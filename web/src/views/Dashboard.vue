@@ -946,7 +946,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       // rulesUnavailable 由 /rules 自己的 then/catch 管理，避免双 setter 竞态。
       ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
     }),
-    slowLane ? request.get('/rules', config).then(async (res) => {
+    slowLane ? request.get('/rules', config).then((res) => {
       if (disposed) return
       if (!res.data) {
         rulesUnavailable.value = true
@@ -964,7 +964,12 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       )
       const version = ++rulesVersion
       const currentRules = rules.value
-       await fetchRuleHealth(currentRules, version, roundSignal)
+      // 健康查询是慢车道：不得 await 在轮询数组内——否则 /config/health 变慢会
+      // 让同一轮的系统指标/流量/连接/状态全部延后（5s 轮询退化为最长 30s），
+      // 下一轮又被 fetchAllDataPromise 挡住。版本守卫（version !== rulesVersion）
+      // 与 ruleHealthInFlight/pending 已保证迟到响应不写回、更新版本补跑，
+      // 函数内部自带 try/catch，fire-and-forget 无未处理 rejection。
+      void fetchRuleHealth(currentRules, version, roundSignal)
      }).catch(() => { if (!disposed) rulesUnavailable.value = true }) : Promise.resolve(),
     request.get('/metrics/connections', config).then((res) => {
       if (disposed) return

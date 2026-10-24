@@ -750,8 +750,8 @@ func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
 	}
 }
 
-// UpdateAdminTLS 是 （读 current → 合并四列 →
-// 整体 UPDATE）。未持 caddyOpMu 时并发保存会以各自基线整体覆盖，前一次变更
+// UpdateAdminTLS 是读改写（读 current → 合并四列 → 整体 UPDATE）。未持
+// caddyOpMu 时并发保存会以各自基线整体覆盖，前一次变更
 // 静默丢失。本测试钉住「锁被占用时保存必须等待」——修复前请求会立即完成。
 func TestUpdateAdminTLS_serializesReadModifyWriteWithCaddyOpLock(t *testing.T) {
 	initializeRuleFeatureTestDB(t)

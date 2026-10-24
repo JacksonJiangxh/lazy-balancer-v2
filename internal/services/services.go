@@ -40,6 +40,13 @@ type MetricsService struct {
 	// stopped 在 Stop 置位：ticker 分支与 startHistoryCleanup 必须先看到它，
 	// 否则 stopCh 与 24h ticker 同时就绪时 select 可随机选中 ticker，在
 	// Start 返回/库关闭之后再启动清理 goroutine（Wait 已观察到 0 计数）。
+	//
+	// 句柄口径：采集/清理读 db.MetricsDB（普通变量，非 db.GetDB 的 atomic
+	// 指针）。安全前提是关停顺序——Stop 置位 + 有界等待清理 + main 在
+	// db.Close 前 await 采集循环；ticker 分支的 stopped 守卫把
+	// 「Stop 之后仍发起新一轮采集」排除在代码层。若未来关停预算被收紧到
+	// 可能放弃等待在途采集，须先给指标库补 db.GetMetricsDB()/SetMetricsDB()
+	// 原子访问器并全仓迁移消费点（只改单点会形成两种句柄口径）。
 	stopped   atomic.Bool
 	cleanupWG sync.WaitGroup
 }
@@ -73,6 +80,12 @@ func (m *MetricsService) Start() {
 	for {
 		select {
 		case <-ticker.C:
+			// 与 cleanup ticker 同口径：Stop 置位后不再发起采集。关停预算
+			// 耗尽时 main 会放弃等待采集 goroutine，本守卫把「Stop 之后仍访问
+			// db.MetricsDB」的窗口压到零新增轮次（一个 tick 只有一次采集）。
+			if m.stopped.Load() {
+				return
+			}
 			m.collect()
 		case <-cleanupTicker.C:
 			if m.stopped.Load() {
@@ -204,6 +217,8 @@ func evictStateTransitionLocked(newKey string) {
 // （时区刷新/运行日志尺寸刷新/排程读取）共用——持久失败在 30s tick 下不再
 // 各打 2880 行/天同一消息；键空间按调用方前缀隔离。map 有界
 // （metricsStateEvictCap）：超上限按族淘汰最旧键，各族的状态记忆互不牵连。
+// 与「同键窗口内只告警一次」的限频族（throttleWarnAllowed）语义不同：本函数
+// 按状态转换记账（恢复要留一条 info），不做窗口判定，故不复用该 helper。
 func logStateTransition(key string, failed bool) string {
 	metricsStateMu.Lock()
 	defer metricsStateMu.Unlock()
@@ -812,30 +827,6 @@ type ruleLabelAggregate struct {
 	bytesIn, bytesOut                          int64
 }
 
-// parseRuleLabelMetrics 解析 lazybalancer_* 指标按 rule label 聚合(2026-09-15
-// 用户裁定:caddy_id 直接匹配替代域名/host 匹配)。单族入口（测试/独立调用）：
-// 单趟扫描；采集主路径在同趟聚合里与全局样本共用一次遍历。
-func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) {
-	res := aggregatePrometheusText(text, prometheusScanRules)
-	if res.rulesErr != nil {
-		return nil, res.rulesErr
-	}
-	return res.rules, nil
-}
-
-// storeRuleMetricsText 按 rule label(lazybalancer_*)写规则级历史行——
-// 2026-09-15 用户裁定:caddy_id 直接匹配替代域名/host 匹配(通配符/大小写/
-// IDNA/多域名/空域名全部天然正确,且不再有静默 continue 失配)。
-// TCP 规则无行(caddy-l4 无规则级流量计数器)。文本入口保留给测试/独立调用，
-// 采集主路径持有已聚合结果，直接走 storePerRuleMetrics（免二次解析）。
-func (m *MetricsService) storeRuleMetricsText(text string) error {
-	byRule, err := parseRuleLabelMetrics(text)
-	if err != nil {
-		return err
-	}
-	return m.storePerRuleMetrics(byRule)
-}
-
 // storePerRuleMetrics 在单个事务内批量写入规则级历史行（每规则一条）。
 // 此前每规则一条独立 Exec（各自隐式事务＝独立 WAL 提交）：300 规则形态每
 // 采集周期 300 次写事务。单事务 + 预处理语句把提交次数收敛为 1；批内共用
@@ -994,18 +985,6 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 	m.overview.TotalRules = totalRules
 	m.overview.OnlineNodes = onlineNodes
 	m.mu.Unlock()
-}
-
-// updateOverview 是**测试/独立调用专用**的整包入口（test-only：生产采集链
-// 不得调用）：DB 派生三项 + 流量样本一次覆盖。生产链走 collect →
-// refreshDBOverviewMetrics + applyTrafficSample（每周期只刷新一次）。复用本
-// 入口会把旧形态「每周期两次 DB 刷新」（6 条 COUNT/周期）重新拉回。
-func (m *MetricsService) updateOverview(metrics parsedMetrics) {
-	// 兼容直接调用方（测试/非 collect 路径）：DB 派生三项在覆盖流量样本前刷新。
-	// collect 不走上层入口（它已在周期开始刷新一次并调 applyTrafficSample）——
-	// 旧形态每周期刷新两次（6 条 COUNT/周期，注释自认「可接受」），现收敛为 3 条。
-	m.refreshDBOverviewMetrics()
-	m.applyTrafficSample(metrics)
 }
 
 // applyTrafficSample 只覆盖 /metrics 流量样本（DB 派生三项由

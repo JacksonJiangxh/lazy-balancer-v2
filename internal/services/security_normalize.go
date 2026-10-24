@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"lazy-balancer-v2/internal/db"
@@ -63,6 +64,93 @@ func ValidBlockStatusCode(v int) bool {
 	return false
 }
 
+// securityEnumRow 是归一前后对比所需的枚举列快照（含策略标识）。
+type securityEnumRow struct {
+	id                         int64
+	name                       string
+	ipACLMode, mode, geoIPMode string
+}
+
+// securityEnumDirtyRows 选出枚举列非法或带首尾空白的策略行——谓词与
+// legacySecurityEnumBackfills 的三个枚举条目同源（TRIM 后不在白名单，或
+// 需要先 trim）。归一本身是保护语义变更（mode 非法→off 会停发该策略全部
+// 规则；ip_acl_mode 空→deny 会突然开始按名单拦截），只报总条数无法定位
+// 「哪条策略、哪个字段、从什么值变成什么值」，故在变更前后各取一次快照。
+func securityEnumDirtyRows(ctx context.Context, tx *sql.Tx) ([]securityEnumRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(name,''), COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,'')
+		FROM security_policies
+		WHERE (ip_acl_mode IS NOT NULL AND ip_acl_mode<>TRIM(ip_acl_mode))
+		   OR (mode IS NOT NULL AND mode<>TRIM(mode))
+		   OR (geoip_mode IS NOT NULL AND geoip_mode<>TRIM(geoip_mode))
+		   OR COALESCE(TRIM(ip_acl_mode),'') NOT IN ('allow','deny','绕过')
+		   OR COALESCE(TRIM(mode),'') NOT IN ('off','custom_only','detection','blocking')
+		   OR COALESCE(TRIM(geoip_mode),'') NOT IN ('off','allow','deny')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []securityEnumRow
+	for rows.Next() {
+		var r securityEnumRow
+		if err := rows.Scan(&r.id, &r.name, &r.ipACLMode, &r.mode, &r.geoIPMode); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// securityEnumChange 是一条枚举列归一记录（field 为列名、from/to 为原始/
+// 归一后取值）。
+type securityEnumChange struct {
+	id                    int64
+	name, field, from, to string
+}
+
+// securityEnumNormalizedChanges 用同一事务内回读的现值与归一前快照对比，
+// 产出逐字段变更清单（未变化的字段不产出）。
+func securityEnumNormalizedChanges(ctx context.Context, tx *sql.Tx, before []securityEnumRow) ([]securityEnumChange, error) {
+	var out []securityEnumChange
+	for _, b := range before {
+		var ipACLMode, mode, geoIPMode string
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,'') FROM security_policies WHERE id=?`, b.id).
+			Scan(&ipACLMode, &mode, &geoIPMode); err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			return nil, err
+		}
+		for _, f := range []struct {
+			name, from, to string
+		}{
+			{"ip_acl_mode", b.ipACLMode, ipACLMode},
+			{"mode", b.mode, mode},
+			{"geoip_mode", b.geoIPMode, geoIPMode},
+		} {
+			if f.from == f.to {
+				continue
+			}
+			out = append(out, securityEnumChange{id: b.id, name: b.name, field: f.name, from: f.from, to: f.to})
+		}
+	}
+	return out, nil
+}
+
+// securityEnumReportNormalized 把逐字段变更写进日志，并对「保护语义收窄」
+// 的方向（mode 非 off → off，该策略的 CRS 与自定义规则全部停止发射）额外
+// 落一条系统审计——与渲染跳过/名单装载失败等安全面变更的留痕口径一致。
+// 归一本身不改变（对齐 Create 默认值族、避免整份配置生成失败）。
+func securityEnumReportNormalized(changes []securityEnumChange) {
+	for _, ch := range changes {
+		Logf("warn", "security enum normalize: 策略 %q（#%d）%s 由 %q 归一为 %q", ch.name, ch.id, ch.field, ch.from, ch.to)
+		if ch.field != "mode" || ch.to != "off" || ch.from == "off" {
+			continue
+		}
+		RecordAuditLog("system", "修改状态", "安全策略",
+			FormatAuditDetail(fmt.Sprintf("策略 %q（#%d）mode 由 %q 归一为 off（该策略规则停止发射）", ch.name, ch.id, ch.from), AuditResultPart("success")), "")
+	}
+}
+
 // NormalizeLegacySecurityPolicyEnums 启动时一次性归一 security_policies 的
 // 遗留枚举空串行。主节点：实际变更 >0 时在同一事务内递增集群版本，从节点随
 // 下次同步收敛。从节点按 sync_security 分流
@@ -98,6 +186,14 @@ func NormalizeLegacySecurityPolicyEnums(ctx context.Context) {
 			return
 		}
 	}
+	// 归一前快照：逐策略/逐字段的 from 值（见 securityEnumDirtyRows 注释）。
+	// 读失败按整体放弃处理——归一仍可在下次启动重做，宁可不动也不留
+	// 「改了但说不清改了谁」的现场。
+	enumBefore, enumErr := securityEnumDirtyRows(ctx, tx)
+	if enumErr != nil {
+		Logf("error", "security enum normalize: failed to snapshot dirty enum rows: %v", enumErr)
+		return
+	}
 	var changed int64
 	for _, stmt := range legacySecurityEnumBackfills {
 		res, err := tx.ExecContext(ctx, stmt)
@@ -113,6 +209,13 @@ func NormalizeLegacySecurityPolicyEnums(ctx context.Context) {
 		changed += n
 	}
 	if changed == 0 {
+		return
+	}
+	// 变更清单在同一事务内回读对比（commit 前），报告在 commit 后输出——
+	// 审计/日志只描述已落库的事实。
+	enumChanges, enumErr := securityEnumNormalizedChanges(ctx, tx, enumBefore)
+	if enumErr != nil {
+		Logf("error", "security enum normalize: failed to diff normalized enum rows: %v", enumErr)
 		return
 	}
 	if isMaster {
@@ -135,4 +238,5 @@ func NormalizeLegacySecurityPolicyEnums(ctx context.Context) {
 	} else {
 		Logf("info", "security enum normalize: normalized %d legacy rows (empty-enum/threshold/status-code/rate-limit dirty rows; slave, sync_security off, no version authority)", changed)
 	}
+	securityEnumReportNormalized(enumChanges)
 }

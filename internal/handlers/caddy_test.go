@@ -1066,3 +1066,69 @@ func TestPutCaddyConfig_acceptsExactLimitRejectsOneByteOver(t *testing.T) {
 		t.Fatalf("limit+1 status=%d body=%.200s, want 413", over.Code, over.Body.String())
 	}
 }
+
+// 无变化载荷的短路必须在预览与保存两端一致：存量坏规则不得让「未提交任何
+// 变更」的预览 400（保存对同一载荷 200「配置无变化」——无写入即无需预检）。
+// 两端对「这份配置能否保存」必须给同一答案。
+func TestPreviewConfigUpdate_noChangeShortCircuitMatchesSave(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/config/preview", h.PreviewConfigUpdate)
+	router.PUT("/config", h.UpdateConfig)
+	// 存量两条 80 端口 TLS 跳转自环规则：聚合预校验恒失败。
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_http_redirect) VALUES
+		('lb_nc_a','无变化甲','http','nc-a.example.test',80,1,1,1),
+		('lb_nc_b','无变化乙','http','nc-b.example.test',80,1,1,1)`); err != nil {
+		t.Fatalf("seed bad rules: %v", err)
+	}
+	post := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	for _, tc := range []struct{ name, method, path string }{
+		{"保存", http.MethodPut, "/config"},
+		{"预览", http.MethodPost, "/config/preview"},
+	} {
+		rec := post(tc.method, tc.path, `{}`)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "配置无变化") {
+			t.Fatalf("%s：status=%d body=%s, want 200 配置无变化（无变化载荷短路两端同判据）", tc.name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// 预览的聚合预校验失败必须复用保存侧分类器：DB 故障不得被回成 400 携带底层
+// 错误文本（管理员会误判为载荷非法），纯配置错误才 400 展示全部问题。
+func TestPreviewConfigUpdate_serverFaultIsNotReportedAsBadRequest(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/config/preview", h.PreviewConfigUpdate)
+	router.PUT("/config", h.UpdateConfig)
+	// 模拟 DB 故障（非配置问题）：规则表不可读。
+	if _, err := db.DB.Exec(`ALTER TABLE lb_rules RENAME TO lb_rules_unreadable`); err != nil {
+		t.Fatalf("rename rule table: %v", err)
+	}
+	post := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	body := `{"source":"basic","log_level":"debug"}`
+	save := post(http.MethodPut, "/config", body)
+	if save.Code != http.StatusInternalServerError {
+		t.Fatalf("save status=%d body=%s, want 500", save.Code, save.Body.String())
+	}
+	preview := post(http.MethodPost, "/config/preview", body)
+	if preview.Code != http.StatusInternalServerError {
+		t.Fatalf("preview status=%d body=%s, want 500（DB 故障不得折成 400 配置问题）", preview.Code, preview.Body.String())
+	}
+	if strings.Contains(preview.Body.String(), "lb_rules_unreadable") || strings.Contains(preview.Body.String(), "no such table") {
+		t.Fatalf("5xx 响应不得携带底层错误文本: %s", preview.Body.String())
+	}
+}

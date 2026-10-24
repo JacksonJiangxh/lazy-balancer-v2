@@ -468,16 +468,21 @@ const mfaPendingFailThreshold = 5
 // MFARecordPendingFailure 记一次 pending 验证失败；达阈值作废 pending 并返回 true。
 // 单条原子条件 UPDATE(读-改-写双语句在并发爆破下丢更新,硬闸
 // 退化约 2 倍预算)——达阈值同语句清空 pending 并回写 0,以影响行数判定。
-func MFARecordPendingFailure(userID int) bool {
+// 写失败必须上抛：activate 无登录限流，pending 码空间 10^6 的收敛完全依赖
+// 本硬闸；吞错返回 false 会让调用方按「未达阈值」继续放行（DB 写故障期
+// 爆破面无限），且应用日志零痕迹。
+func MFARecordPendingFailure(userID int) (bool, error) {
 	var reset int64
 	if err := db.DB.QueryRow(`UPDATE users
 		SET mfa_pending_fails=CASE WHEN COALESCE(mfa_pending_fails,0)+1>=? THEN 0 ELSE COALESCE(mfa_pending_fails,0)+1 END,
 		    mfa_pending_secret=CASE WHEN COALESCE(mfa_pending_fails,0)+1>=? THEN '' ELSE mfa_pending_secret END
 		WHERE id=?
 		RETURNING CASE WHEN COALESCE(mfa_pending_fails,0)=0 THEN 1 ELSE 0 END`, mfaPendingFailThreshold, mfaPendingFailThreshold, userID).Scan(&reset); err != nil {
-		return false
+		// 与挑战计数同族留痕（ErrNoRows=用户已不存在，同样不可能记账）。
+		Logf("error", "MFA pending 失败计数写入失败: %v", err)
+		return false, err
 	}
-	return reset == 1
+	return reset == 1, nil
 }
 
 // MFAClearPendingFailures 成功验证后清零。

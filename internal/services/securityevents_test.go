@@ -1193,7 +1193,7 @@ func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing
 		auditLogPath, securityEventsOffsetPath = oldAuditLog, oldAuditOffset
 	})
 	var rewinds []time.Time
-	SetSecurityEventsRollupRewrite(func(minute time.Time) { rewinds = append(rewinds, minute) })
+	SetSecurityEventsRollupRewrite(func(minute time.Time, _ []time.Time) { rewinds = append(rewinds, minute) })
 
 	if got, _ := SecurityEventsPollOnce(); got != 1 {
 		t.Fatalf("ingested=%d, want 1", got)
@@ -1722,8 +1722,13 @@ func TestRotateAuditLog_backscanFindsStraddleDocStartBeyond8MB(t *testing.T) {
 	if err := db.MetricsDB.QueryRow(`SELECT uri FROM security_events WHERE transaction_id='tx-huge-straddle'`).Scan(&uri); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(uri, "/huge/") || len(uri) != len("/huge/")+9<<20 {
-		t.Fatalf("straddled event uri length=%d, want full 9MB uri", len(uri))
+	// 9MB 巨型 URI 在入库前按单字段上限截断（带可观测标记）；跨界事务仍须完整
+	// 解码入库——截断只影响字段体积，不影响「文档头在 8MB 之前也能找回」的语义。
+	if !strings.HasPrefix(uri, "/huge/") || !strings.HasSuffix(uri, securityEventsTruncatedMarker) {
+		t.Fatalf("straddled event uri prefix/suffix mismatch (len=%d)", len(uri))
+	}
+	if want := securityEventsURICap + len(securityEventsTruncatedMarker); len(uri) != want {
+		t.Fatalf("straddled event uri length=%d, want %d (cap+marker)", len(uri), want)
 	}
 	if _, err := os.Stat(securityEventsPendingDeltaPath()); !os.IsNotExist(err) {
 		t.Fatalf("pending marker must be cleared, stat err=%v", err)
@@ -3992,19 +3997,19 @@ func TestSecurityEventsIngest_attackFlowAlignedWithCommitPoint(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 	offsetPath := filepath.Join(dir, "security_events.offset")
-	okDoc := securityEvents历史Fixture("tx-flow-ok", "203.0.113.61", "/flow-ok")
+	okDoc := securityEvents历史Fixture("tx-flow-ok", "45.33.32.61", "/flow-ok")
 	if err := os.WriteFile(logPath, []byte(okDoc+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	failDoc := securityEvents历史Fixture("tx-flow-fail", "203.0.113.62", "/flow-fail")
+	failDoc := securityEvents历史Fixture("tx-flow-fail", "45.33.32.62", "/flow-fail")
 
 	// 提交成功：恰好 1 条进环
 	tailer := securityEventsNewTailer(logPath, offsetPath)
 	if err := tailer.securityEventsTick(); err != nil {
 		t.Fatalf("first tick: %v", err)
 	}
-	events, _ := ThreatScreenAttackFlowSnapshot(0, 0)
-	if len(events) != 1 || events[0].ClientIP != "203.0.113.61" {
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, 0)
+	if len(events) != 1 || events[0].ClientIP != "45.33.32.61" {
 		t.Fatalf("提交成功批次必须进环 1 条，got %+v", events)
 	}
 
@@ -4016,7 +4021,7 @@ func TestSecurityEventsIngest_attackFlowAlignedWithCommitPoint(t *testing.T) {
 	if err := replay.securityEventsTick(); err != nil {
 		t.Fatalf("replay tick: %v", err)
 	}
-	if events, _ := ThreatScreenAttackFlowSnapshot(0, 0); len(events) != 1 {
+	if events, _, _ := ThreatScreenAttackFlowSnapshot(0, 0); len(events) != 1 {
 		t.Fatalf("offset 重放不得重复进环，got %d 条", len(events))
 	}
 
@@ -4034,12 +4039,12 @@ func TestSecurityEventsIngest_attackFlowAlignedWithCommitPoint(t *testing.T) {
 	if err := failingTailer.securityEventsTick(); err == nil {
 		t.Fatal("injected insert failure must surface as tick error")
 	}
-	events, _ = ThreatScreenAttackFlowSnapshot(0, 0)
+	events, _, _ = ThreatScreenAttackFlowSnapshot(0, 0)
 	if len(events) != 1 {
 		t.Fatalf("回滚批次必须零进环（幽灵事件），got %d 条: %+v", len(events), events)
 	}
 	for _, ev := range events {
-		if ev.ClientIP == "203.0.113.62" {
+		if ev.ClientIP == "45.33.32.62" {
 			t.Fatalf("回滚批次事件进入光流: %+v", ev)
 		}
 	}

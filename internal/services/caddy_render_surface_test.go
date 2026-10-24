@@ -299,3 +299,40 @@ func TestIPPrecheckDirectivesDoNotReadRequestBody(t *testing.T) {
 		}
 	}
 }
+
+// Host 大小写是规则访问日志的可观测边界（引擎事实：Caddy 用原始 Host 做
+// 区分大小写精确查找 logger_names，未命中落默认 logger http.log.access，而
+// default writer 的 exclude 含 "http" 前缀 → 该条目零落盘）。本钉有两个目的：
+//
+//	① logger_names 键必须全小写（与 host matcher 同口径）；
+//	② default writer 必须继续排除 "http"——若有人为「修日志丢失」移除该排除，
+//	   规则行会在 caddy.log 重复（命名 logger 前缀同为 http.*），本断言即红，
+//	   逼迫改动者面对「零落盘 ↔ 日志翻倍」的权衡而不是静默改行为。
+func TestGenerateCaddyConfig_ruleLogSurfaceDependsOnLowercaseHost(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedHTTPRuleForGeneration(t, database, "lb_logcase", "Mixed.Case.Example.Test", 8080)
+	if _, err := database.Exec(`UPDATE lb_rules SET log_enabled=1, domain='Mixed.Case.Example.Test' WHERE caddy_id='lb_logcase'`); err != nil {
+		t.Fatalf("enable log: %v", err)
+	}
+	cfg := generateCaddyConfigFromStore(database)
+	if message, failed := cfg[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generate config: %s", message)
+	}
+	servers := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["http"], "http")["servers"], "servers")
+	server := mustMap(t, servers["http_8080"], "http_8080")
+	loggerNames := mustMap(t, mustMap(t, mustMap(t, server["logs"], "logs")["logger_names"], "logger_names"), "logger_names")
+	if len(loggerNames) == 0 {
+		t.Fatalf("log_enabled 规则必须有 logger_names: %v", server["logs"])
+	}
+	for host := range loggerNames {
+		if host != strings.ToLower(host) {
+			t.Fatalf("logger_names 键 %q 非小写（与 host matcher 规范不一致）", host)
+		}
+	}
+	rootLogs := mustMap(t, mustMap(t, cfg["logging"], "logging")["logs"], "logging.logs")
+	defaultWriter := mustMap(t, rootLogs["default"], "logging.logs.default")
+	exclude, _ := defaultWriter["exclude"].([]string)
+	if len(exclude) == 0 || exclude[0] != "http" {
+		t.Fatalf("default writer exclude=%v, want 以 \"http\" 开头（大写 Host 访问日志零落盘是显式权衡，不得静默移除）", exclude)
+	}
+}

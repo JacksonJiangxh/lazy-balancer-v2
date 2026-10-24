@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -136,5 +139,62 @@ func TestInternalError_doesNotLeakCause(t *testing.T) {
 	}
 	if strings.Contains(resp.Message, "/app/") || strings.Contains(resp.Message, "permission") {
 		t.Fatalf("响应泄漏底层错误: %q", resp.Message)
+	}
+}
+
+// 真实 FIFO 防护：判定必须落在已打开的 fd 上。无写端 FIFO 的阻塞 open(2)
+// 会把请求 goroutine 永久挂住——此处断言请求在超时内返回 500。
+func TestGetAppLogs_fifoDoesNotBlock(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "app.log")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo 不可用: %v", err)
+	}
+	handler := &Handlers{cfg: &config.Config{LogFile: fifo}}
+	router := gin.New()
+	router.GET("/system/logs", handler.GetAppLogs)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/system/logs", nil))
+		done <- rec
+	}()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "读取日志失败") {
+			t.Fatalf("status=%d body=%s, want 500 固定文案", rec.Code, rec.Body.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("FIFO 打开被阻塞（非常规文件判定未落在已打开 fd 上）")
+	}
+}
+
+// 节点角色读必须脱离客户端生命周期：请求 ctx 已取消时仍应解析出真实角色，
+// 不得把「客户端断开」记成角色查询失败（unknown + 每条请求一条 warn）。
+func TestGetSystemInfo_roleReadIndependentOfClientCancel(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.cfg.DataDir = t.TempDir()
+	router := gin.New()
+	router.GET("/system/info", h.GetSystemInfo)
+
+	req := httptest.NewRequest(http.MethodGet, "/system/info", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel() // 客户端在角色读之前断开
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req.WithContext(ctx))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			NodeMode string `json:"node_mode"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode system info: %v", err)
+	}
+	if payload.Data.NodeMode == "unknown" {
+		t.Fatal("node_mode=unknown：角色读被客户端取消影响（必须用脱离取消的上下文）")
 	}
 }

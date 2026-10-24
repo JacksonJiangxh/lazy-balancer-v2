@@ -33,8 +33,8 @@ var autoBackupRunMu sync.Mutex
 // autoBackupFailedRowsKeep:failed 行保留上限（内务裁剪，与 keep 无关）。
 const autoBackupFailedRowsKeep = 20
 
-// HH:MM 校验统一走 services.ValidScheduleHHMM
-// 原本地正则与调度侧解析函数双实现，已收敛）
+// HH:MM 校验统一走 services.ValidScheduleHHMM（原本地正则与调度侧解析
+// 函数双实现，已收敛）。
 
 // autoBackupSafeFilename:文件名一律取自 DB 行，文件操作必须限定在备份目录
 // 内——拒绝任何路径分隔符/点路径/“..”形态（带外改库的深度防御）。
@@ -186,7 +186,7 @@ func nextAutoBackupFilename(dir, trigger string, now time.Time) (string, error) 
 }
 
 // appVersion 为系统真实版本（cfg.Version，不受 branding.json 版本覆盖影响，
-// 2026-09-21 用户裁定备份列表「版本号」列）；存量行缺省 ”，前端显示「—」。
+// 2026-09-21 用户裁定备份列表「版本号」列）；存量行缺省为空串，前端显示「—」。
 func insertAutoBackupRow(filename, status string, sizeBytes int64, sectionsJSON, triggerType, message, appVersion string) (int64, error) {
 	res, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, size_bytes, sections, trigger_type, message, app_version) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		filename, status, sizeBytes, sectionsJSON, triggerType, message, appVersion)
@@ -514,16 +514,19 @@ func (h *Handlers) requireAutoBackupMaster(c *gin.Context) bool {
 }
 
 // autoBackupRowView 是 auto_backups 行的 API 视图（sections 解码为数组）。
+// sections_error 仅在行内 sections 列损坏/带外改写时出现：空数组会被读成
+// 「该备份不含任何分类」，把「范围未知」误报成「范围为空」。
 type autoBackupRowView struct {
-	ID          int64    `json:"id"`
-	Filename    string   `json:"filename"`
-	CreatedAt   string   `json:"created_at"`
-	Status      string   `json:"status"`
-	SizeBytes   int64    `json:"size_bytes"`
-	Sections    []string `json:"sections"`
-	TriggerType string   `json:"trigger_type"`
-	Message     string   `json:"message"`
-	AppVersion  string   `json:"app_version"`
+	ID            int64    `json:"id"`
+	Filename      string   `json:"filename"`
+	CreatedAt     string   `json:"created_at"`
+	Status        string   `json:"status"`
+	SizeBytes     int64    `json:"size_bytes"`
+	Sections      []string `json:"sections"`
+	SectionsError string   `json:"sections_error,omitempty"`
+	TriggerType   string   `json:"trigger_type"`
+	Message       string   `json:"message"`
+	AppVersion    string   `json:"app_version"`
 }
 
 type sqlRowScanner interface {
@@ -537,7 +540,18 @@ func scanAutoBackupRowView(rows sqlRowScanner) (autoBackupRowView, error) {
 		return view, err
 	}
 	view.Sections = []string{}
-	_ = json.Unmarshal([]byte(sectionsRaw), &view.Sections)
+	if err := json.Unmarshal([]byte(sectionsRaw), &view.Sections); err != nil {
+		// 与设置读侧同一列同一口径（decodeAutoBackupSectionsRaw 损坏即报错），
+		// 行视图曾静默退化为空数组：备份列表把「范围损坏/未知」展示成「范围
+		// 为空」，运维可能据此放弃还原。键集沿用空数组，另以 sections_error
+		// 披露并留痕。
+		view.Sections = []string{}
+		view.SectionsError = "备份范围损坏"
+		services.Logf("warn", "自动备份行 %d（%s）备份范围损坏: %v", view.ID, view.Filename, err)
+	}
+	if view.Sections == nil {
+		view.Sections = []string{}
+	}
 	return view, nil
 }
 
@@ -924,7 +938,7 @@ func (h *Handlers) RestoreAutoBackup(c *gin.Context) {
 	}
 	if info.Size() > maxConfigImportBytes {
 		_ = file.Close()
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxConfigImportBytes+1))
@@ -937,10 +951,10 @@ func (h *Handlers) RestoreAutoBackup(c *gin.Context) {
 		return
 	}
 	if int64(len(data)) > maxConfigImportBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return
 	}
-	h.importConfigBackupCore(c, data, true, view.Filename, "还原")
+	h.importConfigBackupCore(c, data, view.Filename, "还原")
 }
 
 // DownloadAutoBackup GET /api/v1/auto-backup/:id/download：下载备份文件

@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -215,10 +216,11 @@ func run() error {
 	services.ConfigureWafDirs(cfg.DataDir)
 	// 审计日志目录必须在首次 ApplyConfigOnStartup
 	// 前保证存在——coraza NewWAF 时 OpenFile 不建父目录,缺失=/load 拒收。
-	// 告警改走 services.Logf("warn")——绕过日志
-	// 级别门（ApplyLogLevel 已在上方装配）会让 warn 级过滤对它失效。
+	// 级别为 error（与相邻的 IP 名单目录同口径）：同一类前置依赖、同一失败
+	// 后果（整份配置被 /load 拒收），warn 在 log_level=error 的常见生产配置下
+	// 会被整行丢弃，排障从「配置应用失败」倒查不到目录权限根因。
 	if err := services.EnsureWafAuditDir(); err != nil {
-		services.Logf("warn", "create waf audit dir failed: %v", err)
+		services.Logf("error", "创建 WAF 审计目录失败（含 WAF 的配置将被 /load 拒收）: %v", err)
 	}
 	// @ipListFast 名单投影目录（v2.3.x）：渲染期 fail-closed 依赖目录可写。
 	if err := services.EnsureIPListDir(); err != nil {
@@ -360,8 +362,12 @@ func run() error {
 		// 且不侵占收尾段预留（此前它无条件吃掉 3s，ACME 段可被钳成 0）。
 		runWithin("metrics 清理等待", shutdown.segmentReserving(metricsCleanupSegmentMax, trailingStopReserve), metricsService.Stop)
 		awaitChannelWithin("metrics 采集循环", metricsDone, shutdown.segment(metricsStopSegmentMax))
-		services.StopTimezoneRefreshWithin(shutdown.segment(tzStopSegmentMax))
-		services.StopLogRotateWithin(shutdown.segment(logRotateStopSegmentMax))
+		// 时区/日志轮转的 Stop*Within 把 within<=0 定义为「无界等待」，与同层
+		// awaitChannelWithin/runWithin 的「0=放弃」相反。segment() 在预算耗尽时
+		// 返回 0，直接传入会把最需要按时退出的分支变成永不放 弃——必须显式跳过
+		// （worker 随进程退出，残留 goroutine 由进程回收）。
+		stopWithinIfBudgeted(shutdown.segment(tzStopSegmentMax), services.StopTimezoneRefreshWithin)
+		stopWithinIfBudgeted(shutdown.segment(logRotateStopSegmentMax), services.StopLogRotateWithin)
 		// 证书 worker 的等待有界（此前 Stop 自身无界阻塞、超时 select 不可达）。
 		lifecycle.ShutdownWithTimeout(shutdown.segment(acmeStopSegmentMax))
 	}()
@@ -475,7 +481,13 @@ func newRestartSignal() (<-chan struct{}, func()) {
 //	→ 引擎排空 = 剩余 − trailingStopReserve
 //	→ 引擎句柄清理 = min(≤5s, 剩余 − trailingStopReserve)
 //	→ metrics 清理等待 = min(≤3s, 剩余 − trailingStopReserve)
-//	→ metrics 采集 ≤2s → 时区 ≤1s → 日志轮转 ≤1s → ACME 收尾 ≤5s
+//	→ metrics 采集 ≤2s → 时区 ≤1s → 日志轮转 ≤1s
+//	→ 证书收尾 ≤5s（段内 = 同步停止 ≤3s + ACME 收尾 = 剩余）
+//
+// 证书收尾段由 runtimeLifecycle.ShutdownWithTimeout 消费：段内先跑集群同步停止
+// （min(传入预算, syncStopSegmentMax=3s)），剩余预算全部留给 ACME 收尾。
+// 时区/日志轮转两段在预算归 0 时直接跳过（Stop*Within 的 within<=0 语义是
+// 无界等待，不能把 segment() 的 0 传进去）。
 //
 // 最坏 10+2+2+2+0+0+2+1+1+5 = 25s ≤ 30s grace（引擎吃满时两处
 // segmentReserving 段按设计归 0）。deadline 之外还有 engineHandleSwapGrace
@@ -648,6 +660,17 @@ func awaitChannelWithin(what string, ch <-chan struct{}, d time.Duration) bool {
 	}
 }
 
+// stopWithinIfBudgeted 在预算为正时执行有界停止，预算耗尽（d<=0）时跳过并
+// 返回 false。用于把「within<=0=无界等待」形态的 Stop*Within 接到关停预算上：
+// segment() 归零表示总预算已用完，此时调用即等于取消有界等待。
+func stopWithinIfBudgeted(d time.Duration, stop func(time.Duration) bool) bool {
+	if d <= 0 {
+		services.Logf("warn", "关停预算已耗尽，跳过该收尾段的等待（worker 随进程退出）")
+		return false
+	}
+	return stop(d)
+}
+
 // takePendingSignal 非阻塞读取启动窗口内已缓存的退出信号（quit 缓冲=1，
 // BootSync 期间到达的信号在此保留）。
 func takePendingSignal(quit <-chan os.Signal) bool {
@@ -778,17 +801,36 @@ type tzLogWriter struct {
 // 底层返回值会报告 n > len(p)。当前唯一消费者（log.Logger）忽略 n，但一旦
 // 日志链路引入缓冲/io.Copy/短写校验，越界 n 会被当成合法字节数使用。
 //
-// 前缀与正文分两次写而不是 append 拼接：日志每行都走本函数
-// （任务/审计/安全事件密集时每秒数百行），拼接会为每行新分配
-// len(prefix)+len(p) 字节的短命切片。两次写的原子性由上游保证：
-// log.Logger.Output 在调用 Write 期间持自身互斥（本 writer 无第二写者）。
+// 整行**单次**写：下游 RotatingFileWriter 按每次 Write 判定轮转并先轮转后写，
+// 前缀与正文分两次写时，跨阈值的那一行会被拆进两个文件（旧文件尾部只剩裸
+// 时间戳、新文件首行没有时间戳）——按行首解析的日志采集与取证因此错位。
+// 拼接缓冲取自 sync.Pool，避免每行新分配（日志密集时每秒数百行）。
 func (t *tzLogWriter) Write(p []byte) (int, error) {
 	prefix := time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05 ")
-	if _, err := t.w.Write([]byte(prefix)); err != nil {
-		return 0, err
+	buffer := logLineBufferPool.Get().(*[]byte)
+	line := append((*buffer)[:0], prefix...)
+	line = append(line, p...)
+	_, err := t.w.Write(line)
+	if cap(line) > maxPooledLogLineBytes {
+		// 偶发超长行不长期占住池容量（池只服务常规行）。
+		*buffer = nil
+	} else {
+		*buffer = line[:0]
 	}
-	if _, err := t.w.Write(p); err != nil {
+	logLineBufferPool.Put(buffer)
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// maxPooledLogLineBytes 是回池行的容量上限：超过它的缓冲不留在池里，
+// 避免一条异常长日志把整池内存抬高。
+const maxPooledLogLineBytes = 64 * 1024
+
+var logLineBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 0, 256)
+		return &buffer
+	},
 }

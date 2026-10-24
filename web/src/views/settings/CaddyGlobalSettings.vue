@@ -35,19 +35,19 @@
         <span class="form-tip-inline tip-nowrap">MB，请求体上限；默认 128，必须为 1-4096（0 不再表示默认）</span>
       </el-form-item>
       <el-form-item label="读取超时">
-        <el-input-number v-model="settings.http_read_timeout" :disabled="isReadOnly" :min="1" :max="86400" controls-position="right" class="number-input" />
-        <span class="form-tip-inline tip-nowrap">秒，读请求超时；必须为 1-86400（0 不再表示无超时）</span>
+        <el-input-number v-model="settings.http_read_timeout" :disabled="isReadOnly" :min="1" controls-position="right" class="number-input" />
+        <span class="form-tip-inline tip-nowrap">秒，读请求超时；必须 ≥1（0 不再表示无超时），常用 60</span>
       </el-form-item>
       <el-form-item label="写入超时">
-        <el-input-number v-model="settings.http_write_timeout" :disabled="isReadOnly" :min="1" :max="86400" controls-position="right" class="number-input" />
-        <span class="form-tip-inline">秒，写响应超时；必须为 1-86400（0 不再表示无超时）</span>
+        <el-input-number v-model="settings.http_write_timeout" :disabled="isReadOnly" :min="1" controls-position="right" class="number-input" />
+        <span class="form-tip-inline">秒，写响应超时；必须 ≥1（0 不再表示无超时），常用 60</span>
       </el-form-item>
       <el-form-item label="空闲超时">
-        <el-input-number v-model="settings.http_idle_timeout" :disabled="isReadOnly" :min="1" :max="86400" controls-position="right" class="number-input" />
-        <span class="form-tip-inline">秒，Keep-Alive 空闲超时；必须为 1-86400（0 不再表示默认）</span>
+        <el-input-number v-model="settings.http_idle_timeout" :disabled="isReadOnly" :min="1" controls-position="right" class="number-input" />
+        <span class="form-tip-inline">秒，Keep-Alive 空闲超时；必须 ≥1（0 不再表示默认），常用 120</span>
       </el-form-item>
       <el-form-item label="上游 Keepalive">
-        <el-input-number v-model="settings.upstream_keepalive_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.upstream_keepalive_timeout" :disabled="isReadOnly" :min="0" controls-position="right" class="number-input" />
         <span class="form-tip-inline">秒，上游空闲保持；0 = 默认 2 分钟</span>
       </el-form-item>
 
@@ -249,7 +249,8 @@ import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { buildCaddyConfigPayload } from '@/utils/caddyConfigPayload'
-import { TRUSTED_PROXY_MAX_TOTAL_ENTRIES, trustedProxyHeadersError, trustedProxyRangesError, trustedProxyTotalError } from '@/utils/trustedProxyRanges'
+import { TRUSTED_PROXY_MAX_TOTAL_ENTRIES, trustedProxyExpansion, trustedProxyHeadersError, trustedProxyRangesError, trustedProxyTotalError } from '@/utils/trustedProxyRanges'
+import type { TrustedProxyReferencedEntries } from '@/utils/trustedProxyRanges'
 import { IP_LIST_CATEGORIES, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type { APIResponse, ProxyTimeoutConfig } from '@/types'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
@@ -376,17 +377,47 @@ const fetchIpLists = async (): Promise<void> => {
 }
 onMounted(() => { void fetchIpLists() })
 
-// 空警告与合计：引用侧条数按选项缓存 entry_count 汇总（与后端展开上限同口径）
-const referencedEntryCount = computed(() => trustedRangeRefs.value.reduce((sum, id) => sum + (ipLists.value.find((l) => l.id === id)?.entry_count ?? 0), 0))
-const trustedRangesTotalCount = computed(() => trustedRanges.value.length + referencedEntryCount.value)
+// 引用名单条目缓存：总量门与后端同口径（规范化前缀并集），只拿 entry_count
+// 无法识别「同一网段既内联又列在名单里」的重叠，会误拒实际展开规模未超限的
+// 合法配置。条目按 id 惰性拉取一次（null=拉取失败/未返回，总量门退回条数估算）。
+interface TrustedIpListDetail { id: number; entries?: { value: string }[] }
+const refListEntries = ref<Record<number, string[] | null>>({})
+// 拉取在途集合（占位 null 之外的独立标记：失败后可随下次选择重试）
+const refListEntriesLoading = new Set<number>()
+const fetchRefListEntries = async (id: number): Promise<void> => {
+  if (id in refListEntries.value || refListEntriesLoading.has(id)) return
+  refListEntriesLoading.add(id)
+  try {
+    const res = await request.get<APIResponse<TrustedIpListDetail>>(`/security/ip-lists/${id}`, { silent: true })
+    refListEntries.value = {
+      ...refListEntries.value,
+      [id]: (res.data?.entries ?? []).map((entry) => String(entry.value ?? '')).filter((value) => value.trim() !== ''),
+    }
+  } catch {
+    // 失败保持未知：总量门按 entry_count 估算（与旧口径一致，不误拒确定未超限的配置）
+  } finally {
+    refListEntriesLoading.delete(id)
+  }
+}
+watch(trustedRangeRefs, (ids) => {
+  for (const id of ids) void fetchRefListEntries(id)
+}, { immediate: true })
+
+const referencedLists = computed<TrustedProxyReferencedEntries[]>(() => trustedRangeRefs.value.map((id) => ({
+  values: refListEntries.value[id] ?? null,
+  entryCount: ipLists.value.find((l) => l.id === id)?.entry_count ?? 0,
+})))
+const trustedExpansion = computed(() => trustedProxyExpansion(trustedRanges.value, referencedLists.value))
+// 合计展示与判据同源：并集（重叠网段只计一次），而非把内联条数与名单条数相加
+const trustedRangesTotalCount = computed(() => trustedExpansion.value.union)
 // 行内校验：非法/过宽条目进入表单即标红（判据单源 utils/trustedProxyRanges，
 // 与后端 services.TrustedProxy* / normalizeTrustedProxyRanges 对表）——
 // 原实现只在预览/PUT 时被整组拒绝，用户只拿到一次 toast 且无法定位是哪一条。
 const trustedRangesError = computed(() => trustedProxyRangesError(trustedRanges.value))
-// 请求头与总量同源判据：条数 ≤8 / 字符集（后端去重前判定）与「内联 + 引用展开」
-// ≤2000。合计的引用面来自名单 entry_count 缓存——未知按 0 计，只在已知超限时拦。
+// 请求头与总量同源判据：条数 ≤8 / 字符集（后端去重前判定）与「内联 ∪ 引用展开」
+// ≤2000（后端去重前缀并集口径）——未知条目按条数估算，只在已知超限时拦。
 const trustedHeadersError = computed(() => trustedProxyHeadersError(trustedHeaders.value))
-const trustedTotalError = computed(() => trustedProxyTotalError(trustedRanges.value.length, referencedEntryCount.value))
+const trustedTotalError = computed(() => trustedProxyTotalError(trustedRanges.value, referencedLists.value))
 
 // —— 存为列表：内联网段一键建名单并转为引用（镜像策略侧「提取为列表」） ——
 const saveListDialogVisible = ref(false)

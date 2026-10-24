@@ -30,7 +30,7 @@ func securityEventsDedupeFixture(txID, timingID, uri, action string, ruleID int)
   "transaction": {
     "unix_timestamp": 1786447017841320426,
     "id": %q,
-    "client_ip": "203.0.113.9",
+    "client_ip": "45.33.32.9",
     "server_id": "go029.com",
     "request": { "method": "GET", "uri": %q, "headers": { %s } },
     "is_interrupted": %t
@@ -270,12 +270,12 @@ func TestSecurityEventsTick_crossPassUpgradeFeedsAutobanUnderBlockedScope(t *tes
 		securityEventsDedupeNowFixture("tx-pass-a", "0011aabbccddeeff", "/split", "logged", 942100))
 	tailer := securityEventsNewTailer(logPath, offsetPath)
 	runSecurityEventsDedupeTick(t, tailer)
-	if got := autobanCountForTest("203.0.113.9"); got != 0 {
+	if got := autobanCountForTest("45.33.32.9"); got != 0 {
 		t.Fatalf("logged 不计入 scope=blocked，首轮 count=%d, want 0", got)
 	}
 
 	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-pass-b", "0011aabbccddeeff", "/split", "blocked", 949110))
-	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+	if got := autobanCountForTest("45.33.32.9"); got != 1 {
 		t.Fatalf("跨 pass 改判 blocked 必须喂一次自动封禁，count=%d, want 1", got)
 	}
 }
@@ -290,12 +290,12 @@ func TestSecurityEventsTick_crossPassUpgradeDoesNotDoubleCountUnderAllScope(t *t
 		securityEventsDedupeNowFixture("tx-all-a", "0022aabbccddeeff", "/split", "logged", 942100))
 	tailer := securityEventsNewTailer(logPath, offsetPath)
 	runSecurityEventsDedupeTick(t, tailer)
-	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+	if got := autobanCountForTest("45.33.32.9"); got != 1 {
 		t.Fatalf("首轮 logged count=%d, want 1", got)
 	}
 
 	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-all-b", "0022aabbccddeeff", "/split", "blocked", 949110))
-	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+	if got := autobanCountForTest("45.33.32.9"); got != 1 {
 		t.Fatalf("跨 pass 改判不得重复计数，count=%d, want 1", got)
 	}
 }
@@ -306,7 +306,7 @@ func TestSecurityEventsTick_crossPassUpgradeFeedsBlockedAfterTrustExemptLogged(t
 	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
 	installDedupeAutobanFixture(t)
 	setAutobanConfigRaw(t, true, 1, 60, "1h", "all", false)
-	if _, err := db.DB.Exec(`UPDATE security_policies SET ip_whitelist_enabled=1, ip_whitelist='["203.0.113.9"]' WHERE id=7`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE security_policies SET ip_whitelist_enabled=1, ip_whitelist='["45.33.32.9"]' WHERE id=7`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -314,12 +314,12 @@ func TestSecurityEventsTick_crossPassUpgradeFeedsBlockedAfterTrustExemptLogged(t
 		securityEventsDedupeNowFixture("tx-trust-a", "0033aabbccddeeff", "/split", "logged", 942100))
 	tailer := securityEventsNewTailer(logPath, offsetPath)
 	runSecurityEventsDedupeTick(t, tailer)
-	if got := autobanCountForTest("203.0.113.9"); got != 0 {
+	if got := autobanCountForTest("45.33.32.9"); got != 0 {
 		t.Fatalf("信任豁免的 logged count=%d, want 0", got)
 	}
 
 	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-trust-b", "0033aabbccddeeff", "/split", "blocked", 949110))
-	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+	if got := autobanCountForTest("45.33.32.9"); got != 1 {
 		t.Fatalf("被豁免的 logged 之后的 blocked 改判必须计数，count=%d, want 1", got)
 	}
 }
@@ -334,10 +334,10 @@ func TestSecurityEventsTick_samePassUpgradeUpdatesAttackFlowAction(t *testing.T)
 		securityEventsDedupeNowFixture("tx-flow-b", "0055aabbccddeeff", "/flow-upgrade", "blocked", 949110))
 	runSecurityEventsDedupeTick(t, securityEventsNewTailer(logPath, offsetPath))
 
-	events, _ := ThreatScreenAttackFlowSnapshot(0, 0)
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, 0)
 	var matched []string
 	for _, ev := range events {
-		if ev.ClientIP == "203.0.113.9" {
+		if ev.ClientIP == "45.33.32.9" {
 			matched = append(matched, ev.Action+"|"+ev.RuleTriggered)
 		}
 	}
@@ -359,9 +359,163 @@ func TestSecurityEventsTick_samePassUpgradeFeedsAutobanOnce(t *testing.T) {
 				securityEventsDedupeNowFixture("tx-same-a", "0044aabbccddeeff", "/same", "logged", 942100),
 				securityEventsDedupeNowFixture("tx-same-b", "0044aabbccddeeff", "/same", "blocked", 949110))
 			runSecurityEventsDedupeTick(t, securityEventsNewTailer(logPath, offsetPath))
-			if got := autobanCountForTest("203.0.113.9"); got != 1 {
+			if got := autobanCountForTest("45.33.32.9"); got != 1 {
 				t.Fatalf("scope=%s 同批改判 count=%d, want 1", scope, got)
 			}
 		})
+	}
+}
+
+// 回退钩子的来源必须可区分：普通插入只报最旧分钟（实现方保留分钟高水位、走
+// 增量合并即可）；原地改判（跨 pass 改判 logged→blocked，行 UPDATE 不改 id）
+// 必须同时上报该分钟——增量重扫看不到改判行，实现方需对该分钟全量重算。
+func TestSecurityEventsTick_rewindHookReportsReclassifyMinutes(t *testing.T) {
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	var oldestMinutes []time.Time
+	var reclassifyMinutes []time.Time
+	SetSecurityEventsRollupRewrite(func(minute time.Time, reclassify []time.Time) {
+		if !minute.IsZero() {
+			oldestMinutes = append(oldestMinutes, minute)
+		}
+		reclassifyMinutes = append(reclassifyMinutes, reclassify...)
+	})
+	t.Cleanup(func() { SetSecurityEventsRollupRewrite(nil) })
+
+	// Given 首个 pass 只有普通插入。
+	writeSecurityEventsDedupeLog(t, logPath,
+		securityEventsDedupeFixture("tx-source-a", "0011223344556677", "/source", "logged", 942100))
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	runSecurityEventsDedupeTick(t, tailer)
+	if len(oldestMinutes) != 1 {
+		t.Fatalf("普通插入 pass 的回退通知次数=%d, want 1", len(oldestMinutes))
+	}
+	if len(reclassifyMinutes) != 0 {
+		t.Fatalf("普通插入不得上报原地改判分钟: %v", reclassifyMinutes)
+	}
+
+	// When 第二个 pass 把同一请求改判为拦截（既有行 UPDATE，id 不变）。
+	appendDedupeLogDoc(t, logPath, tailer,
+		securityEventsDedupeFixture("tx-source-b", "0011223344556677", "/source", "blocked", 949110))
+
+	// Then 改判分钟被单独上报，且与事件分钟一致。
+	if len(oldestMinutes) != 2 {
+		t.Fatalf("改判 pass 的回退通知次数=%d, want 2", len(oldestMinutes))
+	}
+	if len(reclassifyMinutes) != 1 {
+		t.Fatalf("原地改判分钟上报=%v, want 恰好 1 个（缺报会让该分钟增量重扫看不到改判行）", reclassifyMinutes)
+	}
+	var eventTime string
+	if err := db.MetricsDB.QueryRow(`SELECT event_time FROM security_events WHERE transaction_id='tx-source-a'`).Scan(&eventTime); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := time.ParseInLocation("2006-01-02 15:04:05", eventTime, time.UTC)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339, eventTime)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMinute := parsed.Truncate(time.Minute)
+	if !reclassifyMinutes[0].Equal(wantMinute) {
+		t.Fatalf("原地改判分钟=%s, want %s", reclassifyMinutes[0], wantMinute)
+	}
+	if !oldestMinutes[1].Equal(wantMinute) {
+		t.Fatalf("改判 pass 的最旧分钟=%s, want %s", oldestMinutes[1], wantMinute)
+	}
+}
+
+// 去重表跨路径共享必须覆盖标量状态（清扫水位/告警标志）：按值副本只共享
+// map，补采路径推进的 maxSec 停在副本上 → live 侧清扫切点滞后（陈旧键延后
+// 清理）、容量告警重复。指针共享后才与注释声明一致。
+func TestSecurityEventsLiveDedupe_sharesScalarStateWithArchivePath(t *testing.T) {
+	live := securityEventsNewTailer("live.log", "live.offset")
+	securityEventsPollState.Lock()
+	old := securityEventsPollState.tailer
+	securityEventsPollState.tailer = live
+	securityEventsPollState.Unlock()
+	t.Cleanup(func() {
+		securityEventsPollState.Lock()
+		securityEventsPollState.tailer = old
+		securityEventsPollState.Unlock()
+	})
+
+	archive := securityEventsNewTailer("archive.log", "archive.offset")
+	archive.dedupe = securityEventsLiveDedupe()
+	if archive.dedupe != live.deduper() {
+		t.Fatal("补采路径必须引用 live 去重表实例（指针共享），而不是按值副本")
+	}
+
+	archive.deduper().record(1, securityEventsDedupeEntry{atSec: 100})
+	if got := live.deduper().maxSec; got != 100 {
+		t.Fatalf("live 表清扫水位=%d, want 100（标量状态必须跨路径共享）", got)
+	}
+	live.deduper().record(2, securityEventsDedupeEntry{atSec: 200})
+	if _, ok := archive.deduper().lookup(2, 200); !ok {
+		t.Fatal("live 侧新登记必须在补采路径可见（同一实例）")
+	}
+}
+
+// 改判不得用「空归因」覆盖既有非空归因：第二引擎事务缺少 X-LB-Rule-ID /
+// host 映射时，rule_caddy_id/rule_name/policy_id/policy_name 必须保留首行值，
+// 否则事件变成「blocked + 无规则 + 无策略」并从按策略/规则的 24h 计数与检索
+// 中消失。结论列（action/评分）照常覆盖。
+func TestUpgradeDedupedEvent_preservesAttributionWhenNewAttributionEmpty(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events
+		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, precheck_us, request_headers, request_body)
+		VALUES ('2026-10-14 10:00:00','lb_rule1',7,'45.33.32.9','GET','/x','1','score rule','score msg','logged',5,'rule name','policy-seven','tid-1',10,20,'','')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 空归因改判（第二引擎事务无规则头且 host 不可映射）
+	tx, err := db.MetricsDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &securityEventRecord{Action: "blocked", AnomalyScore: 9, RuleTriggered: "blocked-rule", DurationUs: 30, PrecheckUs: 40}
+	if err := securityEventsUpgradeDedupedEvent(tx, "tid-1", rec, securityEventsRuleRef{}, 0, ""); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var action, ruleID, ruleName, policyName string
+	var policyID int
+	if err := db.MetricsDB.QueryRow(`SELECT action, COALESCE(rule_caddy_id,''), COALESCE(policy_id,0), COALESCE(rule_name,''), COALESCE(policy_name,'') FROM security_events WHERE transaction_id='tid-1'`).
+		Scan(&action, &ruleID, &policyID, &ruleName, &policyName); err != nil {
+		t.Fatal(err)
+	}
+	if action != "blocked" {
+		t.Fatalf("action=%q, want blocked（结论必须覆盖）", action)
+	}
+	if ruleID != "lb_rule1" || policyID != 7 || ruleName != "rule name" || policyName != "policy-seven" {
+		t.Fatalf("归因被空值覆盖: rule=%q policy=%d ruleName=%q policyName=%q", ruleID, policyID, ruleName, policyName)
+	}
+
+	// 有归因时照常覆盖（拦截引擎的归因优先）。
+	tx, err = db.MetricsDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := securityEventsUpgradeDedupedEvent(tx, "tid-1", rec, securityEventsRuleRef{caddyID: "lb_rule2", name: "rule two"}, 8, "policy-eight"); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COALESCE(rule_caddy_id,''), COALESCE(policy_id,0), COALESCE(rule_name,''), COALESCE(policy_name,'') FROM security_events WHERE transaction_id='tid-1'`).
+		Scan(&ruleID, &policyID, &ruleName, &policyName); err != nil {
+		t.Fatal(err)
+	}
+	if ruleID != "lb_rule2" || policyID != 8 || ruleName != "rule two" || policyName != "policy-eight" {
+		t.Fatalf("非空归因必须覆盖: rule=%q policy=%d ruleName=%q policyName=%q", ruleID, policyID, ruleName, policyName)
 	}
 }

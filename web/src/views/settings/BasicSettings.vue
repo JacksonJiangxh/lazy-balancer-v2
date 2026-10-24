@@ -135,7 +135,13 @@
           <el-form-item label="强制加密">
             <el-switch v-model="adminTls.enabled" :disabled="isReadOnly || !adminTlsLoaded" @change="onAdminTlsToggle" />
             <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" :disabled="isReadOnly" @click="openAdminTlsDialog">配置证书</el-button>
-            <el-text v-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
+            <!-- 降级读优先于暂存/失败提示：开关当前显示的是后端降级值，
+                 用户必须先知道「不可信」再考虑其它动作（重试走同一读路径）。 -->
+            <template v-if="adminTlsUnavailable">
+              <el-text type="danger" size="small" style="margin-left: 8px">配置读取失败，显示的开关不可信</el-text>
+              <el-link type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</el-link>
+            </template>
+            <el-text v-else-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
             <!-- 读取失败显性化 + 重试（与 githubProxyLoaded 的提示同口径）-->
             <template v-else-if="adminTlsLoadFailed">
               <el-text type="danger" size="small" style="margin-left: 8px">TLS 配置读取失败，开关暂不可用</el-text>
@@ -505,6 +511,8 @@ import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
 import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, displayThreatScreenMode, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
 import { BACKUP_SECTIONS, importConfirmMessage, normalizeBackupSectionKeys } from '@/utils/backupSections'
+import { createImportPreviewSession, importPreviewFingerprint, type ImportPreviewSession } from '@/utils/importPreview'
+import { importFailureLines, importFailureReport } from '@/utils/importFailure'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -891,8 +899,11 @@ const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
       },
     )
     window.location.reload()
-  } catch {
-    // 全局拦截器已提示（还原失败已回滚，配置未受影响）
+  } catch (error: unknown) {
+    // 全局拦截器已弹 message toast；失败响应携带的文件面判决（回退失败=文件与
+    // 版本记录可能分裂 / 提交结果不确定=需人工核对）必须展示——回滚只覆盖库侧，
+    // 回退失败或提交不确定时执行面可能已与库分叉，不得按「已回滚即无需动作」处理。
+    await showImportFailure(error, '配置还原失败', '还原失败')
   }
 }
 
@@ -965,6 +976,9 @@ const importValidating = ref(false)
 const importPreviewSelected = computed<boolean>(() => importSections.value.length > 0)
 const importInput = ref<HTMLInputElement | null>(null)
 let importValidationSeq = 0
+// 预览会话：按「内容指纹 + 所选分类」复用上一次校验结果，分类连续切换时取消
+// 上一轮在途请求——勾选分类不再重传整份备份（上限 128MB）。
+let importPreviewSession: ImportPreviewSession<ImportValidation> | null = null
 
 const summaryLabels: Record<string, string> = {
   lb_rules: '规则',
@@ -990,10 +1004,34 @@ const formatImportConflict = (conflict: DisabledRuleConflict, alreadyDisabled = 
   return `规则 ${conflictIdentifier(conflict)} ${alreadyDisabled ? '已禁用' : '将被禁用'}：与${opponents}冲突`
 }
 
+// showImportFailure 导入/还原失败响应的处置结果弹框。
+//
+// 全局拦截器只弹 message toast（阶段 + 真实错误），而失败分支的事实披露在
+// data.warnings：规则库文件面三态判决（已回退一致/回退失败可能分裂/提交结果
+// 不确定的人工核对指引）与软跳过/归一化清单。丢在 toast 之外等于只有审计库
+// 可见——运维会按「已回滚、无需动作」处理，而 WAF 执行面可能已与库分裂。
+// 无附加事实时不重复弹框（toast 已覆盖）。
+const showImportFailure = async (error: unknown, fallbackMessage: string, title: string): Promise<void> => {
+  const report = importFailureReport(error, fallbackMessage)
+  if (report.warnings.length === 0 && report.conflictCount === 0) return
+  const lines = importFailureLines(report)
+  try {
+    await ElMessageBox.alert(
+      h('div', lines.map((line) => h('div', line))),
+      title,
+      { confirmButtonText: '知道了', type: 'error' },
+    )
+  } catch {
+    // 弹框被关闭（X/ESC）不影响任何状态：失败已由后端回滚或文件面判决披露。
+  }
+}
+
 const triggerImport = (): void => {
   if (backupDisabled.value) return
   importValidationSeq++
   importValidating.value = false
+  importPreviewSession?.dispose()
+  importPreviewSession = null
   importFileName.value = ''
   importFileContent.value = ''
   importFileIsLbbak.value = false
@@ -1005,6 +1043,9 @@ const triggerImport = (): void => {
 const onImportDialogClosed = (): void => {
   importValidationSeq++
   importValidating.value = false
+  // 关闭即取消在途预览上传并丢弃会话（缓存按内容指纹留在会话层之外）
+  importPreviewSession?.dispose()
+  importPreviewSession = null
   // 关闭即释放备份内容(lbbak Blob/JSON 字符串),不驻留至下次选择
   importFileContent.value = ''
   importFileName.value = ''
@@ -1051,9 +1092,19 @@ const handleImportFile = async (event: Event): Promise<void> => {
     } else {
       importFileContent.value = await file.slice(bomLen).text()
     }
+    // 为本次备份建立预览会话（内容指纹只在换文件时算一次；首尾采样，
+    // 不把整份 Blob 复制成第二个 ArrayBuffer）
+    const fingerprint = await importPreviewFingerprint(importFileContent.value)
+    if (validationSeq !== importValidationSeq) return
+    importPreviewSession?.dispose()
+    importPreviewSession = createImportPreviewSession<ImportValidation>({
+      fingerprint,
+      send: (sections, signal) => postImportValidation(sections, signal),
+    })
     // 预览请求携带分类选择（初始=全选，与下方 V2 默认选择一致；
     // 备份不消费该参数）——预览与导入同参，预览结果按所选分类过滤
-    const data = await postImportValidation(BACKUP_SECTIONS.map((sec) => sec.key))
+    const preview = await importPreviewSession.validate(BACKUP_SECTIONS.map((sec) => sec.key))
+    const data = preview.value
     if (validationSeq !== importValidationSeq) return
     importValidation.value = data ?? null
     // 仅负载规则(锁定);V2 默认全选。无 WAF 规则库文件的备份不整类剔除
@@ -1079,27 +1130,32 @@ const handleImportFile = async (event: Event): Promise<void> => {
 // ValidateConfigImport 在校验前按 sections 过滤未选分类的表，坏行不误拒，
 // summary/warnings 亦只含所选分类）。分类选择一律经 ?sections= query，请求体
 // 保持原始字节：v3 纯 JSON 的体内 sections 参与校验和，改写会被判成「已篡改」。
-const postImportValidation = async (sections: string[]): Promise<ImportValidation | undefined> => {
+// 请求可被 signal 取消：分类连续切换时旧轮次的上传不再占用带宽。
+const postImportValidation = async (sections: readonly string[], signal: AbortSignal): Promise<ImportValidation> => {
   const isLbbak = importFileIsLbbak.value
   const endpoint = `/config/import/validate?sections=${encodeURIComponent(sections.join(','))}`
   const body: string | Blob = importFileContent.value
   const res = await request.post<{ data: ImportValidation }>(endpoint, body, {
     headers: { 'Content-Type': isLbbak ? 'application/octet-stream' : 'application/json' },
     timeout: 0,
+    signal,
   })
   return res.data
 }
 
 // 分类切换后按所选分类重校验——预览结果始终反映当前选择（与导入同参）。
-// 面板保持显示（不闪 loading），并发切换经 importValidationSeq 只取最新响应。
+// 面板保持显示（不闪 loading）；同一份备份的同一分类集合直接命中会话缓存，
+// 不再重传备份；并发切换经 importValidationSeq 只取最新响应（在途请求同时被
+// 会话层取消）。
 const revalidateImport = async (): Promise<void> => {
   const sections = importSections.value
   // 校验不消费分类（仅负载规则）；空选择无可导内容（确认时拦截）——不重发
   if (importValidation.value?.type === 'v1' || sections.length === 0) return
-  if (!importFileContent.value) return
+  if (!importFileContent.value || !importPreviewSession) return
+  const session = importPreviewSession
   const validationSeq = ++importValidationSeq
   try {
-    const data = await postImportValidation(sections)
+    const data = (await session.validate(sections)).value
     if (validationSeq !== importValidationSeq) return
     importValidation.value = data ?? null
   } catch {
@@ -1168,8 +1224,10 @@ const confirmImport = async (): Promise<void> => {
     )
     window.location.reload()
   } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to import config:', error)
+    // 全局拦截器只弹 message toast；失败响应的 data.warnings（规则库文件面
+    // 三态判决/提交不确定的人工核对指引/软跳过清单）与冲突明细必须同框展示，
+    // 与成功路径同口径。
+    await showImportFailure(error, '配置导入失败', '导入失败')
   } finally {
     importing.value = false
   }
@@ -1267,6 +1325,7 @@ const {
   adminTlsSaved,
   adminTlsHasCert,
   adminTlsCertError,
+  adminTlsUnavailable,
   stagedAdminTlsCert,
 } = useSettingsDraft()
 const clearGithubToken = () => {
@@ -1376,6 +1435,7 @@ const adminTlsLoaded = ref(false)
 const adminTlsLoadFailed = ref(false)
 const loadAdminTls = async () => {
   adminTlsLoadFailed.value = false
+  adminTlsUnavailable.value = false
   try {
     const res = await request.get('/admin-tls')
     if (res.data) {
@@ -1387,9 +1447,15 @@ const loadAdminTls = async () => {
       const wasStaged = adminTlsDirty.value
       adminTlsSaved.value = saved
       if (!wasStaged) adminTls.value = { ...saved }
-      adminTlsHasCert.value = res.data.cert_info != null || saved.mode === 'selfsigned'
-      adminTlsCertError.value = res.data.cert_info_error || ''
-      adminTlsLoaded.value = true
+      // 后端降级读（config_unavailable）：enabled/mode 是「未启用/自签名」的
+      // 降级值而非真实状态。此时不得视为加载成功（开关保持禁用），证书派生
+      // 态也不据此刷新——降级载荷不含可信的证书信息。
+      adminTlsUnavailable.value = res.data.config_unavailable === true
+      adminTlsLoaded.value = !adminTlsUnavailable.value
+      if (!adminTlsUnavailable.value) {
+        adminTlsHasCert.value = res.data.cert_info != null || saved.mode === 'selfsigned'
+        adminTlsCertError.value = res.data.cert_info_error || ''
+      }
     }
   } catch {
     adminTlsLoadFailed.value = true
@@ -1445,6 +1511,9 @@ let disposed = false
 onUnmounted(() => {
   disposed = true
   appLogTail.stop()
+  // 卸载即取消在途的预览上传（组件销毁后响应无处落地）
+  importPreviewSession?.dispose()
+  importPreviewSession = null
   if (tlsProtocolFallbackTimer) clearTimeout(tlsProtocolFallbackTimer)
   tlsProtocolFallbackTimer = null
 })

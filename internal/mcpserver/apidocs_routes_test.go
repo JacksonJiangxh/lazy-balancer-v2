@@ -113,7 +113,7 @@ func newAPIDocTestRouter(t *testing.T) *gin.Engine {
 		if err := db.Close(); err != nil {
 			t.Errorf("close database: %v", err)
 		}
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreMCPDatabaseHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	// 已认证请求所需的用户行（jwtAuth 校验 pwd_ver 与 users.password_version 一致）
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (41,'apidocs-user','hash','user',1,0)"); err != nil {

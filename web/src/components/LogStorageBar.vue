@@ -16,9 +16,13 @@
           />
           <span class="note">{{ noteText }}</span>
         </template>
+        <!-- 取数失败保留上一次统计（不整条消失），并显式标注数值可能陈旧 -->
+        <span v-if="error" class="note note--error">统计暂不可用</span>
       </div>
     </el-tooltip>
   </div>
+  <!-- 从未取到统计时不留空白：显式说明失败，而不是把整条进度条藏起来 -->
+  <div v-else-if="error" class="form-tip-line">日志统计暂不可用</div>
 </template>
 
 <script setup lang="ts">
@@ -30,7 +34,7 @@ const props = defineProps<{ logKey: string; caddyId?: string; refreshKey?: numbe
 
 // 取数（含换行清空 / 换行重取 / 刷新号重取）在组合子内自洽：logKey 或 caddyId
 // 变化即重新取数并先清空旧行，调用方不必再靠 :key 重挂组件。
-const { info } = useLogStorageStats({
+const { info, error } = useLogStorageStats({
   target: () => ({ logKey: props.logKey, caddyId: props.caddyId }),
   refreshKey: () => props.refreshKey,
 })
@@ -121,4 +125,5 @@ const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.
 .sizes { white-space: nowrap; color: #374151; }
 .bar { width: 90px; flex-shrink: 0; }
 .note { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.note--error { flex: none; color: #e6a23c; }
 </style>

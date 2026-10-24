@@ -1779,7 +1779,7 @@ func TestThreatRollup_ingestBackfillRewindsCoverage(t *testing.T) {
 	}
 
 	// When 摄取提交钩子回退水位到插入分钟前
-	ThreatRollupRewindTo(eventTime)
+	ThreatRollupRewindTo(eventTime, nil)
 	if got := threatRollupWatermarkForTest(t); got != base.Add(-31*time.Minute).Format("2006-01-02 15:04") {
 		t.Fatalf("watermark=%q, want %q（回退到插入分钟前一分钟）", got,
 			base.Add(-31*time.Minute).Format("2006-01-02 15:04"))
@@ -1815,7 +1815,7 @@ func TestThreatRollupRewindTo_lockContentionReturnsAndClampsWindow(t *testing.T)
 		threatRollupMu.Lock()
 		done := make(chan struct{})
 		go func() {
-			ThreatRollupRewindTo(base.Add(-30 * time.Minute))
+			ThreatRollupRewindTo(base.Add(-30*time.Minute), nil)
 			close(done)
 		}()
 		returned := false
@@ -1848,7 +1848,7 @@ func TestThreatRollupRewindTo_lockContentionReturnsAndClampsWindow(t *testing.T)
 		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key,value) VALUES (?,?)`, threatRollupWatermarkKey, lastComplete.Add(-time.Minute).Format("2006-01-02 15:04")); err != nil {
 			t.Fatal(err)
 		}
-		ThreatRollupRewindTo(base.Add(-200 * time.Hour))
+		ThreatRollupRewindTo(base.Add(-200*time.Hour), nil)
 		if got, want := threatRollupWatermarkForTest(t), dFrom.Add(-time.Minute).Format("2006-01-02 15:04"); got != want {
 			t.Fatalf("clamped watermark=%q, want %q", got, want)
 		}
@@ -1895,7 +1895,7 @@ func TestThreatRollupRewindTo_defaultCoversSevenDays(t *testing.T) {
 		t.Fatalf("前提失效：未回退时积压分钟 count=%d, want 0", got)
 	}
 
-	ThreatRollupRewindTo(eventTime)
+	ThreatRollupRewindTo(eventTime, nil)
 	wantWatermark := eventMinute.Add(-time.Minute).Format("2006-01-02 15:04")
 	if got := threatRollupWatermarkForTest(t); got != wantWatermark {
 		t.Fatalf("watermark=%q, want %q（7d 默认窗口不得钳到 24h）", got, wantWatermark)
@@ -1930,7 +1930,7 @@ func TestThreatRollupRewindTo_narrowEnsureDoesNotSwallowRewind(t *testing.T) {
 	eventTime := base.Add(-48 * time.Hour)
 	eventMinute := eventTime.Truncate(time.Minute)
 	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
-	ThreatRollupRewindTo(eventTime)
+	ThreatRollupRewindTo(eventTime, nil)
 
 	for range 4 {
 		if err := ensureThreatRollup(24); err != nil {
@@ -2349,8 +2349,8 @@ func TestGetSecurityThreatScreen_degradedTopTargetsShape(t *testing.T) {
 // 改判（logged→blocked）是对原始行原地 UPDATE：事件 id 不变。回退钩子若只回退
 // 覆盖水位而保留分钟事件高水位键，增量重固只重扫 id > previousMaxID —— 该分钟
 // 被判成「无新增」早退，rollup 的 action 维度永久停在改判前的 logged（大屏拦截
-// 数少计、与事件列表自相矛盾）。回退必须同批删除回退区间的高水位键，让下一次
-// 固化走全量重建。
+// 数少计、与事件列表自相矛盾）。原地改判来源的回退必须让该分钟走全量重建：把
+// 高水位搬进迟到基线（保证全量重建时迟到行仍可合并）后删除高水位键。
 func TestThreatRollup_rewindDropsMinuteHighwaterForInPlaceUpgrade(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	m := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
@@ -2403,6 +2403,15 @@ func TestThreatRollup_rewindDropsMinuteHighwaterForInPlaceUpgrade(t *testing.T) 
 		}
 		return count
 	}
+	baselineValue := func() string {
+		t.Helper()
+		var value string
+		if err := db.MetricsDB.QueryRow(`SELECT value FROM metrics_state WHERE key=?`,
+			services.ThreatRollupLateBaselinePrefix+minute).Scan(&value); err != nil {
+			t.Fatalf("迟到基线未留底（全量重建将无法合并迟到行）: %v", err)
+		}
+		return value
+	}
 
 	// Given 该分钟已按 logged 固化（首固=全量重建 → 写入事件高水位）。
 	fixMinute()
@@ -2422,14 +2431,26 @@ func TestThreatRollup_rewindDropsMinuteHighwaterForInPlaceUpgrade(t *testing.T) 
 	if _, err := db.MetricsDB.Exec(`UPDATE security_events SET action='blocked', rule_triggered='949110', rule_msg='Inbound Anomaly Score Exceeded' WHERE client_ip='93.184.216.7'`); err != nil {
 		t.Fatal(err)
 	}
-	ThreatRollupRewindTo(m)
+	ThreatRollupRewindTo(m, []time.Time{m})
 
-	// Then 分钟事件高水位被删除 → 下一次固化全量重建，action 维度跟随改判。
+	// Then 分钟事件高水位被删除、值搬进迟到基线 → 下一次固化全量重建，
+	// action 维度跟随改判；迟到基线在重固事务内消费（防重复合并）。
 	if highwaterRows() != 0 {
-		t.Fatal("回退必须删除回退区间的分钟事件高水位（否则增量重固看不到原地改判的行）")
+		t.Fatal("原地改判来源的回退必须删除该分钟高水位（否则增量重固看不到原地改判的行）")
+	}
+	if got := baselineValue(); got != "1" {
+		t.Fatalf("迟到基线=%q, want 1（删除的高水位值）", got)
 	}
 	fixMinute()
 	if got := rollupActions(); got["blocked"] != 1 || got["logged"] != 0 {
 		t.Fatalf("改判后 rollup=%v, want blocked=1（永久停在 logged = 大屏与事件列表矛盾）", got)
+	}
+	var baselineRows int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`,
+		services.ThreatRollupLateBaselinePrefix+minute).Scan(&baselineRows); err != nil {
+		t.Fatal(err)
+	}
+	if baselineRows != 0 {
+		t.Fatalf("迟到基线未在重固事务内消费（残留 %d 行 → 下一次回退会重复合并迟到行）", baselineRows)
 	}
 }

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"path/filepath"
 
 	"lazy-balancer-v2/internal/db"
@@ -15,14 +16,34 @@ func storedStatusSnapshot() CRSUpdateStatusSnapshot {
 	if !ok {
 		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
 	}
+	status, message := ProjectActiveUpdateStatusForLocalRole(row.status, row.message)
 	return CRSUpdateStatusSnapshot{
-		Status:     row.status,
+		Status:     status,
 		Trigger:    row.trigger,
 		StartedAt:  row.startedAt,
 		FinishedAt: row.finishedAt,
-		Message:    row.message,
+		Message:    message,
 		Version:    row.version,
 	}
+}
+
+// ProjectActiveUpdateStatusForLocalRole 把「进行中」活动态按本节点角色投影：
+// 这些任务全部 RunsOn=RoleMasterOnly，从节点上的活动态只可能是主端镜像或降级
+// 前的本机残留，本进程不可能将它推进到终态——读侧统一投影为 failed + 归属
+// 文案，避免规则库页/威胁库行长期显示「更新中」（与任务视图 role_applicable
+// 自相矛盾）。数据面收敛仍由启动归一（主节点）与快照应用归一（从节点）负责，
+// 本投影只影响展示，且**不写库**。
+//
+// 角色读失败按原值返回（不猜测）：把活动态投影成 failed 会成为新的假信息。
+func ProjectActiveUpdateStatusForLocalRole(status, message string) (string, string) {
+	if !snapshotActiveUpdateStatus(status) {
+		return status, message
+	}
+	isMaster, err := RoleOf(context.Background(), db.GetDB())
+	if err != nil || isMaster {
+		return status, message
+	}
+	return "failed", snapshotActiveUpdateStatusMessage
 }
 
 // versionTableStatusRow 版本表族（security_crs_version /

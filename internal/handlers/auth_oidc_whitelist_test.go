@@ -258,3 +258,95 @@ func TestOIDCCallback_unverifiedEmailRejected(t *testing.T) {
 		})
 	}
 }
+
+// groups 声明形态归一：IdP 以空白/逗号分隔的字符串返回（自建 Keycloak 自定义
+// mapper、SAML 桥接、部分 ADFS 部署常见）不得导致 claims 解析失败——否则配置
+// 组白名单后全员拒登，且原因只落在服务端日志。
+func TestOIDCCallback_groupsDelimitedStringAccepted(t *testing.T) {
+	idp := newMockIdP(t)
+	idp.groupsClaim.Store(`"ops, dev"`)
+	router, _ := setupOIDCTest(t, idp)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true,"allowed_groups":["dev"]}`)
+
+	front := runOIDCLoginFlow(t, router)
+	if !strings.Contains(front, "#/oidc/callback?token=") {
+		t.Fatalf("分隔字符串形态的 groups 必须命中白名单并登录, got: %s", front)
+	}
+}
+
+// 数组元素逐项 trim：IdP 的 " ops " 不得因逐字比较失败拒登。
+func TestOIDCCallback_groupsArrayTrimmed(t *testing.T) {
+	idp := newMockIdP(t)
+	idp.groupsClaim.Store(`[" ops "]`)
+	router, _ := setupOIDCTest(t, idp)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true,"allowed_groups":["ops"]}`)
+
+	front := runOIDCLoginFlow(t, router)
+	if !strings.Contains(front, "#/oidc/callback?token=") {
+		t.Fatalf("数组元素 trim 后必须命中白名单, got: %s", front)
+	}
+}
+
+// groups 声明存在但形态不可解析（数字/对象）→ 拒登，且审计 reason 与「未返回
+// 声明」区分开（管理员能定位到 IdP 声明类型不兼容）。
+func TestOIDCCallback_groupsMalformedRejected(t *testing.T) {
+	idp := newMockIdP(t)
+	idp.groupsClaim.Store(`42`)
+	router, _ := setupOIDCTest(t, idp)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true,"allowed_groups":["ops"]}`)
+
+	front := runOIDCLoginFlow(t, router)
+	if !strings.Contains(front, "error=") {
+		t.Fatalf("不可解析的 groups 必须拒登, got: %s", front)
+	}
+	var audits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='认证拒绝' AND detail LIKE '%groups 声明类型不支持%'`).Scan(&audits); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if audits == 0 {
+		t.Fatal("拒登审计必须写明「groups 声明类型不支持」而非「未返回声明」")
+	}
+}
+
+// oidcGroups 单元面：数组 / 分隔字符串 / 缺失 / 不可解析四形态。
+func TestOIDCGroups_parsesIdPShapes(t *testing.T) {
+	cases := []struct {
+		name      string
+		raw       string
+		want      []string
+		malformed bool
+	}{
+		{"数组", `["ops","dev"]`, []string{"ops", "dev"}, false},
+		{"数组去空白去空项", `[" ops ","", "  "]`, []string{"ops"}, false},
+		{"逗号分隔字符串", `"ops,dev,sre"`, []string{"ops", "dev", "sre"}, false},
+		{"空白与分号分隔", `"ops dev;sre"`, []string{"ops", "dev", "sre"}, false},
+		{"缺失", ``, nil, false},
+		{"null", `null`, nil, false},
+		{"空数组", `[]`, nil, false},
+		{"数字", `42`, nil, true},
+		{"对象", `{"a":"b"}`, nil, true},
+		{"数字数组", `[1,2]`, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, malformed := oidcGroups([]byte(tc.raw))
+			if malformed != tc.malformed {
+				t.Fatalf("malformed=%v, want %v", malformed, tc.malformed)
+			}
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("groups=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// malformed 在 oidcAccessAllowed 层与「缺失」分判：配置组名单时表述不同。
+func TestOIDCAccessAllowed_malformedGroupsReason(t *testing.T) {
+	cfg := OIDCConfig{AllowedGroups: []string{"ops"}}
+	if ok, reason := oidcAccessAllowed(cfg, oidcAccessClaims{GroupsMalformed: true}); ok || !strings.Contains(reason, "类型不支持") {
+		t.Fatalf("allowed=%v reason=%q, want 拒登且写明类型不支持", ok, reason)
+	}
+	if ok, reason := oidcAccessAllowed(cfg, oidcAccessClaims{}); ok || !strings.Contains(reason, "未返回") {
+		t.Fatalf("allowed=%v reason=%q, want 拒登且写明未返回声明", ok, reason)
+	}
+}

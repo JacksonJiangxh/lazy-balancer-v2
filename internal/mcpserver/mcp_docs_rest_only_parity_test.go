@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,20 +28,30 @@ func normalizeMCPPath(path string) string {
 
 func restOnlyDocSection(t *testing.T) string {
 	t.Helper()
+	section, err := restOnlyDocSectionText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return section
+}
+
+// restOnlyDocSectionText 读「仅 REST 可用的能力」章节原文；抽成无 testing.T
+// 的形态供外部测试包经 export_test.go 复用（正向/反向对账共用同一解析）。
+func restOnlyDocSectionText() (string, error) {
 	body, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.zh-CN.md"))
 	if err != nil {
-		t.Fatalf("读 docs/mcp.zh-CN.md: %v", err)
+		return "", fmt.Errorf("读 docs/mcp.zh-CN.md: %w", err)
 	}
 	source := string(body)
 	start := strings.Index(source, "## 仅 REST 可用的能力")
 	if start < 0 {
-		t.Fatal("docs/mcp.zh-CN.md 缺少「仅 REST 可用的能力」章节")
+		return "", fmt.Errorf("docs/mcp.zh-CN.md 缺少「仅 REST 可用的能力」章节")
 	}
 	section := source[start:]
 	if end := strings.Index(section[len("## 仅 REST 可用的能力"):], "\n## "); end >= 0 {
 		section = section[:len("## 仅 REST 可用的能力")+end]
 	}
-	return section
+	return section, nil
 }
 
 func TestMCPDocsRestOnlySectionHasNoCoveredEndpoints(t *testing.T) {

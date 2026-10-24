@@ -29,10 +29,10 @@
       </template>
       <template v-else>
         <el-form-item label="显示名">
-          <el-input ref="displayNameInput" v-model="profileForm.display_name" :disabled="isReadOnly" placeholder="选填" maxlength="50" />
+          <el-input v-model="profileForm.display_name" :disabled="isReadOnly" placeholder="选填" maxlength="50" />
         </el-form-item>
         <el-form-item label="新密码">
-          <el-input ref="passwordInput" v-model="profileForm.password" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="如不修改请留空（8-24位）" show-password />
+          <el-input v-model="profileForm.password" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="如不修改请留空（8-24位）" show-password />
         </el-form-item>
         <el-form-item label="确认新密码">
           <el-input v-model="profileForm.passwordConfirm" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="再次输入新密码" show-password />
@@ -50,20 +50,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { User } from '@element-plus/icons-vue'
-import type { ElInput } from 'element-plus'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
 import { validatePassword } from '@/utils/credentials'
 import { useAuthStore } from '@/stores/auth'
 
-const props = withDefaults(defineProps<{ modelValue: boolean; focusField?: 'display_name' | 'password' | null }>(), { focusField: null })
+const props = defineProps<{ modelValue: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 const authStore = useAuthStore()
-const displayNameInput = ref<InstanceType<typeof ElInput> | null>(null)
-const passwordInput = ref<InstanceType<typeof ElInput> | null>(null)
 const isOIDCUser = computed(() => authStore.user?.auth_provider === 'oidc')
 const isReadOnly = computed(() => authStore.readOnlyReason === 'slave' || authStore.readOnlyReason === 'unknown')
 const saving = ref(false)
@@ -77,11 +74,8 @@ const syncProfileForm = () => {
     currentPassword: '',
   }
 }
-const handleOpen = async () => {
+const handleOpen = (): void => {
   syncProfileForm()
-  await nextTick()
-  if (props.focusField === 'password') passwordInput.value?.focus()
-  else if (props.focusField === 'display_name') displayNameInput.value?.focus()
 }
 watch(() => props.modelValue, (visible) => { if (visible) syncProfileForm() })
 const beforeClose = (done: () => void): void => { if (!saving.value) done() }

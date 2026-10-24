@@ -11,11 +11,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 空结果写入 60s 缓存——审计库一次瞬态故障(锁/IO)会让筛选下拉在随后 60s 内
-// 持续返回空选项。任一 fetchDistinct 出错必须跳过本轮缓存写入,60s 窗口内
-// 的下一次查询应重新拉取真实数据。
-// diskUsageCache 同型);竞态形态由锁的存在与读写持锁的代码评审覆盖,本测试
-// 钉住「出错不写缓存」的可观察行为。
+// 出错轮不得把空结果写入 60s 缓存——审计库一次瞬态故障(锁/IO)会让筛选下拉
+// 在随后 60s 内持续返回空选项。任一 fetchDistinct 出错必须跳过本轮缓存写入,
+// 60s 窗口内的下一次查询应重新拉取真实数据（diskUsageCache 同型）；竞态形态
+// 由锁的存在与读写持锁的代码评审覆盖,本测试钉住「出错不写缓存」的可观察行为。
 func TestAuditLogOptions_errorRoundDoesNotPoisonCache(t *testing.T) {
 	router, _ := newAuditLogRouter(t)
 	t.Cleanup(resetAuditOptionsCacheForTest)

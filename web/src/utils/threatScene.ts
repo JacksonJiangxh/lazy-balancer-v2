@@ -778,6 +778,18 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     flyTo(server[0], targetY, z)
   }
 
+  /**
+   * 返回世界视口单源（zoomOut / resetView 共用）：作废在途省界加载、清空省层、
+   * 飞回总览并确保渲染循环运行。暂停态下 startLoop 为空操作（flyToOverview 已
+   * 直接落点并补绘），运行态 rafId 非 0 同样不入循环——两处调用语义一致。
+   */
+  function returnToWorldView(): void {
+    drillSeq += 1
+    clearProvinceLayer()
+    flyToOverview()
+    startLoop()
+  }
+
   // ---- 特效 ----
   const arcs: Arc2D[] = []
   const ripples: Ripple2D[] = []
@@ -1230,15 +1242,10 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       else startLoop()
     },
     zoomOut(): void {
-      drillSeq += 1
-      clearProvinceLayer()
-      flyToOverview()
-      startLoop()
+      returnToWorldView()
     },
     resetView(): void {
-      drillSeq += 1
-      clearProvinceLayer()
-      flyToOverview()
+      returnToWorldView()
     },
     cameraState(): { zoom: number; cx: number; cy: number; dist: number; pos: [number, number, number] } {
       return {

@@ -3682,35 +3682,10 @@ func formatIP2RegionLocation(region string) string {
 	return strings.Join(parts, "·")
 }
 
-var reservedIPPrefixes = [...]netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"),       // 本网络/未指定
-	netip.MustParsePrefix("100.64.0.0/10"),   // CGNAT
-	netip.MustParsePrefix("192.0.0.0/24"),    // IETF 协议分配
-	netip.MustParsePrefix("192.0.2.0/24"),    // RFC 5737 文档示例（TEST-NET-1，公网不可路由）
-	netip.MustParsePrefix("198.51.100.0/24"), // RFC 5737 文档示例（TEST-NET-2）
-	netip.MustParsePrefix("203.0.113.0/24"),  // RFC 5737 文档示例（TEST-NET-3）
-	netip.MustParsePrefix("198.18.0.0/15"),   // 基准测试
-	netip.MustParsePrefix("240.0.0.0/4"),     // 保留/广播
-	netip.MustParsePrefix("2001:db8::/32"),   // 文档示例
-}
-
-// isReservedIP 判定保留/私网/回环/链路本地/未指定/组播及特殊用途地址。
-func isReservedIP(ip string) bool {
-	parsed, err := netip.ParseAddr(ip)
-	if err != nil {
-		return false
-	}
-	parsed = parsed.Unmap()
-	if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified() || parsed.IsMulticast() {
-		return true
-	}
-	for _, prefix := range reservedIPPrefixes {
-		if prefix.Contains(parsed) {
-			return true
-		}
-	}
-	return false
-}
+// isReservedIP 判定保留/私网/回环/链路本地/未指定/组播及特殊用途地址
+// （判据单源在 services.IsReservedClientIP：攻击光流环的入环过滤与本节
+// 各消费面必须逐点相等，否则会出现「入口不排、出口才排」的配额挤占）。
+func isReservedIP(ip string) bool { return services.IsReservedClientIP(ip) }
 
 // ruleTriggeredFamilyPrefixes 触发规则筛选的 family 标签 → ID 前缀集合
 // （「WAF 规则（CRS）」为复合 GLOB 条件单独处理，不在此表；「自定义规则」无
@@ -4196,11 +4171,13 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 const securityEventListFieldCap = 16 * 1024
 
 // securityEventListFieldSQL 事件列表的大字段投影：SQL 侧只取截断上限 +1 个
-// **字符**（SQLite SUBSTR 按字符计，天然不切断 UTF-8）。+1 是超限探针——
-// truncateEventListField 据此判定「原值更长」并追加截断标记，响应字节与
-// 此前「整列取回再截断」完全一致。
+// **字节**（CAST AS BLOB 让 SUBSTR 按字节计）。+1 是超限探针——
+// truncateEventListField 据此判定「原值更长」并追加截断标记；Go 侧再按 rune
+// 边界回退到整字符，响应形态与「整列取回再截断」一致。
+// 不用字符口径（SUBSTR 直接作用于 TEXT）：多字节内容会按 16K 字符取回最多
+// ~64KB，而响应只保留 16KB 字节，4× 无谓传输随页面行数放大。
 func securityEventListFieldSQL(column string) string {
-	return "COALESCE(SUBSTR(" + column + ",1," + strconv.Itoa(securityEventListFieldCap+1) + "),'')"
+	return "COALESCE(SUBSTR(CAST(" + column + " AS BLOB),1," + strconv.Itoa(securityEventListFieldCap+1) + "),'')"
 }
 
 func truncateEventListField(value string) string {
@@ -4571,6 +4548,13 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 	// 限流拦截（rule_triggered=429）与事件列表「限流」族/筛选同口径：此前
 	// 429 落 attackFamilyOther（「其他」），纯限流站点于是显示「拦截很多但
 	// 攻击类型几乎全是其他」。429 是精确 ID，无前缀歧义。
+	//
+	// 生产者声明（防御性分支）：caddy-ratelimit 直接返回 caddyhttp.Error(429)，
+	// 不经 coraza 事务 → security_events 里没有 rule_triggered=429 的行，本
+	// 分支当前不可达（前端筛选项已同步移除「限流」）。保留它是因为限流计数走
+	// Prometheus 指标，一旦将来把 429 也落审计行，此处即为正确归类点；
+	// 改动本函数会改变 rollup 固化口径——必须同步递增
+	// threatRollupClassifierVersion（见 security_threat_screen.go 代际注释）。
 	if ruleTriggered == "429" {
 		return "限流"
 	}
@@ -4619,6 +4603,8 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
 	// 限流（429）独立成桶：与事件列表「限流」族、429 筛选及限流卡片同口径，
 	// 此前落「其他」——同一事件在列表与总览口径分叉。
+	// 生产者声明同 categorizeAttack：当前无 429 审计行（限流不经 coraza），
+	// 属防御性分支；分类口径变更须递增 threatRollupClassifierVersion。
 	if ruleTriggered == "429" {
 		return "限流"
 	}
@@ -4708,6 +4694,11 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	// 活跃策略=启用且任一阶段特征非空：旧口径
 	// `mode!='off'` 滞留阶段化前语义——stage1/stage2 策略 mode 恒归一 off，
 	// 纯 stage1/2 部署显示 0。空策略（无任何特征）不计。
+	// 谓词 enabled=1 与生成路径一致：正常写入路径恒显式落 enabled（schema
+	// 默认 TRUE），enabled IS NULL 只可能来自带外改库/旧备份还原。这类行在
+	// 生成路径不发射、在绑定视图按禁用呈现，而列表/详情投影按 schema 默认
+	// 呈现启用——口径差异系带外边角，不在本查询折算 NULL 行（避免为一条
+	// 不可达路径引入三面新口径）。
 	policyRows, perr := db.DB.Query("SELECT " + securityPolicySelectColumns + " FROM security_policies WHERE enabled=1")
 	if perr != nil {
 		trackErr(perr)
@@ -5564,39 +5555,38 @@ func applyStageZerosToCreate(req *models.CreateSecurityPolicyRequest, policyType
 
 // applyStageZerosToUpdate 按同一矩阵把更新请求的阶段外字段指针赋为零值
 // （UPDATE 随之落零）。只有矩阵描述的族被触碰，未列字段保持调用方原值。
+// 每字段一次 new(expr) 分配独立变量：归零矩阵各字段不得共享同一局部变量
+// （别名会让将来任何 `*req.X = v` 形态的归一同时改写多个落库字段，且在
+// review 中不可见）。
 func applyStageZerosToUpdate(req *models.UpdateSecurityPolicyRequest, policyType string) {
-	emptyArr := "[]"
-	offMode := "off"
-	zeroInt := 0
-	falseVal := false
 	for _, family := range outOfStageZeroFamilies(policyType) {
 		switch family {
 		case stageZeroModeOff:
-			req.Mode = &offMode
+			req.Mode = new("off")
 		case stageZeroCRSText:
-			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = &emptyArr, &emptyArr, &emptyArr
+			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = new("[]"), new("[]"), new("[]")
 		case stageZeroRateLimit:
-			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
+			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = new(false), new(0), new(0)
 		case stageZeroWAFFlags:
-			req.WAFCheckResponse, req.LogRequestBody = &falseVal, &falseVal
+			req.WAFCheckResponse, req.LogRequestBody = new(false), new(false)
 		case stageZeroIPACL:
-			req.IPACLEnabled = &falseVal
-			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
+			req.IPACLEnabled = new(false)
+			req.IPACLList, req.IPACLListRefs = new("[]"), new("[]")
 		case stageZeroIPWhitelist:
-			req.IPWhitelistEnabled = &falseVal
-			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
+			req.IPWhitelistEnabled = new(false)
+			req.IPWhitelist, req.IPWhitelistRefs = new("[]"), new("[]")
 		case stageZeroIPBlacklist:
-			req.IPBlacklist = &emptyArr
+			req.IPBlacklist = new("[]")
 		case stageZeroGeoIP:
-			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
+			req.GeoIPMode, req.GeoIPCountries = new("off"), new("[]")
 		case stageZeroGeoIPCrawler:
-			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
+			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = new(false), new("[]")
 		case stageZeroBlockPageAll:
-			req.BlockPageID, req.BlockStatusCode = &zeroInt, &zeroInt
+			req.BlockPageID, req.BlockStatusCode = new(0), new(0)
 		case stageZeroBlockStatusCode:
-			req.BlockStatusCode = &zeroInt
+			req.BlockStatusCode = new(0)
 		case stageZeroTrustDetection:
-			req.TrustDetection = &falseVal
+			req.TrustDetection = new(false)
 		}
 	}
 }

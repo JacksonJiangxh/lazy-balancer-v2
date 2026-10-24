@@ -498,9 +498,13 @@ export const formatAclModeDetail = (
       : ''
   const total = breakdown !== '' ? `共 ${effective} 条${breakdown}` : `${effective} 条`
   // allow 空生效集 = 引擎否定算子空集（恒拒）：带外直写/旧快照可达该形态，
-  // 摘要必须显性警示，否则用户看到「0 条」不会察觉全站被拒。
+  // 摘要必须显性警示，否则用户看到「0 条」不会察觉全站被拒。但该告警以
+  // 「ACL 在渲染」为前提——ip_acl_enabled=false 时渲染侧整块不发射
+  // （security.go 的 IPACLEnabled 门），名单只是保留态，告警在此形态是误报；
+  // 两条结论（恒拒 / 独立黑名单仍生效）互不替代，零生效集分支同样要追告。
   if (policy.ip_acl_mode === 'allow') {
-    return effective === 0 ? `白名单模式 · ${total}（将拒绝所有请求）` : `白名单模式 · ${total}${blAlive}`
+    if (policy.ip_acl_enabled === false) return `白名单模式 · 未启用 ACL${blAlive}`
+    return effective === 0 ? `白名单模式 · ${total}（将拒绝所有请求）${blAlive}` : `白名单模式 · ${total}${blAlive}`
   }
   if (policy.ip_acl_mode === '绕过') return `免检测模式 · ${total}${blAlive}`
   // 空/未知模式：名单存在但渲染侧不发射任何拒绝规则（空模式 ACL 零发射）——
@@ -1164,6 +1168,14 @@ async function loadSharedEntry(id: number, loader: (id: number) => Promise<strin
 }
 
 /**
+ * 缺失条目的名单 id：`ensureSharedEntries` 对单名单失败保持「未缓存」而不抛出
+ * （下次调用可重试），调用方据此把加载失败显性化——否则条目缺失会退化成
+ * 「未命中名单」的业务结论。非正 id 与已缓存 id 均不计入。
+ */
+export const missingSharedEntryIds = (ids: Iterable<number>): number[] =>
+  [...new Set(ids)].filter((id) => id > 0 && !(id in sharedEntriesCache))
+
+/**
  * 按需补齐名单条目：只对「不在缓存」的 id 发请求，
  * 并发调用去重（in-flight 复用）；单名单失败不阻塞其他名单且不留失败缓存
  * （下次调用可重试）。loader 由调用方注入（axios 请求），本模块保持纯状态机。
@@ -1178,7 +1190,7 @@ async function loadSharedEntry(id: number, loader: (id: number) => Promise<strin
  * 发起者自己的请求被丢弃时不自动重取（保持 「丢弃、待重取」语义）。
  */
 export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: number) => Promise<string[]>): Promise<void> {
-  const todo = [...new Set(ids)].filter((id) => id > 0 && !(id in sharedEntriesCache))
+  const todo = missingSharedEntryIds(ids)
   if (todo.length === 0) return
   const generation = entriesCacheGeneration
   await Promise.all(todo.map(async (id) => {

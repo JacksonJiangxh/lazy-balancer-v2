@@ -112,3 +112,42 @@ func TestEnsureBrandingFile_completeFileLeavesLandingInjectionToCaller(t *testin
 		t.Fatalf("landing body=%q, want 丙（调用方负责注入）", got)
 	}
 }
+
+// 同步门指纹必须含 dataDir（与 brandingStore 的键控同构）：同进程切换数据
+// 目录时，前一个目录的指纹与 60s 采样窗不得吞掉新目录的首轮同步。
+func TestBrandingSyncGate_dataDirChangeResetsThrottle(t *testing.T) {
+	resetBrandingSyncGateForTest()
+	t.Cleanup(resetBrandingSyncGateForTest)
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	for _, dir := range []string{dirA, dirB} {
+		if err := os.WriteFile(filepath.Join(dir, "branding.json"), []byte(`{"app_name":"甲"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Given：目录 A 已完成一轮同步（指纹已记录、60s 窗处于计时中）。
+	if !brandingSyncGateAllow(dirA) {
+		t.Fatal("目录 A 首见应放行")
+	}
+	if brandingSyncGateAllow(dirA) {
+		t.Fatal("目录 A 内容未变不得重复放行")
+	}
+
+	// When/Then：紧接切换到目录 B——60s 采样窗必须重置，不得被 A 的时间窗挡住。
+	if !brandingSyncGateAllow(dirB) {
+		t.Fatal("切换 dataDir 后首轮必须放行（60s 采样窗按目录重置）")
+	}
+	if brandingSyncGateAllow(dirB) {
+		t.Fatal("目录 B 内容未变不得重复放行")
+	}
+
+	// And：切回 A 会重新放行一轮（单槽指纹按目录切换重置；写副作用幂等，
+	// 切换本身不是生产形态），随后稳态零写。
+	if !brandingSyncGateAllow(dirA) {
+		t.Fatal("切回目录 A 后首轮放行（指纹槽随目录重置）")
+	}
+	if brandingSyncGateAllow(dirA) {
+		t.Fatal("目录 A 稳态（内容未变）不得重复触发写副作用")
+	}
+}

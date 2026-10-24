@@ -82,6 +82,67 @@ func TestRollupQueries_includeCurrentPartialMinute(t *testing.T) {
 	}
 }
 
+// 今日计数的 rollup 分支与原始表回退分支必须对同一事件集合给出恒等数值：
+// 两分支的谓词套用面一旦分叉，同一卡片会在覆盖水位切换点输出不同数字，
+// 且切换时机由水位决定、极难复现。原始表侧同样套攻击面谓词。
+func TestSecurityOverviewTodayCounts_rollupAndRawFallbackAgree(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	now := time.Date(2026, 10, 19, 12, 0, 30, 0, time.UTC)
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	lastComplete := now.Add(-time.Minute).Truncate(time.Minute)
+	lastStr := lastComplete.Format("2006-01-02 15:04")
+	eventTime := lastComplete.Format("2006-01-02 15:04:05")
+
+	// 事件集合：blocked ×2（普通规则）、logged ×1（普通规则）、
+	// logged ×1（爬虫放行族 id 810016）。爬虫放行行不计攻击面。
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, action, rule_triggered) VALUES
+		(?, 'blocked', '942100'), (?, 'blocked', '942100'),
+		(?, 'logged', '942100'), (?, 'logged', '810016')`,
+		eventTime, eventTime, eventTime, eventTime); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute, rule, action, count) VALUES
+		(?, '942100', 'blocked', 2), (?, '942100', 'logged', 1), (?, '810016', 'logged', 1)`,
+		lastStr, lastStr, lastStr); err != nil {
+		t.Fatalf("seed rollup: %v", err)
+	}
+
+	usable := func(coveredFrom string) {
+		t.Helper()
+		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?), (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			threatRollupCoveredFromKey, coveredFrom,
+			threatRollupWatermarkKey, lastStr); err != nil {
+			t.Fatalf("seed rollup state: %v", err)
+		}
+	}
+
+	usable(dayStart.Format("2006-01-02 15:04"))
+	rollupBlocked, rollupDetected, fromRollup, err := securityOverviewTodayCounts(db.MetricsDB, dayStart, now)
+	if err != nil {
+		t.Fatalf("rollup counts: %v", err)
+	}
+	if !fromRollup {
+		t.Fatal("覆盖新鲜时必须走 rollup 口径")
+	}
+
+	// 覆盖水位晚于今日起点 → 回退原始表直算。
+	usable(dayStart.Add(time.Minute).Format("2006-01-02 15:04"))
+	rawBlocked, rawDetected, fromRollup, err := securityOverviewTodayCounts(db.MetricsDB, dayStart, now)
+	if err != nil {
+		t.Fatalf("raw counts: %v", err)
+	}
+	if fromRollup {
+		t.Fatal("覆盖水位不足时必须回退原始表")
+	}
+	if rollupBlocked != rawBlocked || rollupDetected != rawDetected {
+		t.Fatalf("两分支口径分叉: rollup=%d/%d raw=%d/%d", rollupBlocked, rollupDetected, rawBlocked, rawDetected)
+	}
+	if rawBlocked != 2 || rawDetected != 1 {
+		t.Fatalf("计数口径: blocked=%d detected=%d, want 2/1（爬虫放行不计攻击面）", rawBlocked, rawDetected)
+	}
+}
+
 // 端点级接线：大屏 handler 的总量与 recent_rate 刻意使用不同时间上界，
 // 两者都不许被单方面改动（改动必须成对更新文案与本用例）。
 func TestGetSecurityThreatScreen_partialMinuteScopeIsExplicit(t *testing.T) {

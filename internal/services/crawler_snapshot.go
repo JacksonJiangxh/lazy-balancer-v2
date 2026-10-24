@@ -29,6 +29,10 @@ func SetCrawlerIPListFileForTest(path string) func() {
 	return func() { crawlerIPListFile = old }
 }
 
+// crawlerSnapshotWriteObserver 测试观测点：每次全量快照写入前回调（生产 nil）。
+// 用于断言启动预载只落一次快照——不给生产路径引入计数分支。
+var crawlerSnapshotWriteObserver func()
+
 // crawlerBuiltinSnapshot 新实例内置首版（单一事实源见
 // geoipnames.BuiltinCrawlerIPLists：官方源快照随 geoipnames 包嵌入，镜像内
 // /app/waf.dist 的同名文件由 Dockerfile 从同一路径 COPY）。
@@ -129,8 +133,10 @@ func (m *CrawlerUpdateManager) Prime() error {
 		return err
 	}
 	for engineID, entries := range all {
-		// 内层 upsert 返回「是否实变」，Prime 只关心错误——全量快照写在下游。
-		if _, err := upsertCrawlerIPListChangedInner(engineID, entries); err != nil {
+		// 逐引擎只落 DB：带快照形态会在 DB 尚未补种完的中间态各写一次全量
+		// 快照（插件可能读到只含部分引擎的合法 JSON）。全量快照在循环末尾
+		// 单次写——变更/需刷新语义此处不消费（末尾写覆盖全部引擎）。
+		if _, _, err := upsertCrawlerIPListChangedInnerNoSnapshot(engineID, entries); err != nil {
 			// 部分 upsert 失败时不写全量快照（保留上一份，避免快照缩小），
 			// 由调用方错误日志告警后下次启动继续补种。
 			return err
@@ -172,9 +178,35 @@ func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error)
 
 // upsertCrawlerIPListChangedInner upsert 主体（名单名迁移已由调用方完成——
 // RunUpdate 单轮提升一次；独立调用方走 upsertCrawlerIPListChanged 带迁移形态）。
+// DB 行落定后才写运行快照（快照写失败须让调用方判失败）。
 func upsertCrawlerIPListChangedInner(engineID string, entries []string) (bool, error) {
+	changed, snapshotNeeded, err := upsertCrawlerIPListChangedInnerNoSnapshot(engineID, entries)
+	if err != nil {
+		return false, err
+	}
+	if !snapshotNeeded {
+		return false, nil
+	}
+	// DB 与运行快照是同一更新事务语义：快照写失败不得继续标记源成功。
+	if err := writeCrawlerIPListSnapshot(engineID, entries); err != nil {
+		// 部分提交：DB 已落定而快照失败，调用方仍须计入收敛面。
+		return changed, err
+	}
+	return true, nil
+}
+
+// upsertCrawlerIPListChangedInnerNoSnapshot 只落 DB 行，不写运行快照。
+// 返回 (changed, snapshotNeeded, err)：
+//   - changed=DB 内容真实变化；
+//   - snapshotNeeded=需要按本次内容重建运行快照（DB 实变，或 DB 未变但快照
+//     缺失/损坏/陈旧）。
+//
+// 启动预载（Prime）逐引擎播种时只走本函数、末尾写一次全量快照——逐引擎
+// 调用带快照形态会在 DB 尚未补种完的中间态各写一次全量快照，把只含已落库
+// 引擎的合法 JSON 暴露给插件（iprange 引擎在快照缺项时判 Transient）。
+func upsertCrawlerIPListChangedInnerNoSnapshot(engineID string, entries []string) (changed bool, snapshotNeeded bool, err error) {
 	if len(entries) == 0 {
-		return false, errors.New("空 IP 段列表（解析无产出）")
+		return false, false, errors.New("空 IP 段列表（解析无产出）")
 	}
 	payload := make([]models.IPListEntry, 0, len(entries))
 	for _, value := range entries {
@@ -182,13 +214,13 @@ func upsertCrawlerIPListChangedInner(engineID string, entries []string) (bool, e
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	name := CrawlerIPListName(engineID)
 	var existing string
 	scanErr := db.DB.QueryRow(`SELECT COALESCE(entries,'') FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&existing)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return false, scanErr
+		return false, false, scanErr
 	}
 	if scanErr == nil && crawlerEntriesUnchanged(existing, entries) {
 		// 判定改为内容（多重集）比较而非顺序敏感
@@ -198,10 +230,7 @@ func upsertCrawlerIPListChangedInner(engineID string, entries []string) (bool, e
 		// 文件缺失/坏 JSON/陈旧内容（首轮快照写失败、升级遗留）都要从 DB/entries
 		// 重建；writeCrawlerIPListSnapshot 从 DB 全量重建并覆盖本引擎，其他引擎
 		// 分片保留。
-		if crawlerSnapshotMatchesEngine(engineID, entries) {
-			return false, nil
-		}
-		return true, writeCrawlerIPListSnapshot(engineID, entries)
+		return false, !crawlerSnapshotMatchesEngine(engineID, entries), nil
 	}
 	exists := 0
 	if scanErr == nil {
@@ -214,10 +243,9 @@ func upsertCrawlerIPListChangedInner(engineID string, entries []string) (bool, e
 		_, err = db.DB.Exec(`UPDATE security_ip_lists SET entries=?, updated_at=datetime('now') WHERE name=? AND system=1`, string(encoded), name)
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	// DB 与运行快照是同一更新事务语义：快照写失败不得继续标记源成功。
-	return true, writeCrawlerIPListSnapshot(engineID, entries)
+	return true, true, nil
 }
 
 // crawlerSnapshotMatchesEngine 快照文件可解析且本引擎条目集合与期望一致。
@@ -278,6 +306,9 @@ func crawlerEntriesUnchanged(existingJSON string, entries []string) bool {
 // writeCrawlerIPListSnapshotAll 全量快照：写 map[engine][]string JSON
 // （与 caddygeoip.crawler_verify.go 的读取契约一致，按引擎隔离命中）。
 func writeCrawlerIPListSnapshotAll(all map[string][]string) error {
+	if crawlerSnapshotWriteObserver != nil {
+		crawlerSnapshotWriteObserver()
+	}
 	encoded, err := json.Marshal(all)
 	if err != nil {
 		return err

@@ -250,8 +250,8 @@ func TestUpdateRule_stops_before_database_commit_when_route_snapshot_fails(t *te
 	router.ServeHTTP(response, request)
 
 	// Then
-	// b：快照先于 validate 摄取——管理接口不可达现于快照阶段以 500
-	// 阶段重排并入此处）。核心不变量不变：数据库未提交。
+	// 快照先于 validate 摄取——管理接口不可达在快照阶段即以 500 暴露
+	// （阶段重排后归入此处）。核心不变量不变：数据库未提交。
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
 	}
@@ -405,7 +405,7 @@ func TestUpdateConfig_restores_Caddy_when_commit_fails(t *testing.T) {
 	h.caddyService = services.NewCaddyService(fakeCaddy.URL)
 	router := gin.New()
 	router.PUT("/config", h.UpdateConfig)
-	// 候选与已提交视图字节相同，恢复自然零 /load——测不出回弹）。
+	// 候选与已提交视图字节相同——恢复自然零 /load，测不出回弹。
 	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"caddy_log_size_mb":200}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -419,8 +419,9 @@ func TestUpdateConfig_restores_Caddy_when_commit_fails(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	// 被 100MB 覆盖（旧实现回弹「运行时快照」，LKG 在回弹 /load 失败时滞留
-	// 未提交字节；新收口统一走 RestoreRuntimeToCommittedInLock）。
+	// 运行时视图必须被已提交的 100MB 覆盖（旧实现回弹「运行时快照」，LKG 在
+	// 回弹 /load 失败时滞留未提交字节；新实现统一走
+	// RestoreRuntimeToCommittedInLock）。
 	if loads != 2 {
 		t.Fatalf("Caddy loads=%d, want apply plus committed-view restore", loads)
 	}

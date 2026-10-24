@@ -69,6 +69,18 @@ const parseDateValue = (date: unknown): Date | null => {
   return isNaN(d.getTime()) ? null : d
 }
 
+/**
+ * 站内时间戳有两族，格式化入口不得混用：
+ * - **UTC 存储族**（后端以 UTC 落库 / RFC3339 下发）：audit_logs、cert_jobs、
+ *   cluster nodes、security_events 等——用本文件的 formatDate/formatDateShort，
+ *   经配置时区换算展示。
+ * - **配置时区墙钟族**（后端按配置时区写「无时区」串，不做换算）：task_runs
+ *   的 started_at/finished_at、任务日志时间戳。这类串交给 formatDate 会被当作
+ *   UTC 再换算一次（曾实证任务时间整体 +8h），必须原样展示（TaskMonitor 的
+ *   fmtTime 即此口径）。
+ * 新增调用点前先确认该字段属于哪一族；不明确时按后端的存储语义查，不要凭字段
+ * 名猜。
+ */
 export const formatDate = (date: unknown): string => {
   const d = parseDateValue(date)
   if (d) return formatInConfigTz(d, true)

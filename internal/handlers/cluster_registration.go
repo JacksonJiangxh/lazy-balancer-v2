@@ -159,19 +159,24 @@ func (h *Handlers) ConfirmClusterRegistration(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
-	if err := h.clusterService.ConfirmRegistration(c.Request.Context(), authenticatedClusterToken(c)); err != nil {
+	nodeName, err := h.clusterService.ConfirmRegistration(c.Request.Context(), authenticatedClusterToken(c))
+	if err != nil {
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return
 		}
-		// 同 RegistrationStatus 分判。
+		// 同 RegistrationStatus 分判。失败也留痕（与 register 一致）：注册
+		// 密钥被拒/重放尝试在审计面无记录时无法回溯。
 		if errors.Is(err, services.ErrInvalidClusterAuth) || errors.Is(err, services.ErrNodeNotFound) || errors.Is(err, services.ErrInvalidRegisterToken) {
+			services.RecordAuditLog("system", "确认失败", "集群节点", services.AuditResultPart("failure"), c.ClientIP())
 			clusterError(c, http.StatusUnauthorized, "确认集群注册失败", err)
 			return
 		}
+		services.RecordAuditLog("system", "确认失败", "集群节点", services.FormatAuditDetail(services.AuditResultPart("failure"), err.Error()), c.ClientIP())
 		clusterError(c, http.StatusInternalServerError, "确认集群注册失败", err)
 		return
 	}
+	services.RecordAuditLog("system", "确认", "集群节点", services.FormatAuditDetail(fmt.Sprintf("节点 %s", nodeName), "注册密钥已失效", services.AuditResultPart("success")), c.ClientIP())
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "集群注册已确认"})
 }
 

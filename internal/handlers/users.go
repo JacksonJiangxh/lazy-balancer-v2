@@ -566,11 +566,17 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 			services.Logf("error", "ToggleUserStatus rollback failed for id=%d: %v", id, err)
 		}
 	}()
-	query := "UPDATE users SET is_enabled = ? WHERE id = ?"
-	args := []any{enable, id}
-	if !enable {
-		query += " AND (role <> 'admin' OR is_enabled = 0 OR EXISTS (SELECT 1 FROM users WHERE id <> ? AND role = 'admin' AND is_enabled = 1))"
-		args = append(args, id)
+	var query string
+	var args []any
+	if enable {
+		// 启用即「恢复该账号」：沿用改密语义的解锁片段（passwordResetColumns
+		// 同款）——锁定中/失败计数残留会让管理员刚启用的账号继续 429，且错误
+		// 文案会让人以为账号仍被禁用，恢复意图被 10 分钟锁定打断。
+		query = "UPDATE users SET is_enabled = 1, login_failed_attempts = 0, login_locked_until = NULL WHERE id = ?"
+		args = []any{id}
+	} else {
+		query = "UPDATE users SET is_enabled = 0 WHERE id = ? AND (role <> 'admin' OR is_enabled = 0 OR EXISTS (SELECT 1 FROM users WHERE id <> ? AND role = 'admin' AND is_enabled = 1))"
+		args = []any{id, id}
 	}
 	result, err := tx.ExecContext(c.Request.Context(), query, args...)
 	if err != nil {

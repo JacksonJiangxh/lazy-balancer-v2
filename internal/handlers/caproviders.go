@@ -90,14 +90,14 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		return
 	}
 
-	// 与 CreateRule/ 问题 同款 1MB 请求体上限——credentials 为
-	// 自由 JSON 字符串，无上限时超大合法 JSON 经 ShouldBindJSON 等量内存驻留并
-	// 原样落库（域内其余写端点均已设限，本端点为漏网）。
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+	// credentials 为自由 JSON 字符串：请求体上限跟随全局「请求体大小」配置项，
+	// 与证书配置/签发等写端点同源（独立硬编码会让调整全局上限后本端点行为
+	// 分叉）。超限经 isRequestBodyTooLarge 映射 413。
+	if !guardConfiguredJSONBody(c) {
+		return
+	}
 	var req models.UpdateCAProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// MaxBytesReader 超限映射 413，与导入/
-		// PutCaddyConfig/admin-tls 同口径（此前并入 400）。
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
 			return
@@ -162,7 +162,10 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	if req.Credentials != nil {
 		credentialState = credentialAuditStateFor(*req.Credentials, old.Credentials)
 	}
-	if req.Name != nil && *req.Name != old.Name {
+	// 名称按生效值（trim 后）比对：服务层写库前 TrimSpace，按请求原值比对会把
+	// 「提交带空白填充的同一名称」记成变更——审计假阳性，且与同函数内
+	// 最大并发/最小间隔「归一后生效值才算变更」的口径相悖。
+	if req.Name != nil && strings.TrimSpace(*req.Name) != strings.TrimSpace(old.Name) {
 		changed = append(changed, "名称")
 	}
 	if req.Provider != nil && *req.Provider != old.Provider {
@@ -212,6 +215,9 @@ func (h *Handlers) TestCAProvider(c *gin.Context) {
 	provider, err := h.caProviderService.GetCAProvider(id)
 	if err != nil {
 		if errors.Is(err, services.ErrCAProviderNotFound) {
+			// 预查询 404 与测试内核的 not_found 同一结果类别：测试入口无论在哪一层
+			// 判定不存在都必须留审计（成功/失败测试均留痕的既有口径）。
+			recordAudit(c, "测试失败", "CA提供商", services.FormatAuditDetail(fmt.Sprintf("提供商 %d", id), services.AuditResultPart("not_found")))
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "CA provider not found"})
 			return
 		}

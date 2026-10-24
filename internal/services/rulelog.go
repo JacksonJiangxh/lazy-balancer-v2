@@ -81,6 +81,8 @@ func decodeFileComponent(component string) string {
 // lines plus the end offset, so callers can incrementally consume without any
 // server-side state. Rotation is detected two ways: size < offset (新文件还没
 // 长过旧偏移) 与「offset 不再落在行首」(新文件已长过旧偏移)——两者都从 0 重启。
+// 第二形态是启发式：新文件已长过旧 offset 且 offset-1 恰在行边界时无法识别
+// （残余窗口见下方实现注释），此时由调用方传 offset=0 触发全量重读。
 // 日志文件尚不存在=正常空（规则刚创建/尚无流量，非法 caddy_id 另由端点
 // 存在性门拦截）；其余 I/O 错误（权限/目录/EISDIR 等）必须上抛——静默返回
 // 空会让「日志读不出来」与「没有日志」在 UI 与运维侧无从区分。
@@ -109,6 +111,14 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64, e
 		// 「整窗无换行的超长单条记录」也会把 offset 推进到行中（maxRead 推进
 		// 语义），故额外要求 offset 前 4KB 内确有换行才判轮转——真正的轮转文
 		// 件几乎必然在窗口内带换行，纯二进制/超长单行不受影响。
+		//
+		// 已知残余窗口（启发式，无状态契约下不可消除）：轮转后的新文件在下一次
+		// 轮询前已长过旧 offset，且 offset-1 恰好落在行边界时，两条判据都不成立
+		// （新旧内容巧合），函数从中段继续读——新文件前 offset 字节不再交付，
+		// 且 offset 单调前进、log-stream 无自动 resync。概率≈1/平均行长（访问
+		// 日志 0.3%–1%），需「新文件已长过旧 offset」前提（默认 roll_size_mb=100
+		// 时约 20MB/s 单规则写入）。需要全量重读时由调用方传 offset=0（端点
+		// 契约支持），函数本身不持有 inode/指纹，无法自行判定。
 		var prev [1]byte
 		if _, readErr := f.ReadAt(prev[:], offset-1); readErr == nil && prev[0] != '\n' {
 			window := int64(4096)
@@ -294,26 +304,47 @@ func RemoveRuleLogFiles(ruleID string) error {
 	for i := 1; i <= 5; i++ {
 		remove(fmt.Sprintf("%s.%d", base, i))
 	}
-	// timberjack 时间戳副本(<id>-<ts>-size.log[.gz],至多 roll_keep=5 份)此前
-	// 永久残留——按前缀+完整时间戳尾部清扫。
+	// timberjack 时间戳副本(<id>-<ts>-<reason>[_N].log[.gz|.zst],至多
+	// roll_keep=5 份)此前永久残留——按前缀+完整时间戳+reason 尾部清扫。
 	if err := removeTimberjackRotations(base); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
 
+// timberjackRotationReasons 会写进轮转副本名 reason 段的上游取值（timberjack
+// v1.4.8）：rotate("size")（按 roll_size_mb）与 rotate("time")
+// （RotationInterval/RotateAtMinutes/RotateAt 触发）；openNew("initial") 只新建
+// 文件、不改名，不产生副本。渲染侧当前只发射 roll_size_mb，故 time 家族暂不可
+// 达，但白名单按上游家族完整覆盖——新增 roll_interval/roll_minutes/roll_at
+// 时必须已在此登记，否则副本永久残留而清理报成功。键集↔家族的双向门禁在
+// rulelog_rotation_naming_test.go（TestTimberjackRotationReasonFamily_…）。
+var timberjackRotationReasons = []string{"size", "time"}
+
+// CaddyLogRotationReasonPattern 导出 timberjack 副本 reason 段的正则 alternation
+// （"size|time"）。删除侧白名单（本文件）与 handlers 的日志统计分类器共用同一
+// 上游知识源——两侧各写一份是命名家族漂移的种子（`-size` 与会话碰撞后缀 `_N`
+// 的分歧即由此产生）。
+func CaddyLogRotationReasonPattern() string {
+	return strings.Join(timberjackRotationReasons, "|")
+}
+
 // timberjackRotationSuffix 匹配 timberjack 轮转副本的固定尾部形态：
-// `-<日期>T<时刻>.<毫秒>-size.log[.<压缩后缀>]`。生产链用的是
+// `-<日期>T<时刻>.<毫秒>-<reason>[_<碰撞计数>].log[.<压缩后缀>]`。生产链用的是
 // timberjack 默认时间格式（虚线日期、时刻段同样以 '-' 分隔）与
 // Caddy FileWriter 默认 gzip 压缩（副本名追加 `.gz`），故必须同时接受虚线
 // 日期与可选压缩后缀；紧凑 `yyyyMMdd` 形态一并保留（读侧同族兼容）。
+// reason 段取自 timberjackRotationReasons；`_N` 是同毫秒同 reason 双轮转时
+// uniqueBackupName 写入的碰撞计数（`-size_1`，写在 reason 段内而非文件名尾）。
 // 只认完整时间戳形状——仅判「stem 后首字符是数字」会让兄弟规则
 // （如 lb_abc 与 lb_abc-1）的轮转副本被本规则清扫误删（rest 为
 // "-1-2026…" 时首字符恰是数字）。
-var timberjackRotationSuffix = regexp.MustCompile(`^-(?:\d{8}T\d{2}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})(?:\.\d{1,9})?-size\.log(?:\.gz|\.zst)?$`)
+var timberjackRotationSuffix = regexp.MustCompile(
+	`^-(?:\d{8}T\d{2}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})(?:\.\d{1,9})?-(?:` +
+		strings.Join(timberjackRotationReasons, "|") + `)(?:_\d+)?\.log(?:\.gz|\.zst)?$`)
 
-// removeTimberjackRotations 删除 base 同目录下 <base去扩展名>-<ts>-size.log 形态
-// 的 timberjack 轮转副本。目录不存在=无副本（nil）；读目录/删除失败聚合返回。
+// removeTimberjackRotations 删除 base 同目录下 <base去扩展名>-<ts>-<reason>.log
+// 形态的 timberjack 轮转副本。目录不存在=无副本（nil）；读目录/删除失败聚合返回。
 func removeTimberjackRotations(base string) error {
 	dir := filepath.Dir(base)
 	stem := strings.TrimSuffix(filepath.Base(base), filepath.Ext(base))

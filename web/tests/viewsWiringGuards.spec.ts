@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source, stripComments, repoSource } from './_helpers.ts'
+import { code, member, section, repoCode } from './_helpers.ts'
 import { shouldToastQuietPollError } from '../src/utils/pollErrorToast.ts'
 import {
   CERT_QUEUE_VISIBLE_JOBS,
@@ -17,7 +17,7 @@ import {
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor } from '../src/utils/dnsProviderFields.ts'
 
 test('自定义规则编辑深拷贝条件行（取消/保存失败不得污染列表行）', () => {
-  const body = section(source('src/views/security/SecurityRules.vue'), 'const openRuleDialog', 'const saveCustomRule')
+  const body = section(code('src/views/security/SecurityRules.vue'), 'const openRuleDialog', 'const saveCustomRule')
   assert.match(body, /row\.conditions\.map\(\(c\) => \(\{ \.\.\.c \}\)\)/)
   assert.doesNotMatch(body, /\[\.\.\.row\.conditions\]/, '浅拷贝数组会让弹框 v-model 直接改写列表行对象')
 })
@@ -32,7 +32,7 @@ test('自动备份 quiet 轮询失败不逐轮弹 toast', () => {
   assert.equal(shouldToastQuietPollError(false, 100_000 + 29_999, 100_000), false, '窗口内不得重复提示（刷屏回归）')
   assert.equal(shouldToastQuietPollError(false, 100_000 + 30_001, 100_000), true, '窗口过后可再提示一次')
   // 生产接线：两个分支各自独立——quiet 分支先过节流判定，else 分支无条件提示。
-  const body = section(source('src/views/settings/BasicSettings.vue'), 'const fetchAutoBackup', 'const onAutoBackupOpened')
+  const body = section(code('src/views/settings/BasicSettings.vue'), 'const fetchAutoBackup', 'const onAutoBackupOpened')
   const catchAt = body.indexOf('} catch {')
   assert.ok(catchAt > 0, '缺 catch 分支')
   const catchBody = body.slice(catchAt)
@@ -47,19 +47,19 @@ test('自动备份 quiet 轮询失败不逐轮弹 toast', () => {
 })
 
 test('健康轮询接入退避门，不可达 onError 已删除', () => {
-  const body = section(source('src/views/Rules.vue'), 'const healthPolling = usePollingTask', 'const healthPollingErrorDescription')
+  const body = section(code('src/views/Rules.vue'), 'const healthPolling = usePollingTask', 'const healthPollingErrorDescription')
   assert.match(body, /healthPollingError\.canRun\(\)/)
   assert.doesNotMatch(body, /onError/, 'fetchHealthStatus 内部捕获不抛出——onError 是不可达死代码')
 })
 
 test('证书队列拉取接入轮询 AbortSignal', () => {
-  const text = source('src/views/settings/TaskMonitor.vue')
+  const text = code('src/views/settings/TaskMonitor.vue')
   assert.match(text, /const fetchCertQueue = async \(signal\?: AbortSignal\)/)
   assert.match(text, /fetchCertQueue\(signal\)/)
 })
 
 test('任务详情历史与日志加载失败显性化', () => {
-  const text = source('src/views/settings/TaskMonitor.vue')
+  const text = code('src/views/settings/TaskMonitor.vue')
   // 消费点：失败态必须真的渲染出来（原断言只查符号出现——删掉模板分支仍绿）
   // 单标签元素（自闭合）：用「标签内属性」结构边界（[^>]* 不会跨出标签），
   // 不再用定长 [\s\S]{0,120} 窗口——模板改个属性顺序即假红。
@@ -70,7 +70,7 @@ test('任务详情历史与日志加载失败显性化', () => {
   )
   assert.match(text, /<span v-if="logsLoadError"[^>]*>日志加载失败，自动重试中<\/span>/)
   // 置位路径：详情历史只在最新详情序号下置位，日志失败由轮询 onError 置位
-  const detail = section(text, 'const openDetail', '// ===== 日志抽屉')
+  const detail = section(text, 'const openDetail', 'const logsVisible = ref')
   assert.match(detail, /if \(seq === detailSeq\) detailHistoryError\.value = true/)
   const tail = section(text, 'const logsLoadError = ref(false)', 'const openLogs')
   assert.match(tail, /onError: \(\) => \{ logsLoadError\.value = true \}/)
@@ -79,19 +79,19 @@ test('任务详情历史与日志加载失败显性化', () => {
 })
 
 test('规则向导关闭即清空私钥/证书明文', () => {
-  const body = section(source('src/views/Rules.vue'), 'const resetWizard = () =>', 'const beforeWizardClose')
+  const body = section(code('src/views/Rules.vue'), 'const resetWizard = () =>', 'const beforeWizardClose')
   assert.match(body, /wizardForm\.tls_cert = ''/)
   assert.match(body, /wizardForm\.tls_key = ''/)
 })
 
 test('库健康标签的加载态由视图接线（三态语义由 securityLibraries 行为用例承担）', () => {
-  const page = source('src/views/security/SecurityRules.vue')
+  const page = code('src/views/security/SecurityRules.vue')
   assert.match(page, /loaded: crsInfoLoaded\.value/)
   assert.match(page, /loaded: ip2regionInfoLoaded\.value/)
 })
 
 test('死导出 ADAPTIVE_SAMPLE_TIERS 已移除', () => {
-  assert.doesNotMatch(source('src/utils/threatFlowRules.ts'), /ADAPTIVE_SAMPLE_TIERS/)
+  assert.doesNotMatch(code('src/utils/threatFlowRules.ts'), /ADAPTIVE_SAMPLE_TIERS/)
 })
 
 test('更新者名称四处复用收敛为 utils/updaterName 单源', () => {
@@ -101,7 +101,7 @@ test('更新者名称四处复用收敛为 utils/updaterName 单源', () => {
     'src/views/security/SecurityBlockPages.vue',
     'src/views/security/SecurityPolicies.vue',
   ]) {
-    const text = source(file)
+    const text = code(file)
     assert.ok(text.includes("from '@/utils/updaterName'"), `${file} 必须消费单源`)
     // 钉调用点（而非 import）：删掉调用只留 import 仍须失败
     assert.match(
@@ -123,17 +123,17 @@ test('日志尾轮询五处收敛为 useLogTailPolling', () => {
     'src/views/settings/CaddyGlobalSettings.vue',
   ]) {
     // 钉实际调用形态（`useLogTailPolling({`），仅在注释提及不算消费
-    assert.match(source(file), /useLogTailPolling\(\{/, `${file} 必须调用共享 composable`)
+    assert.match(code(file), /useLogTailPolling\(\{/, `${file} 必须调用共享 composable`)
   }
   // TaskMonitor 原缺 hidden 暂停——收敛后由 composable 统一保证
-  assert.match(source('src/composables/useLogTailPolling.ts'), /document\.hidden/)
+  assert.match(code('src/composables/useLogTailPolling.ts'), /document\.hidden/)
 })
 
 test('DNS 凭证测试按掩码回传分流（***→库中原值 :id/test）', () => {
   // 原断言匹配注释文本「非 UI 客户端」——注释保留而分流逻辑
   // 被删/改向也通过。改为钉分流语义：只有表单凭证含 *** 时打 :id/test（验证库中
   // 存量），用户实际改过凭证（无 ***）走无 id 的 /test。
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   const block = section(page, 'const hasMaskedCred', 'await request.post(url')
   assert.match(block, /v === '\*\*\*'/, '掩码判定必须是凭证值为 ***')
   assert.match(block, /targetId && hasMaskedCred/, '仅在「编辑既有 + 掩码回传」时走库中原值')
@@ -142,29 +142,29 @@ test('DNS 凭证测试按掩码回传分流（***→库中原值 :id/test）', (
 })
 
 test('管理 TLS 读取失败显性化，开关禁用至加载成功', () => {
-  const text = source('src/views/settings/BasicSettings.vue')
+  const text = code('src/views/settings/BasicSettings.vue')
   assert.match(text, /:disabled="isReadOnly \|\| !adminTlsLoaded"/)
 })
 
 test('Caddy 全局配置卡接入 configLoaded 双重门控', () => {
-  const card = source('src/views/settings/CaddyGlobalSettings.vue')
+  const card = code('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(card, /defineProps<\{ configLoaded: boolean \}>/)
   assert.match(card, /:disabled="isReadOnly \|\| !props\.configLoaded"/)
   const save = section(card, 'const handleSave = async', 'if (isReadOnly.value || saving.value) return')
   assert.match(save, /!props\.configLoaded/, 'configLoaded 门必须早于常规写守卫')
-  const page = source('src/views/Settings.vue')
+  const page = code('src/views/Settings.vue')
   assert.match(page, /<CaddyGlobalSettings[\s\S]*?:config-loaded="configLoaded"/)
 })
 
 test('任一 /config 成功读取恢复 configLoaded，失败可重试', () => {
-  const text = source('src/views/Settings.vue')
+  const text = code('src/views/Settings.vue')
   const block = section(text, 'const refreshConfigSection', 'const handleSaveBasic')
   assert.match(block, /configLoaded\.value = true/, '卡片保存后刷新成功必须恢复保存门')
   assert.match(text, /configLoadFailed/)
 })
 
 test('policy_id=0 展示「无策略归属」而非「策略已删除」', () => {
-  const text = source('src/components/events/TriggerDetailDialog.vue')
+  const text = code('src/components/events/TriggerDetailDialog.vue')
   assert.match(text, /本次事件无策略归属/)
   // 无策略归属态由 policy_id<=0 判定（后端 securityevents.go 返回 (0, "")）
   assert.match(text, /const noPolicyAttribution = computed\(\(\) => \(props\.row\?\.policy_id \?\? 0\) <= 0\)/)
@@ -184,7 +184,7 @@ test('policy_id=0 展示「无策略归属」而非「策略已删除」', () =>
 })
 
 test('威胁地图 canvas 注册/注销 pointerleave 清理悬停态', () => {
-  const text = source('src/utils/threatScene.ts')
+  const text = code('src/utils/threatScene.ts')
   assert.match(text, /addEventListener\('pointerleave', onPointerLeave\)/)
   assert.match(text, /removeEventListener\('pointerleave', onPointerLeave\)/)
   assert.match(section(text, 'function onPointerLeave', '\n  }'), /hoverName = null/, '离开画布必须复位悬停名')
@@ -194,21 +194,21 @@ test('威胁地图 canvas 注册/注销 pointerleave 清理悬停态', () => {
 // 口径）与 threatEngineParity.spec（构建一次）；此处不重复断言。
 
 test('指标采集失败时规则表空态报「采集失败」', () => {
-  assert.match(section(source('src/views/Dashboard.vue'), 'const rulesEmptyText', 'const hasRuleRequests'), /caddyMetricsUnavailable/)
+  assert.match(section(code('src/views/Dashboard.vue'), 'const rulesEmptyText', 'const hasRuleRequests'), /caddyMetricsUnavailable/)
 })
 
 test('区域树加载失败保留旧数据并显性提示+重试', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /regionsError/)
   const fetchRegions = section(text, 'const fetchRegions', 'onMounted')
   assert.doesNotMatch(fetchRegions, /\} catch \{\s*regionTree\.value =/, '失败不得静默清空区域树')
 })
 
 test('事件页刷新按钮联动自动封禁状态', () => {
-  const text = source('src/views/security/SecurityEvents.vue')
-  // 函数级限段 + 剥注释：固定字符窗口会被增长后的函数挤出（假红），
-  // 也会被窗口内的无关同名文本命中（假绿）。
-  const body = stripComments(member(text, 'const refreshPage'))
+  const text = code('src/views/security/SecurityEvents.vue')
+  // 函数级限段：固定字符窗口会被增长后的函数挤出（假红），
+  // 也会被窗口内的无关同名文本命中（假绿）；源取剥注释视图。
+  const body = member(text, 'const refreshPage')
   const eventsAt = body.indexOf('fetchEvents(')
   const statusAt = body.indexOf('fetchAutobanStatus(')
   assert.ok(eventsAt > 0, 'refreshPage 必须刷新事件列表')
@@ -218,7 +218,7 @@ test('事件页刷新按钮联动自动封禁状态', () => {
 })
 
 test('信任关联写动作确认前即占位（双击不再叠确认框）', () => {
-  const text = source('src/composables/useTrustAssociation.ts')
+  const text = code('src/composables/useTrustAssociation.ts')
   // 原断言只数 `if (creating.value) return` 出现次数 ≥2——
   // 同一函数里写两次也通过，无法证明「两个写入口都有锁」。改为逐函数限段：
   // 每个写入口的入口守卫必须早于占位与确认框。
@@ -241,7 +241,7 @@ test('信任关联写动作确认前即占位（双击不再叠确认框）', ()
 test('restart 就绪响应落地后 reload 前复查 isDisposed', () => {
   // 原断言取 260 字符窗口——isDisposed 与 reload 可来自无关语句。
   // 改为函数级限段 + 顺序断言：状态请求成功后的 dispose 复查必须紧邻 reload。
-  const body = section(source('src/utils/restart.ts'), 'const reloadAfterRestart = async', 'export interface RestartServiceOptions')
+  const body = section(code('src/utils/restart.ts'), 'const reloadAfterRestart = async', 'export interface RestartServiceOptions')
   const statusAt = body.indexOf("await request.get('/caddy/status'")
   assert.ok(statusAt > 0, '缺就绪探测')
   const afterStatus = body.slice(statusAt)
@@ -255,18 +255,18 @@ test('restart 就绪响应落地后 reload 前复查 isDisposed', () => {
 })
 
 test('死代码清理（灰 tone/死 CSS/死字段/解析器单源）', () => {
-  assert.doesNotMatch(source('src/components/RuleFlowDialog.vue'), /tl-dot--gray|\| 'gray'/)
-  assert.doesNotMatch(source('src/views/security/SecurityEvents.vue'), /autoban-confirm-list|autoban-confirm-text/)
-  assert.doesNotMatch(source('src/views/security/SecurityEvents.vue'), /list_referenced: boolean/, '死字段声明应移除')
-  assert.doesNotMatch(source('src/views/security/SecurityPolicies.vue'), /\.exclusion-empty \.el-button/)
+  assert.doesNotMatch(code('src/components/RuleFlowDialog.vue'), /tl-dot--gray|\| 'gray'/)
+  assert.doesNotMatch(code('src/views/security/SecurityEvents.vue'), /autoban-confirm-list|autoban-confirm-text/)
+  assert.doesNotMatch(code('src/views/security/SecurityEvents.vue'), /list_referenced: boolean/, '死字段声明应移除')
+  assert.doesNotMatch(code('src/views/security/SecurityPolicies.vue'), /\.exclusion-empty \.el-button/)
   // 自定义规则 ID 解析单源化
-  const policies = source('src/views/security/SecurityPolicies.vue')
+  const policies = code('src/views/security/SecurityPolicies.vue')
   assert.match(policies, /parseUnknownIds/)
-  assert.match(source('src/utils/securityStages.ts'), /export const parseUnknownIds|export function parseUnknownIds/)
+  assert.match(code('src/utils/securityStages.ts'), /export const parseUnknownIds|export function parseUnknownIds/)
 })
 
 test('build 门禁：先跑测试、再跑 src 基线与 tests 类型检查', () => {
-  const pkg = JSON.parse(source('package.json')) as { scripts: Record<string, string> }
+  const pkg = JSON.parse(code('package.json')) as { scripts: Record<string, string> }
   assert.ok(
     pkg.scripts.build.startsWith('npm test && npm run typecheck:src && npm run typecheck:test &&'),
     `build 必须先执行 npm test、typecheck:src 与 typecheck:test，实际: ${pkg.scripts.build}`,
@@ -276,18 +276,18 @@ test('build 门禁：先跑测试、再跑 src 基线与 tests 类型检查', ()
   // 若只跑它，src 也只在 ES2024 的 API 面下被检查——等于放宽浏览器兼容基线
   // （restart.ts 明确回避 Promise.withResolvers，旧 Safari 会首屏白屏）。
   assert.equal(pkg.scripts['typecheck:src'], 'vue-tsc -p tsconfig.json --noEmit')
-  assert.match(source('tsconfig.json'), /"lib": \["ES2020", "DOM", "DOM\.Iterable"\]/, 'src 基线 lib 不得抬高')
-  assert.match(source('tsconfig.test.json'), /"lib": \["ES2024", "DOM", "DOM\.Iterable"\]/, 'tests 需要 ES2024 API')
+  assert.match(code('tsconfig.json'), /"lib": \["ES2020", "DOM", "DOM\.Iterable"\]/, 'src 基线 lib 不得抬高')
+  assert.match(code('tsconfig.test.json'), /"lib": \["ES2024", "DOM", "DOM\.Iterable"\]/, 'tests 需要 ES2024 API')
   assert.doesNotMatch(pkg.scripts.build, /(^|&& )vue-tsc --noEmit/, `build 不得跑无 project 的全量检查: ${pkg.scripts.build}`)
 })
 
 test('证书卡：ACME 证书卡接入 configLoaded 双重门控（与 Basic/Caddy 同契约）', () => {
-  const card = source('src/views/settings/FreeCertificates.vue')
+  const card = code('src/views/settings/FreeCertificates.vue')
   assert.match(card, /defineProps<\{ configLoaded: boolean \}>/)
   assert.match(card, /:disabled="isReadOnly \|\| !props\.configLoaded"/)
   const save = section(card, 'const handleSave = async', 'if (isReadOnly.value) return')
   assert.match(save, /!props\.configLoaded/, 'configLoaded 门必须早于常规写守卫')
-  const page = source('src/views/Settings.vue')
+  const page = code('src/views/Settings.vue')
   assert.match(page, /<FreeCertificates[\s\S]*?:config-loaded="configLoaded"/)
 })
 
@@ -310,7 +310,7 @@ test('证书队列非空判据 = 排队 + 进行中 + 等 CA（任何一项 > 0 
 })
 
 test('证书队列横幅接线与 page_size=6', () => {
-  const page = source('src/views/settings/TaskMonitor.vue')
+  const page = code('src/views/settings/TaskMonitor.vue')
   assert.match(page, /certQueueIsBusy\(certQueue\) \? 'primary' : 'success'/)
   assert.match(page, /v-else-if="certQueueHasLive\(certQueue\)"/)
   assert.match(page, /certQueue\.jobs\.slice\(0, CERT_QUEUE_VISIBLE_JOBS\)/)
@@ -320,31 +320,31 @@ test('证书队列横幅接线与 page_size=6', () => {
 })
 
 test('任务监控三份轮询请求缺 data 一律抛 TypeError（进入契约退避）', () => {
-  const page = source('src/views/settings/TaskMonitor.vue')
+  const page = code('src/views/settings/TaskMonitor.vue')
   const tasks = section(page, 'const fetchTasks = async', 'const refreshNow =')
   assert.match(tasks, /if \(!res\.data\) throw new TypeError\('任务列表响应缺少 data'\)/)
   assert.match(tasks, /throw new TypeError\('任务统计响应缺少 data'\)/)
-  const queue = section(page, 'const fetchCertQueue = async', '// ===== 概览统计 =====')
+  const queue = section(page, 'const fetchCertQueue = async', 'const taskFamilyCount = computed')
   assert.match(queue, /if \(!res\.data\) throw new TypeError\('证书队列响应缺少 data'\)/)
   // 必须在自身 catch 中继续向上抛，否则轮询入口永远看不到契约违约
   assert.match(queue, /if \(error instanceof TypeError\) throw error/)
 })
 
 test('任务详情弹框适配窄屏并实时派生（不持打开时快照）', () => {
-  const page = source('src/views/settings/TaskMonitor.vue')
+  const page = code('src/views/settings/TaskMonitor.vue')
   assert.match(page, /<el-dialog v-model="detailVisible" width="min\(720px, 92vw\)"/)
   const block = section(page, 'const detailTask = computed<TaskInfo | null>', 'const history = ref')
   assert.match(block, /tasks\.value\.find\(t => t\.id === id\)/, '详情必须读最新轮询行而非打开时快照')
-  assert.match(section(page, 'const openDetail = async', '// ===== 日志抽屉'), /detailTaskId\.value = row\.id/)
+  assert.match(section(page, 'const openDetail = async', 'const logsVisible = ref'), /detailTaskId\.value = row\.id/)
 })
 
 test('节点审批/拒绝/删除在确认弹框之前取得占位', () => {
-  const block = section(source('src/views/settings/ClusterSettings.vue'), 'const confirmAndRunNodeAction = async', 'const approveNode = (node: ClusterNode)')
+  const block = section(code('src/views/settings/ClusterSettings.vue'), 'const confirmAndRunNodeAction = async', 'const approveNode = (node: ClusterNode)')
   const takePlaceholder = block.indexOf('pendingNodeId.value = node.id')
   const confirm = block.indexOf('confirmAction(')
   assert.ok(takePlaceholder >= 0 && confirm > takePlaceholder, '占位必须先于 confirmAction')
   assert.match(block, /pendingNodeId\.value !== null/, '第二请求必须被显式拒绝而非静默丢弃')
-  const page = source('src/views/settings/ClusterSettings.vue')
+  const page = code('src/views/settings/ClusterSettings.vue')
   // 箭头体必须直接委托 confirmAndRunNodeAction——不要求换行/缩进形态
   // （纯格式化把调用提到 `=>` 同行时不得假红）；中间也不允许夹别的判断。
   for (const name of ['approveNode', 'removeNode']) {
@@ -358,7 +358,7 @@ test('节点审批/拒绝/删除在确认弹框之前取得占位', () => {
 })
 
 test('服务控制/同步/同步设置/清钉同样在确认前占位', () => {
-  const page = source('src/views/settings/ClusterSettings.vue')
+  const page = code('src/views/settings/ClusterSettings.vue')
   const service = section(page, 'const executeServiceControl = async', 'const forgetNodePin = async')
   assert.ok(service.indexOf('serviceControlLoading.value = true') < service.indexOf('confirmAction('), '服务控制占位须先于确认')
   const forgetPin = section(page, 'const forgetNodePin = async', 'const registerToken = ref')
@@ -372,14 +372,14 @@ test('服务控制/同步/同步设置/清钉同样在确认前占位', () => {
 })
 
 test('TLS 文件选择器读完即复位（同路径重选可再次触发 change）', () => {
-  const block = section(source('src/views/settings/BasicSettings.vue'), 'const onTlsFile = async', 'const notifyTlsRestarting')
+  const block = section(code('src/views/settings/BasicSettings.vue'), 'const onTlsFile = async', 'const notifyTlsRestarting')
   const reset = block.indexOf("input.value = ''")
   const firstUse = block.indexOf('adminTlsForm.value.certFile')
   assert.ok(reset >= 0 && reset < firstUse, 'file input 必须在读取后立即复位')
 })
 
 test('/admin-tls 读取失败显性化并提供重试', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   assert.match(page, /const adminTlsLoadFailed = ref\(false\)/)
   const load = section(page, 'const loadAdminTls = async', 'const retryLoadAdminTls')
   assert.match(load, /catch \{\n    adminTlsLoadFailed\.value = true/)
@@ -390,13 +390,13 @@ test('/admin-tls 读取失败显性化并提供重试', () => {
 })
 
 test('兜底提醒不承诺不会发生的自动跳转', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   assert.doesNotMatch(page, /若未自动跳转/)
   assert.match(page, /ElMessage\.warning\(`请手动访问新地址：\$\{target\}`\)/)
 })
 
 test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
-  const basic = source('src/views/settings/BasicSettings.vue')
+  const basic = code('src/views/settings/BasicSettings.vue')
   const checks: Array<[string, string, RegExp]> = [
     ['const saveAutoBackupSettings = async', '\nconst ', /if \(isReadOnly\.value \|\| !autoBackupSectionsValid\.value/],
     ['const restoreAutoBackup = async', '\nconst ', /if \(backupDisabled\.value\) return/],
@@ -406,9 +406,9 @@ test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
   for (const [start, end, pattern] of checks) {
     assert.match(section(basic, start, end), pattern, `${start} 缺函数级写守卫`)
   }
-  const caddy = source('src/views/settings/CaddyGlobalSettings.vue')
+  const caddy = code('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(section(caddy, 'const confirmSaveAsList = async', '\nconst '), /if \(isReadOnly\.value \|\| savingList\.value\) return/)
-  const free = source('src/views/settings/FreeCertificates.vue')
+  const free = code('src/views/settings/FreeCertificates.vue')
   assert.match(section(free, 'const saveCAProvider = async', '\nconst '), /if \(isReadOnly\.value \|\| savingCA\.value\) return/)
   assert.match(section(free, 'const saveConfig = async', '\nconst '), /if \(isReadOnly\.value \|\| savingConfig\.value\) return/)
   assert.match(section(free, 'const deleteConfig = async', '\nconst '), /if \(isReadOnly\.value \|\| savingConfig\.value \|\| deletingId\.value !== null\) return/)
@@ -416,14 +416,14 @@ test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
   assert.match(section(free, 'const testCAProvider = async', '\nconst '), /if \(isReadOnly\.value \|\| isTesting\.value\) return/)
   assert.match(section(free, 'const testConfig = async', '\nconst '), /if \(isReadOnly\.value \|\| isTesting\.value \|\| !config\.id\) return/)
   assert.match(section(basic, 'const openAdminTlsDialog = () => {', '\nconst '), /if \(isReadOnly\.value\) return/)
-  const oidc = source('src/views/settings/OIDCSettings.vue')
+  const oidc = code('src/views/settings/OIDCSettings.vue')
   assert.match(section(oidc, 'const save = async', '\nconst '), /if \(isReadOnly\.value \|\| saving\.value\) return/)
   assert.match(section(oidc, 'const toggleEnabled = async', '\nconst '), /if \(isReadOnly\.value \|\| saving\.value \|\| loadFailed\.value\) return/)
   assert.match(section(oidc, 'const remove = async', '\nconst '), /if \(isReadOnly\.value \|\| saving\.value \|\| loadFailed\.value\) return/)
 })
 
 test('CA 表单不再持有零读取的 credentials / id 副本', () => {
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   const block = section(page, 'const caForm = reactive', 'const caCreds = reactive')
   assert.doesNotMatch(block, /credentials: '\{\}'/, 'caForm 初始值不得再含零读取的 credentials')
   assert.doesNotMatch(block, /\bid: 0,/, 'caForm 初始值不得再含零读取的 id（保存走 editingCAProvider.id）')
@@ -448,16 +448,16 @@ test('DNS 凭证字段可见性按 visible_when 求值，无元数据时恒显�
 })
 
 test('后端下发 visible_when/option_labels，前端不再硬编码 dnspod 字段名', () => {
-  const go = repoSource('internal/services/dnsproviders/dnspod.go')
+  const go = repoCode('internal/services/dnsproviders/dnspod.go')
   const cf = section(go, 'func (d *DNSPod) CredentialFields()', '\nfunc (d *DNSPod) CredentialFieldOptions')
   assert.match(cf, /VisibleWhen: visibleOnly\("dnspod"\)/)
   assert.match(cf, /VisibleWhen: visibleOnly\("tencent_cloud"\)/)
   assert.match(cf, /OptionLabels: map\[string\]string\{"dnspod": "DNSPod API", "tencent_cloud": "腾讯云 API"\}/)
-  const handler = repoSource('internal/handlers/certificates.go')
+  const handler = repoCode('internal/handlers/certificates.go')
   const list = section(handler, 'func (h *Handlers) ListDNSProviders', 'func (h *Handlers) TestCertificateConfig')
   assert.match(list, /field\["visible_when"\] = f\.VisibleWhen/)
   assert.match(list, /field\["option_labels"\] = f\.OptionLabels/)
-  const vue = source('src/views/settings/FreeCertificates.vue')
+  const vue = code('src/views/settings/FreeCertificates.vue')
   assert.match(vue, /credentialFieldVisible\(field, form\.value\.dns_credentials\)/)
   assert.match(vue, /:label="credentialOptionLabel\(field, opt\)"/)
   assert.doesNotMatch(vue, /field\.name === 'auth_mode'\) return true/)
@@ -465,7 +465,7 @@ test('后端下发 visible_when/option_labels，前端不再硬编码 dnspod 字
 })
 
 test('OIDC GET 失败清空为未配置态并禁止保存（不得回填上一轮状态）', () => {
-  const page = source('src/views/settings/OIDCSettings.vue')
+  const page = code('src/views/settings/OIDCSettings.vue')
   const load = section(page, 'const load = async', 'let probeInFlight')
   const catchAt = load.indexOf('} catch {')
   assert.ok(catchAt > 0, 'load 缺 catch 分支')
@@ -480,7 +480,7 @@ test('OIDC GET 失败清空为未配置态并禁止保存（不得回填上一�
 // ── 本批视图接线守卫（数据就绪门 / 请求门 / 单源）──
 
 test('集群模式卡：status 未就绪时写控件 fail-closed（默认值不得覆盖真实配置）', () => {
-  const card = source('src/views/settings/cluster/ClusterModeCard.vue')
+  const card = code('src/views/settings/cluster/ClusterModeCard.vue')
   assert.match(
     card,
     /const intervalDisabled = computed\(\(\) => props\.readOnly \|\| props\.intervalSaving \|\| isSlave\.value \|\| !props\.status\)/,
@@ -492,7 +492,7 @@ test('集群模式卡：status 未就绪时写控件 fail-closed（默认值不�
 })
 
 test('仪表盘：/caddy/status 失败置采集失败并阻断陈旧状态呈现', () => {
-  const page = source('src/views/Dashboard.vue')
+  const page = code('src/views/Dashboard.vue')
   assert.match(page, /const caddyStatusUnavailable = ref\(false\)/)
   const requestBlock = section(page, "request.get('/caddy/status'", ']).then(')
   assert.match(requestBlock, /caddyStatusUnavailable\.value = false/)
@@ -508,12 +508,14 @@ test('仪表盘：/caddy/status 失败置采集失败并阻断陈旧状态呈现
 })
 
 test('设置页：分页初值即由页键派生，且仅消费方分页拉 /config', () => {
-  const page = source('src/views/Settings.vue')
+  const page = code('src/views/Settings.vue')
   assert.match(page, /const activeTab = ref<SettingsTabId>\(settingsTabOfPage\(authStore\.currentPage\) \?\? 'basic'\)/)
-  assert.match(page, /const tabConsumesConfig = \(tab: SettingsTabId\): boolean => tab === 'basic' \|\| tab === 'certificates'/)
-  assert.match(page, /if \(tabConsumesConfig\(activeTab\.value\) && !configLoaded\.value\) void fetchSettings\(\)/, '切回 basic/certificates 须补拉')
+  // 判据单源：横幅与拉取门同用 settingsTabConsumesConfig（本地再写一份会让
+  // 两者在调整「消费 /config」分页时静默分叉）。
+  assert.doesNotMatch(page, /tab === 'basic' \|\| tab === 'certificates'/, '不得在视图内重复枚举消费 /config 的分页')
+  assert.match(page, /if \(settingsTabConsumesConfig\(activeTab\.value\) && !configLoaded\.value\) void fetchSettings\(\)/, '切回 basic/certificates 须补拉')
   const onMounted = section(page, 'onMounted(', '</script>')
-  assert.match(onMounted, /if \(tabConsumesConfig\(activeTab\.value\)\) void fetchSettings\(\)/)
+  assert.match(onMounted, /if \(settingsTabConsumesConfig\(activeTab\.value\)\) void fetchSettings\(\)/)
   assert.doesNotMatch(onMounted, /syncActiveTabFromPage\(\)\s*\n\s*fetchSettings\(\)/, '不得再无条件整取 /config')
 })
 
@@ -529,7 +531,7 @@ test('usePollingErrorState 全部消费点同口径接线（退避门 + 立即�
   ]
   const cache = new Map<string, string>()
   for (const [path, state] of sites) {
-    const text = cache.get(path) ?? source(path)
+    const text = cache.get(path) ?? code(path)
     cache.set(path, text)
     assert.match(text, new RegExp(`const ${state} = usePollingErrorState\\(\\)`), `${path} 缺 ${state} 实例`)
     assert.match(text, new RegExp(`if \\(!${state}\\.canRun\\(\\)\\) return`), `${path} 轮询闭包缺 canRun 退避门`)
@@ -538,7 +540,7 @@ test('usePollingErrorState 全部消费点同口径接线（退避门 + 立即�
 })
 
 test('用户页：OIDC 状态请求与消费面同门（非管理员不发 403 请求）', () => {
-  const page = source('src/views/Users.vue')
+  const page = code('src/views/Users.vue')
   // 角色以 store 为响应式通道（immediate）：fetchUser 瞬时失败时角色先为
   // undefined，一次性 onMounted 判定会永久错过补回窗口。
   const gate = section(page, 'watch(() => authStore.user?.role,', 'onMounted(')
@@ -548,8 +550,8 @@ test('用户页：OIDC 状态请求与消费面同门（非管理员不发 403 �
 })
 
 test('集群同步三分类标签单源（父级确认文案与子级开关行同表）', () => {
-  const master = source('src/views/settings/cluster/ClusterMasterPanel.vue')
-  const settings = source('src/views/settings/ClusterSettings.vue')
+  const master = code('src/views/settings/cluster/ClusterMasterPanel.vue')
+  const settings = code('src/views/settings/ClusterSettings.vue')
   assert.match(master, /import \{ CLUSTER_SYNC_SWITCHES \} from '@\/utils\/clusterSyncSwitches'/)
   assert.match(master, /const syncSwitchItems = CLUSTER_SYNC_SWITCHES/)
   assert.match(settings, /import \{ CLUSTER_SYNC_SWITCHES \} from '@\/utils\/clusterSyncSwitches'/)
@@ -560,7 +562,7 @@ test('集群同步三分类标签单源（父级确认文案与子级开关行�
 })
 
 test('策略向导：阶段覆盖编辑态稀疏持有（不得物化库值 seed）', () => {
-  const page = source('src/views/security/SecurityPolicies.vue')
+  const page = code('src/views/security/SecurityPolicies.vue')
   const watcher = section(page, 'watch([boundRules, allRules], () => {', '}, { immediate: true })')
   assert.match(watcher, /const existing = stageOverrideEdits\.value\[cid\]/)
   assert.match(watcher, /if \(existing\) next\[cid\] = existing/)
@@ -572,7 +574,7 @@ test('策略向导：阶段覆盖编辑态稀疏持有（不得物化库值 seed
 })
 
 test('安全事件：tooltip 死条件删除，crawler 族展示词单源，旧 id 8 中和文案', () => {
-  const page = source('src/views/security/SecurityEvents.vue')
+  const page = code('src/views/security/SecurityEvents.vue')
   const show = section(page, 'const showTriggeredMsg', '\n\n')
   assert.match(show, /!!row\.rule_triggered && !!row\.rule_msg/)
   assert.doesNotMatch(show, /!== '2'|!== '3'|!== '4'|!== '5'|\^949/, '这些排除项永不命中（前两个 el-link 分支已截走）')
@@ -583,7 +585,7 @@ test('安全事件：tooltip 死条件删除，crawler 族展示词单源，旧 
 })
 
 test('OIDC 设置卡：访问白名单字段（email 域 / 用户组）读回显与整表保存', () => {
-  const page = source('src/views/settings/OIDCSettings.vue')
+  const page = code('src/views/settings/OIDCSettings.vue')
   // 解析器已抽到 utils/oidcAllowList（域/组分隔口径不同，行为由 oidcAllowList.spec
   // 覆盖）：SFC 只做接线，不得再内联第二份正则。
   assert.match(page, /from '@\/utils\/oidcAllowList'/)
@@ -608,7 +610,7 @@ test('OIDC 设置卡：访问白名单字段（email 域 / 用户组）读回显
 test('CA 提供商测试成功后刷新列表（陈旧凭证表单不得覆盖刚申请的 EAB）', () => {
   // testCAProvider 会触发 ZeroSSL EAB 自动申请并写库；列表不刷新时后续
   // 「编辑 → 保存」提交的是测试前的空 EAB 快照，会把刚拿到的凭证覆盖为空。
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   const body = section(page, 'const testCAProvider', 'const openConfigDialog')
   const requestAt = body.indexOf('await request.post')
   assert.ok(requestAt > 0, '缺测试请求')

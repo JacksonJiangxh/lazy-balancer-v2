@@ -717,6 +717,13 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 				"db.DefaultHealthCheckHealthyThreshold", "db.DefaultTCPTryInterval",
 			},
 		},
+		{
+			// 任务日志阈值读侧：字面量兜底会让保存的默认值调整后面板阈值、
+			// 真实滚动阈值与导入钳制默认值静默分叉。
+			file:      "../services/tasklog.go",
+			forbidden: []string{`COALESCE(task_log_size_mb, 10)`, "sizeMB = 10", "10 * 1024 * 1024"},
+			required:  []string{"db.DefaultTaskLogSizeMB"},
+		},
 	}
 	for _, tc := range cases {
 		path := filepath.FromSlash(tc.file)

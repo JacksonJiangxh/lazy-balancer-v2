@@ -9,6 +9,18 @@
 export const DEFAULT_CERT_RENEWAL_DAYS = 30
 
 /**
+ * 证书自动重签天数的写侧上界：与后端 services.CertRenewalDaysMax 同值
+ * （90 天规划寿命 − 2 天，见 services/certinfo.go），写侧门/导入钳制/读侧
+ * 生效窗口共用该上限。
+ *
+ * 表单控件必须与写侧门对齐：控件上限窄于写侧门时，API/MCP/导入写入的合法值
+ * 会在管理员点一下 spinner/失焦后被静默夹回控件边界并随保存落库——库值被
+ * 前端无提示改写。产品上「建议 ≤60」只是建议，写在提示文案里，不作硬上限。
+ * 跨栈钉见 configValues.spec。
+ */
+export const CERT_RENEWAL_DAYS_MAX = 88
+
+/**
  * 安全事件保留天数展示值：0=自动（后端内置默认 90 天，见 db.DefaultSecurityEventsRetentionDays），
  * 其余正数原样展示。此前 BasicSettings 内联 `d > 0 ? d : 90` 属第二份实现。
  */

@@ -25,3 +25,20 @@ test('两列都缺失或畸形时返回空串（渲染「-」而非抛错）', (
   // 非法续签天数不得让 new Date(…).toISOString() 抛 RangeError 中断整行渲染
   assert.equal(certJobRenewalAt({ not_after: '2026-12-31T00:00:00Z' }, Number.NaN), '')
 })
+
+// 形状缺口（P3）：两条现状语义必须被显式钉住，否则未来会被当 bug「修复」。
+test('not_after 非空但不可解析时不得回退 expires_at（fail-visible 有意设计）', () => {
+  // `||` 选择：非法非空值会遮蔽合法回退值——这是有意的可见降级（渲染「-」并
+  // 让畸形行暴露），不是缺陷。若改为「回退」，畸形 not_after 会被静默掩盖。
+  const job = { not_after: 'not-a-date', expires_at: '2026-11-20T12:00:00Z' }
+  assert.equal(certJobEffectiveNotAfter(job), 'not-a-date')
+  assert.equal(certJobRenewalAt(job, 10), '', '畸形 not_after 必须 fail-visible（空串→「-」）')
+})
+
+test('续签天数为 0/负数时按字面量计算（调用方负责钳制）', () => {
+  const job = { not_after: '2026-12-31T00:00:00Z' }
+  assert.equal(certJobRenewalAt(job, 0), '2026-12-31T00:00:00.000Z')
+  // 负数会把重签时间推到到期之后（未来），因此调用方（auth store 的
+  // `renewalDays > 0 ? … : DEFAULT`）是唯一防线——本用例把该约束钉成契约。
+  assert.equal(certJobRenewalAt(job, -5), '2027-01-05T00:00:00.000Z')
+})

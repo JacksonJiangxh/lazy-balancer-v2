@@ -20,7 +20,7 @@ func TestJWTAuth_rejects_token_without_expiration(t *testing.T) {
 	// Given
 	cfg, token := newJWTContractFixture(t, jwt.SigningMethodHS256, false)
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -41,7 +41,7 @@ func TestJWTAuth_rejects_non_HS256_HMAC_algorithms(t *testing.T) {
 			// Given
 			cfg, token := newJWTContractFixture(t, method, true)
 			router := gin.New()
-			router.Use(jwtAuth(cfg))
+			router.Use(jwtAuth(db.DB, cfg))
 			router.GET("/protected", noContent)
 			request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 			request.Header.Set("Authorization", "Bearer "+token)
@@ -126,8 +126,7 @@ func newJWTContractFixture(t *testing.T, method jwt.SigningMethod, includeExpira
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (41,'contract-user','hash','user',1,0)"); err != nil {
 		t.Fatal(err)
@@ -181,17 +180,17 @@ func assertSingleSecurityAudit(t *testing.T, recorded []string, reason, credenti
 	}
 }
 
-// 认证审计限流器容量硬上限——1024 清扫阈值
-// 只清 >=2min 陈旧键，洪水期（唯一 reason+path+ip 键高速涌入）全部键新鲜、清扫
-// 零效果，map 曾无界增长（对照 loginRateBuckets 1024 硬拒建桶的真上限）。修复=
-// 清扫后仍达硬上限（4096）则丢弃新键：不进 map 也不记审计（审计丢失可接受，
-// 内存必须有界），与 loginRateBuckets「超限本轮放行不添桶」同族。
+// 认证审计限流器容量硬上限——超过回收阈值后只按批回收 >=2min 的陈旧键，
+// 洪水期（唯一 reason+path+ip 键高速涌入）全部键新鲜、回收零效果，map 曾
+// 无界增长（对照 loginRateBuckets 1024 硬拒建桶的真上限）。修复=回收后仍达
+// 硬上限（4096）则丢弃新键：不进 map 也不记审计（审计丢失可接受，内存必须
+// 有界），与 loginRateBuckets「超限本轮放行不添桶」同族。
 func TestAuthenticationAuditLimiter_floodHardCap(t *testing.T) {
 	// Given：4096 个新鲜唯一键灌满（同分钟窗写入——清扫对新鲜键零效果）
 	securityAuditLimiter.reset()
 	t.Cleanup(securityAuditLimiter.reset)
 	now := time.Now()
-	for i := 0; i < 4096; i++ {
+	for i := range 4096 {
 		if !securityAuditLimiter.allow(fmt.Sprintf("flood-%d", i), now) {
 			t.Fatalf("key %d within hard cap must be admitted", i)
 		}
@@ -227,6 +226,143 @@ func TestAuthenticationAuditLimiter_floodHardCap(t *testing.T) {
 	}
 }
 
+// 超阈值后的回收必须有界：一次 allow 只回收最陈旧的一批键，不得持全局锁
+// 遍历整表（全图扫描在洪水期把锁持有时间与键规模绑死）。
+func TestAuthenticationAuditLimiter_reclaimIsBoundedAndOldestFirst(t *testing.T) {
+	// Given：硬上限灌满（同分钟窗写入）
+	securityAuditLimiter.reset()
+	t.Cleanup(securityAuditLimiter.reset)
+	now := time.Now()
+	for i := range 4096 {
+		if !securityAuditLimiter.allow(fmt.Sprintf("oldest-%d", i), now) {
+			t.Fatalf("key %d within hard cap must be admitted", i)
+		}
+	}
+
+	// When：全部键越过回收线后放行一个新键
+	later := now.Add(3 * time.Minute)
+	if !securityAuditLimiter.allow("newest", later) {
+		t.Fatal("过期的既有键必须腾出容量——新键照常放行")
+	}
+
+	// Then：只回收有界批次——全图清扫会把表清到 1 条。
+	securityAuditLimiter.mu.Lock()
+	size := len(securityAuditLimiter.events)
+	_, hasNewest := securityAuditLimiter.events["newest"]
+	kept := make(map[string]bool, size)
+	for key := range securityAuditLimiter.events {
+		kept[key] = true
+	}
+	securityAuditLimiter.mu.Unlock()
+	if !hasNewest {
+		t.Fatal("新键必须进表")
+	}
+	if size > 4096 {
+		t.Fatalf("events size=%d 超过硬上限 4096", size)
+	}
+	if size < 2048 {
+		t.Fatalf("events size=%d：单次 allow 回收了整表（有界回收应只删一批）", size)
+	}
+
+	// And：回收次序=最早优先——被删的键是 oldest-0 起的连续前缀。
+	reclaimed := 0
+	for i := range 4096 {
+		if kept[fmt.Sprintf("oldest-%d", i)] {
+			break
+		}
+		reclaimed++
+	}
+	if reclaimed == 0 {
+		t.Fatal("过期键必须被回收，否则容量永不释放")
+	}
+	for i := reclaimed; i < 4096; i++ {
+		if !kept[fmt.Sprintf("oldest-%d", i)] {
+			t.Fatalf("oldest-%d 被回收却在 oldest-%d 之后——回收次序必须最早优先", i, reclaimed-1)
+		}
+	}
+	if reclaimed != 4097-size {
+		t.Fatalf("reclaimed=%d size=%d，账不符（有界回收只能删最陈旧前缀）", reclaimed, size)
+	}
+
+	// And：多次调用单调推进——阈值以上每次只推一批（新键数 ≤ 回收数），
+	// 越过阈值后不再回收（低于阈值不做无用工作），但始终不越硬上限。
+	previous := size
+	for i := range 64 {
+		if !securityAuditLimiter.allow(fmt.Sprintf("probe-%d", i), later) {
+			t.Fatalf("probe-%d 必须放行（回收持续腾位）", i)
+		}
+		securityAuditLimiter.mu.Lock()
+		current := len(securityAuditLimiter.events)
+		securityAuditLimiter.mu.Unlock()
+		if current > 4096 {
+			t.Fatalf("probe-%d 后 events size=%d 超过硬上限", i, current)
+		}
+		if previous > authenticationAuditReclaimThreshold && current > previous {
+			t.Fatalf("probe-%d 后 events size=%d > 前值 %d（阈值以上每次调用必须净回收）", i, current, previous)
+		}
+		previous = current
+	}
+}
+
+// 刷新过的键不得因队列里残留的首次登记时间被回收——去重窗内二次记审计是回归。
+func TestAuthenticationAuditLimiter_refreshedKeySurvivesReclaim(t *testing.T) {
+	securityAuditLimiter.reset()
+	t.Cleanup(securityAuditLimiter.reset)
+	now := time.Now()
+	for i := range 4096 {
+		if !securityAuditLimiter.allow(fmt.Sprintf("oldest-%d", i), now) {
+			t.Fatalf("key %d within hard cap must be admitted", i)
+		}
+	}
+	// 越过 1min 去重窗后刷新队头键
+	if !securityAuditLimiter.allow("oldest-0", now.Add(61*time.Second)) {
+		t.Fatal("越过去重窗的既有键必须放行（刷新不占新键额）")
+	}
+
+	// When：推进足够多轮回收（队头条目被反复取出）
+	later := now.Add(3 * time.Minute)
+	for i := range 128 {
+		if !securityAuditLimiter.allow(fmt.Sprintf("probe-%d", i), later) {
+			t.Fatalf("probe-%d 必须放行", i)
+		}
+	}
+
+	// Then：刷新过的键仍在表内，且仍在去重窗内继续抑制重复审计。
+	securityAuditLimiter.mu.Lock()
+	_, live := securityAuditLimiter.events["oldest-0"]
+	securityAuditLimiter.mu.Unlock()
+	if !live {
+		t.Fatal("刷新过的键被陈旧队列条目误回收")
+	}
+	// 刷新发生在 now+61s：回到去重窗内（+30s）必须仍抑制。
+	if securityAuditLimiter.allow("oldest-0", now.Add(91*time.Second)) {
+		t.Fatal("刷新后的键仍在 1min 去重窗内，必须继续抑制")
+	}
+}
+
+// 回收队列自身有界：洪水 + 反复刷新不得让内部队列无界增长。
+func TestAuthenticationAuditLimiter_reclaimQueueStaysBounded(t *testing.T) {
+	securityAuditLimiter.reset()
+	t.Cleanup(securityAuditLimiter.reset)
+	now := time.Now()
+	for round := 0; round < 3; round++ {
+		base := now.Add(time.Duration(round) * 3 * time.Minute)
+		for i := range 4096 {
+			securityAuditLimiter.allow(fmt.Sprintf("round-%d-key-%d", round, i), base)
+		}
+		securityAuditLimiter.mu.Lock()
+		queue := securityAuditLimiter.reclaimQueueLenLocked()
+		events := len(securityAuditLimiter.events)
+		securityAuditLimiter.mu.Unlock()
+		if queue > 4096 {
+			t.Fatalf("round %d reclaim queue=%d 超过硬上限（队列必须与表规模同阶）", round, queue)
+		}
+		if queue > events+64 {
+			t.Fatalf("round %d reclaim queue=%d 远大于表内键数 %d", round, queue, events)
+		}
+	}
+}
+
 // 认证态每请求回读 DB——禁用立即 401、角色取自 DB 而非
 // token claim（旧令牌提升权限必须失效）。
 func TestJWTAuth_disabledUserRejectedImmediately(t *testing.T) {
@@ -235,7 +371,7 @@ func TestJWTAuth_disabledUserRejectedImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -257,7 +393,7 @@ func TestJWTAuth_roleFromDBOverridesClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	admin := router.Group("/admin", adminOnly())
 	admin.GET("/ping", noContent)
 	req := httptest.NewRequest(http.MethodGet, "/admin/ping", nil)

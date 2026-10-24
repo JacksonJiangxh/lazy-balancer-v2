@@ -45,7 +45,7 @@ func TestUpdateCertificateConfig_validatesEffectiveCredentials(t *testing.T) {
 	tests := []struct {
 		name, path, body string
 	}{
-		{name: "credentials only", path: "/certificate-configs/1", body: `{"dns_credentials":{"auth_mode":"dnspod","app_id":"new-id"}}`},
+		{name: "credentials only", path: "/certificate-configs/1", body: `{"dns_credentials":{"auth_mode":"dnspod","app_id":"new-id","app_token":""}}`},
 		{name: "provider only", path: "/certificate-configs/2", body: `{"dns_provider":"dnspod"}`},
 	}
 	for _, tt := range tests {

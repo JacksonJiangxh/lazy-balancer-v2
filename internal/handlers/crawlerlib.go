@@ -1,11 +1,8 @@
 package handlers
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -60,6 +57,9 @@ func (h *Handlers) GetCrawlerLib(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
 			return
 		}
+		// 活动态只属执行进程：从节点不运行该任务，行内「更新中」是主端镜像
+		// 或降级残留，读侧投影为 failed（展示层口径，不写库）。
+		s.UpdateStatus, s.Message = services.ProjectActiveUpdateStatusForLocalRole(s.UpdateStatus, s.Message)
 		sources = append(sources, s)
 		total += s.EntryCount
 	}
@@ -164,77 +164,19 @@ func (h *Handlers) GetCrawlerLibUpdateStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: data})
 }
 
-// UpdateCrawlerLibFlags 更新爬虫源开关（update_enabled 单字段，同 UpdateThreatSourceFlags）。
+// UpdateCrawlerLibFlags 更新爬虫源开关（update_enabled 单字段）。状态机与
+// 威胁库 UpdateThreatSourceFlags 单源收敛在 updateLibSourceFlags，差异面只有
+// 表名/文案/首槽武装/错误装配。
 func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
-	// security_crawler_sources 在导入全量替代表清单内：窗口内写会被静默
-	// 覆盖或撞写锁 500——与威胁库 UpdateThreatSourceFlags 同口径 409
-	// fast-fail，先于 body 解析。
-	if rejectWriteDuringImport(c, "修改爬虫地址库设置（配置导入进行中）") {
-		return
-	}
-	if !guardConfiguredJSONBody(c) {
-		return
-	}
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的源 ID"})
-		return
-	}
-	var body struct {
-		UpdateEnabled *bool `json:"update_enabled"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
-		return
-	}
-	if body.UpdateEnabled == nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无可更新字段"})
-		return
-	}
-	if !requireMasterNode(c) {
-		return
-	}
-	var name string
-	var wasEnabled int
-	if err := db.DB.QueryRow(`SELECT name, COALESCE(update_enabled,0) FROM security_crawler_sources WHERE id=?`, id).Scan(&name, &wasEnabled); err != nil {
-		// 与威胁库同款三分支——缺行=404，其余 DB 故障=500
-		// （此前一律 404，可重试故障被误报「爬虫源不存在」）。
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "爬虫源不存在"})
-		} else {
-			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
-		}
-		return
-	}
-	if *body.UpdateEnabled {
-		// 与威胁库 UpdateThreatSourceFlags 同口径状态机：仅「由关闭转为启用」
-		// 时清失败态（idle+空文案+计数清零）；已启用源重复提交不改运行态
-		// （此前恒清 message，留下 failed+空失败文案形态）。
-		query := `UPDATE security_crawler_sources SET update_enabled=1, updated_at=datetime('now') WHERE id=?`
-		if wasEnabled == 0 {
-			query = `UPDATE security_crawler_sources SET update_enabled=1, update_status='idle', message='', consecutive_failures=0, updated_at=datetime('now') WHERE id=?`
-		}
-		if _, err := db.DB.Exec(query, id); err != nil {
-			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("更新失败", err))
-			return
-		}
-	} else {
-		// 关闭即退出更新任务：清掉关闭前的瞬时失败态与排程槽，否则列表/库头
-		// 继续显示「更新失败」，重新启用还会因残留未来槽无法武装首槽。
-		// consecutive_failures 同步清零（与威胁库同口径，经集群快照在节点间
-		// 复制的失败计数不得跨禁用期陈旧）。
-		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`, id); err != nil {
-			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("更新失败", err))
-			return
-		}
-	}
-	// 单源启用即武装首槽（威胁库 UpdateThreatSourceFlags 同构）——
-	// 总闸已开且无任何启用源持 next_update 时，仅改开关会让排程槽恒空。
-	if *body.UpdateEnabled {
-		services.ArmCrawlerFirstSlots()
-	}
-	recordAudit(c, "更新", "爬虫地址库", fmt.Sprintf("%s 更新开关：%s", name, enabledStateLabel(*body.UpdateEnabled)))
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
+	updateLibSourceFlags(c, libSourceFlagsSpec{
+		Table:         "security_crawler_sources",
+		Family:        "爬虫地址库",
+		NotFoundMsg:   "爬虫源不存在",
+		ReadErrMsg:    "读取爬虫源失败",
+		UpdateErrMsg:  "更新失败",
+		ArmFirstSlots: services.ArmCrawlerFirstSlots,
+		InternalError: crawlerLibInternalError,
+	})
 }
 
 // GetCrawlerLibUpdateLogs 爬虫更新任务日志（tasks/crawlerbot-update.log 尾读，含轮转副本）。

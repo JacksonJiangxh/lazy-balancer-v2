@@ -124,7 +124,12 @@ const (
 	DefaultScheduleDays = "1,2,3,4,5,6,7"
 	DefaultScheduleTime = "04:00"
 	// 日志体量/保留期治理默认：fresh DDL DEFAULT、迁移补列与读侧 COALESCE
-	// 绑定参数同源（config_changes 预览快照与 caddy 设置读路径共用）。
+	// 绑定参数同源。已绑定：config_changes 预览快照、services 任务日志阈值
+	// （getTaskLogSizeBytes）。其余读点（handlers 的 caddy/logstats/
+	// config_backup、services 的 logrotate/auditlog/auditlog_rotation/
+	// cluster_snapshot）尚未绑定本组常量——调整默认值时须一并收敛，不得据本
+	// 注释假设其与常量同步（字面量漂移由 db_truth_defaults 的 AST 门逐个登记
+	// 看守，登记即生效）。
 	DefaultTaskLogSizeMB        = 10
 	DefaultAuditLogSizeMB       = 10
 	DefaultRuntimeLogSizeMB     = 100
@@ -174,6 +179,18 @@ func certJobStatusCheckSQL() string {
 const TaskRunsLatestPerTaskQuery = `SELECT id, task_id, family, trigger, COALESCE(operator,''), status, started_at,
 			COALESCE(finished_at,''), COALESCE(duration_ms,0), COALESCE(message,'')
 			FROM task_runs WHERE id IN (SELECT MAX(id) FROM task_runs GROUP BY task_id)`
+
+// CertJobsMonitorRowsQuery 是任务监控「证书任务动态行」查询的唯一事实源：
+// 生产消费方 = services.collectCertJobRows（任务列表 5s 轮询）。常量落在 db
+// 包是因为排序键的服务对象 idx_cert_jobs_updated_fallback 索引 DDL 与 EXPLAIN
+// 计划钉测同包（db 不可 import services：反向会成环），与
+// TaskRunsLatestPerTaskQuery 同形——查询重构不再假红，表达式漂移仍由计划
+// 钉测拦截。排序键必须与索引表达式逐字一致（COALESCE(updated_at,created_at)
+// DESC）：updated_at 为 NULL 的行走 created_at 回落，改口径即改变展示顺序。
+const CertJobsMonitorRowsQuery = `SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(created_at,''), COALESCE(updated_at,created_at)
+		FROM cert_jobs
+		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
+		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT ?`
 
 func CanonicalDomains(value string) (string, error) {
 	seen := make(map[string]struct{})
@@ -1645,6 +1662,13 @@ func runMigrations() error {
 	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_cert_jobs_rule_updated_id_expires ON cert_jobs(rule_id, updated_at DESC, id DESC, expires_at)"); err != nil {
 		return fmt.Errorf("failed to index cluster certificate selection: %w", err)
 	}
+	// 任务监控的证书任务动态行按 COALESCE(updated_at,created_at) DESC 取前
+	// 101 行（5s 轮询）：表达式排序键无法命中任一列索引，cert_jobs 行数随着
+	// 规则×域名增长后每轮都要物化 + 全排序。表达式索引让该查询直接按序扫描
+	// （查询单源 db.CertJobsMonitorRowsQuery，计划钉测看守表达式一致）。
+	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_cert_jobs_updated_fallback ON cert_jobs(COALESCE(updated_at,created_at) DESC)"); err != nil {
+		return fmt.Errorf("failed to index cert_jobs updated_at fallback ordering: %w", err)
+	}
 
 	// Normalize ca_available_after to SQLite canonical UTC datetime format.
 	// Older rows may contain Go time.Time strings like
@@ -1985,6 +2009,11 @@ func runMigrations() error {
 	// 统一」）：TCP 死值清零（bump cluster_version 触发从端下轮收敛）+ 时间戳
 	// 格式归一（RFC3339/+00:00/平面 三态并存 → SQLite 平面 UTC）。
 	if err := migrateTCPRuleDeadFields(); err != nil {
+		return err
+	}
+	// HTTP 规则跨模式 TLS 残留（升级前遗留行；与保存族/导入/传输归一同一
+	// 不变量，bump cluster_version 触发从端下轮收敛）。
+	if err := migrateRuleTLSModeResidue(); err != nil {
 		return err
 	}
 	// 旧版本 HTTP→TCP 切换前遗留的惰性策略绑定。
@@ -3855,6 +3884,14 @@ func nodesRebuildCopySQL(target string) string {
 		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;`
 }
 
+// oidcIdentityIndexScans / Skips 启动期查重路径的观测计数：Scans=真正执行了
+// users 全表 GROUP BY 查重的次数，Skips=命中 sqlite_master 唯一索引直接跳过的
+// 次数（每次重启 +1）。仅测试消费（与 securityEventsTransactionIndex* 同形）。
+var (
+	oidcIdentityIndexScans atomic.Int64
+	oidcIdentityIndexSkips atomic.Int64
+)
+
 // migrateOidcIdentityUniqueIndex：OIDC 身份三元组唯一
 // 索引——JIT 开户在并发回调窗口（双请求同走 no-rows 分支）下可产生重复
 // (oidc_issuer, oidc_subject) 行，命中 SELECT 无 ORDER BY 时取行不确定，会话
@@ -3863,6 +3900,21 @@ func nodesRebuildCopySQL(target string) string {
 // 重复身份则跳过建索引并告警（绝不因历史脏数据拖垮启动；重复行需人工合并/
 // 清理后重启自动建索引）。幂等：IF NOT EXISTS，重跑零开销。
 func migrateOidcIdentityUniqueIndex() error {
+	// 先探测唯一索引是否在位：唯一部分索引一旦建立，其约束域
+	// （auth_provider='oidc' AND oidc_subject<>''）内不可能存在重复身份
+	// （写入侧即被拒绝），全表 GROUP BY 查重没有任何可发现对象——直接跳过
+	// （与 ensureSecurityEventsTransactionIndex / migrateSystemIPListUniqueIndex
+	// 同款探测门）。存量库（索引缺失）才进入查重+建索引路径。历史重复身份库
+	// 每次启动重复告警的噪声也随之一并消除。
+	var indexSQL sql.NullString
+	if err := DB.QueryRow(`SELECT sql FROM sqlite_master WHERE type='index' AND name='u_oidc_identity'`).Scan(&indexSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect u_oidc_identity index: %w", err)
+	}
+	if indexSQL.Valid && strings.Contains(strings.ToUpper(indexSQL.String), "UNIQUE") {
+		oidcIdentityIndexSkips.Add(1)
+		return nil
+	}
+	oidcIdentityIndexScans.Add(1)
 	rows, err := DB.Query(`SELECT oidc_issuer, oidc_subject, COUNT(*) FROM users
 		WHERE auth_provider='oidc' AND oidc_subject<>'' GROUP BY oidc_issuer, oidc_subject HAVING COUNT(*)>1`)
 	if err != nil {
@@ -4612,6 +4664,13 @@ const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 // 导入归一共用）。
 const TCPRulePathRulesResetSQL = `DELETE FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
 
+// TCPRuleUpstreamOriginResetSQL：TCP 规则上游回源域名残留清零——origin_domain
+// 只有 HTTP 回源消费（buildTCPProxyRoute 零读取），保存族自该字段引入起即拒绝
+// TCP 携带，故存储侧残留只可能来自直改库/外来写入/旧实现。残留行会随 rules 节
+// 同步到从端，并让系统自身导出的备份在导入校验被整包 400 拒绝（备份自毒）。
+const TCPRuleUpstreamOriginResetSQL = `UPDATE upstreams SET origin_domain=''
+	WHERE COALESCE(origin_domain,'')<>'' AND rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
+
 // tcpDeadFieldsProbeSQL 死值探测（与下方 UPDATE 同谓词 + TCP 孤儿路径规则）：
 // 无命中时零写事务、零版本扰动。谓词必须与 UPDATE WHERE 逐字对齐（改一侧
 // 必改另一侧）。
@@ -4630,7 +4689,8 @@ const tcpDeadFieldsProbeSQL = `SELECT
 			OR COALESCE(block_page_stage3_id,0)<>0 OR COALESCE(block_page_stage3_status,0)<>0
 			OR COALESCE(log_enabled,0)<>0
 		))
-		+ (SELECT COUNT(*) FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp'))`
+		+ (SELECT COUNT(*) FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp'))
+		+ (SELECT COUNT(*) FROM upstreams WHERE COALESCE(origin_domain,'')<>'' AND rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp'))`
 
 func migrateTCPRuleDeadFields() error {
 	// 清零与 cluster_version bump 必须同事务。此前两条
@@ -4646,7 +4706,7 @@ func migrateTCPRuleDeadFields() error {
 	if stale == 0 {
 		return nil
 	}
-	var affected, removedPathRules int64
+	var affected, removedPathRules, clearedOrigins int64
 	if err := withWriteTx("TCP dead-field cleanup", func(tx *sql.Tx) error {
 		res, err := tx.Exec(TCPRuleDeadFieldsResetSQL)
 		if err != nil {
@@ -4668,7 +4728,17 @@ func migrateTCPRuleDeadFields() error {
 		if err != nil {
 			return fmt.Errorf("failed to read deleted TCP path rule count: %w", err)
 		}
-		if affected > 0 || removedPathRules > 0 {
+		// TCP 上游回源域名残留同批清零（origin_domain 仅 HTTP 消费；残留会
+		// 随快照同步到从端并让自身备份在导入校验被整包拒绝）。
+		originRes, err := tx.Exec(TCPRuleUpstreamOriginResetSQL)
+		if err != nil {
+			return fmt.Errorf("failed to zero TCP upstream origin domain: %w", err)
+		}
+		clearedOrigins, err = originRes.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to read cleared TCP upstream origin count: %w", err)
+		}
+		if affected > 0 || removedPathRules > 0 || clearedOrigins > 0 {
 			// 快照缓存随版本失效；bump 让从端下一轮拉到归一后 canonical，
 			// rules 节哈希两侧收敛（「分区滞后」自愈）。
 			if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
@@ -4679,12 +4749,70 @@ func migrateTCPRuleDeadFields() error {
 	}); err != nil {
 		return err
 	}
-	if affected > 0 || removedPathRules > 0 {
+	if affected > 0 || removedPathRules > 0 || clearedOrigins > 0 {
 		// 用户规则数据被改写须留痕（与 TCP stale DNS / legacy HTTPS /
 		// 孤儿 upstream 三个姊妹迁移同口径，聚合一行+计数）。
-		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（含路径规则 %d 条；主端库/导出 canonical/从端落库三面同值）", affected, removedPathRules)
+		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（含路径规则 %d 条、上游回源域名 %d 条；主端库/导出 canonical/从端落库三面同值）", affected, removedPathRules, clearedOrigins)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}
+	return nil
+}
+
+// ruleTLSModeResidueProbeSQL：HTTP 规则跨模式 TLS 残留探测（无命中时零写
+// 事务、零版本扰动）。三条谓词与下方复位 SQL、保存族（Create/Update/
+// Duplicate）及导入后置归一逐字对齐。
+const ruleTLSModeResidueProbeSQL = `SELECT
+	(SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''))
+	+ (SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(ca_provider_id,0)<>0)
+	+ (SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')='manual' AND COALESCE(acme_config_id,0)<>0)`
+
+// ruleTLSModeResidueResetSQLs 跨模式 TLS 残留复位（顺序无关、幂等）：
+// 非 manual 源不保留证书材料（私钥正文随导出/备份/快照放大）；非 acme_dns
+// 源不保留 CA 提供商引用（ResolveCAProviderID 对非 0 不校验存在性，残留死
+// 引用签发期才暴露）；manual 源不保留 ACME 配置引用。三种残留渲染零消费，
+// 但会让同一终态在「主端库 / 导出 canonical / 从端落库」呈现两种形态。
+var ruleTLSModeResidueResetSQLs = []string{
+	`UPDATE lb_rules SET tls_cert='', tls_key='' WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>'')`,
+	`UPDATE lb_rules SET ca_provider_id=0 WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(ca_provider_id,0)<>0`,
+	`UPDATE lb_rules SET acme_config_id=0 WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')='manual' AND COALESCE(acme_config_id,0)<>0`,
+}
+
+// migrateRuleTLSModeResidue：HTTP 规则跨模式 TLS 残留清零（存储侧自愈）。
+// 保存族自跨模式归一引入起即清理，但升级前遗留行此前只有再编辑/导入才会
+// 自愈——本迁移与 TCP 死字段迁移同口径（探测→单事务→bump 一次）。
+func migrateRuleTLSModeResidue() error {
+	var stale int
+	if err := DB.QueryRow(ruleTLSModeResidueProbeSQL).Scan(&stale); err != nil {
+		return fmt.Errorf("failed to inspect rule TLS cross-mode residue: %w", err)
+	}
+	if stale == 0 {
+		return nil
+	}
+	if err := withWriteTx("rule TLS cross-mode residue cleanup", func(tx *sql.Tx) error {
+		var changed int64
+		for _, statement := range ruleTLSModeResidueResetSQLs {
+			res, err := tx.Exec(statement)
+			if err != nil {
+				return fmt.Errorf("failed to zero rule TLS cross-mode residue: %w", err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("failed to read zeroed rule TLS residue count: %w", err)
+			}
+			changed += affected
+		}
+		if changed > 0 {
+			if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
+				return fmt.Errorf("failed to bump cluster_version after rule TLS residue cleanup: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	detail := fmt.Sprintf("存量规则跨模式 TLS 残留已清零：%d 处（非 manual 源不保留证书材料、非 acme_dns 源不保留 CA 引用、manual 源不保留 ACME 配置引用）", stale)
+	log.Print(detail)
+	recordSystemAudit("启动迁移", "系统配置", detail)
 	return nil
 }

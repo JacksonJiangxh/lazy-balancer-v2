@@ -90,6 +90,13 @@ func respondTaskEngineUnavailable(c *gin.Context) {
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
 }
 
+// respondTaskEngineStopped 引擎已停止（关停窗口/测试装配/嵌入形态）时的统一
+// 响应：调度写端点在已停引擎上调用 StartLoop/StopLoop 均为 no-op，回 200 与
+// 「已恢复/已停止」文案是假信号（只有偏好落库、下次启动才生效）。
+func respondTaskEngineStopped(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎已停止，调度操作未生效"})
+}
+
 // TriggerSystemTask 手动触发（admin；仅排程/队列类任务族）。
 func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	id := c.Param("id")
@@ -163,6 +170,12 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 		return
 	}
 	if te := services.TaskEngine(); te != nil {
+		// 已停止引擎：StartLoop/StopLoop 恒 no-op，200「已恢复/已停止」与
+		// 审计留痕都是假信号（只有偏好落库，下次启动才生效）——统一 503。
+		if te.IsStopped() {
+			respondTaskEngineStopped(c)
+			return
+		}
 		if m, ok := te.Lookup(id); ok {
 			if m.Kind == taskengine.KindOneshot {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "触发类任务不可调度——仅手动/代码触发执行"})
@@ -255,6 +268,12 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		respondTaskEngineUnavailable(c)
 		return
 	}
+	// 已停止引擎：Start/Stop/Restart 全是 no-op——200「已启动/已重启」是假
+	// 信号，统一 503（与 toggle 同口径）。
+	if te.IsStopped() {
+		respondTaskEngineStopped(c)
+		return
+	}
 	m, ok := te.Lookup(id)
 	if !ok {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
@@ -309,6 +328,8 @@ func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
 			return
 		}
+		// 残留 running 行归一在引擎 History/LatestRun 内完成（与列表同一判定
+		// 与文案）——列表把该行呈现为失败/已中断，历史不得仍称「运行中」。
 		runs := te.History(id, limit)
 		if runs == nil {
 			runs = []taskengine.RunRecord{}

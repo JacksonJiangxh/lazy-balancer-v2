@@ -55,7 +55,7 @@ func TestAPIKeyAuthBindsOwningUser(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(apiKeyAuth(&config.Config{}))
+	router.Use(apiKeyAuth(db.DB))
 	router.GET("/probe", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"user_id":             c.GetInt("user_id"),
@@ -142,13 +142,13 @@ func TestJWTAuthQueriesAuthenticationStateOnce(t *testing.T) {
 	}
 	oldQuery := jwtAuthenticationQuery
 	queryCount := 0
-	jwtAuthenticationQuery = func(query string, args ...any) *sql.Row {
+	jwtAuthenticationQuery = func(database *sql.DB, query string, args ...any) *sql.Row {
 		queryCount++
 		return database.QueryRow(query, args...)
 	}
 	t.Cleanup(func() { jwtAuthenticationQuery = oldQuery })
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
 	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -197,7 +197,7 @@ func TestJWTAuthReportsRevokedBeforeMissingUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
 	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -266,7 +266,7 @@ func TestAPIKeyAuthAppliesIPWhitelistToRESTRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(apiKeyAuth(&config.Config{}))
+	router.Use(apiKeyAuth(db.DB))
 	router.GET("/api/v1/rules", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	request := func(remoteAddr string) *httptest.ResponseRecorder {
@@ -319,7 +319,7 @@ func TestJWTAuthAllowsValidJWTWithInvalidAPIKeyHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(apiKeyAuth(cfg), jwtAuth(cfg))
+	router.Use(apiKeyAuth(db.DB), jwtAuth(db.DB, cfg))
 	router.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
 	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -361,7 +361,7 @@ func TestAPIKeyAuthRejectsDisabledKey(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(apiKeyAuth(&config.Config{}))
+	router.Use(apiKeyAuth(db.DB))
 	router.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
 	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
 	req.Header.Set("Authorization", "Bearer "+plain)

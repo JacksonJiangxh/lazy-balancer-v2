@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+
+	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // importValidationDeps 备份校验链的外部依赖。
@@ -39,6 +43,12 @@ type importValidationResult struct {
 	ACMEDanglingImported    int
 	CertJobProviderWarnings []string
 	AutobanClampNotes       []string
+	// ConfigClampNotes 全局配置数值归一事实（越界/非法形态被钳制的键）——
+	// 链内唯一归一点，预览与导入共用，双路径可见。
+	ConfigClampNotes []string
+	// CertJobDanglingWarnings 证书任务 CA 提供商悬挂/禁用的两档告警——链内
+	// 单源产出，预览直接透传（导入在锁内以事务视图重算同一判据，文案共用）。
+	CertJobDanglingWarnings []string
 	WAFMetadataSkipped      bool
 	WAFCRSMetadataSkipped   bool
 	WAFXdbMetadataSkipped   bool
@@ -92,8 +102,10 @@ var importValidationSteps = []importValidationStep{
 	{"安全策略校验", (*importValidationChain).validateSecurityPolicies},
 	{"TLS 形态校验", (*importValidationChain).validateTLSShape},
 	{"证书任务不变量", (*importValidationChain).validateCertJobs},
+	{"证书任务提供商悬挂", (*importValidationChain).validateCertJobProviderDangling},
 	{"管理端 TLS 门", (*importValidationChain).validateAdminTLS},
 	{"自动封禁配置门", (*importValidationChain).validateAutobanConfig},
+	{"全局配置数值归一", (*importValidationChain).normalizeGlobalConfigNumbers},
 	{"受信代理配置门", (*importValidationChain).validateTrustedProxyConfig},
 	{"运行期设置门", (*importValidationChain).validateRuntimeSettings},
 	{"自动备份设置门", (*importValidationChain).validateAutoBackupConfig},
@@ -300,6 +312,25 @@ func (ch *importValidationChain) validateCertJobs() error {
 	return nil
 }
 
+// validateCertJobProviderDangling 证书任务 CA 提供商悬挂预检（链内单源）：
+// 「系统数据」替换 CA 提供商/证书配置而证书任务未随包时，live 任务行的显式
+// 提供商引用可能已禁用（真实失败面）或整行缺失（回落自愈）。两档语义必须
+// 分开计数与措辞，混为「续签将失败」对缺失子集是过度断言。只告警不阻断
+// （「缺席=保留本地」语义不变）；统计失败同样只作告警（纯可观测性）。
+func (ch *importValidationChain) validateCertJobProviderDangling() error {
+	if ch.deps.DB == nil {
+		return nil
+	}
+	disabled, missing, err := certJobProviderDanglingCounts(ch.ctx, ch.deps.DB, ch.backup.Tables, ch.result.SectionTables)
+	if err != nil {
+		services.Logf("warn", "配置预览/导入：证书任务 CA 提供商悬挂统计失败: %v", err)
+		ch.result.CertJobDanglingWarnings = append(ch.result.CertJobDanglingWarnings, "证书任务 CA 提供商悬挂统计未完成（读取失败）："+err.Error())
+		return nil
+	}
+	ch.result.CertJobDanglingWarnings = certJobProviderDanglingWarnings(disabled, missing)
+	return nil
+}
+
 func (ch *importValidationChain) validateAdminTLS() error {
 	// 坏配置会使下次启动进程退出（崩溃循环），整包拒绝保持零写入语义。
 	return validateV2BackupAdminTLS(ch.backup.Config)
@@ -311,6 +342,29 @@ func (ch *importValidationChain) validateAutobanConfig() error {
 		return err
 	}
 	ch.result.AutobanClampNotes = notes
+	return nil
+}
+
+// normalizeGlobalConfigNumbers 全局配置数值归一（链内唯一归一点）。
+// 此前钳制在导入 core 内链外执行：预览对同一份备份返回 valid 且无警告，导入
+// 后值却被静默改写（预览「可提交」在值域层面不成立）。搬进链后两条路径共用
+// 同一实现与同一组文案，预览 warnings 与导入审计/响应自然同源。
+func (ch *importValidationChain) normalizeGlobalConfigNumbers() error {
+	notes := clampBackupConfigInts(ch.backup.Config)
+	// request_body_max_size_mb 专用归一带值回显（与写侧三处同边界：非法/
+	// <=0 归治理默认 128，上界 4096）。该列为唯一「非法形态」也须点名的
+	// 键——整型钳制表对其只有上界，无法表达 fallback 语义。
+	if value, exists := ch.backup.Config["request_body_max_size_mb"]; exists {
+		normalized := normalizeBackupRequestBodyMB(value, 1, db.DefaultRequestBodyMaxSizeMB)
+		n, integerShape := backupInteger(value)
+		ch.backup.Config["request_body_max_size_mb"] = normalized
+		if !integerShape {
+			notes = append(notes, fmt.Sprintf("request_body_max_size_mb 非法形态（%v），已归一为 %d", value, normalized))
+		} else if n <= 0 || n > 4096 {
+			notes = append(notes, fmt.Sprintf("request_body_max_size_mb 越界（%d），已钳位为 %d", n, normalized))
+		}
+	}
+	ch.result.ConfigClampNotes = notes
 	return nil
 }
 

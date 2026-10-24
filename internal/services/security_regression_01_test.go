@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -340,5 +341,41 @@ func TestNormalizeLegacySecurityPolicyEnums_backfillsInvalidBlockStatusCode(t *t
 	}
 	if got := readStatus("unset-zero"); got != 0 {
 		t.Fatalf("unset-zero block_status_code=%d, want 0（类型②省略型合法值不受影响）", got)
+	}
+}
+
+// 归一是保护语义变更（mode 非法→off 停发该策略全部规则），必须可选
+// 定位到策略：逐字段 warn 留痕（策略名/字段/旧值→新值），并对 mode 收窄方向
+// 额外落系统审计。旧实现只报总条数，运维无从判断哪条策略被停发。
+func TestNormalizeLegacySecurityPolicyEnums_leavesPerPolicyTrace(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	insertLegacyPolicyRow(t, "legacy-blocking-typo", "BLOCKING", "deny", "deny")
+	insertLegacyPolicyRow(t, "legacy-acl-empty", "blocking", "", "deny")
+	buf := captureLogf(t)
+
+	NormalizeLegacySecurityPolicyEnums(context.Background())
+
+	logText := buf.String()
+	if !strings.Contains(logText, "legacy-blocking-typo") || !strings.Contains(logText, `"BLOCKING" 归一为 "off"`) {
+		t.Fatalf("日志缺少策略名与旧值→新值: %s", logText)
+	}
+	if !strings.Contains(logText, "legacy-acl-empty") || !strings.Contains(logText, `ip_acl_mode 由 "" 归一为 "deny"`) {
+		t.Fatalf("日志缺少 ip_acl_mode 变更: %s", logText)
+	}
+	// mode 收窄（BLOCKING→off = 规则停止发射）必须写系统审计。
+	var auditCount int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='修改状态' AND detail LIKE '%legacy-blocking-typo%'`).Scan(&auditCount); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("mode 收窄审计行=%d, want 1", auditCount)
+	}
+	// ip_acl_mode 的归一方向是「开始拦截」而非停发规则，不写 mode 收窄审计。
+	var aclAudit int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='修改状态' AND detail LIKE '%legacy-acl-empty%'`).Scan(&aclAudit); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if aclAudit != 0 {
+		t.Fatalf("ip_acl_mode 归一不应写 mode 收窄审计: %d", aclAudit)
 	}
 }

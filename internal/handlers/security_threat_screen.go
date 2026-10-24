@@ -224,6 +224,15 @@ var threatRollupEnsureMu sync.Mutex
 // 被长回填阻塞。
 var threatRollupRewindPending atomic.Int64
 
+// 待处理的「原地改判」分钟集合：改判是对既有行 UPDATE（事件 id 不变），
+// 增量重固扫不到，必须全量重算；全量重算时「已计入行」与「迟到行」靠回退
+// 时落库的迟到基线区分（见 services.ThreatRollupLateBaselinePrefix）。
+// 钩子抢不到锁时与回退目标一起排队，由下一次 ensure 合并执行。
+var (
+	threatRollupReclassifyMu      sync.Mutex
+	threatRollupReclassifyPending = map[int64]struct{}{}
+)
+
 var errThreatRollupRestart = errors.New("threat rollup restart after concurrent rewind")
 
 // threatScreenNow 时钟缝（可控时间轴验证「上一分钟在完整后
@@ -233,8 +242,9 @@ var threatScreenNow = func() time.Time { return time.Now().UTC() }
 const (
 	// threatRollupWatermarkKey 已覆盖区间的**最新**完整分钟（metrics_state 键）；
 	// threatRollupCoveredFromKey 已覆盖区间的**最旧**分钟（空覆盖=lastComplete）。
-	threatRollupWatermarkKey   = "threat_rollup_last_fixed_minute"
-	threatRollupCoveredFromKey = "threat_rollup_covered_from"
+	// 键名单源在 services：保留清理要读同一批键判定预聚合回填是否就绪。
+	threatRollupWatermarkKey   = services.ThreatRollupWatermarkKey
+	threatRollupCoveredFromKey = services.ThreatRollupCoveredFromKey
 	// threatRollupBatchMinutes 单事务回填分钟数。
 	threatRollupBatchMinutes = 60
 	// threatRollupMaxBatchesPerCall 单次请求最多提交的事务批数（25 批 =
@@ -247,7 +257,7 @@ const (
 	// threatRollupTargetReadyKey 目标维度 rollup 就绪标记：
 	// 升级后缺失 → 强制重置覆盖区间重固——否则既有 coverage 宣称已覆盖，
 	// 历史窗口的目标计数永久缺失（top_targets 与其余卡片窗口分裂）。
-	threatRollupTargetReadyKey = "threat_rollup_target_ready"
+	threatRollupTargetReadyKey = services.ThreatRollupTargetReadyKey
 	// threatRollupGeoIPGenerationKey 固化时使用的归属地库代际
 	// 与当前代际不一致 → 重固窗口（库恢复后历史空归属地维度自愈）。
 	threatRollupGeoIPGenerationKey = "threat_rollup_geoip_generation"
@@ -277,7 +287,7 @@ const (
 	// 固化都按 fullRebuild 处理并把回填下界扩到该起点，覆盖底端推进到起点后
 	// 删除——修复「单次调用最多 23h，其余分钟的增量路径无新事件即 no-op，
 	// 目标维度/归属地永不补算、就绪标记却已写入」的自愈中断。
-	threatRollupRebuildFromKey = "threat_rollup_rebuild_from"
+	threatRollupRebuildFromKey = services.ThreatRollupRebuildFromKey
 	// threatRollupStaleAfter 固化陈旧阈值：warmer 每 60s
 	// 一轮，超过 3 分钟无成功固化视为陈旧——请求路径改为同步固化，持续失败
 	// 以 500 显式暴露，不得把旧值伪装成最新 200。
@@ -346,36 +356,83 @@ func queueThreatRollupRewind(minute time.Time) {
 	}
 }
 
-func applyPendingThreatRollupRewindInLock() {
-	ts := threatRollupRewindPending.Swap(0)
-	if ts == 0 {
+// queueThreatRollupReclassify 排队原地改判分钟（幂等；只保留分钟粒度）。
+func queueThreatRollupReclassify(minutes []time.Time) {
+	if len(minutes) == 0 {
 		return
 	}
-	threatRollupRewindToInLock(time.Unix(ts, 0).UTC())
+	threatRollupReclassifyMu.Lock()
+	defer threatRollupReclassifyMu.Unlock()
+	for _, m := range minutes {
+		if m.IsZero() {
+			continue
+		}
+		threatRollupReclassifyPending[m.UTC().Truncate(time.Minute).Unix()] = struct{}{}
+	}
+}
+
+func takeThreatRollupReclassifyPending() []time.Time {
+	threatRollupReclassifyMu.Lock()
+	defer threatRollupReclassifyMu.Unlock()
+	if len(threatRollupReclassifyPending) == 0 {
+		return nil
+	}
+	out := make([]time.Time, 0, len(threatRollupReclassifyPending))
+	for ts := range threatRollupReclassifyPending {
+		out = append(out, time.Unix(ts, 0).UTC())
+	}
+	threatRollupReclassifyPending = map[int64]struct{}{}
+	return out
+}
+
+func applyPendingThreatRollupRewindInLock() {
+	ts := threatRollupRewindPending.Swap(0)
+	reclassifyMinutes := takeThreatRollupReclassifyPending()
+	if ts == 0 && len(reclassifyMinutes) == 0 {
+		return
+	}
+	var minute time.Time
+	if ts != 0 {
+		minute = time.Unix(ts, 0).UTC()
+	}
+	threatRollupRewindToInLock(minute, reclassifyMinutes)
 }
 
 // ThreatRollupRewindTo 摄取提交后回退 rollup 覆盖水位。
-// minute=本批实际插入的最旧事件分钟（UTC）。若该分钟落在已覆盖区间内（停机/
-// 升级积压、轮转补采），把 last_fixed 回退到 minute-1——下一次 ensureThreatRollup
-// 从该分钟起重固到窗口末端（幂等）。
+// minute=本批需要重固的最旧分钟（UTC；零值=本批只有原地改判）。
+// reclassifyMinutes=本批对既有行原地改判（UPDATE，事件 id 不变）的分钟。
+// 若 minute 落在已覆盖区间内（停机/升级积压、轮转补采），把 last_fixed 回退
+// 到 minute-1——下一次 ensureThreatRollup 从该分钟起重固到窗口末端（幂等）。
+// 普通插入分钟保留分钟事件高水位：迟到行 id 单调更大，增量重固即可合并；
+// 原地改判分钟需全量重算，回退时把其高水位搬进迟到基线后再删键——否则
+// 全量重算在「原始行被裁剪/含旧口径行」形态下 newTotal<oldTotal，迟到行会
+// 被永久丢弃（高水位已被抹掉，后续增量也再扫不到）。
 // 不得阻塞摄取提交——warmer 批次期间 TryLock 失败时仅排队，
 // 由 ensure 的批次间隙/下一次 warmer 合并执行；窗口外目标钳制到展示下界。
-func ThreatRollupRewindTo(minute time.Time) {
-	if minute.IsZero() || db.MetricsDB == nil {
+func ThreatRollupRewindTo(minute time.Time, reclassifyMinutes []time.Time) {
+	if db.MetricsDB == nil {
 		return
 	}
-	minute = threatRollupRewindMinute(minute)
+	if !minute.IsZero() {
+		minute = threatRollupRewindMinute(minute)
+	}
+	if minute.IsZero() && len(reclassifyMinutes) == 0 {
+		return
+	}
 	if !threatRollupMu.TryLock() {
-		queueThreatRollupRewind(minute)
+		if !minute.IsZero() {
+			queueThreatRollupRewind(minute)
+		}
+		queueThreatRollupReclassify(reclassifyMinutes)
 		return
 	}
 	defer threatRollupMu.Unlock()
 	applyPendingThreatRollupRewindInLock()
-	threatRollupRewindToInLock(minute)
+	threatRollupRewindToInLock(minute, reclassifyMinutes)
 }
 
 func drainThreatRollupRewindPending() bool {
-	if threatRollupRewindPending.Load() == 0 {
+	if threatRollupRewindPending.Load() == 0 && !hasPendingThreatRollupReclassify() {
 		return false
 	}
 	if !threatRollupMu.TryLock() {
@@ -386,7 +443,13 @@ func drainThreatRollupRewindPending() bool {
 	return true
 }
 
-func threatRollupRewindToInLock(minute time.Time) {
+func hasPendingThreatRollupReclassify() bool {
+	threatRollupReclassifyMu.Lock()
+	defer threatRollupReclassifyMu.Unlock()
+	return len(threatRollupReclassifyPending) > 0
+}
+
+func threatRollupRewindToInLock(minute time.Time, reclassifyMinutes []time.Time) {
 	database := db.MetricsDB
 	if database == nil {
 		return
@@ -397,41 +460,70 @@ func threatRollupRewindToInLock(minute time.Time) {
 		return
 	}
 	if !okFixed {
-		return
+		return // 从未固化：稍后的全量固化天然包含这些分钟
 	}
-	target := minute.UTC().Truncate(time.Minute).Add(-time.Minute)
-	if !lastFixed.After(target) {
+	const minuteLayout = "2006-01-02 15:04"
+	// 覆盖水位回退目标：minute-1（零值=本批只有原地改判，不动水位）。
+	var target time.Time
+	rewindCoverage := !minute.IsZero() && lastFixed.After(minute.UTC().Truncate(time.Minute).Add(-time.Minute))
+	if rewindCoverage {
+		target = minute.UTC().Truncate(time.Minute).Add(-time.Minute)
+	}
+	// 已固化过的原地改判分钟：高水位搬进迟到基线后再删（键值即「已计入行」
+	// 的最大 id）。尚未固化的分钟无需处理——随后首次固化就是全量重算。
+	baselines := make([]time.Time, 0, len(reclassifyMinutes))
+	for _, m := range reclassifyMinutes {
+		if m.IsZero() {
+			continue
+		}
+		m = m.UTC().Truncate(time.Minute)
+		if m.After(lastFixed) {
+			continue
+		}
+		baselines = append(baselines, m)
+	}
+	if !rewindCoverage && len(baselines) == 0 {
 		return // 该分钟尚未被固化，无需回退
 	}
-	// 回退区间的分钟高水位键必须同批删除：改判（logged→blocked）是对原始行
-	// 原地 UPDATE，id 不变，而增量重固只重扫 id > previousMaxID——不删键时
-	// 该分钟会被判成「无新增（deltaTotal==0）」早退，rollup 的 action 维度永久
-	// 停在改判前的值（大屏/总览与事件列表自相矛盾）。删键后下一次固化
-	// previousMaxID=0 → 走全量重建分支，按当前行重算全部维度。
-	const minuteLayout = "2006-01-02 15:04"
 	tx, err := database.Begin()
 	if err != nil {
 		services.Logf("warn", "threat rollup rewind: begin transaction failed: %v", err)
 		return
 	}
 	defer func() { _ = tx.Rollback() }() // 已 Commit 后为 no-op
-	if _, err := tx.Exec(`DELETE FROM metrics_state WHERE key > ? AND key <= ?`,
-		services.ThreatRollupEventHighwaterPrefix+target.Format(minuteLayout),
-		services.ThreatRollupEventHighwaterPrefix+lastFixed.UTC().Truncate(time.Minute).Format(minuteLayout)); err != nil {
-		services.Logf("warn", "threat rollup rewind: drop event highwater failed: %v", err)
-		return
+	for _, m := range baselines {
+		minuteStr := m.Format(minuteLayout)
+		if _, err := tx.Exec(`INSERT INTO metrics_state (key, value)
+			SELECT ?, value FROM metrics_state WHERE key=?
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			services.ThreatRollupLateBaselinePrefix+minuteStr, services.ThreatRollupEventHighwaterPrefix+minuteStr); err != nil {
+			services.Logf("warn", "threat rollup rewind: save late baseline failed: %v", err)
+			return
+		}
+		if _, err := tx.Exec(`DELETE FROM metrics_state WHERE key=?`, services.ThreatRollupEventHighwaterPrefix+minuteStr); err != nil {
+			services.Logf("warn", "threat rollup rewind: drop event highwater failed: %v", err)
+			return
+		}
 	}
-	if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-		threatRollupWatermarkKey, target.Format(minuteLayout)); err != nil {
-		services.Logf("warn", "threat rollup rewind: write watermark failed: %v", err)
-		return
+	if rewindCoverage {
+		if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			threatRollupWatermarkKey, target.Format(minuteLayout)); err != nil {
+			services.Logf("warn", "threat rollup rewind: write watermark failed: %v", err)
+			return
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		services.Logf("warn", "threat rollup rewind: commit failed: %v", err)
 		return
 	}
-	services.Logf("info", "threat rollup rewind: 摄取补齐历史分钟 %s，覆盖水位回退为 %s（下一次固化全量重算该段）",
-		minute.UTC().Truncate(time.Minute).Format(minuteLayout), target.Format(minuteLayout))
+	if rewindCoverage {
+		services.Logf("info", "threat rollup rewind: 摄取补齐历史分钟 %s，覆盖水位回退为 %s（下一次固化重算该段）",
+			minute.UTC().Truncate(time.Minute).Format(minuteLayout), target.Format(minuteLayout))
+	}
+	if len(baselines) > 0 {
+		services.Logf("info", "threat rollup rewind: %d 个原地改判分钟转全量重算（迟到基线已留底）",
+			len(baselines))
+	}
 }
 
 // ensureThreatRollup 按需固化 rollup（幂等、自愈、可跨请求续做）：
@@ -986,6 +1078,24 @@ func saveThreatRollupEventHighwater(tx *sql.Tx, minute string, id int64) error {
 	return err
 }
 
+// loadThreatRollupLateBaseline 读某分钟的迟到合并基线（回退删高水位时的留底值）。
+func loadThreatRollupLateBaseline(tx *sql.Tx, minute string) (int64, bool, error) {
+	var raw string
+	err := tx.QueryRow(`SELECT value FROM metrics_state WHERE key=?`, services.ThreatRollupLateBaselinePrefix+minute).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	id, perr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if perr != nil || id < 0 {
+		services.Logf("warn", "threat rollup: corrupted late baseline for minute %s (%q), treating as unset", minute, raw)
+		return 0, false, nil
+	}
+	return id, true, nil
+}
+
 // threatRollupKey 分钟 rollup 的维度键（与 security_event_rollup 主键同集合）。
 type threatRollupKey struct{ country, province, family, rule, action string }
 
@@ -1103,6 +1213,24 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 	if err != nil {
 		return err
 	}
+	// 迟到基线：回退（原地改判）删掉分钟高水位时留底的值。全量重算在「原始
+	// 行被裁剪/含旧口径行」形态下 newTotal<oldTotal，只能保留已固化行——此时
+	// 迟到行必须按 id > 基线 合并（基线 ≤ 任何已计入行 id），否则永久不入聚合。
+	// 基线一旦被本事务消费即删除（成功路径与高水位同事务落库；事务回滚则
+	// 一并回滚，不会出现重复合并）。
+	lateBaseline, hasBaseline, err := loadThreatRollupLateBaseline(tx, minuteStr)
+	if err != nil {
+		return err
+	}
+	if hasBaseline {
+		if _, err := tx.Exec(`DELETE FROM metrics_state WHERE key=?`, services.ThreatRollupLateBaselinePrefix+minuteStr); err != nil {
+			return err
+		}
+		if previousMaxID > 0 {
+			// 高水位仍在：基线冗余（高水位 ≥ 基线）。
+			lateBaseline = 0
+		}
+	}
 	var currentMaxID int64
 	if err := tx.QueryRow(`SELECT COALESCE(MAX(id),0) FROM security_events WHERE event_time >= ? AND event_time < ?`,
 		m.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05")).Scan(&currentMaxID); err != nil {
@@ -1134,6 +1262,9 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 	if previousMaxID > highwater {
 		highwater = previousMaxID
 	}
+	if lateBaseline > highwater {
+		highwater = lateBaseline
+	}
 	if incremental {
 		if deltaTotal == 0 {
 			return saveThreatRollupEventHighwater(tx, minuteStr, highwater)
@@ -1150,9 +1281,10 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 		if newTotal < oldTotal {
 			// 原始事件已被保留期/行帽裁剪：全量重算只看得到剩余行，直接覆盖
 			// 会丢掉「已固化但原始行已消失」的历史。保留旧行（读入时已按当前
-			// 攻击口径过滤）并叠加高水位之后的迟到事件——迟到事件仍在原始表
-			// 内，可安全并入。无高水位（口径上线前的历史分钟）时无法区分「迟到」
-			// 与「已计入」，不做增量叠加；但口径外行（放行族）仍须借本次重写
+			// 攻击口径过滤）并叠加高水位（或回退留底的迟到基线）之后的迟到
+			// 事件——迟到事件仍在原始表内，可安全并入。无高水位且无基线
+			// （口径上线前的历史分钟、从未固化过的分钟）时无法区分「迟到」与
+			// 「已计入」，不做增量叠加；但口径外行（放行族）仍须借本次重写
 			// 落库清除，否则旧口径固化行永久留存。
 			oldAgg, oldTarget, lerr := loadExistingRollup(tx, minuteStr)
 			if lerr != nil {
@@ -1163,8 +1295,12 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 				kept += count
 			}
 			lateTotal := 0
-			if previousMaxID > 0 {
-				lateAgg, lateTarget, lateCount, aerr := aggregateEvents(tx, m, next, previousMaxID)
+			lateBaselineID := previousMaxID
+			if lateBaselineID == 0 {
+				lateBaselineID = lateBaseline
+			}
+			if lateBaselineID > 0 {
+				lateAgg, lateTarget, lateCount, aerr := aggregateEvents(tx, m, next, lateBaselineID)
 				if aerr != nil {
 					return aerr
 				}
@@ -1805,9 +1941,11 @@ func (h *Handlers) GetThreatScreenAttackFlow(c *gin.Context) {
 			limit = n
 		}
 	}
-	events, next := services.ThreatScreenAttackFlowSnapshot(since, limit)
+	events, next, gapSkipped := services.ThreatScreenAttackFlowSnapshot(since, limit)
 	out := make([]gin.H, 0, len(events))
 	for _, ev := range events {
+		// 入口已排除保留地址（见 securityevents 入环前的同一判据）；此处保留
+		// 兜底过滤，覆盖入环前收敛之前写入的旧条目。
 		if isReservedIP(ev.ClientIP) {
 			continue
 		}
@@ -1838,6 +1976,10 @@ func (h *Handlers) GetThreatScreenAttackFlow(c *gin.Context) {
 		"events":   out,
 		"next_seq": next,
 		"sample_n": services.ThreatScreenAttackFlowSampleN(),
+		// 环形缓冲溢出导致的永久空洞（与正常光流同口径）：>0 表示本批之前
+		// 有攻击事件未送达，前端须丢弃「连续光流」假设并跳到 next_seq 追赶。
+		"gap":         gapSkipped > 0,
+		"gap_skipped": gapSkipped,
 	}})
 }
 
@@ -2159,6 +2301,8 @@ func triggerTypeForRule(ruleTriggered string) string {
 	}
 	switch ruleTriggered {
 	case "429":
+		// 防御性分支：限流由 caddy-ratelimit 直接返回，无 security_events 行
+		// （生产者缺失见 categorizeAttack 注释）。保留以对齐事件列表口径。
 		return "限流"
 	case "2", "4", "5", "7":
 		return "IP 访问控制"

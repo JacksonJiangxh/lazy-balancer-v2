@@ -493,13 +493,38 @@ func persistCRSSnapshotFromInLock(liveDir, snapshotDir, version string) error {
 		cleanupTmp()
 		return fmt.Errorf("快照版本标记: %w", err)
 	}
-	if err := os.RemoveAll(snapshotDir); err != nil {
+	// 两阶段命名替换（目录无法原地原子覆盖）：旧快照先改名到 .old，新树
+	// rename 到位后再删 .old；任一步失败都把旧快照复位。旧实现
+	// RemoveAll(snapshotDir)+Rename 在两步之间旧快照已不存在，rename 失败
+	// 时再 cleanupTmp() 会把唯一完整的新树也删掉——两份快照同时消失，
+	// 容器重建即回退镜像捆绑版本（快照缺席不自愈，只有退化快照会自愈）。
+	oldDir := snapshotDir + ".old"
+	if err := os.RemoveAll(oldDir); err != nil {
 		cleanupTmp()
-		return fmt.Errorf("清理旧快照: %w", err)
+		return fmt.Errorf("清理旧快照残骸: %w", err)
 	}
-	if err := os.Rename(tmpDir, snapshotDir); err != nil {
-		cleanupTmp()
+	prevExisted := false
+	if _, err := os.Stat(snapshotDir); err == nil {
+		if err := osRename(snapshotDir, oldDir); err != nil {
+			// 旧快照原封未动：清理暂存即可（保留 tmp 会与「旧快照仍有效」
+			// 的现场混淆，且下一次调用入口本就会清 tmp）。
+			cleanupTmp()
+			return fmt.Errorf("暂存旧快照: %w", err)
+		}
+		prevExisted = true
+	}
+	if err := osRename(tmpDir, snapshotDir); err != nil {
+		// 新树到位失败：旧快照复位（失败时保留 .old 与完整 tmp 供人工/
+		// 下次启动识别，绝不主动删除任何一份）。
+		if prevExisted {
+			if rbErr := osRename(oldDir, snapshotDir); rbErr != nil {
+				Logf("error", "crs update: failed to restore previous snapshot %s from %s: %v（两份快照均保留在磁盘）", snapshotDir, oldDir, rbErr)
+			}
+		}
 		return fmt.Errorf("替换快照: %w", err)
+	}
+	if err := os.RemoveAll(oldDir); err != nil {
+		Logf("warn", "crs update: failed to remove replaced snapshot %s: %v（新快照已生效，残留下次覆盖）", oldDir, err)
 	}
 	return nil
 }
@@ -823,6 +848,8 @@ func replaceDirFrom(src, dst string) error {
 
 // osRename is a seam for tests: Docker overlayfs cannot rename a directory
 // baked into an image lower layer (EXDEV), so the fallback path matters.
+// 消费方：moveTree 的跨挂载点回退判定、快照两阶段命名替换（替换失败必须
+// 走「旧快照复位 + 两份保留」分支，测试需要能注入 rename 失败）。
 var osRename = os.Rename
 
 // copyDirRename 是 copyDirTransactional 的测试缝；与 moveTree 的覆盖式

@@ -117,8 +117,8 @@ func TestAutoBackupSettings_lastSuccessAtSeparatedFromWatermark(t *testing.T) {
 	}
 }
 
-// 检查点）——修复前 demote 中在途备份跑完并记 success。取消返回 ctx 错误，
-// 不落 failed 行、不写文件。
+// 取消必须在落盘前生效（检查点）——修复前 demote 中在途备份仍会跑完并记
+// success。取消返回 ctx 错误，不落 failed 行、不写文件。
 func TestRunAutoBackupOnce_cancelledContextWritesNothing(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -141,7 +141,8 @@ func TestRunAutoBackupOnce_cancelledContextWritesNothing(t *testing.T) {
 	}
 }
 
-// auto_backups 行 → prune 永不回收；修复前仅 Rename 失败分支清理）。
+// 写失败不得留下临时文件（残留会让 auto_backups 行 → prune 永不回收；修复前
+// 仅 Rename 失败分支清理）。
 func TestRunAutoBackupOnce_writeFailureLeavesNoTmp(t *testing.T) {
 	// 写失败注入走落盘缝（autoBackupWriteFile）：不依赖文件系统权限语义——
 	// root / 容器内 chmod 0500 不阻断写入，权限位形态会让该回归在 CI 假红
@@ -231,7 +232,8 @@ func TestUpdateAutoBackupSettings_atomicOnEnabledFailure(t *testing.T) {
 	}
 }
 
-// 403「仅允许在主节点执行」误导排障方向（与 requireAutoBackupMaster 先例
+// 角色查询失败必须 500 而非 403——「仅允许在主节点执行」会误导排障方向
+// （与 requireAutoBackupMaster 先例同口径）。
 func TestRequireMasterNode_roleQueryFailureReturns500(t *testing.T) {
 	closed, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "closed.db"))
 	if err != nil {

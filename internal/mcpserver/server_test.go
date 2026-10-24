@@ -135,13 +135,25 @@ func TestUpdateConfigSchemaCurrentWritableFields(t *testing.T) {
 	if raw := schema.Properties["threat_traffic_sample_n"]; json.Unmarshal(raw, &sample) != nil || len(sample.Enum) != 2 || sample.Enum[0] != -1 || sample.Enum[1] != 0 {
 		t.Errorf("threat_traffic_sample_n enum=%v, want [-1,0]", sample.Enum)
 	}
-	for field, wantMax := range map[string]int{"security_events_retention_days": 3650, "security_events_row_cap": 100000000} {
+	// 上限期望值直接取 db.Max*（禁止在测试里复制同一份数字）：schema 由模板
+	// 占位生成，写侧校验也从同一常量取值——复制常量会让「模板占位失效」与
+	// 「常量上调」互相掩盖。另断更新前后文本不同，钉住替换不是 no-op。
+	for field, wantMax := range map[string]int{
+		"security_events_retention_days": db.MaxSecurityEventsRetentionDays,
+		"security_events_row_cap":        db.MaxSecurityEventsRowCap,
+	} {
 		var property struct {
 			Maximum int `json:"maximum"`
 		}
 		if err := json.Unmarshal(schema.Properties[field], &property); err != nil || property.Maximum != wantMax {
-			t.Errorf("%s maximum=%d err=%v, want %d", field, property.Maximum, err, wantMax)
+			t.Errorf("%s maximum=%d err=%v, want %d（db.Max* 单源）", field, property.Maximum, err, wantMax)
 		}
+	}
+	if updateConfigSchema == updateConfigSchemaTemplate {
+		t.Fatal("update_config schema 未替换保留上限占位——上限会与 db.Max* 静默漂移")
+	}
+	if strings.Contains(updateConfigSchema, "%!") || strings.Contains(updateConfigSchema, "%[1]d") {
+		t.Fatalf("update_config schema 保留未展开的格式占位：见 %q", updateConfigSchema)
 	}
 
 	for _, field := range []string{"trusted_proxy_ranges", "trusted_proxy_headers"} {
@@ -1333,7 +1345,6 @@ func withIsolatedMCPDatabase(t *testing.T) {
 		if err := db.Close(); err != nil {
 			t.Errorf("close database: %v", err)
 		}
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreMCPDatabaseHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 }

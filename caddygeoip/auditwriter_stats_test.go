@@ -26,6 +26,7 @@ func TestAuditPipeline_writesWriterStatsSidecar(t *testing.T) {
 	}
 	p.reportDropped("queue full")
 	p.reportIOError("write", errors.New("injected disk failure"))
+	p.reportFormatError(errors.New("injected formatter contract failure"))
 
 	statsPath := auditWriterStatsPath(target)
 	deadline := time.Now().Add(3 * time.Second)
@@ -41,14 +42,17 @@ func TestAuditPipeline_writesWriterStatsSidecar(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	var got struct {
-		Dropped  uint64 `json:"dropped"`
-		IOErrors uint64 `json:"io_errors"`
+		Dropped      uint64 `json:"dropped"`
+		IOErrors     uint64 `json:"io_errors"`
+		FormatErrors uint64 `json:"format_errors"`
 	}
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("stats sidecar malformed: %v (%s)", err, raw)
 	}
-	if got.Dropped != 1 || got.IOErrors != 1 {
-		t.Fatalf("stats=%+v, want dropped=1 io_errors=1", got)
+	// 格式化失败必须独立计数：混入 io_errors 会把代码契约缺陷呈现为磁盘故障，
+	// 排障方向被误导。
+	if got.Dropped != 1 || got.IOErrors != 1 || got.FormatErrors != 1 {
+		t.Fatalf("stats=%+v, want dropped=1 io_errors=1 format_errors=1", got)
 	}
 	if p.dropped.Load() != 1 {
 		t.Fatalf("pipeline dropped counter=%d, want 1", p.dropped.Load())

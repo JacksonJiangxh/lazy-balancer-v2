@@ -1565,6 +1565,12 @@ func loadCAProvider(id int) (models.CAProvider, error) {
 			// 已删除的显式 ID 回退是历史延续，但不得完全无声：点名原 ID 与
 			// 实际使用的提供商，便于运维判断是否该清理旧任务。
 			Logf("warn", "CA queue: 显式 CA 提供商 %d 已不存在，回退到提供商 %d（历史任务延续，后续签发将持久化该 ID）", explicitID, fallbackID)
+		} else {
+			// 「跟随默认」的 providerID=0 不可用（默认被删除/被导入写成禁用 ID）
+			// 时静默改派到首个启用 provider：任务仍在消耗另一个 CA 的配额，而
+			// 规则页仍显示「跟随默认」。回退本身保留（硬失败会让全局签发停摆），
+			// 但必须留一条可归因的 warn。
+			Logf("warn", "CA queue: 默认 CA 提供商不可用，回退到提供商 %d（规则仍显示「跟随默认」，请修复默认 CA 配置）", fallbackID)
 		}
 		id = fallbackID
 		err = scanCAProvider(db.DB.QueryRow("SELECT "+caProviderColumns+" FROM ca_providers WHERE id=? AND enabled=1", id), &p)

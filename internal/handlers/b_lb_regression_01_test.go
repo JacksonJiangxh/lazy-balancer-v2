@@ -1,13 +1,14 @@
 package handlers
 
-//   DuplicateRule 复制前把源行投影为共享保存输入，复用
+// 回归覆盖：
+//   - DuplicateRule 复制前把源行投影为共享保存输入，复用
 //     validateRulePayloadBeforeSave（host/端口/权重/查重/请求体）；
 //     零启用上游/零上游按复制语义放行（不套 Create 表单门）。
-//   重试窗口上界——显式越界 400（交 validateRuleFeatures），
-//     仅存量越界自愈；interval 越界时同步归零 duration，避免
-//     duration>0+interval=0 的渲染必填门矛盾（caddy.go）。
-//   BatchRuleBlockPages 入口 trim+去重保序；bound 按
-//     RowsAffected>0 计，同值命中计入 unchanged。
+//   - 重试窗口上界——显式越界 400（交 validateRuleFeatures），仅存量越界自愈；
+//     interval 越界时同步归零 duration，避免 duration>0+interval=0 的渲染必填门
+//     矛盾（caddy.go）。
+//   - BatchRuleBlockPages 入口 trim+去重保序；bound 按 RowsAffected>0 计，同值
+//     命中计入 unchanged。
 
 import (
 	"encoding/json"

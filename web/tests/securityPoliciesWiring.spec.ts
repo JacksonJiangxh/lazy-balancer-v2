@@ -5,10 +5,10 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { section, source, stripComments } from './_helpers.ts'
+import { code, section } from './_helpers.ts'
 import { STAGE_BLOCK_STATUS_OPTIONS, hasStage3Features, parseCrsFilename, parseUnknownStrings } from '../src/utils/securityStages.ts'
 
-const page = source('src/views/security/SecurityPolicies.vue')
+const page = code('src/views/security/SecurityPolicies.vue')
 
 test('G3 谓词：mode 三态 ∪ 自定义规则引用非空（与后端 PolicyTypeFeatures 同口径）', () => {
   for (const mode of ['blocking', 'detection', 'custom_only']) {
@@ -22,8 +22,7 @@ test('阶段 3 chip 消费 G3 单源谓词（引用数口径，含禁用规则�
   const chip = section(page, 'const stage3ChipOn', '\n\n')
   assert.match(chip, /hasStage3Features\(row\.mode, row\.custom_rules_ref_count/, '判定必须用引用数（与后端 G3 逐字对齐）')
   assert.match(chip, /custom_rules_ref_count \?\? row\.custom_rules_count/, '旧后端缺摘要字段时回退启用计数')
-  const code = stripComments(chip)
-  assert.doesNotMatch(code, /row\.has_waf/)
+  assert.doesNotMatch(chip, /row\.has_waf/)
 })
 
 test('CRS 文件名解析单源：四位解析点全部改引 parseCrsFilename', () => {
@@ -36,7 +35,7 @@ test('CRS 文件名解析单源：四位解析点全部改引 parseCrsFilename',
     // （假红），也会越过单行箭头函数把相邻声明纳入检查面（假绿）。
     const body = section(page, `const ${name} = `, '\nconst ')
     assert.match(body, /parseCrsFilename\(/, `${name} 未走单源解析`)
-    assert.doesNotMatch(stripComments(body), /REQUEST\|RESPONSE/, `${name} 仍内联文件名正则`)
+    assert.doesNotMatch(body, /REQUEST\|RESPONSE/, `${name} 仍内联文件名正则`)
   }
   // 组选项构建（两处）同样不得再内联文件名正则
   assert.doesNotMatch(page, /\/\^\(\?:REQUEST\|RESPONSE\)-9\(\\d\{2\}\)-/i, '文件名正则不得留在视图层')
@@ -79,8 +78,7 @@ test('迁移预演补「已有其他限流策略 → 将跳过」风险组', () 
 test('规则级阶段页状态码选项由共享清单派生', () => {
   const overrideSelect = section(page, 'stage-override-status-select', '</el-select>')
   assert.match(overrideSelect, /v-for="opt in STAGE_BLOCK_STATUS_OPTIONS"/)
-  const code = stripComments(overrideSelect)
-  assert.doesNotMatch(code, /<el-option :value="40[134]"/, '硬编码状态码不得回流')
+  assert.doesNotMatch(overrideSelect, /<el-option :value="40[134]"/, '硬编码状态码不得回流')
   assert.deepEqual(STAGE_BLOCK_STATUS_OPTIONS.map((o) => o.value), [400, 401, 403, 404, 503])
 })
 

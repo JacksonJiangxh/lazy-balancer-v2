@@ -463,6 +463,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (paused) renderOnce()
   }
 
+  /** 返回世界视口单源（zoomOut / resetView 共用）：先作废在途省界加载再复位。 */
+  function returnToWorldView(duration: number): void {
+    drillSeq += 1
+    enterWorldView(duration)
+  }
+
   async function handleCanvasClick(ev: MouseEvent): Promise<void> {
     const geo = screenToLatLng(ev.clientX, ev.clientY)
     if (!geo) return
@@ -470,9 +476,11 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       // 本省（选中国家内）：保持
       if (pointInEntries(geo.lng, geo.lat, provincePolysCache)) return
     }
-    // 命中判定的手势语义与地图版单源（drillClickIntent）：下钻态命中他国=切换
-    // （台湾归一后与选择国同名，不得当「其他国家」重复下钻）、空白=返回世界。
-    const hit = countryHit(geo.lng, geo.lat, drilledName ?? undefined)
+    // 命中判定的手势语义与地图版单源（drillClickIntent）：下钻态命中当前国家
+    // 自身（省界空档/未收录岛屿）/他国/空白分别 stay/switch/world。此处不得
+    // 排除下钻国——排除后「国境内但落在省多边形空档」会被误判为空白并强制
+    // 退出下钻（地图同位置是保持）；台湾归一后与选择国同名同样走 stay。
+    const hit = countryHit(geo.lng, geo.lat)
     const intent = drillClickIntent(hit?.name ?? null, drilledName)
     if (intent === 'drill' || intent === 'switch') {
       if (hit) await drillCountry(hit.name)
@@ -499,12 +507,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let lastHoverPick = 0
 
   /**
-   * 国家命中测试（单源，hover/click 共用）：先用点阵构建期的 bbox 预筛，
-   * 再对候选国做多边形射线。原实现对 177 国逐个全量射线（俄/美多环最重），
-   * 且 bbox 已算好却只给 buildWorldDots 用——下钻态每 120ms 复测都在付全表成本。
+   * 国家命中测试（单源，hover/click 共用）：与地图引擎同源——共享 5° 网格取
+   * 候选国，再做 bbox + 多边形射线。网格候选按国家索引升序（构建顺序），
+   * 「首个命中」与全表扫描同结果。原实现对 239 国逐个 bbox 判定，下钻态每
+   * 120ms 复测都在付全表成本。
    */
   function countryHit(lng: number, lat: number, exclude?: string): { name: string; index: number } | null {
-    for (let i = 0; i < THREAT_COUNTRIES.length; i++) {
+    const candidates = sharedCountryGrid.grid.get(countryGridCell(lng, lat)) ?? []
+    for (const i of candidates) {
       const b = dotBboxes[i]
       if (lng < b.minLon || lng > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
       const name = normalizeCountryName(THREAT_COUNTRIES[i].name)
@@ -1235,12 +1245,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     zoomOut(): void {
       // 与地图版同源——复位/返回必须作废在途省界加载，否则迟到的
       // chunk 续体会把用户刚做的复位覆盖成下钻。
-      drillSeq += 1
-      enterWorldView(600)
+      returnToWorldView(600)
     },
     resetView(): void {
-      drillSeq += 1
-      enterWorldView(600)
+      returnToWorldView(600)
     },
     cameraState(): { zoom: number; cx: number; cy: number; dist: number; pos: [number, number, number] } {
       const pov = globe.pointOfView()

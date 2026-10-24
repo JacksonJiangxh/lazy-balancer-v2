@@ -52,6 +52,9 @@ type mockIdP struct {
 	// 缺省（未设置）="true"；"false"=显式 false；"absent"=不返回该声明。
 	// 域白名单要求已验证邮箱，测试据此覆盖三种形态。
 	emailVerifiedMode atomic.Value
+	// groupsClaim 以原始 JSON 覆盖 id_token 的 groups 声明（未设置=不返回）：
+	// 覆盖数组、分隔字符串、不可解析形态三种 IdP 风格。
+	groupsClaim atomic.Value
 	// nonceByChallenge:PKCE challenge → nonce——并发双登录各自 authorize 后,
 	// 令牌交换按 code_verifier 派生 challenge 回查本登录的 nonce(单登录场景
 	// lastNonce 兜底同值)。
@@ -158,6 +161,12 @@ func newMockIdP(t *testing.T) *mockIdP {
 			idClaims["email_verified"] = false
 		default:
 			idClaims["email_verified"] = true
+		}
+		if raw, _ := m.groupsClaim.Load().(string); raw != "" {
+			var groupsClaim any
+			if err := json.Unmarshal([]byte(raw), &groupsClaim); err == nil {
+				idClaims["groups"] = groupsClaim
+			}
 		}
 		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, idClaims)
 		signed, _ := tok.SignedString(key)

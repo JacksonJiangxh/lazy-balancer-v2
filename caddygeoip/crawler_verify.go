@@ -148,26 +148,48 @@ func VerifyCrawler(ip, engineID string) CrawlerVerdict {
 		ttl = crawlerCachePositiveTTL
 	}
 	crawlerCacheMu.Lock()
+	_, keyExists := crawlerCache[key]
+	var negativeCandidate string
+	haveNegativeCandidate := false
 	if len(crawlerCache) >= crawlerCacheMax {
-		// 固定探针数内回收过期条目；仍满员时宁可不缓存新键，也不清空
-		// 已验证爬虫，且绝不因一个新键扫描整张 200k 缓存。
+		// 固定探针数内：回收过期条目，并记住一个**活跃负结论**作为候选。
+		// 负结论（10min TTL）与正结论（1h TTL）共用容量池时，攻击者可用
+		// 海量自有 IP + 爬虫 UA 把池填满，使合法爬虫的新结论无法缓存
+		// （退化为逐请求 DNS）。正结论绝不淘汰（误删会让真爬虫同样退化）；
+		// 负结论丢弃后 10min 可重验，代价可控。探针总数仍受
+		// crawlerCachePruneProbeLimit 约束，绝不全表扫描。
 		probed := 0
 		for cachedKey, entry := range crawlerCache {
 			probed++
 			crawlerCachePruneVisitsForTest++
 			if !now.Before(entry.expires) {
 				delete(crawlerCache, cachedKey)
+			} else if !entry.ok && !haveNegativeCandidate && cachedKey != key {
+				negativeCandidate = cachedKey
+				haveNegativeCandidate = true
 			}
 			if probed >= crawlerCachePruneProbeLimit || len(crawlerCache) < crawlerCacheMax {
 				break
 			}
 		}
+		if len(crawlerCache) >= crawlerCacheMax && haveNegativeCandidate && !keyExists {
+			delete(crawlerCache, negativeCandidate)
+		}
 	}
-	_, keyExists := crawlerCache[key]
+	_, keyExists = crawlerCache[key]
+	cached := false
 	if len(crawlerCache) < crawlerCacheMax || keyExists {
 		crawlerCache[key] = crawlerVerifyCache{ok: ok, expires: now.Add(ttl)}
+		cached = true
 	}
 	crawlerCacheMu.Unlock()
+	if !cached {
+		// 满员且探针内无可回收的负结论：新结论不缓存（正结论占满或探针
+		// 未命中）。该降级必须留痕迹，否则表现为「DNS 解析量无故升高」。
+		crawlerSnapshotLogfThrottled("crawler-verify-cache", "full",
+			"crawler verification cache is full (%d entries): new conclusion for engine %s is not cached; verification falls back to per-request DNS",
+			crawlerCacheMax, engineID)
+	}
 	return verdict
 }
 
@@ -321,7 +343,7 @@ var (
 const crawlerIPListReloadInterval = 10 * time.Minute
 
 // crawlerIPListMaxBytes 快照文件体积硬上限（4MiB，与 wafiplist 名单文件加载
-// 器的 MaxFileBytes/MaxFastFileBytes 同口径）：正常形态为 360 引擎的官方段
+// 器的 maxFileBytes/maxFastFileBytes 同口径）：正常形态为 360 引擎的官方段
 // 列表（实测远小于 1MiB），超限文件按「快照不可用」fail-closed 处理——
 // 异常/损坏文件不得整体读入内存放大驻留。
 const crawlerIPListMaxBytes = 4 << 20
@@ -334,7 +356,7 @@ func crawlerSnapshotLogf(format string, args ...any) {
 }
 
 // crawlerSnapshotLogInterval 是同路径同原因告警的最小间隔（对齐 wafiplist
-// StaleServeLogInterval 口径；0=不节流，测试用）。失败快照按
+// staleServeLogInterval 口径；0=不节流，测试用）。失败快照按
 // crawlerIPListRetryInterval（10s）重读，持久异常形态（超限文件、磁盘满、
 // 半截快照）不节流时约 8.6k 行/天，会稀释真实告警。原因变化立即上报
 // （状态迁移必须可见）；成功快照落定后清除记录——再次故障立即可见。
@@ -412,7 +434,7 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	raw, info, readErr := crawlerReadBoundedFile(next.filePath, crawlerIPListMaxBytes)
 	switch {
 	case errors.Is(readErr, wafiplist.ErrFileSizeLimit):
-		// 体积门（与 wafiplist.MaxFileBytes/MaxFastFileBytes 同口径）：异常/
+		// 体积门（与 wafiplist 名单加载器的体积上限同口径）：异常/
 		// 损坏文件不得整体读入内存；fail-closed 消费空快照。
 		crawlerSnapshotLogfThrottled(next.filePath, "oversized",
 			"crawler ip list snapshot %s exceeds %d bytes (size %d); treating as unavailable",

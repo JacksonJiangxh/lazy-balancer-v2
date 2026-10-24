@@ -337,17 +337,19 @@ type brandingResponse struct {
 var (
 	brandingSyncMu          sync.Mutex
 	brandingSyncLast        time.Time
+	brandingSyncDataDir     string
 	brandingSyncFingerprint string
 )
 
-// brandingFileFingerprint 返回 branding.json 的内容指纹（mtime+size）；stat
-// 失败返回空串（调用方跳过本轮，下次重试）。
+// brandingFileFingerprint 返回 branding.json 的内容指纹（mtime+size，含 dataDir
+// 键控——与 brandingStore 同构；跨目录不共享缓存）；stat 失败返回空串（调用方
+// 跳过本轮，下次重试）。
 func brandingFileFingerprint(dataDir string) string {
 	info, err := os.Stat(filepath.Join(dataDir, "branding.json"))
 	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("%d.%d", info.ModTime().UnixNano(), info.Size())
+	return fmt.Sprintf("%s\x00%d.%d", dataDir, info.ModTime().UnixNano(), info.Size())
 }
 
 // brandingSyncGateAllow 判定本轮是否需要跑幂等写副作用（landing 注入/拦截页
@@ -367,6 +369,14 @@ func brandingSyncGateAllow(dataDir string) bool {
 	}
 	brandingSyncMu.Lock()
 	defer brandingSyncMu.Unlock()
+	// dataDir 入键（与 brandingStore 的 dataDir 键控同构）：同进程切换数据目录
+	// （测试隔离/多实例形态）时，前一个目录的指纹与 60s 采样窗不得吞掉新目录
+	// 的首轮同步。
+	if dataDir != brandingSyncDataDir {
+		brandingSyncDataDir = dataDir
+		brandingSyncLast = time.Time{}
+		brandingSyncFingerprint = ""
+	}
 	if fingerprint == brandingSyncFingerprint {
 		return false
 	}
@@ -390,6 +400,7 @@ func brandingSyncMarkFailed() {
 func resetBrandingSyncGateForTest() {
 	brandingSyncMu.Lock()
 	brandingSyncLast = time.Time{}
+	brandingSyncDataDir = ""
 	brandingSyncFingerprint = ""
 	brandingSyncMu.Unlock()
 }

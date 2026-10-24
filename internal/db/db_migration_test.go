@@ -3877,3 +3877,48 @@ func TestMigrateSystemIPListUniqueIndex_recordsAuditForDedupedRows(t *testing.T)
 		t.Fatalf("remaining system rows=%d, want 1", remaining)
 	}
 }
+
+// OIDC 唯一索引探测门：索引在位时启动不得再对 users 全表 GROUP BY 查重
+// （与 ensureSecurityEventsTransactionIndex / migrateSystemIPListUniqueIndex
+// 同款探测门）——每次重启白付一次全表扫描，历史重复身份库还会重复同一条告警；
+// 索引被带外删除后必须重新查重并重建（安全阀不被探测门短路）。
+func TestInitialize_oidcIdentityIndexProbeSkipsRescan(t *testing.T) {
+	dir := t.TempDir()
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() {
+		_ = Close()
+		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+
+	scansBase, skipsBase := oidcIdentityIndexScans.Load(), oidcIdentityIndexSkips.Load()
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("second initialize: %v", err)
+	}
+	if got := oidcIdentityIndexScans.Load() - scansBase; got != 0 {
+		t.Fatalf("索引在位时仍执行全表查重 %d 次, want 0（启动只做必要工作）", got)
+	}
+	if got := oidcIdentityIndexSkips.Load() - skipsBase; got != 1 {
+		t.Fatalf("探测跳过计数=%d, want 1", got)
+	}
+
+	if _, err := DB.Exec("DROP INDEX IF EXISTS u_oidc_identity"); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	scansBase = oidcIdentityIndexScans.Load()
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize after index drop: %v", err)
+	}
+	if got := oidcIdentityIndexScans.Load() - scansBase; got != 1 {
+		t.Fatalf("索引缺失时查重次数=%d, want 1", got)
+	}
+	var indexCount int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_index_list('users') WHERE name='u_oidc_identity'`).Scan(&indexCount); err != nil {
+		t.Fatalf("inspect users indexes: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("索引被删后必须重建，实际 count=%d", indexCount)
+	}
+}

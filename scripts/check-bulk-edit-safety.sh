@@ -10,6 +10,8 @@
 #      HEAD^..HEAD）统计空括号
 #      `()` / `（）` 的删除量；一次删除 ≥100 且新增不足其 1/5，判为「批量删括号」
 #      事故形态。阈值可用 BULK_PAREN_MIN / BULK_PAREN_RATIO 覆盖。
+#      干净树时只能看到最近一条提交——多提交变更集请用 BULK_EDIT_RANGE 显式
+#      指定范围（CI/评审传 origin/<base>...HEAD），否则中段提交的批量删除不可见。
 #      该通道依赖 python3 计数：缺失或统计失败一律 fail-closed（拒绝静默通过），
 #      与 check-no-audit-artifacts.sh 对缺 perl 的取向一致。
 #
@@ -27,7 +29,11 @@ scan_scripts() {
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     local traverses=0 writes=0 dry=0
-    grep -Eq '(os\.walk|os\.scandir|glob\.glob|Path\([^)]*\)\.glob|find[[:space:]].*-name|for[[:space:]].*in[[:space:]].*\*\.(go|ts|vue))' "$f" && traverses=1 || true
+    # 遍历特征三类同权：文件系统遍历（find/for/glob）、仓库文件枚举
+    # （git ls-files / git grep -l / rg -l）、管道逐文件（xargs）——事故等价
+    # 写法 `git ls-files -z '*.go' | xargs -0 perl -pi -e ...` 不含 find/for，
+    # 只认前一类会让第一道闸门对它静默放行。
+    grep -Eq '(os\.walk|os\.scandir|glob\.glob|Path\([^)]*\)\.glob|find[[:space:]].*-name|for[[:space:]].*in[[:space:]].*\*\.(go|ts|vue)|xargs|git[[:space:]]+ls-files|git[[:space:]]+grep[[:space:]]+[^|;&]*-[A-Za-z]*l|rg[[:space:]][^|;&]*-[A-Za-z]*l)' "$f" && traverses=1 || true
     # 写盘特征必须覆盖「非紧邻 -i」的全部常见形态（sed -E -i / sed -e … -i /
     # perl -pi -e / python -c）：紧邻匹配漏掉它们等于第一道闸门对最常见的
     # 批量改写作业形态失效（事故形态正是「全仓 sed/perl 正则替换」）。
@@ -44,7 +50,15 @@ scan_scripts() {
 # diff_ranges 列出全部需要检查的变更集（每行一个），而不是互斥取一段：
 # 常见的「部分暂存」工作流下 staged 非空会让未暂存改动完全跳过通道 B——
 # 而第二段改动往往正是批量变换。
+#
+# BULK_EDIT_RANGE 显式指定范围（CI/评审传 origin/<base>...HEAD）：干净树时
+# 本脚本只能看到最后一条提交，多提交 PR 的中段批量删除不可见——需要全范围
+# 检查的调用方必须显式传入。
 diff_ranges() {
+  if [[ -n "${BULK_EDIT_RANGE:-}" ]]; then
+    printf 'RANGE:%s\n' "${BULK_EDIT_RANGE}"
+    return 0
+  fi
   local any=0
   if ! git diff --cached --quiet; then
     echo "--cached"
@@ -93,28 +107,42 @@ check_diff_shape() {
     echo "ERROR: 需要 python3 统计变更形态（缺失时拒绝静默通过）" >&2
     return 1
   fi
-  local bad=0 range tok counts added removed
+  local bad=0 range tok counts added removed git_range label
   while IFS= read -r range; do
     [[ -n "${range}" ]] || continue
+    case "${range}" in
+      RANGE:*)
+        git_range="${range#RANGE:}"
+        label="${git_range}（BULK_EDIT_RANGE 显式范围）"
+        ;;
+      HEAD^..HEAD)
+        git_range="${range}"
+        label="${range}（干净树：仅检查最近一条提交；多提交变更集请设 BULK_EDIT_RANGE）"
+        ;;
+      *)
+        git_range="${range}"
+        label="${range}"
+        ;;
+    esac
     for tok in '()' '（）'; do
       # 统计命令自身失败（python3 运行时错误 / git diff 失败）同样 fail-closed：
       # 命令替换失败不会触发 set -e（read 自身成功），必须显式判定。
-      if ! counts="$(count_parens "${range}" "$tok")"; then
-        echo "ERROR: 变更形态统计失败（范围：${range}，形态：「$tok」）" >&2
+      if ! counts="$(count_parens "${git_range}" "$tok")"; then
+        echo "ERROR: 变更形态统计失败（范围：${label}，形态：「${tok}」）" >&2
         return 1
       fi
       read -r added removed <<<"${counts}"
       if [[ -z "${added}" || -z "${removed}" ]]; then
-        echo "ERROR: 变更形态统计输出异常（范围：${range}，形态：「$tok」）" >&2
+        echo "ERROR: 变更形态统计输出异常（范围：${label}，形态：「${tok}」）" >&2
         return 1
       fi
       if (( removed >= paren_min )) && (( removed > added * paren_ratio )); then
-        echo "ERROR: 变更集疑似批量删除空括号「$tok」：删除 $removed，新增 $added（范围：${range}）" >&2
+        echo "ERROR: 变更集疑似批量删除空括号「${tok}」：删除 ${removed}，新增 ${added}（范围：${label}）" >&2
         bad=1
       fi
     done
     if (( bad == 0 )); then
-      echo "bulk-edit safety: 变更形态正常（${range}）"
+      echo "bulk-edit safety: 变更形态正常（${label}）"
     fi
   done <<<"${ranges}"
   return "$bad"

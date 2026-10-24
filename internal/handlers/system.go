@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -55,14 +57,16 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 		version = brandingCfg.Version
 	}
 	info := models.SystemInfo{
-		NodeMode:      "master",
-		IPAddress:     getOutboundIP(),
-		Hostname:      getHostname(),
-		OSInfo:        getOSInfo(),
-		Kernel:        getKernel(),
-		Architecture:  getArchitecture(),
-		NetworkIPs:    getNetworkIPs(),
-		CaddyVersion:  getCaddyVersion(),
+		NodeMode:     "master",
+		IPAddress:    getOutboundIP(),
+		Hostname:     getHostname(),
+		OSInfo:       getOSInfo(),
+		Kernel:       getKernel(),
+		Architecture: getArchitecture(),
+		NetworkIPs:   getNetworkIPs(),
+		CaddyVersion: getCaddyVersion(),
+		// 「面板进程存活」——能响应本请求即恒为 running，不反映 Caddy
+		// admin 是否可达（Caddy 停摆时本字段仍为 running）。
 		RunningStatus: "running",
 		Uptime:        getUptime(),
 		Version:       version,
@@ -75,11 +79,21 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 		services.Logf("warn", "system info: 数据库未装配，节点角色未知（node_mode=unknown）")
 		info.NodeMode = "unknown"
 	default:
-		if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err != nil {
-			services.Logf("warn", "system info: 节点角色查询失败，按 unknown 呈现: %v", err)
+		// 角色读是单行索引查询，与请求生命周期无关：用脱离客户端取消的短超时
+		// 上下文，客户端断开不得被记成「角色查询失败」。留痕走状态转换限频
+		// （同 getOutboundIP 口径）——否则任一登录用户反复中断本端点即可逐请求
+		// 放大一条 warn，污染排障面。
+		roleCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
+		isMaster, err := services.RoleOf(roleCtx, db.DB)
+		cancel()
+		if err != nil {
+			services.LogConfigReadFailure("system-role", err)
 			info.NodeMode = "unknown"
-		} else if !isMaster {
-			info.NodeMode = "slave"
+		} else {
+			services.LogConfigReadRecovered("system-role")
+			if !isMaster {
+				info.NodeMode = "slave"
+			}
 		}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
@@ -123,35 +137,37 @@ func (h *Handlers) GetAppLogs(c *gin.Context) {
 	// 运行日志路径经 logPaths 统一口径——LOG_FILE 空串
 	// 时兜底默认运行日志(与 GetLogStats 同源),消除空串路径读出的恒空 200。
 	_, logPath := logPaths(h.cfg)
-	const maxBytes = 128 * 1024
+	maxBytes := int64(128 * 1024)
 	const maxLines = 500
 
-	info, err := os.Stat(logPath)
+	// 只读常规文件：判定必须落在已打开的 fd 上。路径 Stat 与 os.Open 之间目标
+	// 被替换为 FIFO/设备节点时，open(2) 对无写端 FIFO 会无超时阻塞（每请求
+	// 永久占一个 goroutine/连接，任意登录用户可低成本耗尽资源）。O_NONBLOCK
+	// 使打开本身不阻塞（常规文件读取不受该标志影响），随后以 f.Stat() 的
+	// mode 判定类型并取 size——不存在「检查后替换」的窗口。
+	f, err := os.OpenFile(logPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": ""}})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, systemInternalFailure("日志文件不可读", err))
-		return
-	}
-	startOffset := int64(0)
-	// 只读常规文件：Stat 与 os.Open 之间目标被替换为 FIFO/设备节点时，open(2)
-	// 对无写端 FIFO 会无超时阻塞（每请求永久占一个 goroutine/连接，任意登录
-	// 用户可低成本耗尽资源）。/system/logs 读侧必须显式拒绝非常规文件。
-	if !info.Mode().IsRegular() {
-		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", fmt.Errorf("非常规文件: %s mode=%v", logPath, info.Mode())))
-		return
-	}
-	if info.Size() > maxBytes {
-		startOffset = info.Size() - maxBytes
-	}
-	f, err := os.Open(logPath)
-	if err != nil {
 		c.JSON(http.StatusInternalServerError, systemInternalFailure("打开日志文件失败", err))
 		return
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", err))
+		return
+	}
+	if !info.Mode().IsRegular() {
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", fmt.Errorf("非常规文件: %s mode=%v", logPath, info.Mode())))
+		return
+	}
+	startOffset := int64(0)
+	if info.Size() > maxBytes {
+		startOffset = info.Size() - maxBytes
+	}
 	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
 		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", err))
 		return

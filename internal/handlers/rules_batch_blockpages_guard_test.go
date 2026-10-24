@@ -8,6 +8,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,6 +100,25 @@ func TestBatchRuleBlockPages_rejectsOversizedBody(t *testing.T) {
 	response := postStageJSON(t, router, "/rules/batch-block-pages", body)
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%s, want 413（独立 1MB 上限）", response.Code, response.Body.String())
+	}
+}
+
+// chunked/未知长度（ContentLength=-1）的超限请求体必须同样映射 413：
+// MaxBytesReader 在解析期截断，错误不得被统一折成「请求参数无效」——
+// 按 413 做重试/降级策略的客户端否则会误判为参数错误。
+func TestBatchRuleBlockPages_rejectsOversizedChunkedBody(t *testing.T) {
+	handler, _ := newStageBatchTestHandlers(t)
+	seedStageBatchRules(t)
+	router := stageBatchRouter(handler)
+	body := `{"rule_ids":["lb_b1"],"padding":"` + strings.Repeat("x", 1<<20) + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/rules/batch-block-pages", io.NopCloser(strings.NewReader(body)))
+	request.ContentLength = -1 // 模拟 chunked：快路径拿不到长度
+	request.TransferEncoding = []string{"chunked"}
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413（chunked 超限不得折成参数错误）", response.Code, response.Body.String())
 	}
 }
 

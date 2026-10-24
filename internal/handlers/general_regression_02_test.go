@@ -1,6 +1,8 @@
 package handlers
 
-//   - OBS  TCP log_enabled 死配置保存/导入归一
+// 回归覆盖：
+//   - 重试窗口；协议切换丢绑定；TCP 复制不搬运绑定；混合 TLS 冲突；管理端口；
+//   - ACME 残留归一；TCP log_enabled 死配置的保存/导入归一。
 // 所有断言基于真实 DB / HTTP 处理器行为。
 
 import (

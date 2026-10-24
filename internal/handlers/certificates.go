@@ -29,6 +29,11 @@ const maskedDNSCredentialsSentinel = "***"
 // 也不强制 VARCHAR(100)——校验必须在这里做。
 const certificateConfigNameMaxRunes = 100
 
+// maxParseCertificateBytes 是证书解析端点（POST /certificates/parse）的请求体
+// 上限：入参是 PEM 文本（证书链+私钥），与普通 JSON 配置写端点的「请求体大小」
+// 配置项无关——2MB 足以容纳最长链，且对齐 admin-tls inspect 的量级。
+const maxParseCertificateBytes = 2 << 20
+
 // normalizeCertificateConfigName 统一 trim + 非空 + 长度校验，写入 trimmed 值。
 func normalizeCertificateConfigName(raw string) (string, error) {
 	name := strings.TrimSpace(raw)
@@ -86,8 +91,20 @@ func isMaskedDNSCredentials(m map[string]string) bool {
 // mergeMaskedDNSCredentials:部分掩码回传逐字段合并——值为掩码
 // 占位的字段取库中原值,非占位取提交值;库中亦无该字段时占位无处可取,
 // 返回错误(防掩码串覆盖真实凭证)。
-func mergeMaskedDNSCredentials(submitted, stored map[string]string) (map[string]string, error) {
-	merged := make(map[string]string, len(submitted))
+//
+// preserveUnsubmitted 控制「提交中缺失的键」语义（与 provider 是否变更绑定）：
+//   - true（同一 provider）：缺失键继承库值——稀疏 PATCH 不得静默抹掉未提交的
+//     凭证字段。整体缺省 dns_credentials（nil）早已是「保持」语义，字段缺省却
+//     「删除」会让同一端点两种缺省含义相反。
+//   - false（provider 变更）：不继承旧 provider 的字段——旧键（如 auth_mode）
+//     混入新 provider 载荷会被凭据归一误判为旧模式，导致保存失败或语义漂移。
+func mergeMaskedDNSCredentials(submitted, stored map[string]string, preserveUnsubmitted bool) (map[string]string, error) {
+	merged := make(map[string]string, len(submitted)+len(stored))
+	if preserveUnsubmitted {
+		for k, v := range stored {
+			merged[k] = v
+		}
+	}
 	for k, v := range submitted {
 		if v == maskedDNSCredentialsSentinel {
 			storedVal, ok := stored[k]
@@ -192,8 +209,7 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 		return
 	}
 
-	// LastInsertId 失败时审计会落「配置 0」，
-	// 与同域已修的「配置 0」文案问题同型——失败留痕后按 0 继续（行已落库，
+	// LastInsertId 失败时审计会落「配置 0」——失败留痕后按 0 继续（行已落库，
 	// 不能因审计 id 丢失而回滚）。
 	id, idErr := result.LastInsertId()
 	if idErr != nil {
@@ -284,7 +300,10 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	}
 	effectiveCredentials := req.DNSCredentials
 	switch {
-	case effectiveCredentials == nil:
+	case effectiveCredentials == nil || len(effectiveCredentials) == 0:
+		// 省略或空对象（表单未编辑任何凭证字段）等价于「未提交」：以库值参与
+		// 校验，且不回写凭证列——空对象不得按「清空全部凭证」落库。
+		req.DNSCredentials = nil
 		effectiveCredentials = map[string]string{}
 		if oldCredentials != "" {
 			if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
@@ -311,7 +330,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		if oldCredentials != "" {
 			_ = json.Unmarshal([]byte(oldCredentials), &stored)
 		}
-		merged, merr := mergeMaskedDNSCredentials(effectiveCredentials, stored)
+		merged, merr := mergeMaskedDNSCredentials(effectiveCredentials, stored, effectiveProvider == oldProvider)
 		if merr != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: merr.Error()})
 			return
@@ -335,7 +354,15 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	// 凭据仍必须过 provider 校验。非空损坏 JSON 与其他无效存量行维持 400。
 	legacyEmptyUnchanged := oldCredentials == "" && req.DNSCredentials == nil && effectiveProvider == oldProvider
 	enablingLegacyEmpty := legacyEmptyUnchanged && req.Enabled != nil && *req.Enabled && !oldEnabled
-	if !legacyEmptyUnchanged || enablingLegacyEmpty {
+	// 生效凭证与库值语义相等（显式提交但未改动凭证）时不重新校验：历史行
+	// （导入/旧版本）可能存有当前 provider 不再接受的形态（如部分空串），非
+	// admin 编辑表单原样回传（省略键/掩码/空串）不得 400——这是「保持库值」而
+	// 非新写入。显式改动、启用与 provider 变更仍走完整校验；未提交凭证的
+	// 改名/其它字段更新沿用下方 legacyEmpty/既有校验口径。
+	effectiveCredentialsJSON, _ := json.Marshal(effectiveCredentials)
+	credentialsUnchangedFromStored := req.DNSCredentials != nil && oldCredentials != "" && effectiveProvider == oldProvider &&
+		services.CredentialsSemanticallyEqual(string(effectiveCredentialsJSON), oldCredentials)
+	if (!legacyEmptyUnchanged || enablingLegacyEmpty) && !credentialsUnchangedFromStored {
 		if _, err := provider.BuildCredentialsJSON(effectiveCredentials); err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
@@ -451,6 +478,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 // DELETE 执行前运行——用于断言「查询→DELETE」窗口仍持有 caddyOpMu，且并发
 // UpdateRule 无法在该窗口提交绑定。生产恒 nil。
 var deleteCertificateConfigPreDeleteHook func()
+
+// issueCertificateBatchSnapshotHook 是测试钩子：批量签发目标快照完成、取
+// caddyOpMu 之前运行（生产恒 nil）。测试用它确定性地模拟「快照已取、规则在
+// 取锁前被删除」，替代依赖墙钟 sleep 的时序假设。
+var issueCertificateBatchSnapshotHook func()
 
 func (h *Handlers) DeleteCertificateConfig(c *gin.Context) {
 	// 与 UpdateCertificateConfig 同门：导入窗口内删除会作用到导入后的同 id
@@ -792,9 +824,22 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "关闭 ACME 规则结果失败: " + err.Error()})
 			return
 		}
+		if issueCertificateBatchSnapshotHook != nil {
+			issueCertificateBatchSnapshotHook()
+		}
 	}
 	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
+	// 部署重试登记（scheduleDeploymentRetry）可能对在途部署回调做有界等待，
+	// 而回调自身要取 caddyOpMu 完成规则写/Caddy 应用——登记必须在锁外执行，
+	// 否则互等到 busy 超时（30-60s），拖住全部规则写与 Caddy 启停。
+	// 「只差部署」快速路径（定向/批量）会显式解锁并清标记后登记；defer 兜底
+	// 其余出口。
+	caddyOpHeld := true
+	defer func() {
+		if caddyOpHeld {
+			h.caddyOpMu.Unlock()
+		}
+	}()
 	queued := 0
 	// 批量路径套用与定向签发同款冷却门，冷却中
 	// 任务跳过并单列计数（仅批量分支产生非零值）。
@@ -882,18 +927,33 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			// 部署生命周期 + 材料在库：只差部署，与证书任务重试入口同源
 			// （rescheduleDownloadedCertJobDeployment）。整轮重签会丢弃已签发
 			// 证书并消耗 CA 配额，且与 certjobs 的重试语义分叉。
+			// 锁内只推进部署窗口（DB 决策），登记立即部署 timer 在解锁后进行
+			// ——见 h.caddyOpMu 上方的锁序说明。
 			if jobMaterialUsable && services.JobLifecycle(jobStatus) == services.JobLifecycleDownloaded {
-				rescheduled, deployErr := rescheduleDownloadedCertJobDeployment(jobID, req.CaddyID, canonicalRuleDomain)
-				if deployErr != nil {
-					statusCode, message := deploymentRetryFailureResponse(deployErr)
+				rescheduled, markErr := markDownloadedCertJobDeploymentPending(jobID, req.CaddyID, canonicalRuleDomain)
+				if markErr != nil {
+					statusCode, message := deploymentRetryFailureResponse(markErr)
 					if statusCode >= http.StatusInternalServerError {
-						services.Logf("error", "IssueCertificate deployment retry failed for job %d: %v", jobID, deployErr)
+						services.Logf("error", "IssueCertificate deployment retry failed for job %d: %v", jobID, markErr)
 					}
 					auditFailure("failed", message)
 					c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 					return
 				}
 				if rescheduled {
+					// 窗口已推进：解锁后登记并构造响应。登记失败仍按同一映射
+					// 如实报 409/500（启动恢复/周期补扫会接手窗口）。
+					h.caddyOpMu.Unlock()
+					caddyOpHeld = false
+					if deployErr := registerDownloadedCertJobDeploymentRetry(jobID, req.CaddyID); deployErr != nil {
+						statusCode, message := deploymentRetryFailureResponse(deployErr)
+						if statusCode >= http.StatusInternalServerError {
+							services.Logf("error", "IssueCertificate deployment retry failed for job %d: %v", jobID, deployErr)
+						}
+						auditFailure("failed", message)
+						c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
+						return
+					}
 					recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, "已触发重新部署（不重新签发）", services.AuditResultPart("deployment_retry")))
 					c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已触发重新部署（不重新签发）", Data: gin.H{"queued": 0, "redeployed": true}})
 					return
@@ -952,6 +1012,9 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		// 只重排部署（材料在库、未重新签发）的目标数——与 queued（新建签发任务）
 		// 分列，响应文案不得把「重新部署」谎报为「已创建签发任务」。
 		redeployed := 0
+		// 锁内已推进部署窗口、待锁外登记立即部署的目标——登记可能等待在途
+		// 部署回调（回调要取 caddyOpMu），不得在临界区内执行。
+		var pendingDeployments []certJobDeploymentRetryTarget
 		// 批量循环中队列被并发暂停（不可再入队）的显式信号。
 		pausedMidBatch := false
 		targets := batchTargets
@@ -977,6 +1040,8 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			var jobStatus string
 			var jobUpdatedAt, jobCreatedAt, jobCAAvailableAfter sql.NullTime
 			var jobMaterialUsable bool
+			// CA 退避窗口是否被 force 越过：置位后仍需入队成功才算真实发生。
+			cooldownOverriddenThisTarget := false
 			jobErr := db.DB.QueryRow(`SELECT id, status, updated_at, created_at, ca_available_after,
 				CASE WHEN `+services.CertJobMaterialPredicateSQL("")+` THEN 1 ELSE 0 END
 				FROM cert_jobs WHERE rule_id=? AND domain=?`, target.ruleID, canonicalDomain).
@@ -993,27 +1058,31 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 					continue
 				}
 				// CA 退避窗口未到期：与定向签发/任务重试同一门（force 才越过）。
+				// 是否真实越过要等入队结果：changed=false（在途/屏障/状态冲突）时
+				// ca_available_after 从未被清空，不得记「手动越过 CA 冷却」。
 				if certJobCAcooldownActive(jobStatus, jobCAAvailableAfter, time.Now()) {
 					if !forceIssue {
 						skippedWaitingCA++
 						continue
 					}
-					forceCAOverride = true
+					cooldownOverriddenThisTarget = true
 				}
 				// 部署生命周期 + 材料在库：与定向签发/任务重试同源，只重排部署，
 				// 不整轮重签（丢弃已签发证书 + 消耗 CA 配额）。
+				// 锁内只推进部署窗口，登记延到锁外（pendingDeployments）——
+				// 锁序与定向路径同源。
 				if jobMaterialUsable && services.JobLifecycle(jobStatus) == services.JobLifecycleDownloaded {
-					rescheduled, deployErr := rescheduleDownloadedCertJobDeployment(jobID, target.ruleID, canonicalDomain)
-					if deployErr != nil {
-						statusCode, message := deploymentRetryFailureResponse(deployErr)
+					rescheduled, markErr := markDownloadedCertJobDeploymentPending(jobID, target.ruleID, canonicalDomain)
+					if markErr != nil {
+						statusCode, message := deploymentRetryFailureResponse(markErr)
 						if statusCode >= http.StatusInternalServerError {
-							services.Logf("error", "Batch issue deployment retry failed for job %d: %v", jobID, deployErr)
+							services.Logf("error", "Batch issue deployment retry failed for job %d: %v", jobID, markErr)
 						}
 						failed = append(failed, fmt.Sprintf("%s(%s)", target.domain, message))
 						continue
 					}
 					if rescheduled {
-						redeployed++
+						pendingDeployments = append(pendingDeployments, certJobDeploymentRetryTarget{jobID: jobID, ruleID: target.ruleID, domain: target.domain})
 						continue
 					}
 					// rescheduled=false：规则/材料在窗口内刚变化，回落整轮重签。
@@ -1044,7 +1113,28 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				}
 				continue
 			}
+			// 入队成功才真实清空了 CA 退避窗口（upsert 的写侧口径），此刻的
+			// force 才是「越过冷却」事实；失败/跳过目标由上面的计数器归因。
+			if cooldownOverriddenThisTarget {
+				forceCAOverride = true
+			}
 			queued++
+		}
+		// 锁外逐个登记立即部署（与定向路径同源）：每个登记都可能等待该任务的
+		// 在途部署回调，而回调需要 caddyOpMu 才能完成——先释放全局锁。
+		// 登记失败按同一映射计入失败项（窗口已推进，周期补扫会接手）。
+		h.caddyOpMu.Unlock()
+		caddyOpHeld = false
+		for _, pending := range pendingDeployments {
+			if deployErr := registerDownloadedCertJobDeploymentRetry(pending.jobID, pending.ruleID); deployErr != nil {
+				statusCode, message := deploymentRetryFailureResponse(deployErr)
+				if statusCode >= http.StatusInternalServerError {
+					services.Logf("error", "Batch issue deployment retry failed for job %d: %v", pending.jobID, deployErr)
+				}
+				failed = append(failed, fmt.Sprintf("%s(%s)", pending.domain, message))
+				continue
+			}
+			redeployed++
 		}
 		skippedTotal := skippedCooldown + skippedWaitingCA + skippedBlocked + skippedInFlight + skippedUnsupported + skippedRetired
 		// forceNote 只在真实越过 CA 冷却时为非空；批量各出口（暂停/全部失败/
@@ -1100,12 +1190,35 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
 				return
 			}
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired)
 			detail := ""
 			if batchForceNote != "" {
 				detail = strings.TrimPrefix(batchForceNote, "，")
 			}
+			if skipNote != "" {
+				if detail != "" {
+					detail += "；"
+				}
+				detail += skipNote
+			}
 			auditFailure("failed", detail)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "全部签发任务创建失败: " + strings.Join(failed, "; ")})
+			message := "全部签发任务创建失败: " + strings.Join(failed, "; ")
+			if skipNote != "" {
+				// 混合形态（部分目标失败 + 部分目标被冷却/退役跳过）必须同时
+				// 交代跳过归因，否则用户会把「冷却/退役跳过」误判为系统故障。
+				message += "；" + skipNote
+			}
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: message, Data: gin.H{
+				"queued":             0,
+				"redeployed":         0,
+				"failed":             len(failed),
+				"skipped_cooldown":   skippedCooldown,
+				"skipped_waiting_ca": skippedWaitingCA,
+				"skipped_in_flight":  skippedInFlight,
+				"skipped_blocked":    skippedBlocked,
+				"skipped_other":      skippedUnsupported,
+				"skipped_retired":    skippedRetired,
+			}})
 			return
 		}
 		if queued == 0 && redeployed > 0 {
@@ -1209,10 +1322,10 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 }
 
 func (h *Handlers) ParseCertificate(c *gin.Context) {
-	// 证书解析入参 PEM 上限 2MB（对齐 admin-tls inspect 的
-	// maxAdminTLSJSONBytes 量级）——此前无上限，任何持凭证者（含只读 API key，
-	// 本端点在 readOnlyWriteRoutes）可投递任意大 body 造成内存压力。
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+	// 证书解析入参 PEM 上限独立于「请求体大小」配置项（见
+	// maxParseCertificateBytes 注释）：任何持凭证者（含只读 API key，
+	// 本端点在 readOnlyWriteRoutes）可投递 body，必须有硬上限。
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxParseCertificateBytes)
 	var req struct {
 		CertPEM string `json:"cert_pem"`
 		KeyPEM  string `json:"key_pem"`

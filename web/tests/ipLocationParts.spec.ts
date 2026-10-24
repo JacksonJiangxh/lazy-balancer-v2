@@ -22,3 +22,14 @@ test('空/缺失输入回退两空串（不炸渲染路径）', () => {
   // 空段保留空串：`中国··深圳市` 的省位不得被后续段顶替
   assert.deepEqual(parseIpLocation('中国··深圳市'), { country: '中国', province: '' })
 })
+
+test('缺失/null 输入回退两空串', () => {
+  assert.deepEqual(parseIpLocation(null as unknown as string), { country: '', province: '' })
+})
+
+test('四段以上只取前两段；混合分隔符不参与拆分（后端只发 `·`）', () => {
+  assert.deepEqual(parseIpLocation('中国·广东省·深圳市·南山区'), { country: '中国', province: '广东省' })
+  // 全角项目符号 `•` 不是分隔符：混用时整段落进 province——钉住现状，后端
+  // 若改分隔符本用例先红（避免两处 split 各自漂移）。
+  assert.deepEqual(parseIpLocation('中国·广东省•深圳市'), { country: '中国', province: '广东省•深圳市' })
+})

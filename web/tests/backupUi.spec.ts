@@ -68,7 +68,9 @@ test('下次备份只消费调度器返回值并标明补跑', () => {
 })
 
 test('立即备份按已保存范围门控，60 秒无结果有提示', () => {
-  assert.match(page, /:disabled="!autoBackupCanRunNow" title="按已保存的自动备份设置执行一次备份/)
+  // 属性序不是契约：两次独立匹配（格式化工具有引入即批量红）。
+  assert.match(page, /:disabled="!autoBackupCanRunNow"/)
+  assert.match(page, /title="按已保存的自动备份设置执行一次备份/)
   const run = section(page, 'const runAutoBackupNow', 'const downloadAutoBackup')
   assert.match(run, /if \(!autoBackupCanRunNow\.value\)/)
   assert.doesNotMatch(run, /if \(!autoBackupSectionsValid\.value\)/)

@@ -46,6 +46,7 @@ package caddygeoip
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -466,12 +467,13 @@ func securityTimingIDFromHeaders(headers map[string][]string) string {
 // （preSet/endSet 区分「未记录」与 0——0µs 是合法计时值）。解析失败原样返回
 // （畸形行不因注入丢失，摄取侧自行跳过）。在 drain goroutine 内执行，不在
 // 请求路径。
+//
+// 字节级插入而非 unmarshal→map→marshal：重编码会把 HTML 敏感字符
+// （`<`/`>`/`&`/U+2028/U+2029）转义成 \uXXXX（行体最多放大 6×，审计日志
+// 轮转按体积触发 ⇒ 保留窗口等比例缩短），并重排顶层键序（原始行可读性与
+// formatter 字节稳定性丢失）。插入只需在单行对象的收尾 `}` 前追加一个字段。
 func injectAuditTiming(body []byte, snap auditTimingSnapshot) []byte {
 	if !snap.hasAny() {
-		return body
-	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
 		return body
 	}
 	payload := make([]byte, 0, 64)
@@ -488,11 +490,25 @@ func injectAuditTiming(body []byte, snap auditTimingSnapshot) []byte {
 		payload = strconv.AppendInt(payload, snap.endUs, 10)
 	}
 	payload = append(payload, '}')
-	doc["lb_timing"] = payload
-	out, err := json.Marshal(doc)
-	if err != nil {
+
+	// 容忍 formatter 可能追加的行尾空白（如尾随换行）；注入后只保留单行
+	// 对象本体，行分隔由 appendLine 统一追加（与重编码时代一致，避免双换行）。
+	trimmed := bytes.TrimRight(body, " \t\r\n")
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
 		return body
 	}
+	if !json.Valid(trimmed) {
+		return body
+	}
+	out := make([]byte, 0, len(trimmed)+len(payload)+16)
+	out = append(out, trimmed[:len(trimmed)-1]...)
+	// 空对象 `{}` 不加逗号（否则产出非法 JSON）。
+	if len(bytes.TrimSpace(trimmed[1:len(trimmed)-1])) > 0 {
+		out = append(out, ',')
+	}
+	out = append(out, `"lb_timing":`...)
+	out = append(out, payload...)
+	out = append(out, '}')
 	return out
 }
 
@@ -512,6 +528,9 @@ type auditSnapshot struct {
 	Parts_       types.AuditLogParts           `json:"-"`
 	Transaction_ auditSnapshotTransaction      `json:"transaction"`
 	Messages_    []plugintypes.AuditLogMessage `json:"messages,omitempty"`
+	// MessagesDropped_ 是写侧 messages 上限截断时丢弃的条数（0 不发射）：
+	// 整行不再因命中规则过多被 auditItemMaxBytes 丢弃，丢失量显性可见。
+	MessagesDropped_ int `json:"messages_dropped,omitempty"`
 }
 
 func (s *auditSnapshot) Parts() types.AuditLogParts { return s.Parts_ }
@@ -971,7 +990,21 @@ func snapshotAuditLog(al plugintypes.AuditLog) *auditSnapshot {
 	if tx := al.Transaction(); !isNilInterface(tx) {
 		s.Transaction_ = *snapshotTransaction(tx)
 	}
-	s.Messages_ = append(s.Messages_, al.Messages()...)
+	// messages 写侧上限：条数 + 估算字节双门（与快照估算同口径）。超限不再
+	// 让整行撞 auditItemMaxBytes 被丢弃——保留高价值事务信息并把丢弃条数
+	// 显性记入 messages_dropped。
+	msgs := al.Messages()
+	s.Messages_ = make([]plugintypes.AuditLogMessage, 0, len(msgs))
+	var used int64
+	for _, m := range msgs {
+		size := estimateAuditMessageBytes(m)
+		if size > 0 && (len(s.Messages_) >= auditMessagesMaxEntries || used+size > auditMessagesMaxBytes) {
+			s.MessagesDropped_ = len(msgs) - len(s.Messages_)
+			break
+		}
+		s.Messages_ = append(s.Messages_, m)
+		used += size
+	}
 	return s
 }
 
@@ -1141,9 +1174,14 @@ type auditPipeline struct {
 	// 且无在途处理」——收尾刷盘（flushQuiesced）据此判定已入队行全部落盘，
 	// 不存在「已出队未计数」的判定窗口。
 	pending atomic.Int64
-	// ioErrors 是落盘/格式化错误累计计数（写盘/刷盘/重开/格式化/关闭）：
-	// 与 dropped 一起由 drain 低频写入侧车文件，供根服务健康位消费。
+	// ioErrors 是落盘/刷盘/重开/关闭错误累计计数：与 dropped 一起由 drain
+	// 低频写入侧车文件，供根服务健康位消费。格式化失败不计入本计数——它是
+	// 代码/契约缺陷（formatter 或快照实现），不是磁盘 IO 故障，混计会把
+	// 代码问题伪装成基础设施告警。
 	ioErrors atomic.Uint64
+	// formatErrors 是 formatter.Format 失败累计计数（独立侧车字段
+	// format_errors）：排障路径与 io_errors 完全不同（先查代码而非磁盘）。
+	formatErrors atomic.Uint64
 	// dropLogMu 保护丢弃告警节流状态（请求路径并发入队可见）。
 	dropLogMu    sync.Mutex
 	lastDropLog  time.Time
@@ -1152,6 +1190,12 @@ type auditPipeline struct {
 	ioErrMu      sync.Mutex
 	lastIOErrLog time.Time
 	ioErrCount   int
+	// formatErrMu 保护格式化失败节流状态（与 IO 错误同族节流：首次立即记录，
+	// 其后每分钟至多一条，携带被抑制计数）。formatter 契约破裂会逐行失败，
+	// 不节流即刷屏。
+	formatErrMu      sync.Mutex
+	lastFormatErrLog time.Time
+	formatErrCount   int
 	// statsDirty 标记累计计数自上次写盘后是否变化；statsMu 保护写盘节流
 	// 状态（仅 drain goroutine 触碰，无需与请求路径互斥——计数是原子读）。
 	statsDirty     atomic.Bool
@@ -1237,6 +1281,30 @@ func (p *auditPipeline) reportIOError(op string, err error) {
 	p.ioErrMu.Unlock()
 	if logNow {
 		auditIOLogf("audit writer: %s failed for %s (suppressed %d since last report): %v", op, p.target, suppressed, err)
+	}
+}
+
+// reportFormatError 记录 formatter.Format 失败（独立于落盘 IO 错误）：
+// 计数进侧车 format_errors，日志同族按分钟节流。格式化失败是可重放的
+// 代码/契约缺陷，与磁盘/权限故障的处置路径不同，不得混入 io_errors。
+func (p *auditPipeline) reportFormatError(err error) {
+	if err == nil {
+		return
+	}
+	p.formatErrors.Add(1)
+	p.statsDirty.Store(true)
+	p.formatErrMu.Lock()
+	now := time.Now()
+	p.formatErrCount++
+	suppressed := p.formatErrCount - 1
+	logNow := p.lastFormatErrLog.IsZero() || now.Sub(p.lastFormatErrLog) >= time.Minute
+	if logNow {
+		p.lastFormatErrLog = now
+		p.formatErrCount = 0
+	}
+	p.formatErrMu.Unlock()
+	if logNow {
+		auditDropLogf("audit writer: format failed for %s (suppressed %d since last report): %v", p.target, suppressed, err)
 	}
 }
 
@@ -1359,9 +1427,41 @@ const (
 	// 每条 message：键名/数字字段/tags 语法 + slice 元素与 RuleMatch 驻留；
 	// 内容串（actionset/message/error_message/data 各字段）另按 len 计入。
 	auditMessageOverhead = 512
+	// auditMessagesMaxEntries / auditMessagesMaxBytes 是写侧 messages 上限：
+	// 四段（请求/响应体与头，各 64KiB）+ 固定开销后仅剩 ~65KiB 余量，约 70-80
+	// 条规则命中即触发 auditItemMaxBytes 整行丢弃——丢的恰是「命中规则多」的
+	// 高价值行。写侧先截断 messages 并标记 messages_dropped，保留整行；
+	// auditItemMaxBytes 仍是兜底（真超限才丢行）。
+	auditMessagesMaxEntries = 64
+	auditMessagesMaxBytes   = 32 * 1024
 	// 快照骨架：transaction/request/response/producer 的固定键名与 envelope。
 	auditSnapshotFixedBytes = 512
 )
+
+// estimateAuditMessageBytes 单条 message 的驻留/序列化字节估算（内容 +
+// 固定开销）。写侧 messages 截断与快照估算共用同一口径，避免两处上限漂移。
+func estimateAuditMessageBytes(m plugintypes.AuditLogMessage) int64 {
+	if isNilInterface(m) {
+		return 0
+	}
+	n := int64(len(m.Actionset())+len(m.Message())) + auditMessageOverhead
+	// error_message 不在 plugintypes.AuditLogMessage 接口上，但内置 JSON
+	// formatter 直接序列化具体值（coraza 的 Message 带该导出字段）。
+	if em, ok := m.(interface{ ErrorMessage() string }); ok {
+		n += int64(len(em.ErrorMessage()))
+	}
+	// 规则数据段（file/line/id/rev/msg/data/severity/ver/maturity/
+	// accuracy/tags/raw）同样进 JSON；Data() 可能是 typed-nil，取任何
+	// 访问器前必须走 isNilInterface。
+	if d := m.Data(); !isNilInterface(d) {
+		n += int64(len(d.File()) + len(d.Rev()) + len(d.Msg()) + len(d.Data()) +
+			len(d.Ver()) + len(d.Raw()))
+		for _, tag := range d.Tags() {
+			n += int64(len(tag)) + auditHeaderValueOverhead
+		}
+	}
+	return n
+}
 
 // estimateAuditSnapshotBytes 估算快照驻留字节（请求路径可付：只做 len 求和
 // 与固定开销累加，无分配、无序列化）。口径见上方常量：内容 + 语法/容器
@@ -1406,25 +1506,7 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 		}
 	}
 	for _, m := range s.Messages_ {
-		if isNilInterface(m) {
-			continue
-		}
-		n += int64(len(m.Actionset())+len(m.Message())) + auditMessageOverhead
-		// error_message 不在 plugintypes.AuditLogMessage 接口上，但内置 JSON
-		// formatter 直接序列化具体值（coraza 的 Message 带该导出字段）。
-		if em, ok := m.(interface{ ErrorMessage() string }); ok {
-			n += int64(len(em.ErrorMessage()))
-		}
-		// 规则数据段（file/line/id/rev/msg/data/severity/ver/maturity/
-		// accuracy/tags/raw）同样进 JSON；Data() 可能是 typed-nil，取任何
-		// 访问器前必须走 isNilInterface。
-		if d := m.Data(); !isNilInterface(d) {
-			n += int64(len(d.File()) + len(d.Rev()) + len(d.Msg()) + len(d.Data()) +
-				len(d.Ver()) + len(d.Raw()))
-			for _, tag := range d.Tags() {
-				n += int64(len(tag)) + auditHeaderValueOverhead
-			}
-		}
+		n += estimateAuditMessageBytes(m)
 	}
 	return n
 }
@@ -1532,13 +1614,15 @@ func (p *auditPipeline) writeWriterStatsIfDue(now time.Time) {
 	// 先清脏标记再读计数：读到计数后到达的新失败会重新置脏，不丢更新。
 	p.statsDirty.Store(false)
 	payload := struct {
-		Dropped   uint64 `json:"dropped"`
-		IOErrors  uint64 `json:"io_errors"`
-		WrittenAt string `json:"written_at"`
+		Dropped      uint64 `json:"dropped"`
+		IOErrors     uint64 `json:"io_errors"`
+		FormatErrors uint64 `json:"format_errors"`
+		WrittenAt    string `json:"written_at"`
 	}{
-		Dropped:   p.dropped.Load(),
-		IOErrors:  p.ioErrors.Load(),
-		WrittenAt: now.UTC().Format(time.RFC3339),
+		Dropped:      p.dropped.Load(),
+		IOErrors:     p.ioErrors.Load(),
+		FormatErrors: p.formatErrors.Load(),
+		WrittenAt:    now.UTC().Format(time.RFC3339),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1608,7 +1692,8 @@ func (p *auditPipeline) process(item lbAuditItem) {
 	body, err := item.formatter.Format(item.snap)
 	if err != nil {
 		// 单行格式化失败只跳过该行，不阻断后续（错误可见化：旧实现静默丢弃）。
-		p.reportIOError("format", err)
+		// 独立计数/告警：格式化缺陷与磁盘 IO 故障的排障路径不同。
+		p.reportFormatError(err)
 		return
 	}
 	if len(body) == 0 {

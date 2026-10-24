@@ -1162,3 +1162,51 @@ func TestBuildWafFileBundleResponse_incompleteBundleNotCached(t *testing.T) {
 		t.Fatal("完整 bundle 的响应体未被缓存（合并窗口失效）")
 	}
 }
+
+// 入口残留自愈：上次同步在「清空 live 后复制」窗口被 SIGKILL 时会留下
+// 缺失 live + .sync-bak。本轮若解包/校验失败（拒绝落盘），旧实现直接返回、
+// live 仍缺失（对应防护静默失效且无任何自愈通道）；新实现入口先按备份恢复
+// 旧树，失败也守住「旧树优于无树」。
+func TestUntarGzTo_healsCrashWindowResidueFromBackup(t *testing.T) {
+	root := t.TempDir()
+	destDir := filepath.Join(root, "crs")
+	// 崩溃窗口形态：live 整体缺失，备份在场。
+	writeTestFile(t, filepath.Join(destDir+".sync-bak", "rules", "REQUEST-900.conf"), "SecRule old")
+	// staging 残骸（上一轮中断留下）：必须被丢弃重建，不得合并进备份/新树。
+	writeTestFile(t, filepath.Join(destDir+".sync-in", "rules", "STALE.conf"), "SecRule stale")
+
+	payload := rawTarGz(t, []tarEntry{
+		{name: "rules/REQUEST-901.conf", body: []byte("SecRule new")},
+	})
+	// 声明哈希不匹配 → 拒绝落盘（校验门在替换 live 之前）。
+	if err := untarGzTo(payload, destDir, "deadbeef"); err == nil {
+		t.Fatal("哈希不匹配必须拒绝落盘")
+	}
+
+	if data, err := os.ReadFile(filepath.Join(destDir, "rules", "REQUEST-900.conf")); err != nil || string(data) != "SecRule old" {
+		t.Fatalf("live 缺失时必须按备份恢复旧树: err=%v data=%q", err, data)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, "rules", "STALE.conf")); !os.IsNotExist(err) {
+		t.Fatalf("staging 残骸不得进入 live 树: %v", err)
+	}
+	assertNoStagingRemains(t, destDir)
+}
+
+// 同族：live 非空（正常树）不受入口自愈影响——备份在场也不得以备份覆盖
+// live（备份可能就是陈旧树，覆盖会回退用户刚同步的规则）。
+func TestUntarGzTo_doesNotRestoreBackupOverHealthyLive(t *testing.T) {
+	root := t.TempDir()
+	destDir := filepath.Join(root, "crs")
+	writeTestFile(t, filepath.Join(destDir, "rules", "REQUEST-900.conf"), "SecRule live")
+	writeTestFile(t, filepath.Join(destDir+".sync-bak", "rules", "REQUEST-900.conf"), "SecRule stale-backup")
+
+	payload := rawTarGz(t, []tarEntry{
+		{name: "rules/REQUEST-901.conf", body: []byte("SecRule new")},
+	})
+	if err := untarGzTo(payload, destDir, ""); err != nil {
+		t.Fatalf("untar: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(destDir, "rules", "REQUEST-900.conf")); !os.IsNotExist(err) {
+		t.Fatalf("全新替换必须删除旧树文件（纯新树不变量）: err=%v data=%q", err, data)
+	}
+}

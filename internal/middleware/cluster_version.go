@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -13,11 +14,14 @@ import (
 )
 
 func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
-	// 幂等重装：生产启动路径已在任务引擎之前完成安装（安装失败即拒绝启动），
-	// 此处重装是防御刷新并保持测试/嵌入形态自足。若仍失败（装配后 DDL 被外部
-	// 破坏的窗口），HTTP 写面按 fail-closed 500 处理——注意后台周期任务不经本
-	// 中间件，它们与触发器的关系由启动门保证。
-	installErr := InstallClusterVersionTriggers(database)
+	// 触发器就绪：生产启动路径已在任务引擎之前完成安装（安装失败即拒绝启动），
+	// 此处重装是防御刷新并保持测试/嵌入形态自足。重装仍会全量 DROP/CREATE
+	// （105 条 DDL、BEGIN IMMEDIATE 取写锁）——若此刻撞上后台写事务并等满
+	// busy_timeout，旧实现把「一次瞬时忙」变成**进程内永久 500**（所有分类写
+	// 与主端登录 fail-closed 到重启），与「启动门不得带病运行」的取向相反。
+	// 因此重装失败后回退为只读探测：库内触发器齐备（就绪门装的那批）即视为
+	// 已就绪并留一次 warn；只有触发器确实缺失/不齐时才 fail-closed。
+	installErr := ensureClusterVersionTriggers(database)
 	// 装配期 DDL 失败后所有同步写与主端登录恒 500，此前只把错误塞进
 	// gin 上下文（无日志落点）——系统日志看不到根因。此处一次性留痕，响应与
 	// fail-closed 语义不变。
@@ -47,6 +51,56 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// ensureClusterVersionTriggers 装配期触发器就绪：先尝试全量重装（保持定义
+// 随代码刷新——升级后 WHEN/OF 子句变更必须生效），重装失败再回退只读探测。
+//
+// 重装失败的可恢复形态是「就绪门刚装好、本次重装撞上后台写事务的写锁」：
+// 触发器齐备，语义与就绪门装的那批一致，不应把一次瞬时忙升级为进程内永久
+// 500（所有分类写与主端登录 fail-closed 到重启）。探测本身读 sqlite_master，
+// 不取写锁、不阻塞写者。
+func ensureClusterVersionTriggers(database *sql.DB) error {
+	installErr := InstallClusterVersionTriggers(database)
+	if installErr == nil {
+		return nil
+	}
+	present, probeErr := clusterVersionTriggersPresent(database)
+	if probeErr == nil && present {
+		services.Logf("warn", "集群版本触发器重装失败但库内触发器已齐备（可能撞写锁），按已就绪继续: %v", installErr)
+		return nil
+	}
+	return installErr
+}
+
+// clusterVersionTriggersPresent 只读探测触发器清单是否齐备：期望名集合由
+// clusterSyncedTables × {INSERT,UPDATE,DELETE} + global_config UPDATE 单源
+// 派生（与安装器同一份数据，避免两份字面量漂移）。
+func clusterVersionTriggersPresent(database *sql.DB) (bool, error) {
+	names := expectedClusterVersionTriggerNames()
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
+	args := make([]any, 0, len(names))
+	for _, name := range names {
+		args = append(args, name)
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(DISTINCT name) FROM sqlite_master
+		WHERE type='trigger' AND name IN (`+placeholders+`)`, args...).Scan(&count); err != nil {
+		return false, err
+	}
+	return count == len(names), nil
+}
+
+// expectedClusterVersionTriggerNames 安装器应建的全部触发器名。
+func expectedClusterVersionTriggerNames() []string {
+	names := make([]string, 0, len(clusterSyncedTables)*3+1)
+	for _, table := range clusterSyncedTables {
+		for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
+			names = append(names, fmt.Sprintf("cluster_version_%s_%s", table.name, strings.ToLower(operation)))
+		}
+	}
+	names = append(names, "cluster_version_global_config_update")
+	return names
 }
 
 // globalConfigSyncedColumns 是 global_config UPDATE 触发器的 OF 列清单单源
@@ -191,6 +245,9 @@ var clusterSyncedTables = []clusterSyncedTable{
 	// OF——当前唯一写路径是 OIDC JIT 开户 INSERT(auth_oidc.go),无 UPDATE
 	// 写路径;若未来新增该三列 UPDATE 写路径(换绑/issuer 迁移),必须同步
 	// 补 OF,否则稳态变更不 bump 版本、永不传播到从节点。
+	// users 节：login_locked_until 参与触发器 bump，但不进 users 载荷/节哈希，
+	// 锁状态经顶层 locked_users 下发（见 models.ClusterLockedUser 注释）——
+	// 移除该列会让主端锁定永不传播到从节点，且无测试会红。
 	{name: "users", snapshotColumns: "id,username,password_hash,role,display_name,is_enabled,password_version,password_changed_at,mfa_enabled,mfa_secret,mfa_recovery_codes,login_locked_until"},
 	{name: "api_keys", snapshotColumns: "id,name,key_hash,key_prefix,created_by,expires_at,is_enabled,mcp_enabled,read_only,mcp_ip_whitelist"},
 	{name: "ca_providers", snapshotColumns: "id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at"},
@@ -436,6 +493,23 @@ func InstallClusterVersionTriggers(database *sql.DB) error {
 	return nil
 }
 
+// usersTableWritePostPaths 是「写 users 表同步列」的 POST 路由清单——
+// 生产代码的唯一事实源。分类判定（isUsersTableWritePath）、触发器降级态的
+// 角色分流、以及测试路由注册与 fail-closed 断言全部从本清单派生，测试不再
+// 维护第二份副本（副本漂移时新写路径会漏掉 fail-closed 保护而无人发现）。
+var usersTableWritePostPaths = []string{
+	"/api/v1/auth/login",
+	"/api/v1/auth/mfa/verify",
+	"/api/v1/auth/setup",
+	"/api/v1/auth/mfa/activate",
+	"/api/v1/auth/mfa/disable",
+	"/api/v1/auth/mfa/recovery-codes",
+}
+
+// usersTableWriteOIDCCallbackPath 是 JIT 开户的 GET 形态路由——方法门之外
+// 精确匹配（开户写 users 同步列）。
+const usersTableWriteOIDCCallbackPath = "/api/v1/auth/oidc/callback"
+
 // isUsersTableWritePath 判定写 users 表同步列（users 触发器 OF 列）的路由单源：
 // 密码登录/MFA 验证步（置锁/解锁 login_locked_until）、初始化管理员
 // （auth/setup）、OIDC 回调 JIT 开户（GET 形态）、MFA 三段状态变更
@@ -452,22 +526,13 @@ func InstallClusterVersionTriggers(database *sql.DB) error {
 // /auth/mfa/verify-step 只写刻意排除的 pending/记账列（永不 bump），按前缀
 // 捕获会让降级态误伤 MFA 登录/step-up。
 func isUsersTableWritePath(method, path string) bool {
-	if method == http.MethodGet && path == "/api/v1/auth/oidc/callback" {
+	if method == http.MethodGet && path == usersTableWriteOIDCCallbackPath {
 		return true
 	}
 	if method != http.MethodPost {
 		return false
 	}
-	switch path {
-	case "/api/v1/auth/login",
-		"/api/v1/auth/mfa/verify",
-		"/api/v1/auth/setup",
-		"/api/v1/auth/mfa/activate",
-		"/api/v1/auth/mfa/disable",
-		"/api/v1/auth/mfa/recovery-codes":
-		return true
-	}
-	return false
+	return slices.Contains(usersTableWritePostPaths, path)
 }
 
 func isSynchronizedWrite(method, path string) bool {

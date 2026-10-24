@@ -1734,3 +1734,89 @@ func TestBuildOpenAPIYAML_summaryAndTagRoundTrip(t *testing.T) {
 		t.Fatalf("checked=%d routes=%d", checked, len(apiDocRoutes))
 	}
 }
+
+// route.Errors 的描述与 JSON 示例 message 必须可原样还原：YAML 标量走引号
+// 转义、示例 message 走 JSON 转义，未来新增含引号/井号/冒号的描述才不会被
+// 解析门静默改写（只证明「仍可解析」不足以守住语义）。
+func TestBuildOpenAPIYAML_errorDescriptionRoundTrip(t *testing.T) {
+	openAPI := buildOpenAPIYAML()
+	var document struct {
+		Paths map[string]map[string]struct {
+			Responses map[string]struct {
+				Description string `yaml:"description"`
+				Content     map[string]struct {
+					// 示例既可能是 JSON 对象，也可能是纯文本/二进制说明
+					// （TXT/lbbak/302 指引），不能强约束为 map。
+					Example any `yaml:"example"`
+				} `yaml:"content"`
+			} `yaml:"responses"`
+		} `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal([]byte(openAPI), &document); err != nil {
+		t.Fatalf("parse generated OpenAPI YAML: %v", err)
+	}
+	checked := 0
+	for _, route := range apiDocRoutes {
+		// 与发射链同源：导入窗口 409 是派生注入的，期望值也必须包含派生结果。
+		route = withDerivedImportWindowError(route)
+		if len(route.Errors) == 0 {
+			continue
+		}
+		path := apipath.ToOpenAPI(route.Path)
+		operation, ok := document.Paths[path][strings.ToLower(route.Method)]
+		if !ok {
+			t.Fatalf("missing operation %s %s", route.Method, path)
+		}
+		var order []string
+		descriptions := map[string][]string{}
+		for _, entry := range route.Errors {
+			parts := strings.SplitN(entry, " ", 2)
+			if _, seen := descriptions[parts[0]]; !seen {
+				order = append(order, parts[0])
+			}
+			description := "错误"
+			if len(parts) == 2 {
+				description = parts[1]
+			}
+			descriptions[parts[0]] = append(descriptions[parts[0]], description)
+		}
+		for _, status := range order {
+			want := strings.Join(descriptions[status], " / ")
+			response, ok := operation.Responses[status]
+			if !ok {
+				t.Fatalf("%s %s missing response %s", route.Method, path, status)
+			}
+			if response.Description != want {
+				t.Fatalf("%s %s %s description=%q, want %q（错误描述被 YAML 改写）", route.Method, path, status, response.Description, want)
+			}
+			example := response.Content["application/json"].Example
+			// 部分错误响应示例是纯文本（TXT/lbbak/302 说明），没有 message 键；
+			// 只有结构化 JSON 示例才校验 message 与描述一致。
+			if envelope, ok := example.(map[string]any); ok {
+				message, _ := envelope["message"].(string)
+				if message != want {
+					t.Fatalf("%s %s %s example message=%q, want %q（JSON 示例转义不一致）", route.Method, path, status, message, want)
+				}
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("未校验任何错误响应")
+	}
+}
+
+// 降级语义必须文档化：partial 覆盖 display_name 富化失败；next_run_at 未启用
+// 时为 null（客户端不得按恒时间串解析）。
+func TestAPIDocRoutes_degradedSemanticsDocumented(t *testing.T) {
+	audit := routesEntry(t, "GET /audit-logs").Description
+	for _, want := range []string{"display_name", "partial"} {
+		if !strings.Contains(audit, want) {
+			t.Errorf("GET /audit-logs description 未说明 %q 的降级语义: %q", want, audit)
+		}
+	}
+	backup := routesEntry(t, "GET /settings/auto-backup").Description
+	if !strings.Contains(backup, "next_run_at") || !strings.Contains(backup, "null") {
+		t.Errorf("GET /settings/auto-backup description 未说明 next_run_at 可能为 null: %q", backup)
+	}
+}

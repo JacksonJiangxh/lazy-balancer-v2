@@ -2169,6 +2169,37 @@ func TestSyncFailureAudit_throttlesIdenticalFailuresAndRerecords(t *testing.T) {
 	}
 }
 
+// 多类别交替失败（安全数据失败与重载失败同轮先后出现）时每类仍只写一条：
+// 单槽键在 A→B→A→B 交替下每轮各记一条，按类别记键后互不干扰。
+func TestSyncFailureAudit_throttlesAlternatingCategoriesIndependently(t *testing.T) {
+	newClusterTestService(t)
+	sync := NewSyncService(nil, nil, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	auditDB := db.AuditDB
+
+	record := func(action, category, detail string) {
+		if sync.syncFailureAuditDue(action, category, detail) {
+			RecordAuditLog("system", action, category, detail, "")
+		}
+	}
+	for range 3 {
+		record("同步失败", "安全数据", "拉取安全数据失败: x")
+		record("重载失败", "Caddy服务", "同步应用后自动重载失败: y")
+	}
+	if got := countAuditRows(t, auditDB, "同步失败", "安全数据"); got != 1 {
+		t.Fatalf("alternating security data failures wrote %d audit rows, want 1", got)
+	}
+	if got := countAuditRows(t, auditDB, "重载失败", "Caddy服务"); got != 1 {
+		t.Fatalf("alternating reload failures wrote %d audit rows, want 1", got)
+	}
+
+	// 同类别内容变化仍重记（节流只抑制同一失败内容）。
+	record("同步失败", "安全数据", "拉取安全数据失败: y")
+	if got := countAuditRows(t, auditDB, "同步失败", "安全数据"); got != 2 {
+		t.Fatalf("changed security data failure rows=%d, want 2", got)
+	}
+}
+
 // 集成面：主节点持续返回签名无效快照时，两轮 Pull 只写一条审计。
 func TestSyncService_Pull_throttlesRepeatedIntegrityFailureAudit(t *testing.T) {
 	_, database := newClusterTestService(t)

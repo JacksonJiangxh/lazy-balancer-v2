@@ -15,9 +15,10 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// （drain 失败分支）：降级竞态下 Stop 已清空 blockedRules 后 block 才创建，
-// drain 失败且补偿无法启动（manager 已停止）时租约必须当场释放——否则节点重新
-// 提升后该规则的证书任务被屏障永久拦截，静默停发直到下一次 Stop。
+// 删除规则的租约释放（drain 失败分支）：降级竞态下 Stop 已清空 blockedRules
+// 后 block 才创建，drain 失败且补偿无法启动（manager 已停止）时租约必须当场
+// 释放——否则节点重新提升后该规则的证书任务被屏障永久拦截，静默停发直到下一
+// 次 Stop。
 func TestDeleteRule_releases_block_lease_when_compensation_start_fails_on_drain_failure(t *testing.T) {
 	// Given：一条规则 + 已停止（模拟 BecomeSlave 完成降级）的 CA 队列管理器，
 	// drain 被强制失败，使 StartRuleDeletionCompensation 命中 stopped 拒绝分支。
@@ -200,8 +201,9 @@ func TestImportConfigBackup_accepts_valid_security_policy_bindings(t *testing.T)
 	}
 }
 
-// rule_caddy_id，与 upstreams/path_rules/cert_jobs 的 rule_id 不同）必须一并
-// 跳过——skip 先于 validateBackupRuleReferences 执行，绑定若不随规则移除会命中
+// 空域名规则的策略绑定（列名 rule_caddy_id，与 upstreams/path_rules/cert_jobs
+// 的 rule_id 不同）必须一并跳过——skip 先于 validateBackupRuleReferences 执行，
+// 绑定若不随规则移除会命中
 // 「引用了不存在的规则」整包 400，与 「软跳过+警告」语义冲突。
 func TestImportConfigBackup_skips_bindings_of_empty_domain_rules(t *testing.T) {
 	// Given：一条空域名 HTTP 规则带绑定，一条正常规则带绑定

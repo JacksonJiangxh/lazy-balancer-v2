@@ -74,16 +74,18 @@ func lockIPListLoad(path string) func() {
 	}
 }
 
-// MaxFileBytes / MaxEntries 是加载侧体积与条目的硬上限（防异常文件拖垮
-// 内存；威胁库下载侧 200000 条上限先行拦截，此为纵深）。测试可收窄。
+// maxFileBytes / maxEntries 是加载侧体积与条目的硬上限（防异常文件拖垮
+// 内存；威胁库下载侧 200000 条上限先行拦截，此为纵深）。包内可调（仅同包
+// 测试收窄），不构成跨模块契约：加载上限是内部不变量。
 var (
-	MaxFileBytes int64 = 64 << 20
-	MaxEntries         = 1_000_000
+	maxFileBytes int64 = 64 << 20
+	maxEntries         = 1_000_000
 )
 
 // StatCheckInterval 是 Evaluate 侧复查文件 mtime/size 的最小间隔（默认 1s）。
 // 正常变更路径（策略保存/威胁库更新）都会触发 Caddy 重载重建算子实例，
 // 本节流只兜底带外文件改动的感知时延；0=每次都 stat（测试用）。
+// 非契约（导出仅为跨模块测试装配收窄）：生产消费方无读取需求，勿依赖。
 var StatCheckInterval = time.Second
 
 // OnStaleServe 是 fail-stale 事件的观测钩子（运维可见性）：文件被删/重建
@@ -102,9 +104,9 @@ var OnListUnavailableServe = func(path string, err error) {
 	log.Printf("WARNING: IP 名单 %q 不可读且无缓存集合，本次判定按未命中处理（等待文件恢复或重载）: %v", path, err)
 }
 
-// StaleServeLogInterval 是同一路径同类上报的最小间隔（默认 1 分钟；
+// staleServeLogInterval 是同一路径同类上报的最小间隔（默认 1 分钟；
 // 0=不节流，测试用）。恢复成功后清除节流记录——再次故障即时上报。
-var StaleServeLogInterval = time.Minute
+var staleServeLogInterval = time.Minute
 
 // staleReports.last 的键是 "kind|path"：fail-stale 与「无缓存不可读」各自
 // 独立节流（同路径可能先不可读后回退到旧集合）。
@@ -119,10 +121,10 @@ func reportServeThrottled(kind, path string, err error, hook func(string, error)
 		return
 	}
 	key := kind + "|" + path
-	if StaleServeLogInterval > 0 {
+	if staleServeLogInterval > 0 {
 		now := monotonicNowNano()
 		staleReports.Lock()
-		if last, ok := staleReports.last[key]; ok && time.Duration(now-last) < StaleServeLogInterval {
+		if last, ok := staleReports.last[key]; ok && time.Duration(now-last) < staleServeLogInterval {
 			staleReports.Unlock()
 			return
 		}
@@ -140,6 +142,14 @@ func reportStaleServe(path string, err error) {
 // reportListUnavailableServe 按路径节流后调用 OnListUnavailableServe。
 func reportListUnavailableServe(path string, err error) {
 	reportServeThrottled("unavailable", path, err, OnListUnavailableServe)
+}
+
+// ReportListUnavailable 是「名单不可读且无缓存集合」的显式上报入口：供已
+// 自行归一化路径的消费方（http.ip_sources.lb_file 的 GetIPRanges）在契约
+// 要求「运行期 MUST NOT fail」时仍留下状态迁移痕迹。节流/恢复语义与
+// Evaluate 内部路径同源。
+func ReportListUnavailable(path string, err error) {
+	reportListUnavailableServe(path, err)
 }
 
 // clearStaleReport 清除路径的全部节流记录（成功加载后调用）。
@@ -207,12 +217,34 @@ func NormalizeAllowedPath(path string) (string, error) {
 // 形态），因此不再对原始串做 contains("..")——那会误拒文件名合法的
 // `a..b.txt`，且错误信息误导排查。算子与导出入口（LoadPrefixesFresh/
 // NormalizeAllowedPath）共用单源。
+//
+// 符号链接硬化：Clean+前缀只能防 `..` 穿越，白名单内的 symlink 仍可指向
+// 白名单外（如 /app/waf/x.txt -> /etc/passwd）。本函数只在构建期/装配期
+// （Provision、算子构建）与热路径之外调用，故在此做一次 EvalSymlinks：
+// 解引用后必须仍落在白名单内。白名单前缀本身也解引用，兼容 data_dir 位于
+// symlink 路径下的部署（如 macOS /var → /private/var）；文件尚不存在时
+// 跳过（首次投影前），由加载路径按缺失 fail-closed。
 func resolveAllowedPath(path string) (string, error) {
 	cleaned := filepath.Clean(path)
 	if !filepath.IsAbs(cleaned) || !strings.HasPrefix(cleaned, AllowedPathPrefix) {
 		return "", fmt.Errorf("名单路径越出白名单（须为 %s 下的绝对路径）: %q", AllowedPathPrefix, path)
 	}
+	if resolved, rerr := filepath.EvalSymlinks(cleaned); rerr == nil {
+		resolvedPrefix, perr := filepath.EvalSymlinks(strings.TrimSuffix(AllowedPathPrefix, string(filepath.Separator)))
+		if perr == nil && !pathWithinPrefix(resolved, AllowedPathPrefix) && !pathWithinPrefix(resolved, resolvedPrefix) {
+			return "", fmt.Errorf("名单路径经符号链接越出白名单（须为 %s 下的绝对路径）: %q → %q", AllowedPathPrefix, path, resolved)
+		}
+	}
 	return cleaned, nil
+}
+
+// pathWithinPrefix 报告 path 是否位于 prefix 目录内（prefix 缺尾分隔符时补齐，
+// 防 /app/wafevil 被当作 /app/waf 的子路径）。
+func pathWithinPrefix(path, prefix string) bool {
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	return strings.HasPrefix(path, prefix)
 }
 
 func newIPListFast(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
@@ -321,8 +353,8 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 	if err != nil {
 		return staleOrError(path, nil, fmt.Errorf("IP 名单不可读 %q: %w", path, err), fresh)
 	}
-	if info.Size() > MaxFileBytes {
-		return staleOrError(path, nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20), fresh)
+	if info.Size() > maxFileBytes {
+		return staleOrError(path, nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, maxFileBytes>>20), fresh)
 	}
 	ipListCache.RLock()
 	cached := ipListCache.states[path]
@@ -493,10 +525,10 @@ func readBoundedFrom(src boundedReadSource, name string, maxBytes int64) ([]byte
 // 与 (mtime,size) 必属同一代际，缓存命中判据不会把上一代的 stat 形态贴到新内容上。
 func parseIPListFile(path string) (*ipListFileState, error) {
 	parseCountForTest.Add(1)
-	raw, info, err := ReadBoundedFile(path, MaxFileBytes)
+	raw, info, err := ReadBoundedFile(path, maxFileBytes)
 	switch {
 	case errors.Is(err, ErrFileSizeLimit):
-		return nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20)
+		return nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, maxFileBytes>>20)
 	case errors.Is(err, ErrFileRewriteDuringRead):
 		// 只比 size 不够：同尺寸原位改写 size 不变，必须同时复核 mtime
 		// （ipListGenerationChanged）——本次放弃，下次复查重建。
@@ -504,14 +536,14 @@ func parseIPListFile(path string) (*ipListFileState, error) {
 	case err != nil:
 		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
 	}
-	// 容量预估：平均每条约 12 字节，封顶 MaxEntries+1（超限在追加处拦截）。
+	// 容量预估：平均每条约 12 字节，封顶 maxEntries+1（超限在追加处拦截）。
 	capHint := len(raw)/12 + 1
-	if capHint > MaxEntries+1 {
-		capHint = MaxEntries + 1
+	if capHint > maxEntries+1 {
+		capHint = maxEntries + 1
 	}
 	prefixes := make([]netip.Prefix, 0, capHint)
 	// 直接在原始字节上按行迭代（bytes.IndexByte + TrimSpace），
-	// 不再整文件复制成 string（MaxFileBytes 64MB 上限时 raw+string 双份常驻
+	// 不再整文件复制成 string（maxFileBytes 64MB 上限时 raw+string 双份常驻
 	// =2× 文件体积峰值）；仅实际条目行短生命周期转 string 供 ParseIPEntry，
 	// 空行/注释行零分配跳过。
 	for lineNo, start := 1, 0; start <= len(raw); lineNo++ {
@@ -531,8 +563,8 @@ func parseIPListFile(path string) (*ipListFileState, error) {
 			return nil, fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo, line)
 		}
 		prefixes = append(prefixes, prefix)
-		if len(prefixes) > MaxEntries {
-			return nil, fmt.Errorf("IP 名单 %q 条目数超过上限 %d", path, MaxEntries)
+		if len(prefixes) > maxEntries {
+			return nil, fmt.Errorf("IP 名单 %q 条目数超过上限 %d", path, maxEntries)
 		}
 	}
 	// 空文件合法（2026-10-15 始终发射收敛）：渲染层空名单投影 0 字节空文件，

@@ -772,15 +772,22 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			if cert.SourceStatus != "" {
 				message += "，源任务状态：" + cert.SourceStatus
 			}
-			// 到期口径收敛：源值优先；源值缺失（旧主节点/旧备份行）时从
-			// 证书材料派生并回填 expires_at。否则本地行 expires_at 恒 NULL，
-			// 而聚合消费面（节点健康 certs_expiring_30d）以该列为门，会漏报
-			// 真正临期的证书；/certificates 与 /certificates/jobs 也会对同一行
-			// 给出「空/有」两种结论。
+			// 到期口径收敛：源值优先；源值缺失或**不可被消费侧解析**（旧主节点/
+			// 旧备份行、带外直写异常形态）时从证书材料派生并回填 expires_at。
+			// 否则本地行 expires_at 对聚合口径恒 NULL，而聚合消费面（节点健康
+			// certs_expiring_30d）以 datetime(expires_at) 为门，会漏报真正临期的
+			// 证书；/certificates 与 /certificates/jobs 也会对同一行给出「空/有」
+			// 两种结论。仅「空值」判定留过缺口：非空坏值同样落 NULL 却不派生。
 			expiresAt := cert.ExpiresAt
-			if expiresAt == "" && cert.CertPEM != "" {
-				if notAfter, ok := CertNotAfterFromPEM(cert.CertPEM); ok {
-					expiresAt = notAfter.UTC().Format(crsTimeLayout)
+			if !snapshotExpiresAtUsable(expiresAt) {
+				// 空串与不可解析形态都按「源值缺失」处理：不可解析串落库后
+				// datetime(expires_at)=NULL，与空值在消费侧等价，但对读侧行值
+				// 是垃圾——显式归 NULL，派生成功则改用材料口径。
+				expiresAt = ""
+				if cert.CertPEM != "" {
+					if notAfter, ok := CertNotAfterFromPEM(cert.CertPEM); ok {
+						expiresAt = notAfter.UTC().Format(crsTimeLayout)
+					}
 				}
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'') FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(expiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.CreatedAt, cert.UpdatedAt, cert.RuleID); err != nil {
@@ -1118,11 +1125,11 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, row := range threatSources {
-			updateStatus, message := normalizeSnapshotUpdateStatus(row["update_status"], row["message"])
+			updateStatus, message, finishedAt := normalizeSnapshotTaskState(row["update_status"], row["message"], row["last_checked"], row["finished_at"])
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_threat_sources (id,name,display_name,url,format,update_enabled,apply_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["apply_enabled"], row["entry_count"], row["version"], updateStatus, message,
 				snapshotNullableDatetime(row["last_checked"]), snapshotNullableDatetime(row["next_update"]), row["trigger"],
-				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(row["finished_at"]),
+				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(finishedAt),
 				row["consecutive_failures"], row["created_at"], row["updated_at"]); err != nil {
 				return fmt.Errorf("写入威胁库源行: %w", err)
 			}
@@ -1141,11 +1148,11 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, row := range crawlerSources {
-			updateStatus, message := normalizeSnapshotUpdateStatus(row["update_status"], row["message"])
+			updateStatus, message, finishedAt := normalizeSnapshotTaskState(row["update_status"], row["message"], row["last_checked"], row["finished_at"])
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_crawler_sources (id,name,display_name,url,format,update_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["entry_count"], row["version"], updateStatus, message,
 				snapshotNullableDatetime(row["last_checked"]), snapshotNullableDatetime(row["next_update"]), row["trigger"],
-				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(row["finished_at"]),
+				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(finishedAt),
 				row["consecutive_failures"], row["created_at"], row["updated_at"]); err != nil {
 				return fmt.Errorf("写入爬虫地址库源行: %w", err)
 			}
@@ -1383,14 +1390,41 @@ func snapshotActiveUpdateStatus(status string) bool {
 	return IsActiveCRSStatus(status) || IsActiveIP2RegionStatus(status) || status == "running"
 }
 
-// normalizeSnapshotUpdateStatus 把 JSON 行载荷中的活动态归一为 failed，
-// 非活动态原样返回（保持源值优先）。
-func normalizeSnapshotUpdateStatus(status, message any) (any, any) {
+// normalizeSnapshotTaskState 归一从主端快照搬运的活动态任务行：
+// status→failed、message→来源说明、finished_at→主端最后检查时刻。
+// 非活动态三列原样返回（保持源值，含 nil 与自定义文案）。
+//
+// 活动态行在主端本无结束时间；只改状态与文案会让落库行呈现「已失败但
+// finished_at 为空」，任务监控的耗时统计按当前时刻计算并持续增长，升主后
+// 残留的 started_at 也会串味。以主端 last_checked（该活动态最后一次被
+// 观测的时刻）作为结束时间；缺失时才回退源 finished_at。
+func normalizeSnapshotTaskState(status, message, lastChecked, finishedAt any) (any, any, any) {
 	text, _ := status.(string)
 	if !snapshotActiveUpdateStatus(text) {
-		return status, message
+		return status, message, finishedAt
 	}
-	return "failed", snapshotActiveUpdateStatusMessage
+	if snapshotDatetimePresent(lastChecked) {
+		return "failed", snapshotActiveUpdateStatusMessage, lastChecked
+	}
+	return "failed", snapshotActiveUpdateStatusMessage, finishedAt
+}
+
+// snapshotDatetimePresent 判定快照载荷时间列是否有值（nil/空白串=无值）。
+func snapshotDatetimePresent(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	}
+	return true
+}
+
+// snapshotDatetimeText 把归一结果按字符串形态交给 nullableString（版本行
+// 参数为字符串列）。
+func snapshotDatetimeText(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 // applyRuleLibVersionRows 全量替换写入一张版本表（先清后插由调用方负责）。
@@ -1399,18 +1433,13 @@ func applyRuleLibVersionRows(ctx context.Context, tx *sql.Tx, table string, rows
 	for _, row := range rows {
 		// 活动态（checking/downloading/installing/reloading）只属于执行该
 		// 任务的进程；从节点不运行该任务，落到本地的活动态是主端镜像且
-		// 永不收敛 → 归一并解释来源。
-		updateStatus := row.UpdateStatus
-		message := row.Message
-		if snapshotActiveUpdateStatus(updateStatus) {
-			updateStatus = "failed"
-			message = snapshotActiveUpdateStatusMessage
-		}
+		// 永不收敛 → 归一（含结束时间）并解释来源。
+		updateStatus, message, finishedAt := normalizeSnapshotTaskState(row.UpdateStatus, row.Message, row.LastChecked, row.FinishedAt)
 		// schedule_days/schedule_time 随版本行全量替换
 		// 落库（升主即生效）；空串来源=旧主端快照缺列，读取端 normalizeScheduleRow
 		// 回落默认，与 NOT NULL 约束兼容。
 		if _, err := tx.ExecContext(ctx, statement, row.ID, row.Version, nullableString(row.UpdatedAt), row.AutoUpdate, updateStatus, message,
-			nullableString(row.LastChecked), nullableString(row.NextUpdate), nullableString(row.Trigger), nullableString(row.StartedAt), nullableString(row.FinishedAt),
+			nullableString(row.LastChecked), nullableString(row.NextUpdate), nullableString(row.Trigger), nullableString(row.StartedAt), nullableString(snapshotDatetimeText(finishedAt)),
 			row.ScheduleDays, row.ScheduleTime); err != nil {
 			return fmt.Errorf("写入快照 %s 版本 %d: %w", table, row.ID, err)
 		}
@@ -1539,6 +1568,9 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 			return fmt.Errorf("写入快照规则 %s: %w", rule.CaddyID, err)
 		}
 		for _, upstream := range rule.Upstreams {
+			// 上游传输归一（单一事实源，与主端导出同函数）：落库值与导出
+			// canonical 必须同形，否则 rules 节哈希主从恒不等。
+			normalizeUpstreamForTransport(&upstream, rule.Protocol)
 			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain) VALUES (?,?,?,?,?,?,?,?,?,?)`, upstream.ID, rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight, false /* dynamic_dns 废弃列：落库恒 0 */, upstream.Enabled, upstream.Protocol, upstream.MaxConnections, upstream.OriginDomain); err != nil {
 				return fmt.Errorf("写入快照上游 %s: %w", rule.CaddyID, err)
 			}
@@ -1882,6 +1914,14 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
+}
+
+// snapshotExpiresAtUsable 判定快照到期串能否被消费侧口径解析（SQLite
+// datetime() 接受的两种落库形态，与 parseUTCSlot 同源）。空串与不可解析形态
+// 都视为「源值缺失」，由证书材料派生——否则该行在聚合口径下恒 NULL
+// （datetime(坏值)=NULL），节点健康的临期证书统计会静默漏行。
+func snapshotExpiresAtUsable(value string) bool {
+	return !parseUTCSlot(value).IsZero()
 }
 
 // snapshotNullableDatetime 快照可空时间列的 any 入口（dumpTableAsJSON 行值

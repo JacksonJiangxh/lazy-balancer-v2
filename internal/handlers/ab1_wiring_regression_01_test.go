@@ -1,11 +1,11 @@
 package handlers
 
-// 走单一入口——
+// 自动封禁的解封与清桶必须走单一入口——
 //  1. 预置名单两条解封路径（remove-ip 端点、差集全量保存）必须调用
 //     services.AutobanForgetIPs（机制侧行为由 services 层
 //     TestAutobanForgetIPs_deleteThenNoNewEventsNoReban 钉死，本钉测锁定调用
 //     点不旁路：securityiplists.go 源扫描恰 2 次）；
-//     唯一生产入口 importConfigBackupCore（HTTP 导入+自动备份还原双面共用）
+//  2. 唯一生产入口 importConfigBackupCore（HTTP 导入+自动备份还原双面共用）
 //     必须在 commit 成功后调用 services.ResetAutobanCounters（Ruling：全量替换
 //     语义下整体清桶，差集 ForgetIPs 不更正确——见
 //     config_backup_autoban_r77_test.go 头注），且调用点在 session.commit 之后。
@@ -35,7 +35,7 @@ func TestAutobanUnban_bucketClearWiringPinned(t *testing.T) {
 	}
 }
 
-// 钉——config_backup.go 恰 1 处 services.ResetAutobanCounters，且位于
+// 清桶调用点钉测——config_backup.go 恰 1 处 services.ResetAutobanCounters，且位于
 // session.commit 调用点之后（commit 前/失败路径清桶=回滚后观察态被误清）。
 func TestAutobanImportReset_wiringPinned(t *testing.T) {
 	src, err := os.ReadFile("config_backup.go")

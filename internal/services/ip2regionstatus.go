@@ -45,12 +45,13 @@ func ip2RegionStoredStatusSnapshot() IP2RegionUpdateStatusSnapshot {
 	if !ok {
 		return IP2RegionUpdateStatusSnapshot{Status: string(IP2RegionStatusIdle)}
 	}
+	status, message := ProjectActiveUpdateStatusForLocalRole(row.status, row.message)
 	return IP2RegionUpdateStatusSnapshot{
-		Status:     row.status,
+		Status:     status,
 		Trigger:    row.trigger,
 		StartedAt:  row.startedAt,
 		FinishedAt: row.finishedAt,
-		Message:    row.message,
+		Message:    message,
 		Version:    row.version,
 	}
 }

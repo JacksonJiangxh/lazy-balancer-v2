@@ -14,7 +14,7 @@ import {
   entriesIntersect,
 } from '../src/utils/securityStages.ts'
 import { CADDY_APPLY_FAILED_MARKER, mergeBulkResults } from '../src/utils/bulkApplyResult.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { code, repoCode, section } from './_helpers.ts'
 
 test('A1 分片：按上限切分且保持原顺序（策略绑定 100 / 批量拦截页 500）', () => {
   const bindings = Array.from({ length: 250 }, (_, i) => `lb_${i}`)
@@ -56,7 +56,7 @@ test('A4 分片请求按方向独立提交：每片对向数组为空且两向�
     },
   ] as const
   for (const { file, start, end } of consumers) {
-    const body = section(source(file), start, end)
+    const body = section(code(file), start, end)
     const requests = [...body.matchAll(/bind: ([^,}\n]+),\s*unbind: ([^,}\n]+)/g)]
     assert.equal(requests.length, 2, `${file}: 必须恰好两处批量请求（bind 一片源、unbind 一片源）`)
     for (const match of requests) {
@@ -120,7 +120,7 @@ test('C3 分片响应：无退化时保持末片文案；空输入返回 undefin
 // 上限不得钉字面量：后端常量调整后前端镜像必须同批跟随，否则 UI 放行 9 条、
 // 后端 400 拒收（或反之静默截断）。直接读 Go 声明对表。
 test('D1 绑定上限单源：与后端 maxBindingsPerRule 同值', () => {
-  const go = repoSource('internal/handlers/security.go')
+  const go = repoCode('internal/handlers/security.go')
   const declared = /^const maxBindingsPerRule = (\d+)$/m.exec(go)
   assert.ok(declared, '后端缺 maxBindingsPerRule 常量声明')
   assert.equal(MAX_POLICIES_PER_RULE, Number(declared[1]), '前端 MAX_POLICIES_PER_RULE 与后端上限漂移')
@@ -130,13 +130,13 @@ test('D1 绑定上限单源：与后端 maxBindingsPerRule 同值', () => {
 // 上限时整批 400 且重试同败；小于后端上限则浪费往返。三常量（批量绑定 /
 // 单策略批量绑定 / 批量拦截页）逐一对表。
 test('D2 分片上限单源：与后端批量端点三常量同值', () => {
-  const security = repoSource('internal/handlers/security.go')
+  const security = repoCode('internal/handlers/security.go')
   const batchBind = /^const maxBatchBindRules = (\d+)$/m.exec(security)
   const bulkBindings = /const maxBulkBindings = (\d+)/.exec(security)
   assert.ok(batchBind && bulkBindings, '后端缺批量绑定上限常量声明')
   assert.equal(SECURITY_BULK_LIMITS.policyBindings, Number(bulkBindings[1]), 'policyBindings 与 maxBulkBindings 漂移')
   assert.equal(SECURITY_BULK_LIMITS.policyBindings, Number(batchBind[1]), 'policyBindings 与 maxBatchBindRules 漂移')
-  const rules = repoSource('internal/handlers/rules.go')
+  const rules = repoCode('internal/handlers/rules.go')
   const blockPages = /const maxBatchRuleBlockPages = (\d+)/.exec(rules)
   assert.ok(blockPages, '后端缺批量拦截页上限常量声明')
   assert.equal(SECURITY_BULK_LIMITS.ruleBlockPages, Number(blockPages[1]), 'ruleBlockPages 与 maxBatchRuleBlockPages 漂移')
@@ -145,7 +145,7 @@ test('D2 分片上限单源：与后端批量端点三常量同值', () => {
 // 退化后缀判定单源：名单直接动作（useTrustAssociation 三侧快捷处置）与批量
 // 合并共用同一标记常量——字面量复制会在文案调整时静默失配（后缀不再常驻）。
 test('退化后缀判定单源：名单直接动作不复制字面量', () => {
-  const composable = source('src/composables/useTrustAssociation.ts')
+  const composable = code('src/composables/useTrustAssociation.ts')
   assert.match(composable, /import \{ CADDY_APPLY_FAILED_MARKER \} from '@\/utils\/bulkApplyResult'/)
   assert.doesNotMatch(composable, /['"]Caddy 配置应用失败['"]/, '不得复制退化后缀字面量')
 })

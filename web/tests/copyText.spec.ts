@@ -172,7 +172,11 @@ test('echarts 全站单一注册点：只有 utils/echarts 引内核，三页面
     if (!/\.(?:ts|vue)$/.test(file.pathname)) continue
     const relative = file.pathname.slice(srcRoot.pathname.length)
     const text = stripComments(readFileSync(file, 'utf8'))
-    if (/from ['"]echarts\//.test(text) && relative !== 'utils/echarts.ts') offenders.push(relative)
+    // 裸包名 import 等价于引入全量内核（守卫此前只匹配 echarts/ 子路径）。
+    // `import type` 在编译期擦除、不进入运行期注册面，故只对非 type 的
+    // 单行 import 断言（多行类型导入不会误报）。
+    const runtimeEchartsImport = /^\s*import\s+(?!type\b)[^;\n]*?from\s+['"]echarts(?:\/|['"])/m
+    if (runtimeEchartsImport.test(text) && relative !== 'utils/echarts.ts') offenders.push(relative)
   }
   assert.deepEqual(offenders, [], '内核 import 只允许出现在 utils/echarts.ts（注册面随路由漂移会静默缺序列）')
 

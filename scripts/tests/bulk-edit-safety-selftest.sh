@@ -147,4 +147,41 @@ if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-partial.out 2>&1; then
   echo "SELFTEST FAIL: 部分暂存时未暂存事故形态未拦截"; cat /tmp/bulk-partial.out; exit 1
 fi
 
+# 8) 遍历特征不含 find/for 的等价事故写法：git ls-files | xargs + 写盘 -i
+#    （无 dry-run）必须同样拦下——只认 find/for 会让第一道闸门漏检该形态。
+mk_repo "$work/xargs-ls-files"
+cat > scripts/rewrite.sh <<'SH'
+git ls-files -z '*.go' | xargs -0 perl -pi -e 's/\(\)//g'
+SH
+chmod +x scripts/rewrite.sh
+git add -A && git commit -qm base
+if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-lsfiles.out 2>&1; then
+  echo "SELFTEST FAIL: git ls-files | xargs 批量写形态未拦截"; cat /tmp/bulk-lsfiles.out; exit 1
+fi
+if ! grep -q '缺少 --dry-run' /tmp/bulk-lsfiles.out; then
+  echo "SELFTEST FAIL: git ls-files | xargs 形态命中原因错误"; cat /tmp/bulk-lsfiles.out; exit 1
+fi
+
+# 9) 多提交变更集：中段提交做批量删括号、末段提交只加注释。干净树默认只看
+#    HEAD^..HEAD（假绿），必须能由 BULK_EDIT_RANGE 显式指定范围抓到。
+mk_repo "$work/range"
+for i in $(seq 1 200); do printf 'func f%s() { return g%s() }\n' "$i" "$i"; done > a.go
+git add -A && git commit -qm base
+sed -e 's/()//g' a.go > a.go.tmp && mv a.go.tmp a.go
+git add -A && git commit -qm "batch delete parens"
+printf '// trailing comment\n' >> a.go
+git add -A && git commit -qm "comment only"
+if ! bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-range-default.out 2>&1; then
+  echo "SELFTEST FAIL: 干净树默认只看末条提交时不应命中（夹具前提不成立）"; cat /tmp/bulk-range-default.out; exit 1
+fi
+if ! grep -q '仅检查最近一条提交' /tmp/bulk-range-default.out; then
+  echo "SELFTEST FAIL: 干净树未明示「仅检查最近一条提交」的边界"; cat /tmp/bulk-range-default.out; exit 1
+fi
+if BULK_EDIT_RANGE=HEAD~2..HEAD bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-range-out.out 2>&1; then
+  echo "SELFTEST FAIL: BULK_EDIT_RANGE 指定的中段批量删括号未拦截"; cat /tmp/bulk-range-out.out; exit 1
+fi
+if ! grep -q 'BULK_EDIT_RANGE 显式范围' /tmp/bulk-range-out.out; then
+  echo "SELFTEST FAIL: 显式范围命中原因未标注范围来源"; cat /tmp/bulk-range-out.out; exit 1
+fi
+
 echo "bulk-edit safety selftest: PASS"

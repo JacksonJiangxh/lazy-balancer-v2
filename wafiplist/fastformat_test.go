@@ -406,12 +406,12 @@ func TestFastFile_UnmaskedEntriesRejected(t *testing.T) {
 
 // ReadFastFile 对跨进程.fast 输入必须先过 Stat
 // 体积门再读字节——异常/恶意超大文件不得在读取阶段就拖垮内存（文本名单
-// 路径已有 MaxFileBytes 同型硬上限，iplistfast.go:249-250）。
+// 路径已有 maxFileBytes 同型硬上限，iplistfast.go:249-250）。
 func TestFastFile_ReadSizeCap(t *testing.T) {
 	dir := t.TempDir()
-	old := MaxFastFileBytes
-	MaxFastFileBytes = 4096
-	t.Cleanup(func() { MaxFastFileBytes = old })
+	old := maxFastFileBytes
+	maxFastFileBytes = 4096
+	t.Cleanup(func() { maxFastFileBytes = old })
 
 	// 超限文件：内容本身合法（写侧产物拼接填充无所谓——体积门先于内容解析）。
 	bigPath := filepath.Join(dir, "big.fast")
@@ -478,9 +478,9 @@ func TestFastFile_4in6InV6SectionRejected(t *testing.T) {
 // 64MiB 文件可声明 1300 万条并展开成数百 MiB 前缀集。
 func TestFastFile_ReadEntryCap(t *testing.T) {
 	dir := t.TempDir()
-	old := MaxFastEntries
-	MaxFastEntries = 3
-	t.Cleanup(func() { MaxFastEntries = old })
+	old := maxFastEntries
+	maxFastEntries = 3
+	t.Cleanup(func() { maxFastEntries = old })
 
 	// 小型 + 巨量计数：体积远低于上限，必须在分配前被条目门拒绝。
 	hugePath := filepath.Join(dir, "huge-count.fast")
@@ -528,7 +528,7 @@ func TestFastFile_ReadEntryCap(t *testing.T) {
 	}
 }
 
-// 写侧自证读侧上限：越过 MaxFastEntries / MaxFastFileBytes 的产物读侧必然
+// 写侧自证读侧上限：越过 maxFastEntries / maxFastFileBytes 的产物读侧必然
 // 拒收——写出来只会得到「写成功、读失败」的名单。写侧必须显式报错且不落盘，
 // 上限恢复后同一输入可写出并被 ReadFastFile 接受（读侧实证）。
 func TestWriteFastFile_selfEnforcesReadCaps(t *testing.T) {
@@ -541,29 +541,29 @@ func TestWriteFastFile_selfEnforcesReadCaps(t *testing.T) {
 	}
 	path := filepath.Join(t.TempDir(), "caps.fast")
 
-	oldEntries := MaxFastEntries
-	t.Cleanup(func() { MaxFastEntries = oldEntries })
-	MaxFastEntries = 4
+	oldEntries := maxFastEntries
+	t.Cleanup(func() { maxFastEntries = oldEntries })
+	maxFastEntries = 4
 	if err := WriteFastFile(path, prefixes, nil); err == nil {
-		t.Fatal("超出 MaxFastEntries 的写入必须被拒绝（读侧必然拒收）")
+		t.Fatal("超出 maxFastEntries 的写入必须被拒绝（读侧必然拒收）")
 	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 		t.Fatalf("被拒绝的写入不得落盘: stat err=%v", statErr)
 	}
 
-	MaxFastEntries = oldEntries
-	oldBytes := MaxFastFileBytes
-	t.Cleanup(func() { MaxFastFileBytes = oldBytes })
-	MaxFastFileBytes = 32
+	maxFastEntries = oldEntries
+	oldBytes := maxFastFileBytes
+	t.Cleanup(func() { maxFastFileBytes = oldBytes })
+	maxFastFileBytes = 32
 	if err := WriteFastFile(path, prefixes, nil); err == nil {
-		t.Fatal("超出 MaxFastFileBytes 的写入必须被拒绝（读侧必然拒收）")
+		t.Fatal("超出 maxFastFileBytes 的写入必须被拒绝（读侧必然拒收）")
 	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 		t.Fatalf("被拒绝的写入不得落盘: stat err=%v", statErr)
 	}
 
 	// 上限恢复：同一输入可写出，且读侧接受（证明拒绝理由确实是上限而非输入）。
-	MaxFastFileBytes = oldBytes
+	maxFastFileBytes = oldBytes
 	if err := WriteFastFile(path, prefixes, nil); err != nil {
 		t.Fatalf("上限恢复后写入失败: %v", err)
 	}

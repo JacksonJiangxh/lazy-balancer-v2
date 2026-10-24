@@ -1,11 +1,8 @@
 package handlers
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -67,6 +64,9 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取威胁情报库失败", err)})
 			return
 		}
+		// 活动态只属执行进程：从节点不运行该任务，行内「更新中」是主端镜像
+		// 或降级残留，读侧投影为 failed（展示层口径，不写库）。
+		s.UpdateStatus, s.Message = services.ProjectActiveUpdateStatusForLocalRole(s.UpdateStatus, s.Message)
 		sources = append(sources, s)
 		totalEntries += s.EntryCount
 	}
@@ -129,73 +129,20 @@ func (h *Handlers) UpdateThreatSchedule(c *gin.Context) {
 
 // UpdateThreatSourceFlags 仅允许改 update_enabled——名单化后「应用」=
 // 策略引用名单（无独立 apply 开关）。请求体携带的其余字段一律忽略
-// （内置源不可变造）。
+// （内置源不可变造）。状态机与爬虫库 UpdateCrawlerLibFlags 单源收敛在
+// updateLibSourceFlags，差异面只有表名/文案/首槽武装/错误装配。
 func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
-	// 与 UpdateThreatAutoUpdate 同口径导入门（先于 body 解析）。
-	if rejectWriteDuringImport(c, "修改威胁情报库设置（配置导入进行中）") {
-		return
-	}
-	if !guardConfiguredJSONBody(c) {
-		return
-	}
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的源 ID"})
-		return
-	}
-	var body struct {
-		UpdateEnabled *bool `json:"update_enabled"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
-		return
-	}
-	if body.UpdateEnabled == nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无可更新字段"})
-		return
-	}
-	// 与 UpdateCRSAutoUpdate 同口径主节点门。
-	if !requireMasterNode(c) {
-		return
-	}
-	var name string
-	var wasEnabled int
-	if err := db.DB.QueryRow(`SELECT name, COALESCE(update_enabled,0) FROM security_threat_sources WHERE id=?`, id).Scan(&name, &wasEnabled); err != nil {
-		// DB 故障不得误报 404——缺行=404，其余=500（与
-		// security_overview 的 ErrNoRows→404 同族契约）。
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "威胁库源不存在"})
-		} else {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取威胁库源失败", err)})
-		}
-		return
-	}
-	if *body.UpdateEnabled {
-		// 启用分支必须与禁用分支同口径收敛状态机——仅在「由关闭转为启用」
-		// 时清失败态（update_status=idle + 空文案 + 失败计数清零）；已启用源重复提交
-		// 不改运行态（此前只清 message，留下「failed + 空失败文案」且计数与实际
-		// 状态脱节）。
-		query := `UPDATE security_threat_sources SET update_enabled=1, updated_at=datetime('now') WHERE id=?`
-		if wasEnabled == 0 {
-			query = `UPDATE security_threat_sources SET update_enabled=1, update_status='idle', message='', consecutive_failures=0, updated_at=datetime('now') WHERE id=?`
-		}
-		if _, err := db.DB.Exec(query, id); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("更新失败", err)})
-			return
-		}
-	} else {
-		// 关闭即退出更新任务：清掉关闭前的瞬时失败态与排程槽，否则列表/库头
-		// 继续显示「更新失败」，重新启用还会因残留未来槽无法武装首槽。
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`, id); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("更新失败", err)})
-			return
-		}
-	}
-	if *body.UpdateEnabled {
-		services.ArmThreatFirstSlots()
-	}
-	recordAudit(c, "更新", "威胁情报库", fmt.Sprintf("%s 更新开关：%s", name, enabledStateLabel(*body.UpdateEnabled)))
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
+	updateLibSourceFlags(c, libSourceFlagsSpec{
+		Table:         "security_threat_sources",
+		Family:        "威胁情报库",
+		NotFoundMsg:   "威胁库源不存在",
+		ReadErrMsg:    "读取威胁库源失败",
+		UpdateErrMsg:  "更新失败",
+		ArmFirstSlots: services.ArmThreatFirstSlots,
+		InternalError: func(message string, err error) models.APIResponse {
+			return models.APIResponse{Code: http.StatusInternalServerError, Message: serverErrMsg(message, err)}
+		},
+	})
 }
 
 // StartThreatLibUpdate 手动触发更新（主节点；镜像 StartCRSUpdate 的受理/

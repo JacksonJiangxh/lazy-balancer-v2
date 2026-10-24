@@ -386,3 +386,43 @@ func TestReconcileCRSState_blocksWhileWafFileLockHeld(t *testing.T) {
 		return nil
 	})
 }
+
+// 快照整体缺席（目录被删/数据卷换新/更新时快照写入失败）不进退化判定：
+// live 树健康且版本可确定时必须按 live 重建，否则 liveV==dbV 判 none 后再无
+// 任何写快照的入口，容器重建即回退镜像捆绑版本（用户更新成果丢失）。
+func TestReconcileCRSState_rebuildsMissingSnapshotFromLive(t *testing.T) {
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "waf", "crs")
+	snapshotDir := filepath.Join(root, "data", "crs")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule user-updated")
+	writeTestFile(t, filepath.Join(liveDir, "crs-setup.conf"), "# user setup")
+	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0\n")
+
+	reconcileCRSStateFrom(liveDir, snapshotDir, "v4.15.0")
+
+	if got := readCRSVersionMarker(snapshotDir); got != "v4.15.0" {
+		t.Fatalf("快照 VERSION=%q, want v4.15.0（缺席快照必须按 live 重建）", got)
+	}
+	if data, err := os.ReadFile(filepath.Join(snapshotDir, "rules", crsRulesProbeFile)); err != nil || string(data) != "SecRule user-updated" {
+		t.Fatalf("重建快照 rules=%q,err=%v, want live 内容", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(snapshotDir, "crs-setup.conf")); err != nil || string(data) != "# user setup" {
+		t.Fatalf("重建快照 setup=%q,err=%v, want live 内容", data, err)
+	}
+}
+
+// 镜像捆绑版本（live 无用户更新）不重建缺席快照：dist 本就可重播，凭空写
+// 快照只会让快照与捆绑版本等值（decideCRSSeedSource 仍回退 dist）。
+func TestReconcileCRSState_skipsSnapshotRebuildForBundledLive(t *testing.T) {
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "waf", "crs")
+	snapshotDir := filepath.Join(root, "data", "crs")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule bundled")
+	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), CRSBundledVersion+"\n")
+
+	reconcileCRSStateFrom(liveDir, snapshotDir, CRSBundledVersion)
+
+	if _, err := os.Stat(snapshotDir); !os.IsNotExist(err) {
+		t.Fatalf("bundled live 不应重建快照: stat err=%v", err)
+	}
+}

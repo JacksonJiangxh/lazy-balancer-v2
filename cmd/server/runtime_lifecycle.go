@@ -23,9 +23,17 @@ type runtimeLifecycle struct {
 	certService lifecycleWorker
 	certDone    chan struct{}
 	// acmeOpsMu 串行化证书侧启停（StartACME vs stopACMEWithin）：停止在途时
-	// 不得拉起新一代，否则在途的 queue.Stop() 会关掉新一代队列。它只覆盖
-	// 串行化，不覆盖等待——等待一律在锁外按调用方预算有界执行。
+	// 不得拉起新一代，否则在途的 queue.Stop() 会关掉新一代队列。互斥**覆盖**
+	// 等待——有界等待就在临界区内执行，因此启动最多被推迟一个停止预算。
+	// 超时后等待被放弃但互斥即释放：残留在途的停止仍可能落在新一代队列上，
+	// 故 acmeStopDone 记录「停止仍在途」，由 StartACME 在拉起新一代前等待它
+	// 收尾（有界，超时则拒绝启动并 error，见 StartACME）。
 	acmeOpsMu sync.Mutex
+	// acmeStopDone 是在途 ACME 停止的完成信号（l.mu 保护）：停止启动时登记，
+	// 真正收尾（queue.Stop/worker.Stop/<-done 全部返回）后清空并 close。
+	// 关停超时只放弃「等待」，不谎称停止已完成——残留停止仍会 PauseAndDrain
+	// 并清空规则屏障租约，若此时拉起新一代，证书签发/部署会静默停摆。
+	acmeStopDone chan struct{}
 	// stopped 是 Shutdown 后的启动门：进程退出路径与 taskengine daemon
 	// 换代（角色翻转/快速重启）并发时，已 teardown 的 worker 不得被重新拉起
 	// （生命周期互斥域对称化：启动/停止两侧同门）。
@@ -47,10 +55,29 @@ func newRuntimeLifecycle(syncService lifecycleWorker, certFactory func() lifecyc
 }
 
 func (l *runtimeLifecycle) StartACME() {
-	// 与在途停止串行化（见 acmeOpsMu）；停止自身的有界等待在这里体现为
-	// 「启动最多被推迟一个停止预算」，不会成为无界阻塞点。
+	// 与在途停止串行化（见 acmeOpsMu）。互斥只保证「同一时刻一个启停动作」，
+	// 不保证上一代停止已经收尾——关停超时后互斥已释放而停止 goroutine 还在跑。
+	// 拉起新一代前必须等它收尾：在途 queue.Stop() 会 PauseAndDrain 新一代队列
+	// 并清空规则屏障租约（证书签发/部署静默停摆）。等待有界（一个停止预算），
+	// 超时则拒绝启动并 error——降级为「无证书 worker 但可诊断」，好过静默启动
+	// 一个立刻被上一代停止杀掉的队列。
 	l.acmeOpsMu.Lock()
 	defer l.acmeOpsMu.Unlock()
+	l.mu.Lock()
+	if l.stopped || l.certService != nil {
+		l.mu.Unlock()
+		return
+	}
+	pendingStop := l.acmeStopDone
+	l.mu.Unlock()
+	if pendingStop != nil {
+		select {
+		case <-pendingStop:
+		case <-time.After(acmeStopSegmentMax):
+			services.Logf("error", "证书服务启停竞态：上一代停止仍在途（超过 %s），本次启动放弃以免在途 Stop 关闭新队列（下次换代重试）", acmeStopSegmentMax)
+			return
+		}
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.stopped || l.certService != nil {
@@ -83,7 +110,8 @@ func (l *runtimeLifecycle) StopACME() { l.stopACMEWithin(acmeStopSegmentMax) }
 //
 // 因此本函数把等待逐层移出锁外：锁内只摘指针/清 active 注入，Stop 与
 // Start 退出统一放进一个 goroutine，由调用方预算有界等待——超时记录 error
-// 后放弃（残留 goroutine 随进程回收），绝不让进程越过容器 stop_grace_period。
+// 后放弃等待（进程继续退出）。放弃等待**不等于**停止已完成：finished 通道
+// 登记为 l.acmeStopDone，StartACME 在拉起新一代前会等它收尾（见该函数）。
 func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 	l.acmeOpsMu.Lock()
 	defer l.acmeOpsMu.Unlock()
@@ -104,8 +132,20 @@ func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 		return
 	}
 	finished := make(chan struct{})
+	// 在启动停止 goroutine 前登记「停止在途」：关停超时只是放弃等待，停止
+	// 仍在执行（queue.Stop 的补偿等待可达分钟级），StartACME 必须能看到它。
+	l.mu.Lock()
+	l.acmeStopDone = finished
+	l.mu.Unlock()
 	go func() {
-		defer close(finished)
+		defer func() {
+			l.mu.Lock()
+			if l.acmeStopDone == finished {
+				l.acmeStopDone = nil
+			}
+			close(finished)
+			l.mu.Unlock()
+		}()
 		if queue != nil {
 			queue.Stop()
 		}

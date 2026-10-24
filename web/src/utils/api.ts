@@ -32,7 +32,7 @@ interface RequestClient {
   get(url: '/metrics/connections', config?: AxiosRequestConfig): Promise<APIResponse<ConnectionStats>>
   get(url: '/caddy/status', config?: AxiosRequestConfig): Promise<APIResponse<{ status: string; pid?: string; apply_error?: string; background_apply_error?: string; config_consistent?: string; config_drift?: string; config_drift_since?: string }>>
   get(url: '/config', config?: AxiosRequestConfig): Promise<APIResponse<GlobalConfigData>>
-  get(url: '/admin-tls', config?: AxiosRequestConfig): Promise<APIResponse<{ enabled: boolean; mode: string; cert_info?: { domain: string; issuer: string; not_after: string; days_left: number } | null; cert_info_error?: string }>>
+  get(url: '/admin-tls', config?: AxiosRequestConfig): Promise<APIResponse<{ enabled: boolean; mode: string; config_unavailable?: boolean; cert_info?: { domain: string; issuer: string; not_after: string; days_left: number } | null; cert_info_error?: string }>>
   get<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
   post<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
   put<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
@@ -143,7 +143,10 @@ async function blobErrorMessage(responseData: unknown): Promise<string | undefin
 }
 
 export class ApiRequestError extends Error {
-  constructor(message: string, readonly status?: number) {
+  // data = 后端错误响应体（信封 { code, message, data }）。失败分支的事实披露
+  // （如导入/还原的 data.warnings：规则库文件面判决、软跳过/归一化）只在这里
+  // ——不回传的话调用方拿到的是被拦截器替换后的错误，除 message 外全部丢失。
+  constructor(message: string, readonly status?: number, readonly data?: unknown) {
     super(message)
     this.name = 'ApiRequestError'
   }
@@ -319,7 +322,7 @@ service.interceptors.response.use(
         ElMessage.error(message)
       }
     }
-    return Promise.reject(new ApiRequestError(message, status))
+    return Promise.reject(new ApiRequestError(message, status, error.response?.data))
   }
 )
 

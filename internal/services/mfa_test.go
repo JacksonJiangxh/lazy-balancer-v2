@@ -1,7 +1,9 @@
 package services
 
 import (
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -337,12 +339,16 @@ func TestMFARecordPendingFailure_invalidatesAtThreshold(t *testing.T) {
 	}
 
 	for attempt := 1; attempt < mfaPendingFailThreshold; attempt++ {
-		if invalidated := MFARecordPendingFailure(4); invalidated {
+		invalidated, err := MFARecordPendingFailure(4)
+		if err != nil {
+			t.Fatalf("第 %d 次 pending 失败计数写失败: %v", attempt, err)
+		}
+		if invalidated {
 			t.Fatalf("第 %d 次 pending 失败不应作废（阈值 %d）", attempt, mfaPendingFailThreshold)
 		}
 	}
-	if invalidated := MFARecordPendingFailure(4); !invalidated {
-		t.Fatalf("第 %d 次 pending 失败必须作废并返回 true", mfaPendingFailThreshold)
+	if invalidated, err := MFARecordPendingFailure(4); err != nil || !invalidated {
+		t.Fatalf("第 %d 次 pending 失败必须作废并返回 true: invalidated=%v err=%v", mfaPendingFailThreshold, invalidated, err)
 	}
 	var pending string
 	var fails int
@@ -357,6 +363,31 @@ func TestMFARecordPendingFailure_invalidatesAtThreshold(t *testing.T) {
 	}
 	if _, err := MFAVerifyPending(4, "123456", time.Now()); err == nil {
 		t.Fatal("作废后 MFAVerifyPending 必须报「没有待激活的 MFA 密钥」")
+	}
+}
+
+// 计数未落库必须上抛（不得静默 false）：activate 无登录限流，5 次硬闸在
+// DB 写故障期一旦静默失效，pending 码空间即无收敛手段。
+func TestMFARecordPendingFailure_writeFailureReturnsError(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 6)
+	oldDB := db.DB
+	closed, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db.DB = closed
+	t.Cleanup(func() { db.DB = oldDB })
+
+	invalidated, err := MFARecordPendingFailure(6)
+	if err == nil {
+		t.Fatalf("写失败必须上抛（invalidated=%v）；静默 false 会让硬闸失效且无痕", invalidated)
+	}
+	if invalidated {
+		t.Fatalf("写失败不得报告已作废: %v", err)
 	}
 }
 

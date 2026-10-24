@@ -262,7 +262,7 @@ func TestCommittedThreatStateWouldPassNameOnlyRollbackAssertion(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/config/import", nil)
-	h.importConfigBackupCore(c, payload, true, "", "导入")
+	h.importConfigBackupCore(c, payload, "", "导入")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("commit probe status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -307,7 +307,7 @@ func TestSentinelFailureRollsBackWafFilesWithNotice(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/config/import", nil)
-	h.importConfigBackupCore(c, payload, true, "", "导入")
+	h.importConfigBackupCore(c, payload, "", "导入")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want injected sentinel failure", rec.Code, rec.Body.String())
 	}

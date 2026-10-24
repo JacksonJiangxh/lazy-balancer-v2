@@ -77,8 +77,12 @@ var (
 	metricsDashboardGroup singleflight.Group
 )
 
+// metricsDashboardState 是包级缓存：键必须包含指标源 URL，否则同一进程中
+// 不同 CaddyMetricsURL 的 Handlers 实例（测试并行/多租形态）会读到对方视角
+// 的聚合结果。
 var metricsDashboardState struct {
 	sync.Mutex
+	url       string
 	outcome   metricsDashboardOutcome
 	expiresAt time.Time
 	valid     bool
@@ -134,10 +138,12 @@ func storeCaddyMetricsSnapshot(url string, body []byte, err error, now time.Time
 		return
 	}
 	caddyMetricsSnapshots.Lock()
-	if caddyMetricsSnapshots.entries == nil {
-		caddyMetricsSnapshots.entries = map[string]caddyMetricsSnapshot{}
+	// 进程内只有一个指标源（h.cfg.CaddyMetricsURL）：整体替换实现单条目语义
+	// ——管理员改地址后旧 URL 的条目（单条最多 16MB 正文）没有消费方却会
+	// 常驻，按 URL 无界累积。并发改地址时两条短暂互斥由下一次抓取收敛。
+	caddyMetricsSnapshots.entries = map[string]caddyMetricsSnapshot{
+		url: {body: body, err: err, expiresAt: now.Add(ttl)},
 	}
-	caddyMetricsSnapshots.entries[url] = caddyMetricsSnapshot{body: body, err: err, expiresAt: now.Add(ttl)}
 	caddyMetricsSnapshots.Unlock()
 }
 
@@ -190,6 +196,7 @@ func loadCaddyMetricsSnapshot(ctx context.Context, url string, cacheFailure bool
 // 的抓取字节）。
 func resetMetricsDashboardCacheForTest() {
 	metricsDashboardState.Lock()
+	metricsDashboardState.url = ""
 	metricsDashboardState.outcome = metricsDashboardOutcome{}
 	metricsDashboardState.expiresAt = time.Time{}
 	metricsDashboardState.valid = false
@@ -209,11 +216,15 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 // metricsDashboardCached TTL 命中直返；未命中经 single-flight 合并并发后聚合，
 // 成功写正缓存、失败写短负缓存（失败不长期缓存）。
 func (h *Handlers) metricsDashboardCached(ctx context.Context) metricsDashboardOutcome {
-	if outcome, ok := loadMetricsDashboardCache(time.Now()); ok {
+	url := ""
+	if h.cfg != nil {
+		url = h.cfg.CaddyMetricsURL
+	}
+	if outcome, ok := loadMetricsDashboardCache(url, time.Now()); ok {
 		return outcome
 	}
-	value, _, _ := metricsDashboardGroup.Do("dashboard", func() (any, error) {
-		if outcome, ok := loadMetricsDashboardCache(time.Now()); ok {
+	value, _, _ := metricsDashboardGroup.Do("dashboard:"+url, func() (any, error) {
+		if outcome, ok := loadMetricsDashboardCache(url, time.Now()); ok {
 			return outcome, nil
 		}
 		// 聚合脱离首个请求的取消信号（首请求断开不应让同批等待者失败），
@@ -221,23 +232,23 @@ func (h *Handlers) metricsDashboardCached(ctx context.Context) metricsDashboardO
 		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 		outcome := h.buildMetricsDashboard(workCtx)
-		storeMetricsDashboardOutcome(outcome, time.Now())
+		storeMetricsDashboardOutcome(url, outcome, time.Now())
 		return outcome, nil
 	})
 	outcome, _ := value.(metricsDashboardOutcome)
 	return outcome
 }
 
-func loadMetricsDashboardCache(now time.Time) (metricsDashboardOutcome, bool) {
+func loadMetricsDashboardCache(url string, now time.Time) (metricsDashboardOutcome, bool) {
 	metricsDashboardState.Lock()
 	defer metricsDashboardState.Unlock()
-	if metricsDashboardState.valid && now.Before(metricsDashboardState.expiresAt) {
+	if metricsDashboardState.valid && metricsDashboardState.url == url && now.Before(metricsDashboardState.expiresAt) {
 		return metricsDashboardState.outcome, true
 	}
 	return metricsDashboardOutcome{}, false
 }
 
-func storeMetricsDashboardOutcome(outcome metricsDashboardOutcome, now time.Time) {
+func storeMetricsDashboardOutcome(url string, outcome metricsDashboardOutcome, now time.Time) {
 	ttl := metricsDashboardTTL
 	if outcome.status != 0 {
 		ttl = metricsDashboardNegativeTTL
@@ -246,6 +257,7 @@ func storeMetricsDashboardOutcome(outcome metricsDashboardOutcome, now time.Time
 		return
 	}
 	metricsDashboardState.Lock()
+	metricsDashboardState.url = url
 	metricsDashboardState.outcome = outcome
 	metricsDashboardState.expiresAt = now.Add(ttl)
 	metricsDashboardState.valid = true
@@ -507,7 +519,7 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 		FROM recent ORDER BY bucket
 	`, bucketSeconds, bucketSeconds, caddyID, modifier, bucketCount, bucketSeconds)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取历史指标失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "读取历史指标失败", err)
 		return
 	}
 	defer rows.Close()
@@ -527,12 +539,12 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 		var r row
 		var timestamp string
 		if err := rows.Scan(&timestamp, &r.Requests, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx, &r.Blocked, &r.BytesIn, &r.BytesOut); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取历史指标失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "读取历史指标失败", err)
 			return
 		}
 		ts, err := time.ParseInLocation("2006-01-02 15:04:05", timestamp, time.UTC)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "解析历史指标时间失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "解析历史指标时间失败", err)
 			return
 		}
 		// 统一口径：返回裸 UTC 字符串，由前端 formatDate 按配置时区转换
@@ -541,7 +553,7 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 		result = append(result, r)
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取历史指标失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "读取历史指标失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"protocol": protocol, "supported": true, "bucket_interval_seconds": bucketSeconds, "rows": result}})
@@ -637,12 +649,12 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 		var ts string
 		if err := rows.Scan(&ts, &m.RequestsTotal, &m.Status2xx, &m.Status3xx,
 			&m.Status4xx, &m.Status5xx, &m.BytesIn, &m.BytesOut); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取指标历史失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "读取指标历史失败", err)
 			return
 		}
 		parsed, err := time.ParseInLocation("2006-01-02 15:04:05", ts, time.UTC)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "解析历史指标时间失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "解析历史指标时间失败", err)
 			return
 		}
 		m.Timestamp = parsed
@@ -650,7 +662,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	}
 
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取指标历史失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "读取指标历史失败", err)
 		return
 	}
 

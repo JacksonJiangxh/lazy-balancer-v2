@@ -45,6 +45,38 @@ func TestRuleEndpoint5xxBodiesHideInternalErrors(t *testing.T) {
 			t.Errorf("caddy.go:%s: 5xx 响应拼接了内部错误文本: %s", decl.Name.Name, leak)
 		}
 	}
+
+	// 规则指标历史端点（business 组）：读取/扫描/时间解析失败的 5xx 与
+	// rules 族同政策——内部结构只进日志，响应只回固定文案。
+	metricsFile, err := parser.ParseFile(fset, "metrics.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse metrics.go: %v", err)
+	}
+	for _, fn := range metricsFile.Decls {
+		decl, ok := fn.(*ast.FuncDecl)
+		if !ok || (decl.Name.Name != "GetRuleMetricsHistory" && decl.Name.Name != "GetMetricsHistory") {
+			continue
+		}
+		for _, leak := range collect5xxErrorTextLeaks(fset, decl) {
+			t.Errorf("metrics.go:%s: 5xx 响应拼接了内部错误文本: %s", decl.Name.Name, leak)
+		}
+	}
+
+	// 共享事务收尾（business 组经 finishTxApply 收口：批量阶段页等）：5xx 与
+	// 已提交视图恢复分支必须只回固定文案——错误详情由日志/审计承担。
+	sharedFile, err := parser.ParseFile(fset, "handlers.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse handlers.go: %v", err)
+	}
+	for _, fn := range sharedFile.Decls {
+		decl, ok := fn.(*ast.FuncDecl)
+		if !ok || decl.Name.Name != "finishTxApply" {
+			continue
+		}
+		for _, leak := range collect5xxErrorTextLeaks(fset, decl) {
+			t.Errorf("handlers.go:%s: 5xx 响应拼接了内部错误文本: %s", decl.Name.Name, leak)
+		}
+	}
 }
 
 // 扫描器自检：识别能力本身必须被钉住——若匹配逻辑退化为恒空，上面的门禁
@@ -197,5 +229,55 @@ func TestGetConfig_500BodyHidesSQLDetails(t *testing.T) {
 	}
 	if !strings.Contains(body, "获取全局配置失败") {
 		t.Fatalf("500 body 缺少固定文案: %s", body)
+	}
+}
+
+// caddyAdmin5xxDetailFunctions 是 admin 组 5xx「保留底层细节」的显式政策清单
+// （不是默认放行）：只有登记在此的 handler 允许在 5xx 响应体拼接 err.Error()。
+// 与 business 组「固定文案」政策并存——admin 端点是排障接口，需要区分 admin
+// 不可达 / 响应超限 / 解析失败 / exec exit status / 路径权限。
+var caddyAdmin5xxDetailFunctions = map[string]string{
+	"UpdateConfig":   "配置 apply/commit 失败需管理员看到 Caddy 侧原因",
+	"ValidateConfig": "校验回退后恢复运行配置失败需点名",
+	"ReloadCaddy":    "手动重载失败原因",
+	"GetCaddyConfig": "admin 不可达(502)/响应超限/解析失败必须可判",
+	"GetCaddyLogs":   "日志文件路径与 errno",
+	"PutCaddyConfig": "自定义配置逃生口排障",
+	"StartCaddy":     "exec 失败原因与配置应用注记",
+	"StopCaddy":      "exec 失败原因",
+	"RestartCaddy":   "exec 失败原因与配置应用注记",
+}
+
+// 政策可判性门禁：caddy.go 里每个 5xx 拼接内部错误文本的函数都必须在政策
+// 清单内（否则按 business 组口径固定文案），且清单条目必须仍存在（过期条目
+// 会掩盖新端点的政策缺口）。4xx 配置拒绝类不受约束。
+func TestCaddyAdmin5xxDetailPolicyIsExplicit(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "caddy.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse caddy.go: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		seen[fn.Name.Name] = true
+		leaks := collect5xxErrorTextLeaks(fset, fn)
+		if len(leaks) == 0 {
+			continue
+		}
+		if _, allowed := caddyAdmin5xxDetailFunctions[fn.Name.Name]; !allowed {
+			t.Errorf("caddy.go:%s 的 5xx 响应拼接了内部错误文本，且不在 admin 细节清单内（business 组必须固定文案；新增 admin 端点须登记理由）: %v", fn.Name.Name, leaks)
+		}
+	}
+	for name, reason := range caddyAdmin5xxDetailFunctions {
+		if !seen[name] {
+			t.Errorf("政策清单条目 %q 已不在 caddy.go（过期条目掩盖新端点的政策缺口）", name)
+		}
+		if strings.TrimSpace(reason) == "" {
+			t.Errorf("政策清单条目 %q 缺少理由", name)
+		}
 	}
 }

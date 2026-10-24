@@ -27,8 +27,8 @@
           <el-input-number v-model="global.cert_expiry_days" :min="1" :max="365" />
         </el-form-item>
         <el-form-item label="自动续签时间">
-          <el-input-number v-model="global.cert_renewal_days" :min="1" :max="60" />
-          <span class="form-tip-inline">证书到期前多少天自动尝试重签；建议不超过 60——窗口接近证书寿命（90 天）时，刚签发的证书仍落在窗口内，会反复重签并被 CA 限流。0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
+          <el-input-number v-model="global.cert_renewal_days" :min="1" :max="CERT_RENEWAL_DAYS_MAX" />
+          <span class="form-tip-inline">证书到期前多少天自动尝试重签；建议不超过 60，上限 {{ CERT_RENEWAL_DAYS_MAX }} 天——窗口接近证书寿命（90 天）时，刚签发的证书仍落在窗口内，会反复重签并被 CA 限流。0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
         </el-form-item>
         <el-form-item label="续签重试次数">
           <el-input-number v-model="global.cert_renewal_attempts" :min="1" :max="10" />
@@ -247,7 +247,9 @@ import { Check, Connection, Document, OfficeBuilding, Plus, Postcard, Setting } 
 import CertJobs from './CertJobs.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { applyCredentialFieldChange, credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
+import { dnsConfigNeedsChallenge, type DnsConfigBaseline } from '@/utils/dnsConfigChallenge'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
+import { CERT_RENEWAL_DAYS_MAX } from '@/utils/configValues'
 import type { APIResponse } from '@/types'
 
 // 字段可见性/选项文案由后端元数据驱动（visible_when/option_labels），
@@ -331,6 +333,10 @@ const editingId = ref<number | null>(null)
 // 这类配置在用户未编辑任何凭证字段时，保存载荷省略 dns_credentials——否则
 // 后端会把表单形态的空对象当作新提交的凭证校验，改名/禁用被旧空值阻断。
 const legacyEmptyCredentials = ref(false)
+// 打开弹框时的库内快照：保存前的真实 DNS 挑战只对「需要重新验证」的变更执行
+// （新建/提供商变更/凭证变更/禁用→启用）。仅改名或仅禁用不得再向 DNS 账户写
+// 临时记录——凭证已失效时那一步会变成永远保存不了的死路。
+const configBaseline = ref<DnsConfigBaseline | null>(null)
 const testingId = ref<number | null>(null)
 const deletingId = ref<number | null>(null)
 const form = ref<{
@@ -583,9 +589,17 @@ const openConfigDialog = (config?: CertConfig) => {
       dns_credentials: canPruneHidden ? applyCredentialFieldChange(providerFields, parsedCreds) : parsedCreds,
       enabled: config.enabled,
     }
+    // 挑战判定基线＝打开弹框时的库值（凭证快照按原样，未填过即 null）——
+    // 与保存时的表单自比会恒等，改名/禁用就再也判不出「无需验证」。
+    configBaseline.value = {
+      dnsProvider: config.dns_provider,
+      dnsCredentials: legacyEmptyCredentials.value ? null : { ...parsedCreds },
+      enabled: config.enabled,
+    }
   } else {
     editingId.value = null
     legacyEmptyCredentials.value = false
+    configBaseline.value = null
     form.value = {
       name: '',
       dns_provider: providers.value[0]?.code || 'dnspod',
@@ -632,7 +646,15 @@ const saveConfig = async () => {
   }
   savingConfig.value = true
 
-  if (!credentialsUnsubmitted) {
+  // 真实 DNS 挑战只在凭证需要重新验证时执行：新建、提供商变更、凭证变更、
+  // 禁用→启用。仅改名/仅禁用/未触碰敏感项直接保存——编辑既有配置的降级操作
+  // 不该要求用户再提供一个可管理的域名。
+  const needsChallenge = dnsConfigNeedsChallenge(configBaseline.value, {
+    dnsProvider: form.value.dns_provider,
+    dnsCredentials: form.value.dns_credentials,
+    enabled: form.value.enabled,
+  })
+  if (needsChallenge) {
     const domain = await promptTestDomain(true)
     if (!domain) {
       savingConfig.value = false

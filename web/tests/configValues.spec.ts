@@ -100,7 +100,9 @@ test('证书自动重签天数默认值与后端 db.go 同源（跨栈钉）', (
   assert.match(auth, /cert_renewal_days \?\? DEFAULT_CERT_RENEWAL_DAYS/, '/config 缺省必须取单源常量')
   assert.match(auth, /renewalDays > 0 \? renewalDays : DEFAULT_CERT_RENEWAL_DAYS/, '≤0 兜底必须取单源常量')
   assert.doesNotMatch(auth, /cert_renewal_days \?\? 30/, '不得回退到硬编码 30')
-  assert.doesNotMatch(auth, /: 30\b/, '不得回退到硬编码 30')
+  // 宽口径全文件 `: 30` 会把未来合法常量（如超时 30）误判——只钉「续签天数
+  // 表达式里的字面量回退」这一处契约。
+  assert.doesNotMatch(auth, /renewalDays[^;\n]*:[^;\n]*\b30\b/, '不得回退到硬编码 30')
 })
 
 test('保留天数展示：0/缺省落 90，正值原样（不再 SFC 内联第二实现）', () => {

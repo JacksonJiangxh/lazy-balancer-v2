@@ -228,8 +228,11 @@ func TestGetRuleMetricsHistory_returns_error_when_cursor_fails(t *testing.T) {
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "cursor interrupted") {
-		t.Fatalf("body=%s, want 携带驱动的游标中断错误（证明到达 rows.Err 分支）", response.Body.String())
+	if !strings.Contains(response.Body.String(), "读取历史指标失败") {
+		t.Fatalf("body=%s, want 固定文案「读取历史指标失败」（详情只进日志）", response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "cursor interrupted") {
+		t.Fatalf("body=%s, want 不得回显驱动内部错误（business 组 5xx 政策）", response.Body.String())
 	}
 }
 

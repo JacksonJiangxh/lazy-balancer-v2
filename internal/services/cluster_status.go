@@ -30,18 +30,11 @@ var (
 // warnNodeHealthParseThrottled 按 nodeID 限频输出 health_json 解析失败告警。
 func warnNodeHealthParseThrottled(nodeID int, cause error, now time.Time) {
 	nodeHealthWarnMu.Lock()
-	last, seen := nodeHealthWarnSeen[nodeID]
-	if seen && now.Sub(last) < nodeHealthWarnWindow {
-		nodeHealthWarnMu.Unlock()
+	allowed := throttleWarnAllowed(nodeHealthWarnSeen, nodeID, now, nodeHealthWarnWindow, nodeHealthWarnWindow)
+	nodeHealthWarnMu.Unlock()
+	if !allowed {
 		return
 	}
-	nodeHealthWarnSeen[nodeID] = now
-	for id, seenAt := range nodeHealthWarnSeen {
-		if now.Sub(seenAt) >= nodeHealthWarnWindow {
-			delete(nodeHealthWarnSeen, id)
-		}
-	}
-	nodeHealthWarnMu.Unlock()
 	Logf("warn", "解析节点 %d 健康状态失败: %v", nodeID, cause)
 }
 

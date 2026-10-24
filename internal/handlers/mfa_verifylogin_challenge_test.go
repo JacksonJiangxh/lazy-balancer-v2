@@ -275,3 +275,38 @@ func TestMFAVerifyLogin_consumedChallengeIsAudited(t *testing.T) {
 		t.Fatalf("audit rows=%d, want 1（「挑战已被使用」拒绝必须留痕）", audits)
 	}
 }
+
+// 同一挑战的并发验码：后来者收到 409「验证进行中」而不是 401「已被使用」——
+// 先消费后验码的互斥不得把「对方可能验码失败并归还」的中间态误报为重放
+// （否则审计里的「挑战已被使用」不再是可靠的重放信号），也不得消费挑战。
+func TestMFAVerifyLogin_concurrentSameChallengeReturns409(t *testing.T) {
+	secret, _ := seedMFAChallengeLoginFixture(t, "inflight-tok", 0)
+	// Given：同一挑战已有一笔请求正在验码。
+	if !tryLockMFAChallengeToken("inflight-tok") {
+		t.Fatal("首次加锁必须成功")
+	}
+	defer unlockMFAChallengeToken("inflight-tok")
+
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+
+	recorder := postMFAVerify(t, router, "inflight-tok", currentTOTPCode(t, secret))
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "验证进行中") {
+		t.Fatalf("status=%d body=%s, want 409 验证进行中（并发落败，非重放）", recorder.Code, recorder.Body.String())
+	}
+	var consumed bool
+	if err := db.DB.QueryRow("SELECT COALESCE(consumed,0) FROM mfa_challenges WHERE token='inflight-tok'").Scan(&consumed); err != nil {
+		t.Fatalf("read challenge: %v", err)
+	}
+	if consumed {
+		t.Fatal("并发落败方不得消费挑战（对方可能验码失败并归还）")
+	}
+
+	// When：在飞请求结束后同一 token 重试。
+	unlockMFAChallengeToken("inflight-tok")
+	recorder = postMFAVerify(t, router, "inflight-tok", currentTOTPCode(t, secret))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("after unlock status=%d body=%s, want 200（挑战未被烧，可正常验码）", recorder.Code, recorder.Body.String())
+	}
+}

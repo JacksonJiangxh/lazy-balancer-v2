@@ -42,6 +42,9 @@ type CrawlerEngine struct {
 	// IPRanges 该引擎官方公布的 CIDR 段（Ruling：保留为**唯一权威
 	// 数据源**——运行期 360 验证走 crawler-ip-lists.json 快照，而快照内容由
 	// crawler_seed_parity_test 断言必须落在本字段声明的段内，二者不得分叉）。
+	// 消费面绑定 VerifyMethod：仅 iprange 引擎（当前只有 so360spider）读运行
+	// 快照名单判定；PTR 引擎名单快照仅作展示/存档，不参与验证（改动此处前先
+	// 确认验证器分支，避免把名单误当 PTR 引擎的判定依据）。
 	IPRanges []string
 }
 

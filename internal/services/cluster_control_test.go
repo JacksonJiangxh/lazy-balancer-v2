@@ -193,6 +193,54 @@ func TestIssueServiceControlTicketPrefersAccessURL(t *testing.T) {
 	}
 }
 
+// 同主机 https 升级重定向的主机名比较不区分大小写：Location 与请求主机仅
+// 大小写不同时仍应重放（否则管理地址带大写字母时升级重放永不触发）。
+func TestDoWithSameHostTLSUpgradeRedirect_hostnameComparisonIgnoresCase(t *testing.T) {
+	var hits atomic.Int32
+	var replayedURL string
+	client := &http.Client{
+		// 契约要求：调用方禁止标准库自动跟随（否则 301 被改写并先行消费）。
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if hits.Add(1) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusMovedPermanently,
+					Status:     "301 Moved Permanently",
+					Header:     http.Header{"Location": []string{"https://MASTER.Example:443/ticket"}},
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			}
+			replayedURL = req.URL.String()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"code":0}`)),
+				Request:    req,
+			}, nil
+		}),
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://master.example:8080/ticket", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := DoWithSameHostTLSUpgradeRedirect(client, req)
+	if err != nil {
+		t.Fatalf("upgrade redirect returned error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200 after same-host upgrade replay", resp.StatusCode)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("transport saw %d requests, want 2 (upgrade replay)", got)
+	}
+	if replayedURL != "https://MASTER.Example:443/ticket" {
+		t.Fatalf("replayed URL=%q, want Location 目标", replayedURL)
+	}
+}
+
 // 无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
 // 空体，且目标端不再收到请求。
 func TestDoWithSameHostTLSUpgradeRedirect_unreplayableBodySynthetic301(t *testing.T) {

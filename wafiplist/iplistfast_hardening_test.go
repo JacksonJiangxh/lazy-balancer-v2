@@ -151,10 +151,10 @@ func TestIPListFast_evictCacheForcesReparse(t *testing.T) {
 // 体积/条目上限：超限文件构建期拒绝，防异常文件拖垮内存。
 func TestIPListFast_loadCaps(t *testing.T) {
 	dir := useAllowedDir(t)
-	oldBytes, oldEntries := MaxFileBytes, MaxEntries
-	MaxFileBytes = 1024
-	MaxEntries = 8
-	t.Cleanup(func() { MaxFileBytes, MaxEntries = oldBytes, oldEntries })
+	oldBytes, oldEntries := maxFileBytes, maxEntries
+	maxFileBytes = 1024
+	maxEntries = 8
+	t.Cleanup(func() { maxFileBytes, maxEntries = oldBytes, oldEntries })
 
 	big := writeListFile(t, dir, "big.txt", []string{"203.0.113.7"})
 	if err := os.Truncate(big, 2048); err != nil { // 稀疏扩容超过 cap
@@ -394,20 +394,20 @@ func TestIPListFast_factoryDedupSharedState(t *testing.T) {
 // 直接喂解析器，模拟「stat 见小、实际读到超大」的形态。
 func TestParseIPListFile_enforcesMaxFileBytesAfterRead(t *testing.T) {
 	dir := useAllowedDir(t)
-	oldBytes := MaxFileBytes
-	MaxFileBytes = 16
-	t.Cleanup(func() { MaxFileBytes = oldBytes })
+	oldBytes := maxFileBytes
+	maxFileBytes = 16
+	t.Cleanup(func() { maxFileBytes = oldBytes })
 
 	path := writeListFile(t, dir, "grew.txt", []string{"203.0.113.7", "198.51.100.0/24", "2001:db8::/32"})
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() <= MaxFileBytes {
+	if info.Size() <= maxFileBytes {
 		t.Fatalf("fixture too small: %d bytes", info.Size())
 	}
 	if _, err := parseIPListFile(path); err == nil {
-		t.Fatal("超过 MaxFileBytes 的内容必须在读侧被拒绝（pre-stat 判限不构成硬上限）")
+		t.Fatal("超过 maxFileBytes 的内容必须在读侧被拒绝（pre-stat 判限不构成硬上限）")
 	}
 }
 
@@ -550,11 +550,11 @@ func TestIPListFast_reportsUnavailableWhenCacheEvictedAndFileGone(t *testing.T) 
 	EvictIPListCache(path)
 
 	var calls int
-	oldHook, oldInterval := OnListUnavailableServe, StaleServeLogInterval
+	oldHook, oldInterval := OnListUnavailableServe, staleServeLogInterval
 	OnListUnavailableServe = func(string, error) { calls++ }
-	StaleServeLogInterval = time.Minute
+	staleServeLogInterval = time.Minute
 	t.Cleanup(func() {
-		OnListUnavailableServe, StaleServeLogInterval = oldHook, oldInterval
+		OnListUnavailableServe, staleServeLogInterval = oldHook, oldInterval
 		clearStaleReport(path)
 	})
 
@@ -566,5 +566,36 @@ func TestIPListFast_reportsUnavailableWhenCacheEvictedAndFileGone(t *testing.T) 
 	}
 	if calls != 1 {
 		t.Fatalf("不可读告警次数=%d, want 1（按路径节流，不逐请求刷屏）", calls)
+	}
+}
+
+// 白名单内的符号链接指向白名单外：构建期（Provision/算子构建）必须拒绝。
+// Clean+前缀只防 `..` 穿越，symlink 可绕过；运行期热路径不做 EvalSymlinks
+// （每请求 syscall），故硬边界落在归一入口。白名单内的链接指向白名单内
+// 目标仍合法。
+func TestIPListFast_symlinkEscapeRejected(t *testing.T) {
+	dir := useAllowedDir(t)
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("203.0.113.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(dir, "escape.txt")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	if _, err := newIPListFast(plugintypes.OperatorOptions{Arguments: escape}); err == nil {
+		t.Fatal("白名单内 symlink 指向白名单外必须在构建期被拒绝")
+	}
+
+	// 白名单内链接（相对目标）合法。
+	inside := writeListFile(t, dir, "inside.txt", []string{"203.0.113.8"})
+	friendly := filepath.Join(dir, "inside-link.txt")
+	if err := os.Symlink(filepath.Base(inside), friendly); err != nil {
+		t.Fatalf("create inside symlink: %v", err)
+	}
+	op := newOp(t, friendly)
+	if !op.Evaluate(nil, "203.0.113.8") {
+		t.Fatal("白名单内 symlink 指向白名单内目标必须正常加载")
 	}
 }

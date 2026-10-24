@@ -453,10 +453,10 @@ func TestStopLogRotateWithin_givesUpWhenWorkerStuck(t *testing.T) {
 // When StopLogRotateWithin 以充裕预算调用。
 // Then 快速返回 true——正常路径不等满预算。
 func TestStopLogRotateWithin_fastPathDoesNotConsumeBudget(t *testing.T) {
-	StopLogRotate()
+	StopLogRotateWithin(0)
 	StartLogRotate(context.Background())
 	t.Cleanup(func() {
-		StopLogRotate()
+		StopLogRotateWithin(0)
 		StartLogRotate(context.Background())
 	})
 
@@ -507,6 +507,59 @@ func TestLogCleanupRound_wafFallbackRotationFailureIsReported(t *testing.T) {
 	}
 	if !strings.HasPrefix(line, "日志清理未完成") || !strings.Contains(line, "injected copy failure") {
 		t.Fatalf("摘要行必须标明未完成与失败原因: %q", line)
+	}
+}
+
+// 兜底 poll 成功但轮转未完成（活文件未截断）时，摘要不得称「清理完成」：
+// 空间未回收，下次兜底在 24h 后——误导性完成文案会把排障方向引向别处。
+func TestLogCleanupRound_wafFallbackReportsRotationDelay(t *testing.T) {
+	initServicesDB(t)
+	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize metrics db: %v", err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
+	auditLogSizeBytes = func() int64 { return 1024 }
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
+	})
+	resetSecurityEventsPollState(t)
+	// 一条合法审计文档起头；copy 完成后追写超阈空白（模拟 Coraza 持续写入）：
+	// 归档已就位但活文件尾部未收敛 → 本轮不截断（轮转延迟）。
+	payload := append([]byte(securityEventsFixtureClean+"\n"), bytes.Repeat([]byte("\n"), 2<<20)...)
+	if err := os.WriteFile(logPath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	auditLogCopyFile = func(src, dst string) error {
+		if err := copyAuditLogTo(src, dst); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.Write(bytes.Repeat([]byte("\n"), 2<<20))
+		return err
+	}
+
+	// When
+	res, line := logCleanupRound(filepath.Join(dir, "app.log"))
+
+	// Then：延迟必须进结果、Err 非空、摘要不得称完成
+	if res.WafAuditError == "" {
+		t.Fatal("waf-audit 兜底轮转延迟必须进结果（此前轮转未完成被当作成功）")
+	}
+	if !strings.Contains(res.WafAuditError, "延迟") {
+		t.Fatalf("WafAuditError 未标注延迟语义: %q", res.WafAuditError)
+	}
+	if err := res.Err(); err == nil {
+		t.Fatal("轮转延迟必须聚合为 Err（任务体不得按成功落 task_runs）")
+	}
+	if strings.Contains(line, "日志清理完成") {
+		t.Fatalf("轮转延迟时摘要不得称「日志清理完成」: %q", line)
 	}
 }
 

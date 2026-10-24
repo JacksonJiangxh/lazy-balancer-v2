@@ -80,21 +80,10 @@ func warnCorruptedSnapshotRow(table string, rowID any, err error) {
 	key := fmt.Sprintf("%s:%v", table, rowID)
 	now := time.Now()
 	snapshotRowIsolationMu.Lock()
-	last, seen := snapshotRowIsolationSeen[key]
-	duplicate := seen && now.Sub(last) < snapshotRowIsolationWindow
-	if !duplicate {
-		snapshotRowIsolationSeen[key] = now
-		// 与证书告警限频表同型：新坏行到达时顺带回收过期键，避免行 ID
-		// churn 让进程生命周期内的 map 单调增长。
-		for k, seenAt := range snapshotRowIsolationSeen {
-			if now.Sub(seenAt) >= snapshotRowIsolationWindow {
-				delete(snapshotRowIsolationSeen, k)
-			}
-		}
-	}
+	allowed := throttleWarnAllowed(snapshotRowIsolationSeen, key, now, snapshotRowIsolationWindow, snapshotRowIsolationWindow)
 	hook := snapshotRowIsolationHook
 	snapshotRowIsolationMu.Unlock()
-	if duplicate {
+	if !allowed {
 		return
 	}
 	if hook != nil {
@@ -168,24 +157,24 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 	return snapshot, true, nil
 }
 
-func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) error {
+// ConfirmRegistration 确认集群令牌交付，返回被确认节点名（审计归因用：确认
+// 成功即注册密钥失效，须能证明是哪个节点消费了它）。
+func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) (string, error) {
 	// 清列与上方旧协议交付确认（84）对齐——过期时间戳
 	// 一并置 NULL，不与已清空的 secret 残留分叉。
 	// SQL 级角色条件——降级窗口内的确认不得再写节点簿记。
-	result, err := s.db.ExecContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=? AND "+masterRoleConditionSQL, tokenHash(token))
-	if err != nil {
-		return fmt.Errorf("确认集群令牌交付: %w", err)
-	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("读取集群令牌确认结果: %w", err)
-	}
-	if updated == 0 {
+	// RETURNING name 免除额外查询，且与「确认了哪一行」天然同源。
+	var nodeName string
+	err := s.db.QueryRowContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=? AND "+masterRoleConditionSQL+" RETURNING name", tokenHash(token)).Scan(&nodeName)
+	if errors.Is(err, sql.ErrNoRows) {
 		// 角色复核单源 masterScopeMissError：已降级 → ErrNotMasterNode(403)，
 		// 主节点下的 0 行 → 令牌不匹配（ErrInvalidClusterAuth）。
-		return s.masterScopeMissError(ctx, ErrInvalidClusterAuth)
+		return "", s.masterScopeMissError(ctx, ErrInvalidClusterAuth)
 	}
-	return nil
+	if err != nil {
+		return "", fmt.Errorf("确认集群令牌交付: %w", err)
+	}
+	return nodeName, nil
 }
 
 func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnapshot, json.RawMessage, string, error) {
@@ -1187,7 +1176,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 }
 
 func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapshotStore) (map[string][]models.Upstream, error) {
-	rows, err := store.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams ORDER BY rule_id, id`)
+	rows, err := store.QueryContext(ctx, `SELECT u.id, u.rule_id, u.host, u.port, COALESCE(u.weight,1), COALESCE(u.dynamic_dns,0), IIF(u.enabled IN ('1',1),1,0), COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,''), COALESCE(r.protocol,'') FROM upstreams u LEFT JOIN lb_rules r ON r.caddy_id = u.rule_id ORDER BY u.rule_id, u.id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照上游: %w", err)
 	}
@@ -1195,12 +1184,14 @@ func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapsho
 	byRule := make(map[string][]models.Upstream)
 	for rows.Next() {
 		var upstream models.Upstream
-		if err := rows.Scan(&upstream.ID, &upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Weight, &upstream.DynamicDNS, &upstream.Enabled, &upstream.Protocol, &upstream.MaxConnections, &upstream.OriginDomain); err != nil {
+		var ruleProtocol string
+		if err := rows.Scan(&upstream.ID, &upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Weight, &upstream.DynamicDNS, &upstream.Enabled, &upstream.Protocol, &upstream.MaxConnections, &upstream.OriginDomain, &ruleProtocol); err != nil {
 			return nil, fmt.Errorf("扫描快照上游: %w", err)
 		}
-		// 上游传输归一（单一事实源）：dynamic_dns 废弃列与写侧恒 0 同口径，
-		// 与从端落库/重建同形（rules 节哈希主从相等的前提）。
-		normalizeUpstreamForTransport(&upstream)
+		// 上游传输归一（单一事实源）：dynamic_dns 废弃列与写侧恒 0 同口径、
+		// TCP 规则的回源域名按「仅 HTTP 消费」清零，与从端落库/重建同形
+		// （rules 节哈希主从相等的前提）。
+		normalizeUpstreamForTransport(&upstream, ruleProtocol)
 		byRule[upstream.RuleID] = append(byRule[upstream.RuleID], upstream)
 	}
 	return byRule, rows.Err()
@@ -1465,22 +1456,17 @@ var snapshotCertificateWarnings = struct {
 // 超过此时间未被再次更新的条目会在下次 warnSnapshotCertificateCandidate 调用时被清理。
 const snapshotCertificateWarningsGCTtl = time.Hour
 
+// snapshotCertificateWarnWindow 是同一证书候选告警的放行窗口。
+const snapshotCertificateWarnWindow = 5 * time.Minute
+
 func warnSnapshotCertificateCandidate(ruleID string, jobID int, cause error, now time.Time) {
 	key := fmt.Sprintf("%s/%d", ruleID, jobID)
 	snapshotCertificateWarnings.Lock()
-	last := snapshotCertificateWarnings.last[key]
-	if !last.IsZero() && now.Sub(last) < 5*time.Minute {
-		snapshotCertificateWarnings.Unlock()
+	allowed := throttleWarnAllowed(snapshotCertificateWarnings.last, key, now, snapshotCertificateWarnWindow, snapshotCertificateWarningsGCTtl)
+	snapshotCertificateWarnings.Unlock()
+	if !allowed {
 		return
 	}
-	snapshotCertificateWarnings.last[key] = now
-	// 顺手清理过期条目，防止长期运行 master 节点的 map 无限增长。
-	for k, t := range snapshotCertificateWarnings.last {
-		if now.Sub(t) > snapshotCertificateWarningsGCTtl {
-			delete(snapshotCertificateWarnings.last, k)
-		}
-	}
-	snapshotCertificateWarnings.Unlock()
 	Logf("warn", "cluster snapshot skipped malformed certificate candidate: rule_id=%s job_id=%d error=%v", ruleID, jobID, cause)
 }
 

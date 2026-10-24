@@ -19,6 +19,9 @@ const (
 	AuditPolicyExplicit
 )
 
+// 集群注册链终结点（从节点持久化集群令牌后清除一次性注册密钥）登记为
+// AuditPolicyExplicit：与 register/approve 对称，handler 显式记录「确认/确认
+// 失败」——事后可证明某节点何时消费了注册密钥。
 var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/auth/login":        AuditPolicyExplicit,
 	"POST /api/v1/auth/ticket-login": AuditPolicyExplicit,
@@ -60,7 +63,7 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"PUT /api/v1/ca-providers/:id":                AuditPolicyExplicit,
 	"POST /api/v1/ca-providers/:id/test":          AuditPolicyExplicit,
 	"POST /api/v1/cluster/register":               AuditPolicyExplicit,
-	"POST /api/v1/cluster/registration/confirm":   AuditPolicySkip,
+	"POST /api/v1/cluster/registration/confirm":   AuditPolicyExplicit,
 	"POST /api/v1/cluster/register-tokens":        AuditPolicyExplicit,
 	"POST /api/v1/cluster/nodes/:id/approve":      AuditPolicyExplicit,
 	"POST /api/v1/cluster/nodes/:id/reject":       AuditPolicyExplicit,

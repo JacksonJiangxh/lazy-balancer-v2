@@ -98,8 +98,8 @@ func TestUpdateUser_preserves_omitted_display_name(t *testing.T) {
 }
 
 func TestUpdateUser_preserves_all_fields_when_password_rejected(t *testing.T) {
-	// Given（bcrypt 只取前 72 字节，73 字符密码在绑定层被 400 拒绝；
-	// 拒绝路径不得产生任何部分写入）
+	// Given（bcrypt 只取前 72 字节；73 字符密码由 validatePasswordPolicy 的
+	// 长度上限拒绝——绑定层只拦空值；拒绝路径不得产生任何部分写入）
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec("INSERT INTO users (id, username, password_hash, role, display_name) VALUES (1, 'original', 'original-hash', 'admin', 'Original Name'), (99, 'backup-admin', 'x', 'admin', '')"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -115,7 +115,8 @@ func TestUpdateUser_preserves_all_fields_when_password_rejected(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 
-	// Then（原断言 500：超长密码以前只能在 bcrypt 阶段失败，现在绑定层提前拦截）
+	// Then（400 来自 validatePasswordPolicy 的长度上限；绑定层只拦空值，
+	// 故此断言验证的是拒绝发生在写库之前）
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
 	}
@@ -744,7 +745,8 @@ func TestConfigBackup_export_preserves_sensitive_columns(t *testing.T) {
 	}
 }
 
-func TestConfigBackup_roundtrips_security_version_tables(t *testing.T) {
+// 导出携带版本表、导入跳过不落库（警告 + 0 行），与纯 JSON 导入跳过版本表同口径。
+func TestConfigBackup_exportsVersionTablesAndImportSkips(t *testing.T) {
 	// Given：CRS/IP2Region 版本表含 auto_update 偏好，导出前先写入非默认值
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -803,19 +805,6 @@ func TestConfigBackup_roundtrips_security_version_tables(t *testing.T) {
 	}
 }
 
-func assertNextUpdateRoundTrip(t *testing.T, got string, year int, month time.Month, day, hour, minute, second int) {
-	t.Helper()
-	// next_update 为 DATETIME 列，导出经 JSON 序列化会被驱动规范化为 RFC3339 文本，
-	// 导入后按同一 UTC 时刻做语义比对，而非逐字节比较。
-	parsed, err := time.Parse(time.RFC3339, got)
-	if err != nil {
-		t.Fatalf("restored next_update %q is not RFC3339: %v", got, err)
-	}
-	if want := time.Date(year, month, day, hour, minute, second, 0, time.UTC); !parsed.Equal(want) {
-		t.Fatalf("restored next_update=%v, want %v", parsed, want)
-	}
-}
-
 func TestImportConfigBackup_clamps_excessive_jwt_expiration(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	completeTables := make(map[string][]map[string]any, len(configBackupTables))
@@ -824,13 +813,13 @@ func TestImportConfigBackup_clamps_excessive_jwt_expiration(t *testing.T) {
 	}
 	completeTables["users"] = []map[string]any{{"id": 1, "username": "admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}}
 	importCfg := map[string]any{"jwt_expire_minutes": 999999}
-	importBackupShared := configBackup{
+	backupPayload := configBackup{
 		Meta:   configBackupMeta{App: "lazy-balancer-v2", Version: 2, ExportedAt: "2026-08-19T00:00:00Z"},
 		Config: importCfg,
 		Tables: completeTables,
 	}
-	importBackupShared.Meta.Checksum = checksumBackupPayload(t, completeTables, importCfg)
-	body, err := json.Marshal(importBackupShared)
+	backupPayload.Meta.Checksum = checksumBackupPayload(t, completeTables, importCfg)
+	body, err := json.Marshal(backupPayload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,13 +860,13 @@ func TestImportConfigBackup_ignoresDeadMetricsRetentionDaysKey(t *testing.T) {
 			}
 			completeTables["users"] = []map[string]any{{"id": 1, "username": "admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}}
 			importCfg := map[string]any{"metrics_retention_days": item.value}
-			importBackupShared := configBackup{
+			backupPayload := configBackup{
 				Meta:   configBackupMeta{App: "lazy-balancer-v2", Version: 2, ExportedAt: "2026-08-19T00:00:00Z"},
 				Config: importCfg,
 				Tables: completeTables,
 			}
-			importBackupShared.Meta.Checksum = checksumBackupPayload(t, completeTables, importCfg)
-			body, err := json.Marshal(importBackupShared)
+			backupPayload.Meta.Checksum = checksumBackupPayload(t, completeTables, importCfg)
+			body, err := json.Marshal(backupPayload)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -996,8 +985,8 @@ func TestImportConfigBackup_missingOperatorAccount_respectsChoice(t *testing.T) 
 
 func TestImportConfigBackup_preserves_backup_rule_attribution_without_operator_context(t *testing.T) {
 	// 归属重映射仅在操作者存在时执行——无操作者上下文时，备份行自带的
-	// updated_by 必须原样保留，不得写 NULL 抹掉全部规则归属（操作者非空但缺席
-	// 备份的场景已被自锁前置门 400 拦截，见上一用例）。
+	// updated_by 必须原样保留，不得写 NULL 抹掉全部规则归属（操作者非空但
+	// 缺席备份的场景按 2026-09-18 裁定为 200 + warning，见上一用例）。
 	// Given
 	h := newBackupTestHandlers(t)
 	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
@@ -1794,8 +1783,8 @@ func TestValidateV2BackupTLSShape_clamps_tcp_stale_tls(t *testing.T) {
 	if err := validateV2BackupTLSShape(tables); err != nil {
 		t.Fatalf("validateV2BackupTLSShape unexpected error: %v", err)
 	}
-	if v, _ := rule["enable_tls"].(int); v != 0 {
-		t.Fatalf("enable_tls=%v, want clamped 0", rule["enable_tls"])
+	if v, ok := rule["enable_tls"].(int); !ok || v != 0 {
+		t.Fatalf("enable_tls=%v (type %T), want clamped int 0", rule["enable_tls"], rule["enable_tls"])
 	}
 	if rule["tls_cert"] != "" || rule["tls_key"] != "" {
 		t.Fatalf("tls_cert=%v tls_key=%v, want cleared", rule["tls_cert"], rule["tls_key"])
@@ -2132,7 +2121,7 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
-	importBackupShared := func(backup string) *httptest.ResponseRecorder {
+	importFn := func(backup string) *httptest.ResponseRecorder {
 		t.Helper()
 		request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
 		request.Header.Set("Content-Type", "application/json")
@@ -2153,7 +2142,7 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 			},
 		}, EmptyConfigIfNil: true})
 
-		response := importBackupShared(backup)
+		response := importFn(backup)
 		if response.Code != http.StatusOK {
 			t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 		}
@@ -2177,7 +2166,7 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 			"lb_rules": {{"caddy_id": "lb_badport", "name": "bad-port", "protocol": "http", "domain": "badport.example.test", "listen_port": 0, "enabled": 1}},
 		}, EmptyConfigIfNil: true})
 
-		response := importBackupShared(backup)
+		response := importFn(backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "1-65535") {
 			t.Fatalf("status=%d body=%s, want 400 invalid port", response.Code, response.Body.String())
 		}
@@ -2405,12 +2394,25 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 		"cert_jobs": {{"id": 1, "rule_id": "lb_nullacme", "domain": "nullacme.example.test", "status": "queued",
 			"ca_provider_id": nil, "renewal_attempts": nil, "deployment_attempts": nil, "created_at": nil,
 			"message": nil, "expires_at": nil, "key_pem": nil, "ca_available_after": nil,
-			"last_error_code": nil, "deployment_available_after": nil, "updated_at": nil}},
+			"last_error_code": nil, "deployment_available_after": nil, "updated_at": nil},
+			{"id": 2, "rule_id": "lb_nulldump", "domain": "nulldump.example.test", "status": "queued",
+				"ca_provider_id": nil, "renewal_attempts": nil, "deployment_attempts": nil, "created_at": nil,
+				"message": nil, "expires_at": nil, "key_pem": nil, "ca_available_after": nil,
+				"last_error_code": nil, "deployment_available_after": nil, "updated_at": nil}},
 		"security_policies":          {{"id": 1, "name": "null-bind-policy"}},
 		"security_policy_bindings":   {{"rule_caddy_id": "lb_nulldump", "policy_id": 1}},
 		"security_crs_version":       {{"id": 1, "version": "v4.99.0", "updated_at": nil, "auto_update": nil, "update_status": nil, "message": nil, "last_checked": nil, "next_update": nil, "trigger": nil, "started_at": nil, "finished_at": nil, "consecutive_failures": nil}},
 		"security_ip2region_version": {{"id": 1, "version": "v3.99.0", "updated_at": nil, "auto_update": nil, "update_status": nil, "message": nil, "last_checked": nil, "next_update": nil, "trigger": nil, "started_at": nil, "finished_at": nil, "consecutive_failures": nil}},
 	}, EmptyConfigIfNil: true})
+	// 夹具自检：非 ACME 清理断言必须有真实种子行，否则 COUNT=0 恒真
+	// （下方「lb_nulldump cert_jobs rows=0」将不再能发现清理谓词被删/写错）。
+	var fixture configBackup
+	if err := json.Unmarshal([]byte(backup), &fixture); err != nil {
+		t.Fatalf("parse backup fixture: %v", err)
+	}
+	if got := len(fixture.Tables["cert_jobs"]); got != 2 {
+		t.Fatalf("fixture cert_jobs rows=%d, want 2（含将被清理的 lb_nulldump 行）", got)
+	}
 
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)

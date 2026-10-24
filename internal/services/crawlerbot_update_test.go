@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // TestCrawlerBotUpdate_fullCycle 全周期：下载→CIDR 提取→名单快照→IP 段命中。
@@ -105,6 +107,148 @@ func TestPrimeCrawlerIPLists_builtinFallback(t *testing.T) {
 	}
 }
 
+// TestCrawlerUpdate_partialCommitFailureMessage 部分提交形态的源失败文案：
+// DB 行已更新而运行快照写失败时，面板不得显示「保留上次快照」（与实际相反）。
+func TestCrawlerUpdate_partialCommitFailureMessage(t *testing.T) {
+	newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	dir := t.TempDir()
+	crawlerIPListFile = filepath.Join(dir, "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"prefixes":[{"ipv4Prefix":"10.11.0.0/24"},{"ipv4Prefix":"10.12.0.0/24"}]}`))
+	}))
+	t.Cleanup(ts.Close)
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatalf("seed sources: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=0;
+		UPDATE security_crawler_sources SET update_enabled=1,url=? WHERE name='googlebot'`, ts.URL); err != nil {
+		t.Fatal(err)
+	}
+	// 收缩门基线：3 条既有条目（2 条新条目 > 半数，不触发收缩拒绝）。
+	if err := upsertCrawlerIPList("googlebot", []string{"203.0.113.1/32", "203.0.113.2/32", "203.0.113.3/32"}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	// 快照目录只读 → DB 行写入成功而快照写失败（部分提交）。
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	if err := GetCrawlerUpdateManager().RunUpdate(context.Background(), taskengine.RunContext{Ctx: context.Background(), Trigger: "manual"}); err == nil {
+		t.Fatal("快照写失败必须让本轮失败（不得静默当成功）")
+	}
+
+	var status, message string
+	if err := db.DB.QueryRow(`SELECT update_status, COALESCE(message,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&status, &message); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("源状态=%q, want failed", status)
+	}
+	if strings.Contains(message, "保留上次快照") {
+		t.Fatalf("部分提交（DB 已更新）不得显示「保留上次快照」: %q", message)
+	}
+	if !strings.Contains(message, "数据库已更新") {
+		t.Fatalf("源失败文案未说明真实类别: %q", message)
+	}
+	// DB 确实已换新内容（部分提交成立的前提）。
+	var entries string
+	if err := db.DB.QueryRow(`SELECT COALESCE(entries,'') FROM security_ip_lists WHERE name=? AND system=1`, CrawlerIPListName("googlebot")).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(entries, "10.11.0.0/24") {
+		t.Fatalf("DB 未写入新名单（部分提交前提不成立）: %q", entries)
+	}
+}
+
+// TestCrawlerUpdate_successStateWriteFailureBackfillsFailedState 成功态写失败时
+// 尽力补写 failed 终态：源行不得停留 running（自动更新随后被关闭时该行会
+// 长期显示「运行中」）。
+func TestCrawlerUpdate_successStateWriteFailureBackfillsFailedState(t *testing.T) {
+	newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"prefixes":[{"ipv4Prefix":"10.11.0.0/24"},{"ipv4Prefix":"10.12.0.0/24"}]}`))
+	}))
+	t.Cleanup(ts.Close)
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatalf("seed sources: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=0;
+		UPDATE security_crawler_sources SET update_enabled=1,url=? WHERE name='googlebot'`, ts.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertCrawlerIPList("googlebot", []string{"203.0.113.1/32", "203.0.113.2/32", "203.0.113.3/32"}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	// 只拒绝 success 终态写（failed 终态仍可写）——成功态写失败的唯一注入点。
+	if _, err := db.DB.Exec(`CREATE TRIGGER reject_crawler_success BEFORE UPDATE ON security_crawler_sources
+		WHEN NEW.update_status='success' BEGIN SELECT RAISE(ABORT,'injected success-state failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec(`DROP TRIGGER IF EXISTS reject_crawler_success`) })
+
+	if err := GetCrawlerUpdateManager().RunUpdate(context.Background(), taskengine.RunContext{Ctx: context.Background(), Trigger: "manual"}); err == nil {
+		t.Fatal("成功态写失败必须让本轮失败（不得 success 掩盖）")
+	}
+
+	var status, message string
+	if err := db.DB.QueryRow(`SELECT update_status, COALESCE(message,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&status, &message); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("源状态=%q, want failed（不得停留 running）", status)
+	}
+	if !strings.Contains(message, "源状态写失败") {
+		t.Fatalf("补写失败态文案未说明真实类别: %q", message)
+	}
+}
+
+// TestPrimeCrawlerIPLists_writesSnapshotOnce 启动预载只写一次全量快照：
+// 逐引擎播种阶段只落 DB——带快照形态会在 DB 尚未补种完时各写一次全量快照，
+// 插件可能读到「合法 JSON 但只含部分引擎」的中间态（iprange 引擎缺项即
+// Transient，合法爬虫失去豁免）。
+func TestPrimeCrawlerIPLists_writesSnapshotOnce(t *testing.T) {
+	_, database := newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	if _, err := database.Exec(`DELETE FROM security_ip_lists WHERE category='搜索引擎爬虫'`); err != nil {
+		t.Fatal(err)
+	}
+	oldObserver := crawlerSnapshotWriteObserver
+	writes := 0
+	crawlerSnapshotWriteObserver = func() { writes++ }
+	t.Cleanup(func() { crawlerSnapshotWriteObserver = oldObserver })
+
+	if err := GetCrawlerUpdateManager().Prime(); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if writes != 1 {
+		t.Fatalf("Prime 全量快照写入次数=%d, want 1（逐引擎中间态快照会被插件当作完整集合读取）", writes)
+	}
+	// 唯一那次写必须已含全部内置引擎。
+	data, err := os.ReadFile(crawlerIPListFile)
+	if err != nil {
+		t.Fatalf("snapshot file missing: %v", err)
+	}
+	var snapshot map[string][]string
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatalf("invalid snapshot JSON: %v (%s)", err, data)
+	}
+	for _, src := range crawlerBotSources {
+		if len(snapshot[src.Name]) == 0 {
+			t.Errorf("快照缺少引擎 %s", src.Name)
+		}
+	}
+}
+
 func TestCrawlerSnapshot_preservesAllSources(t *testing.T) {
 	// Given：连续更新两个源
 	_, _ = newClusterTestService(t)
@@ -161,7 +305,7 @@ func TestMarkCrawlerSourceFailed_usesScheduleNotBackoff(t *testing.T) {
 	}
 
 	// When（auto 触发：现存槽已过期 → 推进）
-	markCrawlerSourceFailed("googlebot", "auto")
+	markCrawlerSourceFailed("googlebot", "auto", "测试失败")
 
 	// Then：失败写下一排程槽（非 5/10/20 分钟指数退避）
 	var next string
@@ -183,7 +327,7 @@ func TestCrawlerSlotAdvance_triggerGate(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour).Format("2006-01-02 15:04:05")
 	write := map[string]func(string, string){
 		"success": func(name, trigger string) { markCrawlerSourceSuccess(name, trigger, 1) },
-		"failed":  func(name, trigger string) { markCrawlerSourceFailed(name, trigger) },
+		"failed":  func(name, trigger string) { markCrawlerSourceFailed(name, trigger, "测试失败") },
 	}
 	cases := []struct {
 		name         string

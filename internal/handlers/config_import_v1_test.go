@@ -684,3 +684,23 @@ func TestRestoreImportRuntime_sameConfigIsSuccessNoop(t *testing.T) {
 		t.Fatalf("运行配置被改写: %s", got)
 	}
 }
+
+// 413 文案必须从 maxConfigImportBytes 派生——测试把限额改小后仍称 128MB
+// 属「断言照过、文案失真」，巡检会按错误上限排障。
+func TestConfigImportLimitMessage_derivesFromConfiguredLimit(t *testing.T) {
+	old := maxConfigImportBytes
+	t.Cleanup(func() { maxConfigImportBytes = old })
+
+	maxConfigImportBytes = 1 << 20
+	if got, want := configImportLimitMessage(), "备份文件不能超过 1MB"; got != want {
+		t.Fatalf("message=%q, want %q", got, want)
+	}
+	maxConfigImportBytes = 256 << 20
+	if got, want := configImportLimitMessage(), "备份文件不能超过 256MB"; got != want {
+		t.Fatalf("message=%q, want %q", got, want)
+	}
+	maxConfigImportBytes = 128 << 20
+	if got, want := configImportLimitMessage(), "备份文件不能超过 128MB"; got != want {
+		t.Fatalf("message=%q, want %q（生产默认值）", got, want)
+	}
+}

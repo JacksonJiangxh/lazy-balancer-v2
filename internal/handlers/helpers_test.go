@@ -921,3 +921,85 @@ func TestParseRuleMetricsFromPrometheus_normalizes_configured_hosts(t *testing.T
 		})
 	}
 }
+
+// CPU 采样错误不得被 1s 采样窗口缓存成「正常的 0%」：错误轮之后的下一个请求
+// 必须重新采样并继续报错（Degraded 不覆盖 cpu，0% 会被误读为负载骤降）。
+func TestGetCPUPercent_errorIsNotCachedBySampleWindow(t *testing.T) {
+	oldWindow := cpuSampleWindow
+	cpuSampleWindow = time.Minute
+	t.Cleanup(func() { cpuSampleWindow = oldWindow })
+
+	lastCPUStats.mu.Lock()
+	oldSnapshot, oldSampledAt, oldHasValue, oldPercent := lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent
+	lastCPUStats.snapshot = cpuSnapshot{total: 1000, idle: 300}
+	lastCPUStats.sampledAt = time.Now().Add(-5 * time.Minute)
+	lastCPUStats.hasValue = true
+	lastCPUStats.percent = 7
+	lastCPUStats.mu.Unlock()
+	t.Cleanup(func() {
+		lastCPUStats.mu.Lock()
+		lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent = oldSnapshot, oldSampledAt, oldHasValue, oldPercent
+		lastCPUStats.mu.Unlock()
+	})
+
+	// 两轮样本的 idle 增量都大于总量增量（个别字段计数回退的畸形样本）。
+	samples := []string{
+		"cpu  200 0 490 320 0 0 0 0 0 0\n",
+		"cpu  200 0 470 350 0 0 0 0 0 0\n",
+	}
+	call := 0
+	oldReadFile := systemMetricsReadFile
+	systemMetricsReadFile = func(string) ([]byte, error) {
+		s := samples[call]
+		if call < len(samples)-1 {
+			call++
+		}
+		return []byte(s), nil
+	}
+	t.Cleanup(func() { systemMetricsReadFile = oldReadFile })
+
+	for round := 1; round <= len(samples); round++ {
+		if _, err := getCPUPercent(); err == nil {
+			t.Fatalf("第 %d 轮采样应报错（错误样本不得被采样窗口缓存成 0%%）", round)
+		}
+	}
+}
+
+// Prometheus 正文允许 NaN/±Inf，但样本值转 int64 对非有限值是实现相关的（会输出
+// 荒谬负数计数）：非有限样本必须跳过；全部无效时与「无有效样本」同口径报错。
+func TestParsePrometheusSamples_skipsNonFiniteValues(t *testing.T) {
+	body := strings.Join([]string{
+		"# HELP caddy_http_requests_total total",
+		`caddy_http_requests_total{host="a"} 5`,
+		"unused_gauge NaN",
+		"unused_inf +Inf",
+		"unused_neg_inf -Inf",
+	}, "\n")
+	samples, err := parsePrometheusSamples(body)
+	if err != nil {
+		t.Fatalf("parsePrometheusSamples: %v", err)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("samples=%+v, want 仅有限值样本", samples)
+	}
+	if samples[0].name != `caddy_http_requests_total{host="a"}` || samples[0].value != 5 {
+		t.Fatalf("sample=%+v, want 有限值样本原样保留", samples[0])
+	}
+	if _, err := parsePrometheusSamples("unused_gauge NaN\n"); err == nil {
+		t.Fatal("全部样本非有限值时应报错（与正文无有效样本同口径）")
+	}
+}
+
+// 超长设备名让 df 折行时仍必须取到总量/已用列（此前固定取第 2 行把设备名当
+// 数字列，磁盘分项整体降级）。
+func TestParseDFOutput_toleratesWrappedDeviceName(t *testing.T) {
+	wrapped := "Filesystem 1B-blocks Used Available Use% Mounted on\n" +
+		"/dev/disk/by-uuid/0123456789abcdef0123456789abcdef\n" +
+		"1000 750 250 75% /\n"
+	if total, used, ok := parseDFOutput(wrapped); !ok || total != 1000 || used != 750 {
+		t.Fatalf("parseDFOutput(wrapped)=(%d,%d,%v), want (1000,750,true)", total, used, ok)
+	}
+	if _, _, ok := parseDFOutput("Filesystem 1B-blocks Used Available Use% Mounted on\n"); ok {
+		t.Fatal("无数据行时不得返回成功")
+	}
+}

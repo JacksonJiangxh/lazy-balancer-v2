@@ -1779,9 +1779,11 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 	// 行数与被删/新建规则的存在性，既保留死锁门也证明并发写无丢失/异常。
 	var codesMu sync.Mutex
 	codes := map[string][]int{}
-	record := func(kind string, code int) {
+	bodies := map[string][]string{}
+	record := func(kind string, code int, body string) {
 		codesMu.Lock()
 		codes[kind] = append(codes[kind], code)
+		bodies[kind] = append(bodies[kind], body)
 		codesMu.Unlock()
 	}
 	go func() {
@@ -1795,11 +1797,11 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 					body := strings.NewReader(`{"description":"u"}`)
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/rules/lb_lockorder", body))
-					record("update", recorder.Code)
+					record("update", recorder.Code, recorder.Body.String())
 				case 1:
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/rules/lb_lockorder", nil))
-					record("delete", recorder.Code)
+					record("delete", recorder.Code, recorder.Body.String())
 				case 2:
 					body := strings.NewReader(`{"name":"newbie","protocol":"tcp","listen_port":19000,
 						"health_check_interval":10,"health_check_timeout":2,
@@ -1807,7 +1809,7 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 						"upstreams":[{"host":"127.0.0.1","port":9001,"weight":1,"enabled":true,"protocol":"tcp"}]}`)
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/rules", body))
-					record("create", recorder.Code)
+					record("create", recorder.Code, recorder.Body.String())
 				}
 			}(i)
 		}
@@ -1832,7 +1834,14 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 				}
 			}
 			if !ok {
-				t.Fatalf("%s status=%d, want one of %v", kind, code, allowed)
+				idx := 0
+				for i, c := range codes[kind] {
+					if c == code {
+						idx = i
+						break
+					}
+				}
+				t.Fatalf("%s status=%d body=%s, want one of %v", kind, code, bodies[kind][idx], allowed)
 			}
 		}
 	}
@@ -1888,6 +1897,15 @@ func TestDeleteRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_del_running'`).Scan(&ruleCount); err != nil || ruleCount != 1 {
 		t.Fatalf("rule must be preserved on 409: count=%d err=%v", ruleCount, err)
 	}
+	// 删除被在途签发挡住属可用性动作，必须留痕（错误检查+细节跳转面）。
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='删除失败' AND resource='负载规则' AND detail LIKE '%lb_del_running%' AND detail LIKE '%证书签发任务%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read blocked delete audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("删除阻断 409 审计条数=%d, want 1", blockedAudits)
+	}
 }
 
 func TestDisableRule_returnsConflictWhenWorkerRunning(t *testing.T) {
@@ -1910,6 +1928,14 @@ func TestDisableRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	var enabled int
 	if err := db.DB.QueryRow(`SELECT IIF(enabled IN ('1',1),1,0) FROM lb_rules WHERE caddy_id='lb_dis_running'`).Scan(&enabled); err != nil || enabled != 1 {
 		t.Fatalf("rule must stay enabled on 409: enabled=%d err=%v", enabled, err)
+	}
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='禁用失败' AND resource='负载规则' AND detail LIKE '%lb_dis_running%' AND detail LIKE '%证书签发任务%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read blocked disable audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("禁用阻断 409 审计条数=%d, want 1", blockedAudits)
 	}
 }
 

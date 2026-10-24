@@ -376,8 +376,11 @@ func securityOverviewTodayCounts(database *sql.DB, todayStart time.Time, now tim
 		return blocked, detected, true, nil
 	}
 	// 回退：原始表直算（含私网/保留地址，includes_reserved 披露）。
+	// 两条语句与 rollup 分支同口径套攻击面谓词——当前谓词只排除
+	// 「logged 且爬虫放行族」，对 blocked 恒真故无行为差异；两分支一旦分叉，
+	// 同一卡片会在 rollup/回退切换点（覆盖水位决定）给出不同数字且极难复现。
 	todayStartText := todayStartUTC.Format("2006-01-02 15:04:05")
-	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='blocked' AND event_time >= ?", todayStartText).Scan(&blocked); err != nil {
+	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='blocked' AND event_time >= ? AND "+services.AttackEventSQLPredicate("rule_triggered", "action"), todayStartText).Scan(&blocked); err != nil {
 		return 0, 0, false, err
 	}
 	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='logged' AND event_time >= ? AND "+services.AttackEventSQLPredicate("rule_triggered", "action"), todayStartText).Scan(&detected); err != nil {

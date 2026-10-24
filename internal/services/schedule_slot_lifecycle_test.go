@@ -344,7 +344,7 @@ func TestCrawlerUpdateSource_manualFailureKeepsExpiredSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := markCrawlerSourceFailed("googlebot", "manual"); err != nil {
+	if err := markCrawlerSourceFailed("googlebot", "manual", "测试失败"); err != nil {
 		t.Fatal(err)
 	}
 

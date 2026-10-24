@@ -774,6 +774,9 @@ interface CtxBodyParsed { state: 'empty' | 'ok' | 'error'; text: string; truncat
 // 请求体解析：utf8:（显式文本转义，必须先于 base64 判断）→ base64-truncated:
 // → base64: → 明文；base64 系 atob 解码（失败回退原始内容 + error 态）；
 // 明文以 \n...[TRUNCATED] 结尾时剥离标记转为截断横幅。
+// base64 两分支在真实管线属防御性不可达（coraza JSON 格式化器把非法 UTF-8
+// 替换为 U+FFFD，摄取侧拿到的恒是合法 UTF-8）；写侧 body_truncated 标记由
+// 摄取侧转成上述前缀/后缀，展示契约保持不变。
 const ctxBodyParsed = computed<CtxBodyParsed>(() => {
   const raw = ctxEvent.value?.request_body ?? ''
   if (raw === '') return { state: 'empty', text: '', truncated: false, binary: false }

@@ -144,3 +144,70 @@ func TestCRSManager_InvalidateRuleCount_rescans(t *testing.T) {
 		t.Fatalf("RuleCount=%d, want 3（失效后必须重扫，不得滞留旧值）", got)
 	}
 }
+
+// 快照替换阶段 rename 失败不得同时丢失两份快照：旧实现在 RemoveAll(snapshot)
+// 之后 rename 失败即 cleanupTmp()——旧快照已删、完整新树被清理，两份皆失，
+// 容器重建回退镜像捆绑版本且快照缺席不会自愈。两阶段替换下失败时旧快照
+// （.old）与完整新树（.tmp）都必须留在盘上。
+func TestPersistCRSSnapshot_replaceRenameFailureKeepsBothCopies(t *testing.T) {
+	liveDir := t.TempDir()
+	snapshotDir := filepath.Join(t.TempDir(), "snapshot")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule new")
+	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0\n")
+	writeTestFile(t, filepath.Join(snapshotDir, "rules", crsRulesProbeFile), "SecRule previous")
+	writeTestFile(t, filepath.Join(snapshotDir, crsVersionFile), "v4.14.0\n")
+
+	oldRename := osRename
+	osRename = func(src, dst string) error {
+		if dst == snapshotDir {
+			return errors.New("rename boom")
+		}
+		return oldRename(src, dst)
+	}
+	t.Cleanup(func() { osRename = oldRename })
+
+	if err := persistCRSSnapshotFrom(liveDir, snapshotDir, "v4.15.0"); err == nil {
+		t.Fatal("替换阶段 rename 失败必须返回错误（不得静默成功）")
+	}
+	prev, err := os.ReadFile(filepath.Join(snapshotDir+".old", "rules", crsRulesProbeFile))
+	if err != nil || string(prev) != "SecRule previous" {
+		t.Fatalf("旧快照必须保留在 .old: err=%v data=%q", err, prev)
+	}
+	fresh, err := os.ReadFile(filepath.Join(snapshotDir+".tmp", "rules", crsRulesProbeFile))
+	if err != nil || string(fresh) != "SecRule new" {
+		t.Fatalf("完整新快照必须保留在 .tmp（不得被 cleanup 删除）: err=%v data=%q", err, fresh)
+	}
+}
+
+// 两阶段替换的第一步（旧快照改名到 .old）失败时旧快照必须原封不动，暂存
+// 目录清理干净——不得留下「旧快照已移走」的半途态。
+func TestPersistCRSSnapshot_staleRenameFailureKeepsSnapshot(t *testing.T) {
+	liveDir := t.TempDir()
+	snapshotDir := filepath.Join(t.TempDir(), "snapshot")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule new")
+	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0\n")
+	writeTestFile(t, filepath.Join(snapshotDir, "rules", crsRulesProbeFile), "SecRule previous")
+
+	oldRename := osRename
+	osRename = func(src, dst string) error {
+		if dst == snapshotDir+".old" {
+			return errors.New("rename boom")
+		}
+		return oldRename(src, dst)
+	}
+	t.Cleanup(func() { osRename = oldRename })
+
+	if err := persistCRSSnapshotFrom(liveDir, snapshotDir, "v4.15.0"); err == nil {
+		t.Fatal("旧快照改名失败必须返回错误")
+	}
+	prev, err := os.ReadFile(filepath.Join(snapshotDir, "rules", crsRulesProbeFile))
+	if err != nil || string(prev) != "SecRule previous" {
+		t.Fatalf("旧快照必须原封不动: err=%v data=%q", err, prev)
+	}
+	if _, err := os.Stat(snapshotDir + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("暂存目录应已清理: stat err=%v", err)
+	}
+	if _, err := os.Stat(snapshotDir + ".old"); !os.IsNotExist(err) {
+		t.Fatalf("改名失败不得留下 .old: stat err=%v", err)
+	}
+}

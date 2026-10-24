@@ -366,7 +366,15 @@ func TestEngine_PeriodicRecordsEveryCycle(t *testing.T) {
 		}
 	}
 	e.StopLoop("t-per")
-	waitForEngine(t, "每轮落行", 2*time.Second, func() bool { return countRuns(t, "t-per") >= 5 })
+	// 行写入与终态更新是两步：只等行数会出现「行已落、status 仍 running」的瞬时态。
+	// 等待「≥5 行且全部 success」再断言，避免把收尾时序当失败。
+	waitForEngine(t, "每轮落行并终态", 2*time.Second, func() bool {
+		var total, done int
+		if err := db.DB.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) FROM task_runs WHERE task_id='t-per'`).Scan(&total, &done); err != nil {
+			return false
+		}
+		return total >= 5 && done == total
+	})
 	rows := countRuns(t, "t-per")
 	if rows < 5 {
 		t.Fatalf("30ms 间隔应≥5 轮且每轮落行, got %d 行", rows)

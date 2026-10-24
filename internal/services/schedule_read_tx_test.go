@@ -169,7 +169,12 @@ func TestScheduleReadPathsUseAtomicHandle(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_crs_version SET schedule_days='1', schedule_time='09:30', next_update='2999-01-01 00:00:00' WHERE id=1`); err != nil {
 		t.Fatalf("seed version schedule: %v", err)
 	}
-	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (name, update_enabled, next_update) VALUES ('src-atomic',1,'2999-01-02 00:00:00')`); err != nil {
+	// 源名取内置注册表名：威胁族槽域=运行域（注册表三源），注册表外启用行
+	// 不参与「最早槽」（见 earliestThreatNextUpdate）。注册表源在 db 初始化时
+	// 已播种，故按 UPSERT 覆写排程而不是裸 INSERT（否则 UNIQUE 冲突）。
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (name, update_enabled, next_update)
+		VALUES ('ustc',1,'2999-01-02 00:00:00')
+		ON CONFLICT(name) DO UPDATE SET update_enabled=1, next_update=excluded.next_update`); err != nil {
 		t.Fatalf("seed threat source: %v", err)
 	}
 

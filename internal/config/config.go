@@ -280,6 +280,21 @@ func load(path string, warnf configWarnf) *Config {
 		cfg.BackupDir = abs
 	}
 
+	// static_dir 与 data_dir/backup_dir 同口径：消费侧直接字符串拼接
+	// （r.Static(cfg.StaticDir+"/assets")），相对值会按**进程 cwd** 解析——
+	// systemd/容器的 cwd 与预期不同时面板静态资源整体 404，且启动期无信号。
+	// 绝对化 + Clean 去尾随斜杠（避免拼出 "//assets"）；目录不存在时启动期
+	// 告警（fail-visible）而不是等到运行期 404。
+	if cfg.StaticDir != "" {
+		if abs, err := filepath.Abs(cfg.StaticDir); err == nil {
+			cfg.StaticDir = abs
+		}
+		cfg.StaticDir = filepath.Clean(cfg.StaticDir)
+		if info, err := os.Stat(cfg.StaticDir); err != nil || !info.IsDir() {
+			warnf("config: static_dir %q 不存在或不是目录——面板静态资源将返回 404", cfg.StaticDir)
+		}
+	}
+
 	// JWT secret: env wins; otherwise persist a random one so tokens survive
 	// restarts and the secret is never predictable.
 	if cfg.JWTSecret == "" {

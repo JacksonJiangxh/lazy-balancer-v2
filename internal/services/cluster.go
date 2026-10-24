@@ -41,11 +41,15 @@ var (
 type ClusterService struct {
 	db *sql.DB
 	// dataDir 用于品牌镜像(branding.json)与未来文件态同步的本地路径。
-	dataDir              string
-	roleMu               sync.Mutex
-	pinCleanupMu         sync.Mutex
-	pendingPinPath       string
-	pendingPinAuditURL   string
+	dataDir            string
+	roleMu             sync.Mutex
+	pinCleanupMu       sync.Mutex
+	pendingPinPath     string
+	pendingPinAuditURL string
+	// pinCleanupFailureKey 是 pin 清理失败审计的去重键（pin 路径+错误文本）：
+	// 失败后 retryPendingPinCleanup 每个快照/巡检周期都会重试，同一失败
+	// （权限/只读目录）稳定复现时只应留一条审计，恢复成功时清空。
+	pinCleanupFailureKey string
 	beforeUpdateSettings func()
 	snapshotNow          func() time.Time
 	// sectionReports 缓存各从节点最近一次上报的分区哈希（ReportNode 写入、
@@ -926,16 +930,25 @@ func (s *ClusterService) cleanupClusterPin(pinPath, auditURL string) {
 			// pending 状态仍清空(无遗留需重试)。
 			s.pendingPinPath = ""
 			s.pendingPinAuditURL = ""
+			s.pinCleanupFailureKey = ""
 			return
 		}
 		s.pendingPinPath = pinPath
 		s.pendingPinAuditURL = auditURL
 		Logf("info", "cluster pin cleanup deferred: %v", err)
-		RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点："+auditURL, err.Error()), "")
+		// 重试由 Snapshot（每次 Pull）与主节点巡检（60s）驱动，同一失败会
+		// 按分钟稳定复现：审计只在失败形态（路径+错误）变化时写一条，恢复
+		// 成功时才重记「清理」；否则取证面被重复行淹没且掩盖真正的残留告警。
+		failureKey := pinPath + "\x00" + err.Error()
+		if s.pinCleanupFailureKey != failureKey {
+			s.pinCleanupFailureKey = failureKey
+			RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点："+auditURL, err.Error()), "")
+		}
 		return
 	}
 	s.pendingPinPath = ""
 	s.pendingPinAuditURL = ""
+	s.pinCleanupFailureKey = ""
 	RecordAuditLog("system", "清理", "证书指纹", FormatAuditDetail("旧主节点："+auditURL, AuditResultPart("success")), "")
 }
 

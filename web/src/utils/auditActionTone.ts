@@ -33,6 +33,9 @@ const ACTION_TONE_EXCEPTIONS: Record<string, AuditActionTone> = {
   '重置密码': 'warning',
   '重载': 'warning',
   '续签': 'warning',
+  // 重新签发（证书重签，与「续签」同族的风险操作）——安全网：后端新动作
+  // 落库即渲染为 warning，不必等色调映射补词。
+  '重新签发': 'warning',
   '重试': 'warning',
   '签发限流': 'warning',
   '切换': 'warning',
@@ -44,6 +47,9 @@ const ACTION_TONE_EXCEPTIONS: Record<string, AuditActionTone> = {
   '手动同步': 'warning',
   '同步自愈': 'warning',
   '注册': 'warning',
+  // 注册交付确认（集群信任链终结点，注册密钥就此失效）——与「注册」同色调；
+  // 失败形态由「失败」关键词派生 danger。
+  '确认': 'warning',
   '生成': 'warning',
   '导出': 'warning',
   '导入': 'warning',

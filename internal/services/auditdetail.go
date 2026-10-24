@@ -53,7 +53,8 @@ var auditResultTextMap = map[string]string{
 	// 证书任务「重试被阻止」终态（certificates.go 经局部
 	// auditFailure 闭包以动态实参传入，字面量扫描钉测覆盖不到——本码曾因此
 	// 渲染成英文 blocked）。
-	"blocked": "重试被阻止",
+	"blocked":            "重试被阻止",
+	"deleted_unverified": "已删除（结果未确认）",
 }
 
 func AuditResultText(result string) string {
@@ -136,6 +137,8 @@ var auditSourceTextMap = map[string]string{
 	"runtime_sweep":        "来源：运行时清扫",
 	"promote_or_startup":   "来源：升主或启动补建",
 	"first_issuance_retry": "来源：首次签发重试",
+	// 部署生命周期行缺证书材料（ACME 下载完成后进程退出）：补扫重新排队签发。
+	"deployment_material_lost": "来源：证书材料丢失",
 }
 
 func AuditSourcePart(source string) string {

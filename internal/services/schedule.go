@@ -300,12 +300,18 @@ func ValidScheduleHHMM(hhmm string) bool {
 
 // NextScheduledSlot 计算 now 之后的下一个排程槽：候选=loc 本地日历的 hh:mm，
 // 当日在星期集内且候选>now 则取当日，否则向后扫描至多 8 天取首个命中。
-// days 空/全非法 → 兜底全周；hhmm 非法 → 兜底 04:00。返回值带 loc 时区，
-// 落库端取 .UTC()。
+// days 空/全非法 → 兜底全周；hhmm 非法 → 兜底治理默认时间（db.
+// DefaultScheduleTime，与 DDL/迁移同源）。返回值带 loc 时区，落库端取 .UTC()。
 func NextScheduledSlot(now time.Time, days []int, hhmm string, loc *time.Location) time.Time {
 	hour, minute, ok := parseAutoBackupHHMM(hhmm)
 	if !ok {
+		// 兜底值必须与治理默认同源：本函数是导出纯函数，handler/测试可直接
+		// 调用，写死 04:00 会在默认时间变更后形成隐形分叉。默认值本身不可
+		// 解析时才退到显式兜底（保持永不失败的纯函数契约）。
 		hour, minute = 4, 0
+		if h, m, ok := parseAutoBackupHHMM(defaultScheduleTime); ok {
+			hour, minute = h, m
+		}
 	}
 	set := map[int]bool{}
 	for _, d := range NormalizeScheduleDays(days) {
@@ -511,23 +517,40 @@ func crawlerNextSlot(now time.Time) string {
 // earliestEnabledSourceUpdate 返回启用源最早排程槽（空=无排程）。
 // sourceTable 仅由包内固定传入，不接受外部输入。
 //
+// names 非空时把「槽域」收窄到运行域（该族任务实际处理的源名集合）：
+// 槽域必须 ⊆ 运行域，否则注册表外的启用行一旦过期，其 next_update 没有任何
+// 推进写点（markSourceSuccess/failSourceRow 只按已处理源写），最早槽恒钉在
+// 过去——auto 轮恒投递、运行体零到期源提前返回、槽永不被消费，该族自动更新
+// 就此静默停摆。威胁族传内置源名集合（运行域=注册表三源）；爬虫族运行域=全部
+// 启用行，传 nil 保持「全部启用行」语义。
+//
 // 排序按 datetime() 归一后的时间序而非原始串 MIN：库内允许 crsTimeLayout
 // （空格）与 RFC3339（T 分隔）双形态（parseUTCSlot 明确兼容），字典序把
 // "YYYY-MM-DD 05:00:00"（空格 0x20）排在 "...THH:MM:SS"（T 0x54）之前，选出的
 // 「最早槽」可能不是真实最早（集群快照/备份导入/旧版本残留可产生混格式）。
 // datetime() 同时把两种形态转成同一 UTC 形态，返回值即归一为 crsTimeLayout；
 // 非法串 datetime()=NULL 被排除（旧实现对垃圾串会直接选中垃圾串）。
-func earliestEnabledSourceUpdate(sourceTable string) string {
+func earliestEnabledSourceUpdate(sourceTable string, names []string) string {
 	database := db.GetDB()
 	if database == nil {
 		return ""
 	}
+	// 名过滤与威胁族运行域同源（db.ThreatSystemLists 的 Source 集合）。
+	// 空名单不拼子句（此时保持「全部启用行」——与爬虫族运行域一致）。
+	nameClause, args := "", make([]any, 0, len(names))
+	if len(names) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
+		nameClause = " AND name IN (" + placeholders + ")"
+		for _, name := range names {
+			args = append(args, name)
+		}
+	}
 	var next string
-	if err := database.QueryRow(`SELECT datetime(next_update) FROM ` + sourceTable + `
+	if err := database.QueryRow(`SELECT datetime(next_update) FROM `+sourceTable+`
 		WHERE update_enabled=1
 		  AND NULLIF(next_update,'') IS NOT NULL
-		  AND datetime(next_update) IS NOT NULL
-		ORDER BY datetime(next_update) ASC LIMIT 1`).Scan(&next); err != nil {
+		  AND datetime(next_update) IS NOT NULL`+nameClause+`
+		ORDER BY datetime(next_update) ASC LIMIT 1`, args...).Scan(&next); err != nil {
 		// 「无启用源/无有效排程」＝正常形态（旧 SQL 的 MIN 返回 NULL 被当成
 		// 读失败留痕）。读错误不得静默归零（引擎按零槽停摆）——接
 		// logScheduleReadFailure 单源首报留痕，恢复补 info。
@@ -542,12 +565,24 @@ func earliestEnabledSourceUpdate(sourceTable string) string {
 	return next
 }
 
+// earliestThreatNextUpdate 威胁族槽域 = 运行域（注册表源名集合）：
+// 运行体 threatDueSources 只处理注册表列出的源，槽域必须同步收窄，
+// 见 earliestEnabledSourceUpdate 的停滞机理说明。
 func earliestThreatNextUpdate() string {
-	return earliestEnabledSourceUpdate("security_threat_sources")
+	registry := db.ThreatSystemLists()
+	names := make([]string, 0, len(registry))
+	for _, source := range registry {
+		if source.Source != "" {
+			names = append(names, source.Source)
+		}
+	}
+	return earliestEnabledSourceUpdate("security_threat_sources", names)
 }
 
+// earliestCrawlerNextUpdate 爬虫族运行域=全部启用行（crawlerDueSources 不按
+// 名单过滤），槽域与运行域天然一致，不做名过滤。
 func earliestCrawlerNextUpdate() string {
-	return earliestEnabledSourceUpdate("security_crawler_sources")
+	return earliestEnabledSourceUpdate("security_crawler_sources", nil)
 }
 
 // setVersionTableSchedule 版本表排程保存 + 保存即重排（auto_update 关闭时也

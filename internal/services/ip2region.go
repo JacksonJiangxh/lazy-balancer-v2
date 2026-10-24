@@ -66,6 +66,22 @@ func ip2RegionStartupRepairWritesAllowed() bool {
 	return isMaster
 }
 
+// loadIP2RegionDistReadOnly 以镜像内置库作只读降级装载——live 库缺失/不可
+// 装载、且本节点不写（从节点/角色不可证实）或写 live 失败时的唯一安全降级
+// 路径。返回 nil 表示镜像库也不可装载（调用方放弃本次装载，Lookup 返回空）。
+// 只读语义由调用方置 readOnlyDist 承担（版本行/sidecar/派生缓存不落盘）：
+// 主节点写 live 失败时只读装载不掩盖失败（ERROR 已先落），却让面板归属地与
+// 库状态保持可用，与从节点分支同一形态。
+func loadIP2RegionDistReadOnly(scene string) *ip2regionService.Ip2Region {
+	s, err := openValidatedIP2RegionSearcher(ip2regionDistPath)
+	if err != nil {
+		Logf("error", "ip2region: %s，镜像内置库只读装载失败: %v", scene, err)
+		return nil
+	}
+	Logf("warn", "ip2region: %s，以镜像内置库只读装载（不写 live/版本行，等待修复或集群同步）", scene)
+	return s
+}
+
 // InitIP2Region loads the GeoIP database into the singleton searcher using
 // BufferCache mode (whole xdb in memory, zero-contention reads). The live
 // xdb wins when present; otherwise, on the master node, the bundled
@@ -89,18 +105,24 @@ func InitIP2Region() {
 		if !writesAllowed {
 			// live 由集群同步治理，本地补齐会与主端声明打架并延长整库漂移
 			// 重拉——只读装载镜像库供本地查询，文件/版本行/派生缓存一律不写。
-			s, oErr := openValidatedIP2RegionSearcher(ip2regionDistPath)
-			if oErr != nil {
-				Logf("error", "ip2region: live 库缺失且非主节点，镜像内置库只读装载失败: %v", oErr)
+			searcher = loadIP2RegionDistReadOnly("live 库缺失且非主节点（或角色不可证实）")
+			if searcher == nil {
 				return
 			}
-			searcher = s
 			readOnlyDist = true
-			Logf("info", "ip2region: live 库缺失且非主节点（或角色不可证实），以镜像内置库只读装载，不写 live；等待集群同步")
 			RecordAuditLog("system", "更新", "IP数据库", "启动时 live IP 库缺失且本节点非主节点，按镜像内置库只读装载（不覆盖 live 文件/版本行）", "")
 		} else if err := copyFile(ip2regionDistPath, ip2regionLivePath); err != nil {
+			// 主节点判定可写却写失败（/app/data 只读、磁盘满、权限变更）：
+			// 与从节点分支同一降级——只读装载镜像库，面板归属地/库状态保持
+			// 可用。写失败本身已 ERROR 留痕，降级不掩盖故障；live 缺失意味着
+			// 数据面同样不可用，属待修复形态而非静默降级。
 			Logf("error", "ip2region: failed to copy %s to %s: %v", ip2regionDistPath, ip2regionLivePath, err)
-			return
+			searcher = loadIP2RegionDistReadOnly("主节点 live 库写入失败")
+			if searcher == nil {
+				return
+			}
+			readOnlyDist = true
+			RecordAuditLog("system", "更新", "IP数据库", "启动时主节点 live IP 库写入失败，按镜像内置库只读装载（live 文件/版本行未写，GeoIP 库待修复）", "")
 		}
 	}
 	if searcher == nil {
@@ -116,16 +138,18 @@ func InitIP2Region() {
 			if _, distErr := os.Stat(ip2regionDistPath); distErr == nil {
 				if !writesAllowed {
 					// 从节点同样不覆盖 live（集群同步自愈），只读装载镜像库。
-					if fallback, oErr := openValidatedIP2RegionSearcher(ip2regionDistPath); oErr != nil {
-						Logf("error", "ip2region: 损坏 live 库且非主节点，镜像内置库只读装载失败: %v", oErr)
-					} else {
-						searcher = fallback
+					if searcher = loadIP2RegionDistReadOnly("损坏 live 库且非主节点（或角色不可证实）"); searcher != nil {
 						readOnlyDist = true
-						Logf("warn", "ip2region: 损坏 live 库且非主节点（或角色不可证实），以镜像内置库只读装载，不覆盖 live（等待集群同步自愈）")
 						RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏且本节点非主节点，按镜像内置库只读装载（不覆盖 live 文件/版本行）", "")
 					}
 				} else if cErr := copyFile(ip2regionDistPath, ip2regionLivePath); cErr != nil {
+					// 主节点写 live 失败：与从节点分支同一只读降级（写失败已
+					// ERROR 留痕），避免面板归属地全空而 live 仍是损坏文件。
 					Logf("error", "ip2region: 损坏 live 库的 dist 回退拷贝失败: %v", cErr)
+					if searcher = loadIP2RegionDistReadOnly("损坏 live 库且主节点回退拷贝失败"); searcher != nil {
+						readOnlyDist = true
+						RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏且镜像库回退拷贝失败，按镜像内置库只读装载（live 文件/版本行未写，待修复）", "")
+					}
 				} else if fallback, oErr := openValidatedIP2RegionSearcher(ip2regionLivePath); oErr != nil {
 					Logf("error", "ip2region: dist 回退库装载失败: %v", oErr)
 				} else {

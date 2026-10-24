@@ -20,21 +20,23 @@ import (
 	"sync/atomic"
 	"time"
 
+	"lazy-balancer-v2/internal/apikey"
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/handlers"
 	"lazy-balancer-v2/internal/mcpserver"
 	"lazy-balancer-v2/internal/services"
 
-	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	jwt "github.com/golang-jwt/jwt/v5"
 )
 
 var internalMCPAuthSecret = rand.Text()
-var jwtAuthenticationQuery = func(query string, args ...any) *sql.Row {
-	return db.DB.QueryRow(query, args...)
-}
+
+// jwtAuthenticationQuery 是认证状态查询的测试注入点：生产默认 nil（查询走
+// 装配期传入的库句柄，与 readOnlyGuard/clusterVersionMiddleware 同源）；
+// 测试可覆盖它以模拟瞬时 DB 失败。
+var jwtAuthenticationQuery func(database *sql.DB, query string, args ...any) *sql.Row
 
 // mfaUserEnabledCheck：MFA 启用态查询的测试注入点（与 jwtAuthenticationQuery 同模式）——
 // fail-closed 回归测试需要模拟「瞬时 DB 失败」，真实关闭 DB 会
@@ -46,9 +48,111 @@ var authenticationSecurityAuditNow = time.Now
 
 var securityAuditLimiter = authenticationAuditLimiter{events: make(map[string]time.Time)}
 
+// 认证审计限流器的容量/回收参数。
+const (
+	// authenticationAuditReclaimThreshold：键数超过该值才启动回收。
+	// 唯一键 = reason+path+ip，正常认证拒绝规模远低于此，阈值以下不做任何
+	// 回收工作（陈旧键留在表内不影响语义：再次命中时仍按 1min 去重窗判定）。
+	authenticationAuditReclaimThreshold = 1024
+	// authenticationAuditReclaimBatch：单次 allow 最多回收的陈旧键数。
+	// 有界批次是本限流器的核心约束——回收量不随表规模增长，锁持有时间恒定
+	// （旧实现按阈值触发整表遍历，洪水期锁内工作量与键数成正比）。
+	authenticationAuditReclaimBatch = 64
+	// authenticationAuditReclaimTTL：键空闲超过该时长才可回收。必须大于 1min
+	// 去重窗，否则回收会让同一键在窗内被再次记审计（去重契约失效）。
+	authenticationAuditReclaimTTL = 2 * time.Minute
+	// authenticationAuditHardCap：键表硬上限。回收后仍满则丢弃新键（不进表也
+	// 不记审计——审计丢失可接受，内存必须有界）。
+	authenticationAuditHardCap = 4096
+	// authenticationAuditQueueCapacity：回收队列容量。键被刷新时会在队尾追加
+	// 带新时间戳的条目、旧条目退化为「被替代」（出队即丢弃），最坏情形同时存在
+	// 两代条目，故取硬上限的两倍；真被填满（边界不可达）则覆盖队头，保证有界。
+	authenticationAuditQueueCapacity = 2 * authenticationAuditHardCap
+)
+
+// authenticationAuditEvent 是回收队列条目：键 + 登记时的最后命中时间。
+// 键被刷新时旧条目留在原处但时间戳落后于表内值，回收时以表内值比对即可识别
+// 这种「被替代」条目（出队即丢弃，不删键）。
+type authenticationAuditEvent struct {
+	key string
+	at  time.Time
+}
+
 type authenticationAuditLimiter struct {
 	mu     sync.Mutex
 	events map[string]time.Time
+	// reclaim 是按最后命中时间升序的定容环形队列（最久未命中在前）——
+	// 回收只从队头取有界批次，永不遍历全表。升序保证「队头都未过回收线时
+	// 队内没有可回收键」，于是繁忙期回收工作量恒为零。
+	reclaim      []authenticationAuditEvent
+	reclaimHead  int
+	reclaimCount int
+}
+
+// enqueueLocked 把键登记到回收队列尾部（调用方须持有 mu）。入队时间不小于
+// 队列内已有条目时队列保持升序；非单调的 now（时钟回拨）只会让回收延后，
+// 不改变语义（回收到期判定仍按表内时间戳）。
+func (limiter *authenticationAuditLimiter) enqueueLocked(key string, at time.Time) {
+	if len(limiter.reclaim) == 0 {
+		limiter.reclaim = make([]authenticationAuditEvent, authenticationAuditQueueCapacity)
+	}
+	if limiter.reclaimCount == len(limiter.reclaim) {
+		// 环满：覆盖队头（最旧条目退化为可丢弃），队列长度恒有界。
+		limiter.reclaim[limiter.reclaimHead] = authenticationAuditEvent{key: key, at: at}
+		limiter.reclaimHead = (limiter.reclaimHead + 1) % len(limiter.reclaim)
+		return
+	}
+	tail := (limiter.reclaimHead + limiter.reclaimCount) % len(limiter.reclaim)
+	limiter.reclaim[tail] = authenticationAuditEvent{key: key, at: at}
+	limiter.reclaimCount++
+}
+
+// headLocked 读取队头条目（不出队，调用方须持有 mu）。
+func (limiter *authenticationAuditLimiter) headLocked() (authenticationAuditEvent, bool) {
+	if limiter.reclaimCount == 0 {
+		return authenticationAuditEvent{}, false
+	}
+	return limiter.reclaim[limiter.reclaimHead], true
+}
+
+// dropHeadLocked 出队丢弃队头条目（调用方须持有 mu）。
+func (limiter *authenticationAuditLimiter) dropHeadLocked() {
+	limiter.reclaimHead = (limiter.reclaimHead + 1) % len(limiter.reclaim)
+	limiter.reclaimCount--
+}
+
+// reclaimQueueLenLocked 是回收队列当前条目数（测试与不变量自检用）。
+func (limiter *authenticationAuditLimiter) reclaimQueueLenLocked() int {
+	return limiter.reclaimCount
+}
+
+// reclaimExpiredLocked 从队头回收至多 authenticationAuditReclaimBatch 条过期
+// 键——每次调用常数级工作量（含出队丢弃被替代的旧条目），摊销完成回收。
+//
+// 队列按最后命中时间升序：队头就是最久未命中的键。它若仍未过回收线，队内
+// 不可能有可回收键，直接停止（繁忙期零工作量）；它已过线则删除并继续下一条。
+// 条目时间戳与表内值不一致说明键在登记后被刷新过（尾部有更新的条目），本条
+// 丢弃即可，键不受影响——去重窗语义不被回收改变。
+// protect 是本次请求正在刷新的键：已过线的它也跳过（刷新既有键不占新键额），
+// 本次 allow 会在队尾为它登记带新时间戳的条目。
+func (limiter *authenticationAuditLimiter) reclaimExpiredLocked(now time.Time, protect string) {
+	for range authenticationAuditReclaimBatch {
+		event, ok := limiter.headLocked()
+		if !ok {
+			return
+		}
+		last, live := limiter.events[event.key]
+		if !live || !last.Equal(event.at) || event.key == protect {
+			// 已被删除 / 已被刷新替代 / 本次请求的键：只丢条目，不删键。
+			limiter.dropHeadLocked()
+			continue
+		}
+		if now.Sub(last) < authenticationAuditReclaimTTL {
+			return
+		}
+		limiter.dropHeadLocked()
+		delete(limiter.events, event.key)
+	}
 }
 
 func (limiter *authenticationAuditLimiter) allow(key string, now time.Time) bool {
@@ -57,25 +161,22 @@ func (limiter *authenticationAuditLimiter) allow(key string, now time.Time) bool
 	if last, exists := limiter.events[key]; exists && now.Sub(last) < time.Minute {
 		return false
 	}
-	// （2026-09-19 历史）：仅规模超阈值才全图清扫——唯一键=
-	// reason+path+ip，1024 远超正常认证拒绝规模。阈值以下陈旧键留在 map 中
-	// 不清扫，但再次命中时上方 1 分钟窗口判定照常生效，语义等价。
-	if len(limiter.events) > 1024 {
-		for eventKey, last := range limiter.events {
-			if now.Sub(last) >= 2*time.Minute {
-				delete(limiter.events, eventKey)
-			}
-		}
+	// 规模超阈值才启动回收，且每次调用只回收有界批次（常数级、摊销）——
+	// 回收量不随表规模增长，锁持有时间恒定。阈值以下不做任何回收工作，
+	// 陈旧键留在表内不影响语义：再次命中时上方 1min 去重窗照常生效。
+	if len(limiter.events) > authenticationAuditReclaimThreshold {
+		limiter.reclaimExpiredLocked(now, key)
 	}
-	// 硬上限——上方清扫只清 >=2min 陈旧键，洪水期
-	// 唯一键高速涌入时全部键新鲜、清扫零效果，map 曾无界增长。清扫后仍达
-	// 4096 则丢弃新键：不进 map 也不记审计（审计丢失可接受，内存必须有界）。
-	// 注意与 loginRateBuckets 不同：限流桶必须保持强制力，容量满改 LRU
-	// 淘汰而非丢键放行；审计限流丢弃只损失一条告警、不放行。
-	// 既有键超窗刷新不占新键额，不受影响。
-	if _, exists := limiter.events[key]; !exists && len(limiter.events) >= 4096 {
+	// 硬上限：回收后仍满则丢弃新键，不进表也不记审计（审计丢失可接受，
+	// 内存必须有界）。与 loginRateBuckets 不同——限流桶必须保持强制力，
+	// 容量满走 LRU 淘汰而非丢键放行；审计限流丢弃只损失一条告警、不放行。
+	// 既有键超窗刷新不占新键额：reclaimExpiredLocked 保护本次键不回收。
+	if _, exists := limiter.events[key]; !exists && len(limiter.events) >= authenticationAuditHardCap {
 		return false
 	}
+	// 新键与刷新都登记（刷新把新时间戳登记到队尾，旧条目出队即丢弃），
+	// 保证表内每个键都有条目覆盖、且条目时间戳对得上。
+	limiter.enqueueLocked(key, now)
 	limiter.events[key] = now
 	return true
 }
@@ -83,6 +184,10 @@ func (limiter *authenticationAuditLimiter) allow(key string, now time.Time) bool
 func (limiter *authenticationAuditLimiter) reset() {
 	limiter.mu.Lock()
 	limiter.events = make(map[string]time.Time)
+	// 队列与表同生命周期：清表而不清队列会让旧条目的时间戳与新键误匹配。
+	limiter.reclaim = nil
+	limiter.reclaimHead = 0
+	limiter.reclaimCount = 0
 	limiter.mu.Unlock()
 }
 
@@ -418,22 +523,32 @@ func abortClusterMachineRateLimit(c *gin.Context) {
 
 var loginRateLimitCleanupOnce sync.Once
 
+// sweepExpiredRateLimitBuckets 删除已过窗（until 早于 now）的限流桶，返回删除
+// 数量。锁序与调用链一致：先 map 锁、再逐桶锁；桶在两次加锁之间被淘汰是良性的
+// ——本次请求的计数落在已脱表桶上，本分钟该来源少记 1 次（下一请求新建桶
+// count=1），不构成限流绕过。
+func sweepExpiredRateLimitBuckets(now time.Time) int {
+	removed := 0
+	loginRateBuckets.Lock()
+	defer loginRateBuckets.Unlock()
+	for ip, bucket := range loginRateBuckets.entries {
+		bucket.mu.Lock()
+		if now.After(bucket.until) {
+			delete(loginRateBuckets.entries, ip)
+			removed++
+		}
+		bucket.mu.Unlock()
+	}
+	return removed
+}
+
 func startLoginRateLimitCleanup() {
 	loginRateLimitCleanupOnce.Do(func() {
 		go func() {
 			ticker := time.NewTicker(time.Minute)
 			defer ticker.Stop()
 			for range ticker.C {
-				now := time.Now()
-				loginRateBuckets.Lock()
-				for ip, bucket := range loginRateBuckets.entries {
-					bucket.mu.Lock()
-					if now.After(bucket.until) {
-						delete(loginRateBuckets.entries, ip)
-					}
-					bucket.mu.Unlock()
-				}
-				loginRateBuckets.Unlock()
+				sweepExpiredRateLimitBuckets(time.Now())
 			}
 		}()
 	})
@@ -525,7 +640,9 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 
 	// CORS
 	r.Use(corsMiddleware())
-	r.Use(gzip.Gzip(gzip.DefaultCompression))
+	// 压缩中间件为本项目实现（internal/middleware/gzip.go）：错误/无体响应保留
+	// Vary，避免把 CORS 的 Vary: Origin 一起删掉。
+	r.Use(gzipMiddleware())
 	r.Use(auditMiddleware())
 	r.Use(clusterVersionMiddleware(db.DB))
 
@@ -562,7 +679,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	v1 := r.Group("/api/v1")
 	{
 		mcpHandler := mcpserver.NewWithInternalAuth(fmt.Sprintf("http://127.0.0.1:%d/api/v1", cfg.Port), loopbackAPIClient(), internalMCPAuthSecret)
-		v1.POST("/mcp", apiKeyAuth(cfg), mcpAccessGuard(), func(c *gin.Context) {
+		v1.POST("/mcp", apiKeyAuth(db.DB), mcpAccessGuard(), func(c *gin.Context) {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 			body, err := io.ReadAll(c.Request.Body)
 			if err != nil {
@@ -616,8 +733,8 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		// 机制），不走 clusterTokenAuth——主节点无法取回令牌明文（仅存哈希）。
 		v1.POST("/cluster/service-control", clusterRateLimit("service-control", 20, "服务控制请求过于频繁，请稍后再试"), h.ClusterServiceControl)
 
-		v1.Use(apiKeyAuth(cfg))
-		v1.Use(jwtAuth(cfg))
+		v1.Use(apiKeyAuth(db.DB))
+		v1.Use(jwtAuth(db.DB, cfg))
 		// apiKeyReadOnlyGuard 挂 v1 级——**正覆盖**下方直挂在 v1 上的路由
 		// （openapi/caddy/metrics/logout 等），与 admin/business 组级
 		// mfaStepUpGuard 的覆盖面不同（后者只管两组内路由）。新增 v1 直挂写
@@ -1010,7 +1127,16 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func jwtAuth(cfg *config.Config) gin.HandlerFunc {
+// jwtAuth 的库读取走装配期传入的句柄（与同组 readOnlyGuard/mfaStepUpGuard 同源），
+// 不再读包级 db.DB——两处句柄来源不同会让「认证读主库、授权读注入库」在测试与
+// 嵌入形态下分叉。
+func jwtAuth(database *sql.DB, cfg *config.Config) gin.HandlerFunc {
+	queryAuthenticationState := func(query string, args ...any) *sql.Row {
+		if jwtAuthenticationQuery != nil {
+			return jwtAuthenticationQuery(database, query, args...)
+		}
+		return database.QueryRow(query, args...)
+	}
 	return func(c *gin.Context) {
 		if c.GetString("auth_type") == "api_key" {
 			c.Next()
@@ -1084,7 +1210,7 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 		var dbEnabled sql.NullBool
 		var passwordVersion sql.NullInt64
 		var revoked bool
-		queryErr := jwtAuthenticationQuery(`WITH auth_state AS (
+		queryErr := queryAuthenticationState(`WITH auth_state AS (
 			SELECT EXISTS(SELECT 1 FROM revoked_jti WHERE jti_hash=? AND expires_at>?) AS revoked
 		)
 		SELECT auth_state.revoked, u.username, u.role, COALESCE(u.is_enabled,0), u.password_version
@@ -1153,19 +1279,15 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 	}
 }
 
-func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
+// apiKeyAuth 的 Key 解析与身份查询共用单源：凭据提取走 internal/apikey（与 MCP
+// 转发侧同一实现），身份查询走装配期传入的库句柄（与 readOnlyGuard 同源）。
+func apiKeyAuth(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 历史 原「JWT 已认证则跳过」首行分支删除——生产链
 		// 不可达（挂载次序固定：v1.Use(apiKeyAuth) 先于 v1.Use(jwtAuth)，/mcp
 		// 路由仅 apiKeyAuth；全链无更早 user_id 写者），user_id 在本中间件
 		// 之前恒不存在。删除后不改变任何可达请求的判定路径。
-		apiKey := c.GetHeader("X-API-Key")
-		if apiKey == "" {
-			authHeader := c.GetHeader("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer lb_sk_") {
-				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
+		apiKey := apikey.FromHeader(c.Request.Header)
 		if apiKey == "" {
 			c.Next()
 			return
@@ -1187,7 +1309,7 @@ func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 		// 认证查询收敛到 db.ResolveAPIKeyIdentity 单源（prefix + sha256
 		// + 有效性条件），与 mcpserver 只读可见性共用——此前两处手写同形 SQL，
 		// 认证条件变更时可见性会静默漂移。
-		identity, err := db.ResolveAPIKeyIdentity(db.DB, apiKey)
+		identity, err := db.ResolveAPIKeyIdentity(database, apiKey)
 		if err != nil {
 			if hasJWTBearer(c) {
 				c.Next()
@@ -1416,7 +1538,7 @@ func mfaStepUpGuard(database *sql.DB) gin.HandlerFunc {
 
 func hasJWTBearer(c *gin.Context) bool {
 	authHeader := c.GetHeader("Authorization")
-	return strings.HasPrefix(authHeader, "Bearer ") && !strings.HasPrefix(authHeader, "Bearer lb_sk_")
+	return strings.HasPrefix(authHeader, "Bearer ") && !apikey.IsAPIKeyAuthorization(authHeader)
 }
 
 func adminOnly() gin.HandlerFunc {

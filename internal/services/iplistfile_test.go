@@ -1,6 +1,9 @@
 package services
 
 import (
+	"bytes"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -468,5 +471,73 @@ func TestWriteIPListFile_fileModeMatchesRollbackPath(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o644 {
 		t.Fatalf("投影文件权限=%o, want 644（与回滚路径同口径）", perm)
+	}
+}
+
+// init 必须同时装配两个观测钩子：fail-stale 与「名单不可读且无缓存集合」。
+// 后者此前未接入面板日志——@ipListFast 的 fail-open 方向与受信代理的「信任
+// 无来源」都表现为「拦截/信任静默失效而零告警」。
+// 判别口径用面板日志的级别过滤：装配后面板钩子走 Logf（warn 在 error 档被
+// 过滤），而 wafiplist 默认钩子直接写 stderr（不受面板级别约束）。
+func TestInitWiresListUnavailableHookToPanelLog(t *testing.T) {
+	prevLevel := CurrentLogLevel()
+	if err := ConfigureLogLevel("error"); err != nil {
+		t.Fatalf("configure log level: %v", err)
+	}
+	t.Cleanup(func() { _ = ConfigureLogLevel(prevLevel) })
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	path := filepath.Join(t.TempDir(), "unavailable-hook.txt")
+	wafiplist.ReportListUnavailable(path, errors.New("boom"))
+	if strings.Contains(buf.String(), "不可读且无缓存集合") {
+		t.Fatalf("warn 级钩子未被面板级别过滤（仍是 wafiplist 默认 stderr 钩子）: %q", buf.String())
+	}
+
+	// 恢复 info 档后同一路径再次上报（节流窗口内不重复——换路径验证装配可用）。
+	if err := ConfigureLogLevel("info"); err != nil {
+		t.Fatalf("configure log level: %v", err)
+	}
+	wafiplist.ReportListUnavailable(path+".2", errors.New("boom"))
+	if got := buf.String(); !strings.Contains(got, "不可读且无缓存集合") {
+		t.Fatalf("面板钩子未生效（无可读告警）, log=%q", got)
+	}
+}
+
+// 同字节跳写必须归一权限：升级前的投影由 os.CreateTemp 生成（恒 0600），
+// 内容不再变化时永远走不到重写路径——Caddy 换 uid 部署会读不到名单。
+func TestWriteIPListFile_sameContentNormalizesMode(t *testing.T) {
+	scope := "mode-normalize"
+	entries := []string{"10.9.0.1", "10.9.0.2"}
+	path, err := writeIPListFile(scope, entries)
+	if err != nil {
+		t.Fatalf("首次写入: %v", err)
+	}
+	// 模拟升级前遗留形态 + 清空进程级备忘（强制走同字节判据而非 memo 快路）。
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod 0600: %v", err)
+	}
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	ipListProjectionMemoMu.Lock()
+	ipListProjectionMemo = map[string]ipListProjectionMemoEntry{}
+	ipListProjectionMemoMu.Unlock()
+
+	if _, err := writeIPListFile(scope, entries); err != nil {
+		t.Fatalf("同字节写入: %v", err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := st.Mode().Perm(); got != 0o644 {
+		t.Fatalf("mode=%o, want 0644（同字节跳写必须归一权限）", got)
+	}
+	if !st.ModTime().Equal(old) {
+		t.Fatalf("mtime=%v, want %v（内容未变不得改写，wafiplist 不重建）", st.ModTime(), old)
 	}
 }

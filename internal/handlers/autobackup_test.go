@@ -1192,3 +1192,39 @@ func TestWriteAutoBackupPayload_canceledContextReturnsCancelError(t *testing.T) 
 		t.Fatalf("未取消写盘错误=%v, want 真实写盘错误（非取消）", err)
 	}
 }
+
+// 行内 sections 损坏必须在列表披露：静默退化为空数组会把「范围未知」展示成
+// 「该备份不含任何分类」（与设置读侧对同一列显式报错的口径分叉）。
+func TestAutoBackupSettings_disclosesCorruptedRowSections(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, trigger_type, sections) VALUES ('lbbak-corrupt.lbbak','success','schedule','{not-json')`); err != nil {
+		t.Fatalf("seed corrupted row: %v", err)
+	}
+
+	response := serveAutoBackupJSON(t, h, http.MethodGet, "/settings/auto-backup", "/settings/auto-backup", "", h.AutoBackupSettings)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Backups []struct {
+				Filename      string   `json:"filename"`
+				Sections      []string `json:"sections"`
+				SectionsError string   `json:"sections_error"`
+			} `json:"backups"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Data.Backups) != 1 || payload.Data.Backups[0].Filename != "lbbak-corrupt.lbbak" {
+		t.Fatalf("backups=%+v, want 仅损坏行", payload.Data.Backups)
+	}
+	row := payload.Data.Backups[0]
+	if row.SectionsError == "" {
+		t.Fatal("损坏的 sections 必须披露 sections_error（不得静默为空数组）")
+	}
+	if len(row.Sections) != 0 {
+		t.Fatalf("sections=%v, want 空数组（键集沿用）", row.Sections)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,8 +75,7 @@ type rotationCopyName struct {
 // <stem>-<ts>-size.log.gz）必须归到剥掉时间戳后的基名——否则会派生出一个
 // 「副本名本身当基名」的非规范条目，按固定基名取值的消费方取不到。
 func classifyRotationCopyName(name string) rotationCopyName {
-	core := strings.TrimSuffix(name, ".gz")
-	gzipped := core != name
+	core, gzipped := stripRotationCompressionSuffix(name)
 	originalCore := core
 	collision := false
 	if stripped, ok := stripRotationCollisionSuffix(core); ok {
@@ -98,12 +98,14 @@ func classifyRotationCopyName(name string) rotationCopyName {
 			return rotationCopyName{kind: rotationCopyTimestamp, base: core[:len(core)-16]}
 		}
 	}
-	// timberjack：<stem>-<ts>-size.log。stem 边界取「从右往左最后一个合法
-	// 时间戳段」——规则/任务日志基名允许含 '-<数字>'（存量/导入 ID，如
-	// lb_abc-123），按首个 '-<数字>' 切分会把副本串到同前缀的兄弟规则。
-	// 尺寸数字与兄弟文件段（-tls-/-1048576-）不构成时间戳，故不误切。
-	if strings.HasSuffix(core, "-size.log") {
-		trimmed := core[:len(core)-len("-size.log")]
+	// timberjack：<stem>-<ts>-<reason>[_<碰撞计数>].log[.gz|.zst]。stem 边界取
+	// 「从右往左最后一个合法时间戳段」——规则/任务日志基名允许含 '-<数字>'
+	// （存量/导入 ID，如 lb_abc-123），按首个 '-<数字>' 切分会把副本串到同前缀
+	// 的兄弟规则。尺寸数字与兄弟文件段（-tls-/-1048576-）不构成时间戳，故不误切。
+	// reason 家族与同毫秒碰撞后缀取自 services.CaddyLogRotationReasonPattern
+	// （与删除侧白名单同源，两处不得各写一份）。
+	if loc := timberjackRotationReasonSuffix.FindStringIndex(core); loc != nil {
+		trimmed := core[:loc[0]]
 		for i := len(trimmed) - 1; i >= 0; i-- {
 			if trimmed[i] != '-' || i+1 >= len(trimmed) {
 				continue
@@ -124,6 +126,24 @@ func classifyRotationCopyName(name string) rotationCopyName {
 		return rotationCopyName{kind: rotationCopyWholeGzip, base: base}
 	}
 	return rotationCopyName{}
+}
+
+// timberjackRotationReasonSuffix 匹配 timberjack 副本的 reason 尾部：
+// -size.log / -size_1.log（同毫秒碰撞计数写在 reason 段内）/ -time.log /
+// -time_2.log。reason 家族取自 services.CaddyLogRotationReasonPattern——与删除
+// 侧白名单同源，避免两侧各写一份上游命名知识后漂移。
+var timberjackRotationReasonSuffix = regexp.MustCompile(
+	`-(?:` + services.CaddyLogRotationReasonPattern() + `)(?:_\d+)?\.log$`)
+
+// stripRotationCompressionSuffix 剥掉轮转副本的压缩后缀（.gz / .zst）并报告
+// 是否压缩——只认 .gz 会让 zstd 副本分类落空（与删除侧白名单同族）。
+func stripRotationCompressionSuffix(name string) (core string, compressed bool) {
+	for _, suffix := range []string{".gz", ".zst"} {
+		if strings.HasSuffix(name, suffix) {
+			return strings.TrimSuffix(name, suffix), true
+		}
+	}
+	return name, false
 }
 
 // isRotationTimestampTail 判定轮转副本名里时间戳段的开头形状（其后可带
@@ -224,7 +244,13 @@ func logStatsVolumeReadFailure(key string, err error) {
 		return
 	}
 	if len(logStatsVolumeState.failed) >= logStatsVolumeStateCap {
-		logStatsVolumeState.failed = map[string]bool{}
+		// 触顶逐出单个键而非整表清空：清空会让仍在失败的 256 个路径全部回到
+		// 「首报」状态（一次性 256 条 warn），并丢掉已失败键的配对信息（日
+		// 后恢复不再补「已恢复」info）。
+		for victim := range logStatsVolumeState.failed {
+			delete(logStatsVolumeState.failed, victim)
+			break
+		}
 	}
 	logStatsVolumeState.failed[key] = true
 	logStatsVolumeState.Unlock()
@@ -293,8 +319,11 @@ func aggregateDirStatsWithEntries(dir string, entries []os.DirEntry, match func(
 			logStatsVolumeReadFailure("logstats-dir-"+dir, err)
 			return out
 		}
+		// 恢复留痕只属于「本函数真的重新读成功」：调用方传入缓存条目时（含
+		// 失败窗口的空非 nil 哨兵）不得在这里报恢复，否则失败态会被同一次
+		// 请求立刻抹掉，形成 warn/info 逐轮抖动。
+		logStatsVolumeReadRecovered("logstats-dir-" + dir)
 	}
-	logStatsVolumeReadRecovered("logstats-dir-" + dir)
 	bases := make(map[string]struct{}, len(entries))
 	stemToBase := make(map[string]string, len(entries))
 	for _, e := range entries {
@@ -593,6 +622,39 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		return false
 	}
 
+	// 请求级目录枚举缓存：运行日志行与 caddy 聚合行的目录默认同为 /app/logs，
+	// 此前各枚举一次（重复 ReadDir + 每文件重复 stat），且两次枚举之间若发生
+	// 轮转，同一响应的两行会来自不同目录快照。成功与失败都缓存，失败返回
+	// 空非 nil 切片（「nil=未提供」哨兵会让调用方重读，故障窗口退化为每个
+	// 消费点一次 syscall）。
+	type dirEntriesResult struct {
+		entries []os.DirEntry
+		ok      bool
+	}
+	dirEntries := map[string]dirEntriesResult{}
+	readDir := func(dir string) []os.DirEntry {
+		if cached, seen := dirEntries[dir]; seen {
+			if !cached.ok {
+				return []os.DirEntry{}
+			}
+			return cached.entries
+		}
+		entries, err := logStatsReadDir(dir)
+		if err != nil {
+			logStatsVolumeReadFailure("logstats-dir-"+dir, err)
+			dirEntries[dir] = dirEntriesResult{ok: false}
+			return []os.DirEntry{}
+		}
+		logStatsVolumeReadRecovered("logstats-dir-" + dir)
+		dirEntries[dir] = dirEntriesResult{entries: entries, ok: true}
+		return entries
+	}
+	// logFileDirStats 以「文件路径」为入口返回活跃/轮转体量（与 dirBytes 同
+	// 口径），枚举复用本请求的目录缓存。
+	logFileDirStats := func(path string) (int64, int64, int) {
+		return dirBytesWithEntries(path, readDir(filepath.Dir(path)))
+	}
+
 	// （2026-09-06 裁定）已被 2026-09-15 裁定部分覆盖:指标历史固定保留
 	// 最近 7 天(services/services.go cleanupHistory),不再复用「日志保留」
 	// ConfigSource 类目清单不得再含指标历史。
@@ -707,7 +769,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		// SizeBytes=真实审计日志文件(2026-09-14 用户裁定:不再用 metrics.db 库文件
 		// 虚标,DBBytes 单独展示库容量)。一次 dirBytes 供 security_events 行复用
 		// (原先每次响应各调一次,重复全目录 ReadDir)。
-		auditActive, auditRotated, auditRotCount := dirBytes(resolvedWafAuditLogFile())
+		auditActive, auditRotated, auditRotCount := logFileDirStats(resolvedWafAuditLogFile())
 		if info := byKey("security_events"); info != nil {
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
 		}
@@ -715,14 +777,14 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 
 	if want("runtime") {
 		if info := byKey("runtime"); info != nil {
-			rtA, rtR, rtC := dirBytes(runtimePath)
+			rtA, rtR, rtC := logFileDirStats(runtimePath)
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = rtA, rtR, rtC
 		}
 	}
 	// +:四文件与「caddy」聚合行共用一次目录枚举——聚合按
 	// 基名归并（原实现每文件各一次 dirBytes、聚合行再扫一遍）。
 	if want("caddy") || want("caddy_runtime") || want("caddy_tls") || want("caddy_server") || want("caddy_proxy") {
-		caddyStats := aggregateDirStats(fixedLogsDir, caddyLogFamilyMatch)
+		caddyStats := aggregateDirStatsWithEntries(fixedLogsDir, readDir(fixedLogsDir), caddyLogFamilyMatch)
 		var caddyActive, caddyRotated int64
 		var caddyRotCount int
 		for _, entry := range []struct{ key, file string }{
@@ -754,35 +816,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	if tasksDir == "" {
 		tasksDir = filepath.Join(filepath.Dir(runtimePath), "tasks")
 	}
-	// 任务目录枚举缓存（含失败形态）：同一 tasks 目录在一次全量请求里被四类
-	// 已知行 + 逐任务行共享，失败窗口不得退化为每任务一次 syscall（见
-	// readTaskDir 的 (ok) 语义）。
-	type taskDirEntriesCache struct {
-		entries []os.DirEntry
-		ok      bool
-	}
-	taskDirEntries := map[string]taskDirEntriesCache{}
-	readTaskDir := func(dir string) []os.DirEntry {
-		if cached, seen := taskDirEntries[dir]; seen {
-			if !cached.ok {
-				// 失败形态返回空非 nil 切片：aggregateDirStatsWithEntries 的
-				// 「nil=未提供」哨兵会触发重读，失败窗口内每个任务重付 syscall。
-				return []os.DirEntry{}
-			}
-			return cached.entries
-		}
-		entries, err := logStatsReadDir(dir)
-		if err != nil {
-			logStatsVolumeReadFailure("logstats-taskdir-"+dir, err)
-			taskDirEntries[dir] = taskDirEntriesCache{ok: false}
-			return []os.DirEntry{}
-		}
-		logStatsVolumeReadRecovered("logstats-taskdir-" + dir)
-		taskDirEntries[dir] = taskDirEntriesCache{entries: entries, ok: true}
-		return entries
-	}
+	// 同一 tasks 目录在一次全量请求里被四类已知行 + 逐任务行共享（request
+	// 级 readDir 缓存），失败窗口不退化。
 	taskFileBytes := func(id string) (int64, int64, int) {
-		return dirBytesWithEntries(filepath.Join(tasksDir, id+".log"), readTaskDir(tasksDir))
+		return dirBytesWithEntries(filepath.Join(tasksDir, id+".log"), readDir(tasksDir))
 	}
 	if want("crs_update") {
 		if info := byKey("crs_update"); info != nil {
@@ -842,7 +879,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 			if strings.HasPrefix(task.ID, "cert-job:") {
 				keep = logRotatedBackups
 			}
-			active, rotated, rotCount := dirBytesWithEntries(path, readTaskDir(filepath.Dir(path)))
+			active, rotated, rotCount := dirBytesWithEntries(path, readDir(filepath.Dir(path)))
 			infos = append(infos, LogStorageInfo{
 				Key: key, Name: task.Name + "日志",
 				SizeBytes: active, RotatedBytes: rotated, RotatedCount: rotCount,
@@ -865,7 +902,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		// （曾读写死 /app/logs 根——惰性化后写入端已迁，不同源恒 0B）。
 		certJobDir := services.CertJobLogDir()
 		if ruleID != "" {
-			cjA, cjR, cjC := dirBytes(services.CertJobLogPath(ruleID))
+			cjA, cjR, cjC := logFileDirStats(services.CertJobLogPath(ruleID))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = cjA, cjR, cjC
 			info.Name = "证书任务日志 #" + ruleID
 		} else {
@@ -873,7 +910,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 			// 归档份数与 .gz 归档同时计入（原丢弃 rotCount、.gz 冒充活跃）。
 			var active, rotated int64
 			var rotCount int
-			for _, st := range aggregateDirStats(certJobDir, isCertJobLogName) {
+			for _, st := range aggregateDirStatsWithEntries(certJobDir, readDir(certJobDir), isCertJobLogName) {
 				active += st.Active
 				rotated += st.Rotated
 				rotCount += st.RotCount
@@ -883,13 +920,13 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if info := byKey("rule_access"); info != nil && want("rule_access") {
 		if ruleID != "" {
-			raA, raR, raC := dirBytes(filepath.Join(fixedLogsDir, "rules", services.RuleLogFileComponent(ruleID)+".log"))
+			raA, raR, raC := logFileDirStats(filepath.Join(fixedLogsDir, "rules", services.RuleLogFileComponent(ruleID)+".log"))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = raA, raR, raC
 			info.Name = "访问日志 #" + ruleID
 		} else {
 			var active, rotated int64
 			var rotCount int
-			for _, st := range aggregateDirStats(filepath.Join(fixedLogsDir, "rules"), isRuleAccessLogName) {
+			for _, st := range aggregateDirStatsWithEntries(filepath.Join(fixedLogsDir, "rules"), readDir(filepath.Join(fixedLogsDir, "rules")), isRuleAccessLogName) {
 				active += st.Active
 				rotated += st.Rotated
 				rotCount += st.RotCount

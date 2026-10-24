@@ -13,10 +13,11 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 续签窗口必须比证书寿命至少小一整天（90 天寿命 ⇒ ≤88 天），否则窗口门与
-// 成功侧迟滞等价：证书一签发就落进窗口，每轮扫描整轮重签 → CA 重复证书限流
-// → 任务 failed → 约一个寿命后到期中断。写侧拒绝、导入钳制共用
-// services.CertRenewalDaysMax 单源。
+// 续签窗口必须比证书寿命至少小一整天（90 天规划寿命 ⇒ ≤88 天），否则窗口门
+// 会让相邻两次自动续签的间隔退化到日级：证书一签发就落进窗口，每轮扫描整轮
+// 重签 → CA 重复证书限流 → 任务 failed → 约一个寿命后到期中断。写侧拒绝、
+// 导入钳制共用 services.CertRenewalDaysMax 单源（CA 实际寿命短于规划值时由
+// 扫描侧 services.certRenewalWindowForLifetime 再收敛）。
 func TestUpdateConfig_rejectsRenewalWindowAboveSafeMax(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)

@@ -58,18 +58,20 @@ func InvalidateTaskLogSizeCache() {
 }
 
 func getTaskLogSizeBytes() int64 {
-	// 未初始化库回退默认 10MB；与多数配置读取 helper 的 db.DB==nil 守卫一致。
+	// 未初始化库回退治理默认值（db.DefaultTaskLogSizeMB）；与多数配置读取
+	// helper 的 db.DB==nil 守卫一致。
+	defaultBytes := int64(db.DefaultTaskLogSizeMB) * 1024 * 1024
 	if db.DB == nil {
-		return 10 * 1024 * 1024
+		return defaultBytes
 	}
 	return taskLogSizeCache.get(func() (int64, error) {
 		var sizeMB int
-		if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
+		if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, ?) FROM global_config WHERE id = 1", db.DefaultTaskLogSizeMB).Scan(&sizeMB); err != nil {
 			// 状态转换口径（首报 warn + 恢复 info）与审计侧同源：本读取经
 			// SetTaskLogSizeBytesFn 在每次任务日志写入前求值，主库持续故障时
 			// 裸 warn 会按写入行数洪泛并与全项目去重口径漂移。
 			if lvl := logStateTransition("task-log-size-refresh", true); lvl != "" {
-				Logf(lvl, "读取任务日志大小配置失败,按 10MB 降级: %v", err)
+				Logf(lvl, "读取任务日志大小配置失败,按默认值 %dMB 降级: %v", db.DefaultTaskLogSizeMB, err)
 			}
 			// 失败不缓存：回退值只对本轮生效，下一轮重试。
 			return 0, err
@@ -78,8 +80,8 @@ func getTaskLogSizeBytes() int64 {
 			Logf(lvl, "读取任务日志大小配置已恢复")
 		}
 		if sizeMB <= 0 {
-			sizeMB = 10
+			sizeMB = db.DefaultTaskLogSizeMB
 		}
 		return int64(sizeMB) * 1024 * 1024, nil
-	}, 10*1024*1024)
+	}, defaultBytes)
 }

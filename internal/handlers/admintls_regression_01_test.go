@@ -5,9 +5,9 @@ import (
 	"time"
 )
 
-// (services/certinfo.go int(hours/24) 截断)不一致——此前未过期 Ceil
-// (23h→1)、已过期 Floor(过期 1天3h→-2)。统一为向零截断:23h→0、
-// 过期 1天3h→-1。
+// days_left 与证书信息同口径向零截断（services/certinfo.go int(hours/24)）：
+// 此前未过期用 Ceil（23h→1）、已过期用 Floor（过期 1天3h→-2），两处对同一
+// 剩余期给出不同天数。统一为向零截断：23h→0、过期 1天3h→-1。
 func TestParseAdminTLSCertInfo_daysLeftTruncates(t *testing.T) {
 	now := time.Now()
 	tests := []struct {

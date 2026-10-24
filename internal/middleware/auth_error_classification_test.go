@@ -97,7 +97,7 @@ func TestAPIKeyAuth_mapsInfrastructureFailureTo500(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(apiKeyAuth(nil))
+	router.Use(apiKeyAuth(db.DB))
 	router.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
 	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
 	request.Header.Set("X-API-Key", "lb_sk_wellformed-but-db-down")

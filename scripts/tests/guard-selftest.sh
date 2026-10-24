@@ -500,5 +500,54 @@ Charset Windows-1252 与 UA 片段 Chrome-120 均按字节处理，不做转码�
 EOF
 assert_good "Windows-1252 and Chrome-120"
 
+# 11) PATH 中无 perl：内容扫描依赖 perl，缺失必须 fail-closed（非零退出、
+#     原因含 perl、且不得宣告通过）——该分支是守卫的安全底线，此前零覆盖。
+#     与 bulk 守卫的「缺 python3」用例同法：裁出只含基础工具的 PATH。
+reset_fixture
+mkdir_in internal/handlers/needs_perl.go
+cat >"$tmp_root/internal/handlers/needs_perl.go" <<'EOF'
+package handlers
+
+func noop() {}
+EOF
+noperl_bin="$tmp_root/bin-noperl"
+mkdir -p "$noperl_bin"
+# 以系统 bin 目录为基线逐项软链、仅剔除 perl*：裁到「最小工具集」会让守卫在
+# 别的缺失上先行失败，掩盖「缺 perl」这一被测分支。
+for bin_dir in /bin /usr/bin /usr/local/bin; do
+  [[ -d "$bin_dir" ]] || continue
+  for tool_path in "$bin_dir"/*; do
+    tool_name="${tool_path##*/}"
+    case "$tool_name" in
+      perl|perl[0-9.]*) continue ;;
+    esac
+    [[ -e "$noperl_bin/$tool_name" ]] || ln -sf "$tool_path" "$noperl_bin/$tool_name"
+  done
+done
+if [[ -e "$noperl_bin/perl" ]]; then
+  echo "FAIL [missing perl] 夹具 PATH 仍含 perl" >&2
+  fail=$((fail + 1))
+else
+  set +e
+  out="$( cd "$tmp_root" && env -i PATH="$noperl_bin" HOME="${HOME:-/tmp}" /bin/bash scripts/check-no-audit-artifacts.sh 2>&1 )"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    echo "FAIL [missing perl] 缺 perl 时守卫静默放行（RC=0）" >&2
+    echo "$out" >&2
+    fail=$((fail + 1))
+  elif [[ "$out" != *perl* ]]; then
+    echo "FAIL [missing perl] 失败原因未指明依赖 perl" >&2
+    echo "$out" >&2
+    fail=$((fail + 1))
+  elif [[ "$out" == *"no audit artifacts tracked"* ]]; then
+    echo "FAIL [missing perl] 缺 perl 时仍宣告守卫通过" >&2
+    fail=$((fail + 1))
+  else
+    echo "ok   [missing perl] fail-closed: $(printf '%s\n' "$out" | grep -m1 'ERROR')"
+    pass=$((pass + 1))
+  fi
+fi
+
 echo "selftest: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

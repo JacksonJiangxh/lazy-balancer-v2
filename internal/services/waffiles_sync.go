@@ -909,13 +909,38 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 	staging := destDir + ".sync-in"
-	os.RemoveAll(staging)
+	backup := destDir + ".sync-bak"
+	// 清理动作的错误不得静默（旧实现裸调用丢弃错误，只读/权限异常下残骸会
+	// 累积）。此处只告警不放弃本轮：残留可能被本轮解包「合并」进 staging，
+	// 但生产唯一调用方（ApplyWafFileBundle）恒定传入声明哈希，污染后的
+	// staging 在落 live 之前的 tarGzDirSum 门即被拒绝并恢复旧树——真正需要
+	// 保持的是「残留可观测」，而不是以放弃一轮同步为代价。
+	if err := os.RemoveAll(staging); err != nil {
+		Logf("warn", "waf sync: 清理同步暂存目录 %s 失败（残留可能与本轮解包合并，哈希门会拒绝落盘）: %v", staging, err)
+	}
+	// 入口残留自愈：上次进程在「清空 live 后复制」窗口（rename→EEXIST 的
+	// 主路径）被 SIGKILL 时会留下「部分新树 + .sync-bak」，此时 live 可能
+	// 缺失或为空。恢复方向安全——旧树优于半新树（缺规则文件=对应防护静默
+	// 失效），随后本轮照常替换。
+	if wafTreeEmptyOrMissing(destDir) {
+		if _, statErr := os.Stat(backup); statErr == nil {
+			if rErr := copyDir(backup, destDir); rErr != nil {
+				return fmt.Errorf("按上次同步备份恢复崩溃窗口的规则树: %w", rErr)
+			}
+			Logf("warn", "waf sync: live 规则树缺失/为空（上次同步中断残留），已按备份 %s 恢复旧树后继续本轮 apply", backup)
+		}
+	}
 	if err := os.MkdirAll(staging, 0755); err != nil {
 		return err
 	}
 	// 兜底清理：任何错误路径（解包失败/哈希校验失败/备份失败）都不得遗留
-	// staging 目录到下一周期；成功路径 rename 后 staging 已不存在，RemoveAll 是空操作。
-	defer os.RemoveAll(staging)
+	// staging 目录到下一周期；成功路径 rename 后 staging 已不存在，RemoveAll
+	// 是空操作。清理失败只告警（入口已能自愈残留，不值得掩盖原始错误）。
+	defer func() {
+		if err := os.RemoveAll(staging); err != nil {
+			Logf("warn", "waf sync: 清理同步暂存目录 %s 失败（下轮入口重试）: %v", staging, err)
+		}
+	}()
 	var writtenBytes int64
 	writtenFiles := 0
 	dirEntries := 0
@@ -985,21 +1010,24 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 		}
 	}
 	// Verify the extracted staging tree before touching the live tree.
+	// 失败路径的 staging 清理由入口 defer 负责（清理失败只告警）。
 	if expectSum != "" {
 		sum, sumErr := tarGzDirSum(staging)
 		if sumErr != nil {
-			os.RemoveAll(staging)
 			return fmt.Errorf("校验同步规则集: %w", sumErr)
 		}
 		if sum != expectSum {
-			os.RemoveAll(staging)
 			return fmt.Errorf("同步规则集哈希不匹配（声明 %s，实际 %s），已拒绝落盘", expectSum, sum)
 		}
 	}
 	// Replace live tree: backup then swap (copy-based, overlayfs-safe like
 	// the CRS updater itself).
-	backup := destDir + ".sync-bak"
-	os.RemoveAll(backup)
+	// 陈旧备份必须清掉：清理失败即放弃本轮，否则下方 copyDir(destDir, backup)
+	// 会把旧残骸合并进备份，失败恢复时把陈旧文件带回 live 树（破坏「纯旧树」
+	// 不变量）。
+	if err := os.RemoveAll(backup); err != nil {
+		return fmt.Errorf("清理上次同步备份 %s: %w", backup, err)
+	}
 	_, destStatErr := os.Stat(destDir)
 	destExisted := destStatErr == nil
 	if destExisted {
@@ -1030,8 +1058,17 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 			return fmt.Errorf("安装同步规则集: %w", errors.Join(err, restoreErr))
 		}
 	}
-	os.RemoveAll(backup)
+	if err := os.RemoveAll(backup); err != nil {
+		Logf("warn", "waf sync: 清理同步备份 %s 失败（新树已生效，残留下次入口覆盖）: %v", backup, err)
+	}
 	return nil
+}
+
+// wafTreeEmptyOrMissing 报告目录缺失或为空——「清空 live 后复制」崩溃窗口
+// 的形态判据（untarGzTo 入口据此决定是否按 .sync-bak 恢复旧树）。
+func wafTreeEmptyOrMissing(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err != nil || len(entries) == 0
 }
 
 // restoreWafTreeFromBackup 尽力从 backup 恢复 destDir：先整树清空再从备份复制，

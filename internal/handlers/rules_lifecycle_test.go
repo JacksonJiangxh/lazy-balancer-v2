@@ -887,3 +887,71 @@ func TestDisableRule_abortsWhenRuleConcurrentlyModifiedInLockWindow(t *testing.T
 		t.Fatalf("禁用 success audit=%d, want 0 when concurrently modified in lock window", successAudit)
 	}
 }
+
+// DuplicateRule 的 5xx 分支必须保留底层 cause（运行日志 + 审计 detail），
+// 响应仍是固定文案：否则复制入口 500 时只能看到「读取规则失败」，无法区分
+// 连接/busy、schema 漂移、关联表损坏——排障必须复现或临时加日志。
+func TestDuplicateRule_keepsUnderlyingCauseInAudit(t *testing.T) {
+	for _, tc := range []struct{ name, table string }{
+		{"读取规则失败", "lb_rules"},
+		{"读取规则关联数据失败", "upstreams"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newRuleFeatureTestHandlers(t)
+			seedTCPRuleForZeroMerge(t, "lb_dup_cause", 17075)
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+			if _, err := db.DB.Exec("ALTER TABLE " + tc.table + " RENAME TO " + tc.table + "_broken"); err != nil {
+				t.Fatalf("rename %s: %v", tc.table, err)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_dup_cause/duplicate", nil))
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "no such table") {
+				t.Fatalf("5xx 响应不得携带底层错误文本: %s", response.Body.String())
+			}
+			var detail string
+			if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log
+				WHERE action='复制失败' AND resource='负载规则' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+				t.Fatalf("read duplicate failure audit: %v", err)
+			}
+			if !strings.Contains(detail, tc.table+"_broken") && !strings.Contains(detail, "no such table") {
+				t.Fatalf("审计 detail 丢失底层 cause: %q", detail)
+			}
+		})
+	}
+}
+
+// UpdateRule 主 UPDATE 命中 0 行（放锁窗口内规则的并发删除）同样必须留痕：
+// 409 是「用户操作被拒」里最需要解释的一类，此前只有版本冲突/并发中止有审计。
+// RAISE(IGNORE) 触发器精确制造「行存在但更新 0 行」形态（先删行会让读取提前 404）。
+func TestUpdateRule_zeroRowUpdateAuditsConflict(t *testing.T) {
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_zero_upd", "zero-upd", "zero-upd.example.test", 18650, true, "manual", false)
+	seedAuditUpstream(t, "lb_zero_upd")
+	if _, err := db.DB.Exec(`CREATE TRIGGER ignore_lb_zero_upd_update BEFORE UPDATE ON lb_rules
+		WHEN OLD.caddy_id='lb_zero_upd' BEGIN SELECT RAISE(IGNORE); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_zero_upd", strings.NewReader(`{"name":"renamed"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（0 行更新不得当成成功）", response.Code, response.Body.String())
+	}
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%lb_zero_upd%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read blocked update audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("0 行更新阻断审计条数=%d, want 1", blockedAudits)
+	}
+}

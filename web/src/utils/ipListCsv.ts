@@ -5,11 +5,13 @@
 
 /**
  * 备注字段导出：换行归一为空格（导入端按行切分，多行备注无法回读），
- * 含逗号或双引号时按 RFC4180 包裹并双写内部引号。
+ * 含逗号、双引号或首尾空白时按 RFC4180 包裹并双写内部引号。
+ * 首尾空白必须加引号：导入侧对未加引号的字段做 trim 归一，不加引号会让
+ * 「导出→导入」丢失备注的两端空格（模块声明的是逐字往返）。
  */
 function formatCsvRemark(remark: string): string {
   const singleLine = remark.replace(/[\r\n]+/g, ' ')
-  return /[",]/.test(singleLine) ? `"${singleLine.replace(/"/g, '""')}"` : singleLine
+  return /[",]|^\s|\s$/.test(singleLine) ? `"${singleLine.replace(/"/g, '""')}"` : singleLine
 }
 
 /** 导出一行（第一列 IP/CIDR，第二列备注；备注为空保留尾随逗号）。 */

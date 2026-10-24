@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -192,16 +193,34 @@ func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
 // （coveredSlotStepPast/slotCoveredByRun/crsNextSlotAware/ip2regionNextSlotAware 已退役——
 // 排程槽生命周期 2026-10-11：失败落定落库推进，NextSlotFn 纯读库。）
 
-// interruptedUpdateStatusFamilies 持久化「更新中」活动态的两族（活动词表
+// interruptedUpdateStatusFamilies 持久化「更新中」活动态的四族（活动词表
 // 判定复用状态镜像同一 helper）。表名只接受包内常量。
+//   - 版本表族（id=1 单行）：活动态词表由族给出；
+//   - 源表族（多行，状态列逐行）perSourceRow=true：活动态恒为 running。
+//
+// 源表此前完全无启动归一：主节点靠「槽未推进→首个 tick 重跑覆盖」自愈，但
+// 同一残留落到从节点时该任务不运行（RunsOn=RoleMasterOnly），行会永久滞留
+// 「更新中」（与任务视图自相矛盾）。主节点侧归一仍幂等（重跑轮会覆盖 failed）。
 var interruptedUpdateStatusFamilies = []struct {
 	table  string
 	taskID string
 	active func(string) bool
+	// perSourceRow=true 表示状态列分散在多行源表（无 id=1 单行约定），
+	// 归一按行集执行；否则按版本表单行 id=1 归一。
+	perSourceRow bool
 }{
 	{table: "security_crs_version", taskID: "crs", active: IsActiveCRSStatus},
 	{table: "security_ip2region_version", taskID: "ip2region", active: IsActiveIP2RegionStatus},
+	{table: "security_threat_sources", taskID: "threat-update", active: isSourceUpdateStatusRunning, perSourceRow: true},
+	{table: "security_crawler_sources", taskID: "crawlerbot-update", active: isSourceUpdateStatusRunning, perSourceRow: true},
 }
+
+// sourceUpdateStatusRunning 源表族唯一活动态（v2.3.x 写侧只写 running）：
+// 状态词表与归一的 WHERE 谓词共用，禁止两处各写字面量。
+const sourceUpdateStatusRunning = "running"
+
+// isSourceUpdateStatusRunning 源表族活动态判定（族表的 active 字段）。
+func isSourceUpdateStatusRunning(status string) bool { return status == sourceUpdateStatusRunning }
 
 // normalizeInterruptedUpdateStatuses 把上次进程退出时残留的活动态归一为
 // failed：活动态只在本进程更新运行期间成立，进程重建后它既无真实执行也无
@@ -212,6 +231,10 @@ func normalizeInterruptedUpdateStatuses() {
 		return
 	}
 	for _, family := range interruptedUpdateStatusFamilies {
+		if family.perSourceRow {
+			normalizeInterruptedSourceStatusRows(family.table, family.taskID)
+			continue
+		}
 		row, ok, err := versionTableStatusRowOf(family.table)
 		if err != nil || !ok || !family.active(row.status) {
 			continue
@@ -228,6 +251,58 @@ func normalizeInterruptedUpdateStatuses() {
 		}
 		TaskLogfWarn(family.taskID, "failed", "上次更新在进程退出时中断（残留状态 %s），已归一为 failed", row.status)
 		Logf("warn", "任务状态归一: %s 残留活动态 %s 已归一为 failed（进程重启回收）", family.taskID, row.status)
+	}
+}
+
+// normalizeInterruptedSourceStatusRows 按行集归一源表族的活动态（源表无 id=1
+// 单行约定，状态列逐行写）。幂等：WHERE 只命中活动行，无命中即静默。
+func normalizeInterruptedSourceStatusRows(table, taskID string) {
+	res, err := db.DB.Exec(`UPDATE `+table+
+		` SET update_status='failed', message='（进程重启回收）', finished_at=datetime('now') WHERE update_status=?`,
+		sourceUpdateStatusRunning)
+	if err != nil {
+		Logf("warn", "任务状态归一失败（%s 残留活动行）: %v", taskID, err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return
+	}
+	TaskLogfWarn(taskID, "failed", "上次更新在进程退出时中断，%d 个源的残留「更新中」状态已归一为 failed", n)
+	Logf("warn", "任务状态归一: %s %d 个源残留活动态已归一为 failed（进程重启回收）", taskID, n)
+}
+
+// normalizeUnregisteredThreatSourceSlots 清空威胁源表里「注册表外」启用行的
+// 排程槽（幂等、最小破坏：只清 next_update，不改 update_enabled/url/内容）。
+// 注册表外的行不会被 threatDueSources 处理，其槽没有任何推进写点；一旦过期，
+// 「启用源最早槽」就恒钉在该值上，威胁库自动更新静默停摆（槽域 ⊋ 运行域）。
+// 读侧已按注册表收窄（earliestThreatNextUpdate），本函数让数据面同步收敛；
+// 未来若该名重新进入注册表，行以「空槽=到期」语义自然恢复运行。
+func normalizeUnregisteredThreatSourceSlots() {
+	registry := db.ThreatSystemLists()
+	names := make([]string, 0, len(registry))
+	for _, source := range registry {
+		if source.Source != "" {
+			names = append(names, source.Source)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
+	args := make([]any, 0, len(names))
+	for _, name := range names {
+		args = append(args, name)
+	}
+	res, err := db.DB.Exec(`UPDATE security_threat_sources SET next_update=NULL
+		WHERE update_enabled=1 AND NULLIF(next_update,'') IS NOT NULL
+		  AND COALESCE(name,'') NOT IN (`+placeholders+`)`, args...)
+	if err != nil {
+		Logf("warn", "威胁源表注册表外启用行槽清理失败（不影响调度读侧收窄）: %v", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		Logf("warn", "威胁源表: %d 个注册表外的启用行排程槽已清空（这些行不会被更新任务处理，保留槽会让自动更新停摆）", n)
 	}
 }
 
@@ -281,6 +356,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// false)同样跳过，与 fail-closed 从节点种子一致。
 	if roleMaster {
 		normalizeInterruptedUpdateStatuses()
+		// 槽域与运行域收敛（数据面）：注册表外启用行的槽没有任何推进写点，
+		// 保留会在过期后让「最早槽」恒钉过去。读侧已收窄，这里让库值同步。
+		normalizeUnregisteredThreatSourceSlots()
 	}
 
 	// ============ 循环（10）============
@@ -371,7 +449,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			// 按构成披露：聚合/高水位删除不计入事件数时，仅报「删除 N 条事件」
 			// 会让停摆后首次清理显示 0（运维误判保留策略未生效）。
-			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除事件 %d 条 · 聚合 %d 行 · 被攻击目标聚合 %d 行 · 高水位键 %d 个（保留期与条数上限，无过期为 0）", retention.Events, retention.Rollup, retention.TargetRollup, retention.Highwater)
+			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除事件 %d 条 · 聚合 %d 行 · 被攻击目标聚合 %d 行 · 分钟状态键 %d 个（保留期与条数上限，无过期为 0）", retention.Events, retention.Rollup, retention.TargetRollup, retention.Highwater)
+			// 行帽延后必须可见：否则运维会把「行数未收敛」当成清理失效。
+			if retention.RowCapDeferred {
+				TaskLogf("security-events-retention", "cleanup", "行帽裁剪本轮跳过：等待预聚合（大屏窗口）回填完成后执行，原始事件暂不按行数上限裁剪")
+			}
 			return nil
 		},
 	})
@@ -822,6 +904,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// StartLoop 副作用（启动记录/首轮执行）之前跳过；否则先启动再 StopLoop
 	// 会留下假启动记录并可能实际跑一轮。
 	taskLoopPrefs := loadTaskLoopPrefs()
+	// 装配期服务屏障：常驻族的 Run 体起步即真实接管服务（cert-issuance →
+	// StartACME → CA 队列/证书部署重试 → Caddy /load），而本循环先于
+	// startup:config-load（规则库载入 → 证书物化 → Caddy 渲染/应用）执行。
+	// schedPaused 只覆盖 tick 与执行登记（启动执行面唯一豁免是 BootSync），
+	// 常驻族启停由 loopEnabled 与角色门管理，故须单独用同一道配置屏障
+	// （configImportHoldActive 单源门）挡住部署面：屏障期内只登记启动意图，
+	// BootSync 完成后 EndConfigImportHold 兑现。不扩大 schedPaused 作用域
+	// ——混入装配暂停会让两种语义纠缠并影响 pendingRestart 通道。
+	BeginConfigImportHold()
 	for _, id := range []string{
 		"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention",
 		"metrics-orphan-cleanup",
@@ -846,6 +937,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// BootSync 任务同步执行（startup:config-load——面板监听前完成，
 	// 替代 main.go 直调+legacy startupPhase 记录旁路）
 	te.RunBootSyncTasks()
+	// 配置载入完成：解除装配期服务屏障，兑现常驻族被延迟的服务启动
+	// （CA 队列/证书部署重试），此后常驻族才真正接管部署面。
+	EndConfigImportHold()
 	// BootSync 完成后解除 tick 暂停——此前 ticker 在
 	// NewEngine 即起跑，周期/定时任务可在配置载入前执行首轮。
 	te.ResumeScheduling()

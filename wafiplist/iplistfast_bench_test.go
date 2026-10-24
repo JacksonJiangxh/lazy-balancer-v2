@@ -85,7 +85,7 @@ func BenchmarkLinearScan_5000_miss(b *testing.B) {
 	}
 }
 
-// —— 威胁库满量标尺（MaxEntries 的 1/5，真实上限形态）——
+// —— 威胁库满量标尺（maxEntries 的 1/5，真实上限形态）——
 // benchmarkSetupLarge 构造 n 条混合名单（v4 CIDR + 裸 IP + v6），磁盘形态与
 // 威胁库投影文件一致（聚合前原始条目）。
 func benchmarkSetupLarge(b *testing.B, n int) (plugintypes.Operator, []string) {

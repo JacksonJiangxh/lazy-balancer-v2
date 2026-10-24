@@ -70,7 +70,8 @@ const reset = (): { posts: PostRecord[]; puts: PutRecord[]; confirmArgs: unknown
     puts.push({ url, body })
     return { data: undefined }
   }
-  g.__get = async () => ({ data: undefined })
+  // 默认：确认后的最新 refs 为空（多数用例的点击前快照同为空）
+  g.__get = async () => ({ data: { policy: { ip_acl_list_refs: '[]', ip_whitelist_refs: '[]' } } })
   return { posts, puts, confirmArgs }
 }
 
@@ -437,4 +438,87 @@ test('超长策略名创建并加入：名单名不超 50 且确认文案披露�
   assert.match(String(confirmArgs[0][0]), /已截断至 50 字符上限/, '确认文案必须披露截断')
   const saves = callsOf('mfaAwareSuccess')
   assert.match(String(saves[0].arg), new RegExp(`已创建「${String(body.name)}」`), '成功文案必须用实际名单名')
+})
+
+// —— 写序与新鲜引用（跨会话一致性）——
+// 复用既有列表时旧写序是「先关联引用、再加入 IP」：条目写入失败会留下
+// 「策略已引用、名单里却没有该 IP」的半态，界面上关联动作报过成功，处置
+// 静默失效。反向半态（名单有条目、策略暂未引用）无损——重试只需补关联。
+
+test('复用既有列表：先加入 IP 再关联引用', async () => {
+  reset()
+  const order: string[] = []
+  const existing = [...lists, { id: 77, name: '策略 A-信任', ref_policies: [] }]
+  g.__post = async (url: string) => {
+    order.push(`POST ${url}`)
+    return { data: { added: true } }
+  }
+  g.__put = async (url: string) => {
+    order.push(`PUT ${url}`)
+    return { data: undefined }
+  }
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.deepEqual(order, ['POST /security/ip-lists/77/ips', 'PUT /security/policies/5'], '条目先落库，引用后建立')
+})
+
+test('复用路径：IP 已加入但关联失败——显性披露半态且不留「已引用无条目」', async () => {
+  const { posts, puts } = reset()
+  g.__put = async (url: string, body?: unknown) => {
+    puts.push({ url, body })
+    throw new Error('policy update failed')
+  }
+  const existing = [...lists, { id: 77, name: '策略 A-信任', ref_policies: [] }]
+  const { ensureListAndJoin, creating } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }], '条目必须先写入')
+  assert.equal(puts.length, 1, '关联确实尝试过')
+  const errors = callsOf('ElMessage.error')
+  assert.equal(errors.length, 1, '半态必须显性披露（不得只留全局错误提示）')
+  assert.match(String(errors[0].arg), /已把 203\.0\.113\.9 加入列表「策略 A-信任」/)
+  assert.match(String(errors[0].arg), /关联失败/)
+  assert.match(String(errors[0].arg), /不会重复添加/, '须说明重试不会重复写入条目')
+  assert.equal(creating.value, false)
+  assert.equal(callsOf('mfaAwareSuccess').length, 0)
+})
+
+// 确认框弹出到点「确定」之间，另一会话（并行标签/另一管理员）可能已改动策略
+// 引用。用点击前快照拼装 `[...refs, target]` 会把对方新增的引用覆盖掉
+// （半途扩容/丢更新），因此写入前必须重读最新 refs。
+test('确认后重读最新 refs：并发新增的引用不被覆盖丢弃', async () => {
+  const { posts, puts } = reset()
+  g.__get = async () => ({ data: { policy: { ip_acl_list_refs: '[3]', ip_whitelist_refs: '[]' } } })
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => lists })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_acl_list_refs: '' }, '203.0.113.9', 'deny')
+  assert.equal(posts.length, 1, '新名单仍按建单即带 IP 创建')
+  assert.deepEqual(
+    puts,
+    [{ url: '/security/policies/5', body: { ip_acl_list_refs: '[3,42]' } }],
+    '关联载荷必须以确认后的最新 refs 追加，不能覆盖并发新增项',
+  )
+})
+
+test('最新 refs 读取失败：不写入任何变更并显性提示', async () => {
+  const { posts, puts } = reset()
+  g.__get = async () => {
+    throw new Error('network down')
+  }
+  const { ensureListAndJoin, creating } = useTrustAssociation({ getList: () => lists })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.deepEqual(posts, [], '读取失败不得创建/加入')
+  assert.deepEqual(puts, [], '读取失败不得基于陈旧引用关联')
+  assert.equal(creating.value, false, '失败分支必须释放占位')
+  const errors = callsOf('ElMessage.error')
+  assert.equal(errors.length, 1)
+  assert.match(String(errors[0].arg), /引用状态读取失败/)
+})
+
+test('复用路径：确认后目标已被并发关联——不重复写 refs，仍加入 IP', async () => {
+  const { posts, puts } = reset()
+  g.__get = async () => ({ data: { policy: { ip_acl_list_refs: '[]', ip_whitelist_refs: '[77]' } } })
+  const existing = [...lists, { id: 77, name: '策略 A-信任', ref_policies: [] }]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }])
+  assert.deepEqual(puts, [], '最新 refs 已含目标列表时不得再写（无变化写会覆盖并发状态）')
 })

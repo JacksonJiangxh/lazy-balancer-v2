@@ -5,6 +5,7 @@ package handlers
 // services.ExtractMetricLabel 精确键匹配(x_host 不得误归集 host)。
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,5 +122,74 @@ func TestValidateSingleDnsAddress_rejectsIllegalHostCharacters(t *testing.T) {
 		if err := validateSingleDnsAddress(good); err != nil {
 			t.Errorf("validateSingleDnsAddress(%q)=%v, want nil", good, err)
 		}
+	}
+}
+
+// 值域枚举门不得按「消费开关」条件生效：关闭态落库的非法 dns_family /
+// compress_types / tls_source 渲染零消费，却会随导出/备份/集群快照放大，并在
+// 用户后续只切换开关时命中指向本次未提交字段的 400。空值放行（写侧归默认）。
+func TestRuleEnumGates_applyRegardlessOfConsumerSwitch(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+	create := func(port int, extra string) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"name":"enum-%d","protocol":"http","domain":"enum%d.test","listen_port":%d,`+
+			`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,`+
+			`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],%s}`, port, port, port, extra)
+		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	rejected := []struct{ name, extra, wantText string }{
+		{"dns_family 关闭动态 DNS 仍校验值域", `"dynamic_dns":false,"dns_family":"bogus"`, "无效的 DNS 协议栈"},
+		{"compress_types 关闭压缩仍校验值域", `"enable_compress":false,"compress_types":"brotli"`, "压缩类型"},
+		{"tls_source 关闭 TLS 仍校验值域", `"enable_tls":false,"tls_source":"bogus"`, "无效的证书来源"},
+	}
+	for i, tc := range rejected {
+		rec := create(18610+i, tc.extra)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.wantText) {
+			t.Fatalf("%s：status=%d body=%s, want 400 含 %q", tc.name, rec.Code, rec.Body.String(), tc.wantText)
+		}
+	}
+
+	// 回归形状：合法值在开关关闭时照常放行（值域门不误伤死配置的合法值）。
+	rec := create(18620, `"dynamic_dns":false,"dns_family":"both","enable_compress":false,"compress_types":"zstd"`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("合法枚举值（开关关闭）应 201, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Update 形态同门：存量规则开关关闭时显式提交非法枚举必须 400 且零落库（
+// 与 Create 同口径，不得因「部分更新合并」而放行）。
+func TestUpdateRule_enumGatesApplyRegardlessOfConsumerSwitch(t *testing.T) {
+	cases := []struct{ name, payload, wantText string }{
+		{"dns_family", `{"dns_family":"bogus"}`, "无效的 DNS 协议栈"},
+		{"compress_types", `{"compress_types":"brotli"}`, "压缩类型"},
+		{"tls_source", `{"tls_source":"bogus"}`, "无效的证书来源"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newRuleFeatureTestHandlers(t)
+			seedAuditRule(t, "lb_enum_upd", "enum-upd", "enum-upd.example.test", 18630, true, "manual", false)
+			seedAuditUpstream(t, "lb_enum_upd")
+			// 开关关闭形态：compress_types 的门不得因 enable_compress=0 而失效。
+			if _, err := db.DB.Exec(`UPDATE lb_rules SET enable_compress=0 WHERE caddy_id='lb_enum_upd'`); err != nil {
+				t.Fatalf("turn off compress: %v", err)
+			}
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.PUT("/rules/:caddy_id", handler.UpdateRule)
+			request := httptest.NewRequest(http.MethodPut, "/rules/lb_enum_upd", strings.NewReader(tc.payload))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), tc.wantText) {
+				t.Fatalf("status=%d body=%s, want 400 含 %q", response.Code, response.Body.String(), tc.wantText)
+			}
+		})
 	}
 }

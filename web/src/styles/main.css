@@ -166,7 +166,14 @@ body {
    el-tag 是 inline-block,vertical-align: middle 按 x-height 对齐(视觉偏高);
    含标签的 cell 改 inline-flex+align-items:center(行盒级居中)。
    原 d5ca6f91 仅 Dashboard scoped,同根因散落
-   ≥10 视图——全局化;.cell 内纯文本/ellipsis 不受影响(规则只命中含 .el-tag 的 cell)。 */
+   ≥10 视图——全局化;.cell 内纯文本/ellipsis 不受影响(规则只命中含 .el-tag 的 cell)。
+
+   已知取舍：混合单元格（标签 + 长文本）改为 flex 容器后，文本成为匿名 flex 项，
+   text-overflow 对匿名项不生效（CSS 规范）——show-overflow-tooltip 的省略号在
+   这类单元格上退化为硬截断，tooltip 仍可展开（可发现性不受影响）。纯标签单元格
+   是这条规则的主要收益面；若某个混合单元格必须显示省略号，只能由该消费方显式
+   覆盖（例如 .cell 上加自定义类改回块布局）——全站统一规则无法在 CSS 层区分
+   「标签 + 文本」与「纯标签」。 */
 .el-table .cell:has(.el-tag) { display: inline-flex; align-items: center; }
 
 /* 列表分页器通用形态：Rules / SecurityRules / SecurityPolicies /

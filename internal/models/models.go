@@ -706,15 +706,17 @@ type MetricsOverview struct {
 
 // SystemInfo contains system information
 type SystemInfo struct {
-	IPAddress     string            `json:"ip_address"`
-	Hostname      string            `json:"hostname"`
-	OSInfo        string            `json:"os_info"`
-	Kernel        string            `json:"kernel"`
-	Architecture  string            `json:"architecture"`
-	NetworkIPs    map[string]string `json:"network_ips"`
-	CaddyVersion  string            `json:"caddy_version"`
-	RunningStatus string            `json:"running_status"`
-	Uptime        int64             `json:"uptime"`
+	IPAddress    string            `json:"ip_address"`
+	Hostname     string            `json:"hostname"`
+	OSInfo       string            `json:"os_info"`
+	Kernel       string            `json:"kernel"`
+	Architecture string            `json:"architecture"`
+	NetworkIPs   map[string]string `json:"network_ips"`
+	CaddyVersion string            `json:"caddy_version"`
+	// RunningStatus 仅表示「面板进程可响应」恒为 running，不反映 Caddy admin
+	// 是否可达（Caddy 停摆时本字段仍为 running）。
+	RunningStatus string `json:"running_status"`
+	Uptime        int64  `json:"uptime"`
 	// NodeMode 三态：master / slave / unknown（unknown=角色查询失败或库未装配，
 	// 不得把查询失败静默呈现为 master 误导排障）。
 	NodeMode string `json:"node_mode"`

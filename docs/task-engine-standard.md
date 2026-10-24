@@ -42,6 +42,15 @@ Scheduled 槽语义（槽缓存 + 同一槽只执行一次）：
 - **用户取消**：仅**自动轮**的**已到期**槽被消费（取消=显式放弃本槽）。手动触发轮不改
   预约（未来槽是下一次预约，与手动轮无归属关系），取消手动轮也不得消费槽——否则未来
   槽被水位永久压住，自动更新静默停摆。`CancelHook` 返回 false（取消未生效）不消费。
+- **成功轮的槽推进**（业务写侧门，`slotSuccessGateSQL` 单源）：`auto` 轮推进
+  **空槽或过期槽**，`manual` 轮**只推进已过期槽**。引擎成功轮（含手动轮）会消费过期槽，
+  业务侧不推进则水位与业务槽单边分叉（tick 的「槽 > 已消费水位」门永不成立 → 该族自动
+  更新永久静默停摆，人工反复「立即更新」只会反复加固）。空槽不在 manual 范围：零值槽
+  不会进入引擎消费分支（无停摆面），且预约只由排程保存/启用/启动武装路径建立。失败轮与
+  取消轮仍只走 auto 门（手动轮失败时引擎按退避重投同一槽，业务抢先推进会把该自动槽吃掉）。
+- **槽域 = 运行域**：`NextSlotFn` 取「启用源最早槽」时，源集合必须与运行体的处理集合
+  一致（威胁族=内置注册表源名，爬虫族=全部启用行）。槽域宽于运行域时，运行域外的启用行
+  槽没有任何推进写点，一旦过期「最早槽」恒钉过去 → 该族自动更新永久停摆。
 - **显式复位**：`StartLoop` 关→开与业务侧重排槽（`RearmSecurityLibrarySlots`）经
   `ResetScheduleProgress` 清空槽缓存/水位/退避——否则旧水位会压住新预约。
 - **导入排空**（`CancelInFlightRuns`）与 demote 取消不消费槽：恢复后到期轮补跑。
@@ -72,6 +81,11 @@ type Descriptor struct {
    不得借 BootSync 绕过。
 2. 必须显式声明 `RunsOn=RoleAny`（含空值拒绝）——启动执行面无角色语义，
    漏声明不得回落到旧任务兼容默认值。
+
+`Daemon` 不得声明 `Cancelable`（注册期拒绝）：`Cancel` 只按 `Cancelable` 路由，被取消的
+常驻任务走「非异常退出」分支——`loop_on` 保持 true 而 `running=false`，监控判 idle，常驻
+采集/签发/同步永久停摆且无任何异常信号。常驻族启停一律 `StartLoop`/`StopLoop`。同理
+`EnabledFn` 仅 Scheduled/Periodic、`RestartOnRoleFlip` 仅 Daemon 可声明（越界即注册失败）。
 
 已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费；`TaskMeta.Enabled`（任务监控只认 `loop_on`，`Lookup/DescribeAll` 不再求值 `EnabledFn`）——`Descriptor.EnabledFn` 仍保留为 Scheduled/Periodic 调度门。
 
@@ -258,6 +272,7 @@ crs/ip2region 状态镜像仅在对应 manager 本进程在途时采纳——持
 | 手动触发 | 1 行（trigger=manual） | 同上 |
 | 崩溃恢复 | 残留 running → interrupted | — |
 | 用户取消自动轮 | 本轮 1 行（终态 cancelled） | [done] cancelled |
+| 零到期源的成功轮 | 1 行（success） | 一行「本轮无更新」业务摘要；审计动作「更新」+ detail「无到期源」 |
 
 用户取消（`Cancel`）只消费「自动轮所属的已到期槽」：本轮 `task_runs` 落 cancelled，
 本槽不再投递；业务推进/重排新槽后恢复。手动触发轮被取消不改预约（不消费槽），
@@ -266,6 +281,10 @@ crs/ip2region 状态镜像仅在对应 manager 本进程在途时采纳——持
 task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取消全部运行，再等待 Scheduled/Periodic/Oneshot 在途 Run 与全部 daemon 落定终态；停止后新的 Trigger/RunSync 返回 `ErrEngineStopped`。
 
 **配置导入暂停/排空**：`PauseScheduling` 与 `ResumeScheduling` 成对使用，均在 `e.mu` 内提交暂停状态，与 `runNow` 的 `inFlight` 登记严格定序。暂停后 tick 不再派发，`Trigger`、`RunSync` 及已越过入口检查的迟到 `runNow` 均返回 `ErrSchedulingPaused`；仅装配期 BootSync（`trigger=startup`）豁免。因此除该启动路径外，暂停返回后 `inFlight` 只减不增，导入可安全排空在途执行；恢复同样在 `e.mu` 内提交，暂停/恢复边界不留下登记窗口。
+
+**装配期启动屏障**：`Options.StartPaused` 只覆盖 tick 投递与 `Trigger`/`RunSync`/`runNow` 登记，**不覆盖常驻族启停**——默认清单里 `security-events-ingestion`/`cert-issuance`/`cluster-sync` 先于 `startup:config-load` 被 `StartLoop` 拉起，其 Run 体起步即真实接管服务（证书签发 → `StartACME` → CA 队列 / 证书部署重试 → Caddy `/load`）。因此装配方在启动默认清单**之前**进入配置屏障（`BeginConfigImportHold`），BootSync（规则库载入 → 证书物化 → Caddy 渲染/应用）完成后 `EndConfigImportHold` 兑现被延迟的队列与生命周期启动：配置载入前面板不得已有证书部署写入运行配置。不得把常驻启停并入 `schedPaused`（会与 `loopEnabled`/`pendingRestart` 语义纠缠）。
+
+**调度自动停摆的留痕口径**：两类「引擎自行停止调度」都必须与用户主动停止可区分——① `IntervalFn` 返回非正周期：立即停调并落一条 `failed` 运行行（状态列呈现 failed，含原因）+ `[error]` 日志；② 定时槽连续 `scheduledFailStreakStopLimit`（4）轮未推进且本轮失败/跳过：停调 + `[error]` 日志（失败轮本身已有 failed 行）。两者均可由 `StartLoop` 关→开恢复（清空退避/槽水位）。
 
 ## 6. 业务侧 helper
 
@@ -296,8 +315,38 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 5. `/logs/stats` 返回 `task:<id>` 真实文件统计，任务监控弹框不得使用目录聚合值。
 6. 注册级测试必须覆盖：默认调度、精确槽值/间隔与 **`DescribeAll` 注册全集**（不写死条数——全集以注册表/`DescribeAll` 输出为准，本文 §2 的「当前 N 个」仅作对照；曾写死 18 与实际的 19 分叉）、全部业务开关双向同源、日志与状态时间、逐任务真实文件统计、停止/取消/角色翻转/崩溃恢复、旧调度器零旁路。
 
+### 6.3 仅测试消费的 API 面（勿新增生产消费方）
+
+以下导出符号**没有生产调用方**，保留供测试装配与排障断言；生产线走注明的替代入口。登记目的是避免后续轮次重复判定为死代码：
+
+| 符号 | 替代/说明 |
+|---|---|
+| `Engine.RunAsync` | 生产手动触发唯一入口=`services.TriggerTaskAsync`→`Engine.RunAsyncResult`（需 onDone 补记补偿审计） |
+| `Engine.Stats24h` | 任务视图走 `Engine.RunOverview` 批量聚合（同 SQL 单源） |
+| `Engine.Trigger` | 同步驱动测试；生产走异步入口 |
+| `Engine.IsRunning` | 诊断投影（`Run 存活 或 loopEnabled∧roleAllows`），**不得**用作「是否正在执行」判据——该语义用 `IsTaskInFlight` |
+| `RoleSlaveOnly` | 仅测试注册使用（生产 19 任务全集只有 RoleAny/RoleMasterOnly） |
+
 ## 7. 修订记录
 
+- v2.0.7（2026-10-24）：调度自动停摆与观测口径收敛——① Periodic 的 `IntervalFn`
+  返回非正周期时停调并落 failed 运行行 + `[error]` 日志（此前只有日志行，与用户
+  主动停止同形；失败行让状态列与「近 24 小时」失败计数可见）；② 定时槽连续
+  `scheduledFailStreakStopLimit`（4）轮未推进且本轮失败/跳过 → 停调（只对自动轮，
+  手动轮有界不触发），退避兜底不再是无限重投；③ `RearmLoop(hasWork=true)` 越过
+  停止态时复位 Scheduled 槽水位/退避（否则旧水位永久压住当前槽）；④ 装配期服务
+  屏障：常驻族先于 `startup:config-load` 启动，配置载入完成前用
+  `BeginConfigImportHold`/`EndConfigImportHold` 挡住部署面启动；⑤ 调度闭包 panic
+  告警按任务分桶（跨任务不再互相遮蔽，被抑制次数随下次放行披露）；⑥ 运行历史与
+  列表共用残留 `running` 行判定（归一 `interrupted` + 同源文案）；⑦ 从节点上
+  角色不适用任务不再推算「下次执行」；⑧ 引擎已停止时调度写端点回 503 且
+  `Register` 返回 `ErrEngineStopped`（不再回 200 假成功）；⑨ §6.3 登记仅测试
+  消费的 API 面。
+- v2.0.6（2026-10-24）：补充 §1.1「成功轮的槽推进」（auto=空/过期、manual=仅过期，
+  `slotSuccessGateSQL` 单源）与「槽域=运行域」（威胁族槽按内置注册表源名收窄，注册表外
+  启用行的槽在启动期清空）；§1.2 登记 `Daemon ∧ Cancelable` 注册期拒绝（及
+  `EnabledFn`/`RestartOnRoleFlip` 的 Kind 约束）。§5 记录口径补：零到期源的成功轮在两族
+  审计同记动作「更新」、detail 声明「无到期源，本轮无更新」，「跳过」专留降级中止。
 - v2.0.5（2026-10-24）：任务状态归属本进程生命周期——状态镜像只在 manager 本进程在途时采纳、启动装配归一残留活动态（failed「进程重启回收」）、`task_runs` 终态写有界重试且残留 running 行按中断呈现；任务视图新增 `role_applicable`（从节点上 master-only 族标注「仅主节点」并解释调度开关不可用、下次执行显示「—」）；业务驱动调度对齐读失败保持上一次生效态并由 60s 角色对账重试（tick 侧 `EnabledFn` 仍二态 fail-closed）。
 - v2.0.4（2026-10-23）：补充 §1.1 Scheduled 槽语义——槽缓存降频求值（前导窗 30s/地板 1min）、同一槽只执行一次（成功/自动轮到期的用户取消消费；失败退避不消费）、取消只消费「自动轮已到期槽」、`ResetScheduleProgress` 显式复位、导入排空/demote 不消费。同步 §5 记录口径（用户取消自动轮=放弃本槽）。
 - v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控只认 `loop_on`，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；历史补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。

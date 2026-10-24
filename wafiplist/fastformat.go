@@ -29,21 +29,21 @@ const fastFileChecksumFlag = 1 << 0
 // fastFileCRCTable 是 crc32c（Castagnoli）查表（包级共享，只读）。
 var fastFileCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
-// MaxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（历史
+// maxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（历史
 // 审计）：.fast 是跨进程输入（节点回传/从节点回退），不能只依赖写侧自律——
 // 异常/恶意超大文件必须先过 Stat 体积门，再进入读取与内容校验。与文本名单
-// 路径的 MaxFileBytes（iplistfast.go）同型；二进制条目 5B/v4、17B/v6，
+// 路径的 maxFileBytes（iplistfast.go）同型；二进制条目 5B/v4、17B/v6，
 // 64MiB 约容纳千万级条目，远超威胁库下载侧 200000 条上限，正常产物远不可及。
-// var 形态供测试收窄。
-var MaxFastFileBytes int64 = 64 << 20
+// 包内可调（仅同包测试收窄），不构成跨模块契约。
+var maxFastFileBytes int64 = 64 << 20
 
-// MaxFastEntries 是读侧条目数（v4Count+v6Count）硬上限。体积门挡不住
+// maxFastEntries 是读侧条目数（v4Count+v6Count）硬上限。体积门挡不住
 // 「条目数 × 内存放大」：最小 v4 条目 5 字节，64MiB 文件可承载约 1342 万条，
 // 展开为 netip.Prefix（每条约 32 字节）即约 410MiB，叠加 data 与消费方
 // []string 展开可达 GiB 量级。百万条已远超威胁库下载侧 200000 条上限，与
-// 文本名单 MaxEntries 同值口径（纵深防御的第二道，第一道是体积）。var 形态
-// 供测试收窄。
-var MaxFastEntries = 1_000_000
+// 文本名单 maxEntries 同值口径（纵深防御的第二道，第一道是体积）。包内可调
+// （仅同包测试收窄），不构成跨模块契约。
+var maxFastEntries = 1_000_000
 
 // FastFileState 是从 .fast 二进制文件加载的内存态（排序不相交前缀集）。
 // 生产消费方=services 侧从节点回退（securityiplists.go ReadFastFile）。
@@ -106,13 +106,13 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	// 读侧上限在写侧自证：产物越过条目数或体积上限时 ReadFastFile 必然
 	// 拒收，写出去只会得到「写成功、读失败」的名单——跨进程回退侧拿不到
 	// 可用数据，且失败点远离真实原因。宁可写侧显式报错且不落盘。
-	if total := len(mv4) + len(mv6); total > MaxFastEntries {
-		return fmt.Errorf("fastfile: 条目数 %d 超过读侧上限 %d（产物必被 ReadFastFile 拒收，未写出）", total, MaxFastEntries)
+	if total := len(mv4) + len(mv6); total > maxFastEntries {
+		return fmt.Errorf("fastfile: 条目数 %d 超过读侧上限 %d（产物必被 ReadFastFile 拒收，未写出）", total, maxFastEntries)
 	}
 	// 计算总大小（header + 条目 + 4 字节 crc32c 尾部）
 	size := fastFileHeaderSize + len(mv4)*5 + len(mv6)*17 + 4
-	if int64(size) > MaxFastFileBytes {
-		return fmt.Errorf("fastfile: 产物体积 %d 字节超过读侧上限 %d（产物必被 ReadFastFile 拒收，未写出）", size, MaxFastFileBytes)
+	if int64(size) > maxFastFileBytes {
+		return fmt.Errorf("fastfile: 产物体积 %d 字节超过读侧上限 %d（产物必被 ReadFastFile 拒收，未写出）", size, maxFastFileBytes)
 	}
 	buf := make([]byte, size)
 
@@ -220,8 +220,8 @@ func ReadFastFile(path string) (*FastFileState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fastfile stat: %w", err)
 	}
-	if info.Size() > MaxFastFileBytes {
-		return nil, fmt.Errorf("fastfile: size %d exceeds cap %d", info.Size(), MaxFastFileBytes)
+	if info.Size() > maxFastFileBytes {
+		return nil, fmt.Errorf("fastfile: size %d exceeds cap %d", info.Size(), maxFastFileBytes)
 	}
 	data := make([]byte, info.Size())
 	if _, err := io.ReadFull(fd, data); err != nil {
@@ -240,8 +240,8 @@ func ReadFastFile(path string) (*FastFileState, error) {
 	v6Count := binary.BigEndian.Uint32(data[8:12])
 	// 条目上限先于任何按计数分配的 make：header 计数是跨进程输入，
 	// 体积门内的小文件同样可以声明巨大计数。
-	if total := int64(v4Count) + int64(v6Count); total > int64(MaxFastEntries) {
-		return nil, fmt.Errorf("fastfile: entry count %d exceeds cap %d", total, MaxFastEntries)
+	if total := int64(v4Count) + int64(v6Count); total > int64(maxFastEntries) {
+		return nil, fmt.Errorf("fastfile: entry count %d exceeds cap %d", total, maxFastEntries)
 	}
 	// 未知 flags 位不得静默忽略（格式演进必须显式：未来的特性位
 	// 若被当 0 解析，会按错误的条目布局读数据）。已知位：bit0=尾部 crc32c。

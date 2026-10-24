@@ -36,8 +36,8 @@ func TestCleanupRulesWithoutUsableCertMaterial(t *testing.T) {
 		}
 	}
 
-	// When
-	cleaned := cleanupRulesWithoutUsableCertMaterial(context.Background())
+	// When：先判定（不删文件），再按判定集删文件
+	cleaned := cleanupCertFilesWithoutMaterial(context.Background(), t)
 
 	// Then：失去材料的规则（关 TLS / 任务材料域名不适用）文件被清理；
 	// manual 有证与材料适用的规则保留
@@ -84,7 +84,7 @@ func TestCleanupRulesWithoutUsableCertMaterial_keepsFailedRetainedPEM(t *testing
 		}
 	}
 
-	cleaned := cleanupRulesWithoutUsableCertMaterial(context.Background())
+	cleaned := cleanupCertFilesWithoutMaterial(context.Background(), t)
 
 	if cleaned != 0 {
 		t.Fatalf("cleaned=%d, want 0（failed/waiting_ca 保留的 PEM 仍是渲染材料）", cleaned)
@@ -114,10 +114,21 @@ func TestCleanupRulesWithoutUsableCertMaterial_cleansDisabledOnlyMaterial(t *tes
 		t.Fatalf("write cert files: %v", err)
 	}
 
-	if cleaned := cleanupRulesWithoutUsableCertMaterial(context.Background()); cleaned != 1 {
+	if cleaned := cleanupCertFilesWithoutMaterial(context.Background(), t); cleaned != 1 {
 		t.Fatalf("cleaned=%d, want 1（disabled 行的 PEM 不参与渲染）", cleaned)
 	}
 	if _, err := os.Stat(filepath.Join(certDir, "lb_mat_disabled.crt")); err == nil {
 		t.Fatal("disabled-only 规则的证书文件未被清理")
 	}
+}
+
+// cleanupCertFilesWithoutMaterial 是测试侧的「判定 + 删文件」组合：与生产
+// 锁外清理段同源（rulesWithoutUsableCertMaterial + removeCertFilesForRules）。
+func cleanupCertFilesWithoutMaterial(ctx context.Context, t *testing.T) int {
+	t.Helper()
+	ids, err := rulesWithoutUsableCertMaterial(ctx, db.DB)
+	if err != nil {
+		t.Fatalf("判定无材料规则: %v", err)
+	}
+	return removeCertFilesForRules(ids)
 }

@@ -314,9 +314,10 @@ func TestGetAppLogs_tailWindowNeverSplitsMultibyteRune(t *testing.T) {
 	}
 }
 
-// 对象换成 loginDummyBcryptHash——其明文是源码内公开常量(随二进制分发),
-// OIDC JIT 用户(password_hash=”)可用该公开串通过主比较登录。安全不变量:
-// 空哈希账户任何密码不得认证(等时比较只取耗时副作用,结果必须恒败)。
+// 空哈希账户的登录比较对象换成 loginDummyBcryptHash——其明文是源码内公开常量
+// (随二进制分发),否则 OIDC JIT 用户(空 password_hash)可用该公开串通过主比较
+// 登录。安全不变量:空哈希账户任何密码不得认证(等时比较只取耗时副作用,结果
+// 必须恒败)。
 func TestLogin_oidcEmptyPasswordHashNeverAuthenticates(t *testing.T) {
 	// Given OIDC JIT 用户(空 password_hash)
 	h := newBackupTestHandlers(t)

@@ -1176,9 +1176,9 @@ func TestListSecurityEvents_disclosesIngestionHealth(t *testing.T) {
 	}
 }
 
-// 列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
-// 仍追加同一截断标记——响应形态不变，但 DB→进程传输不再是大字段全量
-// （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 UTF-8。
+// 列表投影在 SQL 侧只取「截断上限 +1 字节」探针（CAST AS BLOB 按字节计），
+// Go 侧仍按 rune 边界回退并追加同一截断标记——响应形态不变，但 DB→进程
+// 传输不再是大字段全量（100 行 × 64KB/字段），多字节内容也不会 4× 过取。
 func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	gin.SetMode(gin.TestMode)
@@ -1222,6 +1222,15 @@ func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
 	}
 	if len(trimmed) > securityEventListFieldCap {
 		t.Fatalf("request_body 截断后 len=%d > cap=%d", len(trimmed), securityEventListFieldCap)
+	}
+	// 传输侧口径：多字节值在 SQL 侧也必须按字节截断（字符口径会取回
+	// 16K 字符 ≈ 48KB）。探针 +1 字节用于 Go 侧判定「原值更长」。
+	var projected string
+	if err := db.MetricsDB.QueryRow("SELECT " + securityEventListFieldSQL("request_body") + " FROM security_events LIMIT 1").Scan(&projected); err != nil {
+		t.Fatalf("SQL 投影: %v", err)
+	}
+	if len(projected) > securityEventListFieldCap+1 {
+		t.Fatalf("SQL 投影取回 %d 字节 > cap+1（多字节内容按字符口径过取）", len(projected))
 	}
 }
 

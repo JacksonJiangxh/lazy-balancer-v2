@@ -28,8 +28,7 @@ func TestJWTLogout_revokes_only_current_token(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
 	if err != nil {
@@ -59,7 +58,7 @@ func TestJWTLogout_revokes_only_current_token(t *testing.T) {
 	}
 	firstToken := login()
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.POST("/logout", h.Logout)
 	router.GET("/protected", noContent)
 	request := func(method, path, token string) *httptest.ResponseRecorder {
@@ -89,8 +88,7 @@ func TestJWTLogout_revokes_legacy_token_without_jti(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (2,'legacy-logout','hash','user',1,0)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -110,7 +108,7 @@ func TestJWTLogout_revokes_legacy_token_without_jti(t *testing.T) {
 	otherToken := sign("other")
 	h := handlers.NewHandlers(handlers.Dependencies{Config: cfg})
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.POST("/logout", h.Logout)
 	router.GET("/protected", noContent)
 	request := func(method, path, token string) *httptest.ResponseRecorder {
@@ -155,8 +153,7 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (3,'timezone-logout','hash','user',1,0)"); err != nil {
 		t.Fatal(err)
@@ -171,7 +168,7 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	}
 	h := handlers.NewHandlers(handlers.Dependencies{Config: cfg})
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.POST("/logout", h.Logout)
 	router.GET("/protected", noContent)
 	request := func(method, path string) *httptest.ResponseRecorder {
@@ -252,7 +249,7 @@ func TestJWTAuth_splitsExpiredVsInvalidMessages(t *testing.T) {
 		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	hit := func(token string) *httptest.ResponseRecorder {
 		response := httptest.NewRecorder()
@@ -299,7 +296,7 @@ func TestJWTAuth_rejects_username_mismatch_for_same_user_id(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	request.Header.Set("Authorization", "Bearer "+signed)
@@ -365,7 +362,7 @@ func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *t
 		t.Fatalf("password versions=(%d,%d), want (1,2)", firstVersion, secondVersion)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	sign := func(passwordVersion int64) string {
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -431,7 +428,7 @@ func TestResetUserPassword_revokes_target_users_existing_token(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	authRequest := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	authRequest.Header.Set("Authorization", "Bearer "+oldToken)
@@ -464,7 +461,7 @@ func TestJWTAuth_allows_legacy_token_only_for_password_version_zero(t *testing.T
 		t.Fatalf("sign token: %v", err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	request.Header.Set("Authorization", "Bearer "+signed)
@@ -624,7 +621,7 @@ func TestReadOnlyGuard_blocks_non_admin_jwt_after_authentication(t *testing.T) {
 		t.Fatalf("sign token: %v", err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg), readOnlyGuard(database))
+	router.Use(jwtAuth(db.DB, cfg), readOnlyGuard(database))
 	router.POST("/api/v1/rules", noContent)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/rules", nil)
 	request.Header.Set("Authorization", "Bearer "+signed)

@@ -103,6 +103,21 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		if rule.Strategy == "cookie" {
 			rule.Strategy = "weighted_round_robin"
 		}
+		return
+	}
+	// HTTP 跨模式 TLS 残留（与保存族 / 导入后置归一 / 启动迁移同一不变量）：
+	// 生效来源非 manual 不保留证书材料（私钥正文随快照/备份放大）；非
+	// acme_dns 不保留 CA 提供商引用（ResolveCAProviderID 对非 0 不校验存在性，
+	// 残留死引用签发期才暴露）；manual 不保留 ACME 配置引用。渲染侧按来源
+	// 分流，残留列零消费——不回填只会让主端存储/导出/从端落库三面分叉。
+	if rule.TLSSource != "manual" {
+		rule.TLSCert, rule.TLSKey = "", ""
+	}
+	if rule.TLSSource != "acme_dns" {
+		rule.CAProviderID = 0
+	}
+	if rule.TLSSource == "manual" {
+		rule.ACMEConfigID = 0
 	}
 }
 
@@ -111,6 +126,13 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 // 若直读存量 1 值，快照 canonical 与从端落库（恒 0）不同形——rules 节哈希每次
 // 主端 bump 恒不等，每版本一轮全量重拉。导出与从端本地重建共用本函数，
 // 三面（主端导出/从端落库/从端重建）同 0。
-func normalizeUpstreamForTransport(upstream *models.Upstream) {
+//
+// TCP 规则的上游 origin_domain 同属死值（回源域名仅 HTTP 回源使用，保存族
+// 自引入起即拒绝 TCP 携带）——存储/传输面残留会让主端备份在导入校验被整包
+// 拒绝（备份自毒），且随 rules 节同步到从端；故按 ruleProtocol 一并清零。
+func normalizeUpstreamForTransport(upstream *models.Upstream, ruleProtocol string) {
 	upstream.DynamicDNS = false
+	if ruleProtocol == "tcp" {
+		upstream.OriginDomain = ""
+	}
 }

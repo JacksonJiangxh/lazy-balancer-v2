@@ -226,6 +226,38 @@ func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
 			t.Fatal("a full live cache must skip the new key rather than evict verified crawlers")
 		}
 	})
+
+	t.Run("full cache evicts a live negative to admit a new conclusion", func(t *testing.T) {
+		ResetCrawlerVerifyCacheForTest(newResolver())
+		oldMax := crawlerCacheMax
+		crawlerCacheMax = 2
+		t.Cleanup(func() { crawlerCacheMax = oldMax })
+		now := time.Now()
+		crawlerCacheMu.Lock()
+		// 一个正结论 + 一个负结论：负结论可被回收，正结论必须保留。
+		crawlerCache["keep-pos|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
+		crawlerCache["stale-neg|googlebot"] = crawlerVerifyCache{ok: false, expires: now.Add(5 * time.Minute)}
+		crawlerCacheMu.Unlock()
+
+		if got := VerifyCrawler(newIP, "googlebot"); got != CrawlerVerdictSpoof {
+			t.Fatalf("test input must produce a deterministic negative, got %v", got)
+		}
+		crawlerCacheMu.Lock()
+		keep, keepExists := crawlerCache["keep-pos|googlebot"]
+		_, negExists := crawlerCache["stale-neg|googlebot"]
+		_, newExists := crawlerCache[newIP+"|googlebot"]
+		size := len(crawlerCache)
+		crawlerCacheMu.Unlock()
+		if !keepExists || !keep.ok {
+			t.Fatal("positive conclusion must never be evicted at capacity")
+		}
+		if negExists {
+			t.Fatal("a live negative conclusion may be evicted to admit a new conclusion")
+		}
+		if !newExists || size != 2 {
+			t.Fatalf("after negative eviction size=%d newCached=%v, want size=2 and new result cached", size, newExists)
+		}
+	})
 }
 
 func TestVerifyCrawler_cacheCapacityPruneWorkBounded(t *testing.T) {

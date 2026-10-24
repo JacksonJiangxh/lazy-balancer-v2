@@ -862,3 +862,56 @@ func TestEngine_StartLoopResetsScheduleProgress(t *testing.T) {
 		t.Fatalf("关→开未复位排程进度: slot=%v done=%v retry=%v streak=%d", slot, done, retry, streak)
 	}
 }
+
+// Given Scheduled 过期槽（固定过去值）+ 手动触发轮成功落定而业务未推进槽。
+// When 手动轮完成后自动轮继续运转。
+// Then 手动成功同样消费该槽（与自动轮同权）——否则第一次手动成功后 tick 会按
+// 「槽仍过期」反复整轮重投。手动形态此前只有取消/失败语义的钉测。
+func TestEngine_ManualSuccessConsumesExpiredScheduledSlot(t *testing.T) {
+	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	pastSlot := time.Now().Add(-time.Minute)
+	const id = "t-manual-consume"
+	var runs atomic.Int32
+	if err := e.Register(Descriptor{ID: id, Family: "t", Name: "手动消费过期槽", Kind: KindScheduled,
+		RunsOn:     RoleAny,
+		NextSlotFn: func() time.Time { return pastSlot },
+		Run:        func(RunContext) error { runs.Add(1); return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	if _, err := e.RunSync(id, "manual", ""); err != nil {
+		t.Fatalf("手动轮应成功: %v", err)
+	}
+	_, done, _, _ := scheduleStateOf(t, e, id)
+	if !done.Equal(pastSlot) {
+		t.Fatalf("手动成功未消费过期槽: schedDoneSlot=%v, want %v（tick 会重复整轮执行）", done, pastSlot)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("手动轮执行 %d 次, want 1", got)
+	}
+}
+
+// Given Scheduled 未来槽（+700ms）+ 手动触发轮成功落定。
+// When 手动轮完成后自动轮运转到预约时刻。
+// Then 未来槽不被手动成功消费（水位保持零值），到点后仍由 tick 投递一次。
+func TestEngine_ManualSuccessKeepsFutureScheduledSlot(t *testing.T) {
+	e := newTestEngine(t)
+	futureSlot := time.Now().Add(700 * time.Millisecond)
+	const id = "t-manual-future"
+	var runs atomic.Int32
+	if err := e.Register(Descriptor{ID: id, Family: "t", Name: "手动保未来槽", Kind: KindScheduled,
+		RunsOn:     RoleAny,
+		NextSlotFn: func() time.Time { return futureSlot },
+		Run:        func(RunContext) error { runs.Add(1); return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	if _, err := e.RunSync(id, "manual", ""); err != nil {
+		t.Fatalf("手动轮应成功: %v", err)
+	}
+	if _, done, _, _ := scheduleStateOf(t, e, id); !done.IsZero() {
+		t.Fatalf("未来槽被手动成功消费（schedDoneSlot=%v）——到期后自动更新将静默停摆", done)
+	}
+	e.StartLoop(id)
+	waitForEngine(t, "预约到点自动投递", 3*time.Second, func() bool { return runs.Load() == 2 })
+}

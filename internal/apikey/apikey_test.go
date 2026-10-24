@@ -1,0 +1,58 @@
+package apikey
+
+import (
+	"net/http"
+	"testing"
+)
+
+const sampleJWTBearer = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"
+
+// TestFromHeader_extractionRules 钉住「认证侧接受 ⇔ 转发侧可提取」的唯一规则
+// 来源：两处调用（REST 认证中间件 / MCP 内部转发）都不再各自解析请求头。
+func TestFromHeader_extractionRules(t *testing.T) {
+	cases := []struct {
+		name          string
+		apiKeyHeader  string
+		authorization string
+		want          string
+	}{
+		{"x-api-key wins", "lb_sk_direct", "Bearer lb_sk_other", "lb_sk_direct"},
+		{"bearer api key", "", "Bearer lb_sk_bearer", "lb_sk_bearer"},
+		{"jwt bearer is not api key", "", sampleJWTBearer, ""},
+		{"bare api key without scheme", "", "lb_sk_bare", ""},
+		{"lowercase scheme is not accepted", "", "bearer lb_sk_lower", ""},
+		{"empty request", "", "", ""},
+	}
+	for _, tc := range cases {
+		header := http.Header{}
+		if tc.apiKeyHeader != "" {
+			header.Set("X-API-Key", tc.apiKeyHeader)
+		}
+		if tc.authorization != "" {
+			header.Set("Authorization", tc.authorization)
+		}
+		if got := FromHeader(header); got != tc.want {
+			t.Errorf("%s: FromHeader = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIsAPIKeyAuthorization_matchesFromHeader 是两侧语义等价的绊线：认证侧用
+// IsAPIKeyAuthorization 区分「API Key Bearer」与「JWT Bearer」，转发侧用
+// FromHeader 提取——两者对同一 header 的判断必须一致，否则出现「认证通过但
+// 转发提取为空」。
+func TestIsAPIKeyAuthorization_matchesFromHeader(t *testing.T) {
+	for _, authorization := range []string{
+		"Bearer lb_sk_abc",
+		sampleJWTBearer,
+		"bearer lb_sk_abc",
+		"lb_sk_abc",
+		"",
+	} {
+		header := http.Header{"Authorization": []string{authorization}}
+		extracted := FromHeader(header) != ""
+		if decided := IsAPIKeyAuthorization(authorization); decided != extracted {
+			t.Errorf("Authorization=%q: IsAPIKeyAuthorization=%v but FromHeader extracts=%v", authorization, decided, extracted)
+		}
+	}
+}

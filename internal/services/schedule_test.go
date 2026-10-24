@@ -135,14 +135,24 @@ func TestNextScheduledSlot_emptyOrInvalidDaysFallbackAllWeek(t *testing.T) {
 	}
 }
 
-func TestNextScheduledSlot_invalidTimeFallback0400(t *testing.T) {
+func TestNextScheduledSlot_invalidTimeFallbackDefault(t *testing.T) {
 	loc := useShanghaiLocation(t)
 	now := time.Date(2026, 8, 11, 3, 0, 0, 0, loc)
-	want := time.Date(2026, 8, 11, 4, 0, 0, 0, loc)
+	// 兜底值必须与治理默认同源（db.DefaultScheduleTime），不得钉字面量——
+	// 否则默认时间变更后测试保护旧行为、兜底与配置分叉。
+	hour, minute, ok := parseAutoBackupHHMM(db.DefaultScheduleTime)
+	if !ok {
+		t.Fatalf("db.DefaultScheduleTime %q 不可解析", db.DefaultScheduleTime)
+	}
+	want := time.Date(2026, 8, 11, hour, minute, 0, 0, loc)
+	if !want.After(now) {
+		// 默认时间早于 now 时，下一槽落在次日（全周排程）。
+		want = want.AddDate(0, 0, 1)
+	}
 
 	for _, hhmm := range []string{"25:99", "9:00", "bad", ""} {
 		if slot := NextScheduledSlot(now, allWeek(), hhmm, loc); !slot.Equal(want) {
-			t.Fatalf("hhmm=%q: slot=%v, want %v（非法时间兜底 04:00）", hhmm, slot, want)
+			t.Fatalf("hhmm=%q: slot=%v, want %v（非法时间兜底 db.DefaultScheduleTime=%s）", hhmm, slot, want, db.DefaultScheduleTime)
 		}
 	}
 }

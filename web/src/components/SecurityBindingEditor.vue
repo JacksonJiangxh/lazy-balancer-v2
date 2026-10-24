@@ -379,6 +379,13 @@ const onOpen = (): void => {
         .map((rule) => rule.caddy_id)
 }
 
+// 绑定写路径的并发口径（显式声明，避免被当作漏项）：
+// - 规则侧 PUT /security/rules/:caddy_id/policies 与策略侧 bulk 端点都是
+//   「整集替换 + 最后写入生效」，后端不接受乐观并发前置条件（规则编辑的
+//   expected_updated_at 是另一条契约，绑定端点未实现）——多标签页/多管理员
+//   同时改同一规则绑定时，后写覆盖前写且无冲突提示。
+// - 单管理员主节点语境下可接受；若未来需要并发护栏，必须先在绑定端点引入
+//   版本前置条件（409），前端再随请求携带打开时的版本，不能只在前端比对。
 const submit = async (): Promise<void> => {
   if (props.mode === 'rule') {
     const rule = props.rule

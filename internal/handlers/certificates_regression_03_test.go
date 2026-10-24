@@ -273,7 +273,7 @@ func TestMaskedDNSCredentials_threeShapes(t *testing.T) {
 	if isMaskedDNSCredentials(submitted) {
 		t.Fatal("含空串的回传不得判整体未改（会吞掉显式清空）")
 	}
-	merged, err := mergeMaskedDNSCredentials(submitted, stored)
+	merged, err := mergeMaskedDNSCredentials(submitted, stored, true)
 	if err != nil {
 		t.Fatalf("merge shape1: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestMaskedDNSCredentials_threeShapes(t *testing.T) {
 	if isMaskedDNSCredentials(empty) {
 		t.Fatal("全空串不得判整体未改（显式清空语义）")
 	}
-	merged, err = mergeMaskedDNSCredentials(empty, stored)
+	merged, err = mergeMaskedDNSCredentials(empty, stored, true)
 	if err != nil {
 		t.Fatalf("merge shape2: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestMaskedDNSCredentials_threeShapes(t *testing.T) {
 	if isMaskedDNSCredentials(mixed) {
 		t.Fatal("含真实值不得判整体未改")
 	}
-	merged, err = mergeMaskedDNSCredentials(mixed, stored)
+	merged, err = mergeMaskedDNSCredentials(mixed, stored, true)
 	if err != nil {
 		t.Fatalf("merge shape3: %v", err)
 	}
@@ -648,21 +648,32 @@ func TestIssueCertificate_batchAllConflictReturns409(t *testing.T) {
 	router := gin.New()
 	router.POST("/certificates/issue", h.IssueCertificate)
 
-	// 先持全局写锁：请求完成批量快照后阻塞在取锁处。
-	h.caddyOpMu.Lock()
+	// 快照钩子：目标快照完成后、取 caddyOpMu 之前触发——在此删除规则，
+	// 确定性地制造「快照已取、规则在取锁前被删除」，不依赖墙钟 sleep。
+	snapshotTaken := make(chan struct{})
+	allowContinue := make(chan struct{})
+	oldHook := issueCertificateBatchSnapshotHook
+	issueCertificateBatchSnapshotHook = func() {
+		close(snapshotTaken)
+		<-allowContinue
+	}
+	t.Cleanup(func() { issueCertificateBatchSnapshotHook = oldHook })
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 		done <- rec
 	}()
-	// 让快照查询跑完并抵达锁（比对窗口内无其他状态依赖）。
-	time.Sleep(200 * time.Millisecond)
-	if _, err := db.DB.Exec("DELETE FROM lb_rules WHERE caddy_id='lb_conflict_batch'"); err != nil {
-		h.caddyOpMu.Unlock()
-		t.Fatalf("delete rule in lock window: %v", err)
+	select {
+	case <-snapshotTaken:
+	case <-time.After(5 * time.Second):
+		t.Fatal("批量签发目标快照未在超时内完成")
 	}
-	h.caddyOpMu.Unlock()
+	if _, err := db.DB.Exec("DELETE FROM lb_rules WHERE caddy_id='lb_conflict_batch'"); err != nil {
+		close(allowContinue)
+		t.Fatalf("delete rule in snapshot-to-lock window: %v", err)
+	}
+	close(allowContinue)
 
 	var response *httptest.ResponseRecorder
 	select {
@@ -784,6 +795,153 @@ func TestIssueCertificate_batchDownloadedJobsTriggerRedeploy(t *testing.T) {
 		}
 		if !availableAfter.Valid {
 			t.Fatalf("job %d deployment_available_after 未前移", jobID)
+		}
+	}
+	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "等待恢复部署")
+}
+
+// blockingDeploymentRegistrar 注入「登记立即部署时会等待在途部署回调退出」的
+// 登记缝：首次登记会阻塞到测试放行（或 10s 兜底，避免失败分支泄漏 goroutine），
+// 并记录 (jobID:ruleID)。
+func blockingDeploymentRegistrar(t *testing.T) (registrations *[]string, entered <-chan struct{}, release func()) {
+	t.Helper()
+	old := certJobDeploymentRetryRegistrar
+	recorded := make([]string, 0, 2)
+	enteredCh := make(chan struct{}, 1)
+	releaseCh := make(chan struct{})
+	var releaseOnce bool
+	certJobDeploymentRetryRegistrar = func(jobID int, ruleID string) error {
+		recorded = append(recorded, fmt.Sprintf("%d:%s", jobID, ruleID))
+		select {
+		case enteredCh <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseCh:
+		case <-time.After(10 * time.Second):
+			return fmt.Errorf("部署登记等待在途回调超时")
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		certJobDeploymentRetryRegistrar = old
+		if !releaseOnce {
+			close(releaseCh)
+		}
+	})
+	return &recorded, enteredCh, func() {
+		if releaseOnce {
+			return
+		}
+		releaseOnce = true
+		close(releaseCh)
+	}
+}
+
+// assertCaddyOpMuFreeDuringRegistration 断言登记阻塞期间全局锁已释放：在途部署
+// 回调需要 caddyOpMu 才能完成规则写/Caddy 应用，持锁登记会互等到 busy 超时。
+func assertCaddyOpMuFreeDuringRegistration(t *testing.T, h *Handlers, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("部署登记未发生")
+	}
+	locked := make(chan struct{})
+	go func() {
+		h.caddyOpMu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+		h.caddyOpMu.Unlock()
+	case <-time.After(2 * time.Second):
+		t.Fatal("部署登记期间 caddyOpMu 仍被持有（登记未移出临界区）")
+	}
+}
+
+// Given 定向目标「只差部署」且该任务存在在途部署回调（登记会等待其退出）。
+// When 定向签发触发重新部署。
+// Then 登记不在 caddyOpMu 临界区内执行——登记阻塞期间全局锁可用（修复前此处
+// 要等到 busy 超时），放行后响应仍是「已触发重新部署（不重新签发）」。
+func TestIssueCertificate_redeployRegistrationRunsOutsideCaddyOpMu(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_lock_free", "lock-free.example")
+	jobID := seedDownloadedJobWithMaterial(t, "lb_lock_free", "lock-free.example", "downloaded")
+	registrations, entered, release := blockingDeploymentRegistrar(t)
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_lock_free"}`)))
+		done <- rec
+	}()
+	assertCaddyOpMuFreeDuringRegistration(t, h, entered)
+	release()
+	select {
+	case response := <-done:
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "已触发重新部署（不重新签发）") || !strings.Contains(response.Body.String(), `"redeployed":true`) {
+			t.Fatalf("body=%s, want 重新部署响应", response.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("签发请求未返回")
+	}
+	if want := fmt.Sprintf("%d:lb_lock_free", jobID); len(*registrations) != 1 || (*registrations)[0] != want {
+		t.Fatalf("registrations=%v, want [%s]", *registrations, want)
+	}
+	assertLatestCertificateAudit(t, "规则：lb_lock_free", "等待恢复部署")
+}
+
+// Given 批量目标全部「只差部署」且每个目标的登记都会等待在途部署回调退出。
+// When all=true。
+// Then 登记在锁外逐个执行（登记阻塞期间锁可用），放行后全部登记成功、
+// redeployed 计数在登记后聚合，响应文案与审计语义不变。
+func TestIssueCertificate_batchRedeployRegistrationRunsOutsideCaddyOpMu(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_lock_batch_a", "lock-batch-a.example")
+	seedIssueRule(t, "lb_lock_batch_b", "lock-batch-b.example")
+	jobA := seedDownloadedJobWithMaterial(t, "lb_lock_batch_a", "lock-batch-a.example", "downloaded")
+	jobB := seedDownloadedJobWithMaterial(t, "lb_lock_batch_b", "lock-batch-b.example", "cleanup_dns")
+	registrations, entered, release := blockingDeploymentRegistrar(t)
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
+		done <- rec
+	}()
+	assertCaddyOpMuFreeDuringRegistration(t, h, entered)
+	release()
+	select {
+	case response := <-done:
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `"redeployed":2`) || !strings.Contains(response.Body.String(), "已触发重新部署 2 个（不重新签发）") {
+			t.Fatalf("body=%s, want redeployed=2 + 不重新签发文案", response.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("批量签发请求未返回")
+	}
+	if len(*registrations) != 2 {
+		t.Fatalf("registrations=%v, want 2", *registrations)
+	}
+	registered := make(map[string]bool, 2)
+	for _, item := range *registrations {
+		registered[item] = true
+	}
+	for _, want := range []string{fmt.Sprintf("%d:lb_lock_batch_a", jobA), fmt.Sprintf("%d:lb_lock_batch_b", jobB)} {
+		if !registered[want] {
+			t.Fatalf("registrations=%v, want 含 %s", *registrations, want)
 		}
 	}
 	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "等待恢复部署")

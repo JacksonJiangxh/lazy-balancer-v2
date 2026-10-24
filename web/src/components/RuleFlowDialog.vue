@@ -753,6 +753,10 @@ const onDialogOpen = (): void => {
   // 明细缓存随弹框会话重置（规则绑定/策略内容可能已在页间变更）；序号自增使
   // 上一会话在途明细续体失配（修复 A→B 快速切换后 B 明细被 A 续体占死/残留）
   detailsSeq++
+  // 证书序号同样无条件自增：打开非 TLS/TCP 规则时不走证书分支，若只在那条
+  // 分支里自增，上一会话（TLS 规则）在途的 cert-info 响应会通过 seq 校验写回
+  // 旧规则证书（当前模板以 enableTls 门控渲染，故不可见；但属状态污染型回归）。
+  certSeq++
   detailLoading.value = false
   detailsAttached.value = false
   detailFailedSources.value = []

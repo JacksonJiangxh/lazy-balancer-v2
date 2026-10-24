@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +37,9 @@ var systemMetricsReadFile = os.ReadFile
 var systemMetricsCommandTimeout = 2 * time.Second
 
 var systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
-	return exec.CommandContext(ctx, "df", "-B1", "/")
+	// -P（POSIX 输出）保证「一行一文件系统」：非 POSIX 格式下超长设备名会
+	// 独占一行，固定取第 2 行就把设备名当数字列，磁盘分项整体降级。
+	return exec.CommandContext(ctx, "df", "-P", "-B1", "/")
 }
 
 const systemSampleTTL = 5 * time.Second
@@ -626,6 +630,10 @@ func getCPUPercent() (float64, error) {
 	totalDelta := current.total - previous.total
 	idleDelta := current.idle - previous.idle
 	if idleDelta > totalDelta {
+		// 错误样本不得留在采样缓存里冒充成功：本轮已写入的 hasValue 会让
+		// 紧随其后的 1s 窗口内请求直接拿到 0,nil（Degraded 不含 cpu，面板
+		// 会显示为「负载骤降」）。置失效让下一个请求立即重采样。
+		lastCPUStats.hasValue = false
 		return 0, fmt.Errorf("CPU 空闲计数器增量无效")
 	}
 	if totalDelta == 0 {
@@ -639,7 +647,7 @@ var lastNetStats struct {
 	mu       sync.Mutex
 	bytesIn  uint64
 	bytesOut uint64
-	iface    string // 基线所属默认路由接口：接口切换后新旧计数器不可比
+	iface    string // 基线所属统计口径身份：默认路由接口名，或无默认路由时的聚合口径串；口径变化后新旧计数器不可比
 	time     time.Time
 	rateIn   int64
 	rateOut  int64
@@ -669,13 +677,14 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 
 	if !lastNetStats.time.IsZero() {
 		elapsed := now.Sub(lastNetStats.time).Seconds()
-		// 默认路由切换（多网卡/容器重建/策略路由变更）后新接口的累计计数器
-		// 与旧基线不可比：直接差分会把「新接口历史总流量」当成本轮速率（数量级
-		// 假峰值）。接口身份变化即重建基线（本轮速率 0）。
-		ifaceChanged := lastNetStats.iface != "" && iface != "" && iface != lastNetStats.iface
+		// 统计口径变化后新旧计数器不可比：默认路由切换（多网卡/容器重建/
+		// 策略路由变更）、默认路由消失退回物理网卡聚合、聚合成员集变化。任一
+		// 方向直接差分会把「新口径的历史总流量」当成本轮速率（数量级假峰值），
+		// 身份串不等即重建基线（本轮速率 0）。
+		ifaceChanged := lastNetStats.iface != iface
 		countersRolledBack := totalBytesIn < lastNetStats.bytesIn || totalBytesOut < lastNetStats.bytesOut
 		if ifaceChanged {
-			services.Logf("info", "实时流量基线重建：默认路由接口 %s → %s（新旧计数器不可比，本轮速率归零）", lastNetStats.iface, iface)
+			services.Logf("info", "实时流量基线重建：统计口径 %s → %s（新旧计数器不可比，本轮速率归零）", describeNetIdentity(lastNetStats.iface), describeNetIdentity(iface))
 		}
 		if elapsed > 0 && !countersRolledBack && !ifaceChanged {
 			rateIn = int64(float64(totalBytesIn-lastNetStats.bytesIn) / elapsed)
@@ -733,9 +742,26 @@ func init() {
 	primeSystemSamplers()
 }
 
-// parseNetDevTotals 返回默认路由出口接口的累计收发字节与接口名（接口名供读侧
-// 判定「基线是否仍属同一接口」；无默认路由的多物理接口聚合形态返回空串——无
-// 单一身份可比）。
+// netDevAggregateIdentityPrefix 标记「无默认路由时的物理网卡聚合」统计口径。
+// 聚合口径同样需要可比较的身份：成员集变化（网卡下线/上线）会改变聚合总量
+// 的含义，身份串随之变化才能触发基线重建。
+const netDevAggregateIdentityPrefix = "aggregate:"
+
+// describeNetIdentity 把统计口径身份串转成日志可读描述：默认路由接口名直出，
+// 聚合口径列出参与聚合的物理网卡，尚无基线时如实标注。
+func describeNetIdentity(identity string) string {
+	if identity == "" {
+		return "未知口径"
+	}
+	if names, ok := strings.CutPrefix(identity, netDevAggregateIdentityPrefix); ok {
+		return "物理网卡聚合(" + names + ")"
+	}
+	return identity
+}
+
+// parseNetDevTotals 返回默认路由出口接口的累计收发字节与统计口径身份（身份
+// 供读侧判定「基线是否仍属同一口径」）。无默认路由时统计物理类接口聚合并返回
+// 显式聚合身份串（成员集有序拼接——行序抖动不得被当成口径变化）。
 func parseNetDevTotals(input string) (uint64, uint64, string, error) {
 	route, err := systemMetricsReadFile("/proc/net/route")
 	if err != nil {
@@ -766,7 +792,7 @@ func parseNetDevTotals(input string) (uint64, uint64, string, error) {
 	// 无默认路由（如容器 netns 只有子网路由）：统计物理类接口，排除 lo 与
 	// 会重复计数的虚拟叠加层（veth/docker 网桥/br-*）
 	var totalIn, totalOut uint64
-	matched := false
+	var members []string
 	for _, line := range strings.Split(input, "\n") {
 		name, counters, ok := strings.Cut(line, ":")
 		if !ok {
@@ -787,12 +813,13 @@ func parseNetDevTotals(input string) (uint64, uint64, string, error) {
 		}
 		totalIn += bytesIn
 		totalOut += bytesOut
-		matched = true
+		members = append(members, iface)
 	}
-	if !matched {
+	if len(members) == 0 {
 		return 0, 0, "", fmt.Errorf("无法确定默认路由出口接口且无可用物理网卡")
 	}
-	return totalIn, totalOut, "", nil
+	sort.Strings(members)
+	return totalIn, totalOut, netDevAggregateIdentityPrefix + strings.Join(members, ","), nil
 }
 
 func parseDefaultRouteInterface(input string) (string, error) {
@@ -847,20 +874,30 @@ func parseCPUSnapshot(stat string) (cpuSnapshot, bool) {
 }
 
 func parseDFOutput(output string) (uint64, uint64, bool) {
-	lines := strings.Split(output, "\n")
-	if len(lines) < 2 {
-		return 0, 0, false
+	// 以挂载点列定位数据行（`df /` 的目标挂载点恒为 "/"）：非 POSIX 格式下
+	// 超长设备名会独占一行，固定取第 2 行会把设备名当数字列；而只按「数字可
+	// 解析」倒推，折行后的数字行会少一列（设备名在上一行）导致列错位。POSIX
+	// (-P) 形态恒 6 列，折行形态为 5 列，按列数选择 total/used 下标。
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[len(fields)-1] != "/" {
+			continue
+		}
+		totalIndex, usedIndex := 1, 2
+		if len(fields) < 6 {
+			totalIndex, usedIndex = 0, 1
+		}
+		total, err := strconv.ParseUint(fields[totalIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+		used, err := strconv.ParseUint(fields[usedIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+		return total, used, true
 	}
-	fields := strings.Fields(lines[1])
-	if len(fields) < 4 {
-		return 0, 0, false
-	}
-	total, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0, 0, false
-	}
-	used, err := strconv.ParseUint(fields[2], 10, 64)
-	return total, used, err == nil
+	return 0, 0, false
 }
 
 func getConnectionStats() (models.ConnectionStats, error) {
@@ -1301,6 +1338,13 @@ func parsePrometheusSamples(body string) ([]prometheusSample, error) {
 		if err != nil {
 			return nil, fmt.Errorf("解析 Prometheus 第 %d 行样本值 %q 失败: %w", lineNumber+1, fields[1], err)
 		}
+		// Prometheus 文本格式允许 NaN/±Inf，但消费侧把样本值转 int64——Go 规范
+		// 下该转换对非有限值是实现相关的（arm64/amd64 得 -9.2e18），会以 HTTP
+		// 200 输出荒谬的负数计数。非有限样本不参与聚合（与「正文无有效样本 →
+		// 502」同口径：全部无效时仍报错）。
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			continue
+		}
 		samples = append(samples, prometheusSample{name: fields[0], value: value})
 	}
 	if len(samples) == 0 {
@@ -1430,11 +1474,36 @@ func emptyRuleMetrics() gin.H {
 	return ruleMetricsAggregate{}.ruleMetrics()
 }
 
+// allNumericLabels 报告点分串的每个标签是否都只由数字组成（999.1.1.1 形态）。
+// 用于把「看似 IPv4 的非法地址」挡在含义更宽的主机名校验之外。
+func allNumericLabels(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false
+		}
+		for _, c := range label {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func isValidHost(host string) bool {
 	// Check if it's a valid IP address
 	ip := net.ParseIP(host)
 	if ip != nil {
 		return true
+	}
+
+	// 全数字点分串（999.1.1.1、1.2.3.256、1.2.3.4.5）：net.ParseIP 已失败，
+	// 下面的标签字母表校验会放行，但这类串只可能是想写 IP 的笔误——落库后
+	// 渲染进上游地址 / 健康检查 Host 头 / 动态上游 DNS 解析，解析或探测静默
+	// 失败（保存时零提示）。只拒绝「每个标签都纯数字」的点分形态，dns1.example.com
+	// 一类含数字域名与单段数字主机名不受影响。
+	if strings.Contains(host, ".") && allNumericLabels(host) {
+		return false
 	}
 
 	// Check if it's a valid domain name

@@ -2895,9 +2895,16 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			loggerNamesByPort[r.ListenPort] = perPort
 		}
 		for _, d := range splitAndTrim(r.Domain) {
-			// 与 host matcher 同口径规范化——Caddy 日志查找大小写
-			// 敏感,混合大小写 Host 请求会落到默认 logger(归属错位)。
-			// 拆分复用 splitAndTrim（同型去重）。
+			// 键按 host matcher 口径规范化（规则域名写侧已由 db.CanonicalDomains
+			// 规范为小写，本归一基本是 no-op）。Caddy 的日志器查找用**原始
+			// Host**做区分大小写精确匹配（modules/caddyhttp/logging.go）：大写
+			// Host（curl -H 'Host: Example.COM'、脚本、扫描器）查不到小写键，
+			// 落默认 logger http.log.access；而 default writer 的 exclude 含
+			// `http` 前缀、caddy_server 亦显式排除 —— 这**不是归属错位，是
+			// 零落盘**。可观测边界：规则访问日志仅覆盖小写规范 Host；不枚举
+			// 大小写变体（组合不可枚举），也不移除 default 的 http 排除
+			// （会让规则行在 caddy.log 重复，推翻日志收窄）。转发、安全事件与
+			// 指标不受影响（走请求链）。
 			perPort[normalizeHostForMatcher(d)] = "rule_" + r.CaddyID
 		}
 	}
@@ -2983,12 +2990,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 				continue
 			}
 			logsMap["rule_"+r.CaddyID] = map[string]interface{}{
-				"writer": map[string]interface{}{
-					"output":       "file",
-					"filename":     RuleLogPath(r.CaddyID),
-					"roll_size_mb": caddyLogSizeMB,
-					"roll_keep":    caddyLogRollKeep,
-				},
+				"writer":  caddyLogFileWriter(RuleLogPath(r.CaddyID), caddyLogSizeMB),
 				"encoder": encoder,
 				"include": []string{"http.log.access.rule_" + r.CaddyID},
 			}
@@ -3062,6 +3064,20 @@ func accessLogEncoderFields(format string) map[string]interface{} {
 	return fields
 }
 
+// caddyLogFileWriter Caddy 日志文件 writer 的唯一构造点（全局 logging 与规则级
+// logger 共用）。键集决定 timberjack 的轮转 reason 家族（roll_size_mb =>
+// rotate("size")），删除侧白名单（rulelog.go 的 timberjackRotationReasons）与
+// 本键集由 rulelog_rotation_naming_test.go 的双向门禁绑定——新增轮转触发键
+// 必须先登记对应 reason。
+func caddyLogFileWriter(filename string, sizeMB int) map[string]interface{} {
+	return map[string]interface{}{
+		"output":       "file",
+		"filename":     filename,
+		"roll_size_mb": sizeMB,
+		"roll_keep":    caddyLogRollKeep,
+	}
+}
+
 func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 	// sizeMB 由调用方校验恒 >0（库值唯一真相批 1+2：caddy_log_size_mb 类型①
 	// 值型列直读，无效值在调用点显性报错）；level 空串=「未配置」语义归 info
@@ -3071,19 +3087,11 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 	}
 	level = strings.ToUpper(level)
 	consoleEncoder := map[string]interface{}{"format": "console"}
-	fileWriter := func(filename string) map[string]interface{} {
-		return map[string]interface{}{
-			"output":       "file",
-			"filename":     filename,
-			"roll_size_mb": sizeMB,
-			"roll_keep":    caddyLogRollKeep,
-		}
-	}
 	return map[string]interface{}{
 		"logs": map[string]interface{}{
 			"default": map[string]interface{}{
 				"level":   level,
-				"writer":  fileWriter("/app/logs/caddy.log"),
+				"writer":  caddyLogFileWriter("/app/logs/caddy.log", sizeMB),
 				"encoder": consoleEncoder,
 				// exclude 是命名空间前缀匹配："http" 已覆盖 http.log.access
 				// （重复项只增加配置字节噪声）。
@@ -3091,13 +3099,13 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 			},
 			"caddy_tls": map[string]interface{}{
 				"level":   level,
-				"writer":  fileWriter("/app/logs/caddy-tls.log"),
+				"writer":  caddyLogFileWriter("/app/logs/caddy-tls.log", sizeMB),
 				"encoder": consoleEncoder,
 				"include": []string{"tls"},
 			},
 			"caddy_server": map[string]interface{}{
 				"level":   level,
-				"writer":  fileWriter("/app/logs/caddy-server.log"),
+				"writer":  caddyLogFileWriter("/app/logs/caddy-server.log", sizeMB),
 				"encoder": consoleEncoder,
 				// 2026-09-17 用户裁定:http.handlers.waf 命名空间排除——WAF 按请求
 				// 量的拦截日志(coraza 引擎 debug WARN 行 + coraza-caddy 插件
@@ -3107,7 +3115,7 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 			},
 			"caddy_proxy": map[string]interface{}{
 				"level":   level,
-				"writer":  fileWriter("/app/logs/caddy-proxy.log"),
+				"writer":  caddyLogFileWriter("/app/logs/caddy-proxy.log", sizeMB),
 				"encoder": consoleEncoder,
 				"include": []string{"http.handlers.reverse_proxy"},
 			},

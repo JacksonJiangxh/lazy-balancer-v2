@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -68,9 +70,15 @@ func TestIDHandlersRejectNonPositiveIDs(t *testing.T) {
 	}
 }
 
-// MaxBytesReader 超限并入 400——与导入/PutCaddyConfig/admin-tls 的 413 口径不一。
+// CA 提供商写端点跟随全局「请求体大小」配置项（不再硬编码 1MB）。
+// Given 配置上限 1MB。When 提交超过上限的 JSON。Then 413（与导入/PutCaddyConfig/
+// admin-tls 同口径）。
 func TestUpdateCAProvider_oversizedBodyReturns413(t *testing.T) {
-	h := &Handlers{caProviderService: services.NewCAProviderService()}
+	h := newBackupTestHandlers(t)
+	h.caProviderService = services.NewCAProviderService()
+	if _, err := db.DB.Exec("UPDATE global_config SET request_body_max_size_mb=1 WHERE id=1"); err != nil {
+		t.Fatalf("set request body limit: %v", err)
+	}
 	router := gin.New()
 	router.PUT("/ca/:id", h.UpdateCAProvider)
 	body := `{"name":"` + strings.Repeat("a", (1<<20)+64) + `"}`
@@ -80,5 +88,53 @@ func TestUpdateCAProvider_oversizedBodyReturns413(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%.200s, want 413", response.Code, response.Body.String())
+	}
+}
+
+// 5xx 写点单源：dbQueryNotFound 的 500 分支必须委托 writeInternalError，不得
+// 自行 services.Logf + c.JSON——本函数有 21 个调用点，未来统一 5xx 策略
+// （trace id / 统一脱敏 / 错误码映射）漏改这里即分叉。
+func TestDBQueryNotFound_500BranchUsesWriteInternalError(t *testing.T) {
+	source, err := os.ReadFile("db_errors.go")
+	if err != nil {
+		t.Fatalf("read db_errors.go: %v", err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func dbQueryNotFound(")
+	if start < 0 {
+		t.Fatal("db_errors.go 缺 dbQueryNotFound 定义")
+	}
+	rest := text[start:]
+	end := strings.Index(rest, "\n}\n")
+	if end < 0 {
+		t.Fatal("dbQueryNotFound 函数体切片失败")
+	}
+	body := rest[:end]
+	if !strings.Contains(body, `writeInternalError(c, http.StatusInternalServerError, "数据库错误"`) {
+		t.Fatalf("dbQueryNotFound 的 500 分支必须委托统一写点: %s", body)
+	}
+	if strings.Contains(body, "c.JSON(http.StatusInternalServerError") {
+		t.Fatal("dbQueryNotFound 不得自行写 500 响应（统一 5xx 策略会漏改）")
+	}
+}
+
+// dbQueryNotFound 的 500 分支必须经统一写点：响应只含固定文案（不泄底层错误），
+// operation 归因与底层错误只进日志——否则未来统一 5xx 策略会漏改本函数调用面。
+func TestDBQueryNotFound_500UsesUnifiedWriter(t *testing.T) {
+	logs := captureLog(t)
+	response := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(response)
+	if !dbQueryNotFound(context, errors.New("disk I/O error"), "not found", "查询规则") {
+		t.Fatal("error was not handled")
+	}
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", response.Code)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "数据库错误") || strings.Contains(body, "disk I/O error") {
+		t.Fatalf("body=%s, want 固定文案且不泄露底层错误", body)
+	}
+	if !strings.Contains(logs.String(), "查询规则") || !strings.Contains(logs.String(), "disk I/O error") {
+		t.Fatalf("日志=%q, want operation 归因与底层错误", logs.String())
 	}
 }

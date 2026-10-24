@@ -4,29 +4,29 @@ import assert from 'node:assert/strict'
 import { normalizeRateLimitBlocks } from '../src/utils/rateLimitBlocks.ts'
 import { source } from './_helpers.ts'
 
-test('null data -> empty hosts, total 0', () => {
+test('空数据：无主机、总数 0', () => {
   assert.deepEqual(normalizeRateLimitBlocks(null), { total: 0, hosts: [] })
 })
 
-test('hosts:null from legacy backend -> empty array (no .length crash)', () => {
+test('旧后端 hosts:null 归一为空数组（不因 .length 崩溃）', () => {
   assert.deepEqual(normalizeRateLimitBlocks({ total: 0, hosts: null }), { total: 0, hosts: [] })
 })
 
-test('valid hosts are preserved and sorted data untouched', () => {
+test('合法主机原样保留且不重排', () => {
   assert.deepEqual(
     normalizeRateLimitBlocks({ total: 21, hosts: [{ host: 'a.example', count: 14 }, { host: 'b.example', count: 7 }] }),
     { total: 21, hosts: [{ host: 'a.example', count: 14 }, { host: 'b.example', count: 7 }] },
   )
 })
 
-test('legacy null total falls back to the visible host sum', () => {
+test('旧形态 total 为 null 时回退为可见主机计数之和', () => {
   assert.deepEqual(
     normalizeRateLimitBlocks({ total: null, hosts: [{ host: 'x', count: 9 }] }),
     { total: 9, hosts: [{ host: 'x', count: 9 }] },
   )
 })
 
-test('malformed host entries are dropped without throwing', () => {
+test('畸形主机条目丢弃且不抛错', () => {
   assert.deepEqual(
     normalizeRateLimitBlocks({ total: 3, hosts: [null, { host: 'ok.example', count: 3 }, { count: 9 }] } as unknown),
     { total: 3, hosts: [{ host: 'ok.example', count: 3 }] },

@@ -273,3 +273,60 @@ func resetCRSRuleIndexCacheForHardeningTest(t *testing.T) {
 	crsRuleIndexCache, crsRuleIndexKey = nil, ""
 	crsRuleIndexMu.Unlock()
 }
+
+// crs_excluded_rules 渲染侧条目上限（与 crs_rule_groups 同构的防御深度）：
+// 带外/旧快照可绕过写入面 50 条上限，逐条发射会放大配置体积与生成耗时。
+// 夹具 60 条互异作用域条目（各 1 个可展开 ID）→ 渲染侧只发射前 50 条。
+func TestBuildCorazaDirectives_capsExcludedEntries(t *testing.T) {
+	scopedExclusionFixture(t)
+	entries := make([]string, 0, CRSExcludedRulesMaxEntries+10)
+	for i := 1; i <= CRSExcludedRulesMaxEntries+10; i++ {
+		entries = append(entries, fmt.Sprintf(`{"target":"942100","scope":"ip","ips":"10.0.%d.%d"}`, i/250, i%250))
+	}
+	if len(entries) <= CRSExcludedRulesMaxEntries {
+		t.Fatalf("夹具无效：条目数 %d 未超过上限 %d", len(entries), CRSExcludedRulesMaxEntries)
+	}
+	policy := &models.SecurityPolicy{
+		ID: 31, Name: "cap-excluded", AnomalyThreshold: 5, Mode: "blocking",
+		CRSExcludedRules: json.RawMessage("[" + strings.Join(entries, ",") + "]"),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_cap_excluded"))
+
+	ctlLines := 0
+	for _, line := range strings.Split(directives, "\n") {
+		if strings.Contains(line, "ctl:ruleRemoveById=942100") {
+			ctlLines++
+		}
+	}
+	if ctlLines == 0 || ctlLines > CRSExcludedRulesMaxEntries {
+		t.Fatalf("作用域排除行数=%d, want 1..%d（渲染侧必须按条目截断）", ctlLines, CRSExcludedRulesMaxEntries)
+	}
+	compileForEngineGate(t, directives)
+}
+
+// 条目上限挡不住组号展开：单条组号 target 会展开为该组全部规则 ID。行预算
+// 按展开后的真实行数截断——带外写入不得把生成期行数放大到百万级（生成全程
+// 持 CaddyOpLock）。夹具预算缩到 1，组 42 在夹具索引中展开 2 条 → 只发射 1 行。
+func TestBuildCorazaDirectives_capsScopedExclusionDirectiveRows(t *testing.T) {
+	scopedExclusionFixture(t)
+	oldBudget := crsScopedExclusionMaxDirectives
+	crsScopedExclusionMaxDirectives = 1
+	t.Cleanup(func() { crsScopedExclusionMaxDirectives = oldBudget })
+
+	policy := &models.SecurityPolicy{
+		ID: 32, Name: "budget", AnomalyThreshold: 5, Mode: "blocking",
+		CRSExcludedRules: json.RawMessage(`[{"target":"42","scope":"ip","ips":"10.1.1.1"}]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_budget"))
+
+	ctlLines := 0
+	for _, line := range strings.Split(directives, "\n") {
+		if strings.Contains(line, "ctl:ruleRemoveById=") {
+			ctlLines++
+		}
+	}
+	if ctlLines != 1 {
+		t.Fatalf("组展开行数=%d, want 1（行预算必须截断展开后的实际行数）:\n%s", ctlLines, directives)
+	}
+	compileForEngineGate(t, directives)
+}

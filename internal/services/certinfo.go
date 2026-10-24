@@ -103,12 +103,13 @@ func GetCertExpiryThreshold() int {
 // 90 天证书），用作续签窗口安全上限的基准。
 const CertRenewalLifetimeDays = 90
 
-// CertRenewalDaysMax 是安全续签窗口上限（整数天）：窗口必须比证书寿命至少小
-// 一整天。窗口 ≥ 寿命-24h 时窗口门与成功侧迟滞数学等价——证书刚签发就落在
-// 窗口内，每次扫描都整轮重签（日级），约 5-7 天即触发 CA 重复证书限流、任务落
-// failed 后自动续签链终止，再约一个寿命后证书到期、HTTPS 规则 fail-closed。
-// 写侧校验（handlers.UpdateConfig）、导入钳制与读侧生效窗口共用本单源；存量
-// 越界值不静默改写库（读侧按上限生效并显性告警）。
+// CertRenewalDaysMax 是安全续签窗口上限（整数天）：按 90 天规划寿命，窗口必须
+// 比寿命至少小一整天，否则证书刚签发就落在窗口内，相邻两次自动续签的自然间隔
+// L−W 退化到日级（约 5-7 天即触发 CA 重复证书限流、任务落 failed 后自动续签链
+// 终止，再约一个寿命后证书到期、HTTPS 规则 fail-closed）。写侧校验
+// （handlers.UpdateConfig）、导入钳制与读侧生效窗口共用本单源；存量越界值不
+// 静默改写库（读侧按上限生效并显性告警）。CA 实际寿命不可预知，扫描侧另有
+// certRenewalWindowForLifetime 按真实寿命收敛（见 certificates.go）。
 const CertRenewalDaysMax = CertRenewalLifetimeDays - 2
 
 // GetCertRenewalDays returns the configured certificate renewal window in days.
@@ -146,11 +147,11 @@ func GetCertRenewalDays() int {
 		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值超上界（%d >90）——写侧校验/导入钳制之外，疑似带外直写/旧备份恢复（续签风暴风险）；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
 		return db.DefaultCertRenewalDays
 	}
-	// 存量/旧备份遗留的 89/90 仍在旧契约内，但会让窗口门与迟滞等价（日级整轮
-	// 重签）。不得静默改写库值：库保持原样，本轮按安全上限生效并显性告警，
-	// 让运维从续签节奏与日志两侧看到真实原因。
+	// 存量/旧备份遗留的 89/90 仍在旧契约内，但已超过安全上限（窗口接近寿命时
+	// 相邻两次续签间隔退化到日级）。不得静默改写库值：库保持原样，本轮按安全
+	// 上限生效并显性告警，让运维从续签节奏与日志两侧看到真实原因。
 	if days > CertRenewalDaysMax {
-		Logf("error", "GetCertRenewalDays: cert_renewal_days=%d 超过安全上限 %d（证书寿命 %d 天，窗口 ≥ 寿命-24h 会与窗口门等价导致日级整轮重签并触发 CA 重复证书限流）——疑似旧版本/备份导入遗留；库值保留、本轮按 %d 生效，请调小续签时间", days, CertRenewalDaysMax, CertRenewalLifetimeDays, CertRenewalDaysMax)
+		Logf("error", "GetCertRenewalDays: cert_renewal_days=%d 超过安全上限 %d（证书寿命按 %d 天规划，窗口接近寿命会让相邻两次续签间隔退化到日级/亚日级并触发 CA 重复证书限流）——疑似旧版本/备份导入遗留；库值保留、本轮按 %d 生效，请调小续签时间", days, CertRenewalDaysMax, CertRenewalLifetimeDays, CertRenewalDaysMax)
 		return CertRenewalDaysMax
 	}
 	return days
@@ -378,10 +379,15 @@ func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, rul
 		if strings.TrimSpace(candidate.CertPEM) == "" || candidate.Status == "disabled" {
 			continue
 		}
-		// 域名适用性过滤与对账/物化同源：规则改域后旧域的 issued 行属终态、
-		// 不被 sweep 回收，若在此不过滤，本规则证书卡会展示换域前的旧证书
-		// （文案「ACME 证书已过期」），与正常选择路径 VerifyHostname 的口径分叉。
-		if !certJobRuleApplicable(true, ruleDomain, candidate.Domain) {
+		// 域名适用性：先按「任务行域名 == 规则域名」判定（对账/物化同源）；
+		// 不匹配时再按证书 SAN 覆盖判定（与选择路径 VerifyHostname 同口径）——
+		// 规则域名曾由「根域+www」收窄/放宽后，旧任务行的 domain 是当时集合的
+		// 快照，精确比较会把仍覆盖当前域名的证书卡从「已过期」误报成「尚未签发」。
+		leaf := candidate.Leaf
+		if leaf == nil {
+			leaf = parseCertificateLeafFromPEM(candidate.CertPEM)
+		}
+		if !certJobRuleApplicable(true, ruleDomain, candidate.Domain) && !leafCoversRuleDomains(leaf, ruleDomain) {
 			continue
 		}
 		info := formatRuleCertInfo(candidate.CertPEM, candidate.Leaf, "acme_dns", ruleDomain, caddyID, expiryDays, now)
@@ -392,10 +398,6 @@ func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, rul
 		// 已签发但未生效：SelectCertificate 因 now<NotBefore 跳过该候选，
 		// 回退若仍报「尚未签发或不存在」会诱导运维重复触发签发（白烧 CA
 		// 配额），且与磁盘/Caddy 实际部署状态矛盾。
-		leaf := candidate.Leaf
-		if leaf == nil {
-			leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
-		}
 		if leaf != nil && now.Before(leaf.NotBefore) {
 			info.Status = "unknown"
 			info.Error = fmt.Sprintf("ACME 证书尚未生效（NotBefore %s）", leaf.NotBefore.Format("2006-01-02 15:04:05"))
@@ -403,6 +405,38 @@ func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, rul
 		}
 	}
 	return nil
+}
+
+// parseCertificateLeafFromPEM 只解析证书首块（不要求私钥配对）——历史行的
+// 私钥可能已损坏/缺失，但「证书覆盖哪些域名」只依赖证书本体。
+func parseCertificateLeafFromPEM(certPEM string) *x509.Certificate {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return nil
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return leaf
+}
+
+// leafCoversRuleDomains 与 SelectCertificate 的覆盖判定同源（逐域名
+// VerifyHostname）；它只看 SAN/CN 是否覆盖，不看到期时间。
+func leafCoversRuleDomains(leaf *x509.Certificate, ruleDomain string) bool {
+	if leaf == nil {
+		return false
+	}
+	canonical, err := CanonicalACMEDomains(ruleDomain)
+	if err != nil {
+		return false
+	}
+	for _, domain := range strings.Split(canonical, ",") {
+		if leaf.VerifyHostname(domain) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func missingACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {

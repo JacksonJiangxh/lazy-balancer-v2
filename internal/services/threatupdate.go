@@ -67,6 +67,11 @@ type ThreatUpdateManager struct {
 	lastStartedAt   string
 	lastFinishedAt  string
 	lastTaskOutcome string // success / failed / ""（未跑过）
+	// lastRunEmptySources 标记本轮「启用源均未到期，无更新」。它是**审计动作
+	// 的附加语义**而非终态：零到期源轮按成功轮落定（task_runs=success），审计
+	// 动作仍记「更新」，detail 显式声明「无到期源」——与爬虫族同口径。
+	// 「跳过」动作专留给降级中止，不再同时承载「正常空轮」。
+	lastRunEmptySources bool
 }
 
 // nil-until-init（镜像 CRS/IP2Region 管理器）：仅 main.go 初始化。角色传播
@@ -323,15 +328,25 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	defer func() {
 		m.mu.Lock()
 		outcome := m.lastTaskOutcome
+		emptySources := m.lastRunEmptySources
 		m.mu.Unlock()
 		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
 			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
 		}[outcome], trigger)
+		if emptySources && outcome == "success" {
+			// 零到期源的语义单源：动作「更新」（与常态成功轮同族），detail
+			// 声明空轮事实——此前该轮 detail 只有「成功」，与真更新轮不可区分。
+			detail = fmt.Sprintf("无到期源，本轮无更新（触发：%s）", trigger)
+		}
 		switch outcome {
 		case "failed":
 			RecordAuditLog(operator, "更新失败", "威胁情报库", detail, "")
 		case "cancelled":
 			RecordAuditLog(operator, "取消", "威胁情报库", detail, "")
+		case "skipped":
+			// 与爬虫族同口径：降级中止记「跳过」——此前落 default 记「更新」，
+			// 同一安全语义在两族分叉且被伪装成正常轮。
+			RecordAuditLog(operator, "跳过", "威胁情报库", detail, "")
 		default:
 			RecordAuditLog(operator, "更新", "威胁情报库", detail, "")
 		}
@@ -357,6 +372,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	m.mu.Lock()
 	m.lastTrigger = trigger
 	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
+	m.lastRunEmptySources = false
 	m.mu.Unlock()
 	// 起点角色复查：调度器 tick 的 is_master
 	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
@@ -393,6 +409,11 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		return
 	}
 	if len(sources) == 0 {
+		// 零到期源=正常空轮：终态 success（task_runs 成功），审计动作仍为
+		// 「更新」但 detail 声明空轮事实（见审计 defer）。
+		m.mu.Lock()
+		m.lastRunEmptySources = true
+		m.mu.Unlock()
 		finishWith("success")
 		return
 	}

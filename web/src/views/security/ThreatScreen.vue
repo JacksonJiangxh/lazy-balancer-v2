@@ -64,6 +64,9 @@
         </div>
         <div v-if="trafficError" class="error-banner traffic-error">流量采集不可用（Caddy admin 不可达），曲线已保留上一帧</div>
         <div v-if="flowError || attackFlowError" class="error-banner site-unset">光流数据加载失败，正在重试…</div>
+        <div v-if="flowGap || attackFlowGap" class="info-note-bar">
+          <span class="info-note-desc">事件流有空洞：{{ flowGap || attackFlowGap }} 条事件因缓冲溢出未送达，弹道不连续属正常现象</span>
+        </div>
         <div v-if="collectorError" class="error-banner site-unset">大屏流量采集续租失败（Caddy 侧逐请求计数已中断），正在重试…</div>
         <div v-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
       </div>
@@ -816,10 +819,14 @@ const toastTask = usePollingTask(async ({ signal, isCurrent }) => {
 // 大屏只剩静态热力，运维无法区分「无流量」与「光流管线故障」——补显性横幅。
 const flowError = ref(false)
 const attackFlowError = ref(false)
+// 环形缓冲溢出造成的永久丢事件数（服务端 gap_skipped）：攻击流与正常流同一
+// 披露口径——只说明「有事件未送达」，不再与「加载失败」混为一谈。
+const flowGap = ref(0)
+const attackFlowGap = ref(0)
 const collectorError = ref(false)
 let attackFlowSince = 0
 const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
-  const res = await request.get<APIResponse<{ enabled?: boolean; events?: AttackFlowEvent[]; next_seq?: number }>>(
+  const res = await request.get<APIResponse<{ enabled?: boolean; events?: AttackFlowEvent[]; next_seq?: number; gap?: boolean; gap_skipped?: number }>>(
     `/security/overview/threat-screen/attack-flow?since=${attackFlowSince}&limit=1000`,
     { silent: true, signal },
   )
@@ -828,8 +835,10 @@ const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
   const data = res.data
   if (!data?.enabled) {
     attackFlowSince = 0
+    attackFlowGap.value = 0
     return
   }
+  attackFlowGap.value = data.gap_skipped ?? (data.gap === true ? 1 : 0)
   // 引擎尚在异步装载：不消费游标，下一轮重新拉取，否则首波爆发的攻击流
   // 会在 threatMap=null 时被静默丢弃（页面刚打开/模式切换后必现）。
   if (!threatMap) return
@@ -874,9 +883,12 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   const data = res.data
   if (!data?.enabled) {
     flowSince = 0
+    flowGap.value = 0
     return
   }
-  flowError.value = data.gap === true
+  // 空洞与「加载失败」是两种信号：前者是环形缓冲溢出（事件永久丢失，光流
+  // 仍连续推进），后者是端点不可用。混用一个旗标会让横幅把正常丢样报成故障。
+  flowGap.value = data.gap_skipped ?? (data.gap === true ? 1 : 0)
   // 同攻击流：引擎未装载时不得推进游标，否则首轮正常流事件被丢弃。
   if (!threatMap) return
   const events = data.events ?? []
@@ -1398,7 +1410,7 @@ onBeforeUnmount(() => {
 .back-btn { position: absolute; z-index: 4; bottom: 52px; left: 50%; transform: translateX(-50%); }
 .hint { position: absolute; z-index: 2; right: 16px; bottom: 44px; font-size: 11px; color: #56709f; pointer-events: none; }
 
-.toasts { position: absolute; z-index: 5; top: 14px; left: 50%; transform: translateX(-50%); display: grid; gap: 6px; justify-items: center; pointer-events: none; width: min(460px, calc(100% - 32px)); }
+.toasts { position: absolute; z-index: 7; top: 14px; left: 50%; transform: translateX(-50%); display: grid; gap: 6px; justify-items: center; pointer-events: none; width: min(460px, calc(100% - 32px)); }
 .toast {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 14px;
@@ -1436,10 +1448,14 @@ onBeforeUnmount(() => {
   letter-spacing: 3px;
   z-index: 4;
 }
+/* 错误/信息条堆叠区：置顶居中、位于攻击弹框（.toasts z-index 7）之下，
+   默认点击穿透（条带自身不遮挡其下弹框/按钮），仅重试按钮恢复可点。 */
 .error-stack {
   position: absolute; left: 50%; top: 8px; transform: translateX(-50%);
   display: flex; flex-direction: column; align-items: center; gap: 4px; z-index: 6;
+  pointer-events: none; max-width: min(720px, calc(100% - 32px));
 }
+.error-stack .error-retry { pointer-events: auto; }
 .error-banner {
   padding: 4px 14px; border: 1px solid rgba(255, 77, 94, 0.5);
   background: rgba(255, 77, 94, 0.15); color: #ff8f9a; font-size: 12px;

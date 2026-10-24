@@ -112,3 +112,34 @@ func TestCollectEngineFamilies_inFlightRunStaysRunning(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Given 终态 UPDATE 失败的残留行（库 running + 进程内无在途执行）。
+// When 同时读取任务列表与任务运行历史。
+// Then 两者对同一 run 给出一致结论（列表 failed/已中断、历史 interrupted）——
+// 归一判定与文案单源在引擎（History/LatestRun 内置），服务层列表用同一判定。
+func TestHistoryMatchesListOnStaleRunningRow(t *testing.T) {
+	newClusterTestService(t)
+	e := taskengine.NewEngine(taskengine.Options{TickInterval: time.Hour})
+	t.Cleanup(e.Stop)
+	registerMonitorTestTask(t, e, "t-history-stale", func(taskengine.RunContext) error { return nil })
+
+	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at)
+		VALUES ('t-history-stale', 't', 'auto', 'running', datetime('now','-5 minutes'))`); err != nil {
+		t.Fatal(err)
+	}
+	runs := e.History("t-history-stale", 10)
+	if len(runs) != 1 {
+		t.Fatalf("历史行数 %d, want 1", len(runs))
+	}
+	if runs[0].Status != "interrupted" {
+		t.Fatalf("残留 running 行在历史里应归一为 interrupted, got %q", runs[0].Status)
+	}
+	if runs[0].Message != staleRunInterruptedMessage {
+		t.Fatalf("归一须带与列表同源说明, got %q", runs[0].Message)
+	}
+	// 与列表对同一行的结论一致（单源判定的直接对照）。
+	ti := findTaskInfo(t, collectEngineFamilies(e), "t-history-stale")
+	if ti.Status != TaskStatusFailed || ti.LastRun == nil || ti.LastRun.Result != "interrupted" {
+		t.Fatalf("列表侧结论=(%q,%+v)，与历史归一不一致", ti.Status, ti.LastRun)
+	}
+}

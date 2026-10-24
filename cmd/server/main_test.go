@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -148,6 +149,52 @@ func TestTZLogWriterWriteHonorsWriterContract(t *testing.T) {
 type failingWriter struct{ err error }
 
 func (w *failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+// rotationSimulatingSink 复现 RotatingFileWriter 的关键语义：按每次 Write 的
+// 长度判定轮转，先轮转后写（轮转判定看的是本次调用的 p，不是累计行）。
+type rotationSimulatingSink struct {
+	limit int
+	files []bytes.Buffer
+}
+
+func (s *rotationSimulatingSink) Write(p []byte) (int, error) {
+	if len(s.files) == 0 || s.files[len(s.files)-1].Len()+len(p) > s.limit {
+		s.files = append(s.files, bytes.Buffer{})
+	}
+	return s.files[len(s.files)-1].Write(p)
+}
+
+// TestTZLogWriterKeepsLineAtomicAcrossRotation 钉住「一行一次 Write」：前缀与
+// 正文分两次写时，跨轮转阈值的那一行会被拆进两个文件（旧文件尾部只剩裸时间戳、
+// 新文件首行没有时间戳），按行首解析的日志采集与取证因此错位。
+func TestTZLogWriterKeepsLineAtomicAcrossRotation(t *testing.T) {
+	prefixLen := len("2006/01/02 15:04:05 ")
+	sink := &rotationSimulatingSink{limit: prefixLen + 8}
+	writer := &tzLogWriter{w: sink}
+
+	for _, payload := range []string{"first-line\n", "second-line\n", "third-line\n"} {
+		if n, err := writer.Write([]byte(payload)); err != nil || n != len(payload) {
+			t.Fatalf("write %q: n=%d err=%v", payload, n, err)
+		}
+	}
+	if len(sink.files) < 2 {
+		t.Fatalf("夹具未触发轮转（files=%d）——阈值设置未覆盖跨行场景", len(sink.files))
+	}
+	timestampPrefix := regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} `)
+	for index, file := range sink.files {
+		for _, line := range strings.Split(file.String(), "\n") {
+			if line == "" {
+				continue
+			}
+			if !timestampPrefix.MatchString(line) {
+				t.Fatalf("文件 %d 出现没有时间戳的残行：%q", index, line)
+			}
+			if !strings.Contains(line, "-line") {
+				t.Fatalf("文件 %d 出现只有时间戳没有正文的残行：%q", index, line)
+			}
+		}
+	}
+}
 
 // 启动期时区读侧：显式值直读，NULL/空串/缺行落到治理默认值 db.DefaultTimezone
 // （DDL DEFAULT 单源）；读错误才上抛由调用方退回进程默认时区。

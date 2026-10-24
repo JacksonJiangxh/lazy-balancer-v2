@@ -1,6 +1,9 @@
 package models
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"net/netip"
+)
 
 // 策略实体单职化（2026-09-20 用户裁定「实体拆分」）：policy_type ∈
 // stage1（IP 访问控制策略：ACL/信任/黑名单/GeoIP+拦截页）/ stage2（限流策略：
@@ -86,6 +89,26 @@ func InferPolicyType(p *SecurityPolicy) string {
 	}
 }
 
+// SecurityPolicyIPListIndex 是事件归因成员判定的名单解析快照（内部字段，
+// 不序列化，与 CRSRuleGroupsParsed 同构）：名单条目在策略首次判定时解析
+// 一次并聚合为「升序、去重、不相交」前缀集，同一 tick 内「事件×候选策略」
+// 循环复用，成员判定走二分（与引擎 @ipListFast 同模型），不再逐事件对
+// 全名单做字符串重解析。
+type SecurityPolicyIPListIndex struct {
+	// Prefixes 是聚合后的前缀集（升序、去重、不相交）——二分检索的前提，
+	// 由 wafiplist.AggregateParsedPrefixes 单源产出。
+	Prefixes []netip.Prefix
+	// Entries 是名单来源的原始条目数（含空白/不可解析条目）——归因
+	// 「名单非空」判据与逐元素实现同口径。
+	Entries int
+	// NonEmpty 是聚合后发射面非空判据（mergedACLList 输出非空）。
+	NonEmpty bool
+	// Built 标记快照已构建；OK=false 表示名单来源 JSON 畸形（判定按既有的
+	// 「不认领」口径，不猜测内容）。
+	Built bool
+	OK    bool
+}
+
 type SecurityPolicy struct {
 	ID                 int             `json:"id"`
 	Name               string          `json:"name"`
@@ -157,6 +180,12 @@ type SecurityPolicy struct {
 	// 直通上游（不过后续任何流程，零安全事件）；1=保留检测（DetectionOnly
 	// 全评估全记录不拦）。仅 stage0 策略消费；其他类型恒 0。
 	TrustDetection bool `json:"trust_detection"`
+	// IP 名单成员判定的解析快照（内部字段，不序列化，与上面的 CRS 解析缓存
+	// 同构）：ACLIPIndex 覆盖 ip_acl_list（inline；有 refs 合并集时取合并集），
+	// IPBlacklistIPIndex 覆盖遗留 ip_blacklist。两者都在策略首次判定时构建
+	// 一次，同 tick 内逐事件二分检索。
+	ACLIPIndex         SecurityPolicyIPListIndex `json:"-"`
+	IPBlacklistIPIndex SecurityPolicyIPListIndex `json:"-"`
 }
 
 type SecurityPolicySummary struct {
@@ -326,8 +355,9 @@ type SecurityEvent struct {
 	// PrecheckUs：该请求预检段耗时快照（µs）——WAF 事件的触发详情弹框显示
 	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
 	PrecheckUs int64 `json:"precheck_us"`
-	// RequestHeaders：事件请求的完整头（JSON 文本，64KB 截断——2026-09-28 用户
-	// 裁定由 8KB 上调，见 securityEventsHeadersCap；本注释 项纠偏）——
+	// RequestHeaders：事件请求的完整头（JSON 文本，64KB 截断——上限见
+	// services.securityEventsHeadersCap；本字段**原文落库**，敏感头掩码只发生在前端
+	// 展示层，备份/导出/库内读取均为原文）——
 	// 摄入恒落库；
 	// RequestBody：仅策略开 log_request_body 后有值（64KB 截断，非 UTF-8 转
 	// base64 并带标记前缀）。敏感头掩码是前端展示层姿态，库内为原文。

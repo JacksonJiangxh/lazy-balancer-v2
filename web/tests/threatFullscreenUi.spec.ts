@@ -70,12 +70,19 @@ test('统计响应窗口与当前窗口不一致时丢弃', () => {
   assert.match(statsTask, /if \(res\.data\.hours !== windowHours\.value\) return/)
 })
 
-test('正常光流空洞标记贯通到错误状态', () => {
+test('两条光流的空洞标记贯通到独立横幅（不与加载失败混报）', () => {
   const page = source('src/views/security/ThreatScreen.vue')
   const flowTask = section(page, 'const flowTask = usePollingTask', '// ============ 引擎装载')
   assert.match(flowTask, /gap\?: boolean/)
   assert.match(flowTask, /gap_skipped\?: number/)
-  assert.match(flowTask, /flowError\.value = data\.gap === true/)
+  // 空洞（环形缓冲溢出，事件永久丢失）≠ 加载失败：分别落到 flowGap/flowError。
+  assert.match(flowTask, /flowGap\.value = data\.gap_skipped \?\? \(data\.gap === true \? 1 : 0\)/)
+  assert.doesNotMatch(flowTask, /flowError\.value = data\.gap === true/)
+  // 攻击光流同一披露口径（此前只回 enabled/events/next_seq，无 gap）。
+  const attackTask = section(page, 'const attackFlowTask = usePollingTask', 'const statsTask')
+  assert.match(attackTask, /gap_skipped\?: number/)
+  assert.match(attackTask, /attackFlowGap\.value = data\.gap_skipped \?\? \(data\.gap === true \? 1 : 0\)/)
+  assert.ok(page.includes('v-if="flowGap || attackFlowGap"'))
 })
 
 test('采集租约申请/续租失败独立横幅（不与光流失败混报）', () => {

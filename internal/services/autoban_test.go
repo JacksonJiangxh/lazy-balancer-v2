@@ -2081,3 +2081,76 @@ func TestAutobanFeedHealth_reportsIngestionTickFailures(t *testing.T) {
 		t.Fatalf("摄取恢复健康后不得继续报降级: %q", reason)
 	}
 }
+
+// ---- 审计体积与到期解封口径 ----
+
+// 到期解封审计按条目来源分流：手动封禁条目（remark≠自动封禁）到期时不得
+// 被记成「自动封禁 IP 的到期解封」——来源说错会让排障无法区分人工封禁与
+// 自动封禁的到期解封。
+func TestAutobanAuditExpiredUnban_splitsManualFromAuto(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+
+	autobanAuditExpiredUnban([]string{"198.51.100.1", "198.51.100.2"}, []string{"198.51.100.2"})
+
+	rows, err := db.AuditDB.Query(`SELECT detail FROM audit_log WHERE action='自动解封' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, d)
+	}
+	if len(details) != 2 {
+		t.Fatalf("审计行=%d, want 2（自动条目一行、手动条目一行）: %v", len(details), details)
+	}
+	if !strings.Contains(details[0], "到期自动解封 1 个自动封禁 IP") || !strings.Contains(details[0], "198.51.100.1") {
+		t.Fatalf("自动条目行=%q, want 只含自动封禁 IP 198.51.100.1", details[0])
+	}
+	if strings.Contains(details[0], "198.51.100.2") {
+		t.Fatalf("自动条目行不得包含手动封禁条目: %q", details[0])
+	}
+	if !strings.Contains(details[1], "手动封禁条目") || !strings.Contains(details[1], "198.51.100.2") {
+		t.Fatalf("手动条目行=%q, want 明示手动封禁来源", details[1])
+	}
+}
+
+// 单轮逐 IP 封禁审计受上限约束：超限保留前 N 条逐 IP 行 + 一条汇总行
+// （点名总数与省略数）——洪峰下单轮 2000 个 IP 达标不得写 2000 行审计。
+func TestAutobanAuditBanned_capsPerRoundRows(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	oldCap := autobanAuditPerRoundCap
+	autobanAuditPerRoundCap = 2
+	t.Cleanup(func() { autobanAuditPerRoundCap = oldCap })
+
+	autobanAuditBanned(AutobanConfig{Threshold: 5, WindowMinutes: 10, Duration: "1h"},
+		[]string{"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"})
+
+	rows, err := db.AuditDB.Query(`SELECT detail FROM audit_log WHERE action='自动封禁' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	perIP, summaries := 0, 0
+	for rows.Next() {
+		var detail string
+		if err := rows.Scan(&detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "省略逐条记录") {
+			summaries++
+			if !strings.Contains(detail, "共 4 个 IP") || !strings.Contains(detail, "其余 2 个") {
+				t.Fatalf("汇总行口径错误: %q（want 共 4 / 其余 2）", detail)
+			}
+			continue
+		}
+		perIP++
+	}
+	if perIP != 2 || summaries != 1 {
+		t.Fatalf("逐 IP 行=%d 汇总行=%d, want 2/1（上限门失效或汇总缺失）", perIP, summaries)
+	}
+}

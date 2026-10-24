@@ -83,6 +83,17 @@ test('C2 二次往返不累积漂移', () => {
   }
 })
 
+test('C2b 备注首尾空白往返保真（未加引号会被导入侧 trim 掉）', () => {
+  for (const remark of [' x ', ' 前后空白 ', '\t制表符\t']) {
+    const line = formatIpListEntryLine('10.0.0.1', remark)
+    assert.equal(line, `10.0.0.1,"${remark}"`)
+    assert.deepEqual(parseIpListEntryLine(line, isValidCidr), { value: '10.0.0.1', remark })
+  }
+  // 纯空白备注：加引号后回读为空串以外的原值；空备注仍走无引号形态
+  assert.equal(formatIpListEntryLine('10.0.0.1', ' '), '10.0.0.1," "')
+  assert.equal(formatIpListEntryLine('10.0.0.1', ''), '10.0.0.1,')
+})
+
 test('C3 旧格式（无引号、逗号/空白分隔）保持兼容', () => {
   assert.deepEqual(parseIpListEntryLine('10.0.0.1,普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
   assert.deepEqual(parseIpListEntryLine('10.0.0.1 普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })

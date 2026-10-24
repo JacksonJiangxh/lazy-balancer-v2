@@ -81,8 +81,9 @@ func TestParseTLSCertificateWarnings_followConfiguredTimezone(t *testing.T) {
 	})
 }
 
-// InProgress——续签扫描两查询（expires_at 非空）均不可见，任务永不推进。该
-// 形态无到期日可判，必须按 Retry 重排队。
+// issued 但无到期日（expires_at 为空）会让任务停留在 InProgress——续签扫描的
+// 两个查询（均要求 expires_at 非空）都看不到它，任务永不推进。该形态无到期日
+// 可判，必须按 Retry 重排队。
 func TestResolveEnableCertJobAction_issuedWithoutExpiryRetries(t *testing.T) {
 	now := time.Now()
 	if action := ResolveEnableCertJobAction(true, "issued", nil, now, 30); action != EnableCertJobRetry {

@@ -421,6 +421,45 @@ func TestLoad_normalizesRelativeDataDir(t *testing.T) {
 	}
 }
 
+// static_dir 与 data_dir/backup_dir 同口径：相对值以进程 cwd 解析（不是配置文件
+// 目录），且消费侧直接拼接——必须绝对化并去尾随斜杠；目录不存在要在启动期告警，
+// 而不是运行期静默 404。
+func TestLoad_normalizesRelativeStaticDirAndWarnsWhenMissing(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.MkdirAll("ui", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	if err := os.WriteFile("config.json", []byte(`{"static_dir":"./ui/"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Load("config.json")
+	if want := filepath.Join(dir, "ui"); cfg.StaticDir != want {
+		t.Fatalf("StaticDir=%q, want absolute %q（去尾随斜杠）", cfg.StaticDir, want)
+	}
+	if strings.Contains(logBuf.String(), "static_dir") {
+		t.Fatalf("存在的目录不应告警：%s", logBuf.String())
+	}
+
+	logBuf.Reset()
+	if err := os.WriteFile("config.json", []byte(`{"static_dir":"missing-ui"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg = Load("config.json")
+	if want := filepath.Join(dir, "missing-ui"); cfg.StaticDir != want {
+		t.Fatalf("StaticDir=%q, want absolute %q", cfg.StaticDir, want)
+	}
+	if !strings.Contains(logBuf.String(), "static_dir") || !strings.Contains(logBuf.String(), "404") {
+		t.Fatalf("static_dir 不存在时缺少启动期告警：%q", logBuf.String())
+	}
+}
+
 // 仅长度检查会让 32 个空格/单字符重复通过——可预测的 HS256 密钥
 // 等价于无签名（JWT/OIDC state 可离线伪造）。低熵形态必须告警可见，且仍
 // 保持「env 是运维显式输入、不自动替换」的既有裁定。

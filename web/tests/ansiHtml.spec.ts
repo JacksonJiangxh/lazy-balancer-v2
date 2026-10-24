@@ -89,3 +89,10 @@ test('日志消费面：v-html 只接 ansiToHtml 结果，禁止直出原始日�
   assert.match(rules, /v-html="ruleLogHtml"/)
   assert.doesNotMatch(rules, /v-html="ruleLogContent"/, '原始日志不得直出（转义缺失即注入面）')
 })
+
+test('真彩缺参形态：真彩段被忽略，剩余参数按普通 SGR 解释（正文不丢）', () => {
+  // 现状语义（钉住，避免未来改动被当成回归或反之）：`38;2;<缺参>` 不构成真彩
+  // 三元组，解析器跳过颜色部分，后续参数仍按独立 SGR 码处理（1=加粗）。
+  assert.equal(ansiToHtml(`${ESC}[38;2;1;2mx${ESC}[0m`), '<span style="font-weight:bold">x</span>')
+  assert.equal(ansiToHtml(`before${ESC}[38;2;1;2mafter`), 'before<span style="font-weight:bold">after</span>')
+})

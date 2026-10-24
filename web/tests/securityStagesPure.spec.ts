@@ -18,19 +18,25 @@ import {
   hasGeoIPControl,
   hasTrustEntries,
   invalidateSharedEntriesCache,
+  IP_LIST_CATEGORIES,
   mergeIpEntries,
   mergeIpEntryCount,
   mergeIpEntryValues,
   parseRefIds,
   parseUnknownIds,
+  POLICY_TYPE_LABELS,
+  POLICY_TYPE_SHORT_LABELS,
   resolveStageOverride,
+  STAGE_TITLES,
   subscribeSharedEntriesCache,
   type RuleStageModel,
+  type SecurityPolicyType,
   type SecurityStageIPList,
   type SecurityStagePolicy,
   type StageGroup,
   type StagePolicyGroup,
 } from '../src/utils/securityStages.ts'
+import { source } from './_helpers.ts'
 
 const policy = (over: Partial<SecurityStagePolicy> = {}): SecurityStagePolicy => ({
   id: 1,
@@ -172,8 +178,23 @@ test('compareVersion：段数值比较，v 前缀与长短段等价', () => {
   assert.equal(compareVersion('v1.2.3', '1.2.3'), 0)
   assert.equal(compareVersion('1.2', '1.2.0'), 0)
   assert.ok(compareVersion('2.0.0', '1.99.99') > 0)
-  // 非数字段按字符串序（预发布后缀）
-  assert.ok(compareVersion('1.0.0-beta', '1.0.0') > 0)
+  // 设计边界（不是「语义正确」）：非数字段按字符串序比较，因此预发布后缀被
+  // 判为更新（'beta' > ''），与 semver「无后缀 > 有后缀」相反。消费方唯一
+  // （securityLibraries 的各源 version 最大值）当前只处理日期形态（2026.10.01），
+  // 预发布形态不可达；未来若引入 -beta/-rc，必须先改实现并同步本断言。
+  assert.ok(compareVersion('1.0.0-beta', '1.0.0') > 0, '设计边界：预发布方向与 semver 相反（消费方仅日期形态）')
+})
+
+// 不可达性机械钉：唯一消费方把各源 version 交给 compareVersion，版本来源为
+// 日期形态；一旦出现新消费方或预发布字面量，本用例先红。
+test('compareVersion 消费面与版本形态约束', () => {
+  const lib = source('src/utils/securityLibraries.ts')
+  assert.match(lib, /\.sort\(compareVersion\)/, '唯一消费点是各源版本最大值')
+  const stages = source('src/utils/securityStages.ts')
+  assert.match(stages, /日期形态/, 'compareVersion 文档必须声明设计边界形态')
+  for (const file of ['src/utils/securityLibraries.ts']) {
+    assert.doesNotMatch(source(file), /-\s?(?:beta|rc)\b/, `${file} 不得出现预发布版本形态`)
+  }
 })
 
 test('formatDurationUs：0/缺省 → 占位，三档精度', () => {
@@ -195,4 +216,33 @@ test('subscribeSharedEntriesCache：写回通知订阅者，退订后不再回�
   await ensureSharedEntries([12], async () => ['2.2.2.2'])
   assert.equal(hits, 1, '退订后不得再回调')
   invalidateSharedEntriesCache()
+})
+
+// 文案即契约：四张用户可见文案表此前零断言——误改/缺键会直出 undefined 或
+// 错阶段归属（Vue 模板不报错），且与仓内 settingsPages/strategyLabels 的
+// 「可见文案显式钉」口径不一致。
+test('阶段标题/策略类型标签/名单类别：文案与键集即契约', () => {
+  assert.deepEqual(STAGE_TITLES, {
+    0: '阶段 0 · 信任名单',
+    1: '阶段 1 · IP 访问控制',
+    2: '阶段 2 · 限流',
+    3: '阶段 3 · WAF',
+  })
+
+  const policyTypes: SecurityPolicyType[] = ['stage0', 'stage1', 'stage2', 'stage3', 'mixed']
+  assert.deepEqual(Object.keys(POLICY_TYPE_LABELS).sort(), [...policyTypes].sort(), 'POLICY_TYPE_LABELS 键集必须等于 SecurityPolicyType 全枚举')
+  assert.deepEqual(Object.keys(POLICY_TYPE_SHORT_LABELS).sort(), [...policyTypes].sort(), '短标签键集同样必须覆盖全枚举')
+  for (const type of policyTypes) {
+    const label = POLICY_TYPE_LABELS[type]
+    assert.equal(typeof label, 'string')
+    assert.ok(label.length > 0, `${type} 标签缺失（模板会渲染空值）`)
+    assert.ok(POLICY_TYPE_SHORT_LABELS[type].length > 0, `${type} 短标签缺失`)
+  }
+  // 阶段类型标签与 STAGE_TITLES 单源（措辞微调不需双处同步）
+  assert.equal(POLICY_TYPE_LABELS.stage1, STAGE_TITLES[1])
+  assert.equal(POLICY_TYPE_SHORT_LABELS.stage3, '阶段 3')
+  assert.equal(POLICY_TYPE_LABELS.mixed, '混合策略（兼容旧版）')
+
+  // 名单类别是写入值（落库 category）与筛选口径：值与顺序都钉住。
+  assert.deepEqual([...IP_LIST_CATEGORIES], ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'])
 })

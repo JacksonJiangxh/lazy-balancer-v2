@@ -31,6 +31,14 @@ test('默认访问日志格式末行与后端脱敏注入行逐字一致（跨�
   const db = repoSource('internal/db/db.go')
   assert.match(db, /const apiKeyPath = "request>headers>X-API-Key"/, 'db.go 迁移的脱敏路径常量漂移')
   assert.match(db, /apiKeyPath\+\s*" -> delete"/, 'db.go 迁移必须追加 delete 动作（与模板末行同形）')
+  // 第三处（匹配/移除侧）：normalizeAccessLogRedaction 用独立 `path` 常量决定
+  // 移除哪些既有行——它漂移时输出行仍取模板末行，库内格式与面板展示会分叉。
+  assert.match(go, /const path = "request>headers>X-API-Key"/, 'caddy.go 移除侧脱敏路径常量漂移（与写入侧必须同源）')
+  assert.equal(
+    [...go.matchAll(/request>headers>X-API-Key/g)].length,
+    2,
+    '脱敏路径字面量在 caddy.go 只允许写入行常量与移除侧 path 两处（新增副本即失去单源）',
+  )
 })
 
 test('escapeHtml 覆盖五个 HTML 危险字符（含引号属性上下文）', () => {

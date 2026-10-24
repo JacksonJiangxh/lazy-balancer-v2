@@ -60,7 +60,8 @@ func TestGetCertRenewalDays_clampsLegacyWindowAboveSafeMax(t *testing.T) {
 }
 
 // 引擎级行为验证：存量 89 天窗口下，签发 25h 后剩余 88.5 天的证书不得被选中
-// （旧实现按 89 天窗口选中 → 日级重签）；仍在窗口内的证书照常续签。
+// （旧实现按 89 天窗口选中 → 日级重签）；进入保护区（剩余 ≤ 7 天）的证书照常
+// 续签——收敛是窗口门的事，不得把自动续签变成永久跳过。
 func TestCheckExpiration_legacyWindowAboveSafeMaxDoesNotChurnDaily(t *testing.T) {
 	_, database := newClusterTestService(t)
 	now := time.Now()
@@ -70,7 +71,7 @@ func TestCheckExpiration_legacyWindowAboveSafeMaxDoesNotChurnDaily(t *testing.T)
 			VALUES (?,?,'http','example.com',8443,1,1,'acme_dns')`, ruleID, ruleID); err != nil {
 			t.Fatalf("seed rule %s: %v", ruleID, err)
 		}
-		certPEM, keyPEM := hysteresisCertPair(t, notBefore, notAfter)
+		certPEM, keyPEM := certificatePairForDomains(t, notBefore, notAfter, "example.com")
 		result, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id,cert_pem,key_pem,expires_at,updated_at)
 			VALUES (?,'example.com','issued',0,?,?,?,datetime('now','-25 hours'))`, ruleID, certPEM, keyPEM,
 			notAfter.UTC().Format("2006-01-02 15:04:05"))
@@ -87,10 +88,11 @@ func TestCheckExpiration_legacyWindowAboveSafeMaxDoesNotChurnDaily(t *testing.T)
 		t.Fatal(err)
 	}
 	// A：25h 前签发、剩余 88.5 天——旧 89 天窗口下会与其等价重签。
+	// 收敛后可执行窗口是保护区：剩余 88.5 天远在保护区之外，不得入队。
 	idA := seed("lb_hi_window", now.Add(-25*time.Hour), now.Add(88*24*time.Hour+12*time.Hour))
-	// B：72h 前签发、剩余 87 天（寿命 90 天 > 上限窗口）——仍在安全窗口内，
-	// 必须照常进入续签候选。
-	idB := seed("lb_normal_window", now.Add(-72*time.Hour), now.Add(87*24*time.Hour))
+	// B：剩余 6 天（寿命 90 天 > 上限窗口）——已进保护区，必须照常进入续签候选
+	// （收敛不得把自动续签变成永久跳过）。
+	idB := seed("lb_normal_window", now.Add(-90*24*time.Hour+6*24*time.Hour), now.Add(6*24*time.Hour))
 	if _, err := database.Exec("UPDATE cert_jobs SET updated_at=datetime('now','-72 hours') WHERE id=?", idB); err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +111,6 @@ func TestCheckExpiration_legacyWindowAboveSafeMaxDoesNotChurnDaily(t *testing.T)
 		t.Fatalf("job %d（剩余 88.5 天，窗口受限于 %d 天）被选中——存量越界窗口仍会日级重签", idA, CertRenewalDaysMax)
 	}
 	if !selected[idB] {
-		t.Fatalf("job %d（剩余 86 天）未被选中——安全窗口内续签不得被阻断", idB)
+		t.Fatalf("job %d（剩余 6 天）未被选中——保护区内续签不得被阻断", idB)
 	}
 }

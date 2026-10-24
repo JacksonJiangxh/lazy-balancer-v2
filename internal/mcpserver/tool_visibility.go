@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync/atomic"
 
+	"lazy-balancer-v2/internal/apikey"
 	"lazy-balancer-v2/internal/apipath"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
@@ -136,7 +137,7 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 		next.ServeHTTP(writer, request)
 		return
 	}
-	visibility, err := resolver(extractAPIKey(request.Header))
+	visibility, err := resolver(apikey.FromHeader(request.Header))
 	if err != nil {
 		// fail-closed：无法判定 Key 属主时不再原样透传全量工具（旧行为），
 		// 改为空 tools 列表 + warn 日志——工具可见性必须由身份决定。

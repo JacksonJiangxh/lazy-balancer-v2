@@ -5,7 +5,11 @@ package caddygeoip
 //     非 安全中断 的已处理请求）——进程级常驻内存，国名桶硬上限 512（满员
 //     只丢新键，已有键继续计数），随进程生命周期，无文件/无 goroutine。
 //   - 暴露：TrafficStatsAdmin 实现 caddy.AdminRouter——GET /lb/traffic-stats
-//     请求到达时序列化当前快照（无常驻写者/无激活信号；页面异常关闭零残留）。
+//     请求到达时序列化当前快照。计数**只在采集租约有效期间推进**
+//     （traffic_lease.go 的租约激活门 + TTL 自清；blocked_counter 热路径在
+//     无租约时只做一次 atomic load 即返回），快照的 collecting 字段披露租约
+//     当前是否有效——否则「累计不变」与「无流量」不可区分。无常驻写者：
+//     页面异常关闭后租约按 TTL 自清，零残留。
 //   - QPS 保险丝：单秒请求计数超过 fuseQPSPerSecond 时进入 1/N 抽样（N=8，
 //     每 N 个请求计 1 次×N 还原），翻秒且上一秒计数低于阈值 1/4 时回落 N=1。
 //     误差口径披露：抽样期估计量=真值±N（相位偏移 <N 的 floor 量化截断，

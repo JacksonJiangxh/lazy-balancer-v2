@@ -33,6 +33,11 @@ var (
 // 隔离后重建，否则 audit.log 永久不轮转（无界增长）。
 var errPendingDeltaMarkerCorrupt = errors.New("pending delta marker corrupt")
 
+// errAuditRotationDeferred 轮转未完成（归档已就位、活文件未截断，下轮重试）。
+// 与「无需轮转」（nil）和「轮转失败」（其它错误）三态区分：调用方据此披露
+// 「延迟」而不是把它当成功（log-cleanup 摘要）或当硬失败（daemon 任务）。
+var errAuditRotationDeferred = errors.New("audit log rotation deferred")
+
 // pendingDeltaCorruptQuarantineRounds 连续损坏轮次达到该值后隔离标记。
 // 单轮仍保留现场（fail-closed，供诊断/人工恢复），持续不可解析才自愈。
 const pendingDeltaCorruptQuarantineRounds = 3
@@ -90,7 +95,9 @@ func auditFailureThrottleKey(msg string) string {
 }
 
 // auditFailureShouldLog 判定失败消息 msg 现在是否应放行输出，并记录放行时间。
-// 键为归一化消息（auditFailureThrottleKey）。
+// 键为归一化消息（auditFailureThrottleKey）。窗口判定与过期回收复用
+// throttleWarnAllowed 的同源实现；本族因额外有键数上限，按「先判重复 →
+// 回收 → 判上限 → 记录」的历史顺序展开：被抑制的消息不触发清扫/重置。
 func auditFailureShouldLog(msg string) bool {
 	auditFailureLogMu.Lock()
 	defer auditFailureLogMu.Unlock()
@@ -99,13 +106,7 @@ func auditFailureShouldLog(msg string) bool {
 	if last, ok := auditFailureLogTimes[key]; ok && now.Sub(last) < auditFailureLogWindow {
 		return false
 	}
-	// 仅在放行路径清扫：被抑制的消息不触发清扫，稳态下（同一消息
-	// 持续失败）map 恒为 1 键，无额外开销。
-	for k, last := range auditFailureLogTimes {
-		if now.Sub(last) >= auditFailureLogWindow {
-			delete(auditFailureLogTimes, k)
-		}
-	}
+	throttleWarnEvict(auditFailureLogTimes, now, auditFailureLogWindow)
 	if len(auditFailureLogTimes) > auditFailureLogEvictCap {
 		auditFailureLogTimes = make(map[string]time.Time)
 	}
@@ -375,7 +376,14 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	}
 	if finalInfo.Size() > reached && !auditLogTailOnlyWhitespace(auditLogPath, reached, finalInfo.Size()) {
 		throttledAuditFailureLogf("audit log rotation: live tail not fully ingested (reached %d of %d bytes), truncate deferred", reached, finalInfo.Size())
-		return total, rotErr
+		// 轮转未完成必须可识别：返回值此前与「无需轮转」同为 nil（健康位
+		// healthy、调用方无法区分「已回收空间」与「每 2s 全量复制但未截断」）。
+		// 哨兵让健康位与 log-cleanup 摘要如实披露延迟。
+		deferred := fmt.Errorf("%w: 活文件尾部尚未摄取（reached %d of %d bytes，下轮重试）", errAuditRotationDeferred, reached, finalInfo.Size())
+		if rotErr != nil {
+			return total, errors.Join(rotErr, deferred)
+		}
+		return total, deferred
 	}
 	// truncate 前先落 pending 标记。标记写失败绝不在无标记状态下截断——
 	// 活文件仍完好、内容无损失，本轮中止下周期重试。truncate 成功与补采完成之间

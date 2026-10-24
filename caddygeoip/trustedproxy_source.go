@@ -83,7 +83,11 @@ func (s *FileIPRangeSource) GetIPRanges(r *http.Request) []netip.Prefix {
 	prefixes, err := wafiplist.ResolvePrefixesNormalized(s.provisioned)
 	if err != nil {
 		// Provision 已保证首次加载成功；此处 error = 缓存被 GC 淘汰且文件
-		// 已消失。空集=信任无来源（fail-closed）。
+		// 已消失。空集=信任无来源（fail-closed）。运行期不得 fail，但该
+		// 状态迁移（仍有配置引用、文件却消失）必须留节流 WARN——否则全站
+		// 客户端 IP 静默退回 socket 地址（GeoIP/信任名单/限流/审计归属地
+		// 全部按错误 IP 判定）而面板零痕迹。
+		wafiplist.ReportListUnavailable(s.provisioned, err)
 		return nil
 	}
 	return prefixes

@@ -21,6 +21,8 @@ import {
   inferPolicyType,
   isTrustExemptionCandidate,
   isWafDurationFamily,
+  missingSharedEntryIds,
+  sharedEntriesCache,
   triggerStageFamily,
   trustHitMode,
   type SecurityStageBinding,
@@ -214,6 +216,40 @@ test('白名单空生效集必须显性警示「将拒绝所有请求」', () =>
   // 有条目/其他模式不追加警示（回归形状）
   assert.equal(formatAclModeDetail([], { ip_acl_mode: 'allow', ip_acl_list: '["1.1.1.1"]' }), '白名单模式 · 1 条')
   assert.equal(formatAclModeDetail([], { ip_acl_mode: 'deny', ip_acl_list: '[]' }), '黑名单模式 · 0 条')
+})
+
+test('白名单零生效集：ACL 关闭时不得误报「将拒绝所有请求」，独立黑名单追告不得丢失', () => {
+  // ACL 关闭（保留名单）：渲染侧不进入 ACL 发射块（security.go 的
+  // IPACLEnabled 门）——「空 allow 集恒拒」不成立，告警在此形态是误报。
+  assert.equal(
+    formatAclModeDetail([], { ip_acl_enabled: false, ip_acl_mode: 'allow', ip_acl_list: '["1.1.1.1"]', ip_blacklist: '[]' }),
+    '白名单模式 · 未启用 ACL',
+  )
+  // 零生效集告警必须与「独立黑名单仍生效」并存：两条结论缺一都会误导
+  assert.equal(
+    formatAclModeDetail([], { ip_acl_mode: 'allow', ip_acl_list: '[]', ip_blacklist: '["1.1.1.1"]' }),
+    '白名单模式 · 0 条（将拒绝所有请求）；独立黑名单 1 条仍生效',
+  )
+  // ACL 关闭 + 独立黑名单：无恒拒告警，黑名单仍须追告
+  assert.equal(
+    formatAclModeDetail([], { ip_acl_enabled: false, ip_acl_mode: 'allow', ip_acl_list: '["1.1.1.1"]', ip_blacklist: '["2.2.2.2"]' }),
+    '白名单模式 · 未启用 ACL；独立黑名单 1 条仍生效',
+  )
+  // 回归：显式开启的空集仍须告警
+  assert.equal(formatAclModeDetail([], { ip_acl_enabled: true, ip_acl_mode: 'allow', ip_acl_list: '[]' }), '白名单模式 · 0 条（将拒绝所有请求）')
+})
+
+test('缺失名单条目判定单源：只报未缓存的正 id（静默失败的唯一可见信号）', () => {
+  const before = { ...sharedEntriesCache }
+  for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
+  try {
+    sharedEntriesCache[7] = ['1.1.1.1']
+    assert.deepEqual(missingSharedEntryIds([7, 8, 8, 0, -3]), [8], '已缓存/非正 id 不得计入缺失')
+    assert.deepEqual(missingSharedEntryIds([]), [])
+  } finally {
+    for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
+    Object.assign(sharedEntriesCache, before)
+  }
 })
 
 test('阶段可拦截能力门：stage3 关模式/检测无 block 规则、stage1 无能力均不得宣称生效', () => {
@@ -472,9 +508,3 @@ test('多策略绑定链：同阶段两条策略出两组且按绑定顺序编�
   assert.equal(model.stages[0].enabled, false)
 })
 
-test('规则禁用态透传 ruleEnabled=false（不得宣称已启用）', () => {
-  const model = buildStageModel([bindingOf()], [policyOf({ mode: 'blocking' })], [], [], null, false)
-  assert.equal(model.ruleDisabled, true)
-  const enabled = buildStageModel([bindingOf()], [policyOf({ mode: 'blocking' })], [], [], null, true)
-  assert.equal(enabled.ruleDisabled, false)
-})

@@ -15,7 +15,7 @@ import {
   credentialFieldVisible,
   type CredentialFieldMeta,
 } from '../src/utils/dnsProviderFields.ts'
-import { section, source } from './_helpers.ts'
+import { source } from './_helpers.ts'
 
 const doubleSelectFields: readonly CredentialFieldMeta[] = [
   { name: 'region', label: '区域', type: 'select', required: true, options: ['cn', 'global'] },
@@ -112,7 +112,11 @@ test('编辑回填不按 provider 名推断认证方式（缺失键交后端 can
   // 验证与签发链共用）；前端复刻该推断会按 provider 名硬编码，第二个 provider
   // 即被注入无关的 auth_mode。回填只做 JSON 解析，不做任何凭证语义推断。
   const page = source('src/views/settings/FreeCertificates.vue')
-  const backfill = section(page, 'if (config) {\n    editingId.value', '} else {\n    editingId.value = null')
+  // 结构边界取回填块（不依赖空行/缩进形状：格式化工具有引入即批量红）。
+  const backfillStart = page.indexOf('if (config) {')
+  const backfillEnd = page.indexOf('editingId.value = null', backfillStart)
+  assert.ok(backfillStart > 0 && backfillEnd > backfillStart, '编辑回填块边界缺失')
+  const backfill = page.slice(backfillStart, backfillEnd)
   assert.doesNotMatch(backfill, /auth_mode\s*=\s*'/, '回填不得注入 auth_mode 字面量')
   assert.doesNotMatch(backfill, /tencent_cloud/, '回填不得按 provider 名分派')
   assert.doesNotMatch(backfill, /secret_id && parsedCreds\.secret_key/, '凭证形态推断属后端单源')

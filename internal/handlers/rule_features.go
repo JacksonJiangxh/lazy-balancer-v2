@@ -373,8 +373,10 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	if input.HealthCheckInterval > 0 && input.HealthCheckTimeout > 0 && input.HealthCheckTimeout >= input.HealthCheckInterval {
 		return fmt.Errorf("健康检查超时时间（%d 秒）必须小于检查间隔（%d 秒）", input.HealthCheckTimeout, input.HealthCheckInterval)
 	}
-	// compress_types 白名单校验，不支持编码不再静默丢弃。
-	if input.EnableCompress && input.CompressTypes != "" {
+	// compress_types 白名单校验，不支持编码不再静默丢弃。值域门不随
+	// enable_compress 关闭而失效：关闭态落库的非法编码渲染零消费，却会随
+	// 导出/备份/集群快照放大；空值放行（写侧归 gzip）。
+	if input.CompressTypes != "" {
 		for _, ct := range strings.Split(input.CompressTypes, ",") {
 			ct = strings.TrimSpace(ct)
 			if ct == "" {

@@ -95,3 +95,56 @@ func queryPlan(t *testing.T, query string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// 任务监控的证书任务动态行按 COALESCE(updated_at,created_at) DESC 取前 101 行
+// （5s 轮询）：排序键是表达式，必须由同形表达式索引承载——没有索引时每轮都要
+// 物化 + 全排序，cert_jobs 行数随规则×域名线性增长且无保留期清理。
+func TestRunMigrations_createsCertJobsMonitorOrderingIndex(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec("INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')"); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if !indexExists(t, "idx_cert_jobs_updated_fallback") {
+		t.Fatal("idx_cert_jobs_updated_fallback 必须存在（证书任务动态行免全排序）")
+	}
+
+	plan := queryPlanWithArgs(t, CertJobsMonitorRowsQuery, 1, 101)
+	if !strings.Contains(plan, "idx_cert_jobs_updated_fallback") {
+		t.Fatalf("证书任务动态行查询未使用排序索引（表达式漂移）:\n%s", plan)
+	}
+	if strings.Contains(plan, "TEMP B-TREE FOR ORDER BY") {
+		t.Fatalf("证书任务动态行查询仍需临时 B 树排序（索引表达式与 ORDER BY 不一致）:\n%s", plan)
+	}
+}
+
+// queryPlanWithArgs 执行带绑定参数的 EXPLAIN QUERY PLAN 并把 detail 列拼成单串。
+func queryPlanWithArgs(t *testing.T, query string, args ...any) string {
+	t.Helper()
+	rows, err := DB.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+	var lines []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		lines = append(lines, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate plan rows: %v", err)
+	}
+	if len(lines) == 0 {
+		t.Fatal("EXPLAIN QUERY PLAN 无输出")
+	}
+	return strings.Join(lines, "\n")
+}

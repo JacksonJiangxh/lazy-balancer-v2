@@ -158,11 +158,10 @@ export const useAuthStore = defineStore('auth', () => {
     bindConfigVisibilityRefresh()
     configRetryTimer = window.setTimeout(() => {
       configRetryTimer = null
-      // 后台标签页不发请求：顺延一个周期（可见时经 visibilitychange 立即补查）
-      if (typeof document !== 'undefined' && document.hidden) {
-        scheduleConfigRetry()
-        return
-      }
+      // 后台标签页不发请求，也不顺延定时器：隐藏页每 15s 唤醒一次等于永久
+      // 空转（浏览器再节流也非零开销）。恢复可见由 visibilitychange 立即补查，
+      // 回来时不必等一个周期。
+      if (typeof document !== 'undefined' && document.hidden) return
       void fetchConfig(true)
     }, 15_000)
   }

@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source } from './_helpers.ts'
+import { code, member, section, source } from './_helpers.ts'
 import { PAGE_IDS } from '../src/utils/pageIds.ts'
 import { SETTINGS_TAB_IDS } from '../src/utils/settingsPages.ts'
 
@@ -74,7 +74,8 @@ test('轮询诊断 API 与生产守卫分离（无消费面必须标注用途）
 })
 
 test('useVisibilityIntervals：无 window 时不启动间隔', () => {
-  const vis = source('src/composables/useVisibilityIntervals.ts')
+  // 剥注释视图：守卫信号是 `win === undefined) return`，注释化守卫不得继续满足断言。
+  const vis = code('src/composables/useVisibilityIntervals.ts')
   // 不再断言注释措辞（注释改写即红且不守护行为）；退化行为由下方实现断言独立
   // 成立：缺 window 直接返回、不登记定时器。
   const startTimers = member(vis, 'const startTimers')

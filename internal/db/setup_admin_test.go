@@ -255,3 +255,76 @@ func TestInitialize_backfillsSetupAdminFlagOnLegacyDatabase(t *testing.T) {
 		t.Fatalf("flags=%v, want id=5 标记且 id=1 未标记", flags)
 	}
 }
+
+// 启动探测门必须覆盖全部三种归一形态（S1 陈旧标记 / S2 多标记并存 / S3 无标记
+// 补标），且收敛库二次启动零写事务——探测 SQL 与三条 UPDATE 现在共用同一组
+// 谓词常量（setupAdminPredicateParity 启动期自检看守），任一侧改判据都会让
+// 本表驱动测试红。
+func TestEnsureSetupAdminFlagAtStartup_probeCoversEveryNormalization(t *testing.T) {
+	cases := []struct {
+		name string
+		seed string
+		want map[int]int
+	}{
+		{
+			name: "S1 陈旧标记（账号已降级）",
+			seed: `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+				(1,'demoted','h','user',1,1),
+				(7,'admin','h','admin',1,0)`,
+			want: map[int]int{1: 0, 7: 1},
+		},
+		{
+			name: "S2 多标记并存",
+			seed: `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+				(3,'admin-low','h','admin',1,1),
+				(9,'admin-high','h','admin',1,1),
+				(11,'user','h','user',1,0)`,
+			want: map[int]int{3: 1, 9: 0, 11: 0},
+		},
+		{
+			name: "S3 无标记补标",
+			seed: `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+				(5,'admin-a','h','admin',1,0),
+				(8,'admin-b','h','admin',1,0)`,
+			want: map[int]int{5: 1, 8: 0},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			database := seedSetupAdminFixture(t, tc.seed)
+			if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')`); err != nil {
+				t.Fatalf("seed global config: %v", err)
+			}
+
+			writeBase := startupMigrationWriteTx.Load()
+			if err := runMigrations(); err != nil {
+				t.Fatalf("first migrations: %v", err)
+			}
+			if got := startupMigrationWriteTx.Load() - writeBase; got < 1 {
+				t.Fatalf("探测命中的启动写事务=%d, want >=1（归一必须真实执行，否则标记滞留）", got)
+			}
+			flags := setupAdminFlags(t, database)
+			for id, want := range tc.want {
+				if flags[id] != want {
+					t.Fatalf("首轮 flags=%v, id=%d want %d", flags, id, want)
+				}
+			}
+
+			// 收敛库二次启动：探测必须 false（零写事务）——探测漏掉的形态会静默
+			// 跳过归一且没有任何错误信号。
+			writeBase = startupMigrationWriteTx.Load()
+			if err := runMigrations(); err != nil {
+				t.Fatalf("second migrations: %v", err)
+			}
+			if got := startupMigrationWriteTx.Load() - writeBase; got != 0 {
+				t.Fatalf("收敛库二次启动写事务=%d, want 0（探测门未覆盖稳态）", got)
+			}
+			flags = setupAdminFlags(t, database)
+			for id, want := range tc.want {
+				if flags[id] != want {
+					t.Fatalf("二次启动后标记漂移 flags=%v, id=%d want %d", flags, id, want)
+				}
+			}
+		})
+	}
+}

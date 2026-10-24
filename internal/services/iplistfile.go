@@ -15,13 +15,18 @@ import (
 	"lazy-balancer-v2/wafiplist"
 )
 
-// init 装配 wafiplist 的 fail-stale 观测钩子：运行期
-// 名单文件被删/写坏、重建失败而回退旧集合时，按路径节流（wafiplist.
-// StaleServeLogInterval，默认 1 分钟）写 WARN。wafiplist 的默认钩子只写
-// stderr（Caddy 进程内的形态）；本进程覆盖为面板日志，级别过滤与落盘一致。
+// init 装配 wafiplist 的观测钩子：运行期名单文件被删/写坏、重建失败而回退
+// 旧集合（fail-stale）时，以及「名单不可读且无缓存集合」（fail-open/信任
+// 无来源）时，按路径节流（wafiplist 的 staleServeLogInterval，默认 1 分钟）写
+// WARN。wafiplist 的默认钩子只写 stderr（Caddy 进程内的形态）；本进程覆盖为
+// 面板日志，级别过滤与落盘一致。两个钩子必须同时装配——只接 fail-stale 会
+// 让「无旧集合可用」这一更危险的状态在面板日志中完全静默。
 func init() {
 	wafiplist.OnStaleServe = func(path string, err error) {
 		Logf("warn", "IP 名单 %q 无法重建，继续按最近一次成功加载的集合判定（fail-stale）: %v", path, err)
+	}
+	wafiplist.OnListUnavailableServe = func(path string, err error) {
+		Logf("warn", "IP 名单 %q 不可读且无缓存集合，本次判定按未命中处理（等待文件恢复或重载）: %v", path, err)
 	}
 }
 
@@ -198,6 +203,12 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 		}
 	}
 	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		// 同字节跳写仍须归一权限：存量投影由 os.CreateTemp 生成（恒 0600），
+		// 内容不再变化的名单永远走不到重写路径，Caddy 换 uid 部署时读不到。
+		// chmod 幂等且不改 mtime（内容未变，wafiplist 不重建）。
+		if err := os.Chmod(path, 0o644); err != nil {
+			return "", fmt.Errorf("归一 IP 名单文件权限失败 %s: %w", name, err)
+		}
 		recordMemo()
 		return path, nil // 同字节跳写
 	}

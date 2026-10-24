@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { code, section } from './_helpers.ts'
 import { clampPassiveHealthCheckTimeout } from '../src/utils/ruleWizard.ts'
 
-const page = source('src/views/Rules.vue')
+const page = code('src/views/Rules.vue')
 
 // 模板标记定位改为「容错正则 + 显式失败」——原实现把 el-divider
 // 的完整 class 串（含属性顺序）当起点，纯样式调整即假红/截错段。
@@ -27,7 +27,7 @@ test('健康检查超时只属于主动探测（HTTP/TCP 均隐藏在被动模�
   // 从页面头 indexOf，命中的是上游表协议列（:549），随后 enable_active 标记又
   // 命中 HTTP 段（:698），断言对象整体错位（钉空转）。
   const healthStart = markerIndex(page, /<el-divider[^>]*>健康检查<\/el-divider>/, '健康检查分隔符')
-  const healthEnd = page.indexOf('<!-- Step 3: 自定义路由', healthStart)
+  const healthEnd = page.indexOf('<div v-show="currentStep === WIZARD_STEP.CUSTOM_ROUTES"', healthStart)
   assert.ok(healthEnd > healthStart, 'missing custom routes step marker')
   const healthBlock = page.slice(healthStart, healthEnd)
   const activeMarker = '<template v-if="wizardForm.enable_active_health_check">'

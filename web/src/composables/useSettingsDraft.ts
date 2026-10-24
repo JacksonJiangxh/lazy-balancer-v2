@@ -45,6 +45,10 @@ const adminTls = ref<AdminTlsSelection>({ enabled: false, mode: 'selfsigned' })
 const adminTlsSaved = ref<AdminTlsSelection>({ enabled: false, mode: 'selfsigned' })
 const adminTlsHasCert = ref(false)
 const adminTlsCertError = ref('')
+// 后端降级读标记（/admin-tls 的 config_unavailable）：DB 故障/迁移窗口下读路径
+// 以 200 返回「未启用/自签名」的降级值，不是真实状态——必须显性提示「显示的
+// 开关不可信」，不得让界面以「已关闭」静默呈现。
+const adminTlsUnavailable = ref(false)
 const stagedAdminTlsCert = ref<StagedAdminTlsCert | null>(null)
 
 const resetSettingsDraft = (): void => {
@@ -56,6 +60,7 @@ const resetSettingsDraft = (): void => {
   adminTlsSaved.value = { enabled: false, mode: 'selfsigned' }
   adminTlsHasCert.value = false
   adminTlsCertError.value = ''
+  adminTlsUnavailable.value = false
   stagedAdminTlsCert.value = null
 }
 
@@ -68,6 +73,7 @@ export const useSettingsDraft = () => ({
   adminTlsSaved,
   adminTlsHasCert,
   adminTlsCertError,
+  adminTlsUnavailable,
   stagedAdminTlsCert,
 })
 

@@ -3,8 +3,12 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -911,5 +915,65 @@ func TestUpdateIPList_expiredOnlyEntriesBlockedByAllowPolicy(t *testing.T) {
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("active+expired save status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+// 幂等无写分支（追加已生效条目 / 移除不在名单的值）只做 SELECT + 内存比较，
+// 事务内没有写语句：不得 Commit，也不得把「不可能发生的提交错误」报成
+// 「提交结果不确定」（会诱导调用方重试并占住连接锁）。结构钉按 AST 定位
+// 两个 handler，任何新增的 tx.Commit 调用都会转红。
+func TestIPListIdempotentBranches_doNotCommit(t *testing.T) {
+	source, err := os.ReadFile("securityiplists.go")
+	if err != nil {
+		t.Fatalf("read securityiplists.go: %v", err)
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "securityiplists.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse securityiplists.go: %v", err)
+	}
+	for _, name := range []string{"AddIPToList", "RemoveIPFromList"} {
+		fn := findFuncDecl(file, name)
+		if fn == nil {
+			t.Fatalf("securityiplists.go 缺少函数 %s", name)
+		}
+		commits := 0
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if ok && isTxCommitCall(call) {
+				commits++
+			}
+			return true
+		})
+		if commits != 0 {
+			t.Fatalf("%s 含 %d 处 tx.Commit（幂等无写路径必须只回滚；提交统一在共享 applier 内）", name, commits)
+		}
+	}
+}
+
+// 条目实际变化判定按解析后的集合比较：键序/空白/数组重排（前端序列化差异、
+// MCP 客户端重排）不得判为变化而触发热路径重写与审计噪音；任一字段真实
+// 变化必须检出。
+func TestIPListEntriesChanged_semanticComparison(t *testing.T) {
+	cases := []struct {
+		name    string
+		oldJSON string
+		newJSON string
+		changed bool
+	}{
+		{"同字节", `[{"value":"10.0.0.1","remark":""}]`, `[{"value":"10.0.0.1","remark":""}]`, false},
+		{"键序与空白差异", `[{"value":"10.0.0.1","remark":"a"}]`, `[ { "remark" : "a" , "value" : "10.0.0.1" } ]`, false},
+		{"数组重排", `[{"value":"10.0.0.1"},{"value":"10.0.0.2"}]`, `[{"value":"10.0.0.2"},{"value":"10.0.0.1"}]`, false},
+		{"备注变化", `[{"value":"10.0.0.1","remark":"a"}]`, `[{"value":"10.0.0.1","remark":"b"}]`, true},
+		{"到期时间变化", `[{"value":"10.0.0.1","expires_at":"2099-01-01 00:00:00"}]`, `[{"value":"10.0.0.1"}]`, true},
+		{"条目增减", `[{"value":"10.0.0.1"}]`, `[{"value":"10.0.0.1"},{"value":"10.0.0.2"}]`, true},
+		{"左值脏行退回字节比较", `not-json`, `[{"value":"10.0.0.1"}]`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ipListEntriesChanged(tc.oldJSON, tc.newJSON); got != tc.changed {
+				t.Fatalf("changed=%v, want %v", got, tc.changed)
+			}
+		})
 	}
 }

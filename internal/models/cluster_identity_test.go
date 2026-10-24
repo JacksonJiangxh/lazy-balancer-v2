@@ -32,6 +32,11 @@ func TestNormalizeClusterNodeName(t *testing.T) {
 		{name: "strip BOM", in: "\ufeffnode-1", want: "node-1"},
 		// ZWJ 是 emoji 组合的合法组成，不得被当作格式字符剥掉。
 		{name: "keep ZWJ", in: "节点\u200d01", want: "节点\u200d01"},
+		// 例外字符单独构成名字 = 视觉空名：ZWJ 无可见基字符时必须归一到空
+		// （调用方按无效名 400），而带可见字符时的 ZWJ 仍保留。
+		{name: "only ZWJ becomes empty", in: "\u200d", want: ""},
+		{name: "ZWJ with spaces becomes empty", in: "  \u200d \u200d  ", want: ""},
+		{name: "trailing ZWJ after visible char kept", in: "节点\u200d", want: "节点\u200d"},
 		{name: "only whitespace becomes empty", in: " \t\n\x00 ", want: ""},
 		{name: "exact limit kept", in: strings.Repeat("a", ClusterNodeNameMaxLen), want: strings.Repeat("a", ClusterNodeNameMaxLen)},
 		{name: "over limit truncated by rune", in: long, want: strings.Repeat("名", ClusterNodeNameMaxLen)},

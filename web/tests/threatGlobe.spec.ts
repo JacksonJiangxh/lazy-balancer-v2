@@ -55,11 +55,14 @@ test('member() 跳过字符串/模板量/注释中的大括号：字面量不参
 test('复位/返回必须作废在途省界加载（与地图引擎同源）', () => {
   for (const name of ['zoomOut', 'resetView']) {
     const body = member(globeSrc, `${name}(): void {`)
-    const seqIdx = body.indexOf('drillSeq += 1')
-    const viewIdx = body.indexOf('enterWorldView(')
-    assert.ok(seqIdx >= 0, `${name} 必须递增 drillSeq`)
-    assert.ok(viewIdx > seqIdx, `${name} 必须先作废在途加载再返回世界视角`)
+    assert.match(body, /returnToWorldView\(600\)/, `${name} 必须走返回世界视口单源`)
+    assert.doesNotMatch(body, /enterWorldView\(/, `${name} 不得再各自实现复位（两份实现会静默分叉）`)
   }
+  const helper = member(globeSrc, 'function returnToWorldView(')
+  const seqIdx = helper.indexOf('drillSeq += 1')
+  const viewIdx = helper.indexOf('enterWorldView(')
+  assert.ok(seqIdx >= 0, '返回世界视口必须递增 drillSeq')
+  assert.ok(viewIdx > seqIdx, '必须先作废在途加载再返回世界视角')
   // 续体判定必须走共享纯函数（地图/地球同一口径）
   assert.match(globeSrc, /drillCommitAllowed\(seq, drillSeq, disposed\)/)
 })

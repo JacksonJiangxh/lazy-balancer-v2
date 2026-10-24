@@ -3,6 +3,7 @@ package dnsproviders
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	mathrand "math/rand/v2"
@@ -112,6 +113,11 @@ func (d *DNSPod) BuildCredentialsJSON(creds map[string]string) (map[string]inter
 // 测试按比例缩放保持墙钟快速；生产代码不得改写）。
 var dnsProviderValidateTimeout = 30 * time.Second
 
+// presentRetryEnvelopeFactor 是写入探针相对清理预算的倍数：Present 走
+// retry.Transport（429/5xx 3 次尝试 + 1s/2s 退避），单次请求失败重试链可能
+// 长于基础预算，共用基础预算会把「限流/慢响应」误报成超时失败。
+const presentRetryEnvelopeFactor = 3
+
 func (d *DNSPod) Validate(ctx context.Context, creds map[string]string, testDomain string) error {
 	m, err := d.buildCredentials(creds)
 	if err != nil {
@@ -151,9 +157,12 @@ func (d *DNSPod) Validate(ctx context.Context, creds map[string]string, testDoma
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	presentCtx, presentCancel := context.WithTimeout(ctx, dnsProviderValidateTimeout)
+	presentCtx, presentCancel := context.WithTimeout(ctx, dnsProviderValidateTimeout*presentRetryEnvelopeFactor)
 	defer presentCancel()
 	if err := provider.Present(presentCtx, zone, challengeName, probeValue, 600); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("DNS 写入测试超时（DNS API 响应过慢或重试退避耗尽写入预算 %s）: %w", dnsProviderValidateTimeout*presentRetryEnvelopeFactor, err)
+		}
 		return fmt.Errorf("DNS 写入测试失败: %w", err)
 	}
 	// 清理必须用独立预算——共用 Present 的 ctx 时，传输层重试包络
@@ -161,7 +170,9 @@ func (d *DNSPod) Validate(ctx context.Context, creds map[string]string, testDoma
 	// 用户看到「DNS 清理测试失败」的假失败（记录其实写入成功）。
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dnsProviderValidateTimeout)
 	defer cleanupCancel()
-	if err := provider.CleanUp(cleanupCtx, zone, challengeName); err != nil {
+	// 按值清理（能力分派）：探针值每次随机，并发验证同一域名时按名清理会
+	// 删掉另一个请求仍在传播检查中的记录。无 ValueCleaner 的 provider 回退按名。
+	if err := dnsprovider.CleanUpChallenge(cleanupCtx, provider, zone, challengeName, probeValue); err != nil {
 		// 清理失败时测试 TXT 记录可能已残留——记告警
 		// 并在错误文案点名手动清理路径；返回错误语义不变（验证仍判失败）。
 		warnLog("dnspod 验证清理失败，测试记录 %s 可能残留，请手动清理: %v", challengeName, err)

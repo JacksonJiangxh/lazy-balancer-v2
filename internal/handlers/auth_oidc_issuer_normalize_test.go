@@ -90,3 +90,32 @@ func TestOIDCSettingsTest_usesNormalizedIssuerCacheKey(t *testing.T) {
 		t.Fatalf("登录链未使用归一 issuer（缓存未命中/发现失败），got: %s", front)
 	}
 }
+
+// Entra 补 /v2.0 特例的命中面：浏览器地址栏/IdP 门户复制来的 issuer 常带
+// :443，且主权云主机与全球主机并列——按主机名（去端口）判定，否则 v1 端点
+// 无发现文档 → 恒登录失败且被归一为「服务不可达」。
+func TestNormalizeOIDCIssuer_matchesHostByHostname(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"https://login.microsoftonline.com/tenant", "https://login.microsoftonline.com/tenant/v2.0"},
+		{"https://login.microsoftonline.com:443/tenant", "https://login.microsoftonline.com:443/tenant/v2.0"},
+		{"https://Login.MicrosoftOnline.US/tenant/", "https://Login.MicrosoftOnline.US/tenant/v2.0"},
+		{"https://login.partner.microsoftonline.cn/tenant", "https://login.partner.microsoftonline.cn/tenant/v2.0"},
+		{"https://login.chinacloudapi.cn/tenant", "https://login.chinacloudapi.cn/tenant/v2.0"},
+		{"https://login.microsoftonline.com/tenant/v2.0", "https://login.microsoftonline.com/tenant/v2.0"},
+		// 非 Entra 主机逐字保留（只去尾斜杠/空白，不猜路径）。
+		{"https://idp.example.com/tenant/", "https://idp.example.com/tenant"},
+		{"https://idp.example.com/v2.0", "https://idp.example.com/v2.0"},
+		// 子域名不命中（避免把任意外观相似的域当 Entra）。
+		{"https://evil.login.microsoftonline.com/tenant", "https://evil.login.microsoftonline.com/tenant"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			if got := normalizeOIDCIssuer(tc.raw); got != tc.want {
+				t.Fatalf("normalizeOIDCIssuer(%q)=%q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}

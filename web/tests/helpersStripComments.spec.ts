@@ -5,6 +5,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import { member, section, stripComments } from './_helpers.ts'
 
@@ -76,4 +77,27 @@ test('Vue 模板注释剥离', () => {
   const out = stripComments('<div><!-- hidden --><span>ok</span></div>')
   assert.doesNotMatch(out, /hidden/)
   assert.match(out, /<span>ok<\/span>/)
+})
+
+test('脚本存在性断言文件禁止裸 source()/repoSource() 回流', () => {
+  // 这些 spec 的断言对象是「脚本/Go 里某段实现仍在」：注释化实现是最常见的
+  // 临时停用手段，raw 视图下注释里的代码仍满足断言（假绿）。已全量改走
+  // code()/repoCode()，此门禁止把裸导入加回来（新增文件按同一判别表处理：
+  // 模板文案/注释钉用 raw，代码存在性用 code）。
+  const locked = [
+    'viewsWiringGuards.spec.ts',
+    'rulesUi.spec.ts',
+    'securityBulk.spec.ts',
+    'securityPoliciesWiring.spec.ts',
+    'authRole.spec.ts',
+  ]
+  for (const name of locked) {
+    const text = readFileSync(new URL(`./${name}`, import.meta.url), 'utf8')
+    assert.doesNotMatch(
+      text,
+      /import \{[^}]*\b(?:source|repoSource)\b[^}]*\} from '\.\/_helpers\.ts'/,
+      `${name} 不得导入裸 source/repoSource`,
+    )
+    assert.doesNotMatch(text, /(^|[^A-Za-z_.])(?:source|repoSource)\(/m, `${name} 仍有裸取源调用`)
+  }
 })

@@ -44,7 +44,7 @@ func TestThreatScreenAttackFlowRecordBatch_singleFlushPerBatch(t *testing.T) {
 	if got := threatScreenAttackFlowFlushCalls.Load() - base; got != 1 {
 		t.Fatalf("单批 200 条的加锁/裁剪次数=%d, want 1（批内一次加锁）", got)
 	}
-	events, next := ThreatScreenAttackFlowSnapshot(0, 1000)
+	events, next, _ := ThreatScreenAttackFlowSnapshot(0, 1000)
 	if len(events) != 200 {
 		t.Fatalf("事件条数=%d, want 200", len(events))
 	}
@@ -77,7 +77,7 @@ func TestThreatScreenAttackFlowRecordBatch_sampledMultiEventBatch(t *testing.T) 
 	if got := threatScreenAttackFlowFlushCalls.Load() - base; got != 1 {
 		t.Fatalf("单批采样写入的加锁/裁剪次数=%d, want 1（采样不得逐事件加锁）", got)
 	}
-	events, _ := ThreatScreenAttackFlowSnapshot(0, 10)
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, 10)
 	if len(events) != 1 {
 		t.Fatalf("n=4 采样应从 4 条中保留 1 条，got %d（%v）", len(events), events)
 	}
@@ -99,7 +99,7 @@ func TestThreatScreenAttackFlowRecordBatch_trimsToRingMax(t *testing.T) {
 	total := threatScreenAttackFlowRingMax + 500
 	threatScreenAttackFlowRecordBatch(newAttackFlowBatchItems(total, time.Now()))
 
-	events, _ := ThreatScreenAttackFlowSnapshot(0, 1000)
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, 1000)
 	threatScreenAttackFlowMu.Lock()
 	ringLen := len(threatScreenAttackFlowEvents)
 	last := threatScreenAttackFlowEvents[ringLen-1].Seq
@@ -142,7 +142,7 @@ func TestThreatScreenAttackFlowRecordBatch_concurrentBatches(t *testing.T) {
 	}
 
 	want := writers * batchesEach * itemsPerBatch
-	events, _ := ThreatScreenAttackFlowSnapshot(0, want)
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, want)
 	if len(events) != want {
 		t.Fatalf("事件条数=%d, want %d", len(events), want)
 	}

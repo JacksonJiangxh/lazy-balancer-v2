@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -96,5 +97,38 @@ func TestLogStatsVolume_missingDirectoryIsNotLogged(t *testing.T) {
 	aggregateDirStats(missing, func(name string) bool { return true })
 	if strings.Contains(logs.String(), "日志体量读取失败") {
 		t.Fatalf("目录不存在不得留痕: %q", logs.String())
+	}
+}
+
+// 去重表触顶时逐出单个键而非整表清空：清空会让仍在失败的路径全部回到「首报」
+// （一次性告警风暴），并丢掉失败→恢复的配对信息。
+func TestLogStatsVolumeFailure_capEvictsSingleKey(t *testing.T) {
+	resetLogStatsVolumeStateForTest()
+	t.Cleanup(resetLogStatsVolumeStateForTest)
+	logStatsVolumeState.Lock()
+	logStatsVolumeState.failed = map[string]bool{}
+	for i := range logStatsVolumeStateCap {
+		logStatsVolumeState.failed["k"+strconv.Itoa(i)] = true
+	}
+	logStatsVolumeState.Unlock()
+
+	logStatsVolumeReadFailure("new-key", os.ErrPermission)
+
+	logStatsVolumeState.Lock()
+	defer logStatsVolumeState.Unlock()
+	if len(logStatsVolumeState.failed) != logStatsVolumeStateCap {
+		t.Fatalf("触顶后键数=%d, want %d", len(logStatsVolumeState.failed), logStatsVolumeStateCap)
+	}
+	if !logStatsVolumeState.failed["new-key"] {
+		t.Fatal("新失败键必须登记（触顶即拒登会让该路径的失败永久静默）")
+	}
+	kept := 0
+	for i := range logStatsVolumeStateCap {
+		if logStatsVolumeState.failed["k"+strconv.Itoa(i)] {
+			kept++
+		}
+	}
+	if kept != logStatsVolumeStateCap-1 {
+		t.Fatalf("旧键保留 %d 个, want %d（清空整表会让全部旧键重新首报）", kept, logStatsVolumeStateCap-1)
 	}
 }

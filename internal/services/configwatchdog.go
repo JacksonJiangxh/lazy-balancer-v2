@@ -188,7 +188,7 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 		}
 	}()
 	driftSnapshot := snapshotConfigDrift()
-	checked, checkErr := checkConfigConsistency(watchdogAdminURLValue)
+	checked, driftEvent, checkErr := checkConfigConsistencyDeferred(watchdogAdminURLValue)
 	// 比对出口复核：比对窗口期内降级/停机的在途轮不得落写簿记（防覆写
 	// 复位态——入口复核只覆盖轮次开始前已取消的形态）。checkConfigConsistency
 	// 内部会更新漂移状态（含防抖 streak 与确认转移），因此这里还必须把状态
@@ -198,6 +198,10 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 		restoreConfigDriftSnapshot(driftSnapshot)
 		return ctx.Err()
 	}
+	// 对账留痕（运行日志 + 操作审计）在取消复核之后发射：审计是 append-only
+	// 的事实源，回滚撤不回已落库的行——「配置漂移/配置恢复」必须与状态由
+	// 同一判定点产出，否则取消轮会留下与横幅相反的结论。
+	emitConfigDriftEvent(driftEvent)
 	// 日志收敛（2026-10-03 裁定，「日志只记真实执行」延伸）：一致轮
 	// 零逐轮行，每 configWatchdogHeartbeatRounds 轮（60s×60≈1h）一条心跳；
 	// 漂移期逐轮漂移行与恢复事件照旧（task_runs 维持失败留痕不膨胀）。
@@ -273,10 +277,20 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 
 // checkConfigConsistency 单轮真实比对，返回本轮是否真正完成判定（checked）：
 // false=整轮跳过（规则读取失败/Caddy 运行配置不可读），调用方不得据此记
-// 「一致」簿记。
+// 「一致」簿记。直接调用方（一次性诊断/测试）沿用「立即留痕」语义；生产看门狗
+// 走 checkConfigConsistencyDeferred，把留痕推迟到取消复核之后。
 func checkConfigConsistency(adminURL string) (checked bool, err error) {
+	checked, event, err := checkConfigConsistencyDeferred(adminURL)
+	emitConfigDriftEvent(event)
+	return checked, err
+}
+
+// checkConfigConsistencyDeferred 执行比对并返回待发射的对账事件（nil=无结论）。
+// 调用方在取消复核之后才能 emit——降级/停机取消的在途轮不得留下与已复位
+// 状态相反的审计/运行日志。
+func checkConfigConsistencyDeferred(adminURL string) (checked bool, event *configDriftEvent, err error) {
 	if db.DB == nil {
-		return false, nil
+		return false, nil, nil
 	}
 	// 角色门单层化——内层「非主节点跳过」门删除，
 	// 由唯一生产调用方 WatchdogCheckOnce 外层门承担短路+簿记语义（双层
@@ -294,7 +308,7 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 		if shouldWarn {
 			Logf("warn", "配置一致性看门狗：读取规则失败（本轮起跳过检查）: %v", err)
 		}
-		return false, err
+		return false, nil, err
 	}
 	running, err := runningRuleRouteIDs(adminURL)
 	if err != nil {
@@ -313,14 +327,14 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 				Logf("warn", "配置一致性看门狗：读取运行配置失败（本轮起跳过检查）: %v", err)
 			}
 		}
-		return false, err
+		return false, nil, err
 	}
 	configDriftMu.Lock()
 	configDriftQueryWarned = false
 	configDriftReadWarned = false
 	configDriftMu.Unlock()
-	updateConfigDrift(diffExpectedMissing(expected, running), diffRunningExtra(expected, running))
-	return true, nil
+	event = updateConfigDrift(diffExpectedMissing(expected, running), diffRunningExtra(expected, running))
+	return true, event, nil
 }
 
 // expectedRenderedRules 计算应出现在运行配置中的规则：启用中且至少有一个启用上游，
@@ -639,22 +653,45 @@ func routeClaimedByAny(routeID string, claimed map[string]struct{}) bool {
 	return false
 }
 
-// updateConfigDrift 写入一轮比对结果。锁内只更新状态并拷贝待写
-// 内容，日志/审计落库移到 Unlock 之后——审计库 busy（30s busy_timeout）时
-// 持有 configDriftMu 会阻塞读者（GetCaddyStatus 的 CurrentConfigDrift）。
-func updateConfigDrift(missing, extra []string) {
+// configDriftEvent 一轮比对产生的对账留痕（运行日志 + 操作审计）。状态转移与
+// 留痕分离：取消轮只能回滚内存状态，撤不回已落盘的审计行，因此留痕必须由
+// 调用方在取消复核之后发射；nil = 本轮无结论（一致稳态或防抖首轮）。
+type configDriftEvent struct {
+	recovered bool
+	detail    string
+}
+
+// emitConfigDriftEvent 发射对账留痕。调用方必须已完成取消复核——审计是
+// append-only 的会计事实，无法随状态回滚。
+func emitConfigDriftEvent(event *configDriftEvent) {
+	switch {
+	case event == nil:
+		return
+	case event.recovered:
+		Logf("info", "配置一致性看门狗：运行配置与规则数据已恢复一致")
+		RecordAuditLog("system", "配置恢复", "Caddy配置", "运行配置与规则数据已恢复一致", "")
+	default:
+		Logf("error", "配置一致性看门狗：%s", event.detail)
+		RecordAuditLog("system", "配置漂移", "Caddy配置", event.detail, "")
+	}
+}
+
+// updateConfigDrift 写入一轮比对结果。锁内只更新状态，锁外零 I/O：审计库
+// busy（30s busy_timeout）时持有 configDriftMu 会阻塞读者（GetCaddyStatus 的
+// CurrentConfigDrift）。待写留痕以事件返回，由调用方在确认本轮未被取消后
+// 经 emitConfigDriftEvent 发射。
+func updateConfigDrift(missing, extra []string) *configDriftEvent {
 	drifted := len(missing) > 0 || len(extra) > 0
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 	// 展示/审计文本顺序稳定。
 	sort.Strings(missing)
 	sort.Strings(extra)
-	// 待写动作（0=无, 1=恢复, 2=漂移）——锁外执行。
-	pendingIO := 0
-	detail := ""
+	// 待写事件（nil=无结论）——锁外发射。
+	var event *configDriftEvent
 	configDriftMu.Lock()
 	if !drifted {
 		if !configDriftStatus.Consistent {
-			pendingIO = 1
+			event = &configDriftEvent{recovered: true}
 		}
 		configDriftStreak = 0
 		configDriftStatus = ConfigDriftStatus{Consistent: true, CheckedAt: now}
@@ -664,8 +701,7 @@ func updateConfigDrift(missing, extra []string) {
 			configDriftStatus.CheckedAt = now
 		} else {
 			if configDriftStatus.Consistent {
-				detail = formatDriftDetail(missing, extra)
-				pendingIO = 2
+				event = &configDriftEvent{detail: formatDriftDetail(missing, extra)}
 				configDriftStatus = ConfigDriftStatus{Consistent: false, Since: now}
 			}
 			configDriftStatus.Missing = missing
@@ -674,15 +710,7 @@ func updateConfigDrift(missing, extra []string) {
 		}
 	}
 	configDriftMu.Unlock()
-
-	switch pendingIO {
-	case 1:
-		Logf("info", "配置一致性看门狗：运行配置与规则数据已恢复一致")
-		RecordAuditLog("system", "配置恢复", "Caddy配置", "运行配置与规则数据已恢复一致", "")
-	case 2:
-		Logf("error", "配置一致性看门狗：%s", detail)
-		RecordAuditLog("system", "配置漂移", "Caddy配置", detail, "")
-	}
+	return event
 }
 
 // 漂移文案单源（横幅 GetCaddyStatus 与看门狗审计共用）——

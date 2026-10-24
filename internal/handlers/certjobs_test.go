@@ -168,7 +168,7 @@ func TestRetryCertJob_rejects_inactive_rule_atomically(t *testing.T) {
 }
 
 func TestRetryCertJob_concurrent_status_change_returns_refresh_message(t *testing.T) {
-	// 发现4：worker 在 SELECT 与 UPDATE 之间流转状态时，409 文案应区分归因。
+	// worker 在 SELECT 与 UPDATE 之间流转状态时，409 文案应区分归因。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
@@ -448,7 +448,7 @@ func TestDeleteCertJob_allows_issued_job_when_rule_not_auto_renewing(t *testing.
 }
 
 func TestDeleteCertJob_aborts_when_rule_reenabled_during_delete(t *testing.T) {
-	// C-发现3 TOCTOU：守卫读到 enabled=0 放行后 EnableRule（持
+	// TOCTOU：守卫读到 enabled=0 放行后 EnableRule（持
 	// caddyOpMu）完成启用，删除照常执行 → 规则无任务行、续签永久断链。
 	// 修复：守卫检查与状态翻转/删除全程持 caddyOpMu 与 EnableRule 互斥——
 	// EnableRule 先完成时守卫必须复核到 enabled=1 并 409。
@@ -1464,5 +1464,85 @@ func TestListCertJobs_paginationSemanticsUnified(t *testing.T) {
 	}
 	if rec := get("page_size=abc"); rec.Code != http.StatusBadRequest {
 		t.Errorf("page_size=abc status=%d, want 400", rec.Code)
+	}
+}
+
+// 同一秒内批量入队（created_at 完全相同）时 ORDER BY 只有 created_at 没有唯一
+// tiebreaker：等值键的相对顺序由查询计划决定，翻页窗口在等值区间上可重复/漏行。
+// tiebreaker 必须与 GetCurrentCertJobs 同源（created_at DESC, id DESC），
+// 使同一任务在任意 page/page_size 组合下位置唯一。
+func TestListCertJobs_sameSecondCreatedAtPaginationIsStable(t *testing.T) {
+	handler := newBackupTestHandlers(t)
+	const ruleID = "lb_same_second"
+	// 同一秒的固定时刻：批量入队的真实形态（datetime('now') 逐行取值不确定，
+	// 显式同值才能构造等值键）。
+	const createdAt = "2026-10-24 12:00:00"
+	seededIDs := make([]int64, 0, 7)
+	for index := range 7 {
+		result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,created_at,updated_at)
+			VALUES (?,?,'queued',?,?)`, ruleID, "same-second-"+strconv.Itoa(index)+".example.test", createdAt, createdAt)
+		if err != nil {
+			t.Fatalf("seed job %d: %v", index, err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatalf("read job %d ID: %v", index, err)
+		}
+		seededIDs = append(seededIDs, id)
+	}
+	// 唯一排序键 = created_at DESC, id DESC → 期望顺序是插入序的逆序。
+	want := make([]int64, 0, len(seededIDs))
+	for index := len(seededIDs) - 1; index >= 0; index-- {
+		want = append(want, seededIDs[index])
+	}
+
+	router := gin.New()
+	router.GET("/jobs", handler.ListCertJobs)
+	readPage := func(page int) []int64 {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet,
+			"/jobs?page="+strconv.Itoa(page)+"&page_size=3", nil)
+		router.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("page=%d status=%d body=%s", page, recorder.Code, recorder.Body.String())
+		}
+		var payload struct {
+			Data struct {
+				List []struct {
+					ID int64 `json:"id"`
+				} `json:"list"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode page %d: %v", page, err)
+		}
+		ids := make([]int64, 0, len(payload.Data.List))
+		for _, item := range payload.Data.List {
+			ids = append(ids, item.ID)
+		}
+		return ids
+	}
+
+	// 默认列表路径（无 rule_id 过滤）使用 created_at 索引扫描：等值键在索引内
+	// 按 rowid 升序返回，缺 tiebreaker 时同为「最新」的任务会以 id ASC 出现，
+	// 与契约（id DESC）不符且分页拼接顺序随计划漂移。
+	// 三页拼接必须恰好是全集且无重复。
+	paged := make([]int64, 0, len(want))
+	for page := 1; page <= 3; page++ {
+		paged = append(paged, readPage(page)...)
+	}
+	if fmt.Sprint(paged) != fmt.Sprint(want) {
+		t.Fatalf("同秒批量分页拼接=%v, want %v（唯一 tiebreaker：created_at DESC, id DESC）", paged, want)
+	}
+	// 逐页边界：page_size=3 → [7,6,5] / [4,3,2] / [1]，等值键顺序必须确定。
+	for page := 1; page <= 3; page++ {
+		start := (page - 1) * 3
+		end := start + 3
+		if end > len(want) {
+			end = len(want)
+		}
+		if got := readPage(page); fmt.Sprint(got) != fmt.Sprint(want[start:end]) {
+			t.Fatalf("page=%d ids=%v, want %v", page, got, want[start:end])
+		}
 	}
 }

@@ -35,6 +35,19 @@ func countSecurityEventsByType(t *testing.T, eventType string) int {
 	return count
 }
 
+// seedRollupReadyState 预置「预聚合已就绪」状态：行帽裁剪以这批键的存在性为
+// 就绪判据（见 threatRollupBackfillPending），未就绪时按设计跳过行帽阶段。
+// rebuild_from 不预置（存在=全量重建意图未走完）。
+func seedRollupReadyState(t *testing.T) {
+	t.Helper()
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES
+		(?, '2026-10-01 00:00'), (?, '2026-10-01 00:00'), (?, '2026-10-01 00:00')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		ThreatRollupTargetReadyKey, ThreatRollupCoveredFromKey, ThreatRollupWatermarkKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSecurityEventsRetentionCleanup_deletesEventsOlderThanConfiguredDays(t *testing.T) {
 	// Given: a 30-day retention window and events older and newer than the cutoff
 	setupSecurityEventsRetentionTestDB(t)
@@ -311,6 +324,7 @@ func TestSecurityEventRollupRetention_batches(t *testing.T) {
 func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing.T) {
 	// Given cap=3、宽年龄窗、5 条近期事件（id 升序=时间序）
 	setupSecurityEventsRetentionTestDB(t)
+	seedRollupReadyState(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650, security_events_row_cap=3 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -364,8 +378,8 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 	}
 }
 
-// 分钟事件高水位键与 rollup 同生命周期清理——
-// 写入侧每分钟一行 metrics_state，旧实现无任何删除点（1440 键/天常驻）。
+// 分钟 rollup 状态键（事件高水位 + 回退迟到基线）与 rollup 同生命周期清理
+// ——写入侧每分钟最多两行 metrics_state，旧实现无任何删除点（1440+ 键/天常驻）。
 func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) {
 	setupSecurityEventsRetentionTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
@@ -373,18 +387,26 @@ func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) 
 	}
 	oldMinute := time.Now().UTC().AddDate(0, 0, -40).Format("2006-01-02 15:04")
 	recentMinute := time.Now().UTC().Add(-time.Minute).Format("2006-01-02 15:04")
-	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, '5'), (?, '7')`,
-		ThreatRollupEventHighwaterPrefix+oldMinute, ThreatRollupEventHighwaterPrefix+recentMinute); err != nil {
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES
+		(?, '5'), (?, '7'), (?, '5'), (?, '7')`,
+		ThreatRollupEventHighwaterPrefix+oldMinute, ThreatRollupEventHighwaterPrefix+recentMinute,
+		ThreatRollupLateBaselinePrefix+oldMinute, ThreatRollupLateBaselinePrefix+recentMinute); err != nil {
 		t.Fatal(err)
 	}
 
 	securityEventsRetentionCleanup(context.Background())
 
-	var oldCount, recentCount int
+	var oldCount, recentCount, oldBaseline, recentBaseline int
 	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, ThreatRollupEventHighwaterPrefix+oldMinute).Scan(&oldCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, ThreatRollupEventHighwaterPrefix+recentMinute).Scan(&recentCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, ThreatRollupLateBaselinePrefix+oldMinute).Scan(&oldBaseline); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, ThreatRollupLateBaselinePrefix+recentMinute).Scan(&recentBaseline); err != nil {
 		t.Fatal(err)
 	}
 	if oldCount != 0 {
@@ -392,6 +414,12 @@ func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) 
 	}
 	if recentCount != 1 {
 		t.Fatalf("近期高水位键被误删（count=%d）", recentCount)
+	}
+	if oldBaseline != 0 {
+		t.Fatalf("超过 rollup 保留期的迟到基线键未清理（count=%d）", oldBaseline)
+	}
+	if recentBaseline != 1 {
+		t.Fatalf("近期迟到基线键被误删（count=%d）", recentBaseline)
 	}
 }
 
@@ -439,6 +467,7 @@ func TestSecurityEventsRetentionCleanupDetail_reportsAggregateDeletions(t *testi
 // 新事件、留住补采的旧事件。
 func TestSecurityEventsRetentionCleanup_rowCapTrimsByEventTime(t *testing.T) {
 	setupSecurityEventsRetentionTestDB(t)
+	seedRollupReadyState(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650, security_events_row_cap=3 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -470,8 +499,75 @@ func TestSecurityEventsRetentionCleanup_rowCapTrimsByEventTime(t *testing.T) {
 	}
 }
 
-// 保留摘要漏行帽 ——
+// 行帽阶段必须让位于预聚合回填：任务引擎先于 warmer 启动、周期任务「关→开」
+// 立即到期，升级/代际重固期间裁剪最旧原始行会让未固化的分钟永久成 0 且覆盖
+// 水位照常推进（大屏窗口静默少计，backfill_incomplete 转 false 的错误安抚）。
+func TestSecurityEventsRetentionCleanup_defersRowCapUntilRollupReady(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650, security_events_row_cap=3 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES (datetime('now'), ?, ?)`,
+			fmt.Sprintf("198.51.100.%d", i), fmt.Sprintf("deferred-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
+	// Given 尚无任何 rollup 状态（升级后 warmer 未完成首轮固化）。
+	res, err := securityEventsRetentionCleanup(context.Background())
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	// Then 本轮跳过行帽：原始行一条不删，并在结果中显式披露延后。
+	if !res.RowCapDeferred {
+		t.Fatal("回填未就绪时行帽阶段必须延后（RowCapDeferred=true）")
+	}
+	var count int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 5 {
+		t.Fatalf("回填未就绪时事件行=%d, want 5（行帽不得在回填前裁剪原始行）", count)
+	}
+
+	// When 重建意图仍存在（有界分批未走完）。
+	seedRollupReadyState(t)
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, '2026-10-01 00:00')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, ThreatRollupRebuildFromKey); err != nil {
+		t.Fatal(err)
+	}
+	res, err = securityEventsRetentionCleanup(context.Background())
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if !res.RowCapDeferred {
+		t.Fatal("全量重建意图未完成时行帽阶段必须继续延后")
+	}
+
+	// When 重建完成（意图键删除）。
+	if _, err := db.MetricsDB.Exec(`DELETE FROM metrics_state WHERE key=?`, ThreatRollupRebuildFromKey); err != nil {
+		t.Fatal(err)
+	}
+	res, err = securityEventsRetentionCleanup(context.Background())
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	// Then 行帽恢复执行并收敛到 cap。
+	if res.RowCapDeferred {
+		t.Fatal("回填就绪后行帽阶段必须恢复执行")
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("回填就绪后事件行=%d, want 3（cap=3）", count)
+	}
+}
+
+// 保留摘要漏行帽 ——
 // 摘要必须同时表达天数与行帽：cleanup 按 count-max 裁剪，只写「保留 N 天」
 // 会让行帽提前裁剪时的用户可见文案与实际行为漂移。
 func TestSecurityEventsRetention_summaryIncludesRowCap(t *testing.T) {
@@ -484,17 +580,18 @@ func TestSecurityEventsRetention_summaryIncludesRowCap(t *testing.T) {
 		t.Fatalf("rowCap=%d, want 5000", rowCap)
 	}
 	// 双口径 + 行帽按字节披露：行帽按行不按字节，理论体积上限必须随文案
-	// 可见（5000 行 ×128KiB = 625 MiB）。
-	if summary != "每日清理 · 保留 30 天 / 上限 5000 行（按行计，单行最大约 128KiB，理论体积上限约 625 MiB）" {
+	// 可见（5000 行 × 138KiB ≈ 674 MiB）——单行上限按头/体/URI/rule_msg
+	// 四个采集门常量合计（securityEventsRowMaxBytes）。
+	if summary != "每日清理 · 保留 30 天 / 上限 5000 行（按行计，单行最大约 138KiB，理论体积上限约 674 MiB）" {
 		t.Fatalf("summary=%q, want 天数+行帽+字节预算三口径", summary)
 	}
-	// 缺省形态（0=内置默认）同样表达双口径与字节预算（100 万行 ≈ 122 GiB）。
+	// 缺省形态（0=内置默认）同样表达双口径与字节预算（100 万行 ≈ 131 GiB）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0, security_events_row_cap=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	summary, _ = SecurityEventsRetentionSnapshot()
-	if !strings.Contains(summary, "90 天") || !strings.Contains(summary, "1000000 行") || !strings.Contains(summary, "122 GiB") {
-		t.Fatalf("默认 summary=%q, want 含 90 天、1000000 行与 122 GiB 字节预算", summary)
+	if !strings.Contains(summary, "90 天") || !strings.Contains(summary, "1000000 行") || !strings.Contains(summary, "131 GiB") {
+		t.Fatalf("默认 summary=%q, want 含 90 天、1000000 行与 131 GiB 字节预算", summary)
 	}
 }
 

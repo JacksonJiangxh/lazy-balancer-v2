@@ -8,6 +8,7 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,5 +107,46 @@ func TestCaddyRestartWatcher_successConsumesTriggerFile(t *testing.T) {
 	}
 	if n := countCaddyRestartRuns(t); n != 1 {
 		t.Fatalf("应落 1 行 caddy-restart task_runs, got %d", n)
+	}
+}
+
+// 触发文件删除失败（只读目录/异常挂载）不得演变为每 2s 全量重应用：成功收尾会
+// 清零退避，若只按「文件仍存在」判定，下一轮必以 attempts=1 重新执行。同一
+// mtime 已应用后只重试删除并留一次 warn。
+func TestCaddyRestartWatcher_removalFailureDoesNotReapply(t *testing.T) {
+	initTaskEngineForTest(t)
+	newBackupTestHandlers(t)
+	resetCaddyRestartBackoffForTest()
+	t.Cleanup(resetCaddyRestartBackoffForTest)
+	calls := 0
+	services.SetConfigLoadRerun(func(string) error { calls++; return nil })
+	t.Cleanup(func() { services.SetConfigLoadRerun(nil) })
+	logs := captureHandlerLog(t)
+
+	h := &Handlers{}
+	// 非空目录：os.Remove 必失败（ENOTEMPTY），模拟「触发文件删不掉」的
+	// 挂载/权限形态（不依赖 chmod——root/容器内权限位不可靠）。
+	trigger := filepath.Join(t.TempDir(), "caddy-restarted")
+	if err := os.Mkdir(trigger, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trigger, "keep"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	processStart := time.Now().Add(-time.Minute)
+
+	h.caddyRestartWatcherOnce(trigger, processStart)
+	if calls != 1 {
+		t.Fatalf("首轮应执行配置载入 1 次, got %d", calls)
+	}
+	h.caddyRestartWatcherOnce(trigger, processStart)
+	if calls != 1 {
+		t.Fatalf("触发文件删除失败后不得重复执行配置载入, got %d 次", calls)
+	}
+	if n := countCaddyRestartRuns(t); n != 1 {
+		t.Fatalf("重复轮不得新增 task_runs 行, got %d", n)
+	}
+	if got := strings.Count(logs.String(), "Caddy 重启触发文件删除失败"); got != 1 {
+		t.Fatalf("删除失败 warn=%d 条, want 1（同一触发只留痕一次）: %q", got, logs.String())
 	}
 }

@@ -127,6 +127,17 @@ func importFailureAuditDetail(err error) string {
 	return phase + "：" + coordinatorErr.err.Error()
 }
 
+// importFailureCause 返回协调器包装下的真实错误文本（不带动作/阶段前缀）；
+// 非协调器错误原样返回。仅供上文已给出阶段说明的调用点（响应 warnings）使用，
+// 避免同一句阶段描述重复两次。
+func importFailureCause(err error) string {
+	var coordinatorErr *importCoordinatorError
+	if errors.As(err, &coordinatorErr) {
+		return coordinatorErr.err.Error()
+	}
+	return err.Error()
+}
+
 type configImportSession struct {
 	h               *Handlers
 	ctx             context.Context
@@ -167,6 +178,11 @@ type configImportSession struct {
 	// wafRestoreWarnings 是回退成功但运行时面需重启收敛等说明，随失败响应
 	// 一并透出。
 	wafRestoreWarnings []string
+	// pendingCleanup 是提交成功后待执行的产物清理计划：锁内（事务视图）
+	// 只收集判定集并完成 cert_jobs 必要删除，实际删文件/日志/指标的删除动作
+	// 拆到 close 释放 caddyOpMu 与会话锁之后执行，不再把千级规则导入的产物
+	// 删除压进配置写窗口。
+	pendingCleanup *importArtifactCleanupPlan
 }
 
 // errCertQueueDrainIncomplete 证书队列排空未完成：PauseAndDrain
@@ -196,6 +212,10 @@ var configImportBeginMu sync.Mutex
 // 供锁序测试用通道证明到达点，替代固定 sleep。
 var configImportBeginAttemptHook func()
 var configImportBeforePrelockHook func()
+
+// importPostCommitCleanupHook 测试屏障（生产恒 nil）：提交后产物清理执行前
+// 触发，供锁序钉测断言清理发生在 caddyOpMu 与导入会话锁释放之后。
+var importPostCommitCleanupHook func()
 
 // configImportBusy 探测导入会话是否持有全局导入锁（不阻塞）：启停/控制
 // 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain。
@@ -380,6 +400,14 @@ func (session *configImportSession) close() {
 	if session.releaseBeforeLock != nil {
 		session.releaseBeforeLock()
 	}
+	// 提交后产物清理放在最后：此时 caddyOpMu 与导入会话锁都已释放，删证书
+	// 文件/日志/指标不再阻塞配置写与重载窗口（锁内只做了判定集收集与
+	// cert_jobs 的必要删除，见 collectPostCommitCleanup）。提交已落地，清理
+	// 失败只留痕不否决导入。
+	if plan := session.pendingCleanup; plan != nil {
+		session.pendingCleanup = nil
+		session.runPostCommitCleanup(plan)
+	}
 }
 
 func (session *configImportSession) abort(importErr error) error {
@@ -428,21 +456,34 @@ func (session *configImportSession) abort(importErr error) error {
 			// 再以已提交视图重渲染/强制应用：即使恢复 /load 失败，
 			// RestoreRuntimeToCommittedInLock 也会把已提交字节写回 LKG。
 			certErr := services.RestoreCertFiles(session.runtime.certFiles)
-			restoreErr := session.h.recoverCommittedViewAfterCommitFailure(session.tx)
-			if restoreErr != nil {
+			recovery := session.h.recoverCommittedViewAfterCommitFailure(session.tx)
+			if recovery.runtime != nil {
 				// 恢复已提交视图失败=运行配置可能停留在导入候选（传输失败
 				// 且 Caddy 已应用/恢复 /load 再失败），而 DB 已回滚。LKG 由
 				// RestoreRuntimeToCommittedInLock 钉回已提交字节，但横幅事实
 				// 源此前为空——刷新页面后分叉完全不可见。与规则域 apply 失败
 				// 同口径持久化失败横幅。
-				session.h.recordCaddyApplyFailure(fmt.Errorf("导入失败后恢复已提交运行配置失败: %w", restoreErr), restoreErr)
+				session.h.recordCaddyApplyFailure(fmt.Errorf("导入失败后恢复已提交运行配置失败: %w", recovery.runtime), recovery.runtime)
 			}
-			importErr = errors.Join(importErr, certErr, restoreErr)
+			if recovery.db != nil {
+				session.h.recordCompensationSideEffects("导入失败后恢复已提交运行配置", recovery.db)
+			}
+			if certErr != nil {
+				session.h.recordCompensationSideEffects("导入失败后回退证书文件", certErr)
+			}
+			importErr = errors.Join(importErr, certErr, recovery.err())
 			session.finished = true
 			return finishImportFailure(session.tx, &session.recovery, importErr)
 		}
 		if restoreErr := session.h.restoreImportRuntime(*session.runtime); restoreErr != nil {
 			importErr = errors.Join(importErr, fmt.Errorf("恢复运行配置失败: %w", restoreErr))
+		}
+		// 先回滚未提交事务再钉回（PersistCommittedViewAsLastGoodInLock 的显式
+		// 调用契约：渲染读 db.DB，调用方须先回退事务——WAL 下并发读恰好能读到
+		// 已提交快照，但不得依赖 journal_mode 保证）。finishImportFailure 对已
+		// 回滚事务幂等（ErrTxDone 容忍），下方仍统一走它收尾。
+		if rbErr := session.tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			importErr = errors.Join(importErr, fmt.Errorf("回滚未提交导入事务失败: %w", rbErr))
 		}
 		// 运行配置回弹经 ApplyConfig(persistLastGood=true)：若请求前运行配置
 		// 带外漂移（快照≠运行配置），回弹会把该形态写进 LKG，而重启兜底
@@ -490,6 +531,14 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	if err := services.BumpClusterVersion(session.ctx, session.tx); err != nil {
 		return &importCoordinatorError{phase: importPhaseVersion, err: session.abort(err), action: session.action}
 	}
+	// 提交后产物清理的判定集必须在事务视图内收集（此时规则/证书任务世界
+	// 已是导入后状态），cert_jobs 的必要删除也在事务内完成；实际删产物动作
+	// 记录成计划，等 close 释放 caddyOpMu 与会话锁之后再执行——千级规则导入
+	// 的文件删除不再阻塞配置写/重载窗口。
+	cleanupPlan, cleanupErr := session.collectPostCommitCleanup()
+	if cleanupErr != nil {
+		return &importCoordinatorError{err: session.abort(cleanupErr), action: session.action}
+	}
 	if err := session.tx.Commit(); err != nil {
 		// Commit 报错=结果不可判定（可能已落地但确认丢失）：先标记再 abort，
 		// 文件面据此跳过回退（回退只在确定回滚时执行）。
@@ -505,15 +554,10 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	// 刚被 Caddy 接受的候选——导入的 LKG 因此恒为已提交视图。
 	session.h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
 	session.runtime = nil
-	// /全量替换导入对消失规则的产物清理。v2/v1 导入均清光
-	// lb_rules 后重插（v1 还换新 caddy_id），但产物轴此前只写不删：消失规则的
-	// 证书文件（含 ACME 私钥）在 /app/certs 无限残留——与 DeleteRule「规则消失
-	// → 密钥删除」的约定矛盾，卷读权限者可恢复管理员以为已删除的密钥；v1 路径
-	// 还遗留指向已删 caddy_id 的孤儿 cert_jobs 行（终态行永不清理，任务列表
-	// 噪音）。提交成功后按 begin 期收集的 existingRuleIDs 求差清理（v2 的
-	// 事务内孤儿 SQL 幂等重复无害）。清理失败不否决导入（数据已提交），
-	// 留痕审计 + 日志。
-	session.cleanupDisappearedRuleArtifacts()
+	// 全量替换导入对消失规则的产物清理（v1 还换新 caddy_id）：计划已在事务
+	// 内按导入后视图收集完毕，这里只挂到会话，实际删除由 close 在锁外执行。
+	// 清理失败不否决导入（数据已提交），留痕审计 + 日志。
+	session.pendingCleanup = cleanupPlan
 	if err := session.recovery.finish(); err != nil {
 		session.finished = true
 		return &importCoordinatorError{phase: importPhaseQueue, err: err, action: session.action}
@@ -535,103 +579,195 @@ func importFailureCaddyRejected(err error) bool {
 	return errors.As(err, &coordinatorErr) && coordinatorErr.phase == importPhaseCaddy && coordinatorErr.caddyRejected
 }
 
-// cleanupDisappearedRuleArtifacts 清理本次导入中消失规则的产物
-// 证书文件、孤儿 cert_jobs 行、指标与规则/证书日志。提交成功后调用；失败仅
-// 审计留痕，不否决导入。
-func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
-	if !session.replaceRuleArtifacts {
+// importArtifactCleanupPlan 是提交后产物清理的待删集：锁内只做判定（按事务
+// 视图）与必要的事务内写，删除动作在 caddyOpMu/会话锁释放之后按本计划执行。
+type importArtifactCleanupPlan struct {
+	// disappeared 是本次导入后已不在库内的旧规则（证书材料/指标/日志）。
+	disappeared []string
+	// withoutMaterial 是仍在库内但已无任何可用证书材料的规则（仅删残留
+	// 证书文件）。
+	withoutMaterial []string
+}
+
+func (plan *importArtifactCleanupPlan) empty() bool {
+	return plan == nil || (len(plan.disappeared) == 0 && len(plan.withoutMaterial) == 0)
+}
+
+// importCleanupQueryer 让同一套判定查询既跑在导入事务视图（提交前收集）也
+// 跑在已提交视图（锁外复核）上。
+type importCleanupQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// ruleIDsFromQueryer 读取规则集（queryer=导入事务或已提交库）。
+func ruleIDsFromQueryer(ctx context.Context, q importCleanupQueryer) ([]string, error) {
+	rows, err := q.QueryContext(ctx, "SELECT caddy_id FROM lb_rules")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ruleIDs := make([]string, 0)
+	for rows.Next() {
+		var ruleID string
+		if err := rows.Scan(&ruleID); err != nil {
+			return nil, err
+		}
+		ruleIDs = append(ruleIDs, ruleID)
+	}
+	return ruleIDs, rows.Err()
+}
+
+// collectPostCommitCleanup 在导入事务视图内收集提交后待清理的产物集，并在
+// 事务内完成 cert_jobs 的必要删除（孤儿行 + 已非 ACME 签发态的行）。返回 nil
+// 表示本次导入未替换规则/证书任务面（users-only 等分类导入对 live 数据零触碰）。
+//
+// v2/v1 全量替换导入都清光 lb_rules 后重插（v1 还换新 caddy_id）：旧规则的
+// 证书文件（含 ACME 私钥）此前只写不删，与 DeleteRule「规则消失→密钥删除」的
+// 约定矛盾，卷读权限者可恢复管理员以为已删除的密钥；v1 路径还遗留指向已删
+// caddy_id 的孤儿 cert_jobs 行（终态行永不清理，任务列表噪音）。判定必须在
+// 事务视图内做——提交后按 live 视图求差会被并发写污染。
+func (session *configImportSession) collectPostCommitCleanup() (*importArtifactCleanupPlan, error) {
+	if !session.replaceRuleArtifacts || session.tx == nil {
+		return nil, nil
+	}
+	ctx := session.ctx
+	// 与 v2 导入事务内同语句（幂等重复无害）：两处删除都是派生数据清理，
+	// 放事务内=与规则替换同生共死，失败随导入一起回滚。
+	if _, err := session.tx.ExecContext(ctx,
+		`DELETE FROM cert_jobs WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = cert_jobs.rule_id)`); err != nil {
+		return nil, fmt.Errorf("清理孤儿证书任务失败: %w", err)
+	}
+	if _, err := session.tx.ExecContext(ctx,
+		`DELETE FROM cert_jobs WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE NOT (enable_tls=1 AND tls_source='acme_dns'))`); err != nil {
+		return nil, fmt.Errorf("清理失效证书任务失败: %w", err)
+	}
+	plan := &importArtifactCleanupPlan{}
+	currentIDs, err := ruleIDsFromQueryer(ctx, session.tx)
+	if err != nil {
+		// 判定集读取失败不否决导入：产物清理是提交后的 best-effort，任务行
+		// 已在事务内删净；留痕后按空集继续。
+		services.Logf("error", "导入清理：读取导入后规则集失败（跳过消失规则产物清理）: %v", err)
+		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理消失规则产物失败（读取导入后规则集）：%v", err), "")
+	} else {
+		current := make(map[string]struct{}, len(currentIDs))
+		for _, id := range currentIDs {
+			current[id] = struct{}{}
+		}
+		for _, id := range session.existingRuleIDs {
+			if _, alive := current[id]; !alive {
+				plan.disappeared = append(plan.disappeared, id)
+			}
+		}
+	}
+	withoutMaterial, err := rulesWithoutUsableCertMaterial(ctx, session.tx)
+	if err != nil {
+		services.Logf("error", "导入清理：判定无证书材料规则失败（跳过材料清理）: %v", err)
+		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（判定集）：%v", err), "")
+	} else {
+		plan.withoutMaterial = withoutMaterial
+	}
+	return plan, nil
+}
+
+// runPostCommitCleanup 执行提交后的产物删除（证书文件/指标/规则与证书日志）。
+// 调用点必须在 caddyOpMu 与导入会话锁都释放之后（session.close 末尾）——锁内
+// 只收集判定集。提交已落地，任何失败只留痕不否决导入。
+func (session *configImportSession) runPostCommitCleanup(plan *importArtifactCleanupPlan) {
+	if importPostCommitCleanupHook != nil {
+		importPostCommitCleanupHook()
+	}
+	if plan.empty() {
 		return
 	}
-	// 提交已落地 → 清理不再受客户端生命周期左右。请求 ctx 在前端超时/关页/
-	// 网关断连时被取消，旧实现据此在 currentRuleIDs 处早退，整段清理（含
-	// 已不在库内的规则私钥、指标、规则/证书日志、孤儿 cert_jobs）一次不执行
-	// ——数据卷里保留着管理员以为已随规则删除的 ACME 私钥。WithoutCancel
-	// 保留 ctx 值（日志/审计归因）并叠加有界超时，避免无界后台写。
+	// 提交已落地 → 清理不受客户端生命周期左右。请求 ctx 在前端超时/关页/网关
+	// 断连时被取消，旧实现据此在读取规则集处早退，整段清理（含已不在库内的
+	// 规则私钥、指标、规则/证书日志）一次不执行——数据卷里保留着管理员以为
+	// 已随规则删除的 ACME 私钥。WithoutCancel 保留 ctx 值（日志/审计归因）并
+	// 叠加有界预算，避免无界后台写。
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(session.ctx), importCleanupBudget)
 	defer cancel()
+	// 锁外执行存在「判定集 → 删除」窗口：第二次导入可让已消失的规则以同一
+	// caddy_id 复活（备份含它），并发签发可为「无材料」规则写入新证书。删除前
+	// 按已提交视图复核，复活/已有材料的规则从待删集剔除。复核与删除之间仍有
+	// 极小窗口（与 DeleteRule「先判定后删」同型）；RemoveCertFiles 与证书写入
+	// 共用证书锁，删除不会撕裂进行中的写入，最坏形态是删掉刚签发的材料——
+	// 下次签发/续签自愈。
 	currentIDs, err := currentRuleIDs(ctx)
 	if err != nil {
 		services.Logf("error", "导入清理：读取当前规则失败（跳过孤儿清理）: %v", err)
 		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理消失规则产物失败（读取规则集）：%v", err), "")
 		return
 	}
-	current := make(map[string]struct{}, len(currentIDs))
+	live := make(map[string]struct{}, len(currentIDs))
 	for _, id := range currentIDs {
-		current[id] = struct{}{}
+		live[id] = struct{}{}
 	}
-	var disappeared []string
-	for _, id := range session.existingRuleIDs {
-		if _, alive := current[id]; !alive {
+	disappeared := make([]string, 0, len(plan.disappeared))
+	for _, id := range plan.disappeared {
+		if _, alive := live[id]; !alive {
 			disappeared = append(disappeared, id)
 		}
 	}
-	if len(disappeared) == 0 {
-		// 无消失规则仍可能有「规则仍在但失去证书材料」的清理（导入事务
-		// 剪枝只动 DB 行）——跳过消失规则段，继续下方任务行与材料清理。
-	} else {
-		for _, id := range disappeared {
-			if err := services.RemoveCertFiles(id); err != nil {
-				services.Logf("warn", "导入清理：删除消失规则 %s 的证书文件失败: %v", id, err)
+	withoutMaterial := plan.withoutMaterial
+	if len(withoutMaterial) > 0 {
+		liveWithoutMaterial, err := rulesWithoutUsableCertMaterial(ctx, db.DB)
+		if err != nil {
+			services.Logf("error", "导入清理：复核无证书材料规则失败（跳过材料清理）: %v", err)
+			services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（复核判定集）：%v", err), "")
+			withoutMaterial = nil
+		} else {
+			still := make(map[string]struct{}, len(liveWithoutMaterial))
+			for _, id := range liveWithoutMaterial {
+				still[id] = struct{}{}
 			}
-			if db.MetricsDB != nil {
-				if _, err := db.MetricsDB.ExecContext(ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
-					services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
+			filtered := make([]string, 0, len(withoutMaterial))
+			for _, id := range withoutMaterial {
+				if _, ok := still[id]; ok {
+					filtered = append(filtered, id)
 				}
 			}
-			if err := removeImportRuleLogFiles(id); err != nil {
-				services.Logf("error", "导入清理：删除消失规则 %s 的规则日志失败: %v", id, err)
-				services.RecordAuditLog("system", "清理失败", "规则日志", fmt.Sprintf("导入后清理规则 %s 的规则日志失败：%v", id, err), "")
-			}
-			if err := removeImportCertJobLogFiles(id); err != nil {
-				services.Logf("error", "导入清理：删除消失规则 %s 的证书日志失败: %v", id, err)
-				services.RecordAuditLog("system", "清理失败", "证书日志", fmt.Sprintf("导入后清理规则 %s 的证书日志失败：%v", id, err), "")
-			}
+			withoutMaterial = filtered
 		}
 	}
-	// 与 v2 导入事务内的孤儿清理同语句（幂等重复无害）；覆盖 v1 路径与
-	// 理论上的绕过路径。
-	if _, err := db.DB.ExecContext(ctx,
-		`DELETE FROM cert_jobs WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = cert_jobs.rule_id)`); err != nil {
-		services.Logf("error", "导入清理：删除孤儿证书任务失败: %v", err)
-		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理孤儿证书任务失败：%v", err), "")
-		return
+	for _, id := range disappeared {
+		if err := services.RemoveCertFiles(id); err != nil {
+			services.Logf("warn", "导入清理：删除消失规则 %s 的证书文件失败: %v", id, err)
+		}
+		if db.MetricsDB != nil {
+			if _, err := db.MetricsDB.ExecContext(ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
+				services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
+			}
+		}
+		if err := removeImportRuleLogFiles(id); err != nil {
+			services.Logf("error", "导入清理：删除消失规则 %s 的规则日志失败: %v", id, err)
+			services.RecordAuditLog("system", "清理失败", "规则日志", fmt.Sprintf("导入后清理规则 %s 的规则日志失败：%v", id, err), "")
+		}
+		if err := removeImportCertJobLogFiles(id); err != nil {
+			services.Logf("error", "导入清理：删除消失规则 %s 的证书日志失败: %v", id, err)
+			services.RecordAuditLog("system", "清理失败", "证书日志", fmt.Sprintf("导入后清理规则 %s 的证书日志失败：%v", id, err), "")
+		}
 	}
-	// 规则存在但已非 ACME 自动签发态的失效任务行——与
-	// v2 导入事务内同谓词清理；覆盖 v1 路径与理论绕过路径。
-	if _, err := db.DB.ExecContext(ctx,
-		`DELETE FROM cert_jobs WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE NOT (enable_tls=1 AND tls_source='acme_dns'))`); err != nil {
-		services.Logf("error", "导入清理：删除失效证书任务失败: %v", err)
-		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理失效证书任务失败：%v", err), "")
-		return
-	}
-	// 上述清理只动 DB——仍存在但已失去全部可用证书材料的规则（切 manual
-	// 无证/关 TLS/导入行不再带 ACME 材料），其 ACME cert/key 文件会滞留
-	// 数据卷（与 DeleteRule/orphanACME「失去材料即删私钥」约定不对称，
-	// 卷读权限者可恢复管理员以为已丢弃的密钥）。按同一约定 best-effort 清理：
-	// 失败仅 warn+审计，不否决已提交的导入。
-	if cleaned := cleanupRulesWithoutUsableCertMaterial(ctx); cleaned > 0 {
+	if cleaned := removeCertFilesForRules(withoutMaterial); cleaned > 0 {
 		services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入后 %d 条规则已无任何可用证书材料，其残留证书文件已清理", cleaned), "")
 	}
 	if len(disappeared) > 0 {
-		services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入移除 %d 条规则，已清理其证书文件、任务行、指标与日志", len(disappeared)), "")
+		services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入移除 %d 条规则，已清理其证书文件、指标与日志（证书任务行随导入事务清理）", len(disappeared)), "")
 	}
 }
 
-// cleanupRulesWithoutUsableCertMaterial 清理「仍存在但已无任何可用证书材料」
-// 规则的 ACME 证书/私钥文件：手动证书材料在库（tls_source=manual 且
-// cert/key 非空）或有域名适用的任务材料时跳过。返回实际执行了文件清理的规则数
-// （幂等 best-effort，单规则失败仅告警留痕）。
+// rulesWithoutUsableCertMaterial 返回「仍存在但已无任何可用证书材料」的规则
+// id：手动证书材料在库（tls_source=manual 且 cert/key 非空）或有域名适用的
+// 任务材料时跳过。只做判定不删文件——判定集在导入事务视图内收集、删除动作在
+// 锁外执行或复核（见 collectPostCommitCleanup/runPostCommitCleanup）。
 //
 // 查询面固定为两条（规则集 + 材料行集）并在内存中配对：原实现逐规则 2 次查询
 // （域名 + 任务材料）是 N+1，千级规则导入在持 caddyOpMu 的提交窗口里放大 2N 次
 // DB 往返，把配置写/重载全部阻塞在该窗口。
-func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
-	rows, err := db.DB.QueryContext(ctx,
+func rulesWithoutUsableCertMaterial(ctx context.Context, q importCleanupQueryer) ([]string, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT caddy_id, COALESCE(tls_source,''), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(domain,'') FROM lb_rules`)
 	if err != nil {
-		services.Logf("error", "导入清理：读取规则证书形态失败（跳过材料清理）: %v", err)
-		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（读取规则集）：%v", err), "")
-		return 0
+		return nil, fmt.Errorf("读取规则证书形态: %w", err)
 	}
 	type ruleCertShape struct {
 		id        string
@@ -644,27 +780,26 @@ func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
 		var rule ruleCertShape
 		var tlsCert, tlsKey string
 		if err := rows.Scan(&rule.id, &rule.tlsSource, &tlsCert, &tlsKey, &rule.domain); err != nil {
-			services.Logf("error", "导入清理：读取规则行失败: %v", err)
-			continue
+			rows.Close()
+			return nil, fmt.Errorf("读取规则行: %w", err)
 		}
 		rule.hasManual = rule.tlsSource == "manual" && strings.TrimSpace(tlsCert) != "" && strings.TrimSpace(tlsKey) != ""
 		rules = append(rules, rule)
 	}
 	if err := rows.Err(); err != nil {
-		services.Logf("error", "导入清理：遍历规则失败: %v", err)
+		rows.Close()
+		return nil, fmt.Errorf("遍历规则集: %w", err)
 	}
 	rows.Close()
 
 	// 一次取全部「持有可用材料」的任务行（谓词单源：非 disabled + PEM 非空，
 	// 与渲染候选/启动物化/文件对账同语义）。
 	materialByRule := make(map[string][]string)
-	materialRows, err := db.DB.QueryContext(ctx, `SELECT rule_id, COALESCE(domain,'') FROM cert_jobs
+	materialRows, err := q.QueryContext(ctx, `SELECT rule_id, COALESCE(domain,'') FROM cert_jobs
 		WHERE `+services.CertJobMaterialPredicateSQL(""))
 	if err != nil {
 		// 判定面不可读时不得按「无材料」清理（会误删仍在服务的证书文件）。
-		services.Logf("error", "导入清理：查询任务材料失败（跳过材料清理）: %v", err)
-		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（读取任务材料集）：%v", err), "")
-		return 0
+		return nil, fmt.Errorf("查询任务材料: %w", err)
 	}
 	for materialRows.Next() {
 		var ruleID, jobDomain string
@@ -674,14 +809,12 @@ func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
 		materialByRule[ruleID] = append(materialByRule[ruleID], jobDomain)
 	}
 	if err := materialRows.Err(); err != nil {
-		services.Logf("error", "导入清理：遍历任务材料失败（跳过材料清理）: %v", err)
 		materialRows.Close()
-		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（遍历任务材料集）：%v", err), "")
-		return 0
+		return nil, fmt.Errorf("遍历任务材料集: %w", err)
 	}
 	materialRows.Close()
 
-	cleaned := 0
+	ids := make([]string, 0, len(rules))
 	for _, rule := range rules {
 		if rule.hasManual {
 			continue
@@ -701,9 +834,19 @@ func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
 		if usable > 0 {
 			continue
 		}
-		if err := services.RemoveCertFiles(rule.id); err != nil {
-			services.Logf("warn", "导入清理：删除无材料规则 %s 的证书文件失败: %v", rule.id, err)
-			services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理规则 %s 的残留证书文件失败：%v", rule.id, err), "")
+		ids = append(ids, rule.id)
+	}
+	return ids, nil
+}
+
+// removeCertFilesForRules 删除给定规则的残留证书/私钥文件，返回实际清理的
+// 规则数（幂等 best-effort，单规则失败仅告警留痕）。
+func removeCertFilesForRules(ruleIDs []string) int {
+	cleaned := 0
+	for _, id := range ruleIDs {
+		if err := services.RemoveCertFiles(id); err != nil {
+			services.Logf("warn", "导入清理：删除无材料规则 %s 的证书文件失败: %v", id, err)
+			services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理规则 %s 的残留证书文件失败：%v", id, err), "")
 			continue
 		}
 		cleaned++

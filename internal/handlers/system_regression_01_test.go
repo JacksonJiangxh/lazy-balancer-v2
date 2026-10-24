@@ -373,23 +373,38 @@ func TestFinishTxApplyCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 	if end := strings.Index(body, "\nfunc (h *Handlers) reloadDetailFor("); end > 0 {
 		body = body[:end]
 	}
-	needle := "if err := tx.Commit(); err != nil {"
+	// 提交入口是测试缝单源 commitTx(tx)（txCommitForTest 注入）；两形态都必须
+	// 走该入口，否则提交失败分支不可钉测。两种等价写法都认，避免换入口即假红。
+	needles := []string{"if err := commitTx(tx); err != nil {", "if err := tx.Commit(); err != nil {"}
 	branches := 0
 	searchFrom := 0
 	for {
-		index := strings.Index(body[searchFrom:], needle)
-		if index < 0 {
+		nextIndex, nextLen := -1, 0
+		for _, needle := range needles {
+			if index := strings.Index(body[searchFrom:], needle); index >= 0 && (nextIndex < 0 || index < nextIndex) {
+				nextIndex, nextLen = index, len(needle)
+			}
+		}
+		if nextIndex < 0 {
 			break
 		}
-		branchStart := searchFrom + index
-		searchFrom = branchStart + len(needle)
+		branchStart := searchFrom + nextIndex
+		searchFrom = branchStart + nextLen
 		branches++
-		windowEnd := branchStart + 900
-		if windowEnd > len(body) {
-			windowEnd = len(body)
+		// 分支体在收口重构后变长（recovery 两通道 + joined + 审计/响应），
+		// 窗口按「到下一个 commit 分支或文件尾」取整段，不做定长截断。
+		windowEnd := len(body)
+		for _, needle := range needles {
+			if index := strings.Index(body[searchFrom:], needle); index >= 0 && searchFrom+index < windowEnd {
+				windowEnd = searchFrom + index
+			}
 		}
-		if !strings.Contains(body[branchStart:windowEnd], "recoverCommittedViewAfterCommitFailure(tx)") {
+		window := body[branchStart:windowEnd]
+		if !strings.Contains(window, "recoverCommittedViewAfterCommitFailure(tx)") {
 			t.Errorf("第 %d 个 commit 失败分支缺少已提交视图恢复（运行配置/LKG/投影须同口径回退）", branches)
+		}
+		if !strings.Contains(window, "recordPostCommitRestoreFailure(") {
+			t.Errorf("第 %d 个 commit 失败分支缺少提交后失败横幅写点（对象=提交、两通道分离）", branches)
 		}
 	}
 	if branches != 2 {
@@ -434,8 +449,8 @@ func TestRecoverCommittedViewAfterCommitFailureRestoresRuntimeAndLKG(t *testing.
 		t.Fatalf("seed lkg: %v", err)
 	}
 
-	if restoreErr := h.recoverCommittedViewAfterCommitFailure(tx); restoreErr != nil {
-		t.Fatalf("恢复失败: %v", restoreErr)
+	if recovery := h.recoverCommittedViewAfterCommitFailure(tx); recovery.err() != nil {
+		t.Fatalf("恢复失败: %v", recovery.err())
 	}
 	if err := tx.Rollback(); !errors.Is(err, sql.ErrTxDone) {
 		t.Fatalf("恢复后未提交事务必须已回滚, Rollback err=%v", err)

@@ -588,6 +588,13 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 				}
 			}
 		}
+		// 渲染侧同口径截断（防御深度，与 crs_rule_groups 的
+		// emitCRSRuleGroupSelection 同构）：带外直写/集群旧快照/lbbak 旧格式
+		// 可绕过写入面 50 条上限，逐条发射会放大配置体积与生成耗时。
+		if len(excludedEntries) > CRSExcludedRulesMaxEntries {
+			Logf("warn", "策略 %q 的 crs_excluded_rules 条目数 %d 超过上限 %d（疑似带外/旧快照写入），已截断渲染", p.Name, len(excludedEntries), CRSExcludedRulesMaxEntries)
+			excludedEntries = excludedEntries[:CRSExcludedRulesMaxEntries]
+		}
 		for _, entry := range excludedEntries {
 			// 存量兜底：命中基础设施组（901 初始化/949 请求评估/959 响应评估）的
 			// 排除一律跳过——这些文件已由下方强制包含，排除若放行会在 Include 后
@@ -1336,9 +1343,18 @@ func buildWafHandlerWithIndex(ruleCaddyID string, policy *models.SecurityPolicy,
 const ipPrecheckAllowRuleID = 7
 
 // ipPrecheckAllowExemptRuleID 是 allow 白名单命中豁免规则（用户裁定）：
-// allow 交集命中的 IP 以 pass+nolog+skipAfter 跳过后续 GeoIP 逐策略链——白名单
-// 作为「VIP 豁免」语义；显式 deny（id:2/4）先于本规则评估，命中照常拦截。
+// allow 交集命中的 IP 以 pass+nolog+skipAfter 跳过预检段内其后的一切规则。
+// 语义边界（必须与本规则的实际位置一致，勿按「只豁免 GeoIP」理解）：
+//   - 显式 deny（id:2 ACL deny、id:4 遗留黑名单）在本规则之前发射——命中
+//     照常拦截，白名单不豁免显式黑名单；
+//   - 本规则之后的一切预检规则对白名单成员不再评估：逐策略 GeoIP 链（区域
+//     拦截）、爬虫伪装 deny（850000+policyID，含它策略的伪装族）、以及预检
+//     段内后续任何新增规则。即「白名单=该客户端被人工信任」的全豁免口径。
+//   - 预检段之外的处理面不受影响：限流、WAF/CRS、自定义规则等独立处理器
+//     照常评估（skipAfter 只跳到本段的 SECURITY_RULES_END 标记）。
+//
 // nolog：豁免本身不产生安全事件。无 allow 名单时不发射（避免恒真跳过）。
+// 顺序不变量由 geoip_precheck_exempt_test.go 的三段发射序断言钉住。
 const ipPrecheckAllowExemptRuleID = 13
 
 // geoipPrecheckRuleBase 是 GeoIP 预检链的 SecRule id 段基址（阶段化执行模型：
@@ -1852,10 +1868,12 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", operand, ipPrecheckAllowRuleID, denyStatus))
 		}
 	}
-	// allow 白名单豁免（用户裁定）：交集命中 = pass + 跳过后续 GeoIP
-	// 逐策略链（VIP 豁免语义）。置于 deny/blacklist 之后——显式 deny 命中照常
-	// 拦截（其 skipAfter 先行短路，豁免规则不参与评估）；置于 GeoIP 链之前——
-	// 白名单成员不再被区域拦截。交集为空（恒拒形态）时无成员可豁免，不发射。
+	// allow 白名单豁免（用户裁定）：交集命中 = pass + 跳过预检段内其后的一切
+	// 规则（VIP 全豁免语义，语义边界见 ipPrecheckAllowExemptRuleID 注释）。
+	// 置于 deny/blacklist 之后——显式 deny 命中照常拦截（其 skipAfter 先行
+	// 短路，豁免规则不参与评估）；置于 GeoIP 链与爬虫伪装族之前——白名单
+	// 成员不再被区域拦截、也不被爬虫伪装规则拦截（含他策略的伪装族）。
+	// 交集为空（恒拒形态）时无成员可豁免，不发射。
 	if len(allowIntersection) > 0 {
 		operand, err := ipListRuleOperand(precheckProjectionScope("allow-exempt", ruleCaddyID), allowIntersection, false)
 		if err != nil {
@@ -2242,6 +2260,14 @@ func crsFilenameToRuleIDRange(s string) string {
 // 格式无上限，保持现状兼容；50 条上限口径）。
 const CRSExcludedRulesMaxEntries = 50
 
+// crsScopedExclusionMaxDirectives 是单策略作用域排除（scope=ip/list）的
+// ctl:ruleRemoveById 发射行预算。条目数上限挡不住组号展开：每条两位组号
+// target 会展开为该组全部规则 ID（CRS 一组数百条），50 条组号条目即可产出
+// 数万行。行预算按展开后的真实行数截断——带外/旧快照写入不得把生成期行数
+// 放大到百万级（生成全程持 CaddyOpLock，配置体积与 /load 都随之失控）。
+// var 供测试缩小预算构造边界。截断方向安全：排除被少发=拦截更多。
+var crsScopedExclusionMaxDirectives = 20000
+
 // CRSRuleGroupsMaxEntries crs_rule_groups 的条目上限（按原始条目数计，去重
 // 之前）。与 crs_excluded_rules 同族限量：每条 6 位 ID 触发索引 Find 与一行
 // SecRuleRemoveById 输出，超大数组放大配置体积/生成时间。200 远高于 UI
@@ -2530,6 +2556,10 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 			operandByMatchKey[matchKey] = operand
 		}
 		for _, id := range expandCRSScopedExclusionTargets(entry.Target, index, p) {
+			if seq >= crsScopedExclusionMaxDirectives {
+				Logf("warn", "策略 %q 的作用域排除展开行数达到上限 %d，其余排除不再发射（少排除=拦截更多，方向安全）", p.Name, crsScopedExclusionMaxDirectives)
+				return nil
+			}
 			seq++
 			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,pass,nolog,ctl:ruleRemoveById=%s\"\n",
 				operand, crsScopedExclusionIDBase+seq, id))

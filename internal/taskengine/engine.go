@@ -218,10 +218,9 @@ type Engine struct {
 	schedDone    chan struct{}
 	// stopped 原子化：daemon 退出清理路径在 r.mu
 	// 临界区外复核——不得为读它反向嵌套 e.mu（Stop 持 e.mu→r.mu）。
-	stopped   atomic.Bool
-	startedAt time.Time
-	daemonWG  sync.WaitGroup // daemon goroutine 退出等待（2026-10-04 测试污染修复）
-	runWG     sync.WaitGroup // Scheduled/Periodic/Oneshot 在途 Run 退出等待
+	stopped  atomic.Bool
+	daemonWG sync.WaitGroup // daemon goroutine 退出等待（2026-10-04 测试污染修复）
+	runWG    sync.WaitGroup // Scheduled/Periodic/Oneshot 在途 Run 退出等待
 	// inFlight 是 Scheduled/Periodic/Oneshot 在途 Run 计数
 	// runWG 无可取消 Wait，配置导入的「暂停 + 有界排空」需要可轮询计数。
 	// 与 runWG.Add/Done 严格配对（唯一登记点 reserveRunInternal）。
@@ -244,6 +243,12 @@ type Options struct {
 	// StartPaused：以暂停调度形态启动——装配方在
 	// RunBootSyncTasks 完成后必须调 ResumeScheduling，否则周期/定时任务
 	// 与手动/自动执行（startup 豁免）永不投递。
+	// 作用域边界（有意设计）：暂停只覆盖 tick 投递与 Trigger/RunSync/runNow
+	// 登记，**不覆盖常驻族**——Daemon 的 StartLoop→tryStartDaemon 照常拉起
+	// （常驻 Run 体起步即真实接管服务，如 cert-issuance→StartACME→部署重试）。
+	// 因此「装配期不跑业务」对常驻族由装配方的配置屏障承担
+	// （services.InitTaskEngine 在默认启动前 BeginConfigImportHold，BootSync
+	// 完成后 EndConfigImportHold）；不得把常驻启停并入 schedPaused。
 	StartPaused bool
 }
 
@@ -282,7 +287,6 @@ func NewEngine(opts Options) *Engine {
 	e := &Engine{
 		opts: opts, regs: map[string]*registration{}, role: true,
 		schedStop: make(chan struct{}), schedDone: make(chan struct{}),
-		startedAt:           time.Now(),
 		daemonRestartDelays: append([]time.Duration(nil), delays...),
 	}
 	e.schedPaused.Store(opts.StartPaused)
@@ -297,8 +301,6 @@ func (e *Engine) ResumeScheduling() {
 	e.schedPaused.Store(false)
 	e.mu.Unlock()
 }
-
-func (e *Engine) StartedAt() time.Time { return e.startedAt }
 
 // IsStopped 返回引擎是否已停止（测试装配据此避免复用停止实例）。
 func (e *Engine) IsStopped() bool { return e.stopped.Load() }
@@ -566,6 +568,12 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 }
 
 func (e *Engine) Register(d Descriptor) error {
+	// 已停止的引擎不会再有调度 goroutine 判活：注册成功只会得到「已注册但
+	// 永不被调度」的静默形态（StartLoop 对 stopped 恒 no-op）。响亮拒绝，
+	// 装配方须显式新建引擎。
+	if e.stopped.Load() {
+		return ErrEngineStopped
+	}
 	if d.ID == "" || d.Family == "" {
 		return errors.New("taskengine: ID/Family 必填")
 	}
@@ -979,12 +987,12 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 	if r.desc.Kind == KindOneshot {
 		return
 	}
-	绕过 := len(hasWork) > 0
-	if 绕过 && !hasWork[0] {
+	bypassStop := len(hasWork) > 0
+	if bypassStop && !hasWork[0] {
 		return
 	}
 	r.mu.Lock()
-	if 绕过 {
+	if bypassStop {
 		r.loopEnabled = true
 		// 新工作唤醒=显式恢复调度：仅在自愈已用尽时重置预算（普通唤醒
 		// 不得清零崩溃循环的退避预算）。
@@ -992,6 +1000,13 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 			r.abnormalRestarts = 0
 			r.restartExhausted = false
 		}
+		// 越过「已停止」=重新接受本任务的预约：与 StartLoop 的关→开过渡
+		// 同口径清空 Scheduled 槽消费水位/失败退避/求值节拍。缺这一步时，
+		// 停止前 schedDoneSlot 已等于当前 due 槽（成功落定未推进槽/用户取消
+		// 已到期槽）的任务重开后 tick 的到期判定恒拒绝同一槽——loop_on=true
+		// 却零投递、零 task_runs 行（静默停摆，只能靠重启恢复）。非 Scheduled
+		// 由 resetScheduleProgressLocked 内建 guard 零动作。
+		resetScheduleProgressLocked(r)
 	} else if !r.loopEnabled {
 		r.mu.Unlock()
 		return
@@ -1255,19 +1270,33 @@ func runGuarded(run func(RunContext) error, rc RunContext) (err error) {
 //	safeSlot     → zero（无槽，不投递）
 //	safeInterval → 0（tick 按非正周期停止该任务调度）
 var (
-	schedFnPanicMu   sync.Mutex
-	schedFnPanicLast time.Time
+	schedFnPanicMu sync.Mutex
+	// 按调度函数（kind = 任务 ID + Fn 名）分桶：全局单槽时任务 A 每秒 panic
+	// 会让任务 B 同期首次 panic 的 ERROR 在最长 1 分钟内被丢弃，多任务同源
+	// 故障（同一次 DB 故障触发多个装配闭包 panic）只剩一条告警。桶数上界=
+	// 注册任务×Fn 面（调用点固定），有界。
+	schedFnPanicLast       = map[string]time.Time{}
+	schedFnPanicSuppressed = map[string]int{}
 )
 
-// warnSchedFnPanic 限流告警（1 分钟一条）：panic 闭包每 tick 复现时不得刷日志。
+// warnSchedFnPanic 限流告警（同一调度函数 1 分钟一条）：panic 闭包每 tick
+// 复现时不得刷日志。被抑制的次数不丢——下次放行时随行披露，避免「期间另有
+// N 次」在排障面蒸发。
 func warnSchedFnPanic(kind string, p any) {
 	schedFnPanicMu.Lock()
 	defer schedFnPanicMu.Unlock()
 	now := time.Now()
-	if now.Sub(schedFnPanicLast) < time.Minute {
+	if now.Sub(schedFnPanicLast[kind]) < time.Minute {
+		schedFnPanicSuppressed[kind]++
 		return
 	}
-	schedFnPanicLast = now
+	suppressed := schedFnPanicSuppressed[kind]
+	delete(schedFnPanicSuppressed, kind)
+	schedFnPanicLast[kind] = now
+	if suppressed > 0 {
+		log.Printf("ERROR: taskengine: 调度函数 %s panic（本轮 fail-closed 跳过）: %v（期间另有 %d 次同类 panic 未逐条打印）", kind, p, suppressed)
+		return
+	}
 	log.Printf("ERROR: taskengine: 调度函数 %s panic（本轮 fail-closed 跳过）: %v", kind, p)
 }
 
@@ -1314,6 +1343,49 @@ func safeString(kind string, fn func() string) (v string) {
 
 // ---- 历史与统计 ----
 
+// StaleRunningGrace 是「残留 running 行」判定的年龄门：行快照与内存快照是两次
+// 独立取数，刚写入的行可能在两次快照之间完成（呈现「行 running、内存空闲」），
+// 立即判中断会在安全运维页面误报一次失败。终态 UPDATE 失败的残留行一定会变老，
+// 短宽限不影响识别。历史/最近运行/任务列表共用本常量与同一判定。
+const StaleRunningGrace = 30 * time.Second
+
+// StaleRunInterruptedMessage 残留 running 行归一后的说明（历史与列表同源）。
+const StaleRunInterruptedMessage = "运行终态未落库（已按异常结束处理）"
+
+// StaleRunningResidual 判定 task_runs.started_at 是否已超出瞬态宽限（调用方先
+// 自行确认本进程无该任务在途执行）。started_at 是配置时区墙钟串，按同一时区
+// 解析；不可解析的时间戳维持旧口径（判残留）。
+func StaleRunningResidual(startedAt string) bool {
+	if startedAt == "" {
+		return true
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", startedAt, engineLocPtr())
+	if err != nil {
+		return true
+	}
+	return time.Since(t) >= StaleRunningGrace
+}
+
+// normalizeStaleRunningRows 把「库行 running 但本进程已无该任务在途执行且行
+// 年龄超过宽限」的残留行归一为 interrupted——终态 UPDATE 失败只 WARN，行会
+// 留到进程重启才被 RecoverOrphans 回收；不归一的话列表/历史/最近运行会各自
+// 呈现相反结论（列表「失败/已中断」而历史/LatestRun 仍称「运行中」）。
+func (e *Engine) normalizeStaleRunningRows(taskID string, runs []RunRecord) []RunRecord {
+	if len(runs) == 0 || e.IsTaskInFlight(taskID) {
+		return runs
+	}
+	for i := range runs {
+		if runs[i].Status != "running" || !StaleRunningResidual(runs[i].StartedAt) {
+			continue
+		}
+		runs[i].Status = "interrupted"
+		if runs[i].Message == "" {
+			runs[i].Message = StaleRunInterruptedMessage
+		}
+	}
+	return runs
+}
+
 func (e *Engine) History(id string, limit int) []RunRecord {
 	if limit <= 0 {
 		limit = 20
@@ -1347,7 +1419,7 @@ func (e *Engine) History(id string, limit int) []RunRecord {
 	if err := rows.Err(); err != nil {
 		log.Printf("WARNING: taskengine: 任务历史 %s 迭代失败（部分历史缺失）: %v", id, err)
 	}
-	return out
+	return e.normalizeStaleRunningRows(id, out)
 }
 
 func (e *Engine) RecoverOrphans() int64 {
@@ -1526,6 +1598,9 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 
 // RunAsync 原子占位后异步执行一次：入口失败在任何 HTTP 响应
 // 之前同步返回（可映射 409/503），成功即已占位——「已受理」不再说谎。
+// 测试专供（生产零调用）：生产手动触发唯一入口是
+// services.TriggerTaskAsync → RunAsyncResult（需 onDone 补记补偿审计）；
+// 本函数是 onDone=nil 的薄包装，保留给测试装配，勿新增生产消费方。
 func (e *Engine) RunAsync(id, trigger, operator string) error {
 	return e.RunAsyncResult(id, trigger, operator, nil)
 }
@@ -1611,6 +1686,7 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 			r.schedFailStreak++
 			delay := scheduledFailBackoff(r.schedFailStreak)
 			r.schedRetryAfter = time.Now().Add(delay)
+			outcome := map[bool]string{true: "失败", false: "跳过"}[status == "failed"]
 			// 连续失败/跳过留 WARN 行（节流：非首轮至多每分钟一条——兜底
 			// 本身的降噪，不得再制造日志洪峰）。首轮豁免也受
 			// scheduledBackoffFirstWarnFloor 地板约束：槽消费机制覆盖
@@ -1623,8 +1699,20 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 			}
 			if warnDue {
 				r.schedBackoffLastWarnAt = time.Now()
-				outcome := map[bool]string{true: "失败", false: "跳过"}[status == "failed"]
 				taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮%s，退避 %s 后重投（连续 %d 轮；业务 Run 早退须推进槽，见任务引擎标准）", outcome, delay, r.schedFailStreak))
+			}
+			if trigger == "auto" && r.schedFailStreak >= scheduledFailStreakStopLimit {
+				// 与常驻族「重拉预算用尽即停调」对称的终点：退避只节流不定界，
+				// 业务永不推进槽的缺陷形态下 task_runs 会以 30s 节拍无限增长
+				// （≈2880 行/日，保留期内单任务数十万行）并把 24h 失败计数放大
+				// 到失真。连续 N 轮（含首轮）仍未推进槽=调度侧已无可为，停调
+				// 并留痕；StartLoop 关→开（或业务推进槽后重开）即恢复。
+				// 只对自动轮生效：手动触发轮由用户显式发起、次数天然有界，
+				// 不得因几次手动失败让自动排程静默停摆。
+				r.loopEnabled = false
+				r.schedFailStreak = 0
+				r.schedRetryAfter = time.Time{}
+				taskLogAppend(id, fmt.Sprintf("[error] 排程槽连续 %d 轮未推进且本轮%s，已停止该任务调度（需业务推进槽或重开调度）", scheduledFailStreakStopLimit, outcome))
 			}
 		default:
 			r.schedFailStreak = 0
@@ -1659,17 +1747,26 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 }
 
 func truncMsg(err error) string {
-	m := err.Error()
-	if len(m) > 500 {
-		// 裁剪点回退到 rune 边界（与 truncateTaskLogLine 同手法）——按字节
-		// 硬切多字节 UTF-8 会产出非法串落进 task_runs.message。
-		cut := 500
-		for cut > 0 && !utf8.RuneStart(m[cut]) {
-			cut--
-		}
-		m = m[:cut]
+	return truncateUTF8(err.Error(), 500, "")
+}
+
+// truncateUTF8 把 s 裁到 maxBytes 字节预算内，裁剪点回退到 rune 边界——按
+// 字节硬切多字节 UTF-8 会产出非法串（页/编辑器显示乱码，按行解析的工具可能
+// 整行丢弃）。suffix 计入预算（suffix="" 即纯裁剪）：调用方显式决定「预算
+// 是否含后缀」，两个消费面（task_runs.message 500B 不含后缀、任务日志行
+// 4096B 含后缀）语义各自保留，实现单源。
+func truncateUTF8(s string, maxBytes int, suffix string) string {
+	if len(s) <= maxBytes {
+		return s
 	}
-	return m
+	cut := maxBytes - len(suffix)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + suffix
 }
 
 // scheduledBackoffFirstWarnFloor 退避 WARN「首轮」的最小间隔地板：
@@ -1690,9 +1787,17 @@ func slotDueForBackoff(nextSlot, prevSlot time.Time, now time.Time) bool {
 	return !nextSlot.After(prevSlot)
 }
 
+// scheduledFailStreakStopLimit 是「槽未推进连续失败/跳过」的终点（含首轮，
+// 即连续第四次）：退避表三档（1s/5s/30s）用尽——与常驻重拉「三次用尽后停调」
+// 同形的对称终点。安全网不得无限重投：长期缺陷态下 30s 节拍会让 task_runs
+// 无限增长并失真 24h 统计。停调可被 StartLoop 关→开显式恢复
+// （resetScheduleProgressLocked 清 streak），不构成不可恢复状态。
+const scheduledFailStreakStopLimit = 4
+
 // scheduledFailBackoff Scheduled「槽未推进+失败」退避表（与常驻重拉
 // defaultDaemonRestartDelays 同形 1s/5s/30s，第 3 次起封顶 30s）——节流
-// 不是停摆：退避衰减后照常重投（业务修复/槽刷新即恢复常轨）。
+// 不是停摆：退避衰减后照常重投（业务修复/槽刷新即恢复常轨），连续到
+// scheduledFailStreakStopLimit 才停调。
 func scheduledFailBackoff(streak int) time.Duration {
 	switch {
 	case streak <= 1:
@@ -1937,11 +2042,19 @@ func (e *Engine) tick() {
 			if interval <= 0 {
 				// 动态 IntervalFn 只能在 tick 锁外求值（注册期调用会阻塞装配）。
 				// 非正周期必须停止该任务调度，否则 due 恒真形成单飞忙循环。
+				// 停止来源必须机器可读：只写任务日志行时视图与用户主动停止完全
+				// 同形（loop_on=false、状态列 idle、24h 失败计数 0、无 task_runs
+				// 痕迹），管理员只能翻 tasks/{id}.log 分辨。故同步落一条 failed
+				// 运行行——状态列呈现 failed（含原因），与 executeRun 的失败轮
+				// 同形；StartLoop 关→开即可重启该任务（下一轮重新求值）。
 				r.mu.Lock()
 				r.loopEnabled = false
 				r.lastCheck = time.Time{}
 				r.mu.Unlock()
-				taskLogAppend(id, fmt.Sprintf("[error] 调度停止：IntervalFn 必须返回正周期，实际=%s", interval))
+				const stopMsg = "调度停止：IntervalFn 必须返回正周期"
+				runID := globalInsertRunAt(id, r.desc.Family, "auto", engineNowStr(), "")
+				e.finishRunWithMessage(runID, "failed", 0, stopMsg)
+				taskLogAppend(id, fmt.Sprintf("[error] %s，实际=%s（引擎已停止该任务调度，重开调度后重新求值）", stopMsg, interval))
 				continue
 			}
 			r.mu.Lock()
@@ -2129,14 +2242,7 @@ const taskLogTruncSuffix = " …[行已截断]"
 // rune 边界——错误串含中文时按字节硬切会产出非法 （页/编辑器
 // 显示乱码，且按行解析的工具可能整行丢弃）。
 func truncateTaskLogLine(line string) string {
-	if len(line) <= taskLogLineMaxBytes {
-		return line
-	}
-	cut := taskLogLineMaxBytes - len(taskLogTruncSuffix)
-	for cut > 0 && !utf8.RuneStart(line[cut]) {
-		cut--
-	}
-	return line[:cut] + taskLogTruncSuffix
+	return truncateUTF8(line, taskLogLineMaxBytes, taskLogTruncSuffix)
 }
 
 // appendTaskLogLine 打开→追加→关闭共享实现（taskLogAppend

@@ -170,3 +170,40 @@ func TestEngineGate_precheckDirectivesWithLiftedStatus481(t *testing.T) {
 	}
 	compileForEngineGate(t, directives) // 复用门禁 helper（过滤 SecAuditLog 等环境行）
 }
+
+// 语义声明钉（白名单=全豁免）：allow 豁免规则（id:13 skipAfter）位于爬虫伪装
+// deny（850000+policyID）之前——白名单成员被人工信任后不再评估爬虫伪装族
+// （含他策略的伪装规则）。该顺序即「白名单全豁免」语义，注释与之同源；若
+// 未来改为「只豁免 GeoIP」，必须把伪装块移到 id:13 之前并同步更新注释。
+func TestBuildIPPrecheckDirectives_allowExemptPrecedesCrawlerSpoof(t *testing.T) {
+	allowPolicy := &models.SecurityPolicy{
+		ID:           21,
+		PolicyType:   models.PolicyTypeStage1,
+		Mode:         "off",
+		IPACLEnabled: true,
+		IPACLMode:    "allow",
+		IPACLList:    `["203.0.113.10"]`,
+	}
+	crawlerPolicy := &models.SecurityPolicy{
+		ID:                  24,
+		PolicyType:          models.PolicyTypeStage1,
+		Mode:                "blocking",
+		Enabled:             true,
+		GeoIPMode:           "deny",
+		GeoIPCountries:      json.RawMessage(`["海外"]`),
+		GeoIPCrawlerExempt:  true,
+		GeoIPCrawlerEngines: json.RawMessage(`["googlebot"]`),
+		IPWhitelistEnabled:  true,
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, crawlerPolicy}, 403, "lb_exempt_spoof"))
+
+	idxExempt := strings.Index(directives, `id:13,phase:1,pass`)
+	idxSpoof := strings.Index(directives, `id:850024,phase:1,deny`)
+	if idxExempt < 0 || idxSpoof < 0 {
+		t.Fatalf("missing anchors (exempt=%d spoof=%d):\n%s", idxExempt, idxSpoof, directives)
+	}
+	if idxExempt > idxSpoof {
+		t.Fatalf("allow 豁免必须前置于爬虫伪装 deny（全豁免语义；exempt=%d spoof=%d）:\n%s", idxExempt, idxSpoof, directives)
+	}
+	compileForEngineGate(t, directives)
+}

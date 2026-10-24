@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -480,5 +481,44 @@ func TestGetAuditLogs_degradedResponseEchoesRequestedPagination(t *testing.T) {
 	}
 	if !resp.Data.Partial {
 		t.Fatal("降级响应必须 partial=true")
+	}
+}
+
+// 深翻页门必须同样作用于降级路径：审计库未就绪时 ?page=501 若回 200，同一
+// 参数在故障窗口内外状态码分叉，按文档生成的分页器会算出越界偏移。
+func TestGetAuditLogs_degradedResponseStillRejectsDeepPage(t *testing.T) {
+	old := db.AuditDB
+	db.AuditDB = nil
+	t.Cleanup(func() { db.AuditDB = old })
+
+	for _, tc := range []struct {
+		page int
+		want int
+	}{
+		{page: auditLogDeepPageLimit + 1, want: http.StatusBadRequest},
+		{page: auditLogDeepPageLimit, want: http.StatusOK},
+	} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/audit-logs?page="+strconv.Itoa(tc.page), nil)
+		(&Handlers{}).GetAuditLogs(ctx)
+		if recorder.Code != tc.want {
+			t.Fatalf("page=%d status=%d body=%s, want %d", tc.page, recorder.Code, recorder.Body.String(), tc.want)
+		}
+		if tc.want != http.StatusOK {
+			continue
+		}
+		var resp struct {
+			Data struct {
+				Page    int  `json:"page"`
+				Partial bool `json:"partial"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Data.Page != tc.page || !resp.Data.Partial {
+			t.Fatalf("上限页回显 page=%d partial=%v, want %d/true", resp.Data.Page, resp.Data.Partial, tc.page)
+		}
 	}
 }

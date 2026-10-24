@@ -51,6 +51,11 @@ func TestInitTaskEngine_pausesTickUntilBootSyncDone(t *testing.T) {
 		return nil
 	})
 	t.Cleanup(func() { SetConfigLoadRerun(nil) })
+	// 装配期服务屏障：常驻族（cert-issuance）的 Run 体起步即接管部署面
+	// （StartACME→CA 队列/部署重试）。配置载入完成前必须被屏障挡住。
+	lifecycleStarted := make(chan struct{}, 1)
+	SetCertIssuanceLifecycleHooks(func() { lifecycleStarted <- struct{}{} }, func() {})
+	t.Cleanup(func() { SetCertIssuanceLifecycleHooks(nil, nil) })
 	initDone := make(chan *taskengine.Engine, 1)
 	go func() { initDone <- InitTaskEngine("", t.TempDir()+"/app.log") }()
 
@@ -58,6 +63,12 @@ func TestInitTaskEngine_pausesTickUntilBootSyncDone(t *testing.T) {
 	case <-bootEntered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("BootSync did not reach configLoadRerun")
+	}
+	// BootSync 未完成 = 配置未载入：证书签发生命周期不得已接管部署面。
+	select {
+	case <-lifecycleStarted:
+		t.Fatal("配置载入完成前启动了证书签发生命周期（常驻族越过装配屏障）")
+	case <-time.After(200 * time.Millisecond):
 	}
 	te := TaskEngine()
 	if te == nil {
@@ -72,6 +83,16 @@ func TestInitTaskEngine_pausesTickUntilBootSyncDone(t *testing.T) {
 	case te = <-initDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("InitTaskEngine did not finish after BootSync release")
+	}
+	// 屏障在 BootSync 后解除：被延迟的证书生命周期已兑现，屏障无残留
+	// （深度泄漏会让后续导入/队列恢复永久停在「只登记意图」状态）。
+	if configImportHoldActive() {
+		t.Fatal("InitTaskEngine 返回后装配屏障未释放（depth>0）")
+	}
+	select {
+	case <-lifecycleStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("配置载入完成后证书签发生命周期未被兑现（屏障只延迟不丢弃）")
 	}
 	// 看门狗整轮未判定现在会返回错误（Caddy admin 不可达=未判定），
 	// 本用例断言的是「BootSync 后调度已恢复」，故注入可用的假 Caddy admin，

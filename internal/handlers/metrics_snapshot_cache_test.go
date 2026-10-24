@@ -340,3 +340,29 @@ func TestLoadCaddyMetricsSnapshot_ttlAnchoredAtFetchCompletion(t *testing.T) {
 		t.Fatalf("抓取 %d 次, want 1（TTL 以抓取开始时刻为基准时，慢抓取条目出生即过期）", got)
 	}
 }
+
+// 快照缓存按「进程单指标源」实现单条目语义（改地址后旧 URL 的正文不得常驻，
+// 单条最多 16MB）；面板缓存必须按 URL 区分，避免不同实例互相读到对方视角。
+func TestMetricsCaches_areScopedToCurrentMetricsURL(t *testing.T) {
+	resetMetricsDashboardCacheForTest()
+	t.Cleanup(resetMetricsDashboardCacheForTest)
+	now := time.Now()
+
+	storeCaddyMetricsSnapshot("http://a/metrics", []byte("a"), nil, now)
+	storeCaddyMetricsSnapshot("http://b/metrics", []byte("b"), nil, now)
+	caddyMetricsSnapshots.Lock()
+	entries := len(caddyMetricsSnapshots.entries)
+	_, hasLatest := caddyMetricsSnapshots.entries["http://b/metrics"]
+	caddyMetricsSnapshots.Unlock()
+	if entries != 1 || !hasLatest {
+		t.Fatalf("快照条目=%d hasLatest=%v, want 单条目且为最新 URL", entries, hasLatest)
+	}
+
+	storeMetricsDashboardOutcome("http://a/metrics", metricsDashboardOutcome{payload: gin.H{"x": 1}}, now)
+	if _, ok := loadMetricsDashboardCache("http://b/metrics", now); ok {
+		t.Fatal("面板缓存命中其他 URL 的结果（改地址/多实例会串味）")
+	}
+	if _, ok := loadMetricsDashboardCache("http://a/metrics", now); !ok {
+		t.Fatal("同 URL 缓存必须命中")
+	}
+}

@@ -95,14 +95,133 @@ export const trustedProxyHeadersError = (values: readonly string[]): string => {
 }
 
 /**
- * 总量门：内联 + 引用展开 ≤ 2000（后端内联面与引用面合并判定）。
+ * 总量门：内联 ∪ 引用展开 ≤ 2000（与后端 `trustedProxyTotalGate` 同口径）。
  *
- * `referencedEntries` 来自 /security/ip-lists 的 entry_count 缓存，列表被他人
- * 改动时可能短暂偏差且缺失按 0 计——只在「已知合计已超限」时拦截（实际值只会
- * 更大），不确定形态交给后端兜底，避免误拒合法配置。
+ * 后端按「规范化前缀集合大小」判定——同一网段既内联又出现在引用名单时只计
+ * 一次；按条目数累加会把实际展开集合远小于上限的合法载荷拒掉。引用面的条目
+ * 原文来自 `GET /security/ip-lists/:id`（`values`）；尚未拉取或拉取失败时
+ * （`null`）退回 `entryCount`（列表接口缓存的条数）估算——只在「已知合计已
+ * 超限」时拦截，不确定形态交给后端兜底，避免误拒合法配置。
  */
-export const trustedProxyTotalError = (inlineCount: number, referencedEntries: number): string => {
-  const total = inlineCount + referencedEntries
-  if (total <= TRUSTED_PROXY_MAX_TOTAL_ENTRIES) return ''
-  return `受信网段总数超过 ${TRUSTED_PROXY_MAX_TOTAL_ENTRIES} 上限（内联 ${inlineCount} + 引用展开 ${referencedEntries} = ${total}），请收窄内联范围或减少引用列表`
+export interface TrustedProxyReferencedEntries {
+  /** 名单条目原文；null = 尚未拉取或拉取失败（按 entryCount 计入且无法去重）。 */
+  readonly values: readonly string[] | null
+  /** 列表条数缓存（/security/ip-lists 的 entry_count）；values 已知时忽略。 */
+  readonly entryCount: number
+}
+
+/** 展开规模（并集口径）。referenced 含与内联重叠的键，与后端错误文案同构。 */
+export interface TrustedProxyExpansion {
+  readonly union: number
+  readonly inline: number
+  readonly referenced: number
+  /** 未能去重、按 entryCount 计入的条数（>0 时文案须声明为估算）。 */
+  readonly unresolved: number
+}
+
+const ipv4Octets = (address: string): readonly number[] | null => {
+  const parts = address.split('.')
+  if (parts.length !== 4) return null
+  const octets = parts.map((part) => (/^\d{1,3}$/.test(part) ? Number(part) : Number.NaN))
+  return octets.some((octet) => !Number.isInteger(octet) || octet > 255) ? null : octets
+}
+
+/** IPv6 地址 → 8 个十六进制组（小写、去前导零）；无法解析返回 null。
+ *  内嵌 IPv4 尾（`::ffff:1.2.3.4`）按 32 位折算成两个组——使同一地址的不同
+ *  书写形态落到同一键上（后端 netip 解析后同样视为同一 Addr）。 */
+const ipv6Groups = (address: string): readonly number[] | null => {
+  const text = address.trim().toLowerCase()
+  if (!text.includes(':')) return null
+  const lastColon = text.lastIndexOf(':')
+  let normalized = text
+  if (text.slice(lastColon + 1).includes('.')) {
+    const octets = ipv4Octets(text.slice(lastColon + 1))
+    if (!octets) return null
+    const high = ((octets[0] ?? 0) << 8) | (octets[1] ?? 0)
+    const low = ((octets[2] ?? 0) << 8) | (octets[3] ?? 0)
+    normalized = `${text.slice(0, lastColon + 1)}${high.toString(16)}:${low.toString(16)}`
+  }
+  const doubleColon = normalized.indexOf('::')
+  let groupsText: readonly string[]
+  if (doubleColon >= 0) {
+    if (normalized.indexOf('::', doubleColon + 1) >= 0) return null
+    const left = normalized.slice(0, doubleColon)
+    const right = normalized.slice(doubleColon + 2)
+    const leftGroups = left === '' ? [] : left.split(':')
+    const rightGroups = right === '' ? [] : right.split(':')
+    const missing = 8 - leftGroups.length - rightGroups.length
+    if (missing < 0) return null
+    groupsText = [...leftGroups, ...Array.from({ length: missing }, () => '0'), ...rightGroups]
+  } else {
+    groupsText = normalized.split(':')
+  }
+  if (groupsText.length !== 8) return null
+  const groups = groupsText.map((group) => (/^[0-9a-f]{1,4}$/.test(group) ? Number.parseInt(group, 16) : Number.NaN))
+  return groups.some((group) => Number.isNaN(group)) ? null : groups
+}
+
+/**
+ * 规范化前缀键（裸 IP 补 /32 或 /128）：只用于前端并集判定，故不必逐字等于
+ * Go 的 `netip.Prefix.String()`——只需让**同一地址的同一前缀**落到同一键上。
+ * 无法解析返回 null（非法形态由网段判据逐条点名，这里不计入并集）。
+ */
+export const trustedProxyPrefixKey = (rawValue: string): string | null => {
+  const value = rawValue.trim()
+  if (!value) return null
+  const slash = value.indexOf('/')
+  const address = slash < 0 ? value : value.slice(0, slash)
+  const bitsText = slash < 0 ? '' : value.slice(slash + 1)
+  const v4 = ipv4Octets(address)
+  if (v4) {
+    const bits = bitsText === '' ? 32 : Number(bitsText)
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) return null
+    return `v4:${v4.join('.')}/${bits}`
+  }
+  const v6 = ipv6Groups(address)
+  if (!v6) return null
+  const bits = bitsText === '' ? 128 : Number(bitsText)
+  if (!Number.isInteger(bits) || bits < 0 || bits > 128) return null
+  return `v6:${v6.join(':')}/${bits}`
+}
+
+/** 受信网段展开规模：内联 ∪ 引用展开（规范化前缀去重），与后端判定同口径。 */
+export const trustedProxyExpansion = (
+  inlineValues: readonly string[],
+  referenced: readonly TrustedProxyReferencedEntries[],
+): TrustedProxyExpansion => {
+  const union = new Set<string>()
+  for (const value of inlineValues) {
+    const key = trustedProxyPrefixKey(value)
+    if (key) union.add(key)
+  }
+  const inline = union.size
+  let referencedKeys = 0
+  let unresolved = 0
+  for (const ref of referenced) {
+    if (ref.values === null) {
+      unresolved += Math.max(0, ref.entryCount)
+      continue
+    }
+    const keys = new Set<string>()
+    for (const value of ref.values) {
+      const key = trustedProxyPrefixKey(value)
+      if (key) keys.add(key)
+    }
+    referencedKeys += keys.size
+    for (const key of keys) union.add(key)
+  }
+  return { union: union.size + unresolved, inline, referenced: referencedKeys + unresolved, unresolved }
+}
+
+/** 总量门：返回空串=通过，否则为可直接展示的汇总文案（与后端文案同结构）。 */
+export const trustedProxyTotalError = (
+  inlineValues: readonly string[],
+  referenced: readonly TrustedProxyReferencedEntries[],
+): string => {
+  const { union, inline, referenced: referencedCount, unresolved } = trustedProxyExpansion(inlineValues, referenced)
+  if (union <= TRUSTED_PROXY_MAX_TOTAL_ENTRIES) return ''
+  const estimate = unresolved > 0
+    ? `；其中 ${unresolved} 条按条数估算（引用名单条目未加载，重叠网段未参与去重）`
+    : ''
+  return `受信网段总数超过 ${TRUSTED_PROXY_MAX_TOTAL_ENTRIES} 上限（去重后合计 ${union}：内联 ${inline} + 引用展开 ${referencedCount}；重叠网段只计一次${estimate}），请收窄内联网段或减少引用列表`
 }

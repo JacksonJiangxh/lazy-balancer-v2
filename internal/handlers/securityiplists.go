@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"lazy-balancer-v2/internal/services"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -442,6 +443,47 @@ func normalizeIPListEntriesJSON(raw string) string {
 		return "[]"
 	}
 	return raw
+}
+
+// ipListEntriesChanged 判定条目是否**实际变化**（渲染生效集同口径）。
+// 原始 JSON 字节等值会把前端序列化差异（键序/空白/数组重排）判为变化，
+// 触发一次无收益的投影原子重写与审计噪音；解析失败（带外脏行）时退回
+// 字节比较——宁可多判一次变化，也不得漏判真实变化。
+func ipListEntriesChanged(oldJSON, newJSON string) bool {
+	if oldJSON == newJSON {
+		return false
+	}
+	var oldEntries, newEntries []models.IPListEntry
+	if err := json.Unmarshal([]byte(oldJSON), &oldEntries); err != nil {
+		return true
+	}
+	if err := json.Unmarshal([]byte(newJSON), &newEntries); err != nil {
+		return true
+	}
+	if len(oldEntries) != len(newEntries) {
+		return true
+	}
+	// 条目顺序不参与渲染（生效集/投影均按集合消费），故按排序后的四元组
+	// 逐项比较：value/remark/created_at/expires_at 任一不同即为真实变化。
+	key := func(e models.IPListEntry) string {
+		return e.Value + "\x00" + e.Remark + "\x00" + e.CreatedAt + "\x00" + e.ExpiresAt
+	}
+	oldKeys := make([]string, len(oldEntries))
+	for i, entry := range oldEntries {
+		oldKeys[i] = key(entry)
+	}
+	newKeys := make([]string, len(newEntries))
+	for i, entry := range newEntries {
+		newKeys[i] = key(entry)
+	}
+	sort.Strings(oldKeys)
+	sort.Strings(newKeys)
+	for i := range oldKeys {
+		if oldKeys[i] != newKeys[i] {
+			return true
+		}
+	}
+	return false
 }
 
 // validateIPListShape 校验列表载荷并返回解析后的条目：名称非空 ≤50、描述 ≤200、
@@ -925,7 +967,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 			services.AutobanForgetIPs(removed)
 		}
 	}
-	if h.tryIPListHotPathApply(c, tx, listID, oldEntriesJSON != entriesJSON, txApplyFinish{
+	if h.tryIPListHotPathApply(c, tx, listID, ipListEntriesChanged(oldEntriesJSON, entriesJSON), txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "更新",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", name, id, len(entries)),
 		SuccessMsg:  "IP 地址列表已更新",
@@ -1150,10 +1192,12 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 			continue
 		}
 		if len(services.AutobanActiveEntries([]models.IPListEntry{entry})) > 0 {
-			if err := tx.Commit(); err != nil {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
-				return
-			}
+			// 幂等无损路径：事务内只有 SELECT 与内存比较，无写语句——
+			// 直接回滚（defer 已覆盖，这里显式表达意图）后返回「确定未变更」。
+			// 旧实现在此 Commit，把「不可能发生的提交错误」写成
+			// 「提交结果不确定」，误导调用方按已写入处理；Commit 失败还会
+			// 把事务以未回收形态留下，占住 SQLite 连接锁。
+			_ = tx.Rollback()
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"added": false}})
 			return
 		}
@@ -1276,10 +1320,8 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		kept = append(kept, entry)
 	}
 	if !removed {
-		if err := tx.Commit(); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
-			return
-		}
+		// 幂等无损路径：事务内无写语句，回滚即「确定未变更」（同追加侧）。
+		_ = tx.Rollback()
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"removed": false}})
 		return
 	}
@@ -1346,6 +1388,9 @@ func commitIPListTx(tx *sql.Tx) error {
 	if ipListCommitTxForTest != nil {
 		return ipListCommitTxForTest(tx)
 	}
+	if txCommitForTest != nil {
+		return txCommitForTest(tx)
+	}
 	return tx.Commit()
 }
 
@@ -1407,12 +1452,12 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int6
 			// 传输/系统失败 → 退化语义（与 finishTxApply 同口径）：提交 + 业务审计 + 重载失败审计
 			// + caddy_apply_error 标记 + 200 带告警（与 finishTxApply 同口径）。
 			if err := commitIPListTx(tx); err != nil {
-				restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+				recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 				// 恢复失败=运行配置可能停留候选且 DB 已回滚——横幅必须落盘
 				// （看门狗只比对路由 @id，名单/证书变化不触发漂移->分叉不可见）。
 				// 本条 apply 已失败，不得补「重载」审计。
-				h.recordPostCommitRestoreFailure(err, restoreErr)
-				joined := errors.Join(err, restoreErr)
+				h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+				joined := errors.Join(err, recovery.err())
 				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})
 				return true
@@ -1432,11 +1477,11 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int6
 			return true
 		}
 		if err := commitIPListTx(tx); err != nil {
-			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+			recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 			// 强制 /load 已真实成功——「触发重载必须留痕」不因 commit 失败豁免。
 			recordAudit(c, "重载", "Caddy服务", services.FormatAuditDetail("IP 名单热路径证书物化，强制重载收敛", services.AuditResultPart("success")))
-			h.recordPostCommitRestoreFailure(err, restoreErr)
-			joined := errors.Join(err, restoreErr)
+			h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+			joined := errors.Join(err, recovery.err())
 			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})
 			return true

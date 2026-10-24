@@ -14,8 +14,10 @@ import {
   TRUSTED_PROXY_MAX_INLINE_ENTRIES,
   TRUSTED_PROXY_MAX_TOTAL_ENTRIES,
   TRUSTED_PROXY_MIN_PREFIX_BITS,
+  trustedProxyExpansion,
   trustedProxyHeaderError,
   trustedProxyHeadersError,
+  trustedProxyPrefixKey,
   trustedProxyRangeError,
   trustedProxyRangesError,
   trustedProxyTotalError,
@@ -119,13 +121,46 @@ test('请求头汇总文案逐条点名非法值', () => {
   assert.doesNotMatch(message, /CF-Connecting-IP（/)
 })
 
-// —— 总量门：内联 + 引用展开 ≤2000（后端 trustedProxyMaxTotalCIDRs） ——
+// —— 总量门：内联 ∪ 引用展开 ≤2000（后端 trustedProxyTotalGate 去重口径） ——
 
-test('总量门只拦「已知合计」超限的形态，未知引用条数交给后端兜底', () => {
-  assert.equal(trustedProxyTotalError(60, 1940), '', '合计 2000 恰好等于上限应放行')
-  assert.match(trustedProxyTotalError(60, 1950), /超过 2000 上限/)
-  assert.match(trustedProxyTotalError(60, 1950), /内联 60 \+ 引用展开 1950/, '文案要点名两个分量')
-  assert.equal(trustedProxyTotalError(64, 0), '', '未引用名单时内联上限由网段判据单独承担')
+test('总量门按规范化前缀并集判定：重叠网段不再把合法配置顶过上限', () => {
+  const shared = Array.from({ length: 60 }, (_, i) => `203.0.${i}.0/24`)
+  const unique = Array.from({ length: 1940 }, (_, i) => `198.${Math.floor(i / 256)}.${i % 256}.0/24`)
+  // 内联 60 条同时出现在引用名单内 + 名单另有 1940 条：按条数累加 2060（旧误拒），
+  // 按前缀并集恰为 2000（后端实际展开规模）。
+  const refs = [{ values: [...shared, ...unique], entryCount: 2000 }]
+  assert.equal(trustedProxyTotalError(shared, refs), '', '重叠网段只计一次，恰好 2000 应放行')
+  assert.equal(trustedProxyExpansion(shared, refs).union, 2000)
+})
+
+test('总量门超限文案给出去重后合计与两个分量（与后端文案同结构）', () => {
+  const unique = Array.from({ length: 2000 }, (_, i) => `198.${Math.floor(i / 256)}.${i % 256}.0/24`)
+  const message = trustedProxyTotalError(['203.0.113.0/24'], [{ values: unique, entryCount: 2000 }])
+  assert.match(message, /超过 2000 上限/)
+  assert.match(message, /去重后合计 2001：内联 1 \+ 引用展开 2000/)
+  assert.match(message, /重叠网段只计一次/)
+})
+
+test('同一前缀的不同书写形态合并计一次（裸 IP、IPv6 大小写与展开形态）', () => {
+  const inline = ['203.0.113.4', '203.0.113.4/32', '203.0.113.0/24', '203.0.113.0/24 ']
+  assert.equal(trustedProxyExpansion(inline, []).union, 2, '裸 IP 与 /32、重复项必须同键')
+  assert.equal(trustedProxyExpansion(['2001:DB8::/32', '2001:db8:0:0:0:0:0:0/32'], []).union, 1)
+  assert.equal(trustedProxyExpansion([], [{ values: ['::ffff:203.0.113.0/120', '0:0:0:0:0:ffff:cb00:7100/120'], entryCount: 2 }]).union, 1)
+  assert.deepEqual(
+    [trustedProxyPrefixKey(' 203.0.113.4 '), trustedProxyPrefixKey('203.0.113.4/32'), trustedProxyPrefixKey('not-a-cidr')],
+    ['v4:203.0.113.4/32', 'v4:203.0.113.4/32', null],
+  )
+})
+
+test('引用条目未加载时按 entry_count 估算（只拦已知超限，不误拒）', () => {
+  assert.equal(trustedProxyTotalError(['203.0.113.0/24'], [{ values: null, entryCount: 0 }]), '')
+  assert.match(trustedProxyTotalError(['203.0.113.0/24'], [{ values: null, entryCount: 2000 }]), /按条数估算/)
+  assert.equal(trustedProxyTotalError([], [{ values: null, entryCount: 2000 }]), '', '恰好 2000 应放行')
+  assert.equal(trustedProxyTotalError([], [{ values: null, entryCount: 0 }]), '', '未引用名单时不设额外总量门')
+})
+
+test('非法/空条目不计入并集（由网段判据逐条点名）', () => {
+  assert.equal(trustedProxyExpansion(['', '  ', 'not-a-cidr', '203.0.113.0/24'], []).union, 1)
 })
 
 test('跨栈对表：请求头与总量判据与 Go 侧同值', () => {
@@ -133,6 +168,9 @@ test('跨栈对表：请求头与总量判据与 Go 侧同值', () => {
   assert.match(handler, /len\(entries\) > 8/, '请求头条数上限须对表')
   assert.match(handler, /\^\[A-Za-z0-9-\]\{1,64\}\$/, '请求头字符集须对表')
   assert.match(handler, /trustedProxyMaxTotalCIDRs = 2000/, '总量上限须对表')
+  const gate = section(handler, 'func trustedProxyTotalGate', 'func trustedProxyInlinePrefixes')
+  assert.match(gate, /union := len\(inline\)/, '后端按规范化前缀集合大小判总量')
+  assert.match(gate, /重叠网段只计一次/, '后端文案口径须与前端一致')
   assert.equal(TRUSTED_PROXY_MAX_HEADERS, 8)
   assert.equal(TRUSTED_PROXY_MAX_TOTAL_ENTRIES, 2000)
 })
@@ -140,7 +178,10 @@ test('跨栈对表：请求头与总量判据与 Go 侧同值', () => {
 test('组件接线：请求头与总量行内提示 + 保存门', () => {
   const card = source('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(card, /const trustedHeadersError = computed\(\(\) => trustedProxyHeadersError\(trustedHeaders\.value\)\)/)
-  assert.match(card, /const trustedTotalError = computed\(\(\) => trustedProxyTotalError\(/)
+  assert.match(card, /const trustedTotalError = computed\(\(\) => trustedProxyTotalError\(trustedRanges\.value, /)
+  assert.match(card, /const trustedExpansion = computed\(\(\) => trustedProxyExpansion\(trustedRanges\.value, /)
+  assert.match(card, /request\.get<APIResponse<TrustedIpListDetail>>\(`\/security\/ip-lists\/\$\{id\}`, \{ silent: true \}\)/, '总量门须拉取引用名单条目以去重')
+  assert.match(card, /interface TrustedIpListDetail \{ id: number; entries\?: \{ value: string \}\[\] \}/, '详情载荷形状须与 GET /security/ip-lists/:id 对齐')
   assert.match(card, /v-if="trustedHeadersError"/, '非法请求头必须就地呈现')
   assert.match(card, /v-if="trustedTotalError"/, '合计超限必须就地呈现')
   assert.match(card, /上限 \{\{ TRUSTED_PROXY_MAX_TOTAL_ENTRIES \}\}/, '展示上限与判据常量同源')

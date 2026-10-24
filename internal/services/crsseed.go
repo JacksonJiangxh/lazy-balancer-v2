@@ -146,22 +146,23 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 				healVersion = strings.TrimSpace(string(raw))
 			}
 		}
-		healDegenerateCRSSnapshotInLock(liveDir, snapshotDir, healVersion)
+		healCRSSnapshotFromLiveInLock(liveDir, snapshotDir, healVersion)
 	}
 }
 
-// healDegenerateCRSSnapshotInLock 用健康 live 树重建退化快照。live 树
-// 自身也不健康（如 dist 源退化）或版本不可知时保留留现场语义，不做回写。
-func healDegenerateCRSSnapshotInLock(liveDir, snapshotDir, version string) {
+// healCRSSnapshotFromLiveInLock 用健康 live 树重建快照（退化快照与整体缺席
+// 两种形态共用）：live 树自身也不健康（如 dist 源退化）或版本不可知时保留
+// 留现场语义，不做回写。
+func healCRSSnapshotFromLiveInLock(liveDir, snapshotDir, version string) {
 	if version == "" || !crsRulesTreeIntact(filepath.Join(liveDir, "rules")) {
-		Logf("info", "crs: live tree unhealthy or version unknown, leaving degenerate snapshot %s in place for diagnosis", snapshotDir)
+		Logf("info", "crs: live tree unhealthy or version unknown, leaving snapshot %s in place for diagnosis", snapshotDir)
 		return
 	}
 	if err := persistCRSSnapshotFromInLock(liveDir, snapshotDir, version); err != nil {
 		Logf("error", "crs: failed to rebuild snapshot %s from live tree: %v", snapshotDir, err)
 		return
 	}
-	Logf("info", "crs: rebuilt degenerate snapshot %s from live tree (%s)", snapshotDir, version)
+	Logf("info", "crs: rebuilt snapshot %s from live tree (%s)", snapshotDir, version)
 }
 
 // writeCRSVersionMarker records the on-disk CRS version under the live dir so
@@ -347,7 +348,14 @@ func reconcileCRSStateFromInLock(liveDir, snapshotDir, dbV string) {
 	// 发现2：live 树完好且版本标记可确定时，用 live 树重建退化快照——
 	// 用户更新版本在容器重建前即被保留，不必等下次成功更新才自愈。
 	if snapshotDegenerate {
-		healDegenerateCRSSnapshotInLock(liveDir, snapshotDir, liveV)
+		healCRSSnapshotFromLiveInLock(liveDir, snapshotDir, liveV)
+	} else if snapV == "" && liveV != "" && liveV != CRSBundledVersion {
+		// 快照整体缺席（目录被删/数据卷换新/首次更新时快照写入失败）不进上面
+		// 的退化判定：对账在 liveV==dbV 时判 none 且再无任何写快照的入口，
+		// 非卷挂载 /app/waf 的部署容器重建即回退镜像捆绑版本、用户更新成果
+		// 丢失。live 树完好且版本可确定（且非 bundled——那本就可由 dist 重播）
+		// 时按 live 重建快照；helper 自带 live 树完整性门，失败只留日志。
+		healCRSSnapshotFromLiveInLock(liveDir, snapshotDir, liveV)
 	}
 	plan := planCRSReconcile(liveV, snapV, dbV, CRSBundledVersion, snapshotRulesExist, crsTreeProbeMatches(liveDir, snapshotDir))
 	switch plan.action {

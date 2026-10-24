@@ -411,13 +411,13 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		}
 	}
 
-	// 本端点是 （读 current → 合并四列 → 整体
-	// UPDATE）。同域全局配置写者 UpdateConfig/PutCaddyConfig 均持 caddyOpMu；
+	// 本端点是读改写（读 current → 合并四列 → 整体 UPDATE）。同域全局配置
+	// 写者 UpdateConfig/PutCaddyConfig 均持 caddyOpMu；
 	// 此处不取锁时，UI 与 JSON/MCP 通道并发保存会以各自读到的 current 为基线
 	// 整体覆盖，前一次变更静默丢失，且各自排期一次进程重启。锁只覆盖
 	// 「读当前值 → 校验/探针 → 写库」，restartProcess 在解锁后执行。
 	// 锁序：caddyOpMu → wafFileMu（ResolveCertificate 只碰证书文件），与全仓
-	// 既有顺序一致，无。
+	// 既有顺序一致，不存在反向取锁。
 	h.caddyOpMu.Lock()
 	locked := true
 	defer func() {

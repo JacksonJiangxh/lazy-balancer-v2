@@ -691,8 +691,8 @@ func TestUpdateConfigDrift_releasesLockBeforeAuditIO(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		updateConfigDrift([]string{"lb_x"}, nil) // 首轮只计数（无 I/O）
-		updateConfigDrift([]string{"lb_x"}, nil) // 置漂移 + 审计落库（被写锁阻塞）
+		emitConfigDriftEvent(updateConfigDrift([]string{"lb_x"}, nil)) // 首轮只计数（无事件）
+		emitConfigDriftEvent(updateConfigDrift([]string{"lb_x"}, nil)) // 置漂移 + 审计落库（被写锁阻塞）
 	}()
 	t.Cleanup(func() {
 		_ = tx.Rollback()

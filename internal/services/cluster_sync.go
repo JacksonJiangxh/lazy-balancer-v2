@@ -127,15 +127,16 @@ type SyncService struct {
 	pullWG               sync.WaitGroup
 	reportAuditMu        sync.Mutex
 	lastReportFailureMsg string
-	// syncAuditMu/lastSyncFailureKey 是同步失败操作审计的节流状态
-	// 同一失败内容（动作+类别+明细）只写一条操作审计，
-	// 内容变化或同步恢复成功后再失败时重记——与 Report 的
-	// lastReportFailureMsg 同口径。主节点持续返回签名无效/schema 不匹配/应用
-	// 失败时 run 按 1s→30s 退避无限重试，此前每轮 1 条操作审计（默认 60s
-	// 周期≈1440 条/天）；last_sync_error 与失败日志仍按轮刷新，页面可见性
-	// 与取证面不变。键含动作与类别，WAF/重载/完整性三类失败互不抑制。
+	// syncAuditMu/lastSyncFailureKeys 是同步失败操作审计的节流状态：
+	// 按类别（WAF/重载/完整性）各记一个「动作+明细」键，同一类别内失败内容
+	// 不变只写一条操作审计，内容变化或同步恢复成功后再失败时重记——与
+	// Report 的 lastReportFailureMsg 同口径。主节点持续返回签名无效/schema
+	// 不匹配/应用失败时 run 按 1s→30s 退避无限重试，此前每轮 1 条操作审计
+	// （默认 60s 周期≈1440 条/天）；last_sync_error 与失败日志仍按轮刷新，
+	// 页面可见性与取证面不变。单槽键在多类别交替失败时（安全数据失败与重载
+	// 失败同轮先后出现，A→B→A→B）会每轮各记一条，故按类别分别记键。
 	syncAuditMu            sync.Mutex
-	lastSyncFailureKey     string
+	lastSyncFailureKeys    map[string]string
 	runFn                  func(context.Context)
 	loadRunState           func(context.Context) (bool, string, int, error)
 	waitRunDelay           func(context.Context, time.Duration) bool
@@ -796,17 +797,24 @@ func syncRoundSuccessLines(prevFailed bool, res SyncResult) []string {
 }
 
 // syncFailureAuditDue 判定本轮同步失败是否应写操作
-// 同一失败内容（动作+类别+明细）只放行一次，内容变化或同步恢复后清空，
-// 再次失败重新放行——与 Report 的 lastReportFailureMsg 同口径。
-// 字段级状态见 SyncService.lastSyncFailureKey。失败日志与 last_sync_error
-// 仍按轮刷新（页面可见性与取证面不变）。
+// 同一类别内同一失败内容（动作+明细）只放行一次，内容变化或同步恢复后
+// 清空，再次失败重新放行——与 Report 的 lastReportFailureMsg 同口径。
+// WAF/重载/完整性三类失败各自记键、互不抑制；多类别交替失败（安全数据
+// 失败 + 重载失败同轮出现）每类仍只留一条。字段级状态见
+// SyncService.lastSyncFailureKeys。失败日志与
+// last_sync_error 仍按轮刷新（页面可见性与取证面不变）。
 // 调用方在放行分支内以字面量写 RecordAuditLog（操作标签/事件对象词汇守卫
 // 只认字面量，动态透传会触发 audit_vocabulary 门禁）。
 func (s *SyncService) syncFailureAuditDue(action, category, detail string) bool {
-	key := action + "\x00" + category + "\x00" + detail
+	key := action + "\x00" + detail
 	s.syncAuditMu.Lock()
-	due := s.lastSyncFailureKey != key
-	s.lastSyncFailureKey = key
+	if s.lastSyncFailureKeys == nil {
+		s.lastSyncFailureKeys = map[string]string{}
+	}
+	due := s.lastSyncFailureKeys[category] != key
+	if due {
+		s.lastSyncFailureKeys[category] = key
+	}
 	s.syncAuditMu.Unlock()
 	return due
 }
@@ -815,7 +823,7 @@ func (s *SyncService) syncFailureAuditDue(action, category, detail string) bool 
 // 必须重新记录（与 Report 成功分支清空 lastReportFailureMsg 同语义）。
 func (s *SyncService) resetSyncFailureAuditThrottle() {
 	s.syncAuditMu.Lock()
-	s.lastSyncFailureKey = ""
+	s.lastSyncFailureKeys = nil
 	s.syncAuditMu.Unlock()
 }
 

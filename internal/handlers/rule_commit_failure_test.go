@@ -215,11 +215,19 @@ func isTxCommitFailureIf(ifStmt *ast.IfStmt) bool {
 	return ok && binaryExpr.Op == token.NEQ && isNilIdent(binaryExpr.Y) && isTxCommitCall(binaryExpr.X)
 }
 
-// isTxCommitCall 报告表达式是否为 `tx.Commit()`。
+// isTxCommitCall 报告表达式是否为事务提交调用：`tx.Commit()` 或测试缝单源
+// `commitTx(tx)`（提交入口收敛后两者语义相同；分支断言不得因换入口而失效）。
 func isTxCommitCall(expr ast.Expr) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok {
 		return false
+	}
+	if ident, ok := call.Fun.(*ast.Ident); ok {
+		if ident.Name != "commitTx" || len(call.Args) != 1 {
+			return false
+		}
+		arg, ok := call.Args[0].(*ast.Ident)
+		return ok && arg.Name == "tx"
 	}
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != "Commit" {

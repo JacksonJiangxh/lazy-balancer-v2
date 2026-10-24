@@ -447,6 +447,11 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	if domainList == nil {
 		return fmt.Errorf("ACME证书仅支持单域名或根域+www二级域名: %s", domains)
 	}
+	for _, domain := range domainList {
+		if !isValidACMEIssuanceDomain(domain) {
+			return fmt.Errorf("ACME证书域名不符合公共 CA 签发要求（仅小写字母/数字/连字符标签，且至少两级）: %s", domain)
+		}
+	}
 
 	logger := &jobLogger{jobID: jobID, ruleID: ruleID, file: NewCertJobFileLogger(ruleID)}
 
@@ -460,11 +465,34 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	var deploymentAttempt int
 	var ruleEnabled bool
 	var ruleProviderID int
+	var jobDomain, ruleDomain string
 	// 使用 QueryRowContext 以响应 worker 取消信号。
-	if err := db.DB.QueryRowContext(ctx, `SELECT j.status, COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0), COALESCE(r.enabled,0), COALESCE(r.ca_provider_id,0)
+	if err := db.DB.QueryRowContext(ctx, `SELECT j.status, COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0), COALESCE(r.enabled,0), COALESCE(r.ca_provider_id,0), COALESCE(j.domain,''), COALESCE(r.domain,'')
 		FROM cert_jobs j LEFT JOIN lb_rules r ON r.caddy_id = j.rule_id WHERE j.id = ?`, jobID).
-		Scan(&jobStatus, &jobProviderID, &deploymentAttempt, &ruleEnabled, &ruleProviderID); err == nil &&
+		Scan(&jobStatus, &jobProviderID, &deploymentAttempt, &ruleEnabled, &ruleProviderID, &jobDomain, &ruleDomain); err == nil &&
 		(jobStatus == "issued" || jobStatus == "downloaded") && ruleEnabled {
+		// 域名适用性：规则改域后旧行的 domain 是当时集合的快照。这类「不适用
+		// 却带材料」的行若继续走快速路径，confirmCertificateDeployment 会以
+		// 「域名不再匹配」失败 → failJob 对 downloaded+材料保留部署态 → 30s
+		// 补扫再调度，形成最长约 6h 的无效部署重试，并占住规则的新签发（补建
+		// 要求无任何非 disabled 行）。此处显式退役旧行并立即补建：恢复路径从
+		// 「等对账」缩短为「一次执行内完成」。
+		if !certJobRuleApplicable(true, ruleDomain, jobDomain) {
+			Logf("warn", "证书任务 %d：任务域名 %q 与规则 %s 当前域名 %q 不匹配，退役旧任务并补建新任务", jobID, jobDomain, ruleID, ruleDomain)
+			// 走 approved 状态写入口（CAS from=issued/downloaded）；并发流转
+			// （如 worker 已推进）不阻断补建尝试。
+			if err := transitionJob(db.DB, jobID, []string{"issued", "downloaded"}, "disabled", map[string]any{"message": "规则域名已变更，旧任务不再适用"}); err != nil {
+				if !errors.Is(err, ErrJobTransitionConflict) {
+					Logf("error", "证书任务 %d：退役域名不匹配的旧任务失败: %v", jobID, err)
+					return fmt.Errorf("disable stale certificate job: %w", err)
+				}
+				Logf("warn", "证书任务 %d：退役时状态已被并发流转（%v），按现状继续补建", jobID, err)
+			}
+			if _, backfillErr := BackfillMissingACMECertJobs(ctx, GetCAQueueManager()); backfillErr != nil {
+				Logf("warn", "证书任务 %d：域名不匹配旧任务退役后补建失败（对账/重启接管）: %v", jobID, backfillErr)
+			}
+			return nil
+		}
 		existingCert, existingKey, materialErr := readFastPathIssuedMaterial(ctx, jobID)
 		if materialErr != nil && !errors.Is(materialErr, sql.ErrNoRows) {
 			// 读失败（瞬时 DB 故障）不得静默回落完整签发：静默会白烧一张新 CA
@@ -1110,10 +1138,13 @@ func normalizeAndValidateDomains(domains string) []string {
 	return nil
 }
 
-// isValidACMEIssuerDomain rejects wildcards, IP addresses, empty labels and
-// labels longer than 63 bytes.
+// isValidACMEIssuerDomain 校验可签发的 DNS 名的结构边界：拒绝通配符/IP、
+// 空标签、首尾点/连续点与超长标签。字符集/公共后缀约束在签发入口
+// （isValidACMEIssuanceDomain）叠加——本函数同时服务 CanonicalACMEDomains 的
+// 任务/规则域比较，历史/测试行里可能含下划线等 CA 不接受但库内已存在的写法，
+// 比较层拒绝会让这些行被误判「规则不适用」而遭禁用/断链。
 func isValidACMEIssuerDomain(d string) bool {
-	if d == "" {
+	if d == "" || len(d) > 253 {
 		return false
 	}
 	if strings.Contains(d, "*") {
@@ -1125,14 +1156,35 @@ func isValidACMEIssuerDomain(d string) bool {
 	if strings.HasPrefix(d, ".") || strings.HasSuffix(d, ".") || strings.Contains(d, "..") {
 		return false
 	}
-	if len(d) > 253 {
-		return false
-	}
 	for _, label := range strings.Split(d, ".") {
-		if label == "" {
+		if label == "" || len(label) > 63 {
 			return false
 		}
-		if len(label) > 63 {
+	}
+	return true
+}
+
+// isValidACMEIssuanceDomain 是签发入口的完整校验：在结构校验之上追加
+// RFC 1035 LDH 字符集与 ≥2 标签（公开 FQDN）要求。含空格、下划线、非 ASCII
+// 或单标签的域名必然被公共 CA 拒绝——必须在发起订单前拦住（否则白烧一次
+// 订单/配额，含空格域名还会污染 lower(replace(domain,' ')) 比较）。
+func isValidACMEIssuanceDomain(d string) bool {
+	if !isValidACMEIssuerDomain(d) {
+		return false
+	}
+	labels := strings.Split(d, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := range len(label) {
+			ch := label[i]
+			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+				continue
+			}
 			return false
 		}
 	}
@@ -1140,8 +1192,15 @@ func isValidACMEIssuerDomain(d string) bool {
 }
 
 // parseCertNotAfter extracts the NotAfter time from a PEM certificate chain.
+// 单源：委托 CertNotAfterFromPEM（cert_jobs.expires_at 回退、任务列表派生字段
+// 与签发链共用同一解析实现，避免两份「解析首块」逻辑在错误/空块行为上漂移）。
+// 需要区分「空块」与「解析失败」的调用方请直接用 parseCertTime。
 func parseCertNotAfter(certPEM string) (time.Time, error) {
-	return parseCertTime(certPEM, func(cert *x509.Certificate) time.Time { return cert.NotAfter })
+	notAfter, ok := CertNotAfterFromPEM(certPEM)
+	if !ok {
+		return time.Time{}, fmt.Errorf("invalid certificate PEM")
+	}
+	return notAfter, nil
 }
 
 // parseCertNotBefore extracts the NotBefore time from a PEM certificate chain.

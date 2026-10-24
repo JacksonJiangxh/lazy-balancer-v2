@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -479,5 +480,63 @@ func TestPendingDeltaArchiveReplaced_sizeGuard(t *testing.T) {
 	}
 	if pendingDeltaArchiveReplaced(nil) {
 		t.Fatal("nil 标记不得判为被替换")
+	}
+}
+
+// 截断推迟必须返回可识别哨兵：此前该分支返回 rotErr（通常 nil），调用方无法
+// 区分「本轮无需轮转」与「归档已复制但活文件未截断、每 2s 全量复制」——健康位
+// 与 log-cleanup 摘要都会把后者当成功。
+func TestRotateAuditLog_truncateDeferredReturnsSentinel(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
+	})
+
+	// 一条合法审计文档；复制完成后追写超阈空白（模拟 Coraza 在 copy 之后持续
+	// 写入）：归档已就位，但「摄取到达偏移」停在文档末尾、剩余字节超过空白
+	// 豁免上限 → 本轮不截断（延迟，下次 tick 重试）。
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureClean+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	auditLogCopyFile = func(src, dst string) error {
+		if err := copyAuditLogTo(src, dst); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.Write(bytes.Repeat([]byte("\n"), 2<<20))
+		return err
+	}
+
+	// When
+	_, err := rotateAuditLogIfNeeded()
+
+	// Then
+	if !errors.Is(err, errAuditRotationDeferred) {
+		t.Fatalf("err=%v, want errAuditRotationDeferred（截断推迟必须与「无需轮转」区分）", err)
+	}
+	live, statErr := os.Stat(logPath)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if live.Size() == 0 {
+		t.Fatal("截断推迟分支不得截断活文件（尾部事件尚未确认摄取）")
+	}
+	if _, aerr := os.Stat(logPath + ".1"); aerr != nil {
+		t.Fatalf("归档应已就位（副本语义未变）: %v", aerr)
 	}
 }

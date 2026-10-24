@@ -479,9 +479,14 @@ type UpdateCurrentUserRequest struct {
 	// 同族：binding 只拦空，长度/复杂度交
 	// validatePasswordPolicy 友好文案（CurrentPassword 例外见下）。
 	Password string `json:"password" binding:"omitempty"`
-	// （用户已批准契约，2026-09 裁定保留——登录后唯一密码确认例外）：提交新
+	// （用户已批准契约，2026-09 裁定保留——登录后密码确认门）：提交新
 	// 密码时必须携带当前密码过共享确认门——此前仅凭会话即可改密，劫持会话可直接
 	// 置换密码把原主锁在门外。仅改昵称不要求。
+	// 边界精确化：本端点（PATCH /users/me）不是「唯一」改密入口——重置语义的
+	// 入口（PUT /users/:id 的 password 字段、POST /users/:id/reset-password）
+	// 不验当前密码，仅会话/角色门（见 users.go ResetUserPassword 注释与
+	// middleware 的 adminOrSelfParam）。安全评审不得据此假设「任何改密都要
+	// 当前密码」。
 	// 当前密码不套用新密码策略 8-24——登录不做策略校验（存量密码可能
 	// 来自旧策略），25-72 字符的存量密码必须仍能自助更换；这里只保留 bcrypt
 	// 物理上限 72（>72 字节比较必败，400 文案与 401 无行为差异）。

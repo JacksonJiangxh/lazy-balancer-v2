@@ -249,3 +249,33 @@ func TestMFAVerifyEntries_notEnabledReturns400(t *testing.T) {
 		}
 	})
 }
+
+// 自助 MFA 端点的错误分类：用户行缺失（jwtAuth 与本 handler 之间的并发删除
+// 窗口）按全仓 401 约定处理，不得折叠成 500 诱导客户端重试；基础设施故障
+// 500 + 固定文案 + 服务端留痕（不得零日志，也不得回显底层 SQL）。
+func TestMFAStatus_errorClasses(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	call := func(userID int) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodGet, "/auth/mfa/status", nil)
+		c.Set("user_id", userID)
+		h.MFAStatus(c)
+		return rec
+	}
+
+	if rec := call(424242); rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "用户不存在或已禁用") {
+		t.Fatalf("missing user status=%d body=%s, want 401 用户不存在或已禁用", rec.Code, rec.Body.String())
+	}
+
+	if _, err := db.DB.Exec(`DROP TABLE users`); err != nil {
+		t.Fatalf("drop users: %v", err)
+	}
+	rec := call(1)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "MFA 操作失败") {
+		t.Fatalf("infra failure status=%d body=%s, want 500 固定文案", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "no such table") {
+		t.Fatalf("响应泄漏底层 SQL: %s", rec.Body.String())
+	}
+}

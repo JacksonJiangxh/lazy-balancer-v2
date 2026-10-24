@@ -18,10 +18,15 @@ test('编辑向导记录打开时的 updated_at 并随保存回传 expected_upda
 test('版本冲突（409）刷新列表并提示重新打开，不静默覆盖', () => {
   assert.match(page, /error instanceof ApiRequestError && error\.status === 409/)
   assert.match(page, /规则已被他人修改/)
-  const catchBlock = page.slice(page.indexOf("console.error('submit wizard failed'"))
-  assert.ok(catchBlock.length > 0)
-  const conflict = page.slice(page.indexOf('error instanceof ApiRequestError && error.status === 409'), page.indexOf("console.error('submit wizard failed'"))
-  assert.match(conflict, /fetchRules\(\)/)
+  // 边界硬失败：marker 缺失时 indexOf 返回 -1，slice(-1) 会退化成文件末字符、
+  // 断言自动变宽仍绿（本用例要守的「409 刷新列表」失守也不会红）。
+  const catchMarker = "console.error('submit wizard failed'"
+  const catchIdx = page.indexOf(catchMarker)
+  assert.ok(catchIdx > 0, `catch 起点 marker 缺失: ${catchMarker}`)
+  const conflictIdx = page.indexOf('error instanceof ApiRequestError && error.status === 409')
+  assert.ok(conflictIdx > 0 && conflictIdx < catchIdx, '409 分支必须位于提交失败 catch 之前')
+  const conflict = page.slice(conflictIdx, catchIdx)
+  assert.match(conflict, /fetchRules\(/)
 })
 
 test('实时统计只借 /logs 的 offset，不消费打开前的历史内容', () => {

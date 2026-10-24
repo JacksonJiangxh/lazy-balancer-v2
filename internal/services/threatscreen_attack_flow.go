@@ -210,10 +210,13 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 	threatScreenAttackFlowMu.Unlock()
 }
 
-// ThreatScreenAttackFlowSnapshot 返回 since 之后的攻击流事件。
-// since=0 只返回最近 limit 条；next_seq 为本批实际推进到的序号。
-// 游标超前于本进程已分配序号（如进程重启）时返回 next_seq=0，前端从最新窗口追赶。
-func ThreatScreenAttackFlowSnapshot(since uint64, limit int) ([]ThreatScreenAttackFlowEvent, uint64) {
+// ThreatScreenAttackFlowSnapshot 返回 since 之后的攻击流事件、next_seq 与
+// 「因环形缓冲溢出而永久丢失」的事件数（gapSkipped>0 即存在空洞）。
+// gap 计算与正常光流同一判据（trafficEventSnapshotWithGap）：消费者游标落在
+// 最老保留序号之前 ⇒ 中间记录已被环形缓冲覆盖。since=0（首屏）不算空洞。
+// 两种丢失（抽样稀疏 / 环溢出丢事件）必须可区分——否则攻击洪峰下前端只能
+// 看到 seq 跳号或静默丢弧，而同屏正常流会亮「事件流有空洞」。
+func ThreatScreenAttackFlowSnapshot(since uint64, limit int) ([]ThreatScreenAttackFlowEvent, uint64, uint64) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -222,6 +225,12 @@ func ThreatScreenAttackFlowSnapshot(since uint64, limit int) ([]ThreatScreenAtta
 	}
 	threatScreenAttackFlowMu.Lock()
 	defer threatScreenAttackFlowMu.Unlock()
+
+	// 比较用减法而非 since+1：since==MaxUint64 时 +1 回绕为 0 会误判空洞。
+	var gapSkipped uint64
+	if since > 0 && len(threatScreenAttackFlowEvents) > 0 && since < threatScreenAttackFlowEvents[0].Seq && threatScreenAttackFlowEvents[0].Seq-since > 1 {
+		gapSkipped = threatScreenAttackFlowEvents[0].Seq - since - 1
+	}
 
 	out := make([]ThreatScreenAttackFlowEvent, 0, limit)
 	start := 0
@@ -246,7 +255,7 @@ func ThreatScreenAttackFlowSnapshot(since uint64, limit int) ([]ThreatScreenAtta
 	} else if len(out) > 0 {
 		next = out[len(out)-1].Seq
 	}
-	return out, next
+	return out, next, gapSkipped
 }
 
 // ResetThreatScreenAttackFlowForTest 测试缝：清空环形缓冲、租约表与采样状态。

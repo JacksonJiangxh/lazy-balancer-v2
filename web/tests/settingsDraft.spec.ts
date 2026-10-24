@@ -26,7 +26,9 @@ test('暂存态跨基础设置卡挂载保留（切分页不丢），离开设�
   first.securityEventsRetentionDirty.value = true
   first.securityEventsRowCapDirty.value = true
   first.adminTls.value = { enabled: true, mode: 'upload' }
-  first.adminTlsSaved.value = { enabled: false, mode: 'selfsigned' }
+  // 非默认值才能区分「跨挂载保留」与「已复位」（此前写入默认值，断言恒真）。
+  first.adminTlsSaved.value = { enabled: true, mode: 'upload' }
+  first.adminTlsHasCert.value = true
   first.adminTlsCertError.value = 'bad pem'
   first.stagedAdminTlsCert.value = { certFile, keyFile, certInfo }
 
@@ -37,7 +39,8 @@ test('暂存态跨基础设置卡挂载保留（切分页不丢），离开设�
   assert.equal(second.securityEventsRetentionDirty.value, true)
   assert.equal(second.securityEventsRowCapDirty.value, true)
   assert.deepEqual(second.adminTls.value, { enabled: true, mode: 'upload' }, '暂存的强制加密开关不得回退')
-  assert.equal(second.adminTlsSaved.value.enabled, false)
+  assert.deepEqual(second.adminTlsSaved.value, { enabled: true, mode: 'upload' }, '服务端派生缓存（已暂存判定）不得在切页后回退')
+  assert.equal(second.adminTlsHasCert.value, true, '「已有证书」派生缓存不得在切页后丢失')
   assert.equal(second.adminTlsCertError.value, 'bad pem')
   assert.equal(second.stagedAdminTlsCert.value?.certFile, certFile, '已暂存证书材料必须仍是同一对象')
 
@@ -49,8 +52,18 @@ test('暂存态跨基础设置卡挂载保留（切分页不丢），离开设�
   assert.equal(third.securityEventsRetentionDirty.value, false)
   assert.equal(third.securityEventsRowCapDirty.value, false)
   assert.deepEqual(third.adminTls.value, { enabled: false, mode: 'selfsigned' })
+  assert.deepEqual(third.adminTlsSaved.value, { enabled: false, mode: 'selfsigned' })
+  assert.equal(third.adminTlsHasCert.value, false, '复位必须覆盖 adminTlsHasCert（否则残留「已有证书」）')
   assert.equal(third.adminTlsCertError.value, '')
   assert.equal(third.stagedAdminTlsCert.value, null)
+  // 复位覆盖面 = 导出键集合（新增字段漏进 reset 即红）。
+  const keys = Object.keys(third) as Array<keyof typeof third>
+  assert.deepEqual(
+    keys.sort(),
+    ['adminTls', 'adminTlsCertError', 'adminTlsHasCert', 'adminTlsSaved', 'adminTlsUnavailable', 'githubTokenClearPending', 'githubTokenInput', 'securityEventsRetentionDirty', 'securityEventsRowCapDirty', 'stagedAdminTlsCert'],
+    '导出键集合变化必须同步复位与断言（漏复位字段会跨页残留）',
+  )
+  assert.equal(third.adminTlsUnavailable.value, false)
 })
 
 test('安全事件编辑：编辑值写回共享模型，dirty 跨挂载保留，保存载荷携带编辑值', () => {

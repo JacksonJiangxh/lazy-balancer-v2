@@ -717,18 +717,15 @@ func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extr
 // 调用约束：必须在本请求的 DB 回退完成之后调用——钉回渲染的是「已提交
 // 视图」，DB 尚未回退时会把本请求的改动当成已提交内容写回 LKG。
 func (h *Handlers) pinLastGoodAfterCompensation() error {
-	return h.caddyService.PersistCommittedViewAsLastGoodInLock()
-}
-
-// recordPostCommitRestoreFailure 提交后失败分支的横幅写点：补偿/恢复失败
-// = 库态与运行态分叉，刷新页面后唯一可见信号就是 caddy_apply_error（看门狗
-// 只比对规则路由 id，同 id 的域名/上游/策略变化不触发漂移横幅）。恢复成功
-// （restoreErr == nil）不写——库态与运行态已一致，写横幅只会长亮假告警。
-func (h *Handlers) recordPostCommitRestoreFailure(opErr, restoreErr error) {
-	if restoreErr == nil {
-		return
+	err := h.caddyService.PersistCommittedViewAsLastGoodInLock()
+	if err != nil {
+		// 附带失败：LKG 未钉回不改变「运行配置是否已恢复」的事实，故不得参与
+		// 横幅两态标签；但重启兜底可能回放漂移形态，必须独立留痕。
+		text := fmt.Sprintf("last-known-good 钉回失败（重启兜底可能回放漂移形态）：%v", err)
+		services.Logf("error", "%s", text)
+		services.RecordAuditLog("system", "补偿失败", "Caddy配置", text, "")
 	}
-	h.recordCaddyApplyFailure(errors.Join(opErr, restoreErr), restoreErr)
+	return err
 }
 
 // respondRuleApplyError 规则×5 apply 错误统一映射（裁定 2026-09-07）
@@ -738,23 +735,24 @@ func (h *Handlers) recordPostCommitRestoreFailure(opErr, restoreErr error) {
 // 的 CLI 预检/事务内应用两轮渲染已按未提交内容重写投影文件（规则×绑定策略的
 // u-*/p<id> 投影），磁盘同步回退到已提交态（零 /load；单一收敛点= 同族
 // 收敛，禁止单点补丁）。
-func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr error, verb string) {
+//
+// runtimeErr = 运行配置是否已恢复（唯一驱动横幅两态标签）；sideErr = 附带失败
+// （未提交事务回滚 / LKG 钉回），独立留痕，不进标签。
+func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, runtimeErr, sideErr error, verb string) {
 	h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-	if restoreErr != nil {
-		applyErr = errors.Join(applyErr, restoreErr)
-	}
+	allErr := errors.Join(applyErr, runtimeErr, sideErr)
 	// 横幅事实源收口（与配置域 UpdateConfig/PutCaddyConfig/finishTxApply
 	// 同写点）：apply 失败只回 500+审计时，刷新页面后分叉完全不可见
-	// （看门狗只比对路由 id，纯策略/限流变化不触发漂移横幅）。调用方已先走
-	// recoverCommittedViewAfterCommitFailure——恢复成功时运行配置确为
-	// 「旧配置已保留」；恢复失败（双失败）时横幅必须改口「状态未知」，不得
-	// 在同一行里既称已保留又称恢复失败。
-	h.recordCaddyApplyFailure(applyErr, restoreErr)
+	// （看门狗只比对路由 id，纯策略/限流变化不触发漂移横幅）。运行配置恢复
+	// 成功时横幅为「旧配置已保留」；恢复失败（双失败）时改口「状态未知」，
+	// 不得在同一行里既称已保留又称恢复失败。
+	h.recordCompensationSideEffects("Caddy 配置应用失败，规则未"+verb, sideErr)
+	h.recordCaddyApplyFailure(allErr, runtimeErr)
 	// 规则五端点均为 Explicit 审计策略（中间件对 Explicit 整体
 	// 跳过）——此前 apply 失败只写 HTTP 响应，操作审计完全缺席。与配置域
 	// finishTxApply（拒绝/未校验分支）及安全域同口径：失败必须留痕。
 	// 审计词条用字面量（词汇表门禁禁止动态 action；动词集合固定为五值）。
-	failureDetail := services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure"))
+	failureDetail := services.FormatAuditDetail("Caddy 配置应用失败", allErr.Error(), services.AuditResultPart("failure"))
 	switch verb {
 	case "创建":
 		recordAudit(c, "创建失败", "负载规则", failureDetail)
@@ -768,7 +766,7 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 		recordAudit(c, "禁用失败", "负载规则", failureDetail)
 	}
 	if services.IsConfigRejected(applyErr) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置应用失败，规则未" + verb + ": " + applyErr.Error()})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置应用失败，规则未" + verb + ": " + allErr.Error()})
 		return
 	}
 	writeInternalError(c, http.StatusInternalServerError, "Caddy 配置应用失败，规则未"+verb, nil)
@@ -793,6 +791,15 @@ func (h *Handlers) respondRuleSnapshotError(c *gin.Context, verb string, err err
 		recordAudit(c, "禁用失败", "负载规则", detail)
 	}
 	writeInternalError(c, http.StatusInternalServerError, "备份当前运行配置失败", err)
+}
+
+// ruleConflictDetail 阻断型 409 的审计明细（规则归因 + 原因 + 失败结果）。
+// 动作词由调用点以字面量传入并直接进 recordAudit——审计动作必须能静态扫描
+// （词汇门禁），因此不在本函数内拼接动作。被在途证书签发 / 放锁窗口内的并发
+// 删除或修改挡住的操作必须留痕：运维要能从审计回答「谁在何时尝试、被什么
+// 挡住」，此前 409 族只有版本冲突与并发中止两处有账。
+func ruleConflictDetail(caddyID, reason string) string {
+	return services.FormatAuditDetail(services.AuditRulePart(caddyID), reason, services.AuditResultPart("failure"))
 }
 
 // normalizeInactiveHealthCheckFields 主动健康检查未启用时，其专属字段
@@ -1561,34 +1568,35 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// restoreImportRuntime→ApplyConfig 会在恢复 /load 成功时把「请求前
 		// 运行配置」写进 LKG，而该快照可能是漂移形态，重启兜底不得回放）；
 		// ④横幅持久化（respondRuleApplyError 内）。
-		var restoreErr error
+		var sideErr error
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+			sideErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
 		}
-		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
-		restoreErr = errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
-		h.respondRuleApplyError(c, applyErr, restoreErr, "创建")
+		runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(sideErr, h.pinLastGoodAfterCompensation())
+		h.respondRuleApplyError(c, applyErr, runtimeErr, sideErr, "创建")
 		return
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(tx); err != nil {
 		//  +：commit 失败与 finishTxApply/UpdateConfig
 		// 同收口——统一恢复回滚事务、按已提交视图重渲染并 /load，双失败时
 		// 仍把已提交字节写回 LKG（restoreImportRuntime 只用运行时快照，恢复
 		// /load 失败会让 LKG 滞留未提交内容）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		// 新规则证书文件可能已在事务内渲染时物化。Commit 返回错误无法区分
 		// 「未提交」与「已提交但确认丢失」（commitUncertainLabel）——清理按
-		// 已提交视图的存在性判定（见 helper 注释）。
-		restoreErr = errors.Join(restoreErr, cleanupUncommittedRuleCertsAfterCommitFailure(caddyID))
+		// 已提交视图的存在性判定（见 helper 注释）。证书清理失败属附带失败：
+		// 运行配置是否已恢复与它无关。
+		certCleanupErr := cleanupUncommittedRuleCertsAfterCommitFailure(caddyID)
 		services.Logf("error", "CreateRule transaction commit error: %v", err)
 		// 提交后失败的两条留痕：真实 /load 已发生（重载审计）+ 恢复失败时
 		// 库态/运行态分叉的横幅（刷新后唯一可见信号）。
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(err, restoreErr)
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, errors.Join(recovery.db, certCleanupErr))
 		// 提交后失败审计：Explicit 审计策略下提交后失败必须留痕（与
 		// respondRuleApplyError / EnableRule failEnableWithStatus 同口径）。
 		recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, recovery.err(), certCleanupErr).Error(), services.AuditResultPart("failure")))
 		writeInternalError(c, http.StatusInternalServerError, commitUncertainLabel, nil)
 		return
 	}
@@ -1629,26 +1637,28 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		services.RemoveCertFiles(caddyID)
 		return nil
 	}
-	restoreCreatedRule := func() error {
+	restoreCreatedRule := func() (runtimeErr, sideErr error) {
 		// 顺序不可换：DB 回退（removeCreatedRule）完成后才能钉回——已提交
-		// 视图不得含本请求新建的规则。
-		restoreErr := errors.Join(h.restoreImportRuntime(runtimeSnapshot), removeCreatedRule())
-		return errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
+		// 视图不得含本请求新建的规则。运行配置恢复与附带失败（DB 回退、
+		// LKG 钉回）分通道返回：只有前者决定横幅两态标签。
+		runtimeErr = h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(removeCreatedRule(), h.pinLastGoodAfterCompensation())
+		return runtimeErr, sideErr
 	}
 	if enabledVal == 1 && req.EnableTLS && req.TLSSource == "acme_dns" && req.Protocol == "http" && req.Domain != "" {
 		qm := services.GetCAQueueManager()
 		if qm == nil {
-			restoreErr := restoreCreatedRule()
-			if restoreErr != nil {
+			runtimeErr, sideErr := restoreCreatedRule()
+			if restoreErr := errors.Join(runtimeErr, sideErr); restoreErr != nil {
 				services.Logf("error", "问题: CreateRule ACME compensation failed for caddy_id=%s: %v", caddyID, restoreErr)
 			}
 			// 提交后失败的两条留痕：真实 /load 已发生（重载审计）+ 补偿
 			// 恢复失败时库态/运行态分叉的横幅。
 			reloadNote.auditReload()
-			h.recordPostCommitRestoreFailure(errors.New("证书任务入队失败：CA 队列未初始化"), restoreErr)
+			h.recordPostCommitRestoreFailure("证书任务入队失败", errors.New("证书任务入队失败：CA 队列未初始化"), runtimeErr, sideErr)
 			// 提交后失败审计：提交后失败（含补偿）必须落操作审计。
 			detail := "证书任务入队失败：CA 队列未初始化，已回滚创建"
-			if restoreErr != nil {
+			if restoreErr := errors.Join(runtimeErr, sideErr); restoreErr != nil {
 				detail = "证书任务入队失败（CA 队列未初始化），补偿恢复失败: " + restoreErr.Error()
 			}
 			recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
@@ -1657,15 +1667,15 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			return
 		}
 		if _, err := services.CreateOrRequeueCertJob(caddyID, req.Domain, req.CAProviderID, qm); err != nil {
-			restoreErr := restoreCreatedRule()
-			if restoreErr != nil {
+			runtimeErr, sideErr := restoreCreatedRule()
+			if restoreErr := errors.Join(runtimeErr, sideErr); restoreErr != nil {
 				services.Logf("error", "问题: CreateRule ACME compensation failed for caddy_id=%s: %v", caddyID, restoreErr)
 			}
 			reloadNote.auditReload()
-			h.recordPostCommitRestoreFailure(err, restoreErr)
+			h.recordPostCommitRestoreFailure("证书任务入队失败", err, runtimeErr, sideErr)
 			// 提交后失败审计：入队失败 + 补偿结果一并留痕（补偿失败时点名）。
 			detail := "证书任务入队失败，已回滚创建: " + err.Error()
-			if restoreErr != nil {
+			if restoreErr := errors.Join(runtimeErr, sideErr); restoreErr != nil {
 				detail = "证书任务入队失败，补偿恢复失败: " + errors.Join(err, restoreErr).Error()
 			}
 			recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
@@ -2691,6 +2701,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 			if executingJobs > 0 {
 				tx.Rollback()
+				recordAudit(c, "更新失败", "负载规则", ruleConflictDetail(caddyID, "证书申请中，请等待完成或失败后再修改规则"))
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书申请中，请等待完成或失败后再修改规则"})
 				return
 			}
@@ -2749,6 +2760,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		tx.Rollback()
 		// 409 早退（非终态证书任务在途）。裁定 ④' 后保存路径无预校验
 		// 探针，此处早退零运行时扰动，无需恢复。
+		recordAudit(c, "更新失败", "负载规则", ruleConflictDetail(caddyID, "证书申请中，请等待完成或失败后再修改规则"))
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书申请中，请等待完成或失败后再修改规则"})
 		return
 	}
@@ -2811,26 +2823,26 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退运行配置/
 		// 证书文件（同字节短路安全）→ LKG 钉回已提交视图（零 /load）→
 		// 横幅持久化（respondRuleApplyError 内）。
-		var restoreErr error
+		var sideErr error
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+			sideErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
 		}
-		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
-		restoreErr = errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
-		h.respondRuleApplyError(c, applyErr, restoreErr, "更新")
+		runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(sideErr, h.pinLastGoodAfterCompensation())
+		h.respondRuleApplyError(c, applyErr, runtimeErr, sideErr, "更新")
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "UpdateRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		// 真实 /load 已发生（重载审计）+ 恢复失败时的分叉横幅。
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(err, restoreErr)
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
 		// 提交后失败审计：提交后失败留痕（Explicit 审计策略，中间件不兜底）。
 		recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, recovery.err()).Error(), services.AuditResultPart("failure")))
 		writeInternalError(c, http.StatusInternalServerError, commitUncertainLabel, nil)
 		return
 	}
@@ -2901,10 +2913,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(caProviderID)
 		resolvedExistingCAProviderID, resolveExistingErr := services.ResolveCAProviderID(existingRule.CAProviderID)
 		if resolveErr != nil || resolveExistingErr != nil {
-			restoreErr := errors.Join(h.restoreImportRuntime(runtimeSnapshot), restoreRuleDBSnapshot(), h.pinLastGoodAfterCompensation())
+			runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+			sideErr := errors.Join(restoreRuleDBSnapshot(), h.pinLastGoodAfterCompensation())
 			reloadNote.auditReload()
-			h.recordPostCommitRestoreFailure(errors.Join(resolveErr, resolveExistingErr), restoreErr)
+			h.recordPostCommitRestoreFailure("解析 CA 提供商失败", errors.Join(resolveErr, resolveExistingErr), runtimeErr, sideErr)
 			// 审计项：提交后失败的更早补偿分支同样必须留痕（此前只有应用日志）。
+			restoreErr := errors.Join(runtimeErr, sideErr)
 			detail := "解析 CA 提供商失败，已回滚更新: " + errors.Join(resolveErr, resolveExistingErr).Error()
 			if restoreErr != nil {
 				detail = "解析 CA 提供商失败且恢复失败: " + errors.Join(resolveErr, resolveExistingErr, restoreErr).Error()
@@ -2922,10 +2936,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		// 无自动恢复路径）。快照失败时迁移尚未执行，只需回滚规则与运行时。
 		certJobsSnapshot, err := services.SnapshotCertJobsForRule(caddyID)
 		if err != nil {
-			restoreErr := errors.Join(h.restoreImportRuntime(runtimeSnapshot), restoreRuleDBSnapshot(), h.pinLastGoodAfterCompensation())
+			runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+			sideErr := errors.Join(restoreRuleDBSnapshot(), h.pinLastGoodAfterCompensation())
 			reloadNote.auditReload()
-			h.recordPostCommitRestoreFailure(err, restoreErr)
+			h.recordPostCommitRestoreFailure("备份证书任务失败", err, runtimeErr, sideErr)
 			// 审计项：同族更早补偿分支补审计（失败/回滚结果一并留痕）。
+			restoreErr := errors.Join(runtimeErr, sideErr)
 			detail := "备份证书任务失败，已回滚更新: " + err.Error()
 			if restoreErr != nil {
 				detail = "备份证书任务失败且恢复失败: " + errors.Join(err, restoreErr).Error()
@@ -3046,13 +3062,15 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		tlsSourceChangedToACME := existingRule.TLSSource != "acme_dns"
 		var enqueuedJobID int
 		var queueManager *services.CAQueueManager
-		restoreACMEState := func() error {
+		restoreACMEState := func() (runtimeErr, sideErr error) {
 			if enqueuedJobID > 0 && queueManager != nil {
 				cancelCertJob(enqueuedJobID)
 			}
-			// DB 回退（restoreRuleDBSnapshot + 任务行）完成后再钉回 LKG。
-			restoreErr := errors.Join(h.restoreImportRuntime(runtimeSnapshot), restoreRuleDBSnapshot(), services.RestoreCertJobsForRule(certJobsSnapshot))
-			return errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
+			// 运行配置恢复与附带失败（DB 回退 + 任务行回退 + LKG 钉回）分通道：
+			// 只有前者决定横幅两态标签；钉回必须在 DB 回退之后。
+			runtimeErr = h.restoreImportRuntime(runtimeSnapshot)
+			sideErr = errors.Join(restoreRuleDBSnapshot(), services.RestoreCertJobsForRule(certJobsSnapshot), h.pinLastGoodAfterCompensation())
+			return runtimeErr, sideErr
 		}
 		// 提交后失败统一出口：补偿 -> 审计 -> 响应。更新端点为 Explicit 审计策略，
 		// 中间件不兜底——提交后的每个失败分支都必须留痕（与 EnableRule 的
@@ -3062,9 +3080,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			if cause != nil {
 				services.Logf("error", "UpdateRule post-commit failure for caddy_id=%s: %s: %v", caddyID, message, cause)
 			}
-			restoreErr := restoreACMEState()
+			runtimeErr, sideErr := restoreACMEState()
+			restoreErr := errors.Join(runtimeErr, sideErr)
 			reloadNote.auditReload()
-			h.recordPostCommitRestoreFailure(errors.New(message), restoreErr)
+			h.recordPostCommitRestoreFailure(message, errors.New(message), runtimeErr, sideErr)
 			detail := message
 			if cause != nil {
 				detail = message + "：" + cause.Error()
@@ -3148,9 +3167,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		if needJob {
 			queueManager = services.GetCAQueueManager()
 			if queueManager == nil {
-				restoreErr := restoreACMEState()
+				runtimeErr, sideErr := restoreACMEState()
+				restoreErr := errors.Join(runtimeErr, sideErr)
 				reloadNote.auditReload()
-				h.recordPostCommitRestoreFailure(errors.New("证书任务入队失败：CA 队列未初始化"), restoreErr)
+				h.recordPostCommitRestoreFailure("证书任务入队失败", errors.New("证书任务入队失败：CA 队列未初始化"), runtimeErr, sideErr)
 				// 提交后失败审计：提交后失败留痕（补偿结果一并点名）。
 				detail := "证书任务入队失败：CA 队列未初始化"
 				if restoreErr != nil {
@@ -3172,9 +3192,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				enqueuedJobID = jobID
 			}
 			if err != nil {
-				restoreErr := restoreACMEState()
+				runtimeErr, sideErr := restoreACMEState()
+				restoreErr := errors.Join(runtimeErr, sideErr)
 				reloadNote.auditReload()
-				h.recordPostCommitRestoreFailure(err, restoreErr)
+				h.recordPostCommitRestoreFailure("证书任务入队失败", err, runtimeErr, sideErr)
 				// 提交后失败审计：入队失败 + 补偿结果留痕。
 				detail := "创建证书任务失败，已回滚更新: " + err.Error()
 				if restoreErr != nil {
@@ -3236,6 +3257,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	// ——queued 取消瞬时、waiting_ca 冷却可达数小时均不拦；检查与操作间的
 	// TOCTOU 窗口落入既有超时中止+快照回滚保护，正确性不变。
 	if qm := services.GetCAQueueManager(); qm != nil && qm.HasRunningJobForRule(caddyID) {
+		recordAudit(c, "删除失败", "负载规则", ruleConflictDetail(caddyID, "该规则有正在进行的证书签发任务（约需几分钟），请任务完成后再删除或稍后重试"))
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "该规则有正在进行的证书签发任务（约需几分钟），请任务完成后再删除或稍后重试"})
 		return
 	}
@@ -3360,16 +3382,16 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	if applyErr != nil {
 		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退 → LKG 钉回
 		// 已提交视图（零 /load）→ 横幅持久化。
-		var restoreErr error
+		var sideErr error
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+			sideErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
 		}
-		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
-		restoreErr = errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
-		if restoreErr != nil {
+		runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(sideErr, h.pinLastGoodAfterCompensation())
+		if restoreErr := errors.Join(runtimeErr, sideErr); restoreErr != nil {
 			services.Logf("error", "问题: DeleteRule Caddy apply and runtime restore failed for caddy_id=%s: apply=%v restore=%v", caddyID, applyErr, restoreErr)
 		}
-		h.respondRuleApplyError(c, applyErr, restoreErr, "删除")
+		h.respondRuleApplyError(c, applyErr, runtimeErr, sideErr, "删除")
 		return
 	}
 	if err := h.removeRuleCertFiles(caddyID); err != nil {
@@ -3378,14 +3400,15 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		// 钉回 LKG 都会把「本请求已删的规则」当成已提交内容——已提交视图
 		// 必须由 DB 先回到删除前形态。回滚同时释放 SQLite 写锁（渲染读
 		// db.DB 不被阻塞）。
-		var restoreErr error
+		var sideErr error
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+			sideErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
 		}
-		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
-		restoreErr = errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
+		runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(sideErr, h.pinLastGoodAfterCompensation())
+		restoreErr := errors.Join(runtimeErr, sideErr)
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(err, restoreErr)
+		h.recordPostCommitRestoreFailure("证书文件清理失败", err, runtimeErr, sideErr)
 		// 历史 问题: 证书文件可能被部分删除（cert 已删 / key 残留 或反之），
 		// 即便 Caddy 配置和 DB 事务都恢复了，下次 reload 可能因找不到证书导致 TLS 静默失败。
 		// 用户决策：保留现有顺序（先删文件再 commit），但加 问题 告警 + audit + 操作审计（当前实现无安全事件写入），
@@ -3405,16 +3428,16 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	if err := tx.Commit(); err != nil {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "DeleteRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
-		if restoreErr != nil {
+		if restoreErr := recovery.err(); restoreErr != nil {
 			services.Logf("error", "问题: DeleteRule commit and runtime restore failed for caddy_id=%s: commit=%v restore=%v", caddyID, err, restoreErr)
 		}
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(err, restoreErr)
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
 		// 提交后失败审计：提交失败留痕（补偿结果一并点名）。
 		detail := commitUncertainLabel + "：" + err.Error()
-		if restoreErr != nil {
+		if restoreErr := recovery.err(); restoreErr != nil {
 			detail = commitUncertainLabel + "，且恢复失败：" + errors.Join(err, restoreErr).Error()
 		}
 		recordAudit(c, "删除失败", "负载规则", services.FormatAuditDetail(
@@ -3486,7 +3509,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 
 	rows, err := db.DB.Query(`SELECT `+lbRuleColumns+` FROM lb_rules WHERE caddy_id = ?`, caddyID)
 	if err != nil {
-		fail(http.StatusInternalServerError, "读取规则失败")
+		failInternal("读取规则失败", err)
 		return
 	}
 	rules, err := scanLbRules(rows)
@@ -3508,7 +3531,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// 预检（DynamicDNS && count>1）在复制路径永不触发。
 	// 不再对 rule.Domain 规范化——落库域名已由 Create/Update 与启动迁移规范化。
 	if err := hydrateRuleRelations(c.Request.Context(), rules); err != nil {
-		fail(http.StatusInternalServerError, "读取规则关联数据失败")
+		failInternal("读取规则关联数据失败", err)
 		return
 	}
 	rule := rules[0]
@@ -3960,6 +3983,13 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBatchBlockPagesBodyBytes)
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// chunked/未知长度请求体在解析期被 MaxBytesReader 截断（快路径看不到
+		// 长度）：与 CreateRule/UpdateRule 同口径，按 413 回应体积超限，
+		// 不得折成「请求参数无效」。
+		if isRequestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
@@ -4277,27 +4307,27 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	if applyErr != nil {
 		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退 → LKG 钉回
 		// 已提交视图（零 /load）→ 横幅持久化（respondRuleApplyError 内）。
-		var restoreErr error
+		var sideErr error
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+			sideErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
 		}
-		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
-		restoreErr = errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
-		h.respondRuleApplyError(c, applyErr, restoreErr, "启用")
+		runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(sideErr, h.pinLastGoodAfterCompensation())
+		h.respondRuleApplyError(c, applyErr, runtimeErr, sideErr, "启用")
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "EnableRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(err, restoreErr)
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
 		// 提交后失败审计：Explicit 审计策略下中间件不兜底，提交结果不确定
 		// （磁盘满/IO/确认丢失）这一最需追溯的场景必须留痕——与创建/更新/
 		// 删除/禁用四端点逐字同口径。
 		recordAudit(c, "启用失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, recovery.err()).Error(), services.AuditResultPart("failure")))
 		writeInternalError(c, http.StatusInternalServerError, commitUncertainLabel, nil)
 		return
 	}
@@ -4305,7 +4335,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 
 	var enqueuedJobID int
 	var queueManager *services.CAQueueManager
-	restoreEnabledState := func() error {
+	restoreEnabledState := func() (runtimeErr, sideErr error) {
 		if enqueuedJobID > 0 && queueManager != nil {
 			cancelCertJob(enqueuedJobID)
 		}
@@ -4329,9 +4359,12 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		if isACME {
 			jobsErr = services.RestoreCertJobsForRule(certJobsSnapshot)
 		}
-		restoreErr := errors.Join(caddyErr, dbErr, jobsErr)
-		// DB 回退（上方 UPDATE）完成后才能钉回：已提交视图不得含本次启用。
-		return errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
+		// 运行配置恢复与附带失败（DB 回退 + 任务行回退 + LKG 钉回）分通道：
+		// 只有前者决定横幅两态标签。DB 回退（上方 UPDATE）完成后才能钉回：
+		// 已提交视图不得含本次启用。
+		runtimeErr = caddyErr
+		sideErr = errors.Join(dbErr, jobsErr, h.pinLastGoodAfterCompensation())
+		return runtimeErr, sideErr
 	}
 	failEnableWithStatus := func(message string, status int, cause error) {
 		// 启用端点为 Explicit 审计策略，中间件不兜底；此前
@@ -4341,10 +4374,11 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		if cause != nil {
 			services.Logf("error", "EnableRule post-commit failure for caddy_id=%s: %s: %v", caddyID, message, cause)
 		}
-		restoreErr := restoreEnabledState()
+		runtimeErr, sideErr := restoreEnabledState()
+		restoreErr := errors.Join(runtimeErr, sideErr)
 		// 真实 /load 已发生（重载审计）+ 补偿恢复失败的分叉横幅。
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(errors.New(message), restoreErr)
+		h.recordPostCommitRestoreFailure(message, errors.New(message), runtimeErr, sideErr)
 		detail := message
 		if cause != nil {
 			detail = message + "：" + cause.Error()
@@ -4618,6 +4652,7 @@ func abortIfRuleDeleted(c *gin.Context, caddyID string) bool {
 	}
 	if !exists {
 		services.Logf("warn", "UpdateRule: 规则 %s 已在放锁窗口内被删除，中止后续迁移/补偿（不复活规则）", caddyID)
+		recordAudit(c, "更新失败", "负载规则", ruleConflictDetail(caddyID, "规则已被删除，本次更新已中止"))
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则已被删除，本次更新已中止"})
 		return true
 	}
@@ -4737,6 +4772,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	// 时禁用会进入有界取消等待（最长 2 分钟），秒回 409 优于请求悬挂。仅拦
 	// 「执行中」；TOCTOU 窗口落入既有超时中止+回滚保护，正确性不变。
 	if qm := services.GetCAQueueManager(); qm != nil && qm.HasRunningJobForRule(caddyID) {
+		recordAudit(c, "禁用失败", "负载规则", ruleConflictDetail(caddyID, "该规则有正在进行的证书签发任务（约需几分钟），请任务完成后再禁用或稍后重试"))
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "该规则有正在进行的证书签发任务（约需几分钟），请任务完成后再禁用或稍后重试"})
 		return
 	}
@@ -4787,25 +4823,25 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	if applyErr != nil {
 		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退 → LKG 钉回
 		// 已提交视图（零 /load）→ 横幅持久化（respondRuleApplyError 内）。
-		var restoreErr error
+		var sideErr error
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+			sideErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
 		}
-		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
-		restoreErr = errors.Join(restoreErr, h.pinLastGoodAfterCompensation())
-		h.respondRuleApplyError(c, applyErr, restoreErr, "禁用")
+		runtimeErr := h.restoreImportRuntime(runtimeSnapshot)
+		sideErr = errors.Join(sideErr, h.pinLastGoodAfterCompensation())
+		h.respondRuleApplyError(c, applyErr, runtimeErr, sideErr, "禁用")
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "DisableRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(err, restoreErr)
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
 		// 提交后失败审计：提交失败留痕（Explicit 审计策略）。
 		recordAudit(c, "禁用失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, recovery.err()).Error(), services.AuditResultPart("failure")))
 		writeInternalError(c, http.StatusInternalServerError, commitUncertainLabel, nil)
 		return
 	}

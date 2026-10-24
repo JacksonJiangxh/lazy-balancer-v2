@@ -13,9 +13,8 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 公共种子：一条可用的 DNS 提供商配置。
-
-// 公共种子：当前启用的 CA 提供商 id。
+// 公共种子：当前启用的 CA 提供商 id（证书配置种子见
+// testhelpers_shared_test.go 的 seedR52CertificateConfig）。
 func seedR52EnabledProviderID(t *testing.T) int {
 	t.Helper()
 	var providerID int

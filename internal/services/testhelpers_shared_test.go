@@ -209,3 +209,52 @@ func captureApplicationLogs(t *testing.T) *bytes.Buffer {
 	})
 	return &logs
 }
+
+// —— test-only 入口（生产文件只保留主路径）——
+//
+// 以下函数仅测试消费，原寄居 logrotate.go / services.go 生产文件；生产文件
+// 承载 test-only 符号会让「生产调用面」判断失真（误复用即把旧形态拉回主链），
+// 故搬到同包测试文件（编译进测试二进制，不进产品符号表）。
+
+// logCleanupSummaryLine log-cleanup 任务单轮摘要行——对「摘要行口径 = 实际
+// 清理口径」直接钉测。
+func logCleanupSummaryLine(logFile string) string {
+	_, line := logCleanupRound(logFile)
+	return line
+}
+
+// taskLogsHousekeeping 任务日志清理（保留月数自行读取）——测试/独立调用
+// 入口；生产链走 RuntimeLogCleanupOnce（复用已读取口径，避免一轮两次查库）。
+func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
+	months, monthsErr := auditRetentionMonths()
+	return taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
+}
+
+// parseRuleLabelMetrics 解析 lazybalancer_* 指标按 rule label 聚合
+// （caddy_id 直接匹配）：单趟扫描，供文本入口测试使用；采集主路径在同一趟
+// 聚合里与全局样本共用一次遍历。
+func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) {
+	res := aggregatePrometheusText(text, prometheusScanRules)
+	if res.rulesErr != nil {
+		return nil, res.rulesErr
+	}
+	return res.rules, nil
+}
+
+// storeRuleMetricsText 按 rule label（lazybalancer_*）写规则级历史行——
+// 文本入口测试专用；生产链持有已聚合结果，直接走 storePerRuleMetrics。
+func (m *MetricsService) storeRuleMetricsText(text string) error {
+	byRule, err := parseRuleLabelMetrics(text)
+	if err != nil {
+		return err
+	}
+	return m.storePerRuleMetrics(byRule)
+}
+
+// updateOverview 整包入口（测试专用）：DB 派生三项 + 流量样本一次覆盖。
+// 生产采集链走 collect（每周期只刷新一次 DB 派生项）——复用本入口会把旧形态
+// 「每周期两次 DB 刷新」重新拉回。
+func (m *MetricsService) updateOverview(metrics parsedMetrics) {
+	m.refreshDBOverviewMetrics()
+	m.applyTrafficSample(metrics)
+}

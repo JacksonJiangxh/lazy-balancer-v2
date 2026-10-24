@@ -5,8 +5,10 @@
 // 独立排程（默认每天 04:00）+ 手动触发下载 → 通用 CIDR 提取（JSON/HTML 通用解析）→
 // security_ip_lists 系统名单（name=CrawlerIPListName(engine)，system=1）原子快照
 // 写入；失败保留上次快照（fail-safe，绝不以更新失败破坏既有豁免）。
-// 验证器（caddygeoip.VerifyCrawler）按 IP 段命中即豁免（方法 C 与方法 B
-// PTR 双跳并行），名单投影与既有安全_ip_lists 同表复用。
+// 验证器（caddygeoip.VerifyCrawler）按引擎 VerifyMethod 二选一：iprange 引擎
+// （当前仅 so360spider）读运行快照名单做 IP 段验证，其余引擎走 PTR 双跳——
+// 不存在两法并行的豁免路径。名单投影与既有安全_ip_lists 同表复用；非 iprange
+// 引擎的名单仅用于展示/存档，不参与验证判定。
 package services
 
 import (
@@ -287,6 +289,11 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		operator = "system"
 	}
 	outcome := "success"
+	// emptyRound 标记「启用源均未到期，无更新」：审计动作仍为「更新」（与威胁
+	// 族同口径），detail 显式声明空轮；「跳过」动作专留给降级中止。此前该轮
+	// 把 outcome 置 skipped 充当审计词，导致同一语义在两族分叉到不同动作，且
+	// 「跳过」同时承载降级的安全含义。
+	emptyRound := false
 	// 用户取消自动轮=显式放弃本槽（与失败同源）：把全部到期/空源槽推进到
 	// 下一排程槽。引擎侧取消时已消费本槽，而未处理的到期源仍留在被消费的
 	// 槽值上（引擎排程槽=启用源最早 next_update）——不推进则爬虫地址库自动
@@ -301,6 +308,9 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
 			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
 		}[outcome], rc.Trigger)
+		if emptyRound && outcome == "success" {
+			detail = fmt.Sprintf("无到期源，本轮无更新（触发：%s）", rc.Trigger)
+		}
 		switch outcome {
 		case "failed":
 			RecordAuditLog(operator, "更新失败", "爬虫地址库", detail, "")
@@ -345,8 +355,9 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	if len(sources) == 0 {
 		// 与威胁族口径一致：无到期源按成功轮处理（task_runs 不记 skip），
 		// 任务日志只留一条 INFO 业务摘要——此前写 skipped 级行与 task_runs
-		// success 分叉。
-		outcome = "skipped"
+		// success 分叉；审计动作同族（「更新」+ detail 声明空轮），「跳过」不再
+		// 混用（见 emptyRound 注释）。
+		emptyRound = true
 		TaskLogf("crawlerbot-update", "checking", "没有启用或到期的爬虫源，本轮无更新")
 		return nil
 	}
@@ -417,7 +428,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 				firstErr = fmt.Errorf("源 %s 下载失败: %w", src.Name, err)
 			}
 			failedCount++
-			markCrawlerSourceFailed(src.Name, rc.Trigger)
+			markCrawlerSourceFailed(src.Name, rc.Trigger, "下载失败（保留上次快照）")
 			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
 		}
@@ -444,7 +455,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 				firstErr = fmt.Errorf("源 %s 解析失败: %w", src.Name, perr)
 			}
 			failedCount++
-			markCrawlerSourceFailed(src.Name, rc.Trigger)
+			markCrawlerSourceFailed(src.Name, rc.Trigger, "解析或校验失败（保留上次快照）")
 			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, perr))
 			continue
 		}
@@ -480,7 +491,13 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 				firstErr = fmt.Errorf("源 %s 写名单失败: %w", src.Name, err)
 			}
 			failedCount++
-			markCrawlerSourceFailed(src.Name, rc.Trigger)
+			// 部分提交形态：DB 已落定而运行快照写失败时不得显示「保留上次
+			// 快照」（与事实相反，面板排障会被误导）。
+			failMsg := "名单写入失败（保留上次快照）"
+			if changed {
+				failMsg = "名单写入失败（数据库已更新，运行快照未写入）"
+			}
+			markCrawlerSourceFailed(src.Name, rc.Trigger, failMsg)
 			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
 		}
@@ -495,6 +512,12 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			}
 			failedCount++
 			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 写成功态失败: %v", src.Name, merr))
+			// 尽力补写 failed 终态：否则源行停留 running，自动更新随后被关闭
+			// 时该行长期显示「运行中」。补写可能同样失败（通常就是 DB 写
+			// 故障），失败不影响任务终态与计数。
+			if ferr := markCrawlerSourceFailed(src.Name, rc.Trigger, "名单已写入但源状态写失败（下轮刷新状态）"); ferr != nil {
+				WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 补写失败态失败: %v", src.Name, ferr))
+			}
 			continue
 		}
 		successCount++
@@ -607,10 +630,12 @@ func markCrawlerSourceCancelled(name string) error {
 
 // markCrawlerSourceFailed 源失败态：consecutive_failures+1、next_update 按
 // 同一推进门更新（退避机制已撤除；失败保留上次快照，内容表 entries 不动）。
+// message 由调用方给出真实失败类别——面板按该文案排障，常量文案会把「名单
+// 已更新而快照写失败」误述成「保留上次快照」。
 // 返回落库错误（同 markCrawlerSourceSuccess）。
-func markCrawlerSourceFailed(name, trigger string) error {
+func markCrawlerSourceFailed(name, trigger, message string) error {
 	next := crawlerNextSlot(time.Now().UTC())
-	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message='下载或解析失败（保留上次快照）', consecutive_failures=consecutive_failures+1, `+crawlerSlotAdvanceSQL+`, finished_at=datetime('now') WHERE name=?`, trigger, next, name)
+	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message=?, consecutive_failures=consecutive_failures+1, `+crawlerSlotAdvanceSQL+`, finished_at=datetime('now') WHERE name=?`, message, trigger, next, name)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写失败态失败: %v", name, err)
 	}

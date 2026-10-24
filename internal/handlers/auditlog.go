@@ -375,20 +375,24 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// 深翻页折中：页码分页保留（可跳页、有总页数），但超过阈值显式 400 并给出
+	// 筛选指引——OFFSET 深页在大审计库上是秒级全表扫描，静默 clamp 会让用户
+	// 以为「翻到了第 501 页」却拿到错位结果。该 400 同时是 *pageSize 溢出的
+	// 唯一防线（page ≤500 × page_size ≤100 → offset 恒安全）。
+	// 必须在 nil 守卫之前：降级窗口不得比正常路径更宽松——审计库未就绪时
+	// ?page=99999999 若回 200，按文档生成的分页器会显示不存在的页并算出越界
+	// 偏移，同一参数在故障窗口内外的状态码分叉也无从排障。降级分支只回显
+	// 合法页码。
+	if page > auditLogDeepPageLimit {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
+			"结果过多（超过 %d 页），请使用时间范围/用户/动作筛选缩小范围", auditLogDeepPageLimit)})
+		return
+	}
 	// 与 GetAuditLogOptions 同口径的 nil 守卫。降级形态与正常路径同键集：
 	// total_stale=true（计数不可信）+ partial=true，消费方无需按状态切换解码。
 	if db.AuditDB == nil {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "审计库未就绪",
 			Data: auditLogListPayload([]map[string]any{}, 0, true, true, page, pageSize)})
-		return
-	}
-	// 深翻页折中：页码分页保留（可跳页、有总页数），但超过阈值显式 400 并给出
-	// 筛选指引——OFFSET 深页在大审计库上是秒级全表扫描，静默 clamp 会让用户
-	// 以为「翻到了第 501 页」却拿到错位结果。该 400 同时是 *pageSize 溢出的
-	// 唯一防线（page ≤500 × page_size ≤100 → offset 恒安全）。
-	if page > auditLogDeepPageLimit {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
-			"结果过多（超过 %d 页），请使用时间范围/用户/动作筛选缩小范围", auditLogDeepPageLimit)})
 		return
 	}
 	offset := int64(page-1) * int64(pageSize)

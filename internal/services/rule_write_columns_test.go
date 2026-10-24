@@ -255,6 +255,11 @@ func TestLbRuleInsertSQL_snapshotSelectRoundTrip(t *testing.T) {
 	service, database := newClusterTestService(t)
 	rule := testLbRuleFullyPopulated(t)
 	rule.CaddyID = "lb_p231_roundtrip"
+	// manual 源携带 ACME/CA 引用是写路径已不可能产生的跨模式残留，会在传输
+	// 归一时清零（见 rule_transport_cross_mode_test）。本用例验证「写侧可产生
+	// 形态」的列往返，故取一致形态：manual 只保留证书材料。
+	rule.ACMEConfigID = 0
+	rule.CAProviderID = 0
 
 	columns := LbRuleWriteColumns()
 	if _, err := database.Exec(LbRuleInsertSQL(columns), LbRuleInsertArgs(&rule, columns)...); err != nil {

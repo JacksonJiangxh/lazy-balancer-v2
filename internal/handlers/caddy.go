@@ -1,5 +1,18 @@
 package handlers
 
+// 5xx 响应体政策（本文件全域，与 rules/metrics/system 等 business 组端点的
+// 「固定文案」政策并存）：
+//   - business 组（任意登录用户可读，如 /settings 的 GetConfig）一律固定文案：
+//     底层错误（SQL 文本、路径、admin 地址）只进运行日志与操作审计。
+//   - admin 组（本文件内的配置读写/校验/重载/Caddy 原始配置/日志/启停）保留
+//     底层错误文本——这些端点是管理员排障接口，需要区分「admin 不可达 / 响应
+//     超限 / 解析失败 / exec exit status / 路径权限」；固定文案会把根因抹平
+//     （GetCaddyConfig 的超限用例即要求「不得误报为解析失败」）。
+//   - 两份口径由 caddyAdmin5xxDetailFunctions 清单（error_body_leak_rules_test.go）
+//     + 源码门禁钉住：新增 5xx 写点或端点路由组变化必须同步清单，否则测试红。
+//     此前本文件内两条 5xx 收敛为固定文案、其余仍带细节，读者无法判断哪条是
+//     政策、哪条是遗漏。
+
 import (
 	"context"
 	"database/sql"
@@ -680,12 +693,19 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// 与 UpdateConfig 同门：preview 200 后 PUT 不应因存量规则聚合校验变 400
-	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+	// 与保存同一判据的无变化短路：无变化=无写入，无需预检（存量坏规则不该
+	// 阻断「确认无变更」流程），两端对同一载荷给出同一答案。
+	plan := planConfigChanges(req, old)
+	if !plan.Changed {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置无变化", Data: plan})
 		return
 	}
-	plan := planConfigChanges(req, old)
+	// 与 UpdateConfig 同门、同分类器：DB 故障不得被回成 400 携带底层错误文本
+	// （管理员会误判为载荷非法），纯配置错误才 400 展示全部问题。
+	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
+		writeConfigValidationFailure(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: plan})
 }
 
@@ -931,19 +951,18 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		}
 		return
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(tx); err != nil {
 		// +: apply 已把未提交事务视图的投影/证书写盘并把
 		// 该内容写入 LKG；commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
 		// /load + 回退 LKG——恢复 /load 失败时仍把已提交字节写回 LKG）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		// 真实 /load 已在 commit 之前发生——「触发重载必须留痕」不因随后失败
 		// 而豁免（同规则族 commit 失败分支）。
 		reloadNote.auditReload()
 		// 横幅两态：恢复失败=「运行配置状态未知」，恢复成功=「旧配置已保留」。
-		// recordCaddyApplyResult 恒以 nil 恢复参数落盘，会把恢复失败误报成
-		// 「旧配置已保留」——提交失败分支必须走带 restoreErr 的写点。
-		h.recordPostCommitRestoreFailure(err, restoreErr)
-		err = errors.Join(err, restoreErr)
+		// 提交失败不是配置应用失败（apply 已发生）——失败对象用提交口径。
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+		err = errors.Join(err, recovery.err())
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(commitUncertainLabel+"："+err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
 		return
@@ -1402,18 +1421,19 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		}
 		return
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(tx); err != nil {
 		// commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
 		// /load + 回退 LKG/投影/证书物化——恢复 /load 失败时仍把已提交字节
 		// 写回 LKG，运行配置不停留在一次性逃生口载荷上）。
-		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 		// loaded=true 表示 apply 已真实 /load——提交失败不豁免「重载」留痕。
 		if loaded {
 			recordAudit(c, "重载", "Caddy服务", "保存配置后自动重载")
 		}
-		// 横幅两态（恢复成功=旧配置已保留 / 失败=运行配置状态未知）。
-		h.recordPostCommitRestoreFailure(err, restoreErr)
-		err = errors.Join(err, restoreErr)
+		// 横幅两态（恢复成功=旧配置已保留 / 失败=运行配置状态未知），失败对象
+		// 为提交而非配置应用。
+		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+		err = errors.Join(err, recovery.err())
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail(commitUncertainLabel, err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})
 		return

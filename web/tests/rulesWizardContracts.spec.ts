@@ -9,10 +9,20 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { section, source } from './_helpers.ts'
+import { code, repoCode, section } from './_helpers.ts'
 import { RULE_NUMERIC_LIMITS } from '../src/utils/ruleValidation.ts'
 
-const page = source('src/views/Rules.vue')
+const page = code('src/views/Rules.vue')
+
+/**
+ * 从 Go 写侧门提取界值（门缺失/形态漂移即硬失败——不得回退到 TS 字面量自证）。
+ * `pattern` 第 1 组必须是界值数字。
+ */
+const gateBound = (text: string, pattern: RegExp, what: string): number => {
+  const match = pattern.exec(text)
+  assert.ok(match, `后端缺写侧门：${what}`)
+  return Number(match[1])
+}
 
 // 策略枚举/卡片集的行为与跨栈对表归 strategyLabels.spec（键集由后端双 map 派生）；
 // 本文件只钉「向导不另造第二份字面量」——同一不变量不重复断言。
@@ -59,11 +69,28 @@ test('C 三个辅助端点失败有错误态 + 横幅重试（不再仅 console�
   }
 })
 
-test('D 数值控件边界引用共享常量（写侧门单源）', () => {
-  assert.equal(RULE_NUMERIC_LIMITS.healthCheckIntervalMin, 1, '后端间隔门 ≥1（原控件 min=5 夹紧合法值 3）')
-  assert.equal(RULE_NUMERIC_LIMITS.healthCheckTimeoutMin, 1)
-  assert.equal(RULE_NUMERIC_LIMITS.tcpTryIntervalMax, 60000, '后端重试间隔上界 60000（原控件 10000）')
-  assert.equal(RULE_NUMERIC_LIMITS.maxConnectionsMin, 0)
+test('D 数值控件边界与后端写侧门逐值对表（改门即红）', () => {
+  // 这四条常量的唯一存在理由就是镜像后端写侧门；只钉 TS 字面量等于自证。
+  // 界值从 Go 源码提取后逐值比较：后端收紧/放宽门时前端必须同批跟随。
+  const handlers = repoCode('internal/handlers/handlers.go')
+  const ruleFeatures = repoCode('internal/handlers/rule_features.go')
+
+  const intervalMin = gateBound(handlers, /if data\.HealthCheckInterval < (\d+) \{/, '健康检查间隔下限')
+  assert.equal(RULE_NUMERIC_LIMITS.healthCheckIntervalMin, intervalMin, '间隔下限与后端门漂移')
+  const timeoutMin = gateBound(handlers, /if data\.HealthCheckTimeout < (\d+) \{/, '健康检查超时下限')
+  assert.equal(RULE_NUMERIC_LIMITS.healthCheckTimeoutMin, timeoutMin, '超时下限与后端门漂移')
+  // 上游最大连接数：`u.MaxConnections < N`（0=不限，负值 400）。
+  const maxConnMin = gateBound(handlers, /if u\.MaxConnections < (\d+) \{/, '上游最大连接数下限')
+  assert.equal(RULE_NUMERIC_LIMITS.maxConnectionsMin, maxConnMin, '最大连接下限与后端门漂移')
+
+  // 重试间隔上界：http 分支 `interval < 0 || interval > N`，tcp 分支
+  // `duration > N || interval > N`——两协议同值，且前端 :max 必须等于该值。
+  const tcpTry = section(ruleFeatures, 'func validateTCPTryWindowBounds', 'func validateStoredRuleProtocolFields')
+  const intervalMax = gateBound(tcpTry, /if interval < 0 \|\| interval > (\d+) \{/, 'tcp_try_interval 上界')
+  assert.equal(RULE_NUMERIC_LIMITS.tcpTryIntervalMax, intervalMax, '重试间隔上界与后端门漂移')
+  const bounds = [...tcpTry.matchAll(/interval > (\d+)/g)].map((m) => Number(m[1]))
+  assert.deepEqual([...new Set(bounds)], [intervalMax], '两协议分支的上界必须同值')
+
   // 按 el-input-number 开标签取属性集判定：不依赖属性书写顺序。此前三条否定
   // 断言把 `:max="30"` 写在字段名之前，而模板恒为「字段名在前」——真回归（重新
   // 加 :max）时空转（死断言）。标签提取必须跳过引号内的 `>`（`:min="a > b ? …"`

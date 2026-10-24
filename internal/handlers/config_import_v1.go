@@ -17,8 +17,6 @@ import (
 )
 
 type v1Backup struct {
-	UserList       *v1Section `json:"user_list"`
-	MainConfig     *v1Section `json:"main_config"`
 	ProxyConfig    *v1Section `json:"proxy_config"`
 	UpstreamConfig *v1Section `json:"upstream_config"`
 }
@@ -576,7 +574,11 @@ type importValidateResponse struct {
 // 导出侧同样拒绝超限产物，兼顾大备份往返与导入瞬态内存峰值。
 var maxConfigImportBytes int64 = 128 << 20
 
-const configImportLimitMessage = "备份文件不能超过 128MB"
+// configImportLimitMessage 413 文案从 maxConfigImportBytes 派生（单源）：测试
+// 收窄限额后文案必须同步，否则「断言照过、文案失真」。
+func configImportLimitMessage() string {
+	return fmt.Sprintf("备份文件不能超过 %dMB", maxConfigImportBytes>>20)
+}
 
 // lbbakPayloadFromCtx 取 validate 流程中解包的 lbbak 载荷(可能为 nil)。
 func lbbakPayloadFromCtx(c *gin.Context) *lbbakPayload {
@@ -587,7 +589,7 @@ func lbbakPayloadFromCtx(c *gin.Context) *lbbakPayload {
 
 func limitConfigImportBody(c *gin.Context) bool {
 	if c.Request.ContentLength > maxConfigImportBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return false
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxConfigImportBytes)
@@ -608,7 +610,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 	}
 	body, err := c.GetRawData()
 	if isRequestBodyTooLarge(err) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return
 	}
 	if err != nil {
@@ -687,20 +689,13 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// 链内自动封禁钳制事实（阈值/窗口越界被归一）与上述并列，预览必须
 		// 可见——否则预览显示 valid 且无提示，导入后实际生效值已变。
 		validateWarnings = append(validateWarnings, chain.AutobanClampNotes...)
-		// live 证书任务引用 live CA 提供商的悬挂预检：与导入锁内同一判据
-		// （certJobProviderDanglingCounts，按「已禁用=真失败 / 不存在=回落自愈」
-		// 分档），预览与导入对同一备份给出同一组告警。
-		if disabledProviders, missingProviders, countErr := certJobProviderDanglingCounts(c.Request.Context(), db.DB, backup.Tables, sectionTables); countErr != nil {
-			services.Logf("warn", "配置预览：证书任务 CA 提供商悬挂统计失败: %v", countErr)
-			validateWarnings = append(validateWarnings, "证书任务 CA 提供商悬挂统计未完成（读取失败）："+countErr.Error())
-		} else {
-			if disabledProviders > 0 {
-				validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 个证书任务的 CA 提供商已禁用——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", disabledProviders))
-			}
-			if missingProviders > 0 {
-				validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 个证书任务引用的 CA 提供商已不存在——续签时将回落首个启用提供商（自愈），如需保持原提供商请补齐", missingProviders))
-			}
-		}
+		// 全局配置数值归一（整型钳制表 + request_body_max_size_mb）同源可见：
+		// 预览与导入共用链内归一点，同一份备份两侧给出同一组文案。
+		validateWarnings = append(validateWarnings, chain.ConfigClampNotes...)
+		// live 证书任务引用 live CA 提供商的悬挂预检：链内单源产出（按
+		// 「已禁用=真失败 / 不存在=回落自愈」分档，规则源按备份是否携带
+		// lb_rules 二选一），预览与导入对同一备份给出同一组文案。
+		validateWarnings = append(validateWarnings, chain.CertJobDanglingWarnings...)
 		hasWaf := false
 		if payload := lbbakPayloadFromCtx(c); payload != nil {
 			// 威胁库名单条目也是规则库数据文件
@@ -799,7 +794,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	body, err := c.GetRawData()
 	if isRequestBodyTooLarge(err) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return
 	}
 	if err != nil {
@@ -854,29 +849,29 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	restoreImportNodeRole, err := suppressImportClusterVersionBumps(ctx, tx)
 	if err != nil {
 		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "准备导入事务失败，已回滚: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "准备导入事务失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_rules"); err != nil {
 		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧路径规则失败，已回滚: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧路径规则失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM upstreams"); err != nil {
 		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧上游失败，已回滚: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧上游失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM lb_rules"); err != nil {
 		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧规则失败，已回滚: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧规则失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	// v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
 	// 绑定表对 rule_caddy_id 无外键级联，残留行会指向已删除规则成为悬挂绑定。
 	if _, err := tx.ExecContext(ctx, "DELETE FROM security_policy_bindings"); err != nil {
 		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧策略绑定失败，已回滚: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧策略绑定失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	userID := int(contextUserID(c))
@@ -889,7 +884,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		caddyID, err := services.GenerateCaddyID()
 		if err != nil {
 			err = session.abort(err)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则编号失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则编号失败: " + importFailureAuditDetail(err)})
 			return
 		}
 		affectedRuleIDs = append(affectedRuleIDs, caddyID)
@@ -907,16 +902,16 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 			r.Compress, r.Enabled, userID, userID, caddyID)
 		if err != nil {
 			err = session.abort(err)
-			recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s: %v", r.Name, err))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则失败，已回滚: " + err.Error()})
+			recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s：%s", r.Name, importFailureAuditDetail(err)))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则失败，已回滚: " + importFailureAuditDetail(err)})
 			return
 		}
 		for _, u := range r.Upstreams {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections)
 				VALUES (?, ?, ?, ?, 0, ?, ?, 0)`, caddyID, u.Host, u.Port, u.Weight, u.Enabled, u.Protocol); err != nil {
 				err = session.abort(err)
-				recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s 上游: %v", r.Name, err))
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入上游失败，已回滚: " + err.Error()})
+				recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s 上游：%s", r.Name, importFailureAuditDetail(err)))
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入上游失败，已回滚: " + importFailureAuditDetail(err)})
 				return
 			}
 			upstreamCount++
@@ -937,8 +932,8 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	droppedTCPBindings, err := normalizeRuleRowsForTransport(ctx, tx)
 	if err != nil {
 		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", err.Error())
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则归一失败，已回滚: " + err.Error()})
+		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则归一失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if droppedTCPBindings > 0 {
@@ -946,8 +941,8 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	if err := restoreImportNodeRole(); err != nil {
 		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", err.Error())
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "恢复导入前节点角色失败，已回滚: " + err.Error()})
+		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "恢复导入前节点角色失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {
@@ -957,28 +952,35 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 			// 与 v2 尾部（config_backup.go queue
 			// 分支后继续提交后收敛）对齐——此前提前返回丢失全部转换/跳过/
 			// 归一化警告、不写「重载」审计、不清陈旧 caddy_apply_error 横幅。
-			auditDetail := err.Error()
+			// detail 走单源：审计 action 已带「部分失败」，detail 不再重复动作词。
+			auditDetail := importFailureAuditDetail(err)
 			if len(disabledConflicts) > 0 {
 				auditDetail = services.FormatAuditDetail(auditDetail, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
 			}
 			recordAudit(c, "部分失败", "配置备份", auditDetail)
 			recordAudit(c, "重载", "Caddy服务", "导入配置后自动重载")
 			h.recordCaddyApplyResult(nil)
-			partialWarnings := append(append([]string{}, allWarnings...), "数据库已提交，但证书任务恢复失败: "+err.Error())
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置已导入，但证书任务恢复失败: " + err.Error(), Data: gin.H{
+			// 提交已落地：imported 是真实已提交条数（回滚路径相反，不报条数）。
+			// message/warnings 只带阶段说明与真实原因（不重复动作词）。
+			partialWarnings := append(append([]string{}, allWarnings...), "数据库已提交，但证书任务恢复失败: "+importFailureCause(err))
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置已导入，但证书任务恢复失败: " + importFailureCause(err), Data: gin.H{
 				"imported": imported, "disabled_conflicts": disabledConflicts,
 				"partial": true, "warnings": partialWarnings,
 			}})
 			return
 		}
+		// message 正文与审计 detail 同源（阶段描述+真实错误）：err.Error() 自带
+		// 「导入失败」动作前缀，再拼「配置导入失败:」会双前缀。
 		status := http.StatusInternalServerError
-		message := "配置导入失败: " + err.Error()
+		message := "配置导入失败: " + importFailureAuditDetail(err)
 		if importFailureCaddyRejected(err) {
 			status = http.StatusBadRequest
-			message = "备份生成的配置未通过 Caddy 验证，未执行导入: " + err.Error()
+			message = "备份生成的配置未通过 Caddy 验证，未执行导入: " + importFailureAuditDetail(err)
 		}
-		recordAudit(c, "导入失败", "配置备份", err.Error())
-		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"imported": imported, "disabled_conflicts": disabledConflicts}})
+		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
+		// 事务已回滚：循环里的插入计数全部作废，不得报 imported（否则前端/
+		// 运维会误判部分规则已落地）。
+		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"disabled_conflicts": disabledConflicts}})
 		return
 	}
 	auditParts := []string{"来源：v1 备份（覆盖导入规则）", fmt.Sprintf("规则 %d 条", imported), fmt.Sprintf("TLS 规则 %d 条", tlsCount), fmt.Sprintf("上游 %d 个", upstreamCount)}

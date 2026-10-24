@@ -25,90 +25,128 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+// synchronizedWriteClassificationCase 是 isSynchronizedWrite 分类矩阵的一条用例。
+type synchronizedWriteClassificationCase struct {
+	method string
+	path   string
+	want   bool
+}
+
+// synchronizedWriteClassificationCases 是同步写分类回归矩阵：快照内容写路径
+// true，只读/纯代理 false。生产 users 写路径清单必须被本矩阵全覆盖——反向
+// 覆盖断言见 TestIsSynchronizedWrite_coversProductionUsersWritePaths。
+var synchronizedWriteClassificationCases = []synchronizedWriteClassificationCase{
+	{"PUT", "/api/v1/config", true},
+	{"POST", "/api/v1/config/preview", false},
+	{"PUT", "/api/v1/caddy/config", true},
+	{"POST", "/api/v1/rules", true},
+	{"POST", "/api/v1/rules/cert-info", false},
+	{"PATCH", "/api/v1/users/me", true},
+	{"DELETE", "/api/v1/api-keys/:id", true},
+	{"POST", "/api/v1/cluster/mode", false},
+	{"PUT", "/api/v1/cluster/settings", true},
+	{"PUT", "/api/v1/admin-tls", true},
+	{"POST", "/api/v1/admin-tls/inspect", false},
+	{"POST", "/api/v1/config/import", true},
+	{"POST", "/api/v1/config/import/v1", true},
+	{"POST", "/api/v1/config/import/validate", false},
+	// 还原经 importConfigBackupCore 重写 lb_rules/
+	// upstreams 等全部同步表,必须与 /config/import 同口径 fail-closed;
+	// run/delete 仅写 auto_backups 本地簿记表(非同步表),不放行。
+	{"POST", "/api/v1/auto-backup/:id/restore", true},
+	{"POST", "/api/v1/auto-backup/7/restore", true},
+	{"POST", "/api/v1/auto-backup/run", false},
+	{"DELETE", "/api/v1/auto-backup/:id", false},
+	{"POST", "/api/v1/certificates/issue", true},
+	{"POST", "/api/v1/certificates/jobs/:id/retry", true},
+	{"DELETE", "/api/v1/certificates/jobs/:id", true},
+	{"POST", "/api/v1/certificates/jobs/current", false},
+	{"POST", "/api/v1/certificates/parse", false},
+	{"GET", "/api/v1/certificates/jobs/:id", false},
+	{"PUT", "/api/v1/ca-providers/:id", true},
+	// test 端点在 ZeroSSL 缺 EAB 时写
+	// ca_providers.credentials（同步表），与 PUT 同口径 fail-closed。
+	{"POST", "/api/v1/ca-providers/:id/test", true},
+	{"POST", "/api/v1/ca-providers/7/test", true},
+	{"POST", "/api/v1/certificate-configs", true},
+	{"PUT", "/api/v1/certificate-configs/:id", true},
+	{"DELETE", "/api/v1/certificate-configs/:id", true},
+	{"POST", "/api/v1/certificate-configs/test", false},
+	{"POST", "/api/v1/certificate-configs/:id/test", false},
+	{"POST", "/api/v1/security/policies", true},
+	{"PUT", "/api/v1/security/policies/:id", true},
+	{"DELETE", "/api/v1/security/policies/:id", true},
+	{"PUT", "/api/v1/settings/auto-backup", true},
+	{"PUT", "/api/v1/settings/oidc", true},
+	{"DELETE", "/api/v1/settings/oidc", true},
+	{"POST", "/api/v1/security/policies/:id/bind", true},
+	{"DELETE", "/api/v1/security/policies/:id/bind/:caddy_id", true},
+	{"POST", "/api/v1/security/custom-rules", true},
+	{"PUT", "/api/v1/security/custom-rules/:id", true},
+	{"DELETE", "/api/v1/security/custom-rules/:id", true},
+	{"POST", "/api/v1/security/block-pages", true},
+	{"PUT", "/api/v1/security/block-pages/:id", true},
+	{"DELETE", "/api/v1/security/block-pages/:id", true},
+	{"PUT", "/api/v1/security/crs/auto-update", true},
+	{"POST", "/api/v1/security/crs/update", true},
+	// 手动任务触发可写版本表；整路由 fail-closed，避免在中间件维护
+	// 第二份任务 ID/同步写清单。其他任务操作不据此捕获。
+	{"POST", "/api/v1/system/tasks/:id/trigger", true},
+	{"POST", "/api/v1/system/tasks/:id/toggle", false},
+	// 大屏流量采集租约是 Caddy admin 的纯代理
+	//（内存租约，不写任何同步表）——不得按 security 前缀误分类为
+	// 同步写（触发器降级态会把它误伤成 500）。
+	{"POST", "/api/v1/security/overview/threat-screen/collector", false},
+	{"DELETE", "/api/v1/security/overview/threat-screen/collector", false},
+	{"GET", "/api/v1/security/policies", false},
+	{"GET", "/api/v1/security/custom-rules", false},
+	// 登录锁传播：密码登录与 MFA 验证步均写
+	// users 同步列（失败置锁 login_locked_until/成功清零解锁），触发器
+	// 不可用时须与 setup/OIDC 开户同口径 fail-closed。
+	{"POST", "/api/v1/auth/login", true},
+	{"POST", "/api/v1/auth/mfa/verify", true},
+	// 初始化管理员 / OIDC JIT 开户 / MFA 三段状态变更同样写 users
+	// 同步列——生产单源清单里的每条都必须在此留 true 用例（反向覆盖
+	// 断言见 TestIsSynchronizedWrite_coversProductionUsersWritePaths）。
+	{"POST", "/api/v1/auth/setup", true},
+	{"GET", "/api/v1/auth/oidc/callback", true},
+	{"POST", "/api/v1/auth/mfa/activate", true},
+	{"POST", "/api/v1/auth/mfa/disable", true},
+	{"POST", "/api/v1/auth/mfa/recovery-codes", true},
+	// 反例：只写 pending/记账列（永不 bump），按前缀捕获会误伤 MFA 登录/step-up。
+	{"POST", "/api/v1/auth/mfa/setup", false},
+	{"POST", "/api/v1/auth/mfa/verify-step", false},
+	// 票据登录不写 users 同步列（失败仅记审计）——不误伤从节点登录
+	// 可用性；GET 形态同样不入。
+	{"POST", "/api/v1/auth/ticket-login", false},
+	{"GET", "/api/v1/auth/login", false},
+}
+
 func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testing.T) {
-	tests := []struct {
-		method string
-		path   string
-		want   bool
-	}{
-		{"PUT", "/api/v1/config", true},
-		{"POST", "/api/v1/config/preview", false},
-		{"PUT", "/api/v1/caddy/config", true},
-		{"POST", "/api/v1/rules", true},
-		{"POST", "/api/v1/rules/cert-info", false},
-		{"PATCH", "/api/v1/users/me", true},
-		{"DELETE", "/api/v1/api-keys/:id", true},
-		{"POST", "/api/v1/cluster/mode", false},
-		{"PUT", "/api/v1/cluster/settings", true},
-		{"PUT", "/api/v1/admin-tls", true},
-		{"POST", "/api/v1/admin-tls/inspect", false},
-		{"POST", "/api/v1/config/import", true},
-		{"POST", "/api/v1/config/import/v1", true},
-		{"POST", "/api/v1/config/import/validate", false},
-		// 还原经 importConfigBackupCore 重写 lb_rules/
-		// upstreams 等全部同步表,必须与 /config/import 同口径 fail-closed;
-		// run/delete 仅写 auto_backups 本地簿记表(非同步表),不放行。
-		{"POST", "/api/v1/auto-backup/:id/restore", true},
-		{"POST", "/api/v1/auto-backup/7/restore", true},
-		{"POST", "/api/v1/auto-backup/run", false},
-		{"DELETE", "/api/v1/auto-backup/:id", false},
-		{"POST", "/api/v1/certificates/issue", true},
-		{"POST", "/api/v1/certificates/jobs/:id/retry", true},
-		{"DELETE", "/api/v1/certificates/jobs/:id", true},
-		{"POST", "/api/v1/certificates/jobs/current", false},
-		{"POST", "/api/v1/certificates/parse", false},
-		{"GET", "/api/v1/certificates/jobs/:id", false},
-		{"PUT", "/api/v1/ca-providers/:id", true},
-		// test 端点在 ZeroSSL 缺 EAB 时写
-		// ca_providers.credentials（同步表），与 PUT 同口径 fail-closed。
-		{"POST", "/api/v1/ca-providers/:id/test", true},
-		{"POST", "/api/v1/ca-providers/7/test", true},
-		{"POST", "/api/v1/certificate-configs", true},
-		{"PUT", "/api/v1/certificate-configs/:id", true},
-		{"DELETE", "/api/v1/certificate-configs/:id", true},
-		{"POST", "/api/v1/certificate-configs/test", false},
-		{"POST", "/api/v1/certificate-configs/:id/test", false},
-		{"POST", "/api/v1/security/policies", true},
-		{"PUT", "/api/v1/security/policies/:id", true},
-		{"DELETE", "/api/v1/security/policies/:id", true},
-		{"PUT", "/api/v1/settings/auto-backup", true},
-		{"PUT", "/api/v1/settings/oidc", true},
-		{"DELETE", "/api/v1/settings/oidc", true},
-		{"POST", "/api/v1/security/policies/:id/bind", true},
-		{"DELETE", "/api/v1/security/policies/:id/bind/:caddy_id", true},
-		{"POST", "/api/v1/security/custom-rules", true},
-		{"PUT", "/api/v1/security/custom-rules/:id", true},
-		{"DELETE", "/api/v1/security/custom-rules/:id", true},
-		{"POST", "/api/v1/security/block-pages", true},
-		{"PUT", "/api/v1/security/block-pages/:id", true},
-		{"DELETE", "/api/v1/security/block-pages/:id", true},
-		{"PUT", "/api/v1/security/crs/auto-update", true},
-		{"POST", "/api/v1/security/crs/update", true},
-		// 手动任务触发可写版本表；整路由 fail-closed，避免在中间件维护
-		// 第二份任务 ID/同步写清单。其他任务操作不据此捕获。
-		{"POST", "/api/v1/system/tasks/:id/trigger", true},
-		{"POST", "/api/v1/system/tasks/:id/toggle", false},
-		// 大屏流量采集租约是 Caddy admin 的纯代理
-		//（内存租约，不写任何同步表）——不得按 security 前缀误分类为
-		// 同步写（触发器降级态会把它误伤成 500）。
-		{"POST", "/api/v1/security/overview/threat-screen/collector", false},
-		{"DELETE", "/api/v1/security/overview/threat-screen/collector", false},
-		{"GET", "/api/v1/security/policies", false},
-		{"GET", "/api/v1/security/custom-rules", false},
-		// 登录锁传播：密码登录与 MFA 验证步均写
-		// users 同步列（失败置锁 login_locked_until/成功清零解锁），触发器
-		// 不可用时须与 setup/OIDC 开户同口径 fail-closed。
-		{"POST", "/api/v1/auth/login", true},
-		{"POST", "/api/v1/auth/mfa/verify", true},
-		// 票据登录不写 users 同步列（失败仅记审计）——不误伤从节点登录
-		// 可用性；GET 形态同样不入。
-		{"POST", "/api/v1/auth/ticket-login", false},
-		{"GET", "/api/v1/auth/login", false},
-	}
-	for _, test := range tests {
+	for _, test := range synchronizedWriteClassificationCases {
 		if got := isSynchronizedWrite(test.method, test.path); got != test.want {
 			t.Errorf("isSynchronizedWrite(%s %s)=%v, want %v", test.method, test.path, got, test.want)
 		}
+	}
+}
+
+// 反向覆盖：生产清单是唯一事实源，分类矩阵必须为其中每条写路径留 true 用例。
+// 新增 users 写路径时若忘了扩展矩阵，本断言直接失败（生产 ⊆ 测试覆盖），
+// 不会出现「清单加了、分类行为没人验」的静默漂移。
+func TestIsSynchronizedWrite_coversProductionUsersWritePaths(t *testing.T) {
+	covered := make(map[string]bool, len(synchronizedWriteClassificationCases))
+	for _, test := range synchronizedWriteClassificationCases {
+		if test.want {
+			covered[test.method+" "+test.path] = true
+		}
+	}
+	for _, path := range usersTableWritePostPaths {
+		if !covered[http.MethodPost+" "+path] {
+			t.Errorf("生产 users 写路径 POST %s 未出现在同步写分类矩阵", path)
+		}
+	}
+	if !covered[http.MethodGet+" "+usersTableWriteOIDCCallbackPath] {
+		t.Errorf("生产 users 写路径 GET %s 未出现在同步写分类矩阵", usersTableWriteOIDCCallbackPath)
 	}
 }
 
@@ -270,10 +308,25 @@ func TestClusterVersionMiddleware_rejects_with_api_response_when_trigger_install
 		t.Fatalf("initialize database: %v", err)
 	}
 	database := db.DB
+	t.Cleanup(func() {
+		_ = database.Close()
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
+	})
 	if err := db.Close(); err != nil {
 		t.Fatalf("close database: %v", err)
 	}
-	db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	// 夹具复位走单源 restoreTestDBHandles（含 SetDB）。句柄自检用已关闭库的
+	// 指针身份做非平凡断言：db.Close 内部 SetDB(nil)，只赋值包级变量的旧写法
+	// 会让 db.GetDB() 停在 nil，与 db.DB 分叉（两条读取路径读到不同库）。
+	restoreTestDBHandles(database, oldMetricsDB, oldAuditDB)
+	if db.DB != database || db.GetDB() != database {
+		t.Fatalf("夹具复位未回填原子句柄：db.DB=%p db.GetDB()=%p want %p", db.DB, db.GetDB(), database)
+	}
+	// 再复位到用例开始前的环境（后续只在 router 内使用已关闭的 database）。
+	restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
+	if db.DB != oldDB || db.GetDB() != oldDB {
+		t.Fatalf("复位到用例前环境失败：db.DB=%p db.GetDB()=%p want %p", db.DB, db.GetDB(), oldDB)
+	}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.Use(clusterVersionMiddleware(database))
@@ -689,7 +742,7 @@ func TestClusterPasswordVersionSync_rejects_old_JWT(t *testing.T) {
 		t.Fatalf("sign old JWT: %v", err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	request.Header.Set("Authorization", "Bearer "+token)

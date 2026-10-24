@@ -43,7 +43,16 @@
       </div>
 
       <!-- ② 策略配置与命中明细（仅展示与本次触发相关的维度；零操作，处置在 IP 快捷弹框） -->
-      <div v-if="loadError" class="info-note-bar"><span class="info-note-desc">策略信息加载失败，请关闭后重试</span></div>
+      <!-- 加载失败面：策略信息与名单条目分开呈现（依据不同：前者是配置，
+           后者决定命中/豁免归因）。两者都可原地重取——弹框内不必关闭重开。 -->
+      <div v-if="loadError" class="info-note-bar">
+        <span class="info-note-desc">策略信息加载失败，配置与命中信息可能不完整</span>
+        <el-button size="small" type="primary" plain :loading="loading" @click="retryLists">重新加载</el-button>
+      </div>
+      <div v-if="entriesError && !loadError" class="info-note-bar">
+        <span class="info-note-desc">地址列表条目加载失败：命中名单与信任豁免归因不完整</span>
+        <el-button size="small" type="primary" plain :loading="loading" @click="retryLists">重新加载</el-button>
+      </div>
       <div class="trg-card">
         <div class="trg-card-title">策略配置 · {{ dimensionTitle }}</div>
         <div class="trg-kv"><span class="k">当前配置</span><span>{{ relevantSummary }}</span></div>
@@ -57,7 +66,7 @@
           <div v-if="inlineAclHit" class="trg-kv"><span class="k">命中位置</span><span>策略内联{{ policy?.ip_acl_mode === 'allow' ? '白' : '黑' }}名单</span></div>
           <div v-if="trustHitNote" class="trg-kv"><span class="k">信任豁免</span><span>{{ trustHitNote }}</span></div>
           <div v-if="memberSystemTip" class="trg-tip">{{ memberSystemTip }}</div>
-          <div v-if="allHitLists.length === 0 && !inlineAclHit && kind === 'acl' && !isAllowOutside && !loadError" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
+          <div v-if="allHitLists.length === 0 && !inlineAclHit && kind === 'acl' && !isAllowOutside && !loadError && !entriesError" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
         </template>
 
         <!-- 爬虫校验：验证结果与豁免引擎（v2.3.8 独立族，不再误标地域） -->
@@ -152,7 +161,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, missingSharedEntryIds, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet } from '@/utils/securityStages'
 import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
@@ -330,6 +339,11 @@ const heroHitSource = computed(() => {
 const loading = ref(false)
 const policyMissing = ref(false)
 const loadError = ref(false)
+// 名单条目加载失败态：ensureSharedEntries 对单名单失败保持「未缓存」且不抛出，
+// 故失败信号只能按「引用名单是否全部落地」判定。不显性化时条目缺失会被渲染成
+// 「未定位到命中的地址列表」的业务结论（与真实未命中无法区分）——与 IP 处置
+// 弹框的 listsError 同口径：横幅 + 重试，「未定位」结论在失败态不可达。
+const entriesError = ref(false)
 // policy_id<=0 是后端归因的合法「无策略归属」态（规则未绑定策略时
 // securityevents.go 返回 (0, "")），不是「策略已删除」——文案分离。
 const noPolicyAttribution = computed(() => (props.row?.policy_id ?? 0) <= 0)
@@ -401,6 +415,7 @@ const loadAll = async (): Promise<void> => {
   loading.value = true
   policyMissing.value = false
   loadError.value = false
+  entriesError.value = false
   policy.value = null
   enabledPolicies.value = []
   lists.value = []
@@ -453,21 +468,23 @@ const loadAll = async (): Promise<void> => {
     })
     // 只补拉共享缓存缺失的名单：原实现对全部 refIds 无条件
     // 并发 GET——连续打开事件详情时同一批名单反复下载。写回/通知由缓存单源负责。
-    try {
-      await ensureSharedEntries(refIds, async (id) => {
-        const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true })
-        return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
-      })
-    } catch {
-      // 条目加载失败不能伪装成「未命中名单」的业务结论。
-      loadError.value = true
-    }
+    // ensureSharedEntries 对单名单失败保持「未缓存」且不抛出（下次调用可重试）——
+    // 失败信号只能按「引用名单是否全部落地」判定，否则条目缺失会退化成
+    // 「未命中名单」的业务结论（不能伪装成业务结论）。
+    await ensureSharedEntries(refIds, async (id) => {
+      const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true })
+      return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
+    })
     if (seq !== loadSeq) return
+    entriesError.value = missingSharedEntryIds(refIds).length > 0
     entriesCache.value = { ...sharedEntriesCache }
   } finally {
     if (seq === loadSeq) loading.value = false
   }
 }
+
+// 加载失败横幅的重试入口：策略/名单/条目同轮重取（loadAll 内含会话竞态守卫）
+const retryLists = (): void => { void loadAll() }
 
 // 区域清单展示层翻译——country_names_cn 单源映射，未命中
 // （省份/省市联值/海外哨兵）回退原文；geoip_countries 值零改动。

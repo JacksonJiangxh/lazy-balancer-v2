@@ -25,6 +25,9 @@ type PathRuleInput = {
 // 单标签 ≤63、总长 ≤253。前端方向不放宽到 IP 字面量（SNI 语义不需要）。
 export const isValidHostName = (value: string): boolean => {
   if (value === '' || value.length > 253) return false
+  // 全数字点分串（999.1.1.1、1.2.3.4.5）并非合法 IP，却满足标签字符表：
+  // 与后端同口径拒绝，避免前端放行、保存时才被 400 拦下。
+  if (value.includes('.') && value.split('.').every((part) => /^\d+$/.test(part))) return false
   return value.split('.').every((part) => {
     if (part === '' || part.length > 63) return false
     if (!/^[A-Za-z0-9_-]+$/.test(part)) return false

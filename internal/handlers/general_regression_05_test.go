@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// （回归）：drain 超时 abort 路径下补偿已成功启动并接管租约，
+// 删除规则的租约归属（回归）：drain 超时 abort 路径下补偿已成功启动并接管租约，
 // 处理程序返回后 defer 不得释放该租约——提前释放会让补偿 goroutine 的
 // enqueueCompensation 见租约缺失而永久退避（每轮重新 drain+restore，
 // 反复打断该规则合法签发）。租约必须由补偿 goroutine 自身在完成时释放。
@@ -71,7 +71,7 @@ func TestDeleteRule_keeps_block_lease_when_compensation_started_after_drain_time
 	}
 }
 
-// （panic 窗口）：drain 前/中 panic 时 gin Recovery 只恢复 HTTP 栈、
+// 删除规则的租约释放（panic 窗口）：drain 前/中 panic 时 gin Recovery 只恢复 HTTP 栈、
 // 不清理 blockedRules——租约 defer 必须登记在 drain 之前，否则屏障滞留到下一次
 // Stop，该规则证书任务被静默永久拦截。
 func TestDeleteRule_releases_block_lease_when_drain_panics(t *testing.T) {

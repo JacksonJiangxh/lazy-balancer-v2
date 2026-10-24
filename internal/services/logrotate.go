@@ -76,12 +76,8 @@ func StartLogRotate(ctx context.Context) {
 	}()
 }
 
-func StopLogRotate() {
-	runtimeLogSizeRefresh.stop(runtimeLogSizeRefreshLogLabel)
-}
-
 // StopLogRotateWithin 有界停止日志尺寸刷新 worker：cancel 后最多等待 within
-// （within<=0=无界，与 StopLogRotate 同语义）。超时放弃等待并 warn——进程
+// （within<=0=无界）。超时放弃等待并 warn——进程
 // 退出路径用：残留 goroutine 随进程消亡，cancel/done 字段保留，worker 最终
 // 退出后可再次调用完成清零（可重启语义不变）。返回 true=worker 已退出且
 // 状态清零。
@@ -399,13 +395,6 @@ func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
 	return res, "日志清理完成：" + logCleanupDetail(res)
 }
 
-// logCleanupSummaryLine log-cleanup 任务单轮摘要行（从 wire 描述符闭包抽出，
-// 便于对「摘要行口径 = 实际清理口径」直接钉测）。
-func logCleanupSummaryLine(logFile string) string {
-	_, line := logCleanupRound(logFile)
-	return line
-}
-
 // logCleanupDetail 摘要行的明细段（各自独立失败原因可见）。
 func logCleanupDetail(res RuntimeCleanupResult) string {
 	// 保留月数取 RuntimeCleanupResult 的单源回填值（与实际删除口径
@@ -473,6 +462,12 @@ func wafAuditHousekeeping() ([]string, error) {
 	}
 	sizeBefore := info.Size()
 	if _, rotErr := SecurityEventsPollOnce(); rotErr != nil {
+		if errors.Is(rotErr, errAuditRotationDeferred) {
+			// 轮转未完成 ≠ 无需轮转：归档已就位但活文件未截断（尾部未收敛），
+			// 空间未回收。摘要必须写「延迟」而不是「清理完成」——下次兜底只在
+			// 24h 后，误导性完成文案会把排障方向引向别处。
+			return nil, fmt.Errorf("超阈兜底轮转延迟（audit.log %d 字节 ≥ %d 字节，尾部尚未摄取，下次清理重试）: %w", sizeBefore, maxBytes, rotErr)
+		}
 		return nil, fmt.Errorf("超阈兜底轮转失败（audit.log %d 字节 ≥ %d 字节）: %w", sizeBefore, maxBytes, rotErr)
 	}
 	if after, aerr := os.Stat(auditLogPath); aerr != nil {
@@ -480,21 +475,16 @@ func wafAuditHousekeeping() ([]string, error) {
 	} else if after.Size() < sizeBefore {
 		actions = append(actions, fmt.Sprintf("audit.log %.1fMB≥%dMB（摄取+轮转）",
 			float64(sizeBefore)/1024/1024, maxBytes/1024/1024))
+	} else if after.Size() >= maxBytes {
+		// poll 成功但未回收空间（阈值缓存/外部写入使活文件仍在阈上）：不得
+		// 以「无动作」呈现为完成。
+		return nil, fmt.Errorf("超阈兜底轮转延迟（audit.log %d 字节仍 ≥ %d 字节，本轮未回收空间）", after.Size(), maxBytes)
 	}
 	for _, action := range actions {
 		Logf("info", "waf-audit 兜底轮转：%s", action)
 		TaskLogf("log-cleanup", "waf-audit", "兜底轮转：%s", action)
 	}
 	return actions, nil
-}
-
-// taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）——
-// 返回清理明细（哪个文件被删/轮转——用户可见）。保留月数自行读取（测试/独立
-// 调用入口）；RuntimeLogCleanupOnce 复用同一实现并传入自己已读取的口径，
-// 避免一轮两次查库。
-func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
-	months, monthsErr := auditRetentionMonths()
-	return taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
 }
 
 // taskLogsHousekeepingWithRetention 以调用方给定的保留期执行任务日志清理。

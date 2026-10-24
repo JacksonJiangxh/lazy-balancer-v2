@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -29,26 +30,51 @@ const (
 // 删除——两处不得各自硬编码。
 const ThreatRollupEventHighwaterPrefix = "threat_rollup_max_event_id:"
 
+// 大屏 rollup 的覆盖/状态键（metrics_state）。定义在本包是因为保留清理必须
+// 读取同一批键来判定「预聚合首轮/代际回填是否就绪」——写侧（handlers）与
+// 清理侧各自硬编码会让就绪判据随任一侧改名而静默失效。
+const (
+	// ThreatRollupWatermarkKey 已覆盖区间的最新完整分钟。
+	ThreatRollupWatermarkKey = "threat_rollup_last_fixed_minute"
+	// ThreatRollupCoveredFromKey 已覆盖区间的最旧分钟。
+	ThreatRollupCoveredFromKey = "threat_rollup_covered_from"
+	// ThreatRollupTargetReadyKey 目标维度 rollup 就绪标记（缺失=从未成功固化）。
+	ThreatRollupTargetReadyKey = "threat_rollup_target_ready"
+	// ThreatRollupRebuildFromKey 未完成的全量重建意图起点（存在=回填未走完）。
+	ThreatRollupRebuildFromKey = "threat_rollup_rebuild_from"
+	// ThreatRollupLateBaselinePrefix 回退时被删除的分钟事件高水位在此留底：
+	// 高水位删掉后下一次固化走全量重算，而「已计入行」与「迟到行」只能靠该
+	// 基线区分（原始行被裁剪/含旧口径行时全量重算总量小于已固化总量，迟到
+	// 行必须按 id > 基线 合并，否则永久不入聚合）。与高水位键同生命周期清理。
+	ThreatRollupLateBaselinePrefix = "threat_rollup_late_baseline:"
+)
+
 // SecurityEventsRetentionSnapshot 一次读取策略并返回（面板摘要, 行数上限）：
 // 日志统计面板同一响应内需同时展示两项，收敛为单次
 // global_config 点查（此前 Summary 与 Max 各读一遍同一条 SQL）。
 // 摘要必须同时表达 Days 与 Max 双口径——cleanup
 // 按 count-max 裁剪，只写「保留 N 天」会让行帽提前裁剪的用户可见文案与实际
 // 行为漂移（securityEventsRetentionPolicy 本就 Days+Max 双口径）。
-// 行帽按行不按字节：单行最坏 ≈ 请求头 64KiB + 响应体 64KiB（采集上限
-// securityEventsHeadersCap/BodyCap）加字段余量——摘要披露理论体积上限，
-// 避免「100 万行」被误读为固定小体积（理论 ≈128GiB 量级）。
+// 行帽按行不按字节：单行最坏 ≈ 请求头 64KiB + 请求体 64KiB + URI 8KiB +
+// rule_msg 2KiB（采集上限 securityEvents*Cap，另有文本截断标记）——摘要
+// 披露理论体积上限，避免「100 万行」被误读为固定小体积。
 func SecurityEventsRetentionSnapshot() (string, int) {
 	policy := securityEventsRetentionPolicyFromDB()
-	return fmt.Sprintf("每日清理 · 保留 %d 天 / 上限 %d 行（按行计，单行最大约 128KiB，理论体积上限约 %s）",
-		policy.Days, policy.Max, securityEventsRowCapByteBudget(policy.Max)), policy.Max
+	return fmt.Sprintf("每日清理 · 保留 %d 天 / 上限 %d 行（按行计，单行最大约 %s，理论体积上限约 %s）",
+		policy.Days, policy.Max, securityEventsRowMaxLabel(), securityEventsRowCapByteBudget(policy.Max)), policy.Max
 }
 
-// securityEventsRowCapByteBudget 行帽对应的理论体积上限（单行按 headers+body
-// 采集上限 128KiB 计，索引/元数据余量忽略——披露用约数，非配额语义）。
+// securityEventsRowMaxLabel 是单行上限的披露文案（KiB 取整，与摘要同单位）。
+// 计数源为 securityEventsRowMaxBytes——新增采集字段时披露自动跟随。
+func securityEventsRowMaxLabel() string {
+	return fmt.Sprintf("%dKiB", securityEventsRowMaxBytes()/(1<<10))
+}
+
+// securityEventsRowCapByteBudget 行帽对应的理论体积上限（单行按
+// securityEventsRowMaxBytes 计，索引/元数据余量忽略——披露用约数，
+// 非配额语义）。
 func securityEventsRowCapByteBudget(rowCap int) string {
-	const rowBytes = int64(securityEventsHeadersCap + securityEventsBodyCap)
-	bytes := int64(rowCap) * rowBytes
+	bytes := int64(rowCap) * securityEventsRowMaxBytes()
 	switch {
 	case bytes >= 1<<30:
 		return fmt.Sprintf("%d GiB", bytes/(1<<30))
@@ -108,6 +134,43 @@ func securityEventsRetentionSettings() (days, max int) {
 	return policy.Days, policy.Max
 }
 
+// threatRollupBackfillPending 判定大屏预聚合（rollup）首轮/代际重建是否仍在
+// 进行。就绪判据只看 metrics_state 的存在性（无需与 handlers 侧的代际版本
+// 常量比较，避免跨包依赖）：重建意图键**存在**=全量重建未走完；目标维度就绪/
+// 覆盖底端/覆盖水位任一**缺失**=从未完成过一次固化。空值按缺失处理（损坏状态
+// 等同未就绪，行帽最多延后一轮）。
+func threatRollupBackfillPending(database *sql.DB) (bool, error) {
+	nonEmpty := func(key string) (bool, error) {
+		var present int
+		err := database.QueryRow(`SELECT 1 FROM metrics_state WHERE key=? AND TRIM(COALESCE(value,''))<>'' LIMIT 1`, key).Scan(&present)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	rebuilding, err := nonEmpty(ThreatRollupRebuildFromKey)
+	if err != nil || rebuilding {
+		return rebuilding, err
+	}
+	for _, key := range []string{
+		ThreatRollupTargetReadyKey,
+		ThreatRollupCoveredFromKey,
+		ThreatRollupWatermarkKey,
+	} {
+		present, err := nonEmpty(key)
+		if err != nil {
+			return false, err
+		}
+		if !present {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // 保留策略是安全事件历史的**唯一有意**删除路径：事件存放在 metrics 库
 // （不是可丢弃遥测——同库 metrics_history 可再生，事件历史不可再生），库损坏
 // 隔离重建属意外丢失，由 db 层显式披露并留痕（db.reportMetricsQuarantine）。
@@ -133,7 +196,11 @@ type SecurityEventsRetentionResult struct {
 	Events       int // security_events 行
 	Rollup       int // security_event_rollup 行
 	TargetRollup int // security_event_target_rollup 行
-	Highwater    int // metrics_state 分钟高水位键
+	Highwater    int // metrics_state 分钟 rollup 状态键（事件高水位 + 迟到基线）
+	// RowCapDeferred 行帽阶段本轮被就绪门跳过：预聚合（rollup）首轮/代际
+	// 回填尚未完成时不得按 event_time 删最旧原始行——尚未固化的分钟会被
+	// 固化成空并随覆盖水位推进被宣称「已回填」，大屏窗口静默少计。
+	RowCapDeferred bool
 }
 
 // Aggregates 聚合派生数据的删除量（三类之和）。
@@ -187,43 +254,58 @@ func securityEventsRetentionCleanup(ctx context.Context) (SecurityEventsRetentio
 	if err := ctx.Err(); err != nil {
 		return result, nil
 	}
-	var count int
-	if err := database.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
-		Logf("warn", "security events retention: row count failed: %v", err)
-		return result, err // SEC-L1：age 阶段已删计数不丢弃
+	// 行帽阶段与预聚合回填的顺序约束：warmer 的注释自称「赶在保留期/行帽
+	// 裁剪之前」，但调用时序（任务引擎先启动、warmer 后启动）不构成保证。
+	// 回填未完成时裁剪最旧原始行，会让尚未固化的分钟永久固化成 0 且覆盖
+	// 水位照常推进（大屏窗口静默少计 + backfill_incomplete 转 false 的错误
+	// 安抚）。判据只查 metrics_state 的存在性（零新表）；读失败按「未就绪」
+	// 处理——事件历史不可再生，宁可延后一轮行帽也必须先保住原始行。
+	if pending, perr := threatRollupBackfillPending(database); perr != nil {
+		result.RowCapDeferred = true
+		Logf("warn", "security events retention: rollup backfill readiness unknown (%v), deferring row-cap trim", perr)
+	} else if pending {
+		result.RowCapDeferred = true
+		Logf("info", "security events retention: 预聚合回填未完成，行帽裁剪本轮跳过（待回填完成后执行；事件保留期裁剪照常）")
 	}
-	if overflow := count - max; overflow > 0 {
-		remaining := overflow
-		for remaining > 0 {
-			batch := remaining
-			if batch > securityEventsRetentionDeleteBatch {
-				batch = securityEventsRetentionDeleteBatch
-			}
-			// 按事件时间（event_time ASC, id ASC）
-			// 裁剪而非自增 id——摄取停摆后的补采/归档重放会以新 id 插入旧
-			// event_time 的行，按 id 删会先删「最早插入」而非「最旧事件」，
-			// 即先丢新事件、留住补采的旧事件。与上方年龄裁剪同一时间口径
-			// （idx_security_events_time 支撑排序）。
-			res, err := database.Exec(`DELETE FROM security_events WHERE id IN (SELECT id FROM security_events ORDER BY event_time ASC, id ASC LIMIT ?)`, batch)
-			if err != nil {
-				Logf("warn", "security events retention: count-based cleanup failed: %v", err)
-				return result, err
-			}
-			affected, _ := res.RowsAffected()
-			if affected == 0 {
-				break
-			}
-			remaining -= int(affected)
-			// count 阶段删除同样计入返回（此前只减 remaining 从不累加
-			// total——审计建议遗漏点：仅改 return 不补累计，count 阶段删除在
-			// 正常终点同样少报）。
-			result.Events += int(affected)
-			// 批间短暂让出写锁，避免长时间阻塞摄取 INSERT；同时响应 ctx 取消
-			select {
-			case <-ctx.Done():
-				Logf("info", "security events retention: count-based cleanup canceled mid-pass")
-				return result, nil
-			case <-time.After(10 * time.Millisecond):
+	if !result.RowCapDeferred {
+		var count int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
+			Logf("warn", "security events retention: row count failed: %v", err)
+			return result, err // SEC-L1：age 阶段已删计数不丢弃
+		}
+		if overflow := count - max; overflow > 0 {
+			remaining := overflow
+			for remaining > 0 {
+				batch := remaining
+				if batch > securityEventsRetentionDeleteBatch {
+					batch = securityEventsRetentionDeleteBatch
+				}
+				// 按事件时间（event_time ASC, id ASC）
+				// 裁剪而非自增 id——摄取停摆后的补采/归档重放会以新 id 插入旧
+				// event_time 的行，按 id 删会先删「最早插入」而非「最旧事件」，
+				// 即先丢新事件、留住补采的旧事件。与上方年龄裁剪同一时间口径
+				// （idx_security_events_time 支撑排序）。
+				res, err := database.Exec(`DELETE FROM security_events WHERE id IN (SELECT id FROM security_events ORDER BY event_time ASC, id ASC LIMIT ?)`, batch)
+				if err != nil {
+					Logf("warn", "security events retention: count-based cleanup failed: %v", err)
+					return result, err
+				}
+				affected, _ := res.RowsAffected()
+				if affected == 0 {
+					break
+				}
+				remaining -= int(affected)
+				// count 阶段删除同样计入返回（此前只减 remaining 从不累加
+				// total——审计建议遗漏点：仅改 return 不补累计，count 阶段删除在
+				// 正常终点同样少报）。
+				result.Events += int(affected)
+				// 批间短暂让出写锁，避免长时间阻塞摄取 INSERT；同时响应 ctx 取消
+				select {
+				case <-ctx.Done():
+					Logf("info", "security events retention: count-based cleanup canceled mid-pass")
+					return result, nil
+				case <-time.After(10 * time.Millisecond):
+				}
 			}
 		}
 	}
@@ -282,14 +364,15 @@ func securityEventsRetentionCleanup(ctx context.Context) (SecurityEventsRetentio
 	if result.TargetRollup > 0 {
 		Logf("info", "security events retention: target rollup cleanup removed %d rows older than %s", result.TargetRollup, rollupCutoff)
 	}
-	// 分钟事件高水位键 threat_rollup_max_event_id:<minute>
-	// 与 rollup 同生命周期——此前每分钟一行常驻 metrics_state（约 1440 行/天、
-	// 52.5 万行/年），全仓无删除点。按同一 rollupCutoff 清理（键后缀为
-	// 'YYYY-MM-DD HH:MM' 同形态，字符串比较即时间序）。
+	// 分钟 rollup 状态键（事件高水位 + 回退迟到基线）与 rollup 同生命周期
+	// ——此前每分钟一行常驻 metrics_state（约 1440 行/天、52.5 万行/年），
+	// 全仓无删除点。按同一 rollupCutoff 清理（键后缀为 'YYYY-MM-DD HH:MM'
+	// 同形态，字符串比较即时间序）。
 	for {
 		res, err := database.Exec(`DELETE FROM metrics_state WHERE key IN (
-			SELECT key FROM metrics_state WHERE key LIKE ? AND substr(key, ?) < ? LIMIT 500)`,
-			ThreatRollupEventHighwaterPrefix+"%", len(ThreatRollupEventHighwaterPrefix)+1, rollupCutoff)
+			SELECT key FROM metrics_state WHERE (key LIKE ? AND substr(key, ?) < ?) OR (key LIKE ? AND substr(key, ?) < ?) LIMIT 500)`,
+			ThreatRollupEventHighwaterPrefix+"%", len(ThreatRollupEventHighwaterPrefix)+1, rollupCutoff,
+			ThreatRollupLateBaselinePrefix+"%", len(ThreatRollupLateBaselinePrefix)+1, rollupCutoff)
 		if err != nil {
 			Logf("warn", "security events retention: rollup highwater cleanup failed: %v", err)
 			return result, err

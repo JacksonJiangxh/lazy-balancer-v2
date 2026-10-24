@@ -1611,11 +1611,14 @@ const WIZARD_STEP_META: Record<WizardStep, { title: string; icon: typeof InfoFil
   [WIZARD_STEP.PREVIEW]: { title: '配置预览', icon: Check },
 }
 const currentStep = ref<WizardStep>(WIZARD_STEP.BASIC)
-// 条目值惰性拉取：进入 IP/信任编辑、关联
-// 规则或配置预览时补齐缺失条目——后两步的冲突链与预览同样消费引用条目。
+// 条目值惰性拉取：进入 IP/信任编辑、拦截页、关联规则或配置预览时补齐缺失
+// 条目——后三步同样消费引用条目：拦截页的「该阶段是否会产生拦截」能力门按
+// 合并条目数判定（编辑态可点步骤条直接跳转），关联规则/预览的冲突链与预览
+// 亦同。漏掉拦截页会让引用型 ACL 在该步被误判为「不会产生该阶段拦截」。
 watch([currentStep, ipACLList, ipWhitelist, ipACLListRefs, ipWhitelistRefs], ([step]) => {
   if (step !== WIZARD_STEP.IP_ACL && step !== WIZARD_STEP.TRUST
-    && step !== WIZARD_STEP.BINDINGS && step !== WIZARD_STEP.PREVIEW) return
+    && step !== WIZARD_STEP.BLOCK_PAGE && step !== WIZARD_STEP.BINDINGS
+    && step !== WIZARD_STEP.PREVIEW) return
   const hasContent = ipACLList.value.length > 0 || ipWhitelist.value.length > 0 ||
     ipBlacklistSelf.value.length > 0 || ipACLListRefs.value.length > 0 || ipWhitelistRefs.value.length > 0
   if (!hasContent) return
@@ -2667,11 +2670,13 @@ const wafStepCrsAlert = computed<string>(() => {
 // - aclSectionAlert（访问控制区）：ACL 列表（允许侧=allow/绕过、拒绝侧=deny）
 //   + ip_blacklist（服务端加载、本向导不编辑，语义属拒绝侧 → 归访问控制区）；
 // - whitelistSectionAlert（信任名单区）：ip_whitelist（允许侧）。
-// 名单生效口径与保存语义对齐：ip_whitelist 随保存下发且受 ip_whitelist_enabled 三态门
-// 应用（开关仅控制编辑器显隐），故 computed 以 ipWhitelist 实际内容为准、仅模板
-// 显示层受 ipWhitelistEnabled 门控；ip_acl_list 仅 ip_acl_enabled 时生效（同
-// ipAclSideEntries）；ip_blacklist 非空即生效（无开关，但其警告随访问控制区
-// 显示，显示门控 form.ip_acl_enabled）。v1 仅精确字符串匹配，不展开 CIDR 包含。
+// 名单生效口径与保存语义对齐：ip_whitelist 随保存下发且受 ip_whitelist_enabled
+// 三态门应用——**门控在 computed 内**（信任关闭 = 条目零生效，与引擎发射门 /
+// ipAclSideEntries 同源），不参与跨策略冲突比较；模板只渲染结果，不做二次判断。
+// 若把门挪到显示层，关闭态会误报「本策略信任 X 却在被拦截」的伪冲突。
+// ip_acl_list 仅 ip_acl_enabled 时生效（同 ipAclSideEntries）；ip_blacklist 非空
+// 即生效（无开关，但其警告随访问控制区显示，显示门控 form.ip_acl_enabled）。
+// v1 仅精确字符串匹配，不展开 CIDR 包含。
 // 冲突条目来源标注：内联直接命中不标注；仅经引用列表带入的条目标注列表名，
 // 消除「地址不在访问控制名单（内联）却报冲突」的观感矛盾——引用即生效
 const entrySourceSuffix = (entry: string, inline: string[], refs: number[]): string => {

@@ -1,6 +1,7 @@
 package handlers
 
-// (tcp→http 回切恢复 dns_family 默认)。
+// 回归覆盖：安全策略拦截状态码不得使用限流语义 429；tcp→http 回切恢复
+// dns_family 默认。
 
 import (
 	"net/http"
@@ -13,8 +14,8 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 限流(scrapeRateLimitBlocksUncached 限流卡片按 code=429 计数),WAF 拦截页 429
-// 会混入限流指标口径。
+// 429 是限流专用语义(scrapeRateLimitBlocksUncached 限流卡片按 code=429 计数),
+// WAF 拦截页使用 429 会混入限流指标口径。
 func TestValidateSecurityPolicyEnums_rejectsBlockStatus429(t *testing.T) {
 	// Given 合法基线枚举(mode/ip_acl_mode/geoip_mode 均合法)
 

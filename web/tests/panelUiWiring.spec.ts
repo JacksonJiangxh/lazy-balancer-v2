@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source, stripComments } from './_helpers.ts'
+import { code, member, section, source, stripComments } from './_helpers.ts'
 
 test('当前密码错误在页面本地 toast，拦截器复用精确分类', () => {
   const profile = source('src/components/ProfileDialog.vue')
@@ -111,11 +111,13 @@ test('事件名称搜索命中后自动切换到策略所在 tab', () => {
 })
 
 test('自动封禁卡片主体恢复配置点击入口', () => {
-  assert.match(source('src/views/security/SecurityEvents.vue'), /<div\s+class="autoban-main"[^>]*@click="openAutobanConfig"/)
+  assert.match(code('src/views/security/SecurityEvents.vue'), /<div\s+class="autoban-main"[^>]*@click="openAutobanConfig"/)
 })
 
 test('自动封禁卡片主体与函数入口统一受只读和节点门控', () => {
-  const text = source('src/views/security/SecurityEvents.vue')
+  // 剥注释视图：这些断言的对象是「守卫仍在」，注释化守卫是最常见的临时停用
+  // 手段——raw 视图会让注释里的守卫继续满足断言（假绿）。
+  const text = code('src/views/security/SecurityEvents.vue')
   assert.match(text, /<el-tooltip[^>]*:content="autobanConfigTooltip"[^>]*:disabled="autobanWritable"/)
   assert.match(text, /:tabindex="autobanWritable \? 0 : -1"/)
   assert.match(text, /:aria-disabled="!autobanWritable"/)
@@ -126,7 +128,7 @@ test('自动封禁卡片主体与函数入口统一受只读和节点门控', ()
   // writable 门（与 openAutobanConfig 同构）——键盘/控制台直接调用不得绕过。
   const save = section(text, 'const saveAutobanConfig', 'const AUTOBAN_ENABLE_CONFIRM_HTML')
   assert.match(save, /if \(!autobanWritable\.value\) return/, '保存必须带函数级 autobanWritable 守卫')
-  const toggle = section(text, 'const toggleAutobanEnabled', '// 触发阶段分类')
+  const toggle = section(text, 'const toggleAutobanEnabled', 'const ctxWafFamily = computed')
   assert.match(toggle, /!autobanWritable\.value/, '禁用直切必须带函数级 autobanWritable 守卫')
 })
 
@@ -334,8 +336,21 @@ test('大屏光流可用性位/恢复基线/重装复位（L8 前端三项）', 
   assert.match(text, /<div v-if="flowError || attackFlowError" class="error-banner site-unset">光流数据加载失败，正在重试…<\/div>/, '光流端点失败必须显性横幅')
   assert.match(text, /interval: ATTACK_FLOW_POLL_MS, onError: \(\) => \{ attackFlowError\.value = true \}/)
   assert.match(text, /interval: 1000, onError: \(\) => \{ flowError\.value = true \}/)
-  // 恢复首轮重建基线：手动暂停恢复 + 可见性恢复两处（原仅「不可用」一处）
-  assert.ok([...text.matchAll(/trafficBaseline = null/g)].length >= 3, '暂停/可见性恢复/不可用三处都必须重建基线')
+  // 恢复首轮重建基线：手动暂停恢复 + 可见性恢复两处（原仅「不可用」一处）。
+  // 名册式断言（每个命中反推所在函数）——计数式 `>= 3` 无法定位「三处中少一处」。
+  const enclosingDecl = (sourceText: string, index: number): string => {
+    const lines = sourceText.slice(0, index).split('\n')
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      // 只认顶层声明（列 0）：嵌套 `const res = …` 不是站点归属。
+      const hit = lines[i].match(/^(?:const|function)\s+([A-Za-z_$][\w$]*)/)
+      if (hit) return hit[1]
+    }
+    return '<module>'
+  }
+  const baselineSites = [...text.matchAll(/trafficBaseline = null/g)]
+    .map((match) => enclosingDecl(text, match.index ?? 0))
+    .sort()
+  assert.deepEqual(baselineSites, ['screenLoop', 'togglePause', 'trafficTask'], '暂停恢复/可见性恢复/不可用三处都必须重建基线（名册式：缺一处即点名）')
   assert.match(member(text, 'async function mountEngine('), /zoomedName\.value = null/, '引擎重装必须复位下钻态')
 })
 
@@ -464,11 +479,17 @@ test('触发详情按类别/动作收敛预取面（WAF 拦截不下载 ACL 条�
 
 test('明细失败位脱离展开区且按钮恒可见（可按类别重试）', () => {
   const text = source('src/components/RuleFlowDialog.vue')
-  // 面板级失败位（两处：阶段 0 + 阶段面板），带重试入口
-  assert.ok([...text.matchAll(/v-if="detailFailedSources\.length > 0" class="flow-detail-line"/g)].length >= 2, '失败位必须在面板级')
-  assert.ok([...text.matchAll(/@click="ensureDetails\(true\)"/g)].length >= 2, '重试入口必须存在')
-  // 按钮可见性与明细数据存在性解耦
-  assert.ok([...text.matchAll(/v-if="groupHasDetails\(group\) \|\| detailFailedSources\.length > 0"/g)].length >= 2)
+  // 名册式：阶段 0 面板与阶段 1/2/3 面板各自必须齐备失败位/重试入口/解耦按钮
+  // （计数式 `>= 2` 无法定位「两处中少一处」）。
+  const stageZero = section(text, '<!-- 阶段 0 · 信任名单面板 -->', '<!-- 阶段 1/2/3 面板 -->')
+  const stagePanelsStart = text.indexOf('<!-- 阶段 1/2/3 面板 -->')
+  assert.ok(stagePanelsStart >= 0, '阶段 1/2/3 面板 marker 缺失')
+  const stagePanels = text.slice(stagePanelsStart)
+  for (const [label, panel] of [['阶段 0', stageZero], ['阶段 1/2/3', stagePanels]] as const) {
+    assert.match(panel, /v-if="detailFailedSources\.length > 0" class="flow-detail-line"/, `${label} 失败位必须在面板级`)
+    assert.match(panel, /@click="ensureDetails\(true\)"/, `${label} 必须有重试入口`)
+    assert.match(panel, /groupHasDetails\(group\) \|\| detailFailedSources\.length > 0/, `${label} 按钮可见性与明细存在性必须解耦`)
+  }
   // force 重试同样突破已附着锁
   assert.match(member(text, 'const ensureDetails = async ('), /if \(detailsAttached\.value && !force\) return/)
   // 全源失败分支保留失败位

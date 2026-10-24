@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -61,7 +62,7 @@ var apiDocRoutes = []apiDocRoute{
 	{"GET", "/config/export", "配置", "导出配置备份（lbbak）", "", `{"meta":{},"config":{},"tables":{}}`, []string{"403 slave_or_admin_or_api_key_read_only", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅主节点；只读 API Key 不能导出配置备份（403）；开启 mfa_write_guard 时 JWT 身份需新鲜 MFA 验证（428，经 verify-step 后重试）。下载 lbbak 备份包（tar.gz 二进制，含用户与密钥哈希、证书任务；meta.app_version 记录真实产品版本；勾选安全防护分类时附 CRS/IP2Region 规则库文件本体，示例为包内 config.json 形态）。导出与导入共用 128MB/64 条目/单条目 64MB 上限；超限时导出显式失败，不产出无法回传还原的备份。"},
 	{"POST", "/config/import", "配置", "导入配置备份", `{"meta":{"app":"lazy-balancer-v2"},"config":{},"tables":{}}`, `{"code":0,"message":"配置导入成功：规则 3 条、上游 3 个","data":{"summary":"规则 3 条；上游 3 个","disabled_conflicts":[{"name":"web-b","caddy_id":"lb_...","reason":"端口冲突","conflicts_with":[{"name":"web-a","caddy_id":"lb_...","reason":"同端口 8080"}]}],"warnings":["系统数据已导入：全部登录会话已吊销，请重新登录"]}}`, []string{"400 invalid_backup", "403 slave_or_admin_required", "409 certificate_queue_draining", "413 body_exceeds_128MB", "500 rollback", "428 mfa_step_up_required"}, "仅主节点；单事务全覆盖恢复，失败回滚并保留原配置（随包落盘的规则库文件——CRS 规则树/IP2Region 库/威胁名单——随事务一并回退到导入前状态；回退失败在 warnings 显性说明并写审计）。配置已提交但证书任务恢复失败时返回 200 且 data.partial=true（warnings 说明失败面），客户端应刷新页面并按部分成功提示。请求体支持二进制 lbbak 备份（tar.gz，含规则库文件本体）与旧式纯 JSON 备份（示例形态）；lbbak 的分类选择经 ?sections= query 传输（与导出对称），JSON 备份以体内 sections 字段为准。响应 data.summary 为分表计数汇总，disabled_conflicts 为冲突置禁用规则清单，warnings 是软跳过/元数据跳过/操作账户替换/会话吊销/ACME 悬挂/证书质量等警告的唯一机器可读出口（失败响应同构）。"},
 	{"POST", "/config/import/validate", "配置", "校验配置备份", `{"meta":{"app":"lazy-balancer-v2","version":1},"tables":{"lb_rules":[],"users":[]}}`, `{"code":0,"data":{"valid":true,"type":"v2","summary":{}}}`, []string{"400 empty_or_unreadable_transport", "413 body_exceeds_128MB", "403 slave_or_admin_required"}, "只校验备份格式和兼容性，不写数据库。传输层请求为空或不可读返回 400，超过 128MB 返回 413（与导入端点同上限）；可读取但格式或语义无效的备份返回 200，data.valid=false 并在 data.error 给出原因。"},
-	{"GET", "/settings/auto-backup", "配置", "读取自动备份设置与备份列表", "", `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["users","rules","security","cluster"],"last_run":"2026-09-20T03:00:00Z","last_success_at":"2026-09-20 03:00:00","next_run_at":"2026-09-21T03:00:00+08:00","catch_up_due":false,"backups":[{"id":1,"filename":"lbbak-auto-20260920-030000.lbbak","created_at":"2026-09-20 03:00:00","status":"success","size_bytes":1024,"sections":["users"],"trigger_type":"schedule","message":"","app_version":"v2.3.8-beta"}]}`, []string{"403 slave_or_admin_required"}, "仅主节点；调度器仅主节点运行（提升为主节点自动启动，切换为从节点自动停止）。last_run 为调度水位线（启用时置为当前时刻，非执行事实）；last_success_at 为最近一次成功备份的落库时间（无成功备份时为 null），界面「上次成功备份」取该字段。next_run_at 使用调度器同一 nextAutoBackupSlot 计算（已保存设置 + 水位线）；catch_up_due=true 表示停机跨槽补跑已到期，界面显示「待补跑」。"},
+	{"GET", "/settings/auto-backup", "配置", "读取自动备份设置与备份列表", "", `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["users","rules","security","cluster"],"last_run":"2026-09-20T03:00:00Z","last_success_at":"2026-09-20 03:00:00","next_run_at":"2026-09-21T03:00:00+08:00","catch_up_due":false,"backups":[{"id":1,"filename":"lbbak-auto-20260920-030000.lbbak","created_at":"2026-09-20 03:00:00","status":"success","size_bytes":1024,"sections":["users"],"trigger_type":"schedule","message":"","app_version":"v2.3.8-beta"}]}`, []string{"403 slave_or_admin_required"}, "仅主节点；调度器仅主节点运行（提升为主节点自动启动，切换为从节点自动停止）。last_run 为调度水位线（启用时置为当前时刻，非执行事实）；last_success_at 为最近一次成功备份的落库时间（无成功备份时为 null），界面「上次成功备份」取该字段。next_run_at 使用调度器同一 nextAutoBackupSlot 计算（已保存设置 + 水位线），未启用、库不可用或排程参数非法时为 null（客户端不得假定恒为时间串）；catch_up_due=true 表示停机跨槽补跑已到期，界面显示「待补跑」。backups[].sections 解码失败（库内 JSON 损坏/带外改写）时该行携带 sections_error（sections 为空数组），不得据此判定「备份范围为空」。"},
 	{"PUT", "/settings/auto-backup", "配置", "保存自动备份设置", `{"enabled":true,"frequency":"weekly","time":"03:00","day":1,"keep":7,"sections":["users","rules","security","cluster"]}`, `{"code":0,"message":"自动备份设置已保存"}`, []string{"400 invalid_request", "403 slave_or_admin_required", "413 body_exceeds_16KiB", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "frequency=daily/weekly/monthly；time 为 HH:MM（按配置时区，即基础设置时区）；day：weekly 1-7（周一=1）、monthly 1-28（短月自动收敛到月末）；keep 1-30（超出上限返回 400；升级前保存的越界存量值读取时回退 7）；sections 为「" + configBackupSectionsDocText() + "」子集且不能为空；旧版 global_config/waf_files 键自动归一为 users/security。请求体上限 16 KiB（超过返回 413）。关闭→开启时置水位线（不回补停用期间的槽，也不立即执行），下一次执行=启用后的下一个到期槽；停机跨槽在下次启动补跑一次。"},
 	{"GET", "/system/tasks/:id/logs", "系统", "任务文本日志（统一任务引擎管理——tasks/{id}.log 与轮转副本合计尾部 256KB；更新族含分阶段流水）", "", `{"content":"2026/09/29 04:23:49 [start] 手动触发\n2026/09/29 04:23:50 [INFO] downloading - 下载 ustc\n2026/09/29 04:23:51 [done] success 耗时=1043ms 触发=manual"}`, []string{"401 unauthenticated"}, "每任务一个文本日志文件；运行日志轮转副本清理任务统一清理（保留期同审计月数）与轮转（10MB 上限超限保一份，task_log_size_mb）；生命周期与业务行时间戳均为 YYYY/MM/DD HH:MM:SS。"},
 	{"GET", "/system/tasks/:id/history", "系统", "任务运行历史（task_runs 时间倒序，最多 50 条）", "", `{"runs":[{"id":1,"task_id":"threat","family":"security","trigger":"manual","operator":"alice","status":"success","started_at":"2026-09-29 00:30:00","finished_at":"2026-09-29 00:30:01","duration_ms":1043,"message":""}]}`, []string{"401 unauthenticated", "404 not_found"}, "每次真实执行落一行（含手动/自动）；无历史的已注册任务族返回空数组。status ∈ running/success/failed/cancelled/skipped/interrupted。"},
@@ -73,7 +74,7 @@ var apiDocRoutes = []apiDocRoute{
 	{"POST", "/system/tasks/:id/cancel", "系统", "取消运行中任务（仅下载类）", "", `{"code":0,"message":"已发出取消信号，任务将在当前下载阶段中断"}`, []string{"401 unauthenticated", "403 admin_or_master_required", "409 not_running", "428 mfa_step_up_required"}, "下载阶段中断，已完成源的结果保留；非下载类任务（备份/重载）不支持取消。"},
 	{"POST", "/auto-backup/run", "配置", "手动触发一次完整备份（202 异步受理）", "", `{"code":0,"message":"手动备份已开始，完成后可在备份列表查看"}`, []string{"403 slave_or_admin_required", "409 backup_running", "428 mfa_step_up_required", "503 task_engine_unavailable"}, "仅主节点；与导出同构（lbbak，含凭证与证书材料），落盘服务器 backup 目录。202 之前已完成引擎原子占位：手动触发进行中或定时备份在途返回 409（不排队），调度暂停（配置导入窗口）返回 409，引擎停止返回 503——不会出现「已受理但后台未执行」。备份在后台任务执行（task_runs/auto_backups 照常落行），客户端应轮询 GET /settings/auto-backup 查看结果。"},
 	{"DELETE", "/auto-backup/:id", "配置", "删除备份记录与文件", "", `{"code":0,"message":"备份已删除"}`, []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required"}, "行不存在 404；文件缺失容忍（仅删行）。"},
-	{"POST", "/auto-backup/:id/restore", "配置", "从备份还原配置", "", `{"message":"配置还原成功：..."}`, []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "409 task_or_certificate_queue_busy", "428 mfa_step_up_required", "500 import_failed"}, "按行读服务器 backup 目录内的备份文件走导入链；在途任务或证书队列排空失败返回 409，导入不执行。事务失败回滚；数据库已提交但证书任务恢复失败时返回 200 + data.partial=true 与 warnings。还原的是备份实际包含的内容（导出时未选的分类不在备份内）。审计动作「还原」。"},
+	{"POST", "/auto-backup/:id/restore", "配置", "从备份还原配置", "", `{"message":"配置还原成功：..."}`, []string{"400 invalid_id", "400 invalid_backup", "403 slave_or_admin_required", "404 not_found", "409 task_or_certificate_queue_busy", "413 body_exceeds_128MB", "428 mfa_step_up_required", "500 import_failed"}, "按行读服务器 backup 目录内的备份文件走导入链；在途任务或证书队列排空失败返回 409，导入不执行。事务失败回滚；数据库已提交但证书任务恢复失败时返回 200 + data.partial=true 与 warnings。还原的是备份实际包含的内容（导出时未选的分类不在备份内）。审计动作「还原」。"},
 	{"GET", "/auto-backup/:id/download", "配置", "下载备份文件", "", "(lbbak tar.gz 二进制包，以 application/octet-stream 流式下发，非 JSON)", []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required"}, "与手动导出同敏感级（备份含私钥与凭证明文），下载审计留痕。"},
 	{"POST", "/config/preview", "配置", "预览配置变更", `{"source":"basic","log_level":"debug"}`, `{"changed":true,"section":"基础设置","changes":["系统日志级别"]}`, []string{"400 invalid_request", "403 admin_required"}, "不写数据库，不触发 Caddy。"},
 	{"POST", "/config/reload", "配置", "手动重载 Caddy", "", `{"code":0,"message":"Caddy 配置已重载"}`, []string{"403 admin_required", "500 caddy_reload_failed", "428 mfa_step_up_required"}, ""},
@@ -159,7 +160,7 @@ var apiDocRoutes = []apiDocRoute{
 	{"GET", "/metrics/connections", "指标", "连接统计", "", `{"established":0,"syn_recv":0,"fin_wait1":0,"fin_wait2":0,"close_wait":0,"last_ack":0,"listening":0,"closing":0,"time_wait":0,"total":0}`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/system/info", "系统", "系统信息", "", `{"ip_address":"192.0.2.10","hostname":"lb-node","os_info":"Ubuntu 24.04","kernel":"6.8.0","architecture":"x86_64","network_ips":{"eth0":"192.0.2.10"},"caddy_version":"v2.11.4","running_status":"running","uptime":3600,"node_mode":"master","version":"2.3.8"}`, []string{"401 unauthenticated"}, "node_mode ∈ master/slave/unknown（unknown=节点角色查询失败或数据库未装配，不冒充主节点）。"},
 	{"GET", "/system/metrics", "系统", "系统指标", "", `{"cpu_percent":0,"memory_percent":0}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/audit-logs", "审计", "操作日志", "", `{"list":[],"total":0,"total_stale":false,"partial":false,"page":1,"page_size":20}`, []string{"400 invalid_pagination", "400 page_exceeds_limit", "401 unauthenticated"}, "query: page, page_size, username, action, resource, ip, keyword, start_time, end_time；created_at 为 UTC（2006-01-02 15:04:05），前端按配置时区展示。total 为 5 秒进程内缓存计数，total_stale=true 表示本次计数来自缓存（可能滞后数秒），消费方可据此决定是否刷新核对。partial 仅部分降级响应为 true（当前仅审计库未就绪/读失败；计数查询失败按 500 返回，不置 partial），键集与正常响应一致。页码分页保留跳页与总页数，但 page>500 返回 400（深 OFFSET 会退化为全表扫描），请用筛选条件缩小范围；page/page_size 非整数返回 400，page_size 超 100 钳到 100。"},
+	{"GET", "/audit-logs", "审计", "操作日志", "", `{"list":[],"total":0,"total_stale":false,"partial":false,"page":1,"page_size":20}`, []string{"400 invalid_pagination", "400 page_exceeds_limit", "401 unauthenticated"}, "query: page, page_size, username, action, resource, ip, keyword, start_time, end_time；created_at 为 UTC（2006-01-02 15:04:05），前端按配置时区展示。total 为 5 秒进程内缓存计数，total_stale=true 表示本次计数来自缓存（可能滞后数秒），消费方可据此决定是否刷新核对。partial=true 表示本次响应部分降级：审计库未就绪/读失败、total 走降级路径，或 display_name 富化失败（此时该字段退化为 username）；计数查询失败按 500 返回，不置 partial。键集与正常响应一致。页码分页保留跳页与总页数，但 page>500 返回 400（深 OFFSET 会退化为全表扫描），请用筛选条件缩小范围；page/page_size 非整数返回 400，page_size 超 100 钳到 100。列筛选（username/action/resource/ip/keyword）为子串匹配（LIKE '%…%'），对索引不可用，大审计库上为全表扫描且每个不同筛选组合各付一次计数——请与时间范围组合使用以缩小扫描面。"},
 	{"GET", "/audit-logs/options", "审计", "操作日志筛选选项", "", `{"usernames":[{"value":"admin","count":12}],"actions":[{"value":"更新","count":5}],"resources":[{"value":"全局配置","count":3}],"partial":false}`, []string{"401 unauthenticated"}, "操作人/操作/对象的去重可选值（按频次排序，对象取高频前 50）。partial=true 表示至少一列聚合失败或审计库未就绪（此时三列为空数组），下拉缺项须显式披露。"},
 	{"GET", "/auth/oidc/status", "认证", "OIDC 状态(公开)", "", `{"enabled":true,"display_name":"sso.example.com"}`, []string{"429 rate_limited(60/min/IP)"}, "登录页按钮显隐;未启用返回 enabled=false。"},
 	{"GET", "/auth/oidc/login", "认证", "OIDC 登录跳转(302)", "", "\"302 Location: IdP 授权页\"", []string{}, "浏览器跳转 IdP；成功与失败同为 302（失败回前端登录页，oidc_error 经 URL fragment 携带：未启用/state 封顶/discovery 失败），非 API 消费形态。"},
@@ -250,6 +251,96 @@ var apiDocRoutes = []apiDocRoute{
 	{"GET", "/security/crawler-lib/update/logs", "安全", "爬虫地址库更新任务日志", "", `{"content":"2026/10/16 22:00:00 [INFO] crawlerbot-update: 源 googlebot 更新 170 个 IP 段"}`, []string{"401 unauthenticated"}, ""},
 }
 
+// apiDocImportWindowError 导入窗口写门的文档条目单源。
+const apiDocImportWindowError = "409 import_in_progress（配置导入窗口拒绝写）"
+
+// importWindowGatedDocRoutes 受「配置导入窗口写门」约束的端点
+// （method + " " + path）。文档错误码由代码派生：buildOpenAPIYAML 对本集合内
+// 端点自动补 409——新增/删除写门只需改这里，且
+// TestAPIDocsImportWindow_derivedFromHandlerGates 从 handler 源码的门调用点与
+// middleware 路由注册双向派生校验，扩族/漏登不再靠人工逐条同步文案。
+var importWindowGatedDocRoutes = map[string]struct{}{
+	"DELETE /certificate-configs/:id":              {},
+	"DELETE /rules/:caddy_id":                      {},
+	"DELETE /security/block-pages/:id":             {},
+	"DELETE /security/custom-rules/:id":            {},
+	"DELETE /security/ip-lists/:id":                {},
+	"DELETE /security/policies/:id":                {},
+	"DELETE /security/policies/:id/bind/:caddy_id": {},
+	"DELETE /settings/oidc":                        {},
+	"DELETE /users/:id":                            {},
+	"GET /config/export":                           {},
+	"PATCH /users/me":                              {},
+	"POST /auth/mfa/activate":                      {},
+	"POST /auth/mfa/disable":                       {},
+	"POST /auth/mfa/recovery-codes":                {},
+	"POST /auth/mfa/setup":                         {},
+	"POST /ca-providers/:id/test":                  {},
+	"POST /caddy/restart":                          {},
+	"POST /caddy/start":                            {},
+	"POST /caddy/stop":                             {},
+	"POST /certificate-configs":                    {},
+	"POST /certificates/issue":                     {},
+	"POST /cluster/mode":                           {},
+	"POST /cluster/nodes/:id/forget-pin":           {},
+	"POST /cluster/promote":                        {},
+	"POST /cluster/register-tokens":                {},
+	"POST /config/reload":                          {},
+	"POST /config/validate":                        {},
+	"POST /rules":                                  {},
+	"POST /rules/:caddy_id/disable":                {},
+	"POST /rules/:caddy_id/duplicate":              {},
+	"POST /rules/:caddy_id/enable":                 {},
+	"POST /rules/batch-block-pages":                {},
+	"POST /security/block-pages":                   {},
+	"POST /security/custom-rules":                  {},
+	"POST /security/ip-lists":                      {},
+	"POST /security/ip-lists/:id/ips":              {},
+	"POST /security/ip-lists/:id/remove-ip":        {},
+	"POST /security/policies":                      {},
+	"POST /security/policies/:id/bind":             {},
+	"POST /security/policies/:id/bindings/bulk":    {},
+	"POST /security/policies/:id/split":            {},
+	"POST /security/policies/batch-bind":           {},
+	"POST /system/restart":                         {},
+	"POST /users":                                  {},
+	"POST /users/:id/mfa/reset":                    {},
+	"PUT /admin-tls":                               {},
+	"PUT /ca-providers/:id":                        {},
+	"PUT /caddy/config":                            {},
+	"PUT /certificate-configs/:id":                 {},
+	"PUT /cluster/nodes/:id/access-url":            {},
+	"PUT /cluster/nodes/:id/site":                  {},
+	"PUT /cluster/settings":                        {},
+	"PUT /config":                                  {},
+	"PUT /rules/:caddy_id":                         {},
+	"PUT /security/autoban":                        {},
+	"PUT /security/block-pages/:id":                {},
+	"PUT /security/custom-rules/:id":               {},
+	"PUT /security/ip-lists/:id":                   {},
+	"PUT /security/policies/:id":                   {},
+	"PUT /security/rules/:caddy_id/policies":       {},
+	"PUT /settings/auto-backup":                    {},
+	"PUT /settings/oidc":                           {},
+	"PUT /users/:id/status":                        {},
+}
+
+// withDerivedImportWindowError 返回文档条目副本：受门约束但未登记该码的端点
+// 补上 409（已手工登记者原样返回，避免重复条目）。
+func withDerivedImportWindowError(route apiDocRoute) apiDocRoute {
+	if _, gated := importWindowGatedDocRoutes[route.Method+" "+route.Path]; !gated {
+		return route
+	}
+	for _, entry := range route.Errors {
+		if strings.Contains(entry, "import_in_progress") {
+			return route
+		}
+	}
+	clone := route
+	clone.Errors = append(append([]string{}, route.Errors...), apiDocImportWindowError)
+	return clone
+}
+
 func buildOpenAPIYAML() string {
 	var b strings.Builder
 	b.WriteString("openapi: 3.1.0\ninfo:\n  title: Lazy Balancer API\n  version: 1.0.0\n")
@@ -266,7 +357,7 @@ func buildOpenAPIYAML() string {
 	for _, path := range pathOrder {
 		fmt.Fprintf(&b, "  %s:\n", path)
 		for _, route := range routesByPath[path] {
-			writeOpenAPIOperation(&b, route)
+			writeOpenAPIOperation(&b, withDerivedImportWindowError(route))
 		}
 	}
 	b.WriteString("components:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      description: JWT 或 lb_sk_ API Key\n    mcpApiKey:\n      type: apiKey\n      in: header\n      name: X-API-Key\n      description: MCP 专用 lb_sk_ API Key；也接受 Authorization Bearer 形式\n    clusterToken:\n      type: apiKey\n      in: header\n      name: X-Cluster-Token\n    registrationSecret:\n      type: apiKey\n      in: header\n      name: X-Registration-Secret\n")
@@ -334,7 +425,15 @@ func writeOpenAPIOperation(b *strings.Builder, route apiDocRoute) {
 	}
 	for _, status := range statusOrder {
 		description := strings.Join(descriptionsByStatus[status], " / ")
-		fmt.Fprintf(b, "        '%s':\n          description: %s\n          content:\n            application/json:\n              example: {\"code\":%s,\"message\":\"%s\"}\n", status, description, status, description)
+		// 错误描述与 summary/tags 同口径转义：YAML 标量走 strconv.Quote；
+		// JSON 示例内的 message 走 json.Marshal——Go 字符串字面量的 \xNN
+		// 转义不是合法 JSON，直接复用 strconv.Quote 会让含控制字符的描述
+		// 生成无法解析的示例。
+		messageJSON, err := json.Marshal(description)
+		if err != nil {
+			messageJSON = []byte(strconv.Quote(description))
+		}
+		fmt.Fprintf(b, "        '%s':\n          description: %s\n          content:\n            application/json:\n              example: {\"code\":%s,\"message\":%s}\n", status, strconv.Quote(description), status, messageJSON)
 	}
 }
 
@@ -411,7 +510,7 @@ var apiDocContracts = map[string]apiDocContract{
 	"POST /certificate-configs":          {successStatus: http.StatusCreated},
 	// v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
 	// application/gzip 下发);sections query 与导入侧对称（分类键清单由
-	// configBackupSections 单一事实源派生——，防文档与实现再分叉）。
+	// configBackupSections 单一事实源派生，防文档与实现再分叉）。
 	"GET /config/export": {rawResponse: true, responseContentType: "application/gzip", queryParameters: []apiDocParameter{{"sections", "string", "可选配置分类（逗号分隔）：" + configBackupSectionKeysText() + "，默认全选；旧版 global_config/waf_files 键自动归一（分别视为 users/security）；未知分类返回 400"}}},
 	// 两个非 JSON 下载端点显式登记 media type——漏登记
 	// 会回落到 application/json 并被包成 {"code":0,...,"data":非 JSON}。
@@ -497,7 +596,15 @@ func writeYAMLExample(b *strings.Builder, indent, example string) {
 		}
 		return
 	}
-	fmt.Fprintf(b, "%sexample: %s\n", indent, example)
+	// 单行示例：JSON 对象/数组保持原样（OpenAPI 里是结构化示例），其余文本
+	// 一律 quote——裸标量含 ": "、"#"、括号开头或空格时会被 YAML 解析成
+	// 字符串/映射/注释，round-trip 会失败或静默改写语义。
+	trimmed := strings.TrimSpace(example)
+	if json.Valid([]byte(trimmed)) && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
+		fmt.Fprintf(b, "%sexample: %s\n", indent, trimmed)
+		return
+	}
+	fmt.Fprintf(b, "%sexample: %s\n", indent, strconv.Quote(example))
 }
 
 func documentedResponse(route apiDocRoute, raw bool) string {

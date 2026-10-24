@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -23,6 +25,34 @@ func rejectMFAChallengeLogin(c *gin.Context) {
 	// 挑战无效不泄露具体原因
 	services.RecordAuditLog("", "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战令牌无效或已过期"), c.ClientIP())
 	c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "MFA 挑战无效或已过期，请重新登录"})
+}
+
+// mfaLoginInflight 同一挑战令牌的验码串行化。先消费后验码使「同一 token 的
+// 两笔并发请求」互斥：A 消费成功后 B 立即在「已被使用」上落败，而 A 若验码失败
+// 会归还挑战——B 本可成功却被劝退，且其 401 被审计为「挑战已被使用」，使该
+// 审计不再是可靠的重放信号。此表只登记正在验码的令牌（TryLock 失败即 409，
+// 不阻塞 goroutine），请求结束即删除，无长期驻留。
+var (
+	mfaLoginInflightMu sync.Mutex
+	mfaLoginInflight   = map[string]struct{}{}
+)
+
+// tryLockMFAChallengeToken 标记令牌正在验码；false=已有请求在验码。
+func tryLockMFAChallengeToken(token string) bool {
+	mfaLoginInflightMu.Lock()
+	defer mfaLoginInflightMu.Unlock()
+	if _, busy := mfaLoginInflight[token]; busy {
+		return false
+	}
+	mfaLoginInflight[token] = struct{}{}
+	return true
+}
+
+// unlockMFAChallengeToken 解除标记（必须与成功的 tryLock 成对调用）。
+func unlockMFAChallengeToken(token string) {
+	mfaLoginInflightMu.Lock()
+	delete(mfaLoginInflight, token)
+	mfaLoginInflightMu.Unlock()
 }
 
 // MFAVerifyLogin POST /auth/mfa/verify — 登录第二步：挑战令牌 + 验证码 → JWT。
@@ -100,6 +130,17 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		return
 	}
 
+	// 同一挑战的并发验码互斥（见 mfaLoginInflight）：落败方既不能断言「挑战
+	// 已被使用」（对方可能验码失败并归还），也不得重复验码（恢复码/时间片双
+	// 花）。提示稍后重试，且不写「挑战已被使用」审计以保持重放信号纯粹。
+	// 注意：此标记在消费之前、全部身份/锁定/版本门之后获取。
+	if !tryLockMFAChallengeToken(req.MFAToken) {
+		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "验证进行中（并发请求）"), c.ClientIP())
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "验证进行中，请稍后重试"})
+		return
+	}
+	defer unlockMFAChallengeToken(req.MFAToken)
+
 	// 先消费挑战、后验码——消费判定是挑战状态的唯一权威（已消费/并发
 	// 落败/过期窗口在此 401，不触碰凭证）；旧顺序先验码，恢复码「提交即消费」
 	// 会在「挑战已被使用」路径白烧。验码失败归还挑战（错误码不烧挑战，同 token
@@ -159,7 +200,15 @@ func (h *Handlers) MFAStatus(c *gin.Context) {
 	userID := int(contextUserID(c))
 	st, err := services.MFAGetStatus(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 MFA 状态失败"})
+		// ErrNoRows 只可能是「鉴权与 handler 之间用户被并发删除」（jwtAuth 已
+		// 校验存在/启用）——与全仓 401 约定一致，不诱导客户端重试。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+			return
+		}
+		// 其余为基础设施故障（列缺失/恢复码存储损坏/库锁）：固定文案 + 服务端
+		// 留痕，不得零日志折叠成 500。
+		mfaInternalFailure(c, "读取 MFA 状态", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: st})
@@ -248,7 +297,11 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 	userID := int(contextUserID(c))
 	var mfaEnabled bool
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&mfaEnabled); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 MFA 状态失败"})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+			return
+		}
+		mfaInternalFailure(c, "读取 MFA 状态", err)
 		return
 	}
 	if mfaEnabled {
@@ -332,7 +385,15 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 		// pending 码失败计数——VerifyPending 无锁定无限流（loginRateLimit
 		// 只挂公开路由），持会话者可对 10^6 码空间暴力；5 次失败作废 pending（重新
 		// setup 才能再试），与挑战级计数同为与全局开关无关的硬闸。
-		if invalidated := services.MFARecordPendingFailure(userID); invalidated {
+		invalidated, ferr := services.MFARecordPendingFailure(userID)
+		if ferr != nil {
+			// 失败计数未落库 = 5 次硬闸失效（activate 无登录限流）；fail-closed 500，
+			// 不得以「验证码错误」回应让爆破继续。pending secret 与计数保持原状，
+			// 用户重试即可。
+			mfaInternalFailure(c, "记录 MFA 绑定失败次数", ferr)
+			return
+		}
+		if invalidated {
 			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "验证码错误次数过多，绑定已作废，请重新开始绑定"})
 			return
 		}
@@ -416,10 +477,14 @@ func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 	}
 	userID := int(contextUserID(c))
 	var enabled bool
-	// DB 读失败不得并入「MFA 未启用」400——
-	// 基础设施故障 500，业务态未启用保持 400。
+	// DB 读失败不得并入「MFA 未启用」400——缺行（并发删除）=401，基础设施
+	// 故障=500 且留痕。
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&enabled); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 MFA 状态失败"})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+			return
+		}
+		mfaInternalFailure(c, "读取 MFA 状态", err)
 		return
 	}
 	if !enabled {
@@ -551,8 +616,18 @@ func DecideMFAStepUp(c *gin.Context, covered bool, mfaEnabledCheck func(int) (bo
 	}
 	mfaTs := c.GetFloat64("mfa_ts")
 	elapsed := time.Since(time.Unix(int64(mfaTs), 0))
-	if mfaTs > 0 && elapsed < mfaStepUpGraceWindow {
-		return MFAStepUpDecision{Applies: true, Verified: true, SecondsAgo: int64(elapsed.Seconds())}, nil
+	if mfaTs > 0 {
+		if elapsed < 0 {
+			// 时钟回拨/VM 快照恢复会让旧 mfa_ts 落在未来：负年龄不得等价于
+			// 「刚验证」。按未验证处理（fail-safe），并留痕以便定位时序故障。
+			services.Logf("warn", "MFA step-up 时间戳在未来（时钟回拨？），按未验证处理: user_id=%d age=%s", userID, elapsed)
+			return MFAStepUpDecision{Applies: true}, nil
+		}
+		if elapsed < mfaStepUpGraceWindow {
+			// 向上取整：int64 截断会把 15.9s 记成 15s，使「≤15s 窄窗」实际放宽
+			// 到 16s（拆除/重绑免码窗的边界）。
+			return MFAStepUpDecision{Applies: true, Verified: true, SecondsAgo: int64(math.Ceil(elapsed.Seconds()))}, nil
+		}
 	}
 	return MFAStepUpDecision{Applies: true}, nil
 }

@@ -117,10 +117,10 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 		isMaster = 0
 	}
 	readFailed := false
-	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(created_at,''), COALESCE(updated_at,created_at)
-		FROM cert_jobs
-		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
-		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT ?`, isMaster, certJobRowsLimit+1)
+	// 查询单源（db.CertJobsMonitorRowsQuery）：排序键 COALESCE(updated_at,
+	// created_at) DESC 由表达式索引 idx_cert_jobs_updated_fallback 承载，计划
+	// 钉测在 db 包内看守两者一致。
+	rows, err := db.DB.Query(db.CertJobsMonitorRowsQuery, isMaster, certJobRowsLimit+1)
 	if err != nil {
 		// 任务行读失败留痕：查询失败不再静默空列表（对照下方 rows.Err 留痕形态）。
 		// 5s 轮询下按失败态转换留痕（首报一条，故障持续期静默，恢复补一条）。
@@ -252,9 +252,9 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		case taskengine.KindOneshot:
 			ti.Cadence = "手动触发"
 		}
-		// db.DB nil 防护（与同层 collectCertJobRows 同形）。
-		// LatestRun 单次查询复用（曾每任务两查）；全部任务
-		// 合并为两条批量查询（RunOverview）。
+		// 最近运行与 24h 统计：单次批量取（曾每任务两查）——nil 库守卫在
+		// RunOverview/Lookup 内部，本层不裸用 db.DB（下方 cert-waiting-ca
+		// 分支是唯一显式守卫点）。
 		latestRun := latestRuns[m.ID]
 		// staleRunning 标记「task_runs 仍是 running 但进程内已无在途执行」的
 		// 残留行（终态 UPDATE 失败）——最近运行结果按中断呈现。
@@ -312,7 +312,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 					// 年龄门只覆盖「刚写入」的行，终态写失败的行一定会变老。
 					if m.Running {
 						ti.Status = TaskStatusRunning
-					} else if startedAt, ok := taskRunWallClockStartedAt(latestRun.StartedAt); ok && time.Since(startedAt) < staleRunningGrace {
+					} else if !staleRunningResidual(latestRun.StartedAt) {
 						ti.Status = TaskStatusRunning
 					} else {
 						ti.Status = TaskStatusFailed
@@ -351,10 +351,15 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				// 呈现（与进程重启回收的 interrupted 同语义）。
 				ti.LastRun.Result = "interrupted"
 				if ti.LastRun.Message == "" {
-					ti.LastRun.Message = "运行终态未落库（已按异常结束处理）"
+					ti.LastRun.Message = staleRunInterruptedMessage
 				}
 			}
-			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.LoopOn && m.Kind == taskengine.KindPeriodic {
+			// RoleApplicable 门：从节点上 master-only 族的 LoopOn 仍是主节点
+			// 语义的值（引擎侧有意直传，由 RoleApplicable 解释「仅主节点运行」）。
+			// 此处是服务层自行推算的第二条路径，必须继承同一约定——否则从节点
+			// 对 cert-renewal-scan 等任务展示一个具体「下次执行」时间而实际永不
+			// 投递，与同行的角色不适用标注自相矛盾。
+			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.LoopOn && m.RoleApplicable && m.Kind == taskengine.KindPeriodic {
 				if t, err := time.ParseInLocation("2006-01-02 15:04:05", latestRun.StartedAt, CurrentLocation()); err == nil {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
 				}
@@ -376,23 +381,20 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	return out
 }
 
-// staleRunningGrace 是「残留 running 行」判定的年龄门：行快照与内存快照
-// 两次独立取数，刚写入的行可能在两次快照之间完成（呈现「行 running、内存
-// 空闲」），立即判失败会在安全运维页面误报一次失败/中断。终态 UPDATE 失败
-// 的残留行一定会变老，短宽限不影响识别；不可解析的时间戳维持旧口径（失败）。
-const staleRunningGrace = 30 * time.Second
+// staleRunningGrace / staleRunInterruptedMessage / staleRunningResidual 全部委托
+// 引擎单源（taskengine.StaleRunningGrace / StaleRunInterruptedMessage /
+// StaleRunningResidual）：历史与最近运行（Engine.History/LatestRun）已内置同一
+// 归一，列表侧（RunOverview 批量行 + DescribeAll 内存快照）在此用同一判定呈现
+// 失败/已中断——同一 run 不得在两个端点给出相反结论。
+const (
+	staleRunningGrace          = taskengine.StaleRunningGrace
+	staleRunInterruptedMessage = taskengine.StaleRunInterruptedMessage
+)
 
-// taskRunWallClockStartedAt 解析 task_runs.started_at——引擎按配置时区以
-// 墙面时间串写入（"2006-01-02 15:04:05"），故按 CurrentLocation 解析。
-func taskRunWallClockStartedAt(ts string) (time.Time, bool) {
-	if ts == "" {
-		return time.Time{}, false
-	}
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, CurrentLocation())
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
+// staleRunningResidual 判定「库行 running」是否为残留（本进程已无在途执行且行
+// 年龄超过瞬态宽限）。调用方先自行确认本进程无在途执行。
+func staleRunningResidual(startedAt string) bool {
+	return taskengine.StaleRunningResidual(startedAt)
 }
 
 func humanInterval(sec int) string {

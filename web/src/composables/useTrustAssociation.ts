@@ -104,6 +104,24 @@ const resolveScopedListName = (
   return fitAutoListName(policyName, `${suffix}#${policyId}`).name
 }
 
+// 确认后重读策略最新 refs：口径与策略读路径一致（GET /security/policies/:id
+// 返回 { policy, bindings }）。读取失败返回 null——调用方必须放弃本次写入：
+// 引用快照停留在弹框弹出前，确认期间其它会话（并行标签/另一管理员）新增的
+// 引用会被「快照 + 目标」覆盖掉，策略静默丢掉刚加的名单。
+const fetchLatestPolicyRefs = async (
+  policyId: number,
+  field: 'ip_acl_list_refs' | 'ip_whitelist_refs',
+): Promise<number[] | null> => {
+  try {
+    const res = await request.get<APIResponse<{ policy?: TrustPolicyLike }>>(`/security/policies/${policyId}`, { silent: true })
+    const raw = res.data?.policy?.[field]
+    if (typeof raw !== 'string') return null
+    return parseRefIds(raw)
+  } catch {
+    return null
+  }
+}
+
 export const useTrustAssociation = (options: {
   /** 组件当前的地址列表选项（用于把 refs 解析为名单对象） */
   getList: () => TrustListRef[]
@@ -149,7 +167,6 @@ export const useTrustAssociation = (options: {
     // 否则确认后创建必然 400，动作无法在当前弹框内完成。
     const auto = fitAutoListName(policy.name, cfg.suffix)
     const truncatedNote = auto.truncated ? '（策略名过长，名单名已截断至 50 字符上限）' : ''
-    const refs = parseRefIds(policy[cfg.refField])
     const listNow = options.getList()
     const isNameTaken = (name: string): boolean => listNow.some((l) => ipListNameKey(l.name) === ipListNameKey(name))
     // 同名列表只在「未被其它引用面引用」时可复用（category 无关）；判据与后端
@@ -173,14 +190,36 @@ export const useTrustAssociation = (options: {
       } catch {
         return
       }
+      // 确认后才取最新引用：快照留在弹框弹出前的策略行上，确认期间别处新增的
+      // 名单引用会在「快照 + 本次目标」拼装时被覆盖掉。读取失败则整单放弃
+      // （仍以快照写入比不写更危险）。
+      const latestRefs = await fetchLatestPolicyRefs(policy.id, cfg.refField)
+      if (latestRefs === null) {
+        ElMessage.error('策略当前引用状态读取失败，本次未做任何修改；请关闭后重试')
+        return
+      }
       if (reuseTarget) {
-        if (!refs.includes(reuseTarget.id)) {
-          const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, reuseTarget.id]) })
-          // 关联中间跳的退化后缀（Caddy 应用失败但 DB 已提交）不可静默
-          if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
-        }
+        // 写序=先加 IP、再关联：反序时条目写入失败会留下「策略已引用的名单里
+        // 没有该 IP」，界面仍报过关联成功，处置静默失效；反向半态（名单有条目、
+        // 策略暂未引用）无损，重试只补关联。
         const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${reuseTarget.id}/ips`, { value: ip })
-        showSaveResult(added as unknown as { message?: string }, `已关联既有「${reuseTarget.name}」并加入 ${ip}`)
+        const alreadyLinked = latestRefs.includes(reuseTarget.id)
+        if (!alreadyLinked) {
+          try {
+            const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...latestRefs, reuseTarget.id]) })
+            // 关联中间跳的退化后缀（Caddy 应用失败但 DB 已提交）不可静默
+            if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
+          } catch {
+            // 半态显性披露：条目已就绪，重试只会补关联（幂等，不重复写入）
+            ElMessage.error(`已把 ${ip} 加入列表「${reuseTarget.name}」，但策略关联失败；条目已就绪，重试不会重复添加`)
+            await options.onChanged?.()
+            return
+          }
+        }
+        showSaveResult(
+          added as unknown as { message?: string },
+          alreadyLinked ? `已${cfg.verb}——已加入列表「${reuseTarget.name}」` : `已关联既有「${reuseTarget.name}」并加入 ${ip}`,
+        )
         await options.onChanged?.()
         return
       }
@@ -199,7 +238,7 @@ export const useTrustAssociation = (options: {
         ElMessage.error(`列表「${createName}」创建响应异常，请重试`)
         return
       }
-      const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
+      const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...latestRefs, newId]) })
       // 关联是最后一步：退化后缀弹警告，正常成功用动作口径文案（响应 message 是
       // 策略更新的通用文案，不能拿来当本次动作的反馈）。
       if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')

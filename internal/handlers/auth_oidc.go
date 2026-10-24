@@ -33,6 +33,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gin-gonic/gin"
@@ -197,6 +198,10 @@ type oidcAccessClaims struct {
 	EmailVerified     bool
 	EmailVerifiedSeen bool
 	Groups            []string
+	// GroupsMalformed=groups 声明存在但形态不可解析（既非字符串数组也非
+	// 分隔字符串）——配置了组名单时与「声明缺失」分开表述，排障能定位到
+	// IdP 声明类型不兼容而不是「没配组」。
+	GroupsMalformed bool
 }
 
 // oidcAccessAllowed 访问白名单判定（单源，OIDC 回调每次登录调用）。
@@ -239,6 +244,9 @@ func oidcAccessAllowed(cfg OIDCConfig, claims oidcAccessClaims) (bool, string) {
 		}
 	}
 	if len(cfg.AllowedGroups) > 0 {
+		if claims.GroupsMalformed {
+			return false, "groups 声明类型不支持（需字符串数组或以空白/逗号分隔的字符串）"
+		}
 		if len(claims.Groups) == 0 {
 			return false, "IdP 未返回 groups 声明（已配置组名单）"
 		}
@@ -281,6 +289,48 @@ func oidcEmailVerified(raw json.RawMessage) (verified, known bool) {
 		}
 	}
 	return false, false
+}
+
+// oidcGroups 解析 groups 声明，与 email_verified 同族的「IdP 声明形态差异」
+// 归一：
+//   - 标准形态=字符串数组；
+//   - 单个字符串（自建 Keycloak 自定义 mapper / SAML 桥接 / ADFS 常见）按
+//     空白、逗号、分号切分；
+//   - 缺失/null → 空集（malformed=false，由白名单判定按「未返回」拒登）；
+//   - 其他形态（数字数组、对象等）→ malformed=true，调用方据此把审计 reason
+//     与「声明缺失」区分开。
+//
+// 元素逐项 trim 并丢弃空项：白名单比较是逐字匹配，IdP 的多余空白不得造成
+// 全员拒登。
+func oidcGroups(raw json.RawMessage) (groups []string, malformed bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, false
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return normalizeOIDCGroupValues(arr), false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return normalizeOIDCGroupValues(strings.FieldsFunc(s, func(r rune) bool {
+			return r == ',' || r == ';' || unicode.IsSpace(r)
+		})), false
+	}
+	return nil, true
+}
+
+// normalizeOIDCGroupValues trim + 丢空（保持 IdP 顺序）。
+func normalizeOIDCGroupValues(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, g := range raw {
+		if g = strings.TrimSpace(g); g != "" {
+			out = append(out, g)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // oidcAllowedDomainRe 允许的 email 域条目形态（小写字母/数字/点/连字符，
@@ -328,16 +378,30 @@ func normalizeOIDCAllowedGroups(raw []string) []string {
 	return out
 }
 
-// oidcProvider 按 issuer 获取(带缓存的 discovery)。
-// normalizeOIDCIssuer 通用规范化(2026-09-17):去尾斜杠;对 login.microsoftonline.com
-// (Microsoft Entra)自动补 /v2.0——v1 端点无 OIDC 发现文档,漏写是最高频配置错误;
-// 其他提供商逐字保留。以标准 OIDC 为准,不针对特定厂商做分支逻辑。
+// normalizeOIDCIssuer 通用规范化：去首尾空白与尾斜杠；按主机名（去端口）匹配
+// Entra 家族登录主机，缺 /v2.0 时自动补——Entra 的 v1 端点无 OIDC 发现文档，
+// 漏写 /v2.0 是最高频配置错误。这是针对 Entra 的兼容特例，不属于标准 OIDC
+// 语义；其余提供商逐字保留（不猜路径）。主机名判定使浏览器地址栏复制来的
+// `:443` 形态同样命中。
 func normalizeOIDCIssuer(raw string) string {
 	issuer := strings.TrimRight(strings.TrimSpace(raw), "/")
-	if u, err := url.Parse(issuer); err == nil && u.Host == "login.microsoftonline.com" && !strings.HasSuffix(issuer, "/v2.0") {
+	u, err := url.Parse(issuer)
+	if err != nil || !entraIssuerHosts[strings.ToLower(u.Hostname())] {
+		return issuer
+	}
+	if !strings.HasSuffix(issuer, "/v2.0") {
 		issuer += "/v2.0"
 	}
 	return issuer
+}
+
+// entraIssuerHosts Entra 家族登录主机（全球与各主权云）。仅这些主机适用
+// 「补 /v2.0」兼容特例。
+var entraIssuerHosts = map[string]bool{
+	"login.microsoftonline.com":        true,
+	"login.microsoftonline.us":         true,
+	"login.partner.microsoftonline.cn": true,
+	"login.chinacloudapi.cn":           true,
 }
 
 // oidcProvider 按 issuer 获取(带缓存的 discovery;:网络发现移出全局锁,
@@ -986,7 +1050,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		EmailVerified     json.RawMessage `json:"email_verified"`
 		PreferredUsername string          `json:"preferred_username"`
 		Name              string          `json:"name"`
-		Groups            []string        `json:"groups"`
+		Groups            json.RawMessage `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		fail("解析用户信息失败", "OIDC claims 解析失败")
@@ -1007,11 +1071,13 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	// 域名单叠加 email_verified（缺失/false 一律拒登）：域白名单信任的是
 	// 「IdP 已验证该邮箱归属」，未验证的自定义邮箱声明可被任何人指向允许域。
 	emailVerified, emailVerifiedSeen := oidcEmailVerified(claims.EmailVerified)
+	groups, groupsMalformed := oidcGroups(claims.Groups)
 	if allowed, reason := oidcAccessAllowed(cfg, oidcAccessClaims{
 		Email:             claims.Email,
 		EmailVerified:     emailVerified,
 		EmailVerifiedSeen: emailVerifiedSeen,
-		Groups:            claims.Groups,
+		Groups:            groups,
+		GroupsMalformed:   groupsMalformed,
 	}); !allowed {
 		fail("账号不在允许登录的范围，请联系管理员", "OIDC 白名单拒绝："+reason)
 		return

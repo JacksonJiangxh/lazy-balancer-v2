@@ -497,6 +497,36 @@ func TestGetLogStats_singleRowRequestSkipsUnrelatedConfigReads(t *testing.T) {
 	}
 }
 
+// 运行日志行与 caddy 聚合行默认同读 /app/logs：一次请求内该目录只枚举一次
+// （此前各枚举一次，重复 ReadDir/stat，且两次枚举间发生轮转时同一响应的两行
+// 会来自不同目录快照）。
+func TestGetLogStats_sharedLogsDirEnumeratedOnce(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.cfg.LogFile = "/app/logs/lazy-balancer.log"
+
+	var fixedDirReads int
+	oldReadDir := logStatsReadDir
+	logStatsReadDir = func(dir string) ([]os.DirEntry, error) {
+		if filepath.Clean(dir) == "/app/logs" {
+			fixedDirReads++
+			return []os.DirEntry{}, nil
+		}
+		return os.ReadDir(dir)
+	}
+	t.Cleanup(func() { logStatsReadDir = oldReadDir })
+
+	router := gin.New()
+	router.GET("/logs/stats", h.GetLogStats)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logs/stats?key=runtime,caddy", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if fixedDirReads != 1 {
+		t.Fatalf("/app/logs 枚举 %d 次, want 1（运行行与 caddy 聚合必须共享请求级缓存）", fixedDirReads)
+	}
+}
+
 // 全量请求对同一 tasks 目录只枚举一次（四类已知任务行 + 逐任务行共享缓存）；
 // 失败形态同样只尝试一次——此前每个任务都重读，故障窗口退化为 O(N) 次失败
 // syscall，且失败零留痕。

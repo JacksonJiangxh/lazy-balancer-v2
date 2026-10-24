@@ -1207,6 +1207,33 @@ func TestInjectAuditTiming(t *testing.T) {
 	if out := injectAuditTiming(bad, auditTimingSnapshot{preUs: 1, preSet: true}); string(out) != string(bad) {
 		t.Fatalf("malformed JSON must be returned unchanged, got %s", out)
 	}
+
+	// 字节保真：插入必须是字节级拼接——HTML 敏感字符不得被转义成 \u003c
+	// （重编码会让行体最多放大 6×），顶层键序不得被重排。
+	rawBody := `{"transaction":{"request":{"body":"a<b>c&d"}},"messages":[{"m":"x"}]}`
+	out = injectAuditTiming([]byte(rawBody), auditTimingSnapshot{preUs: 7, preSet: true})
+	if strings.Contains(string(out), `\u003c`) || strings.Contains(string(out), `\u0026`) {
+		t.Fatalf("注入不得重编码/转义原行: %s", out)
+	}
+	if !strings.HasPrefix(string(out), `{"transaction":`) {
+		t.Fatalf("注入不得重排顶层键序: %s", out)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("注入后必须是合法 JSON: %s", out)
+	}
+	doc = nil
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("注入行解码: %v", err)
+	}
+	if string(doc["transaction"]) != `{"request":{"body":"a<b>c&d"}}` {
+		t.Fatalf("transaction 必须逐字节保留: %s", doc["transaction"])
+	}
+
+	// 行尾空白/换行：注入后输出为单行对象（行分隔由 appendLine 统一追加），
+	// 与重编码时代的输出形态一致，不产生双换行。
+	if out := injectAuditTiming([]byte("{\"k\":1}\n"), auditTimingSnapshot{endUs: 3, endSet: true}); strings.HasSuffix(string(out), "\n") {
+		t.Fatalf("注入后不得保留 formatter 行尾换行（避免双换行）: %q", out)
+	}
 }
 
 // 注册表钉：record→wait（未终态，超时返回部分快照）→close→wait 立即返回完整快照。
@@ -2158,5 +2185,67 @@ func TestEstimateAuditSnapshotBytes_isUpperBound(t *testing.T) {
 				t.Fatalf("估算 %d < 序列化 %d：预算按估算执法，低估即实际驻留可突破上限", got, len(serialized))
 			}
 		})
+	}
+}
+
+// messageOnlyAuditLog 只承载 messages 的最小 AuditLog 实现（截断逻辑单测）。
+type messageOnlyAuditLog struct {
+	msgs []plugintypes.AuditLogMessage
+}
+
+func (l messageOnlyAuditLog) Parts() types.AuditLogParts { return nil }
+func (l messageOnlyAuditLog) Transaction() plugintypes.AuditLogTransaction {
+	return nil
+}
+func (l messageOnlyAuditLog) Messages() []plugintypes.AuditLogMessage { return l.msgs }
+
+// messages 写侧上限：四段全满时，旧形态（messages 无独立上限）让单条快照
+// 越过 auditItemMaxBytes 被**整行丢弃**（命中规则多的高价值行反而丢失）。
+// 截断后整行保留，并在 messages_dropped 显性披露丢弃条数。
+func TestSnapshotAuditLog_truncatesMessagesUnderItemCap(t *testing.T) {
+	raw := make([]plugintypes.AuditLogMessage, 0, 200)
+	for i := 0; i < 200; i++ {
+		raw = append(raw, estimateTestMessage{Message_: strings.Repeat("m", 100)})
+	}
+	snap := snapshotAuditLog(messageOnlyAuditLog{msgs: raw})
+	if got := len(snap.Messages_); got > auditMessagesMaxEntries {
+		t.Fatalf("messages 保留 %d 条 > 上限 %d", got, auditMessagesMaxEntries)
+	}
+	if snap.MessagesDropped_ != len(raw)-len(snap.Messages_) || snap.MessagesDropped_ == 0 {
+		t.Fatalf("messages_dropped=%d, want %d（丢弃条数须显性披露）",
+			snap.MessagesDropped_, len(raw)-len(snap.Messages_))
+	}
+	var used int64
+	for _, m := range snap.Messages_ {
+		used += estimateAuditMessageBytes(m)
+	}
+	if used > auditMessagesMaxBytes {
+		t.Fatalf("messages 估算 %d 字节 > 上限 %d", used, auditMessagesMaxBytes)
+	}
+
+	// 四段全满（请求/响应体与头各 64KiB）+ 截断后的 messages：必须落在单条
+	// 上限内；同形但未截断的 messages 集合必然超限（钉子有效性反证）。
+	full := strings.Repeat("x", auditBodyMaxBytes)
+	snap.Transaction_ = auditSnapshotTransaction{
+		Request_:  &auditSnapshotRequest{Body_: full, Headers_: map[string][]string{"h": {full}}},
+		Response_: &auditSnapshotResponse{Body_: full, Headers_: map[string][]string{"h": {full}}},
+	}
+	if size := estimateAuditSnapshotBytes(snap); size > auditItemMaxBytes {
+		t.Fatalf("截断后 size=%d > 单条上限 %d（整行仍会被丢弃）", size, auditItemMaxBytes)
+	}
+	untruncated := *snap
+	untruncated.Messages_ = raw
+	untruncated.MessagesDropped_ = 0
+	if estimateAuditSnapshotBytes(&untruncated) <= auditItemMaxBytes {
+		t.Fatal("夹具无效：未截断 messages 形态本应超单条上限")
+	}
+
+	// 序列化后 messages_dropped 可见、messages 条数受限。
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(serialized), `"messages_dropped":`) {
+		t.Fatalf("截断标记缺失: %s", serialized[:min(len(serialized), 200)])
 	}
 }

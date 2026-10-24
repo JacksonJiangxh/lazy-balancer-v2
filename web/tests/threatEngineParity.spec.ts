@@ -70,13 +70,41 @@ test('暂停态数据/坐标 setter 必须补绘一帧（地球与地图同口�
 
 test('地球 hover/click 命中必须复用点阵 bbox 预筛，且静止态不再反复拾取', () => {
   const hit = member(globeSrc, 'function countryHit(')
+  assert.match(hit, /sharedCountryGrid\.grid\.get\(countryGridCell\(/, '命中候选必须复用共享 5° 网格（与地图引擎同源）')
   assert.match(hit, /dotBboxes\[i\]/, '命中测试必须先用 bbox 预筛')
   assert.match(hit, /lng < b\.minLon \|\| lng > b\.maxLon/, '预筛必须同时约束经度')
+  assert.doesNotMatch(hit, /i < THREAT_COUNTRIES\.length/, '不得再全表逐国扫描')
   const hover = member(globeSrc, 'function processHover(')
   assert.match(hover, /countryHit\(/, 'hover 拾取必须走预筛单源')
   assert.doesNotMatch(hover, /THREAT_COUNTRIES\.find\(/, 'hover 不得再全表逐个射线')
   assert.match(hover, /const autoRotate = globe\.controls\(\)\.autoRotate/, '读自转状态')
   assert.match(hover, /autoRotate && hoverPoint && now - lastHoverPick >= 120/, '仅自转时复测静止指针')
+})
+
+test('下钻态点击的手势输入集与地图一致：不得排除下钻国', () => {
+  // 地图：countryHitIndex 不排除，同国命中 → drillClickIntent=stay。
+  const sceneClick = member(sceneSrc, 'function onClick(')
+  assert.match(sceneClick, /countryHitIndex\(geo\.lon, geo\.lat\)/, '地图点击不得排除下钻国')
+  // 地球：原实现排除下钻国，国境内落在省多边形空档时被判空白 → 强制退出下钻。
+  const globeClick = member(globeSrc, 'async function handleCanvasClick(')
+  assert.match(globeClick, /countryHit\(geo\.lng, geo\.lat\)/, '地球点击不得排除下钻国')
+  assert.doesNotMatch(globeClick, /countryHit\(geo\.lng, geo\.lat, drilledName/, '排除下钻国会让省界空档被误判为空白')
+})
+
+test('返回世界视口在两引擎内各自单源（zoomOut/resetView 不得各写一份）', () => {
+  for (const [src, name] of [[sceneSrc, '地图'], [globeSrc, '地球']] as const) {
+    for (const method of ['zoomOut', 'resetView']) {
+      const body = member(src, `${method}(): void {`)
+      assert.match(body, /returnToWorldView\(/, `${name} ${method} 必须走返回世界视口单源`)
+    }
+    const helper = member(src, 'function returnToWorldView(')
+    assert.match(helper, /drillSeq \+= 1/, `${name} 返回世界视口必须作废在途加载`)
+    assert.ok(
+      helper.indexOf('drillSeq += 1') < helper.indexOf('enterWorldView(') ||
+      helper.indexOf('drillSeq += 1') < helper.indexOf('flyToOverview()'),
+      `${name} 必须先作废在途加载再复位视口`,
+    )
+  }
 })
 
 test('地球点色更新用单次局部缓存（不得跨 30s 轮询累积）', () => {

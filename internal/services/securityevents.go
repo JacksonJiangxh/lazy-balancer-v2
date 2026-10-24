@@ -73,6 +73,15 @@ type securityEventRecord struct {
 	requestKey string
 }
 
+// rowBytes 是单行大文本字段的保留字节合计——批次字节门（batchByteCap）与
+// 单轮字节上限（securityEventsPassMaxBytes）的唯一口径。头/体/URI/rule_msg
+// 全部计入：新增长文本字段只需在此登记，避免逐处手工相加漏算（旧实现只统计
+// headers+body，长 URI/msg 洪峰不触发提前提交）。字段已在上游按各自上限
+// 裁剪，此处取裁剪后的落库形态。
+func (rec *securityEventRecord) rowBytes() int {
+	return len(rec.RequestHeaders) + len(rec.RequestBody) + len(rec.URI) + len(rec.RuleMsg)
+}
+
 // securityEventsAuditMessage 是一条审计消息：message 为宏展开后的规则 msg，
 // data.id 是规则 ID（数字），data.raw 是发射的 SecRule 原文。
 type securityEventsAuditMessage struct {
@@ -102,6 +111,10 @@ type securityEventsAuditTransaction struct {
 			// Body 仅当策略 handler 的 SecAuditLogParts 含 C（策略开
 			// log_request_body）时由 coraza 输出；其余事务为零值空串。
 			Body string `json:"body"`
+			// BodyTruncated 是写侧（caddygeoip auditwriter）在 64KiB 硬截断
+			// 时置位的标记：文本体另带 \n...[TRUNCATED] 后缀，二进制体只有
+			// 本标记——不消费它，截断后的半截内容会被展示成完整内容。
+			BodyTruncated bool `json:"body_truncated"`
 		} `json:"request"`
 		IsInterrupted bool `json:"is_interrupted"`
 	} `json:"transaction"`
@@ -252,7 +265,7 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	// 预检与全部绑定策略的引擎事务都携带同一值（见 securityEventsRequestDeduper）。
 	rec.requestKey = securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id")
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
-	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
+	rec.RequestBody = securityEventsRecordBody(tx.Request.Body, tx.Request.BodyTruncated)
 	if tx.IsInterrupted {
 		rec.Action = "blocked"
 	}
@@ -261,9 +274,12 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	}
 	if len(doc.Messages) > 0 {
 		rec.RuleTriggered = doc.Messages[0].Data.ID.String()
-		rec.RuleMsg = doc.Messages[0].Message
+		rec.RuleMsg = securityEventsClipTextField(doc.Messages[0].Message, securityEventsRuleMsgCap)
 		rec.chainedCustomRule = securityEventsRawIsChainStarter(doc.Messages[0].Data.Raw)
 	}
+	// URI 与 rule_msg 同门裁剪（头/体在构造期已裁剪）：单行体积契约为
+	// 「解析后的记录」自身属性，插入与改判 UPDATE 两条写路径共享。
+	rec.URI = securityEventsClipTextField(rec.URI, securityEventsURICap)
 	rec.AnomalyScore = securityEventsExtractAnomalyScore(doc.Messages)
 	// v2.3.8（用户裁定 2026-10-17）：阶段 1/2 事件（IP 名单/预检/GeoIP/限流）
 	// 审计消息不含 coraza 评分段——入库时补固定语义分，全管线统一评分驱动
@@ -340,6 +356,16 @@ func securityEventsHostWithoutPort(hostport string) string {
 const (
 	securityEventsHeadersCap = 65536 // 64KB(2026-09-28 用户裁定:service mesh 用户携带大量 x-b3/x-envoy 等追踪头,8KB 截断影响调试体验;此上限仅约束事件详情弹框存储,不影响请求本身)
 	securityEventsBodyCap    = 65536
+	// URI / rule_msg 与头体同门：头部字段已是攻击者可控输入（长 URI、
+	// 规则 msg 宏展开内嵌匹配数据），无上限时单行可达 MB 级——行帽按行裁剪
+	// 会放大磁盘/内存，且批次字节门对它们不成立。上限取列表读侧单字段
+	// 16KiB 裁剪预算之内（8KiB/2KiB），超限按 UTF-8 边界截断并追加标记。
+	securityEventsURICap     = 8192
+	securityEventsRuleMsgCap = 2048
+	// securityEventsTruncatedMarker 是文本字段超限截断标记（与列表读侧
+	// handlers.truncateEventListField 同形态）——落库值自带标记，展示层与
+	// 导出可直接观测「该字段被裁剪」，不静默截断。
+	securityEventsTruncatedMarker = "\n...[TRUNCATED]"
 	// SecurityEventsDroppedHeadersKey 是写侧合成的 64KB 采集裁剪丢弃计数键；
 	// 客户端同名头一律剥离，避免伪造字段被展示层当作真实丢弃数。导出供
 	// handlers 列表侧裁剪原样保留该键（跨包字符串契约，禁止各包再写字面量）。
@@ -350,6 +376,14 @@ const (
 	securityEventsB64TruncatedPrefix = "base64-truncated:"
 	securityEventsTextPrefix         = "utf8:"
 )
+
+// securityEventsRowMaxBytes 是单行理论最大体积：头/体/URI/rule_msg 各自
+// 采集上限 + 文本截断标记。保留策略披露（securityevents_retention.go）与
+// 批次/单轮字节口径同源，禁止在披露侧复算上限（分叉即失真）。
+func securityEventsRowMaxBytes() int64 {
+	caps := int64(securityEventsHeadersCap + securityEventsBodyCap + securityEventsURICap + securityEventsRuleMsgCap)
+	return caps + 3*int64(len(securityEventsTruncatedMarker))
+}
 
 // securityEventsSerializeHeaders 落库事件请求头：JSON 文本，64KB 上限——超限按
 // 值体积从大到小逐条丢弃，并以 _lb_dropped_headers 键记录丢弃条数（始终保持合法 JSON，
@@ -465,11 +499,41 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 	return string(raw)
 }
 
+// securityEventsRecordBody 把审计请求体编码进事件行，并消费写侧的
+// body_truncated 标记（caddygeoip auditwriter 在 64KiB 硬截断时置位；文本体
+// 另会自带 \n...[TRUNCATED] 后缀，二进制体不带）。只看长度的旧口径对二进制体
+// 失效：coraza 的 JSON 格式化器把非法 UTF-8 替换为 U+FFFD，摄取拿到的是合法
+// UTF-8 字符串，长度与是否截断不再一一对应——标记位是唯一可靠信号。
+// 展示层已识别该后缀（SecurityEvents.vue），此处补齐落库契约。
+func securityEventsRecordBody(body string, truncated bool) string {
+	encoded := securityEventsEncodeBody(body)
+	if !truncated || encoded == "" {
+		return encoded
+	}
+	// 二进制体走 base64 前缀契约（文本标记会破坏解码）：把前缀升级为
+	// base64-truncated 表达同一事实，展示层按该前缀渲染截断提示。
+	if strings.HasPrefix(encoded, securityEventsB64TruncatedPrefix) {
+		return encoded
+	}
+	if payload, ok := strings.CutPrefix(encoded, securityEventsB64Prefix); ok {
+		return securityEventsB64TruncatedPrefix + payload
+	}
+	if !strings.HasSuffix(encoded, securityEventsTruncatedMarker) {
+		encoded += securityEventsTruncatedMarker
+	}
+	return encoded
+}
+
 // securityEventsEncodeBody 落库事件请求体：64KB 上限。UTF-8 文本原样存储，
 // 超限截到符文边界（不劈开多字节字符）并追加 \n...[TRUNCATED]；二进制整体
 // base64 并加 base64: 前缀，超限只编码前 64KB 原始字节、前缀改为
 // 文本若本身以任一保留前缀开头，先加 utf8: 转义，
 // 消除「明文被展示层误当二进制」的歧义。空体存空串。
+//
+// base64/base64-truncated 两分支在真实管线中**防御性不可达**：coraza 的 JSON
+// 审计格式化器（json.Marshal）把非法 UTF-8 字节替换为 U+FFFD，解码后的字符串
+// 恒为合法 UTF-8，不会进入非 UTF-8 分支。保留它们是为了直接函数调用（单测/
+// 未来非 JSON 管线）仍能安全处理二进制体。
 func securityEventsEncodeBody(body string) string {
 	if body == "" {
 		return ""
@@ -487,7 +551,7 @@ func securityEventsEncodeBody(body string) string {
 		for cut > 0 && !utf8.RuneStart(body[cut]) {
 			cut--
 		}
-		return body[:cut] + "\n...[TRUNCATED]"
+		return body[:cut] + securityEventsTruncatedMarker
 	}
 	raw := body
 	truncated := false
@@ -499,6 +563,20 @@ func securityEventsEncodeBody(body string) string {
 		return securityEventsB64TruncatedPrefix + base64.StdEncoding.EncodeToString([]byte(raw))
 	}
 	return securityEventsB64Prefix + base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
+// securityEventsClipTextField 把单行文本字段截到 capBytes 字节内：不劈开多字节
+// 字符（回退到符文起点），超限追加截断标记——标记随值落库，展示/导出可观测
+// 「该字段被裁剪」。空值与上限内值原样返回（零拷贝）。
+func securityEventsClipTextField(value string, capBytes int) string {
+	if len(value) <= capBytes {
+		return value
+	}
+	cut := capBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + securityEventsTruncatedMarker
 }
 
 // securityEventsRuleRef is an lb_rules identity resolved for one event:
@@ -555,13 +633,9 @@ func (m *securityEventsTrustMatcher) trusted(ruleCaddyID, ip string) bool {
 	if err != nil {
 		return false
 	}
-	addr = addr.Unmap()
-	for _, prefix := range prefixes {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
+	// 信任并集与 securityEventsIPPrefixSet 同形态（升序、去重、不相交），
+	// 逐事件二分判定，不随名单规模线性放大。
+	return securityEventsPrefixSetContains(prefixes, addr)
 }
 
 // securityEventsLoadMappings batch-loads per-tick indexes: host→rule, plus the
@@ -674,9 +748,31 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 
 // securityEventsPolicyCRSExclusions 是摄取热路径的排除判定快照：JSON 只在
 // tick 装载时解析一次，scope=list 的引用条目同批加载，避免逐事件查库。
+// entrySets 与 entries 等长：scope=ip/list 条目的成员集（entry.IPs ∪ 引用
+// 名单）在装载期解析为「升序、去重、不相交」前缀集，事件侧二分判定，
+// 不再逐事件重解析 IP 串。
 type securityEventsPolicyCRSExclusions struct {
-	entries []CRSExcludedEntry
-	lists   map[int64][]string
+	entries   []CRSExcludedEntry
+	lists     map[int64][]string
+	entrySets [][]netip.Prefix
+}
+
+// securityEventsBuildCRSExclusionIPIndex 为每条排除条目构建成员前缀集：
+// 条目作用域不是 ip/list 时留空集（该条目无需 IP 判定）。集合来源与逐事件
+// 实现同口径——entry.IPs 逗号串 ∪ ListRefs 引用的名单条目。
+func securityEventsBuildCRSExclusionIPIndex(entries []CRSExcludedEntry, lists map[int64][]string) [][]netip.Prefix {
+	out := make([][]netip.Prefix, len(entries))
+	for i, entry := range entries {
+		if entry.Scope != "ip" && entry.Scope != "list" {
+			continue
+		}
+		match := strings.Split(entry.IPs, ",")
+		for _, ref := range entry.ListRefs {
+			match = append(match, lists[ref]...)
+		}
+		out[i] = securityEventsIPPrefixSet(match)
+	}
+	return out
 }
 
 func securityEventsBuildCRSExclusionMatcher(policyByID map[int]*models.SecurityPolicy) map[int]securityEventsPolicyCRSExclusions {
@@ -691,7 +787,7 @@ func securityEventsBuildCRSExclusionMatcher(policyByID map[int]*models.SecurityP
 		if len(entries) == 0 {
 			continue
 		}
-		out[id] = securityEventsPolicyCRSExclusions{entries: entries}
+		set := securityEventsPolicyCRSExclusions{entries: entries}
 		for _, entry := range entries {
 			if entry.Scope != "list" {
 				continue
@@ -704,17 +800,20 @@ func securityEventsBuildCRSExclusionMatcher(policyByID map[int]*models.SecurityP
 				refIDs = append(refIDs, ref)
 			}
 		}
+		out[id] = set
 	}
-	if len(refIDs) == 0 {
-		return out
-	}
-	lists, _, err := loadIPListEntriesVia(nil, refIDs)
-	if err != nil {
-		// 与发射端一致：列表不可读时该引用不形成排除（宁可记录，不误排除）。
-		Logf("warn", "security events attribution: load CRS exclusion IP lists failed: %v", err)
+	var lists map[int64][]string
+	if len(refIDs) > 0 {
+		loaded, _, err := loadIPListEntriesVia(nil, refIDs)
+		if err != nil {
+			// 与发射端一致：列表不可读时该引用不形成排除（宁可记录，不误排除）。
+			Logf("warn", "security events attribution: load CRS exclusion IP lists failed: %v", err)
+		}
+		lists = loaded
 	}
 	for id, set := range out {
 		set.lists = lists
+		set.entrySets = securityEventsBuildCRSExclusionIPIndex(set.entries, lists)
 		out[id] = set
 	}
 	return out
@@ -743,7 +842,13 @@ func securityEventsCRSExclusionTargetMatches(target, ruleID string) bool {
 }
 
 func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions, ruleID, clientIP string) bool {
-	for _, entry := range set.entries {
+	// 装载期已构建的成员集直接用；手工构造的快照（测试/非生产路径）按同一
+	// 构建函数补齐，保证两条路径的判定逐点一致。
+	sets := set.entrySets
+	if sets == nil {
+		sets = securityEventsBuildCRSExclusionIPIndex(set.entries, set.lists)
+	}
+	for i, entry := range set.entries {
 		if CRSExclusionTargetRemovesInfra(entry.Target) {
 			continue
 		}
@@ -753,11 +858,7 @@ func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions
 			if clientIP == "" || !(IsCRSGroupCode(entry.Target) || IsCRSRuleIDTarget(entry.Target)) {
 				continue
 			}
-			match := strings.Split(entry.IPs, ",")
-			for _, ref := range entry.ListRefs {
-				match = append(match, set.lists[ref]...)
-			}
-			if !securityEventsIPInList(clientIP, match) {
+			if i >= len(sets) || !securityEventsIPInPrefixSet(clientIP, sets[i]) {
 				continue
 			}
 		} else if entry.Scope != "" && entry.Scope != "all" {
@@ -891,29 +992,23 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		}
 		return len(geoCountries) > 0
 	case n == 4:
-		var blacklist []string
-		if err := json.Unmarshal(policy.IPBlacklist, &blacklist); err != nil {
+		blacklist := securityEventsPolicyBlacklistIndex(policy)
+		if !blacklist.OK || blacklist.Entries == 0 {
 			return false
 		}
-		if len(blacklist) == 0 {
-			return false
-		}
-		return clientIP == "" || securityEventsIPInList(clientIP, blacklist)
+		return clientIP == "" || securityEventsIPInPrefixSet(clientIP, blacklist.Prefixes)
 	case n == 2:
 		if !policy.IPACLEnabled {
 			return false
 		}
 		// deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
-		// 否则 refs-only deny 策略无法认领自己的 id:2 事件。
-		aclList := policy.MergedACLList
-		if len(aclList) == 0 {
-			var inline []string
-			if err := json.Unmarshal([]byte(policy.IPACLList), &inline); err != nil {
-				return false
-			}
-			aclList = inline
+		// 否则 refs-only deny 策略无法认领自己的 id:2 事件。名单解析快照
+		// 每个策略只构建一次（前缀集 + 原始条目数），成员判定二分。
+		acl := securityEventsPolicyACLIndex(policy)
+		if !acl.OK {
+			return false
 		}
-		nonEmpty := len(aclList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs)
+		nonEmpty := acl.Entries > 0 || ipListRefsNonEmpty(policy.IPACLListRefs)
 		if policy.IPACLMode == "allow" {
 			// 空 allow 名单发射的是 fail-closed 恒拒面，事件应由该策略认领；
 			// 非空 allow 的 id:2 仍保持既有「不拥有」口径。
@@ -922,7 +1017,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if policy.IPACLMode != "deny" || !nonEmpty {
 			return false
 		}
-		return clientIP == "" || securityEventsIPInList(clientIP, aclList)
+		return clientIP == "" || securityEventsIPInPrefixSet(clientIP, acl.Prefixes)
 	case n == 7:
 		// 预检 allow 交集外拒绝（含空名单 fail-closed 恒拒）属于 allow 策略。
 		return policy.IPACLEnabled && policy.IPACLMode == "allow"
@@ -1153,16 +1248,17 @@ func securityEventsIPFamilyEventSurface(p *models.SecurityPolicy, action, ruleTr
 	if n == 8 || IsGeoIPPrecheckID(n) {
 		return PolicyHasGeoIP(p)
 	}
-	aclEntries := mergedACLList(p)
-	aclCapable := p.IPACLEnabled && (p.IPACLMode == "allow" || len(aclEntries) > 0 || ipListRefsNonEmpty(p.IPACLListRefs))
+	// 名单判据走每 tick 一次的解析快照（ACL 前缀集/原始条目数），逐事件
+	// 不再重解析名单或重复 Unmarshal 黑名单；NonEmpty 与 mergedACLList 同源。
+	aclIndex := securityEventsPolicyACLIndex(p)
+	aclCapable := p.IPACLEnabled && (p.IPACLMode == "allow" || aclIndex.NonEmpty || ipListRefsNonEmpty(p.IPACLListRefs))
 	switch n {
 	case 2:
 		if p.IPACLMode == "deny" && aclCapable {
 			return true
 		}
 	case 4:
-		var blacklist []string
-		if err := json.Unmarshal(p.IPBlacklist, &blacklist); err == nil && len(blacklist) > 0 {
+		if blacklist := securityEventsPolicyBlacklistIndex(p); blacklist.OK && blacklist.Entries > 0 {
 			return true
 		}
 	case 7:
@@ -1180,28 +1276,98 @@ func securityEventsIPFamilyEventSurface(p *models.SecurityPolicy, action, ruleTr
 	return false
 }
 
-// securityEventsIPInList 报告事件源 IP 是否命中名单条目（精确或 CIDR 包含）。
-// 条目解析走引擎侧单一事实源 wafiplist.ParseIPEntry（4in6 归一 / zone 拒绝
-// 与 @ipListFast 完全同口径）——此前裸 netip.ParsePrefix 不归一 4in6 条目，
-// 写侧允许的 ::ffff:a.b.c.d/120 在引擎侧命中、此处判不命中，导致 id:2/4 归因
-// 与 CRS 排除 scope 判定与引擎匹配口径分叉。解析失败按不命中跳过（与渲染端
-// @ipMatch 的宽松容忍一致——坏条目在生成期告警，不在此重复报）。
-func securityEventsIPInList(ip string, list []string) bool {
-	addr, err := netip.ParseAddr(ip)
-	if err != nil {
-		return false
-	}
-	addr = addr.Unmap()
-	for _, entry := range list {
+// securityEventsIPPrefixSet 把名单条目解析为「升序、去重、不相交」前缀集
+// （wafiplist.AggregateParsedPrefixes 单一事实源，与 @ipListFast 加载形态
+// 相同）：条目只在此处解析一次，成员判定走二分。条目解析走引擎侧单一事实源
+// wafiplist.ParseIPEntry（4in6 归一 / zone 拒绝与 @ipListFast 完全同口径）
+// ——裸 netip.ParsePrefix 不归一 4in6 条目，写侧允许的 ::ffff:a.b.c.d/120
+// 在引擎侧命中、归因侧会判不命中。解析失败/空白条目按不命中跳过（与渲染端
+// @ipMatch 的宽松容忍一致——坏条目在生成期告警，不在此重复报）；聚合前后
+// 匹配集合逐点相等，故二分结果与逐条扫描等价。
+func securityEventsIPPrefixSet(entries []string) []netip.Prefix {
+	parsed := make([]netip.Prefix, 0, len(entries))
+	for _, entry := range entries {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
-		if prefix, perr := wafiplist.ParseIPEntry(entry); perr == nil && prefix.Contains(addr) {
-			return true
+		if prefix, err := wafiplist.ParseIPEntry(entry); err == nil {
+			parsed = append(parsed, prefix)
 		}
 	}
-	return false
+	return wafiplist.AggregateParsedPrefixes(parsed)
+}
+
+// securityEventsIPInPrefixSet 报告事件源 IP 是否落在前缀集内：集合满足
+// 「升序、去重、不相交」不变量（securityEventsIPPrefixSet 产物），含目标的
+// 前缀必为最后一个起始地址 ≤ 目标的条目，单次 sort.Search 即判定。
+// IP 解析口径与引擎一致：4in6 归一后匹配（查询侧 Unmap，前缀侧已在
+// ParseIPEntry 归一）。
+func securityEventsIPInPrefixSet(ip string, set []netip.Prefix) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	return securityEventsPrefixSetContains(set, addr)
+}
+
+// securityEventsPrefixSetContains 是 addr 形态的二分判定（集合不变量同
+// securityEventsIPInPrefixSet）：调用方已持有解析后的地址时避免重复解析。
+// 查询侧先 Unmap——4in6 形态地址与 v4 前缀在归一后才可比。
+func securityEventsPrefixSetContains(set []netip.Prefix, addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	i := sort.Search(len(set), func(i int) bool { return set[i].Addr().Compare(addr) > 0 }) - 1
+	return i >= 0 && set[i].Contains(addr)
+}
+
+// securityEventsPolicyACLIndex 返回策略 IP ACL 名单的解析快照（每个策略在
+// 首次判定时构建一次，同 tick 内「事件×候选策略」复用）。来源选择与逐事件
+// 实现同口径：合并集（inline ∪ refs）非空取合并集，否则回退 inline JSON；
+// inline JSON 畸形时 OK=false（调用方按既有「不认领」口径）。NonEmpty 与
+// mergedACLList 同源（该调用亦负责内联畸形诊断），Entries 是原始条目数。
+func securityEventsPolicyACLIndex(p *models.SecurityPolicy) models.SecurityPolicyIPListIndex {
+	if p.ACLIPIndex.Built {
+		return p.ACLIPIndex
+	}
+	idx := models.SecurityPolicyIPListIndex{Built: true}
+	idx.NonEmpty = len(mergedACLList(p)) > 0
+	list := p.MergedACLList
+	idx.OK = true
+	if len(list) == 0 {
+		var inline []string
+		if err := json.Unmarshal([]byte(p.IPACLList), &inline); err != nil {
+			idx.OK = false
+		} else {
+			list = inline
+		}
+	}
+	if idx.OK {
+		idx.Entries = len(list)
+		idx.Prefixes = securityEventsIPPrefixSet(list)
+	}
+	p.ACLIPIndex = idx
+	return idx
+}
+
+// securityEventsPolicyBlacklistIndex 返回遗留 ip_blacklist 的解析快照
+// （构建时机/复用语义同 securityEventsPolicyACLIndex）：原始 JSON 与条目
+// 解析都不再逐事件重复；JSON 畸形时 OK=false（判定按不命中）。
+func securityEventsPolicyBlacklistIndex(p *models.SecurityPolicy) models.SecurityPolicyIPListIndex {
+	if p.IPBlacklistIPIndex.Built {
+		return p.IPBlacklistIPIndex
+	}
+	idx := models.SecurityPolicyIPListIndex{Built: true}
+	var list []string
+	if err := json.Unmarshal(p.IPBlacklist, &list); err == nil {
+		idx.Entries = len(list)
+		idx.Prefixes = securityEventsIPPrefixSet(list)
+		idx.OK = true
+	}
+	p.IPBlacklistIPIndex = idx
+	return idx
 }
 
 // securityEventsAttributePolicy v2.2.0 多策略事件归因：rule_triggered → 查该规则
@@ -1412,7 +1578,7 @@ func (t *securityEventsTailer) securityEventsGenerationGuard(offset int64) (int6
 		ResetAutobanCounters()
 		// 去重表与会话绑定：新库为空，整份审计日志重放必须逐条重新落库——
 		// 旧库时代的去重记忆会把重放事件当重复丢弃（新库永远缺这些行）。
-		t.dedupe = securityEventsRequestDeduper{}
+		t.dedupe = &securityEventsRequestDeduper{}
 		if err := securityEventsWriteOffset(t.offsetPath, 0); err != nil {
 			return offset, fmt.Errorf("security events: persist offset reset for new library generation: %w", err)
 		}
@@ -1543,26 +1709,33 @@ func securityEventsScanNextDocumentBounded(f *os.File, from, limit int64) (int64
 	return 0, false, nil
 }
 
-// securityEventsRollupRewriteHook 摄取提交后的 rollup 覆盖水位回退钩子
+// securityEventsRollupRewriteHook 摄取提交后的 rollup 重固钩子
 // （由 main.go 装配 handlers.ThreatRollupRewindTo）。
 // 停机/升级积压或轮转补采的插入事件时间可能落在 rollup 已覆盖的分钟区间
 // ——warmer 在摄取首 pass 之前已推进水位时，超过 threatRollupRepairMinutes
-// 的积压分钟再无重固入口，大屏永久少计。钩子接收本批实际插入的最旧事件
+// 的积压分钟再无重固入口，大屏永久少计。oldestMinute=本批需要重固的最旧
 // 分钟（UTC，分钟截断），实现方负责把覆盖水位回退到该分钟之前。
-var securityEventsRollupRewriteHook func(oldestInsertedMinute time.Time)
+// reclassifyMinutes=本批对**既有行**原地改判（logged→blocked，事件 id 不变）
+// 的分钟集合：增量重固只重扫更大的 id，这些分钟必须全量重算；普通插入分钟
+// 不需要全量重算（迟到行 id 单调更大，增量即可覆盖，避免积压恢复时把整段
+// 覆盖区间退化成全量重扫）。
+var securityEventsRollupRewriteHook func(oldestMinute time.Time, reclassifyMinutes []time.Time)
 
 // SetSecurityEventsRollupRewrite 装配覆盖水位回退钩子（nil=停用，供测试）。
-func SetSecurityEventsRollupRewrite(fn func(time.Time)) {
+func SetSecurityEventsRollupRewrite(fn func(time.Time, []time.Time)) {
 	securityEventsRollupRewriteHook = fn
 }
 
-// notifySecurityEventsRollupRewrite 在事务提交后通知回退钩子（零值=本批无
-// 实际插入，零动作）。
-func notifySecurityEventsRollupRewrite(minute time.Time) {
-	if minute.IsZero() || securityEventsRollupRewriteHook == nil {
+// notifySecurityEventsRollupRewrite 在事务提交后通知回退钩子（无插入且无
+// 原地改判=零动作）。
+func notifySecurityEventsRollupRewrite(minute time.Time, reclassifyMinutes []time.Time) {
+	if securityEventsRollupRewriteHook == nil {
 		return
 	}
-	securityEventsRollupRewriteHook(minute)
+	if minute.IsZero() && len(reclassifyMinutes) == 0 {
+		return
+	}
+	securityEventsRollupRewriteHook(minute, reclassifyMinutes)
 }
 
 // securityEventsIngestCommits 摄取事务提交次数（测试观测批次节奏——行数批
@@ -1755,19 +1928,31 @@ type securityEventsTailer struct {
 	generationLoaded bool
 	generationPath   string
 	// dedupe 是请求级事件去重表（跨 pass 复用：同一请求的引擎事务被轮转/
-	// 停等拆到不同 pass 时仍归并为一条）。
-	dedupe securityEventsRequestDeduper
+	// 停等拆到不同 pass 时仍归并为一条）。指针形态——补采 tailer 直接引用
+	// live 表（securityEventsLiveDedupe），map 与清扫水位/告警标志等标量状态
+	// 全部共享；按值副本只共享 map，标量写入落在副本上（live 侧切点滞后、
+	// 容量告警重复）。首次使用时由 deduper 惰性初始化。
+	dedupe *securityEventsRequestDeduper
 }
 
-// securityEventsLiveDedupe 返回 live tailer 的请求级去重表（共享同一 map）。
-// 无锁契约：补采路径只在 securityEventsPollOnce 持有 securityEventsPollState
-// 且同一 goroutine 内（经 rotateAuditLogIfNeeded）被调用；其它调用方（测试）
-// 拿不到 live tailer 时返回空表。
-func securityEventsLiveDedupe() securityEventsRequestDeduper {
-	if securityEventsPollState.tailer == nil {
-		return securityEventsRequestDeduper{}
+// deduper 返回去重表（nil 时惰性建空表）：保证所有消费点拿到同一实例。
+func (t *securityEventsTailer) deduper() *securityEventsRequestDeduper {
+	if t.dedupe == nil {
+		t.dedupe = &securityEventsRequestDeduper{}
 	}
-	return securityEventsPollState.tailer.dedupe
+	return t.dedupe
+}
+
+// securityEventsLiveDedupe 返回 live tailer 的请求级去重表（补采路径与 live
+// 路径共享同一实例，包括清扫水位与告警标志）。无锁契约：补采路径只在
+// securityEventsPollOnce 持有 securityEventsPollState 且同一 goroutine 内
+// （经 rotateAuditLogIfNeeded）被调用；其它调用方（测试）拿不到 live tailer
+// 时返回独立空表。
+func securityEventsLiveDedupe() *securityEventsRequestDeduper {
+	if securityEventsPollState.tailer == nil {
+		return &securityEventsRequestDeduper{}
+	}
+	return securityEventsPollState.tailer.deduper()
 }
 
 func securityEventsNewTailer(logPath, offsetPath string) *securityEventsTailer {
@@ -1977,7 +2162,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 		if entry, ok := pendingDedupe[key]; ok && entry.atSec >= atSec-securityEventsDedupeWindowSec {
 			return entry, true
 		}
-		return t.dedupe.lookup(key, atSec)
+		return t.deduper().lookup(key, atSec)
 	}
 	// crossPassUpgradeNeedsBlockedFeed 判定跨 pass 改判是否需要补喂 blocked
 	// （本批缓冲里没有该请求的条目=上一 pass 已提交）。不变量「一请求只计
@@ -2011,6 +2196,15 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 	// 本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
 	// 回退钩子（积压事件落在已覆盖分钟区间时重固，防止大屏永久少计）。
 	var batchOldestMinute time.Time
+	// 本批对既有行原地改判（UPDATE，事件 id 不变）的分钟集合：这些分钟
+	// 必须全量重算 rollup 维度，而普通插入分钟走增量即可。
+	var batchReclassifyMinutes map[time.Time]struct{}
+	markReclassifyMinute := func(m time.Time) {
+		if batchReclassifyMinutes == nil {
+			batchReclassifyMinutes = map[time.Time]struct{}{}
+		}
+		batchReclassifyMinutes[m] = struct{}{}
+	}
 	commit := func() error {
 		if err := tx.Commit(); err != nil {
 			// 提交失败必须补发 ROLLBACK（见 securityEventsRollbackLeakedTx）：
@@ -2022,7 +2216,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 		passInsertedTotal += batchInserted
 		batchInserted = 0
 		for key, entry := range pendingDedupe {
-			t.dedupe.record(key, entry)
+			t.deduper().record(key, entry)
 		}
 		pendingDedupe = map[uint64]securityEventsDedupeEntry{}
 		autobanObserveBatch(autobanBatch)
@@ -2031,8 +2225,13 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 		threatScreenAttackFlowRecordBatch(attackFlowBatch)
 		attackFlowBatch = nil
 		attackFlowIndex = map[uint64]int{}
-		notifySecurityEventsRollupRewrite(batchOldestMinute)
+		reclassifyMinutes := make([]time.Time, 0, len(batchReclassifyMinutes))
+		for m := range batchReclassifyMinutes {
+			reclassifyMinutes = append(reclassifyMinutes, m)
+		}
+		notifySecurityEventsRollupRewrite(batchOldestMinute, reclassifyMinutes)
 		batchOldestMinute = time.Time{}
+		batchReclassifyMinutes = nil
 		return nil
 	}
 	for {
@@ -2262,8 +2461,10 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 						attackFlowBatch[idx].ruleTriggered = rec.RuleTriggered
 					}
 					// 该分钟 rollup 可能已按 logged 固化：重固让 action/rule
-					// 维度与改判后的行一致。
+					// 维度与改判后的行一致。原地 UPDATE 不改 id，增量重固扫不到
+					// ——按「原地改判」来源上报，实现方对该分钟走全量重算。
 					m := time.Unix(prev.atSec, 0).UTC().Truncate(time.Minute)
+					markReclassifyMinute(m)
 					if batchOldestMinute.IsZero() || m.Before(batchOldestMinute) {
 						batchOldestMinute = m
 					}
@@ -2314,7 +2515,12 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 					// 放行（每个已验证爬虫请求都是一条 logged 事件），不过滤
 					// 会把 Googlebot/Bingbot 画成攻击弹道，与同屏 feed/总量/
 					// 拦截率（均已按同谓词排除）口径分叉。
-					if threatScreenAttackFlowSampleN.Load() > 0 && SecurityEventCountsAsAttack(rec.Action, rec.RuleTriggered) {
+					// 保留地址（内网/回环/文档示例）同样在**入环前**排除：同屏
+					// 其它攻击面全在入口侧排除，唯独本环原先在端点出口才丢——
+					// 高频内网扫描会占满环与单轮 limit，把真实外网攻击弧挤出
+					// 窗口（静默表现为「攻击变少」）。
+					if threatScreenAttackFlowSampleN.Load() > 0 && SecurityEventCountsAsAttack(rec.Action, rec.RuleTriggered) &&
+						!IsReservedClientIP(rec.ClientIP) {
 						if dedupeable {
 							attackFlowIndex[dedupeKey] = len(attackFlowBatch)
 						}
@@ -2347,8 +2553,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 				}
 			}
 			batchCount++
-			batchBytes += len(rec.RequestHeaders) + len(rec.RequestBody)
-			passBytesTotal += len(rec.RequestHeaders) + len(rec.RequestBody)
+			batchBytes += rec.rowBytes()
+			passBytesTotal += rec.rowBytes()
 			if batchCount >= batchSize || batchBytes >= batchByteCap {
 				stmt.Close()
 				if cerr := commit(); cerr != nil {
@@ -2385,11 +2591,25 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 // 结论：action/评分/触发规则/策略归因整体替换为拦截引擎的值（展示必须自洽
 // ——谁拦的、按什么规则、多少分）。请求头与请求体保留首次落库的快照：后续
 // 引擎未开请求体记录时不该把已有请求体清空。幂等（重放时重复执行同样值）。
+//
+// 归因列（rule_caddy_id/rule_name/policy_id/policy_name）采用保留式赋值：
+// 结论列必须覆盖，但归因缺失时不得反向清空既有归因——第二引擎事务若没有
+// 注入 X-LB-Rule-ID（或绑定在发射后被删），零值归因会把已落库的规则/策略
+// 覆盖成空，「blocked + 无规则 + 无策略」的事件从按策略/规则的 24h 计数与
+// 检索中消失。空归因=未知，不是「没有归因」。
 func securityEventsUpgradeDedupedEvent(tx *sql.Tx, transactionID string, rec *securityEventRecord, rule securityEventsRuleRef, policyID int, policyName string) error {
 	if _, err := tx.Exec(`UPDATE security_events
-		SET action=?, anomaly_score=?, rule_caddy_id=?, rule_triggered=?, rule_msg=?, rule_name=?, policy_id=?, policy_name=?, duration_us=?, precheck_us=?
+		SET action=?, anomaly_score=?,
+			rule_caddy_id=COALESCE(NULLIF(?, ''), rule_caddy_id),
+			rule_triggered=?,
+			rule_msg=?,
+			rule_name=COALESCE(NULLIF(?, ''), rule_name),
+			policy_id=CASE WHEN ?>0 THEN ? ELSE policy_id END,
+			policy_name=COALESCE(NULLIF(?, ''), policy_name),
+			duration_us=?, precheck_us=?
 		WHERE transaction_id=?`,
-		rec.Action, rec.AnomalyScore, rule.caddyID, rec.RuleTriggered, rec.RuleMsg, rule.name, policyID, policyName, rec.DurationUs, rec.PrecheckUs, transactionID); err != nil {
+		rec.Action, rec.AnomalyScore, rule.caddyID, rec.RuleTriggered, rec.RuleMsg, rule.name,
+		policyID, policyID, policyName, rec.DurationUs, rec.PrecheckUs, transactionID); err != nil {
 		return fmt.Errorf("security events: upgrade merged event: %w", err)
 	}
 	return nil

@@ -16,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// " up.test " 渲染成非法 dial）。
+// 路径规则上游地址写侧 trim——带前后空白的 " up.test " 会渲染成非法 dial。
 func TestCreateRule_pathUpstreamAddressTrimmedOnWrite(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -278,16 +278,24 @@ func TestRuleCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 		t.Fatalf("read rules.go: %v", err)
 	}
 	source := string(raw)
-	needle := "if err := tx.Commit(); err != nil {"
+	// 提交入口有两个等价形态：`tx.Commit()` 与测试缝单源 `commitTx(tx)`
+	//（提交失败可注入，见 txCommitForTest）。分支断言必须两者都认，否则换
+	// 入口即假红。
+	needles := []string{"if err := tx.Commit(); err != nil {", "if err := commitTx(tx); err != nil {"}
 	searchFrom := 0
 	branches := 0
 	for {
-		index := strings.Index(source[searchFrom:], needle)
-		if index < 0 {
+		nextIndex, nextNeedleLen := -1, 0
+		for _, needle := range needles {
+			if index := strings.Index(source[searchFrom:], needle); index >= 0 && (nextIndex < 0 || index < nextIndex) {
+				nextIndex, nextNeedleLen = index, len(needle)
+			}
+		}
+		if nextIndex < 0 {
 			break
 		}
-		start := searchFrom + index
-		searchFrom = start + len(needle)
+		start := searchFrom + nextIndex
+		searchFrom = start + nextNeedleLen
 		// 分支体内（900 字节窗口，含中文注释）必须含已提交视图统一恢复；
 		// DuplicateRule 不应用 Caddy 配置（副本默认禁用），无副作用，按专属
 		// 日志文案豁免。

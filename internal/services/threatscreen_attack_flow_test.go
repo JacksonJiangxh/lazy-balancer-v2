@@ -28,7 +28,7 @@ func TestThreatScreenAttackFlow_samplingAndCursor(t *testing.T) {
 	// 全量：三条全部入环，weight=1。
 	mustAcquireAttackFlowLease(t, "tab-t", 1)
 	threatScreenAttackFlowRecordBatch(items)
-	events, next := ThreatScreenAttackFlowSnapshot(0, 10)
+	events, next, _ := ThreatScreenAttackFlowSnapshot(0, 10)
 	if len(events) != 3 || next != 3 {
 		t.Fatalf("full sampling events=%d next=%d, want 3/3", len(events), next)
 	}
@@ -48,7 +48,7 @@ func TestThreatScreenAttackFlow_samplingAndCursor(t *testing.T) {
 			ruleTriggered: "942100",
 		}})
 	}
-	events, next = ThreatScreenAttackFlowSnapshot(next, 10)
+	events, next, _ = ThreatScreenAttackFlowSnapshot(next, 10)
 	if len(events) != 2 || next != 5 {
 		t.Fatalf("1/4 sampling events=%d next=%d, want 2/5", len(events), next)
 	}
@@ -61,7 +61,7 @@ func TestThreatScreenAttackFlow_samplingAndCursor(t *testing.T) {
 	// 关闭（租约释放）：不再追加。
 	ReleaseThreatScreenAttackFlowLease("tab-t")
 	threatScreenAttackFlowRecordBatch(items)
-	events, _ = ThreatScreenAttackFlowSnapshot(next, 10)
+	events, _, _ = ThreatScreenAttackFlowSnapshot(next, 10)
 	if len(events) != 0 {
 		t.Fatalf("sample_n=0 recorded %d events, want 0", len(events))
 	}
@@ -163,7 +163,7 @@ func TestThreatScreenAttackFlowSnapshot_omitsRuleMessage(t *testing.T) {
 		action:        "blocked",
 		ruleTriggered: "942100",
 	}})
-	events, _ := ThreatScreenAttackFlowSnapshot(0, 1)
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, 1)
 	if len(events) != 1 {
 		t.Fatalf("events=%d, want 1", len(events))
 	}
@@ -186,7 +186,7 @@ func TestThreatScreenAttackFlow_cursorAheadResets(t *testing.T) {
 		action:        "blocked",
 		ruleTriggered: "942100",
 	}})
-	_, next := ThreatScreenAttackFlowSnapshot(999, 10)
+	_, next, _ := ThreatScreenAttackFlowSnapshot(999, 10)
 	if next != 0 {
 		t.Fatalf("cursor ahead next=%d, want 0", next)
 	}

@@ -31,10 +31,10 @@ func TestScheduleReads_readFailureLeavesWarnTrace(t *testing.T) {
 		t.Fatal("closed DB must yield no slot")
 	}
 	nextAutoBackupSlot(time.Now())
-	if got := earliestEnabledSourceUpdate("security_threat_sources"); got != "" {
+	if got := earliestEnabledSourceUpdate("security_threat_sources", nil); got != "" {
 		t.Fatalf("closed DB must yield empty earliest slot, got %q", got)
 	}
-	earliestEnabledSourceUpdate("security_threat_sources")
+	earliestEnabledSourceUpdate("security_threat_sources", nil)
 
 	out := buf.String()
 	if strings.Count(out, "schedule-read-auto-backup") != 1 {
@@ -58,7 +58,7 @@ func TestEarliestEnabledSourceUpdate_ordersMixedSlotFormats(t *testing.T) {
 	}
 
 	// When
-	got := earliestEnabledSourceUpdate("security_threat_sources")
+	got := earliestEnabledSourceUpdate("security_threat_sources", nil)
 
 	// Then：真实最早＝01:00Z，且归一为空格形态（crsTimeLayout）
 	if want := "2026-01-02 01:00:00"; got != want {

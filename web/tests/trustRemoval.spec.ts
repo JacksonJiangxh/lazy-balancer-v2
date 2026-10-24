@@ -75,7 +75,7 @@ test('仅 CIDR 提供信任：本弹窗无可执行动作', () => {
   assert.deepEqual(refCidr.residualSources, ['引用列表「数据中心」的 CIDR 条目'])
 })
 
-test('引用列表精确条目但不在可移除集合：不得纳入删除计划', () => {
+test('引用列表精确条目但不在可移除集合：不得纳入删除计划，且必须报告残余信任', () => {
   const plan = planTrustRemoval({
     ip,
     inlineWhitelist: '[]',
@@ -86,6 +86,22 @@ test('引用列表精确条目但不在可移除集合：不得纳入删除计�
   })
   assert.equal(plan.hasRemovable, false)
   assert.deepEqual(plan.exactRefListIds, [])
+  // 不可移除的精确条目同样提供信任：漏计会让「取消信任」在无可执行动作时
+  // 指引用户去编辑一个本弹窗无法移除的来源，或谎报已解除。
+  assert.deepEqual(plan.residualSources, ['引用列表「系统名单」的精确条目（不可在本弹窗移除）'])
+})
+
+test('可移除列表的精确条目移除后不再是残余来源', () => {
+  const plan = planTrustRemoval({
+    ip,
+    inlineWhitelist: '[]',
+    whitelistRefs: '[5,6]',
+    lists: [{ id: 5, name: '可移除' }, { id: 6, name: '系统名单' }],
+    removableListIds: [5],
+    listEntries: (id) => (id === 5 ? [ip] : ['203.0.113.0/24']),
+  })
+  assert.deepEqual(plan.exactRefListIds, [5])
+  assert.deepEqual(plan.residualSources, ['引用列表「系统名单」的 CIDR 条目'])
 })
 
 test('空白归一：带空格的精确条目仍视为可移除', () => {

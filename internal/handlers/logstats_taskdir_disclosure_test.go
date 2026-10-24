@@ -241,6 +241,13 @@ func TestClassifyRotationCopyName_familiesAgreeAcrossConsumers(t *testing.T) {
 		{"caddy-20260921-120000-64-size.log", rotationCopyTimberjack, "caddy.log"},
 		{"caddy-20260921-120000-64-size.log.gz", rotationCopyTimberjack, "caddy.log"},
 		{"caddy-tls-20260921-120000-64-size.log", rotationCopyTimberjack, "caddy-tls.log"},
+		// 同毫秒碰撞后缀（timberjack 的 uniqueBackupName 把计数写在 reason 段内）
+		// 与时间触发 reason、zstd 压缩：与删除侧白名单同族的真实命名。
+		{"caddy-20260921-120000-64-size_1.log", rotationCopyTimberjack, "caddy.log"},
+		{"caddy-20260921-120000-64-size_1.log.gz", rotationCopyTimberjack, "caddy.log"},
+		{"caddy-20260921-120000-64-time.log", rotationCopyTimberjack, "caddy.log"},
+		{"caddy-tls-20260921-120000-64-size.log.zst", rotationCopyTimberjack, "caddy-tls.log"},
+		{"caddy-20260921-120000-64-time_2.log.zst", rotationCopyTimberjack, "caddy.log"},
 		{"certjob-lb_x.log.gz", rotationCopyWholeGzip, "certjob-lb_x.log"},
 		{"caddy.log", rotationCopyNone, ""},
 	}

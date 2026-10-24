@@ -76,6 +76,12 @@ func NormalizeClusterNodeName(name string) string {
 		return r
 	}, name)
 	name = strings.TrimSpace(name)
+	// ZWJ 例外只服务 emoji 组合：整名仅由 ZWJ 与空白构成时它不携带任何可见
+	// 字符，归一到空（由调用方按 ErrInvalidClusterNodeName 拒绝），否则会落成
+	// 视觉空名（集群列表/审计详情的节点列显示空白）。
+	if name != "" && strings.TrimFunc(name, func(r rune) bool { return r == '\u200d' || unicode.IsSpace(r) }) == "" {
+		return ""
+	}
 	if utf8.RuneCountInString(name) > ClusterNodeNameMaxLen {
 		name = string([]rune(name)[:ClusterNodeNameMaxLen])
 	}
@@ -442,9 +448,15 @@ type ClusterUser struct {
 
 // ClusterLockedUser 是主节点活跃登录锁的同步载荷：主节点账号被锁
 // 状态必须传播到从节点（从节点本地锁定独立生效）。走快照独立顶层载荷
-// locked_users 而非 users 节列——login_* 不在 users 触发器快照列/节哈希/漂移
-// 守卫内，避免每次登录失败触发 users/api_keys 全量重放与漂移循环。只携带
-// 未来时间的活跃锁（与 loginLockedNow 同口径），自然过期后条目自动从快照消失。
+// locked_users，而**不**进入 users 载荷/节哈希/漂移守卫——注意这不等于
+// 「login_locked_until 不参与触发」：该列在 cluster_version.go 的 users
+// snapshotColumns 内，值变化（置锁/解锁）照常 bump 集群版本（值变化守卫保证
+// 登录热路径的保值写零抖动），从节点 304 门因此失效并拿到携带新锁状态的整体
+// 快照；锁状态本身经本顶层载荷下发。仅 login_failed_attempts（失败计数）不入列。
+// 若把该列从 snapshotColumns 移除，锁将永不传播（从节点对已锁定账号仍可登录），
+// 且无测试会红——改动该列前先读本节与 cluster_version.go 同处的修订说明。
+// 只携带未来时间的活跃锁（与 loginLockedNow 同口径），自然过期后条目自动从
+// 快照消失。
 type ClusterLockedUser struct {
 	Username    string `json:"username"`
 	LockedUntil string `json:"locked_until"`

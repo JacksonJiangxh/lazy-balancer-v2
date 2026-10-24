@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"reflect"
 	"testing"
 
 	"lazy-balancer-v2/internal/models"
@@ -74,6 +75,58 @@ func TestStageZeroMatrix_createUpdateParity(t *testing.T) {
 			// 阶段内字段不得被误清零：每阶段至少保留一项非零哨兵
 			if !hasNonZero(created) {
 				t.Fatalf("stage=%s: 所有字段被归零（矩阵过度清零）", stage)
+			}
+		})
+	}
+}
+
+// 归零矩阵的指针别名钉：每个字段必须是独立变量地址（new(expr) 每字段一份）。
+// 共享同一局部变量时，将来任何 `*req.X = v` 形态的归一都会经别名同时改写
+// 多个落库字段，且在 review 中不可见。
+func TestStageZeroMatrix_zeroPointersAreDistinct(t *testing.T) {
+	stages := []string{
+		models.PolicyTypeStage0, models.PolicyTypeStage1,
+		models.PolicyTypeStage2, models.PolicyTypeStage3,
+	}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			req := pollutedUpdateRequest()
+			applyStageZerosToUpdate(&req, stage)
+			fields := map[string]any{
+				"mode":                  req.Mode,
+				"crs_rule_groups":       req.CRSRuleGroups,
+				"crs_excluded_rules":    req.CRSExcludedRules,
+				"custom_rules":          req.CustomRules,
+				"rate_limit_enabled":    req.RateLimitEnabled,
+				"rate_limit_rps":        req.RateLimitRPS,
+				"rate_limit_burst":      req.RateLimitBurst,
+				"waf_check_response":    req.WAFCheckResponse,
+				"log_request_body":      req.LogRequestBody,
+				"ip_acl_enabled":        req.IPACLEnabled,
+				"ip_acl_list":           req.IPACLList,
+				"ip_acl_list_refs":      req.IPACLListRefs,
+				"ip_whitelist_enabled":  req.IPWhitelistEnabled,
+				"ip_whitelist":          req.IPWhitelist,
+				"ip_whitelist_refs":     req.IPWhitelistRefs,
+				"ip_blacklist":          req.IPBlacklist,
+				"geoip_mode":            req.GeoIPMode,
+				"geoip_countries":       req.GeoIPCountries,
+				"geoip_crawler_exempt":  req.GeoIPCrawlerExempt,
+				"geoip_crawler_engines": req.GeoIPCrawlerEngines,
+				"block_page_id":         req.BlockPageID,
+				"block_status_code":     req.BlockStatusCode,
+				"trust_detection":       req.TrustDetection,
+			}
+			seen := make(map[uintptr]string, len(fields))
+			for name, ptr := range fields {
+				if ptr == nil {
+					continue
+				}
+				addr := reflect.ValueOf(ptr).Pointer()
+				if prev, dup := seen[addr]; dup {
+					t.Fatalf("%s 与 %s 共享同一指针地址（归零矩阵别名，写入会互相覆盖）", name, prev)
+				}
+				seen[addr] = name
 			}
 		})
 	}

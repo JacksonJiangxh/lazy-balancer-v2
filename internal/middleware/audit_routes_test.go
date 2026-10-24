@@ -16,12 +16,13 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 	// Given
 	router := newMiddlewareTestRouter(t)
 	intentionalSkip := map[string]struct{}{
-		"POST /api/v1/admin-tls/inspect":            {},
-		"POST /api/v1/certificates/parse":           {},
-		"POST /api/v1/certificates/jobs/current":    {},
-		"POST /api/v1/cluster/nodes/report":         {},
-		"POST /api/v1/cluster/registration/confirm": {},
+		"POST /api/v1/admin-tls/inspect":         {},
+		"POST /api/v1/certificates/parse":        {},
+		"POST /api/v1/certificates/jobs/current": {},
+		"POST /api/v1/cluster/nodes/report":      {},
 		// 服务控制机器接口：handler 全路径（含失败）显式记录「服务控制」审计。
+		// registration/confirm 已升 Explicit（handler 记录确认/确认失败），
+		// 不再属有意跳过。
 		"POST /api/v1/cluster/service-control": {},
 		"POST /api/v1/config/import/validate":  {},
 		"POST /api/v1/config/preview":          {},

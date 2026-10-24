@@ -729,3 +729,59 @@ func TestInitIP2Region_rejectsProbePanicOnCorruptSegment(t *testing.T) {
 		t.Fatal("启动装载必须与导入/Reload 同强度拒绝损坏 xdb")
 	}
 }
+
+// 主节点判定可写却写 live 失败（/app/data 只读、磁盘满、路径被同名文件占位）
+// 时，必须与从节点分支同一只读降级：以镜像内置库装载，面板归属地/库状态保持
+// 可用。旧实现直接放弃 → searcher 为空、归属地全空，且无任何可见的降级路径。
+func Test_InitIP2Region_masterDistCopyFailureLoadsDistReadOnly(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	dir := t.TempDir()
+	dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")
+	if err := os.MkdirAll(filepath.Dir(dist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestXDB(t, dist, testSegments)
+	// live 的父路径是普通文件 → os.Stat(live) 报错（按「缺失」处理），
+	// copyFile 的 MkdirAll 必然失败（可写判定为真但写不成）。
+	blocker := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(blocker, "ip2region.xdb")
+	withIP2RegionPaths(t, live, dist)
+
+	InitIP2Region()
+
+	if got := Lookup("1.2.3.1"); got != "US" {
+		t.Fatalf("主节点 live 写入失败后未只读装载 dist: Lookup=%q, want US", got)
+	}
+	if _, err := os.Stat(live); err == nil {
+		t.Fatal("live 不得被静默创建（降级是只读的）")
+	}
+}
+
+// 同族：live 存在但不可装载（此处以目录占位模拟半写/带外损坏）且主节点
+// dist 回退拷贝失败（rename 到目录必然失败）时，同样只读装载 dist。
+func Test_InitIP2Region_masterCorruptLiveCopyFailureLoadsDistReadOnly(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	if err := os.MkdirAll(live, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")
+	if err := os.MkdirAll(filepath.Dir(dist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestXDB(t, dist, testSegments)
+	withIP2RegionPaths(t, live, dist)
+
+	InitIP2Region()
+
+	if got := Lookup("1.2.3.100"); got != "US" {
+		t.Fatalf("主节点回退拷贝失败后未只读装载 dist: Lookup=%q, want US", got)
+	}
+	if info, err := os.Stat(live); err != nil || !info.IsDir() {
+		t.Fatalf("live 现场必须保持原样（不得被半写文件覆盖）: err=%v", err)
+	}
+}

@@ -214,7 +214,11 @@ func DoWithSameHostTLSUpgradeRedirect(client *http.Client, req *http.Request) (*
 		return resp, nil
 	}
 	target, err := url.Parse(location)
-	if err != nil || target.Scheme != "https" || target.Hostname() != req.URL.Hostname() {
+	// 主机名比较不区分大小写：url.URL.Hostname() 原样保留书写形态，
+	// 主节点地址填 https://Master.Example 而明文端口回 https://master.example
+	// 时字符串比较会让升级重放永远不触发（调用方拿到空 body 走重定向指引）。
+	// 端口变化隐含允许（明文端口 80→443 是升级的常规形态）。
+	if err != nil || target.Scheme != "https" || !strings.EqualFold(target.Hostname(), req.URL.Hostname()) {
 		return resp, nil
 	}
 	resp.Body.Close()

@@ -84,6 +84,14 @@ var autobanMaxTrackedIPs = 100000
 // 容量截断新封并落「容量收敛」留痕）。2026-10-14 用户裁定设大值（500→2000）。
 var AutobanListEntryCap = 2000
 
+// autobanAuditPerRoundCap 单轮逐 IP「自动封禁」审计行上限。逐 IP 留痕是
+// 可追溯性裁定（2026-09-14/15 审计可见性强化链）的默认形态，正常规模不
+// 触发；（首次启用/容量刚释放时）单轮 2000 个 IP 同时达标会一次写 2000 行
+// 审计——审计库按 3 个月保留且 AutobanBannedToday 依赖 audit_log(action)
+// 索引，洪峰下写放大与体积不可控。超限时保留前 N 条逐 IP 行并补一条汇总行
+// （点名总数与省略数）；完整名单始终以预置 IP 列表为准。
+var autobanAuditPerRoundCap = 500
+
 // AutobanDuration/Clock/Scope：配置枚举与时长换算。
 var autobanDurations = map[string]time.Duration{
 	"10m":       10 * time.Minute,
@@ -646,11 +654,15 @@ func AutobanSeedCounterForTest(ip string, count, threshold int) {
 
 // autobanMergeOutcome 单轮 merge 结果（TaskLogf 摘要与审计数据源）。
 type autobanMergeOutcome struct {
-	ListID     int64
-	Expired    []string // 到期自动解封的 IP
-	Banned     []string // 本轮新封禁的 IP
-	Evicted    int      // 超限挤出的自动条目数
-	EvictedIPs []string // 被挤出条目的 IP（挤出=解封同语义：调用方须随
+	ListID  int64
+	Expired []string // 到期解封的 IP（自动+手动条目全集，清桶口径按全集）
+	// ExpiredManual 是 Expired 中 remark≠自动封禁（手动封禁）的子集：解封
+	// 动作同样由系统执行，但审计文案若把人工封禁条目称「到期自动解封」会把
+	// 来源说错（排障时无法区分自动/手动），故单列供审计分流。
+	ExpiredManual []string
+	Banned        []string // 本轮新封禁的 IP
+	Evicted       int      // 超限挤出的自动条目数
+	EvictedIPs    []string // 被挤出条目的 IP（挤出=解封同语义：调用方须随
 	// Expired 一起清计数桶，否则旧计数仍 ≥ 阈值 → 下轮零新事件立即重封，
 	// 形成「挤出→重封→再挤出」轮转；同时供容量收敛留痕点名身份）
 	DroppedNew int // 容量不足丢弃的新封数
@@ -743,6 +755,9 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 	for _, e := range entries {
 		if exp := parseAutobanEntryTime(e.ExpiresAt); !exp.IsZero() && !exp.After(now) {
 			out.Expired = append(out.Expired, e.Value)
+			if e.Remark != autobanEntryRemark {
+				out.ExpiredManual = append(out.ExpiredManual, e.Value)
+			}
 			expiredThisRound[e.Value] = struct{}{}
 			out.Changed = true
 			continue
@@ -1075,7 +1090,7 @@ func AutobanDisableFlush() {
 		// 被挤者无 WARN/审计可核对（是否需手动加白/调容量无从判定）。
 		autobanReportCapacityOutcome("（禁用收尾）", out)
 		if out.Changed {
-			autobanAuditExpiredUnban(out.Expired)
+			autobanAuditExpiredUnban(out.Expired, out.ExpiredManual)
 			autobanConvergeLocked("自动封禁禁用收尾", out.ListID)
 		}
 	}
@@ -1246,15 +1261,9 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 			TaskLogfWarn(AutobanTaskID, "audit", "节点降级/取消窗口：本轮名单已收敛，逐 IP 审计从简（名单内容为准，审计缺口见此行）")
 			return nil
 		}
-		// 审计逐 IP「自动封禁」+ 每批「到期自动解封」汇总（系统操作者）。
-		for _, ip := range out.Banned {
-			RecordAuditLog("system", AutobanAuditAction, "IP 地址列表",
-				FormatAuditDetail("IP："+ip,
-					fmt.Sprintf("命中：%d 次/%d 分钟", cfg.Threshold, cfg.WindowMinutes),
-					"时长："+AutobanDurationLabel(cfg.Duration),
-					AuditResultPart("success")), "")
-		}
-		autobanAuditExpiredUnban(out.Expired)
+		// 审计逐 IP「自动封禁」+ 每批「到期解封」汇总（系统操作者）。
+		autobanAuditBanned(cfg, out.Banned)
+		autobanAuditExpiredUnban(out.Expired, out.ExpiredManual)
 	}
 	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 名单 %d 条%s%s",
 		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.Total, reloadNote(out.Changed, reloadState), feedNote)
@@ -1279,14 +1288,60 @@ func autobanReportCapacityOutcome(scope string, out autobanMergeOutcome) {
 		fmt.Sprintf("自动封禁容量收敛%s：挤出 %d、丢弃 %d（上限 %d）%s", scope, out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix), "")
 }
 
-// autobanAuditExpiredUnban 到期自动解封审计（Run 轮与禁用收尾共用单一实现，
-// 系统操作者归因）。
-func autobanAuditExpiredUnban(ips []string) {
+// autobanAuditBanned 逐 IP「自动封禁」审计（Run 轮：降级窗口外、名单已收敛）。
+// 逐 IP 行受单轮上限约束：超限时保留前 N 条并补一条汇总行（完整名单以预置
+// IP 列表为准），避免洪峰下单轮写放大到 AutobanListEntryCap 行审计。
+func autobanAuditBanned(cfg AutobanConfig, banned []string) {
+	if len(banned) == 0 {
+		return
+	}
+	omitted := 0
+	if len(banned) > autobanAuditPerRoundCap {
+		omitted = len(banned) - autobanAuditPerRoundCap
+		banned = banned[:autobanAuditPerRoundCap]
+	}
+	for _, ip := range banned {
+		RecordAuditLog("system", AutobanAuditAction, "IP 地址列表",
+			FormatAuditDetail("IP："+ip,
+				fmt.Sprintf("命中：%d 次/%d 分钟", cfg.Threshold, cfg.WindowMinutes),
+				"时长："+AutobanDurationLabel(cfg.Duration),
+				AuditResultPart("success")), "")
+	}
+	if omitted > 0 {
+		RecordAuditLog("system", AutobanAuditAction, "IP 地址列表",
+			fmt.Sprintf("本轮自动封禁共 %d 个 IP，逐 IP 审计超过单轮上限 %d，其余 %d 个省略逐条记录（完整名单见预置 IP 列表）", len(banned)+omitted, autobanAuditPerRoundCap, omitted), "")
+	}
+}
+
+// autobanAuditExpiredUnban 到期解封审计（Run 轮与禁用收尾共用单一实现，
+// 系统操作者归因）。按条目来源分行：ips 中不在 manual 子集的是自动封禁
+// 条目，manual 子集是手动封禁条目（remark≠自动封禁）——两者解封动作都由
+// 系统在到期时执行，但把人工封禁说成「自动封禁的到期解封」会把来源说错，
+// 排障时无从区分。
+func autobanAuditExpiredUnban(ips, manual []string) {
 	if len(ips) == 0 {
 		return
 	}
-	RecordAuditLog("system", "自动解封", "IP 地址列表",
-		fmt.Sprintf("到期自动解封 %d 个 IP：%s", len(ips), strings.Join(ips, "、")), "")
+	manualSet := make(map[string]struct{}, len(manual))
+	for _, ip := range manual {
+		manualSet[ip] = struct{}{}
+	}
+	var autoIPs, manualIPs []string
+	for _, ip := range ips {
+		if _, ok := manualSet[ip]; ok {
+			manualIPs = append(manualIPs, ip)
+			continue
+		}
+		autoIPs = append(autoIPs, ip)
+	}
+	if len(autoIPs) > 0 {
+		RecordAuditLog("system", "自动解封", "IP 地址列表",
+			fmt.Sprintf("到期自动解封 %d 个自动封禁 IP：%s", len(autoIPs), strings.Join(autoIPs, "、")), "")
+	}
+	if len(manualIPs) > 0 {
+		RecordAuditLog("system", "自动解封", "IP 地址列表",
+			fmt.Sprintf("到期解封 %d 个手动封禁条目（到期时间到达，系统自动执行）：%s", len(manualIPs), strings.Join(manualIPs, "、")), "")
+	}
 }
 
 // autobanEvictedIdentitySuffix 容量收敛留痕的挤出条目身份片段

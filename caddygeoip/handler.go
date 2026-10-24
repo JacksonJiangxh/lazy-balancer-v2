@@ -69,7 +69,9 @@ func (h *GeoIPHandler) Provision(ctx caddy.Context) error {
 	setCrawlerIPListFilePath(h.CrawlerIPListFile)
 	searcher, err := sharedGeoIPSearcher(h.XdbPath)
 	if err != nil {
-		ctx.Logger().Warn("geoip2region: ip2region database unavailable, geoip disabled",
+		// 告警已在 sharedGeoIPSearcher 内按（原因|路径）节流上报——一次
+		// reload 每条地域规则各调一次本函数，此处再 Warn 会按规则数放大。
+		ctx.Logger().Debug("geoip2region: ip2region database unavailable, geoip disabled",
 			zap.String("xdb_path", h.XdbPath), zap.Error(err))
 		return nil
 	}
@@ -177,6 +179,11 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 		}
 		geoipSharedMu.Unlock()
 		if !ok {
+			// 无缓存形态（首次缺失/权限错/挂载未就绪）是最常见的失败分支，
+			// 必须与 fail-stale 分支同族节流：一次 reload 会为每条地域规则
+			// 各调一次本函数，不节流则 WARN 按规则数放大并稀释真实告警。
+			geoipWarnThrottled("unavailable", path, "ip2region database unavailable, geoip disabled",
+				zap.String("xdb_path", path), zap.Error(err))
 			return nil, err
 		}
 		geoipWarnThrottled("stat", path, "ip2region database is not stat-able, serving the previous database instance and rebuilding on the next reload",
@@ -203,6 +210,9 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 				zap.String("xdb_path", path), zap.Error(err))
 			return cached.searcher, nil
 		}
+		// 无缓存的重建失败同样按（原因|路径）节流上报，与有缓存分支同族。
+		geoipWarnThrottled("rebuild-unavailable", path, "ip2region database unavailable, geoip disabled",
+			zap.String("xdb_path", path), zap.Error(err))
 		return nil, err
 	}
 	if replaced, ok := geoipSharedSearchers[path]; ok {

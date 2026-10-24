@@ -1601,8 +1601,12 @@ func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
 	}
 
 	// When
-	if err := service.ConfirmRegistration(context.Background(), "slave-token"); err != nil {
+	name, err := service.ConfirmRegistration(context.Background(), "slave-token")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if name != "s1" {
+		t.Fatalf("确认返回节点名=%q, want s1（审计归因依赖该值）", name)
 	}
 
 	// Then：secret 与过期时间戳双列均 NULL

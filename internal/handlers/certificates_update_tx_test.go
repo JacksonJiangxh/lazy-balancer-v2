@@ -1,7 +1,6 @@
 package handlers
 
-// LBS/：UpdateCertificateConfig 旧行读取与动态 UPDATE 必须
-// 同事务。本测试直接记录真实 SQLite driver 的 BEGIN/旧行 SELECT 顺序，避免用
+// UpdateCertificateConfig 旧行读取与动态 UPDATE 必须同事务。本测试直接记录真实 SQLite driver 的 BEGIN/旧行 SELECT 顺序，避免用
 // 固定 sleep 制造并发交错：旧实现会先 SELECT 后 BEGIN/UPDATE，契约顺序即失败。
 
 import (

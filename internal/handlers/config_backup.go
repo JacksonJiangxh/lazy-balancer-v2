@@ -1152,7 +1152,7 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 // 在「备份携带 lb_rules」时执行；仅导入「安全防护」分类（lb_rules 缺席）而
 // security_policy_bindings 被携带时，指向 live TCP 规则的绑定仍会插入并存活，
 // 策略页 rule_count/绑定视图宣称生效而运行态零防护。故 v2 导入把本步从
-// hasRules 门中提出，无条件执行一次（与 cleanupDisappearedRuleArtifacts 的
+// hasRules 门中提出，无条件执行一次（与 collectPostCommitCleanup 的事务内
 // 幂等重复无害同型）。
 func pruneTCPRuleBindings(ctx context.Context, tx *sql.Tx) (int64, error) {
 	result, err := tx.ExecContext(ctx, `DELETE FROM security_policy_bindings
@@ -1176,20 +1176,7 @@ type importCertificate struct {
 }
 
 func currentRuleIDs(ctx context.Context) ([]string, error) {
-	rows, err := db.DB.QueryContext(ctx, "SELECT caddy_id FROM lb_rules")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	ruleIDs := make([]string, 0)
-	for rows.Next() {
-		var ruleID string
-		if err := rows.Scan(&ruleID); err != nil {
-			return nil, err
-		}
-		ruleIDs = append(ruleIDs, ruleID)
-	}
-	return ruleIDs, rows.Err()
+	return ruleIDsFromQueryer(ctx, db.DB)
 }
 
 func (h *Handlers) snapshotImportRuntime(ruleIDs []string) (importRuntimeSnapshot, error) {
@@ -2682,8 +2669,11 @@ func loadLiveCertJobShapes() ([]map[string]any, error) {
 
 // certJobRowQueryer 是证书任务统计的查询面：导入锁内传 *sql.Tx，预览传
 // *sql.DB——同一判据两条路径共用，避免预览与导入对同一备份给出不同告警。
+// QueryRowContext 是 CA 提供商存在性/启用态读取面：必须走同一 querier（此
+// 前走 db.DB 直读另一条连接，导入路径读到的不是事务视图）。
 type certJobRowQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // certJobProviderDanglingCounts 统计「导入后会参与续签」的证书任务中 CA 提供商
@@ -2695,6 +2685,9 @@ type certJobRowQueryer interface {
 //
 // 计数面收敛为「非终态 ∧ 规则为启用 ACME」——此前对 cert_jobs 全表（含
 // failed/disabled 残留行与非 ACME 规则的孤儿行）计数，告警系统性偏高。
+// 规则源按备份是否携带 lb_rules 二选一：随包时用备份行（导入后视图），
+// 否则 JOIN live——此前恒读调用时的库视图，导入路径在 deleteOrder 之前执行，
+// 「导入前规则态」与「导入后任务行」组合会漏计/多计。
 func certJobProviderDanglingCounts(ctx context.Context, q certJobRowQueryer, tables map[string][]map[string]any, sectionTables map[string]bool) (disabled, missing int, err error) {
 	if _, certJobsCarried := tables["cert_jobs"]; certJobsCarried {
 		return 0, 0, nil
@@ -2702,21 +2695,44 @@ func certJobProviderDanglingCounts(ctx context.Context, q certJobRowQueryer, tab
 	if !sectionTables["ca_providers"] && !sectionTables["certificate_configs"] {
 		return 0, 0, nil
 	}
-	rows, qerr := q.QueryContext(ctx, `
-		SELECT COALESCE(j.ca_provider_id,0) FROM cert_jobs j
+	rulesCarried := len(tables["lb_rules"]) > 0
+	query := `
+		SELECT j.rule_id, COALESCE(j.ca_provider_id,0) FROM cert_jobs j
 		JOIN lb_rules r ON r.caddy_id=j.rule_id
 		WHERE COALESCE(j.ca_provider_id,0) <> 0
 		  AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
-		  AND j.status NOT IN ('failed','disabled')`)
+		  AND j.status NOT IN ('failed','disabled')`
+	if rulesCarried {
+		query = `
+		SELECT rule_id, COALESCE(ca_provider_id,0) FROM cert_jobs
+		WHERE COALESCE(ca_provider_id,0) <> 0 AND status NOT IN ('failed','disabled')`
+	}
+	rows, qerr := q.QueryContext(ctx, query)
 	if qerr != nil {
 		return 0, 0, qerr
 	}
 	defer rows.Close()
+	// 备份随包时的「导入后启用 ACME 规则集」（JOIN 形态已由 SQL 过滤）。
+	var applicableRules map[string]bool
+	if rulesCarried {
+		applicableRules = make(map[string]bool, len(tables["lb_rules"]))
+		for _, rule := range tables["lb_rules"] {
+			protocol, _ := rule["protocol"].(string)
+			if backupRuleEnabled(rule) && protocol == "http" &&
+				backupBooleanEnabled(rule["enable_tls"]) && backupString(rule["tls_source"]) == "acme_dns" {
+				applicableRules[backupString(rule["caddy_id"])] = true
+			}
+		}
+	}
 	state := make(map[int]struct{ exists, enabled bool })
 	for rows.Next() {
+		var ruleID string
 		var providerID int
-		if scanErr := rows.Scan(&providerID); scanErr != nil {
+		if scanErr := rows.Scan(&ruleID, &providerID); scanErr != nil {
 			return 0, 0, scanErr
+		}
+		if applicableRules != nil && !applicableRules[ruleID] {
+			continue
 		}
 		st, seen := state[providerID]
 		if !seen {
@@ -2725,7 +2741,7 @@ func certJobProviderDanglingCounts(ctx context.Context, q certJobRowQueryer, tab
 				st = struct{ exists, enabled bool }{exists: found, enabled: found && backupRowEnabled(row)}
 			} else {
 				var enabled int
-				liveErr := db.DB.QueryRow("SELECT COALESCE(enabled,0) FROM ca_providers WHERE id=?", providerID).Scan(&enabled)
+				liveErr := q.QueryRowContext(ctx, "SELECT COALESCE(enabled,0) FROM ca_providers WHERE id=?", providerID).Scan(&enabled)
 				if liveErr != nil && !errors.Is(liveErr, sql.ErrNoRows) {
 					return 0, 0, liveErr
 				}
@@ -2741,6 +2757,19 @@ func certJobProviderDanglingCounts(ctx context.Context, q certJobRowQueryer, tab
 		}
 	}
 	return disabled, missing, rows.Err()
+}
+
+// certJobProviderDanglingWarnings 两档悬挂告警的文案单源（预览 warnings 与
+// 导入审计共用）——此前预览/导入各写一份近似文案，措辞与口径随时可能分叉。
+func certJobProviderDanglingWarnings(disabled, missing int) []string {
+	warnings := make([]string, 0, 2)
+	if disabled > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d 个证书任务的 CA 提供商已禁用——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", disabled))
+	}
+	if missing > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d 个证书任务引用的 CA 提供商已不存在——续签时将回落首个启用提供商（自愈），如需保持原提供商请补齐", missing))
+	}
+	return warnings
 }
 
 // validateV2BackupCertJobs 校验最终处于启用态的 acme_dns 规则携带域名匹配的
@@ -3736,13 +3765,10 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 			return fmt.Errorf("备份的代理流关闭延迟不能为负数")
 		}
 	}
-	for _, key := range []string{"http_read_timeout", "http_write_timeout", "http_idle_timeout"} {
-		if raw, exists := config[key]; exists && raw != nil {
-			if value, ok := backupInteger(raw); ok && value < 0 {
-				return fmt.Errorf("备份的 %s 不能为负数", key)
-			}
-		}
-	}
+	// http 三超时的符号与下界由 backupConfigClampRules（ResetOnLow）统一处置：
+	// 0/负值/非法形态一律归治理默认并留审计，与「导入钳制」单口径一致。
+	// 此处再设一道负值 400 会让同一输入得到相反结论（400 vs 静默归一），
+	// 且该 400 先于钳制执行，钳制的负值分支永远不可达。
 	if raw, exists := config["threat_traffic_sample_n"]; exists && raw != nil {
 		value, ok := backupInteger(raw)
 		if !ok {
@@ -4690,7 +4716,8 @@ var backupConfigClampRules = []backupConfigClampRule{
 	{Key: "cert_expiry_days", Lo: 1, Hi: 365, Def: 30},
 	// 库值唯一真相（批 1+2）：http 三超时为类型①值型列（NOT NULL DEFAULT
 	// 60/60/120+启动回填）——旧备份的 0/NULL（省略语义时代残留）在导入门归
-	// 治理默认；写侧无上界，故 Hi=0。
+	// 治理默认；写侧无上界，故 Hi=0。本表是这三键的唯一导入门：负值/0/非法
+	// 形态统一归默认并留审计（ResetOnLow 覆盖负值与 0），不再另设 400 门。
 	{Key: "http_read_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPReadTimeout, ResetOnLow: true},
 	{Key: "http_write_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPWriteTimeout, ResetOnLow: true},
 	{Key: "http_idle_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPIdleTimeout, ResetOnLow: true},
@@ -5051,6 +5078,24 @@ func removeImportVersionSentinel(ctx context.Context, table string) (bool, error
 	return affected > 0, nil
 }
 
+// cleanupImportVersionSentinels 撤销本次导入写入的临时版本种子行
+// （security_crs_version/security_ip2region_version）。
+// 提交已落地，清理必须与请求生命周期解耦：前端超时/关页/网关断连会让请求
+// ctx 取消，残留哨兵行 auto_update=0 且不被 rearm 补槽（自动更新静默停摆）。
+// 与 collectPostCommitCleanup 同口径：WithoutCancel + 独立预算。
+func cleanupImportVersionSentinels(ctx context.Context, tables []string) {
+	for _, table := range tables {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importCleanupBudget)
+		removed, err := removeImportVersionSentinel(cleanupCtx, table)
+		cancel()
+		if err != nil {
+			services.Logf("warn", "配置导入：撤销 %s 版本种子行失败: %v", table, err)
+		} else if !removed {
+			services.Logf("info", "配置导入：%s 占位行已被并发更新，保留该行", table)
+		}
+	}
+}
+
 // errUnknownBackupSection:buildLbbakExport 的 4xx 语义哨兵——薄壳端点据此
 // 保持原 400 文案,其余错误一律 500「导出失败: …」。分类合并后
 // 「仅全局配置」形态不可达(global_config 是 users 别名,恒有表),
@@ -5213,18 +5258,20 @@ func (h *Handlers) ImportConfigBackup(c *gin.Context) {
 		// 交回 core 对原（已半消费）body 走 ShouldBindJSON，transport 读失败退化为
 		// 通用「备份文件格式不正确」，排障方向被误导（validate/v1 两路径早已
 		// 显式返回「备份文件读取失败: …」/「内容为空」）。
+		// 尺寸超限（413）属探测面，不落审计；其余读失败与空体是「被拒绝的导入
+		// 尝试」，与核心的事务前校验失败同口径留痕。
 		if isRequestBodyTooLarge(rerr) {
-			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 			return
 		}
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + rerr.Error()})
+		failImportValidation(c, "导入", "备份文件读取失败: "+rerr.Error())
 		return
 	}
 	if len(raw) == 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
+		failImportValidation(c, "导入", "备份文件内容为空")
 		return
 	}
-	h.importConfigBackupCore(c, raw, true, "", "导入")
+	h.importConfigBackupCore(c, raw, "", "导入")
 }
 
 const warningPureJSONThreatSourcesPreserved = "纯 JSON 备份不携带威胁名单文件，已保留本地威胁源配置与名单"
@@ -5338,47 +5385,52 @@ func failImportTx(c *gin.Context, session *configImportSession, action, detail s
 	return err
 }
 
+// failImportValidation 是导入「事务前」失败分支的单一收尾：审计 + 400。
+// 与 failImportTx 对称——篡改备份（校验和不匹配）、伪造/损坏 lbbak 等被
+// 拒绝的导入尝试必须在操作审计页可见（V1 导入与集群注册端点同族已如此），
+// 否则取证面只剩 stdout 日志。尺寸类探测走 413 分支，不经此处。
+func failImportValidation(c *gin.Context, action, detail string) {
+	recordAudit(c, action+"失败", "配置备份", detail)
+	c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: detail})
+}
+
 // importConfigBackupCore 携带导入全量逻辑,HTTP 导入端点与自动备份还原端点
 // (autobackup.go)共用。128MB 压缩上限由 HTTP 调用方 limitConfigImportBody
 // 与自动备份还原读取侧共同把守。内存
 // 峰值评估——lbbak 解压(gzip 放大,条目上限在读入内存前拦截)+config.json
 // 展开为 map+checksum 重 marshal,峰值约上限的 ~10×（约 1.2-1.5GB 瞬态）；
 // 导入为管理员手动低频操作，当前不加并发互斥（记录裁定，不再重复评估）。
-// dataOK=false 表示请求体读取失败,body 保持原样(错误透传给 ShouldBindJSON,
-// 保持原 413/400 判定);filename 非空时进入审计来源(还原路径);action 为
+// data 为调用方已完整读入的备份字节（读体失败由调用方就地返回，不再把半
+// 消费的 body 透传进来）；filename 非空时进入审计来源(还原路径);action 为
 // 审计动作与结果文案前缀(「导入」/「还原」)。
-func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bool, filename, action string) {
+func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename, action string) {
 	// v2.3.0 lbbak:tar.gz 备份先解包校验,内部 config.json 走既有 V2 流程
 	var lbbakFiles *lbbakPayload
 	var lbbakUnregisteredThreat []string
-	if dataOK {
-		// v2 JSON 备份带 UTF-8 BOM 时预览端点已剥(见
-		// config_import_v1.go),导入核心同口径——否则同一份备份预览通过、
-		// 导入 400。BOM(\xef\xbb\xbf)与 gzip 魔数(0x1f 0x8b)不冲突,
-		// 剥 BOM 必须在 isLbbakBytes 魔数检测之前。
-		data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
-		if isLbbakBytes(data) {
-			payload, perr := parseLbbak(data)
-			if perr != nil {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: perr.Error()})
-				return
-			}
-			lbbakFiles = payload
-			// manifest 未登记的 threat/*.iplist 条目——老备份兼容照常
-			// 落盘，响应/审计侧告警（内容未经 sha256 校验）。
-			lbbakUnregisteredThreat = payload.UnregisteredThreatEntries
-			c.Request.Body = io.NopCloser(bytes.NewReader(payload.ConfigJSON))
-		} else {
-			c.Request.Body = io.NopCloser(bytes.NewReader(data))
+	// v2 JSON 备份带 UTF-8 BOM 时预览端点已剥(见
+	// config_import_v1.go),导入核心同口径——否则同一份备份预览通过、
+	// 导入 400。BOM(\xef\xbb\xbf)与 gzip 魔数(0x1f 0x8b)不冲突,
+	// 剥 BOM 必须在 isLbbakBytes 魔数检测之前。
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	if isLbbakBytes(data) {
+		payload, perr := parseLbbak(data)
+		if perr != nil {
+			failImportValidation(c, action, perr.Error())
+			return
 		}
+		lbbakFiles = payload
+		// manifest 未登记的 threat/*.iplist 条目——老备份兼容照常
+		// 落盘，响应/审计侧告警（内容未经 sha256 校验）。
+		lbbakUnregisteredThreat = payload.UnregisteredThreatEntries
+		c.Request.Body = io.NopCloser(bytes.NewReader(payload.ConfigJSON))
+	} else {
+		c.Request.Body = io.NopCloser(bytes.NewReader(data))
 	}
 	var backup configBackup
 	if err := c.ShouldBindJSON(&backup); err != nil {
-		if isRequestBodyTooLarge(err) {
-			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
-			return
-		}
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件格式不正确"})
+		// 请求体读取在调用方已完成（data 已全量入内存，MaxBytesReader 在
+		// 读体路径消费），此处不再存在 413 形态。
+		failImportValidation(c, action, "备份文件格式不正确")
 		return
 	}
 	// 完整性 → 分类选择/过滤 → 软跳过 → 行级门 → 形态/引用/任务/全局配置门
@@ -5388,7 +5440,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		ValidateRuleListenPort: h.validateRuleListenPortForSave,
 	}, &backup, importValidationOptions{LbbakPayload: lbbakFiles, RequestedSections: c.Query("sections")})
 	if chainErr != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: chainErr.Error()})
+		failImportValidation(c, action, chainErr.Error())
 		return
 	}
 	sectionTables := chain.SectionTables
@@ -5416,25 +5468,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if wafXdbMetadataSkipped {
 		recordAudit(c, action+"警告", "配置备份", warningWafXdbMetadataSkipped)
 	}
-	// 六个整型钳制键 + 证书续签三键 + http 三超时统一收敛为单表单循环
-	// （backupConfigClampRules；审计留痕随钳制产生）。
-	configClampNotes := clampBackupConfigInts(backup.Config)
-	certNumericClamped := make([]string, 0, 1)
-	// request_body_max_size_mb 导入钳制（与写侧三处
-	// 同边界）——溢出向量此前只堵了保存/更新，备份导入可携带天文数字绕过，
-	// 渲染侧 MB→字节 int64 乘法回绕会让 body 限制静默取消。库值唯一真相
-	//（批 1+2）：该列为类型①值型列，<=0（旧备份的渲染兜底时代残留/NULL）
-	// 归治理默认 128。归一形态带值回显，保留为该表的专用分支。
-	if value, exists := backup.Config["request_body_max_size_mb"]; exists {
-		normalized := normalizeBackupRequestBodyMB(value, 1, db.DefaultRequestBodyMaxSizeMB)
-		n, integerShape := backupInteger(value)
-		backup.Config["request_body_max_size_mb"] = normalized
-		if !integerShape {
-			certNumericClamped = append(certNumericClamped, fmt.Sprintf("request_body_max_size_mb 非法形态（%v），已归一为 %d", value, normalized))
-		} else if n <= 0 || n > 4096 {
-			certNumericClamped = append(certNumericClamped, fmt.Sprintf("request_body_max_size_mb 越界（%d），已钳位为 %d", n, normalized))
-		}
-	}
+	// 全局配置数值归一（整型钳制表 + request_body_max_size_mb 专用归一）
+	// 已在链内完成——预览与导入共用同一归一点与同一组文案，此处只消费事实。
+	configClampNotes := chain.ConfigClampNotes
 	ctx := c.Request.Context()
 	importUsername := c.GetString("username")
 	// 2026-09-18 用户裁定:「备份不含操作者账户」不再硬阻断——①分类导入可
@@ -5538,11 +5574,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		// 计数失败不阻断导入（纯可观测性）：留痕并在响应中显式说明未完成统计。
 		services.Logf("warn", "配置导入：证书任务 CA 提供商悬挂统计失败: %v", certJobProviderCountErr)
 	}
-	if certJobProviderDisabled > 0 {
-		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个证书任务的 CA 提供商已禁用——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobProviderDisabled))
-	}
-	if certJobProviderMissing > 0 {
-		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个证书任务引用的 CA 提供商已不存在——续签时将回落首个启用提供商（自愈），如需保持原提供商请补齐", certJobProviderMissing))
+	// 文案单源（与预览 warnings 同一实现），动作前缀只标明本次操作。
+	for _, warning := range certJobProviderDanglingWarnings(certJobProviderDisabled, certJobProviderMissing) {
+		recordAudit(c, action+"警告", "配置备份", warning)
 	}
 	// 初检读取 live 的三项合并校验在锁内重跑（任何写之前）。
 	if err := revalidateImportLiveDependencies(ctx, tx, &backup, sectionTables); err != nil {
@@ -6224,7 +6258,6 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	auditParts := []string{"来源：" + auditSource, counts}
 	auditParts = append(auditParts, configClampNotes...)
-	auditParts = append(auditParts, certNumericClamped...)
 	auditParts = append(auditParts, autobanClampNotes...)
 	if len(skipWarnings) > 0 {
 		// 列表现含空域名规则与空内容拦截页两类跳过，标签泛化。
@@ -6370,6 +6403,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		services.RearmSecurityLibrarySlots()
 		// rearm 对临时哨兵行不补槽（auto_update=0）；提交后仅在哨兵形态未变
 		// 时 CAS 删除，维持「未导入=零行」且绝不覆盖并发真实更新。
+		var sentinelTables []string
 		for _, item := range []struct {
 			table    string
 			imported bool
@@ -6380,13 +6414,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			if item.imported || versionRowExistedBefore[item.table] {
 				continue
 			}
-			removed, err := removeImportVersionSentinel(ctx, item.table)
-			if err != nil {
-				services.Logf("warn", "配置导入：撤销 %s 版本种子行失败: %v", item.table, err)
-			} else if !removed {
-				services.Logf("info", "配置导入：%s 占位行已被并发更新，保留该行", item.table)
-			}
+			sentinelTables = append(sentinelTables, item.table)
 		}
+		cleanupImportVersionSentinels(ctx, sentinelTables)
 	}
 	services.SyncBusinessTaskDrivers()
 	// 爬虫源或名单被替换后，caddygeoip 的运行交换文件必须立即

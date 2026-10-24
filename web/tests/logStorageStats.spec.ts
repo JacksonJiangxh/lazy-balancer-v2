@@ -142,6 +142,63 @@ test('迟到响应不写回：换行后上一行的慢响应被丢弃', async ()
   assert.equal(info.value?.name, '操作日志', '旧行迟到响应不得覆盖当前行')
 })
 
+test('同一 tick 换行 + 刷新号自增只发一次请求（双 watch 已合并）', async () => {
+  const target = ref({ logKey: 'runtime' })
+  const refreshKey = ref(0)
+  g.__gets = []
+  g.__get = async () => statsOf('runtime', '运行日志')
+  const { info } = useLogStorageStats({ target: () => target.value, refreshKey: () => refreshKey.value })
+  await flush()
+  assert.equal(g.__gets.length, 1)
+  assert.equal(info.value?.name, '运行日志')
+
+  target.value = { logKey: 'audit' }
+  refreshKey.value += 1
+  await nextTick()
+  await flush()
+  assert.equal(g.__gets.length, 2, '同一 tick 的两个触发源必须合并为一次取数')
+  // 新 key 无对应行（stub 恒返 runtime 行）→ 清空后保持空，不残留上一行
+  assert.equal(info.value, null)
+  assert.deepEqual(g.__gets[1].config, { params: { key: 'audit' } })
+})
+
+test('取数失败：置 error 且保留上一次统计（不得整条消失）', async () => {
+  const target = ref({ logKey: 'audit' })
+  const refreshKey = ref(0)
+  g.__gets = []
+  let call = 0
+  g.__get = async () => {
+    call += 1
+    if (call === 1) return statsOf('audit', '操作日志')
+    throw new Error('network down')
+  }
+  const { info, error } = useLogStorageStats({ target: () => target.value, refreshKey: () => refreshKey.value })
+  await flush()
+  assert.equal(info.value?.name, '操作日志')
+  assert.equal(error.value, null, '成功时无错误位')
+
+  refreshKey.value += 1
+  await nextTick()
+  await flush()
+  assert.equal(info.value?.name, '操作日志', '失败必须保留上一次统计（不闪成空白）')
+  assert.equal(error.value, 'network down', '失败必须显式暴露错误')
+
+  // 恢复后错误位清除
+  g.__get = async () => statsOf('audit', '操作日志（新）')
+  refreshKey.value += 1
+  await nextTick()
+  await flush()
+  assert.equal(info.value?.name, '操作日志（新）')
+  assert.equal(error.value, null)
+})
+
+test('组合子不导出取数函数（loadStats 无外部消费）', () => {
+  const src = source('src/composables/useLogStorageStats.ts')
+  assert.match(src, /return \{ info, error \}/, '返回值只含消费面（info/error）')
+  assert.doesNotMatch(src, /return \{ info, loadStats \}/, 'loadStats 零外部消费，不得再作为对外契约')
+  assert.match(source('src/components/LogStorageBar.vue'), /const \{ info, error \} = useLogStorageStats\(/, '失败态必须被消费')
+})
+
 test('日志统计条消费 rows_unavailable：保持条数口径并标注不可用', () => {
   // 主题归属：日志统计条用例放在日志统计 spec 中（此前混在管理 TLS 证书
   // spec 里，查日志条不会想到那个文件）。

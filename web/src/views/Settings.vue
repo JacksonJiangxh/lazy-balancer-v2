@@ -269,15 +269,16 @@ const syncActiveTabFromPage = () => {
 
 // 仅消费 settings/global 的分页才拉整包 /config（apikeys/tasks/cluster 不接
 // props，白拉 60+ 字段整包后丢弃）；切回 basic/certificates 且未加载时补拉。
-const tabConsumesConfig = (tab: SettingsTabId): boolean => tab === 'basic' || tab === 'certificates'
+// 判据单源在 utils/settingsPages（横幅与拉取门必须同源：各自枚举会在调整
+// 「消费 /config」分页时静默分叉）。
 
 watch(() => authStore.currentPage, () => {
   syncActiveTabFromPage()
-  if (tabConsumesConfig(activeTab.value) && !configLoaded.value) void fetchSettings()
+  if (settingsTabConsumesConfig(activeTab.value) && !configLoaded.value) void fetchSettings()
 })
 
 onMounted(() => {
-  if (tabConsumesConfig(activeTab.value)) void fetchSettings()
+  if (settingsTabConsumesConfig(activeTab.value)) void fetchSettings()
 })
 
 // 设置草稿（令牌输入/安全事件 dirty/管理面板证书暂存）随「设置」逻辑页面

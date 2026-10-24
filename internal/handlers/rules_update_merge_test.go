@@ -110,6 +110,15 @@ func TestAbortIfRuleDeleted_rejectsDeletedRule(t *testing.T) {
 	if !strings.Contains(body.Message, "已被删除") {
 		t.Fatalf("message=%q, want 含「已被删除」", body.Message)
 	}
+	// 中止必须留痕：审计是唯一能回答「谁尝试更新了已删除规则」的通道。
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%lb_gone%' AND detail LIKE '%已被删除%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read deleted-rule conflict audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("删除复核中止审计条数=%d, want 1", blockedAudits)
+	}
 }
 
 // 对照：规则仍存在时守卫放行。

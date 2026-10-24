@@ -67,6 +67,15 @@ func TestUpdateRule_orphanACME_executingJobConflict409(t *testing.T) {
 	if status := certJobStatusByDomain(t, "lb_a86_exec", "exec.example.test"); status != "creating_order" {
 		t.Fatalf("cert job status=%q, want creating_order（409 早退不得删行/改行）", status)
 	}
+	// 阻断型 409 必须留痕：运维要能从审计回答「谁在何时尝试、被什么挡住」。
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%lb_a86_exec%' AND detail LIKE '%证书申请中%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read blocked conflict audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("在途签发阻断的 409 审计条数=%d, want 1（细节：更新失败/负载规则）", blockedAudits)
+	}
 	var tlsSource string
 	if err := db.DB.QueryRow("SELECT tls_source FROM lb_rules WHERE caddy_id='lb_a86_exec'").Scan(&tlsSource); err != nil || tlsSource != "acme_dns" {
 		t.Fatalf("rule tls_source=%q err=%v, want acme_dns（事务已回滚）", tlsSource, err)

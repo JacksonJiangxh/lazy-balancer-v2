@@ -55,11 +55,15 @@ func init() {
 // 按规则计数。覆盖:coraza 中断(WAF/GeoIP/IP ACL,ID=tx.ID() 16 字符)+限流 429;
 // 排除:proxy 499/request_body 413/其他 caddyhttp.Error 4xx(ID 9 字符)/coraza
 // 引擎 500(4xx 约束);上游 4xx 不产 HandlerError 不误计。
-// 稳定优先设计(2026-09-15 用户裁定,负载均衡/WAF 稳定最重要):
-//   - Provision 无操作——无 I/O/无外部依赖/无失败模式,配置加载零风险;
-//   - ServeHTTP 只读检测——不修改请求/响应/错误,链语义与无插件时逐字节一致;
-//   - 无锁/无共享态——prometheus counter 线程安全,reload 幂等;
-//   - API 兼容面:caddy.Module/caddyhttp.HandlerError 稳定(v2.0 起);
+// 稳定优先设计（2026-09-15 用户裁定，负载均衡/WAF 稳定最重要）：
+//   - Provision 只做 registry 注册（ctx.GetMetricsRegistry() nil 守卫；无 I/O/
+//     无外部依赖/无失败模式），配置加载零风险；reload 幂等由 registerOrExisting
+//     复用既有 Collector 保证（重复 MustRegister 会 panic）；
+//   - ServeHTTP 只读检测 + 原子计数/计时注册表写入——不修改请求/响应/错误；
+//     唯一请求头改动是计时关联头，渲染侧已将其列入上游头删除清单；
+//   - 无自定义锁/无跨请求可变状态——prometheus CounterVec 线程安全，每请求
+//     WithLabelValues 取子计数器；reload 幂等；
+//   - API 兼容面：caddy.Module/caddyhttp.HandlerError 稳定（v2.0 起）；
 //     ctx.GetMetricsRegistry() 是 EXPERIMENTAL(Caddy 标注 subject to change)
 //     已 nil 守卫(移除则降级为不计数而非崩溃),。
 type SecurityBlockedCounter struct {

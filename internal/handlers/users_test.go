@@ -552,3 +552,51 @@ func TestUpdateUser_oidcGateComparesValuesNotFieldPresence(t *testing.T) {
 		t.Fatalf("real display_name change: status=%d body=%s, want 400 OIDC", rec.Code, rec.Body.String())
 	}
 }
+
+// 重新启用用户必须清零历史登录失败与锁定（与改密的解锁语义同源）：管理员
+// 「恢复该账号」的意图不得被前 5 次失败留下的 10 分钟锁定打断。
+func TestToggleUserStatus_enableClearsLoginLock(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin", "admin", true)
+	seedUserAuditTest(t, 2, "locked-user", "user", false)
+	if _, err := db.DB.Exec(`UPDATE users SET login_failed_attempts=5, login_locked_until=datetime('now','+9 minutes') WHERE id=2`); err != nil {
+		t.Fatalf("seed lock state: %v", err)
+	}
+
+	rec := serveUserMutation(h, http.MethodPut, "/users/2", `{"is_enabled":true}`, 1, h.ToggleUserStatus)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var attempts int
+	var lockedUntil sql.NullString
+	if err := db.DB.QueryRow(`SELECT login_failed_attempts, login_locked_until FROM users WHERE id=2`).Scan(&attempts, &lockedUntil); err != nil {
+		t.Fatalf("read lock state: %v", err)
+	}
+	if attempts != 0 || lockedUntil.Valid {
+		t.Fatalf("attempts=%d locked_until=%v, want 0/NULL（启用即解锁）", attempts, lockedUntil)
+	}
+}
+
+// 禁用分支不得顺带解锁：禁用≠换凭据，历史失败计数保留（重启后仍生效）。
+func TestToggleUserStatus_disableKeepsLoginLock(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin-1", "admin", true)
+	seedUserAuditTest(t, 2, "admin-2", "admin", true)
+	seedUserAuditTest(t, 5, "locked-user", "user", true)
+	if _, err := db.DB.Exec(`UPDATE users SET login_failed_attempts=3, login_locked_until=datetime('now','+4 minutes') WHERE id=5`); err != nil {
+		t.Fatalf("seed lock state: %v", err)
+	}
+
+	rec := serveUserMutation(h, http.MethodPut, "/users/5", `{"is_enabled":false}`, 1, h.ToggleUserStatus)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var attempts int
+	var lockedUntil sql.NullString
+	if err := db.DB.QueryRow(`SELECT login_failed_attempts, login_locked_until FROM users WHERE id=5`).Scan(&attempts, &lockedUntil); err != nil {
+		t.Fatalf("read lock state: %v", err)
+	}
+	if attempts != 3 || !lockedUntil.Valid {
+		t.Fatalf("attempts=%d locked_until=%v, want 3/保留（禁用不解锁）", attempts, lockedUntil)
+	}
+}

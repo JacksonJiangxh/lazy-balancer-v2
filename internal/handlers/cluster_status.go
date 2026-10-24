@@ -64,6 +64,13 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 				clusterMasterForbidden(c, err)
 				return
 			}
+			if errors.Is(err, services.ErrNodeNotFound) {
+				// 从端重试脱离通知（DELETE 成功但响应丢失）时节点已不存在：
+				// 按幂等成功应答，从端据 200 停止重试；500 会让从端按
+				// 「服务端故障」持续重试并写入 last_sync_error。
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "节点已不在集群"})
+				return
+			}
 			clusterError(c, http.StatusInternalServerError, "节点脱离处理失败", err)
 			return
 		}
@@ -74,6 +81,12 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 	if err := h.clusterService.ReportNode(c.Request.Context(), nodeID, req, time.Now()); err != nil {
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
+			return
+		}
+		if errors.Is(err, services.ErrNodeNotFound) {
+			// 节点已被主节点删除：身份不存在的 404 语义（同族端点一致），
+			// 从端据此停止上报而不是反复重试。
+			clusterError(c, http.StatusNotFound, "节点状态上报失败：节点已不在集群", err)
 			return
 		}
 		clusterError(c, http.StatusInternalServerError, "节点状态上报失败", err)

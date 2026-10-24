@@ -812,6 +812,7 @@ const resultTagType = (r: string): 'success' | 'danger' | 'info' | 'warning' =>
 // 再作任何时区换算。曾委托 formatDate（其把无时区串强制按 UTC 解析再转
 // 配置时区），任务时间全部被 +8h 偏移（22:12→次日 06:12 实证）；formatDate 其余
 // 消费方（audit/cert_jobs/nodes 等 UTC 存储族）不受影响、保持原样。
+// 两族的边界与禁止面同时写在 utils/date.ts 的 formatDate 文档里（新增调用点先读那里）。
 const fmtTime = (s?: string) => {
   if (!s) return ''
   return s.replace('T', ' ').replace(/\.\d+/g, '').replace(/Z$/, '')
