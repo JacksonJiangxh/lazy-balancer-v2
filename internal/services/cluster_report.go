@@ -68,8 +68,8 @@ func (s *SyncService) Report(ctx context.Context) error {
 	expiryModifier := strconv.Itoa(expiryDays)
 	// 状态集必须覆盖部署生命周期——cleanup_dns/cleanup_warning
 	//（JobLifecycle=Downloaded）材料已落库、待部署，此前漏计会与规则页/任务
-	// 页的到期口径分叉（状态集单源见 jobstate.go 的 deploymentLifecycleJobStatusSQL）。
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','failed',`+deploymentLifecycleJobStatusSQL+`) AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
+	// 页的到期口径分叉（状态集单源见 jobstate.go 的 DeploymentLifecycleJobStatusSQL）。
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','failed',`+DeploymentLifecycleJobStatusSQL+`) AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
 		return fmt.Errorf("统计即将到期证书: %w", err)
 	}
 	// 构造契约允许 caddy=nil（测试/独立运维路径）；nil 下按

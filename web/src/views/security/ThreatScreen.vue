@@ -450,7 +450,12 @@ const staleFrameLabel = computed(() => {
 const attackTypeShare = computed(() => stats.value?.attack_type_share ?? [])
 const displayRecentRateX10 = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
 const displayRecentRate = computed(() => formatRecentRate(displayRecentRateX10.value / 10))
-const showEmptyState = computed(() => !statsError.value && !!stats.value && stats.value.total_events === 0)
+// 空态是三态的一部分：stats 属于旧窗口（切窗在途）时不得用旧窗口的
+// total_events 给当前窗口下「无安全事件」的结论——与 statsPending/staleFrameLabel
+// 同源判据，只在该帧确属当前窗口且无错误时展示。
+const showEmptyState = computed(() =>
+  !statsError.value && !!stats.value && stats.value.total_events === 0
+  && stats.value.hours === windowHours.value)
 const countryCount = computed(() => Object.keys(stats.value?.countries ?? {}).length)
 
 const formatFeedTime = (value: string): string => formatDate(value).slice(11) || value

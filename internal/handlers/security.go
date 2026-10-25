@@ -1130,18 +1130,6 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 	} {
 		normalizeEmptyJSONList(val)
 	}
-	for _, f := range []struct {
-		name string
-		val  *string
-	}{
-		{"crs_rule_groups", &req.CRSRuleGroups},
-		{"crs_excluded_rules", &req.CRSExcludedRules},
-	} {
-		if err := validateAndNormalizeCRSField(f.name, f.val, true); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-			return
-		}
-	}
 	if req.GeoIPMode == "" {
 		// 门（services.ValidateGeoIPCountries：非 off + 空名单 =
 		// 「宣称启用但零强制」→ 400）下的缺省归一：未显式启用地域控制且名单为空
@@ -1174,6 +1162,21 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 	// 「仅 stage0 消费；其他类型恒 0」契约，防跨阶段字段漂移落库。
 	if policyType != models.PolicyTypeStage0 {
 		req.TrustDetection = false
+	}
+	// CRS 载荷校验必须位于类型归一**之后**（与 Update 同口径）：显式阶段
+	// 类型的归零矩阵会把阶段外 CRS 字段改写为 "[]"，先校验会拿本应被丢弃的
+	// 载荷报 400（旧实现顺序相反，同一输入 POST 400 / PUT 200）。
+	for _, f := range []struct {
+		name string
+		val  *string
+	}{
+		{"crs_rule_groups", &req.CRSRuleGroups},
+		{"crs_excluded_rules", &req.CRSExcludedRules},
+	} {
+		if err := validateAndNormalizeCRSField(f.name, f.val, true); err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
 	}
 	if err := validatePolicyCrawlerExemption(req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines, req.GeoIPMode); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -1641,6 +1644,15 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略描述不能超过 500 字符"})
 		return
 	}
+	// 显式空串按 Create 口径归一为 "[]"，保持列形状一致，避免库内 "" 与
+	// "[]" 并存。**必须先归一后校验**（与 Create 同序）：空白串/空串先被
+	// 归一为 "[]" 才能通过 CIDR 与 CRS 形状校验，旧顺序让同一输入 POST 200 /
+	// PUT 400。GeoIPCountries 同口径。
+	for _, val := range []**string{&req.IPACLList, &req.IPWhitelist, &req.IPBlacklist, &req.IPACLListRefs, &req.IPWhitelistRefs, &req.GeoIPCountries} {
+		if *val != nil {
+			normalizeEmptyJSONList(*val)
+		}
+	}
 	for _, f := range []struct {
 		name string
 		val  *string
@@ -1654,15 +1666,6 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 				return
 			}
-		}
-	}
-	// 显式空串按 Create 口径归一为 "[]"，保持列形状一致，避免库内 "" 与 "[]"
-	// 并存（Create 在 :411-419 归一，custom_rules 在下方同口径归一）。
-	// GeoIPCountries 补入归一(与 Create 口径一致,此前唯独缺席
-	// 使显式空串 400 而 Create 归一)。
-	for _, val := range []**string{&req.IPACLList, &req.IPWhitelist, &req.IPBlacklist, &req.IPACLListRefs, &req.IPWhitelistRefs, &req.GeoIPCountries} {
-		if *val != nil {
-			normalizeEmptyJSONList(*val)
 		}
 	}
 	// 显式空串会把枚举列清空：mode 为 "" 时汇总口径（mode!="off" 即计入 WAF）
@@ -5541,6 +5544,11 @@ func resolveCreatePolicyType(req *models.CreateSecurityPolicyRequest) (string, e
 		if policyType == models.PolicyTypeMixed {
 			return "", fmt.Errorf("策略内容跨多个阶段，请显式按阶段类型（信任名单/IP 访问控制/限流/WAF）分别创建")
 		}
+		// 缺省类型推断路径与显式类型路径同口径归一拦截状态码：无页策略的
+		// deny 恒 403、stage2 限流恒 429，落库非零值会让详情/列表宣称一个
+		// 不生效的状态码（旧实现只对显式类型调用归一，API/MCP 省略
+		// policy_type 即可落 404）。
+		req.BlockStatusCode = normalizeBlockStatusCode(req.BlockStatusCode, policyType, req.BlockPageID)
 		return policyType, nil
 	case models.PolicyTypeStage0, models.PolicyTypeStage1, models.PolicyTypeStage2, models.PolicyTypeStage3:
 		// 创建路径的显式类型 = 「按该阶段类型落库」的全量归一契约（编辑器提交

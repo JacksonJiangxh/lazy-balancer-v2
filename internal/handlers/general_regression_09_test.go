@@ -120,7 +120,7 @@ func TestValidateV2BackupCertJobs_rejects_uncanonicalizable_domains(t *testing.T
 	}
 }
 
-// （校验门函数级）：acme_dns 分支对启用行强制 ValidateACMEDomains
+// （校验门函数级）：acme_dns 分支对启用行强制 ValidateACMEDomainsForIssuance
 // （与保存/启用侧同口径）——双非 root+www 域名与三域集拒绝并点名规则；
 // 合法 root+www（含用户输入顺序变体）放行。
 func TestValidateV2BackupTLSShape_acme_domain_legality(t *testing.T) {
@@ -177,6 +177,36 @@ func TestValidateV2Backup_accepts_legal_root_www_acme_shape(t *testing.T) {
 	}
 	if _, err := validateV2BackupCertJobs(tables); err != nil {
 		t.Fatalf("validateV2BackupCertJobs unexpected error: %v", err)
+	}
+}
+
+// 导入的 cert_jobs.domain 必须落成排序规范串：消费面（任务 upsert 的冲突键与
+// 精确回查、HasCertJob、签发冷却查询）按规范串精确匹配，非规范串原样落库会让
+// 同规则同域集并存两行——两行都被判为适用，可同时入队（同一域名两次 CA 订单）。
+func TestImportConfigBackup_canonicalizesCertJobDomain(t *testing.T) {
+	// Given：备份携带大写/空白/顺序变体的任务域名（手改备份或旧工具产出）
+	h := newBackupTestHandlers(t)
+	rule := backupACMERuleShared(7)
+	rule["domain"] = "www.bak-acme.example.test,bak-acme.example.test"
+	backup := completeBackupJSON(t, map[string][]map[string]any{
+		"lb_rules":            {rule},
+		"certificate_configs": {{"id": 7, "name": "dns", "dns_provider": "dnspod", "dns_credentials": "", "enabled": 1}},
+		"cert_jobs":           {{"rule_id": "lb_bak_acme", "domain": " WWW.Bak-Acme.Example.Test , bak-acme.example.test ", "status": "queued"}},
+	})
+
+	// When
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
+
+	// Then：落库值为排序规范串
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var domain string
+	if err := db.DB.QueryRow(`SELECT domain FROM cert_jobs WHERE rule_id='lb_bak_acme'`).Scan(&domain); err != nil {
+		t.Fatalf("read imported cert job: %v", err)
+	}
+	if want := "bak-acme.example.test,www.bak-acme.example.test"; domain != want {
+		t.Fatalf("cert_jobs.domain=%q, want %q（导入必须落规范串，否则精确匹配的消费面无法命中）", domain, want)
 	}
 }
 

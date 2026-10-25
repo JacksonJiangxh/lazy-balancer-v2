@@ -234,7 +234,9 @@ test('MFA 绑定向导：6 位门、在途禁关、恢复码关闭确认', () =>
   const wizard = code('src/components/MfaBindingWizard.vue')
   assert.match(wizard, /:disabled="code\.length !== 6"/)
   assert.match(wizard, /if \(code\.value\.length !== 6 \|\| loading\.value\) return/)
-  assert.match(wizard, /if \(loading\.value\) return/, '在途提交期间禁止关闭')
+  // 在途禁关与恢复码步确认收敛进一次性凭据守卫单源（utils/oneTimeSecretGuard）
+  assert.match(wizard, /blocked: \(\) => loading\.value/, '在途提交期间禁止关闭')
+  assert.match(wizard, /skip: \(\) => step\.value !== 2/, '未到恢复码步（无秘密可丢）直接关闭')
   assert.match(wizard, /恢复代码仅此一次显示/, '恢复码步关闭必须确认已保存')
   assert.match(wizard, /:before-close="beforeClose"/)
 })

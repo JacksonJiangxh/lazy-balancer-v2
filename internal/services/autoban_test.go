@@ -1758,6 +1758,45 @@ func TestAutobanDisableFlush_evictedIPBucketCleared(t *testing.T) {
 	}
 }
 
+// 启用→达标→禁用→隔窗→启用：禁用必须把陈旧计数证据作废（清空计数桶），
+// 否则停用任意时长后重新启用会在零新流量下以旧计数立即封禁，且封禁起点
+// 从「此刻」重算——共享 NAT/已重新分配的 IP 会被长期封死。
+func TestSetAutobanConfig_disableClearsStaleCounters(t *testing.T) {
+	clock := installAutobanFixture(t, "2026-10-14 10:00:00")
+	cfg := AutobanConfig{Enabled: true, Threshold: 3, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false}
+	if err := SetAutobanConfig(cfg); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	for range 3 {
+		autobanObserveEvent("203.0.113.77", "blocked", "942100")
+	}
+	if got := autobanReachedCount(); got != 1 {
+		t.Fatalf("前置：达标 IP 数=%d, want 1", got)
+	}
+
+	// 禁用（生产写侧入口）。
+	cfg.Enabled = false
+	if err := SetAutobanConfig(cfg); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if got := autobanTrackedCount(); got != 0 {
+		t.Fatalf("禁用后计数桶=%d, want 0（陈旧计数必须作废）", got)
+	}
+
+	// 停用期跨越统计窗口的任意倍数（此处 1 小时 = 12 个窗口）。
+	clock.Advance(time.Hour)
+	cfg.Enabled = true
+	if err := SetAutobanConfig(cfg); err != nil {
+		t.Fatalf("re-enable: %v", err)
+	}
+	if got := autobanTrackedCount(); got != 0 {
+		t.Fatalf("重新启用后计数桶=%d, want 0", got)
+	}
+	if cand := autobanCandidates(cfg.Threshold, time.Duration(cfg.WindowMinutes)*time.Minute); len(cand) != 0 {
+		t.Fatalf("重新启用零新流量候选=%v, want 空（不得以陈旧计数封禁）", cand)
+	}
+}
+
 func TestAutobanDisableFlush_mergeFailureIsVisible(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, false, 1, 5, "1h", "all", false)
@@ -2152,5 +2191,49 @@ func TestAutobanAuditBanned_capsPerRoundRows(t *testing.T) {
 	}
 	if perIP != 2 || summaries != 1 {
 		t.Fatalf("逐 IP 行=%d 汇总行=%d, want 2/1（上限门失效或汇总缺失）", perIP, summaries)
+	}
+}
+
+// 批量到期解封的审计必须按行预算分片：旧实现把整批 IP 拼进一行，超过 4KiB
+// 净化上限后后半名单被截断静默丢失（与逐 IP 封禁审计的可追溯性不对称）。
+func TestAutobanAuditExpiredUnban_chunksWithinDetailBudget(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	const total = 120
+	ips := make([]string, 0, total)
+	for i := range total {
+		ips = append(ips, fmt.Sprintf("10.%d.%d.%d", i/256, i%256, i%7+1))
+	}
+	autobanAuditExpiredUnban(ips, nil)
+
+	rows, err := db.AuditDB.Query(`SELECT detail FROM audit_log WHERE action='自动解封' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got int
+	joined := strings.Builder{}
+	for rows.Next() {
+		var detail string
+		if err := rows.Scan(&detail); err != nil {
+			t.Fatal(err)
+		}
+		got++
+		if len(detail) >= 4096 {
+			t.Fatalf("审计行 %d 字节 ≥ 4KiB 净化上限（会被截断）: %s", len(detail), detail)
+		}
+		joined.WriteString(detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := (total + autobanUnbanAuditPerLine - 1) / autobanUnbanAuditPerLine
+	if got != want {
+		t.Fatalf("审计行数=%d, want %d（每行 ≤%d 个 IP）", got, want, autobanUnbanAuditPerLine)
+	}
+	all := joined.String()
+	for _, ip := range ips {
+		if !strings.Contains(all, ip) {
+			t.Fatalf("审计未覆盖 IP %s（分片丢条目）", ip)
+		}
 	}
 }

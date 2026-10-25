@@ -227,7 +227,7 @@ func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() 
 	// 吞掉 ErrNoRows 而永久卡死；放宽后重试循环才能推进（成功→issued，反复失败→failed）。
 	if err := db.DB.QueryRowContext(ctx, `SELECT rule_id, COALESCE(cert_pem,''), COALESCE(key_pem,''), expires_at,
 		COALESCE(ca_provider_id,0), COALESCE(deployment_attempts,0)
-		FROM cert_jobs WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, jobID).Scan(
+		FROM cert_jobs WHERE id=? AND status IN (`+DeploymentLifecycleJobStatusSQL+`)`, jobID).Scan(
 		&material.ruleID, &material.certPEM, &material.keyPEM, &expiresAt,
 		&material.providerID, &material.deploymentAttempt,
 	); err != nil {
@@ -1099,22 +1099,13 @@ func extractRetryAfterFromError(errText string) time.Duration {
 	return 0
 }
 
-// ValidateACMEDomains returns an error if the domains string is not a valid
-// ACME certificate request (single domain or root+www).
-func ValidateACMEDomains(domains string) error {
-	if normalizeAndValidateDomains(domains) == nil {
-		return fmt.Errorf("ACME证书仅支持单域名或根域+www二级域名: %s", domains)
-	}
-	return nil
-}
-
 // ValidateACMEDomainsForIssuance 是保存/启用/导入侧的签发域名校验：结构校验
 // 之上叠加公共 CA 的字符集要求（RFC 1035 LDH、≥2 标签）。缺这道门时
 // `foo_bar.example.com`、`localhost`、非 ASCII 域能保存、能启用、能入队，
 // 直到签发执行期（Issue 的纵深门）才失败，并消耗 5 次自动重试才停。
 //
-// 与 ValidateACMEDomains 的分工：结构层继续服务任务/规则域比较
-// （CanonicalACMEDomains / certJobRuleApplicable）——历史行可能含下划线，
+// 与结构层（normalizeAndValidateDomains）的分工：结构层继续服务任务/规则域
+// 比较（CanonicalACMEDomains / certJobRuleApplicable）——历史行可能含下划线，
 // 比较层拒绝会让这些行被误判「规则不适用」而遭退役/断链。本函数只用于
 // 写入口，不参与比较。
 func ValidateACMEDomainsForIssuance(domains string) error {

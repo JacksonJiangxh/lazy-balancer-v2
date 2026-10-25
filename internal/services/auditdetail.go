@@ -87,6 +87,9 @@ var auditResultTextMap = map[string]string{
 //     否则审计详情渲染成英文内部标识（blocked、conflict 两次前车之鉴）；
 //   - handlers 侧 auditFailure 闭包的字面量实参另由 AST 扫描兜底
 //     （TestAuditResultText_auditFailureLiteralsRegistered），新增码未登记即红；
+//   - 「result := "..." 后把变量传给 auditFailure/AuditResultPart」的赋值链路
+//     由 TestAuditResultText_dynamicAssignmentsRegistered 收集（字面量扫描与
+//     auditFailure 扫描的双盲区，query_failed 曾因此漏登记），未登记即红；
 //   - 守护测试直接遍历本清单，不再在测试里手写第二份清单（手写清单曾漏
 //     conflict，映射表与测试同步漂移）。
 var auditDynamicResultCodes = []string{
@@ -100,11 +103,13 @@ var auditDynamicResultCodes = []string{
 	"database_error", "invalid_ticket", "invalid_signature", "expired", "replay", "user_unavailable",
 	// handlers/certjobs.go 证书任务重试/删除失败出口（retryCertJobByID 的
 	// auditFailure/auditFailureWithRule 与 DeleteCertJob 的 auditFailure 均以
-	// 动态实参进入 AuditResultPart）
+	// 动态实参进入 AuditResultPart）。query_failed 是 DeleteCertJob 查询失败
+	// 分支的变量赋值取值（result := "query_failed"）——字面量扫描与
+	// auditFailure 字面量扫描都看不见，由动态赋值链路用例兜底。
 	"job_not_found", "cooldown", "permanent", "ca_cooldown", "deployment_retry_failed",
 	"queue_unavailable", "enqueue_failed", "status_read_failed", "state_changed",
 	"in_flight", "not_retryable", "rule_state_read_failed", "guarded_active_rule",
-	"disable_failed", "disable_verify_failed", "delete_failed",
+	"disable_failed", "disable_verify_failed", "delete_failed", "query_failed",
 }
 
 func AuditResultText(result string) string {

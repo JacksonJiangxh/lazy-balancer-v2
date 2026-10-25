@@ -364,6 +364,7 @@ import { useAuthStore } from '@/stores/auth'
 import { formatDate, formatDateShort } from '@/utils/date'
 import { serializeWhitelist } from '@/utils/apiKeyWhitelist'
 import { copyText } from '@/utils/copy'
+import { createOneTimeSecretCloseGuard } from '@/utils/oneTimeSecretGuard'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { CircleCheckFilled, Connection, CopyDocument, Delete, Document, Key, Plus, Setting, SetUp, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
 import type { APIKey, APIResponse, CreateAPIKeyInput, MCPToolSpec, UpdateAPIKeyInput } from '@/types'
@@ -404,14 +405,12 @@ const deletingIds = ref(new Set<number>())
 const createdKey = ref('')
 const createdKeyVisible = ref(false)
 /** 明文密钥仅此一次下发（库内只存哈希）：ESC / 右上角 X 关闭前必须确认已保存，
- *  否则误触即永久丢失、只能删除重建（与 MfaBindingWizard 恢复码步同范式）。 */
-const closeCreatedKey = (done: () => void): void => {
-  ElMessageBox.confirm('密钥仅此一次显示，关闭后将无法再次查看。确认已保存？', '保存密钥', {
-    type: 'warning',
-    confirmButtonText: '我已保存',
-    cancelButtonText: '继续查看',
-  }).then(() => done()).catch(() => undefined)
-}
+ *  否则误触即永久丢失、只能删除重建（一次性凭据守卫单源——与集群注册令牌、
+ *  MFA 恢复码同实现）。 */
+const closeCreatedKey = createOneTimeSecretCloseGuard({
+  message: '密钥仅此一次显示，关闭后将无法再次查看。确认已保存？',
+  title: '保存密钥',
+})
 const mcpDocsVisible = ref(false)
 const mcpTools = ref<readonly MCPToolSpec[]>([])
 const mcpToolsLoading = ref(false)
@@ -543,12 +542,18 @@ async function createKey() {
       expires_at: createForm.value.expiresAt ? createForm.value.expiresAt.toISOString() : undefined,
     }
     const res = await request.post<CreateAPIKeyResponse>('/users/me/api-keys', payload)
-    mfaAwareSuccess('密钥创建成功')
-    createDialogVisible.value = false
-    if (res.data?.key) {
-      createdKey.value = res.data.key
-      createdKeyVisible.value = true
+    // 一次性明文是本次创建的唯一产出：响应缺 key（契约漂移/网关改写）时不得
+    // 先报成功再关框——密钥已入库（列表会多一条），明文却永久不可得，用户只能
+    // 删除重建。缺 key 即显性报错、保持创建框并刷新列表，把违约形态摆到眼前。
+    if (!res.data?.key) {
+      ElMessage.error('响应异常：密钥未返回，请在列表中删除该条目后重建')
+      await fetchKeys()
+      return
     }
+    mfaAwareSuccess('密钥创建成功')
+    createdKey.value = res.data.key
+    createdKeyVisible.value = true
+    createDialogVisible.value = false
     await fetchKeys()
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor.

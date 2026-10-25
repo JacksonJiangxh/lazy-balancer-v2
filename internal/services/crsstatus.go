@@ -153,6 +153,11 @@ func (m *CRSUpdateManager) rescanRuleCount() {
 			Logf("error", "%s", msg)
 		}
 		m.mu.Lock()
+		// 失败必须清掉正解标记：RuleCount 先判 hasRuleCount、后判
+		// retryAfter——只设负缓存会让旧 rule_count 永久滞留（更新成功后重扫
+		// 遇瞬时 IO 失败 → UI 一直显示更新前的规则数，负缓存重试路径失效）。
+		m.hasRuleCount = false
+		m.ruleCount = -1
 		m.ruleCountRetryAfter = time.Now().Add(crsRuleCountFailureRetry)
 		m.mu.Unlock()
 		return

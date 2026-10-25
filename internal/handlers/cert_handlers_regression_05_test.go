@@ -128,7 +128,7 @@ func TestCertificateConfigNameValidation(t *testing.T) {
 func TestUpdateCAProviderAuditUsesClampedValues(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	if _, err := db.DB.Exec(`UPDATE ca_providers SET max_concurrent=1, min_interval_ms=1000 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE ca_providers SET max_concurrent=1, min_interval_ms=2000 WHERE id=1`); err != nil {
 		t.Fatalf("seed CA provider: %v", err)
 	}
 	router := gin.New()
@@ -145,8 +145,8 @@ func TestUpdateCAProviderAuditUsesClampedValues(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT max_concurrent, min_interval_ms FROM ca_providers WHERE id=1`).Scan(&maxConcurrent, &minInterval); err != nil {
 		t.Fatalf("read CA provider: %v", err)
 	}
-	if maxConcurrent != 1 || minInterval != 1000 {
-		t.Fatalf("stored max_concurrent=%d min_interval_ms=%d, want 1/1000", maxConcurrent, minInterval)
+	if maxConcurrent != 1 || minInterval != 2000 {
+		t.Fatalf("stored max_concurrent=%d min_interval_ms=%d, want 1/2000", maxConcurrent, minInterval)
 	}
 	var detail string
 	if err := db.AuditDB.QueryRow(`SELECT COALESCE(detail,'') FROM audit_log WHERE action='更新' AND resource='CA提供商' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {

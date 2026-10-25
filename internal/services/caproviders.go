@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,12 +26,17 @@ const (
 	// Official directory URLs. These are fixed and not user-editable.
 	LetsEncryptDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 	ZeroSSLDirectoryURL     = "https://acme.zerossl.com/v2/DV90"
-	// caProviderColumns 的可空列统一 COALESCE（带外 NULL 不得让整表扫描/解析
-	// 500）：max_concurrent/min_interval_ms 取 DDL 默认值；enabled 取 0 而非
-	// DDL 默认 1——所有取用门都是 `WHERE enabled=1`，SQL 三值逻辑下 NULL 本就
-	// 不会命中，读成「启用」会让列表显示与队列准入自相矛盾（fail-closed 口径）。
-	caProviderColumns = "id, name, provider, directory_url, COALESCE(credentials,''), COALESCE(max_concurrent,1), COALESCE(min_interval_ms,2000), COALESCE(enabled,0), created_at, updated_at"
 )
+
+// caProviderColumns 的可空列统一 COALESCE（带外 NULL 不得让整表扫描/解析
+// 500）：max_concurrent/min_interval_ms 的兜底值由 db 治理常量派生（与 fresh
+// DDL DEFAULT 双向钉死）；enabled 取 0 而非 DDL 默认 1——所有取用门都是
+// `WHERE enabled=1`，SQL 三值逻辑下 NULL 本就不会命中，读成「启用」会让列表
+// 显示与队列准入自相矛盾（fail-closed 口径）。非编译期常量：默认值必须来自
+// 治理常量而非第二份字面量。
+var caProviderColumns = "id, name, provider, directory_url, COALESCE(credentials,''), COALESCE(max_concurrent," +
+	strconv.Itoa(db.DefaultCAProviderMaxConcurrent) + "), COALESCE(min_interval_ms," +
+	strconv.Itoa(db.DefaultCAProviderMinIntervalMS) + "), COALESCE(enabled,0), created_at, updated_at"
 
 // CredentialsSemanticallyEqual 报告两段凭证 JSON 语义相等（键序/空白无关）：
 // 解析后按规范化形态比较。
@@ -61,21 +67,22 @@ type caProviderScanner interface {
 }
 
 // NormalizeCAProviderMaxConcurrent 是「最大并发」钳制的单源实现：<=0 视为
-// 默认 1（保留「0 即默认」的 API 兼容语义）。落库与审计比对必须共用它——
-// handler 按请求原值比对会把「提交 0、库值 1、落库仍 1」记成一次变更（审计
-// 假阳性）。
+// 默认 DefaultCAProviderMaxConcurrent（保留「0 即默认」的 API 兼容语义）。
+// 落库与审计比对必须共用它——handler 按请求原值比对会把「提交 0、库值 1、
+// 落库仍 1」记成一次变更（审计假阳性）。
 func NormalizeCAProviderMaxConcurrent(value int) int {
 	if value <= 0 {
-		return 1
+		return db.DefaultCAProviderMaxConcurrent
 	}
 	return value
 }
 
 // NormalizeCAProviderMinIntervalMS 同 NormalizeCAProviderMaxConcurrent：
-// <=0 视为默认 1000ms。
+// <=0 视为默认 DefaultCAProviderMinIntervalMS——该默认值与 fresh DDL DEFAULT、
+// 读侧 COALESCE、导入回填同一常量，不得出现第二套节流数字。
 func NormalizeCAProviderMinIntervalMS(value int) int {
 	if value <= 0 {
-		return 1000
+		return db.DefaultCAProviderMinIntervalMS
 	}
 	return value
 }
@@ -172,8 +179,16 @@ var ErrCAProviderInvalidCredentials = errors.New("credentials must be valid JSON
 // ErrCAProviderLetsEncryptCredentialsNotEmpty is returned when letsencrypt credentials are provided.
 var ErrCAProviderLetsEncryptCredentialsNotEmpty = errors.New("letsencrypt credentials must be empty")
 
+// ErrCAProviderMaxConcurrentTooLow is returned when max_concurrent is negative
+// (0 = 「未设置/默认」，写侧与读侧统一归一为 DefaultCAProviderMaxConcurrent).
+var ErrCAProviderMaxConcurrentTooLow = errors.New("max_concurrent must be >= 0")
+
 // ErrCAProviderMaxConcurrentTooHigh is returned when max_concurrent exceeds the allowed upper bound.
 var ErrCAProviderMaxConcurrentTooHigh = errors.New("max_concurrent must be <= 100")
+
+// ErrCAProviderMinIntervalTooLow is returned when min_interval_ms is negative
+// (0 = 「未设置/默认」，归一为 DefaultCAProviderMinIntervalMS).
+var ErrCAProviderMinIntervalTooLow = errors.New("min_interval_ms must be >= 0")
 
 // ErrCAProviderMinIntervalTooHigh is returned when min_interval_ms exceeds the allowed upper bound.
 var ErrCAProviderMinIntervalTooHigh = errors.New("min_interval_ms must be <= 60000")

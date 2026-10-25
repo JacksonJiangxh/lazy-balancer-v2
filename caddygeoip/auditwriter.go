@@ -74,6 +74,10 @@ const auditWriterName = "lbfile"
 // 格式化链中保留的原始体字节数（两侧同一硬上限——coraza 默认
 // SecResponseBodyLimit=512KiB，响应侧不设限会让 2048 深队列放大到 ~1GiB）。
 // 截断只影响审计展示，不影响 WAF 已完成的规则评估。
+//
+// 该上限是**原始字节**口径，而单条/队列字节估算走 JSON 转义口径
+// （jsonStringEscapedLen，`<`/`>`/`&` 计 6 字节）：auditItemMaxBytes 已按
+// 6× 最坏比推导，保证 64KiB 转义密集体不会被整行丢弃。
 const auditBodyMaxBytes = 64 * 1024
 
 func init() {
@@ -92,14 +96,23 @@ var (
 	// 64KiB 硬限。打满后入队有界等待，超时丢弃并计数告警。
 	auditQueueSize = 2048
 	// auditQueueByteBudget 队列驻留字节总预算：条数上限不界字节——单条快照
-	// 最坏 ≈256KiB（请求体/响应体/请求头/响应头各 64KiB 硬限）+messages，
-	// 2048 深度下大 body/大 header 洪峰可驻留 ~512MiB 撞容器内存上限。
+	// 最坏 ≈1MiB（见 auditItemMaxBytes：四段 64KiB 原始内容按 6× 转义最坏比
+	// 展开）+messages，2048 深度下大 body/大 header 洪峰若不按字节收敛会撞
+	// 容器内存上限（64MiB 预算下最坏形态驻留 ≤64 条）。
 	// 按字节收敛后驻留有界；超预算立即丢弃（走既有 reportDropped 计数/
 	// 节流告警/健康位联动），请求路径不再为超预算快照付 2s 入队等待。
 	auditQueueByteBudget = int64(64 << 20)
-	// auditItemMaxBytes 单条快照字节硬上限（四个 64KiB 截断段 + messages/
-	// 元数据余量）：超限条目直接丢弃计数——异常巨型快照不得独占队列预算。
-	auditItemMaxBytes = int64(320 * 1024)
+	// auditItemMaxBytes 单条快照字节硬上限：**按转义最坏比推导**，不是原始
+	// 字节相加。估算/执法口径是 JSON 转义后字节（jsonStringEscapedLen 对
+	// `<`/`>`/`&` 与控制字符计 6 字节），而体段按 64KiB 原始字节截断
+	// （snapshotAuditBody）——两口径必须对齐，否则 64KiB 全 `&`/`<` 的合法体
+	// 展开为 384KiB，仅请求体一项就超过「四段原始字节 + 余量」的旧上限
+	// （320KiB），整条安全事件被丢弃（客户端可控的字符分布即可让自身事件
+	// 不留库）。
+	// 上界 = 6×请求体 + 6×响应体 + 请求头 + 响应头（后两者已在快照侧按转义
+	// 字节截断到各 64KiB）+ messages（转义字节 32KiB）+ 96KiB 余量（事务
+	// 字符串/文件条目/messages 固定开销）。取 1MiB。
+	auditItemMaxBytes = int64(1024 * 1024)
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
 	// 兜底（低流量下 bufio 滞留行不超周期）。
 	auditFlushThreshold = 32 * 1024
@@ -250,10 +263,13 @@ func auditTimingRecord(id, segment string, us int64) {
 	// 包级生命周期）——停流后过期条目也由周期清扫回收，不再仅依赖建条驱动。
 	startAuditTimingSweeperForTest()
 	e.mu.Lock()
+	// 分段键用同包常量（timingSegmentPre/End）而非字面量：生产调用点传常量，
+	// 此处若写死字面量，改常量值或新增第三段时会静默不命中（分段丢失且无
+	// 日志）。未知分段显式跳过——耗时是增强信息，不为它引入请求路径错误。
 	switch segment {
-	case "pre":
+	case timingSegmentPre:
 		e.preUs, e.preSet = us, true
-	case "end":
+	case timingSegmentEnd:
 		e.endUs, e.endSet = us, true
 	}
 	e.mu.Unlock()

@@ -9,7 +9,7 @@
 // - 新会话先登记 requestedSession 再复用旧请求；旧请求若因此失效，settled 后
 //   链式补取最新会话（不得让调用方空等且永不 loaded）；
 // - 旧会话的返回/异常一律丢弃（不 apply、不清 loading），由最新会话收尾。
-export interface SessionSingleFlight {
+interface SessionSingleFlight {
   readonly ensure: (session: number) => Promise<void>
   readonly loadedSession: () => number | null
   /** 诊断/测试用：生产代码零消费（用于验证「新会话已登记」的单飞语义）。 */

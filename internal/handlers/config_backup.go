@@ -467,7 +467,8 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"mcp_ip_whitelist": "", "created_at": "1970-01-01 00:00:00",
 	},
 	"ca_providers": {
-		"credentials": "", "max_concurrent": int64(1), "min_interval_ms": int64(2000), "enabled": int64(1),
+		"credentials": "", "max_concurrent": int64(db.DefaultCAProviderMaxConcurrent),
+		"min_interval_ms": int64(db.DefaultCAProviderMinIntervalMS), "enabled": int64(1),
 		"created_at": "1970-01-01 00:00:00", "updated_at": "1970-01-01 00:00:00",
 	},
 	"certificate_configs": {
@@ -973,6 +974,10 @@ func sanitizeNodeRowsForExport(rows []map[string]any) {
 		} {
 			delete(row, key)
 		}
+		// mode 唯一的运行期写入（注册路径）恒为 slave，巡检也按 slave 过滤；
+		// 旧版本遗留/带外直改的其它取值原样入包会让当前版本的导入行级门
+		// 拒绝该备份（实例无法还原自己的备份），故导出即归一。
+		row["mode"] = "slave"
 		if hash, _ := row["cluster_token_hash"].(string); hash != "" {
 			row["cluster_token_delivered"] = 1
 		}
@@ -2031,12 +2036,29 @@ func validateV2BackupRows(ctx context.Context, database *sql.DB, backup configBa
 			}
 		}
 		for _, limit := range []struct {
-			key     string
-			max     int
-			tooHigh error
+			key       string
+			min       int
+			max       int
+			tooLow    error
+			tooHigh   error
+			normalize func(int) int
 		}{
-			{key: "max_concurrent", max: 100, tooHigh: services.ErrCAProviderMaxConcurrentTooHigh},
-			{key: "min_interval_ms", max: 60000, tooHigh: services.ErrCAProviderMinIntervalTooHigh},
+			{
+				key: "max_concurrent", min: 0, max: 100,
+				tooLow:  services.ErrCAProviderMaxConcurrentTooLow,
+				tooHigh: services.ErrCAProviderMaxConcurrentTooHigh,
+				// 与写侧 UpdateCAProvider 同一归一：0=「未设置」→默认值。
+				normalize: services.NormalizeCAProviderMaxConcurrent,
+			},
+			{
+				key: "min_interval_ms", min: 0, max: 60000,
+				tooLow:  services.ErrCAProviderMinIntervalTooLow,
+				tooHigh: services.ErrCAProviderMinIntervalTooHigh,
+				// 默认值单源在 db.DefaultCAProviderMinIntervalMS：导入原样落库 0
+				// 会让列表/集群快照显示 0，而队列闸门按默认值执行（同一行两种
+				// 口径）。负值属备份垃圾，显性拒绝而非静默归一。
+				normalize: services.NormalizeCAProviderMinIntervalMS,
+			},
 		} {
 			raw, exists := provider[limit.key]
 			if !exists || raw == nil {
@@ -2046,9 +2068,13 @@ func validateV2BackupRows(ctx context.Context, database *sql.DB, backup configBa
 			if !ok {
 				return fmt.Errorf("备份的 ca_providers.%s 必须为整数", limit.key)
 			}
+			if value < limit.min {
+				return fmt.Errorf("备份的 ca_providers.%s 低于下限: %w", limit.key, limit.tooLow)
+			}
 			if value > limit.max {
 				return fmt.Errorf("备份的 ca_providers.%s 超出上限: %w", limit.key, limit.tooHigh)
 			}
+			provider[limit.key] = int64(limit.normalize(value))
 		}
 	}
 	for _, certCfg := range backup.Tables["certificate_configs"] {
@@ -2457,7 +2483,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		// （用户裁决：系统不支持通配符域名）：创建/更新（rules.go CanonicalDomains）、
 		// 启用/复制（:2136/:2327 同门）、v1 导入（isValidDomain 拒绝 '*'）均拒绝通配与非法
 		// 形态，v2 导入是最后一个能把它带入运行库的门（此前仅 acme_dns 行有
-		// ValidateACMEDomains 门，manual/无 TLS 行的域名原样落库）。与保存侧 :609/:613
+		// ValidateACMEDomainsForIssuance 门，manual/无 TLS 行的域名原样落库）。与保存侧 :609/:613
 		// 同口径——http 规则域名必须非空且可规范化（idna 拒绝 '*'、IP 形态、超长段），
 		// 否则整包 400：通配域名进入 lb_rules 后安全事件归属映射对该规则整体跳过
 		// （db.CanonicalDomains 报错即 continue），Enable/Update 又被同门卡死成
@@ -2668,7 +2694,7 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 		if tlsSource == "acme_dns" {
 			// 导入侧补 ACME 域名合法性门（与保存侧 rules.go / 启用侧
 			// createOrRequeueCertJob 同口径，单域名或根域+www）——此前导入链无任何
-			// ValidateACMEDomains 等价校验，手造备份可带入 "a.com,b.org" 形态，
+			// ValidateACMEDomainsForIssuance 等价校验，手造备份可带入 "a.com,b.org" 形态，
 			// 运行期 certJobRuleApplicable 严格规范化失败 → 续签永久断链且
 			// TLS 端口明文服务。
 			if err := services.ValidateACMEDomainsForIssuance(backupString(rule["domain"])); err != nil {
@@ -3010,9 +3036,11 @@ func validateImportedSystemIPLists(rows []map[string]any) error {
 }
 
 // validateBackupIPListQuota 以导入后最终状态校验名单配额：200 是用户可管理
-// 名单额度（与 ipListMaxGlobalCount 一致），服务端系统名单在提交后由
-// SeedSystemIPLists 自动补齐，不应占用用户额度；最终总行数再以
-// 「200 + 固定系统种子数」封顶，防止备份注入任意数量的 system 行绕过资源门。
+// 名单额度（与 ipListMaxGlobalCount 一致），服务端系统名单在提交后自动补齐
+// （威胁三源/自动封禁经 db.SeedSystemIPLists；爬虫四源经
+// services.RestoreCrawlerIPListSnapshot 逐引擎补种），不应占用用户额度；最终
+// 总行数再以「200 + 固定系统种子数」封顶，防止备份注入任意数量的 system 行
+// 绕过资源门。
 func validateBackupIPListQuota(rows []map[string]any) error {
 	systemNames := backupSystemIPListNames()
 	presentSystem := make(map[string]bool, len(systemNames))
@@ -4011,7 +4039,9 @@ func revalidateImportLiveDependencies(ctx context.Context, tx *sql.Tx, backup *c
 	// 视图重验，命中即 400 点名表/行/规则 ID（与初检同口径）。判据必须是
 	// 「备份是否携带 lb_rules」（缺席=live 保留），分类选择集合恒含 lb_rules。
 	_, rulesCarried := backup.Tables["lb_rules"]
-	if !rulesCarried && (len(backup.Tables["upstreams"]) > 0 || len(backup.Tables["path_rules"]) > 0) {
+	_, policiesCarried := backup.Tables["security_policies"]
+	bindingRows := backup.Tables["security_policy_bindings"]
+	if !rulesCarried && (len(backup.Tables["upstreams"]) > 0 || len(backup.Tables["path_rules"]) > 0 || len(bindingRows) > 0) {
 		liveRuleIDs := make(map[string]struct{})
 		rows, err := tx.QueryContext(ctx, `SELECT caddy_id FROM lb_rules`)
 		if err != nil {
@@ -4036,6 +4066,47 @@ func revalidateImportLiveDependencies(ctx context.Context, tx *sql.Tx, backup *c
 				if _, exists := liveRuleIDs[ruleID]; !exists {
 					return fmt.Errorf("%s 第 %d 行引用了不存在的规则 %q（导入期间规则已被删除）", table, i+1, ruleID)
 				}
+			}
+		}
+		// 绑定表的规则轴：初检按「规则表缺席则 live 视图」放行，窗口内规则被
+		// 删除会让绑定原样落库（该表无外键，无 FK 兜底），规则消失后绑定成为
+		// 悬挂行；按事务视图重验，口径与初检一致。
+		for i, row := range bindingRows {
+			ruleID, _ := row["rule_caddy_id"].(string)
+			if _, exists := liveRuleIDs[ruleID]; !exists {
+				return fmt.Errorf("security_policy_bindings 第 %d 行引用了不存在的规则 %q（导入期间规则已被删除）", i+1, ruleID)
+			}
+		}
+	}
+	// 绑定表的策略轴：初检在策略表缺席时按 live 策略视图放行；窗口内删除被
+	// 引用策略会让绑定落库而 loadSecurityPolicyContext 查不到策略——该规则
+	// WAF/限流/GeoIP 全部静默失效（UI 仍显示已绑定）。锁内按事务视图重验。
+	if len(bindingRows) > 0 && !policiesCarried {
+		livePolicyIDs := make(map[int64]struct{})
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM security_policies`)
+		if err != nil {
+			return fmt.Errorf("锁内读取安全策略引用视图失败: %v", err)
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("锁内读取安全策略引用视图失败: %v", err)
+			}
+			livePolicyIDs[id] = struct{}{}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return fmt.Errorf("锁内读取安全策略引用视图失败: %v", err)
+		}
+		for i, row := range bindingRows {
+			policyID, ok := backupInteger(row["policy_id"])
+			if !ok {
+				return fmt.Errorf("security_policy_bindings 第 %d 行 policy_id 必须为整数", i+1)
+			}
+			if _, exists := livePolicyIDs[int64(policyID)]; !exists {
+				return fmt.Errorf("security_policy_bindings 第 %d 行引用了不存在的安全策略 %d（导入期间策略已被删除）", i+1, policyID)
 			}
 		}
 	}
@@ -5548,6 +5619,19 @@ func failImportTx(c *gin.Context, session *configImportSession, action, detail s
 	return err
 }
 
+// rowsAffectedOrUnknown 读取执行结果的受影响行数：错误时留痕并按「未知」返回
+// known=false。调用方不得把未知当 0——归一计数会把已发生的语义变更（off→
+// custom_only 使自定义规则开始生效）静默成「0 条」，重播种计数会把「已插入」
+// 误报成「未生效」，两者都直接误导运维与审计。
+func rowsAffectedOrUnknown(result sql.Result, action, what string) (int64, bool) {
+	counted, err := result.RowsAffected()
+	if err != nil {
+		services.Logf("warn", "配置%s：读取%s失败（按未知继续，不改判定）: %v", action, what, err)
+		return 0, false
+	}
+	return counted, true
+}
+
 // failImportValidation 是导入「事务前」失败分支的单一收尾：审计 + 400。
 // 与 failImportTx 对称——篡改备份（校验和不匹配）、伪造/损坏 lbbak 等被
 // 拒绝的导入尝试必须在操作审计页可见（V1 导入与集群注册端点同族已如此），
@@ -5979,7 +6063,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 			err = failImportAbort(c, session, action, "off→custom_only 归一", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
-		} else if n, _ := result.RowsAffected(); n > 0 {
+		} else if n, known := rowsAffectedOrUnknown(result, action, "off→custom_only 归一计数"); !known {
+			// 归一 SQL 已成功、条数未知：语义变更仍已发生，必须留痕（不得
+			// 因计数失败而静默——那是「自定义规则从全关变生效」的披露通道）。
+			recordAudit(c, action+"警告", "配置备份", action+"后 WAF 模式为 off 且挂启用自定义规则的策略已按旧语义归一为 custom_only（自定义规则开始生效；受影响条数读取失败）")
+		} else if n > 0 {
 			customOnlyNormalized = n
 			services.Logf("info", "配置导入：%d 个 mode=off 且挂启用自定义规则的策略已归一为 custom_only（旧语义兼容）", n)
 			// 注释承诺的「留审计提示」在此落地：归一改变运行态语义（自定义
@@ -6018,7 +6106,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 			result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO security_block_pages (id, name, description, content, is_default, created_at, updated_at) VALUES (1, '默认拦截页面', '系统默认 403 拦截页面', '', TRUE, datetime('now'), datetime('now'))`)
 			if err != nil {
 				recordAudit(c, action+"警告", "配置备份", "默认拦截页面重播种失败: "+err.Error())
-			} else if affected, _ := result.RowsAffected(); affected == 0 {
+			} else if affected, known := rowsAffectedOrUnknown(result, action, "默认拦截页面重播种计数"); !known {
+				// 未知不等于 0：不得报「未生效」（实际可能已插入）。
+			} else if affected == 0 {
 				// 备份携带 id=1 的非默认行时 OR IGNORE 因 PK 冲突静默
 				// no-op，导入后仍旧零默认页且无任何 error——告警机制不会
 				// 触发，此处显式补记警告以便追溯。
@@ -6581,11 +6671,14 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 	}
 	services.SyncBusinessTaskDrivers()
 	// 爬虫源或名单被替换后，caddygeoip 的运行交换文件必须立即
-	// 与 DB 收敛；专用 rebuild 不播种、不回写名单，失败仅告警不回滚已提交配置。
+	// 与 DB 收敛；导入是全表替换，旧备份可能不含 system=1 爬虫行（v2.3.8 前
+	// 导出/用户裁剪），故走「补种缺失引擎 + 重建快照」同一收敛体（与启动
+	// Prime 同源），只 rebuild 会让缺失引擎的豁免/伪装检测静默失效到重启为
+	// 止。失败仅告警不回滚已提交配置。
 	_, crawlerSourcesReplaced := backup.Tables["security_crawler_sources"]
 	_, ipListsReplaced := backup.Tables["security_ip_lists"]
 	if crawlerSourcesReplaced || ipListsReplaced {
-		if err := services.RebuildCrawlerIPListSnapshot(); err != nil {
+		if err := services.RestoreCrawlerIPListSnapshot(); err != nil {
 			warning := "爬虫运行快照重建失败（重启或下次更新后重试）: " + err.Error()
 			recordAudit(c, action+"警告", "配置备份", warning)
 			responseWarnings = append(append([]string{}, responseWarnings...), warning)

@@ -184,6 +184,8 @@ test('字节格式化不得再有第二份实现（api.ts / ingestionHealth 只�
 // 守卫——新增零消费导出由评审按同一口径处理，不由本清单自动扩展。
 test('零外部消费的符号不得再导出（导出面 = 消费面）', () => {
   const cases: Array<[string, string]> = [
+    ['src/composables/useCrsRuleIndex.ts', 'CrsRuleIndexEntry'],
+    ['src/composables/useSettingsDraft.ts', 'StagedAdminTlsCert'],
     ['src/utils/settingsPages.ts', 'SETTINGS_TABS_CONSUMING_CONFIG'],
     ['src/utils/certJobColumns.ts', 'CERT_JOB_COLUMN_HIDE_ORDER'],
     ['src/utils/adminTlsGate.ts', 'AdminTlsStoredCertState'],
@@ -200,6 +202,7 @@ test('零外部消费的符号不得再导出（导出面 = 消费面）', () =>
     ['src/utils/caddyConfigPayload.ts', 'CaddyAccessLogSettings'],
     ['src/utils/caddyConfigPayload.ts', 'CaddyConfigPayload'],
     ['src/utils/certJobExpiry.ts', 'CertJobExpiryFields'],
+    ['src/utils/certJobStatus.ts', 'CertJobStatusTone'],
     ['src/utils/certQueue.ts', 'CertQueueCounts'],
     ['src/utils/clusterSyncSwitches.ts', 'ClusterSyncSwitch'],
     ['src/utils/clusterUrl.ts', 'ClusterUrlValidationOptions'],
@@ -212,6 +215,8 @@ test('零外部消费的符号不得再导出（导出面 = 消费面）', () =>
     ['src/utils/logStatCap.ts', 'LogStatBucket'],
     ['src/utils/policyPayload.ts', 'PolicyPayload'],
     ['src/utils/rateLimitBlocks.ts', 'RateLimitBlockHost'],
+    ['src/utils/restart.ts', 'reloadAfterRestart'],
+    ['src/utils/restart.ts', 'RestartServiceOptions'],
     ['src/utils/ruleWizard.ts', 'StageBlockPageOverrideState'],
     ['src/utils/securityLibraries.ts', 'LibraryTagType'],
     ['src/utils/securityLibraries.ts', 'LibrarySummary'],
@@ -227,6 +232,7 @@ test('零外部消费的符号不得再导出（导出面 = 消费面）', () =>
     ['src/utils/securityStages.ts', 'EventDetailRefScope'],
     ['src/utils/securityStages.ts', 'BlockPageEffective'],
     ['src/utils/securityStages.ts', 'BlockPageStageCapability'],
+    ['src/utils/sessionSingleFlight.ts', 'SessionSingleFlight'],
     ['src/utils/sessionSingleFlight.ts', 'SessionSingleFlightOptions'],
     ['src/utils/siteLocation.ts', 'SiteLocationChoice'],
     ['src/utils/siteLocation.ts', 'NodeSiteFormValue'],

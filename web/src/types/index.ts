@@ -298,7 +298,7 @@ export interface ClusterStatus {
   readonly sync_error_code?: string
   readonly pending_count: number
   readonly approved_count: number
-  /**：从节点→主节点链路为明文 HTTP 时常驻 true（后端 models.ClusterStatus）*/
+  /** 从节点→主节点链路为明文 HTTP 时常驻 true（后端 models.ClusterStatus）。*/
   readonly transport_insecure: boolean
 }
 

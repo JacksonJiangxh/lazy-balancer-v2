@@ -11,7 +11,9 @@ package services
 // 注入形态：把排程列改名，SELECT 该列失败而既有列的 UPDATE 仍成功（关闭整个
 // 库连接会把 UPDATE 一起打掉，无法区分「没写槽」与「整条写都失败」）。
 // 覆盖写面：版本表槽推进（失败/取消）、版本表成功落库、威胁/爬虫源成功/失败、
-// 以及引擎侧「失败轮不消费槽→退避重投→读恢复后推进」的端到端链。
+// 引擎侧「失败轮不消费槽→退避重投→读恢复后推进」的端到端链，以及生产接线的
+// 「排程槽未推进 → Run error」映射（InitTaskEngine 注册的真实 Run 体经 RunSync
+// 直接驱动——测试内复刻 Run 闭包不会覆盖这一段）。
 
 import (
 	"context"
@@ -408,6 +410,102 @@ func TestVersionTableSlotSuccess_ip2RegionLatestSkipStateWriteFailure(t *testing
 	if status != string(IP2RegionStatusSuccess) {
 		t.Fatalf("update_status=%q, want success", status)
 	}
+	assertFutureSlot(t, "写恢复后的 IP2Region 槽", slot)
+}
+
+// latestRunStatus 读某任务最新一条运行行的终态（Run error → 引擎落行的断言面）。
+func latestRunStatus(t *testing.T, taskID string) string {
+	t.Helper()
+	var status string
+	if err := db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("读取 %s 最新运行行: %v", taskID, err)
+	}
+	return status
+}
+
+// Given 生产接线装配（InitTaskEngine 注册的真实 crs 描述符）且状态行不可写
+// （排程读取正常，本轮走到「已是最新」落库分支）。
+// When 引擎执行一轮（RunSync 驱动注册表里的 Run 体，不经测试内复刻的闭包）。
+// Then Run 返回「排程槽未推进」，引擎落 failed 运行行、槽保持原值；写恢复后
+// 同一 Run 体成功收尾并推进槽。
+//
+// 判据必须落在生产 Run 体上：测试内注册同形 descriptor 只能验证「契约长什么样」，
+// 删掉 taskengine_wire.go 里的 ScheduleSlotError→error 映射时那样的用例仍然全绿。
+func TestEngineWiring_CRSUnadvancedSlotFailsRun(t *testing.T) {
+	m := newTestCRSManager(t)
+	te := newWireTestEngine(t)
+	// 关掉该族调度：本用例断言的是手动 RunSync 这一轮的行/槽，tick 并发派发
+	// 会让「最新运行行」被另一轮覆盖（或被单飞门拒绝）。
+	te.StopLoop("crs")
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.30.0", nil }
+	previous := crsUpdateManager
+	crsUpdateManager = m
+	t.Cleanup(func() { crsUpdateManager = previous })
+	seedCRSVersionRow(t, "v4.30.0", true)
+	expired := expiredSlot()
+	setCRSSlot(t, expired)
+
+	restore := injectColumnRename(t, "security_crs_version", "message")
+
+	_, err := te.RunSync("crs", "manual", "")
+	if !errors.Is(err, errScheduleSlotNotAdvanced) {
+		t.Fatalf("RunSync(crs)=%v, want 排程槽未推进（生产 Run 体必须把 ScheduleSlotError 按失败返回）", err)
+	}
+	if got := crsNextUpdate(t); got != expired {
+		t.Fatalf("槽未推进错误返回后 next_update=%q, want 保持原值 %q", got, expired)
+	}
+	if got := latestRunStatus(t, "crs"); got != "failed" {
+		t.Fatalf("运行行 status=%q, want failed（Run error 必须成为失败终态，不得静默 success）", got)
+	}
+
+	restore()
+	if _, err := te.RunSync("crs", "manual", ""); err != nil {
+		t.Fatalf("写恢复后同一 Run 体应成功收尾: %v", err)
+	}
+	if got := latestRunStatus(t, "crs"); got != "success" {
+		t.Fatalf("写恢复后运行行 status=%q, want success", got)
+	}
+	assertFutureSlot(t, "写恢复后的 CRS 槽", crsNextUpdate(t))
+}
+
+// Given 同上的生产接线，但换成 ip2region 族（另一处同型映射）。
+// When 状态行不可写时执行一轮。
+// Then Run 返回「排程槽未推进」并落 failed 运行行、槽保持原值；写恢复后成功。
+func TestEngineWiring_IP2RegionUnadvancedSlotFailsRun(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	te := newWireTestEngine(t)
+	te.StopLoop("ip2region")
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.0.0", nil }
+	previous := ip2RegionUpdateManager
+	ip2RegionUpdateManager = m
+	t.Cleanup(func() { ip2RegionUpdateManager = previous })
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	expired := expiredSlot()
+	if _, err := db.DB.Exec(`UPDATE security_ip2region_version SET next_update=? WHERE id=1`, expired); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := injectColumnRename(t, "security_ip2region_version", "message")
+
+	_, err := te.RunSync("ip2region", "manual", "")
+	if !errors.Is(err, errScheduleSlotNotAdvanced) {
+		t.Fatalf("RunSync(ip2region)=%v, want 排程槽未推进（生产 Run 体必须把 ScheduleSlotError 按失败返回）", err)
+	}
+	if _, slot := ip2RegionRowStatusSlot(t); slot != expired {
+		t.Fatalf("槽未推进错误返回后 next_update=%q, want 保持原值 %q", slot, expired)
+	}
+	if got := latestRunStatus(t, "ip2region"); got != "failed" {
+		t.Fatalf("运行行 status=%q, want failed", got)
+	}
+
+	restore()
+	if _, err := te.RunSync("ip2region", "manual", ""); err != nil {
+		t.Fatalf("写恢复后同一 Run 体应成功收尾: %v", err)
+	}
+	if got := latestRunStatus(t, "ip2region"); got != "success" {
+		t.Fatalf("写恢复后运行行 status=%q, want success", got)
+	}
+	_, slot := ip2RegionRowStatusSlot(t)
 	assertFutureSlot(t, "写恢复后的 IP2Region 槽", slot)
 }
 

@@ -358,11 +358,14 @@ func securityEventsRetentionCleanup(ctx context.Context) (SecurityEventsRetentio
 	// ——此前每分钟一行常驻 metrics_state（约 1440 行/天、52.5 万行/年），
 	// 全仓无删除点。按同一 rollupCutoff 清理（键后缀为 'YYYY-MM-DD HH:MM'
 	// 同形态，字符串比较即时间序）。
+	// 前缀匹配必须用 GLOB：前缀含 5 个 `_`，SQLite LIKE 里 `_`=任意单字符，
+	// 模式比意图宽——未来出现近似命名的键（同长度前缀）会被误删（迟到基线
+	// 误删会让迟到行永久不入聚合）。GLOB 的 `_` 是字面量，`*` 才是通配。
 	for {
 		res, err := database.Exec(`DELETE FROM metrics_state WHERE key IN (
-			SELECT key FROM metrics_state WHERE (key LIKE ? AND substr(key, ?) < ?) OR (key LIKE ? AND substr(key, ?) < ?) LIMIT 500)`,
-			ThreatRollupEventHighwaterPrefix+"%", len(ThreatRollupEventHighwaterPrefix)+1, rollupCutoff,
-			ThreatRollupLateBaselinePrefix+"%", len(ThreatRollupLateBaselinePrefix)+1, rollupCutoff)
+			SELECT key FROM metrics_state WHERE (key GLOB ? AND substr(key, ?) < ?) OR (key GLOB ? AND substr(key, ?) < ?) LIMIT 500)`,
+			ThreatRollupEventHighwaterPrefix+"*", len(ThreatRollupEventHighwaterPrefix)+1, rollupCutoff,
+			ThreatRollupLateBaselinePrefix+"*", len(ThreatRollupLateBaselinePrefix)+1, rollupCutoff)
 		if err != nil {
 			Logf("warn", "security events retention: rollup highwater cleanup failed: %v", err)
 			return result, err

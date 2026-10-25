@@ -79,22 +79,26 @@ test('TTL 过期：过期缓存不算就绪（必须重拉后才回报空清单�
 
 const page = code('src/views/security/IPLocationAction.vue')
 
-test('取消信任：先补齐信任侧引用名单条目，再算处置计划', () => {
+test('取消信任：先取最新策略、补齐信任侧引用名单条目，再算处置计划', () => {
   const cancel = section(page, 'const cancelTrustAll = async', '\n}\n')
-  const refreshAt = cancel.indexOf('await ensureSharedEntriesMissing(trustRefIds, loadListEntries)')
-  const planAt = cancel.indexOf('planTrustRemoval({')
+  const refreshAt = cancel.indexOf('await ensureSharedEntriesMissing(refIds, loadListEntries)')
+  const planAt = cancel.indexOf('const plan = buildPlan(policy)')
   assert.ok(refreshAt > 0, '决策前必须补齐条目（安全结论不得读可能过期的显示缓存）')
-  assert.ok(planAt > refreshAt, '补齐必须早于 planTrustRemoval —— 否则计划仍按旧条目计算')
-  // 只刷新本策略信任侧引用（不做与本决策无关的整批下载）
-  assert.match(cancel, /const trustRefIds = parseRefIds\(row\.policy\.ip_whitelist_refs\)/)
-  assert.ok(cancel.indexOf('const trustRefIds') < refreshAt, '补齐的 id 集合必须来自本策略信任侧 refs')
+  assert.ok(planAt > refreshAt, '补齐必须早于出计划 —— 否则计划仍按旧条目计算')
+  // 只刷新本策略信任侧引用（不做与本决策无关的整批下载）；refs 取自**最新策略**
+  // 而非弹层挂载快照——并发新增的信任引用列表同样要被补齐与移除。
+  assert.match(cancel, /const trustRefIds = parseRefIds\(policy\.ip_whitelist_refs\)/)
+  const callAt = cancel.indexOf('const missingTrustIds = await refreshTrustEntries(trustRefIds)')
+  assert.ok(callAt > 0, '补齐调用必须传入本策略信任侧 refs')
+  assert.ok(cancel.indexOf('const trustRefIds') < callAt, '补齐的 id 集合必须来自最新策略信任侧 refs')
+  assert.match(cancel, /policy = await fetchDetail\(row\.policy\.id\)/, '决策前必须重取策略（不得读挂载快照）')
 })
 
 test('补齐失败不得出结论：置错误态、释放 busy、不进入确认/写入', () => {
   const cancel = section(page, 'const cancelTrustAll = async', '\n}\n')
   const checkAt = cancel.indexOf('if (missingTrustIds.length > 0) {')
   assert.ok(checkAt > 0, '必须校验补齐结果')
-  const failure = cancel.slice(checkAt, cancel.indexOf('const plan = planTrustRemoval(', checkAt))
+  const failure = cancel.slice(checkAt, cancel.indexOf('const plan = buildPlan(policy)', checkAt))
   assert.match(failure, /listsError\.value = true/, '失败必须与加载失败态同口径（禁用全部处置动作 + 横幅重试）')
   assert.match(failure, /unlockBusy\(row\.policy\.id, 'untrust'\)/, '失败路径必须释放 busy 锁（否则按钮永久转圈）')
   assert.match(failure, /return\b/, '失败路径必须直接返回，不得落到确认框/写入')
@@ -111,7 +115,7 @@ test('刷新期间的缓存中间态不得回写显示（不出现名单瞬时�
   assert.match(handler, /if \(entriesRefreshInFlight\) return/, '刷新期间必须跳过中间态回写')
   const cancel = section(page, 'const cancelTrustAll = async', '\n}\n')
   const flagAt = cancel.indexOf('entriesRefreshInFlight = true')
-  const refreshAt = cancel.indexOf('await ensureSharedEntriesMissing(trustRefIds, loadListEntries)')
+  const refreshAt = cancel.indexOf('await ensureSharedEntriesMissing(refIds, loadListEntries)')
   assert.ok(flagAt > 0 && flagAt < refreshAt, '必须在发请求前置位抑制标记')
   assert.match(cancel, /\.finally\(\(\) => \{ entriesRefreshInFlight = false \}\)/, '刷新结束（含失败）必须复位标记')
   assert.ok(

@@ -101,8 +101,8 @@ const certificateConfigFieldsSchema = `"name":{"type":"string","description":"�
 var createCertificateConfigSchema = `{"type":"object","required":["name","dns_provider"],"properties":{` + certificateConfigFieldsSchema + `},"additionalProperties":true}`
 var updateCertificateConfigSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"配置 ID"},` + certificateConfigFieldsSchema + `},"additionalProperties":true}`
 
-const createUserSchema = `{"type":"object","required":["username","password","role"],"properties":{"username":{"type":"string","description":"用户名（3-50 字符）"},"password":{"type":"string","description":"初始密码（≤72 字符）"},"role":{"type":"string","enum":["admin","user"]},"display_name":{"type":"string","description":"显示名（≤50 字符）"}},"additionalProperties":true}`
-const updateUserSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"用户 ID"},"username":{"type":"string"},"role":{"type":"string","enum":["admin","user"]},"display_name":{"type":"string"},"password":{"type":"string","description":"新密码（省略=不修改）"}},"additionalProperties":true}`
+const createUserSchema = `{"type":"object","required":["username","password","role"],"properties":{"username":{"type":"string","description":"用户名：小写字母开头，仅小写字母/数字（3-50 字符，不接受大写、下划线、汉字）"},"password":{"type":"string","description":"初始密码：8-24 个可打印 ASCII 字符（数字/大小写字母/特殊字符，不强制四类全含）"},"role":{"type":"string","enum":["admin","user"]},"display_name":{"type":"string","description":"显示名（≤50 字符）"}},"additionalProperties":true}`
+const updateUserSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"用户 ID"},"username":{"type":"string","description":"新用户名：小写字母开头，仅小写字母/数字（3-50 字符，不接受大写、下划线、汉字；省略=不修改）"},"role":{"type":"string","enum":["admin","user"]},"display_name":{"type":"string"},"password":{"type":"string","description":"新密码：8-24 个可打印 ASCII 字符（数字/大小写字母/特殊字符；省略=不修改）"}},"additionalProperties":true}`
 
 const createAPIKeySchema = `{"type":"object","required":["name"],"properties":{"name":{"type":"string","description":"密钥名称"},"expires_at":{"type":["string","null"],"description":"过期时间（RFC3339），null=永不过期"},"mcp_enabled":{"type":"boolean","description":"允许该 Key 调 MCP"},"read_only":{"type":"boolean","description":"只读 Key（仅查询与读探测工具）"},"mcp_ip_whitelist":{"type":"array","items":{"type":"string"},"description":"来源 IP 白名单（CIDR，约束该 Key 的全部 REST 与 MCP 调用）"}},"additionalProperties":true}`
 const updateAPIKeyStatusSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"密钥 ID"},"is_enabled":{"type":"boolean"},"mcp_enabled":{"type":"boolean"},"read_only":{"type":"boolean"},"mcp_ip_whitelist":{"type":"array","items":{"type":"string"},"description":"来源 IP 白名单（CIDR）"}},"additionalProperties":true,"description":"四个字段均可选但至少提交一个"}`
@@ -126,7 +126,7 @@ var tools = []toolSpec{
 	{"retry_cert_job", "重试指定证书签发任务", http.MethodPost, "/certificates/jobs/{id}/retry", []string{"id"}, nil, idSchema("id", "证书任务 ID", "integer")},
 	{"delete_cert_job", "删除指定证书签发任务", http.MethodDelete, "/certificates/jobs/{id}", []string{"id"}, nil, idSchema("id", "证书任务 ID", "integer")},
 	{"issue_certificate", "触发 ACME 证书签发", http.MethodPost, "/certificates/issue", nil, nil, issueCertificateSchema},
-	{"list_certificates", "列出证书任务清单（每规则每域名最新签发任务：状态/到期时间）", http.MethodGet, "/certificates", nil, nil, emptySchema},
+	{"list_certificates", "列出证书任务清单（每规则每域名最新签发任务：状态/到期时间）", http.MethodGet, "/certificates", nil, []string{"page", "page_size"}, listCertificatesSchema},
 	{"get_config", "读取全局配置", http.MethodGet, "/config", nil, nil, emptySchema},
 	{"update_config", "更新全局配置并应用 Caddy", http.MethodPut, "/config", nil, nil, updateConfigSchema},
 	{"reload_caddy", "从数据库重新生成并加载 Caddy 配置", http.MethodPost, "/config/reload", nil, nil, emptySchema},
@@ -390,7 +390,7 @@ const updateRuleSchema = `{"type":"object","required":["caddy_id"],"properties":
 // 确认门（与 REST 侧 POST /certificates/issue 的 {"all":true} 同步）
 // 空 body（全量重签）不再放行——批量必须显式 all:true（enum 锁死 true，防
 // all:false 静默变空批量）；定向签发仍走 caddy_id（domain 可选）。
-const issueCertificateSchema = `{"type":"object","properties":{"caddy_id":{"type":"string"},"domain":{"type":"string"},"all":{"type":"boolean","enum":[true]}},"oneOf":[{"required":["all"]},{"required":["caddy_id"]}],"additionalProperties":false}`
+const issueCertificateSchema = `{"type":"object","properties":{"caddy_id":{"type":"string"},"domain":{"type":"string"},"all":{"type":"boolean","enum":[true],"description":"全量重签（含已签发任务，消耗 CA 配额并触发 DNS 变更）：单次最多匹配 500 个 ACME 规则，超出 REST 返回 400，请分批执行或改传 caddy_id 定向签发"}},"oneOf":[{"required":["all"]},{"required":["caddy_id"]}],"additionalProperties":false}`
 const auditLogsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":500,"default":1,"description":"页码；超过 500 页 REST 直接 400（深 OFFSET 全表扫描），请用时间/用户/动作筛选缩小范围"},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"username":{"type":"string","description":"操作人模糊筛选"},"action":{"type":"string","description":"操作模糊筛选"},"resource":{"type":"string","description":"对象模糊筛选"},"ip":{"type":"string","description":"IP 模糊筛选"},"keyword":{"type":"string","description":"详情关键词"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
 
 // schema 必须覆盖 queryArgs 声明的全部
@@ -403,6 +403,12 @@ const auditLogsSchema = `{"type":"object","properties":{"page":{"type":"integer"
 // page≤1000、page_size≤200 默认 50——见 ListCertJobs maxCertJobPage）。
 const listCRSRulesSchema = `{"type":"object","properties":{"search":{"type":"string","description":"搜索关键词"},"page":{"type":"integer","minimum":1,"maximum":100000,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":50,"default":50}},"additionalProperties":false}`
 const listCertJobsSchema = `{"type":"object","properties":{"rule_id":{"type":"string","description":"按规则 ID 过滤"},"page":{"type":"integer","minimum":1,"maximum":1000,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}`
+
+// list_certificates 与 REST ListCertificates 的分页钳位同值（page/page_size
+// 上限均 maxCertJobPage=1000，默认 1/1000）：此前 schema 为 emptySchema，
+// 端点在获得 LIMIT/OFFSET 后 Agent 在 >1000 行部署上只能拿到前 1000 行，
+// 响应 total 可见却无续页参数可跟随。
+const listCertificatesSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":1000,"default":1,"description":"页码；与 REST 同口径，page_size 默认 1000（等价原全量返回）"},"page_size":{"type":"integer","minimum":1,"maximum":1000,"default":1000,"description":"每页条数；响应 data.total 为匹配总数，超过本页条数时按 page 续取"}},"additionalProperties":false}`
 const securityEventsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":1000,"default":1,"description":"页码；REST 侧超过 1000 会静默钳位（深 OFFSET 保护），更深历史请用筛选条件"},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"action":{"type":"string"},"ip":{"type":"string"},"rule_caddy_id":{"type":"string"},"rule_name":{"type":"string","description":"按负载规则名称过滤（子串）"},"policy_name":{"type":"string","description":"按安全策略名称过滤（子串）"},"rule_triggered":{"type":"string","description":"按触发规则过滤（类别：IP 访问控制/地域拦截/WAF 规则（CRS）含全部 6 位规则 ID/自定义规则；也可输细标签（评分拦截/协议异常/协议攻击）或 CRS 规则 ID/消息关键词）"},"rule_triggered_exclude":{"type":"string","description":"按触发规则反向过滤（同 rule_triggered 的类别/细标签/ID，整体取反——筛掉该类型看其余）"},"uri":{"type":"string","description":"按请求 URI 过滤（子串）"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
 const caddyLogsSchema = `{"type":"object","properties":{"type":{"type":"string","enum":["runtime","server","proxy","tls"]}},"additionalProperties":false}`
 const metricsHistorySchema = `{"type":"object","properties":{"rule_id":{"type":"string","description":"可选规则 ID（Caddy ID），省略时返回全局聚合趋势"},"interval":{"type":"string","description":"时间范围（如 1h、24h、7d），默认 1h"}},"additionalProperties":false}`

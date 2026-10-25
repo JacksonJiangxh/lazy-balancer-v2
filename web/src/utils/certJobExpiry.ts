@@ -18,8 +18,45 @@ export const certJobEffectiveNotAfter = (job: CertJobExpiryFields): string =>
   job.not_after || job.expires_at || ''
 
 /**
- * 自动重签时间 = 到期时刻前 renewalDays 天，返回 ISO 原值（列内紧凑格式与
+ * 续签保护窗口（天）：剩余有效期跌到该值即续签，同时是两次自动续签之间的
+ * 最小节奏。与后端 certificates.go 的 certRenewalGuaranteedGrace 同值。
+ */
+const CERT_RENEWAL_GRACE_DAYS = 7
+
+/**
+ * ACME 证书的规划寿命（天）：与后端 certinfo.go 的 CertRenewalLifetimeDays
+ * 同值，用作续签窗口上限的基准。
+ */
+const CERT_RENEWAL_LIFETIME_DAYS = 90
+
+/**
+ * 实际生效的续签窗口（天）：镜像后端 certRenewalWindowForLifetime 的收敛——
+ * 窗口大于「寿命 − 最小节奏」时按窗口入队会让相邻两次续签挤在一起（CA 重复
+ * 证书限流），故收敛到保护区（到期前 7 天）。库值不改写，收敛只作用于渲染。
+ *
+ * 后端以真实证书寿命收敛，前端只知道规划寿命（90 天）：配置 84–88 天时两边
+ * 一致收敛为 7 天；自定义 CA 签发更短寿命的证书时后端会收敛得更多，前端按
+ * 规划寿命显示可能偏大——该差额由后端未来下发 renewal_at 消除。
+ */
+export const certRenewalWindowDays = (days: number): number => {
+  if (!Number.isFinite(days) || days <= 0) return days
+  const headroom = CERT_RENEWAL_LIFETIME_DAYS - CERT_RENEWAL_GRACE_DAYS
+  if (days <= headroom) return days
+  return Math.min(CERT_RENEWAL_GRACE_DAYS, headroom)
+}
+
+/** 续签窗口是否被寿命收敛（UI 据此提示实际节奏与配置不同）。 */
+export const certRenewalWindowConverged = (days: number): boolean =>
+  certRenewalWindowDays(days) !== days
+
+/**
+ * 自动重签时间 = 到期时刻前「实际生效窗口」天，返回 ISO 原值（列内紧凑格式与
  * tooltip 完整格式各自取用，不在 helper 里预先格式化）。
+ *
+ * 窗口必须经 certRenewalWindowDays 收敛：配置侧允许 84–88 天（上限按 90 天
+ * 寿命留两天余量），而这已超过后端可执行窗口——按库值直算会把「自动重签
+ * 时间」显示成签发后 2–6 天（已经过去的日期），与扫描实际行为相反。
+ *
  * 畸形时间/非法天数一律返回空串——`new Date(NaN).toISOString()` 会抛
  * RangeError 并中断整行渲染。
  */
@@ -29,5 +66,5 @@ export const certJobRenewalAt = (job: CertJobExpiryFields, renewalDays: number):
   const expiry = new Date(expiryValue)
   if (Number.isNaN(expiry.getTime())) return ''
   if (!Number.isFinite(renewalDays)) return ''
-  return new Date(expiry.getTime() - renewalDays * 24 * 60 * 60 * 1000).toISOString()
+  return new Date(expiry.getTime() - certRenewalWindowDays(renewalDays) * 24 * 60 * 60 * 1000).toISOString()
 }

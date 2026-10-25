@@ -307,10 +307,13 @@ const NON_ENVELOPE_SITES: Record<string, number> = {
 // 调用点对账（calls = pairs + registered）里仍被完全约束。
 const MIN_ENVELOPES: Record<(typeof SCAN_DIRS)[number], number> = {
   // 实测下限：writeInternalError 等共享装配器把多站点收敛为一个信封，
-  // 目录级下限跟随实测（调用点对账仍保证无漏网）。本期「还原/下载进入导入核心
-  // 之前」的 9 处裸信封（404/413/500）收敛为 failRestoreFileAccess 单源
-  // （净 -8），叠加其它调用点增补后实测 1314。
-  'internal/handlers': 1314,
+  // 目录级下限跟随实测（调用点对账仍保证无漏网）。基线 1314 之后的两处
+  // 合法收敛：①「还原/下载进入导入核心之前」的 9 处裸信封收敛为
+  // failRestoreFileAccess 单源（净 -8）；②V1 导入 6 处事务前 400 收敛为
+  // failImportValidation 单源（净 -6）；③自动备份访问族（编号/文件名非法、
+  // 行不存在、查询失败）收敛为 failAutoBackupAccess 单源（净 -2）。
+  // 叠加上其它调用点增补后实测 1306。
+  'internal/handlers': 1306,
   'internal/middleware': 43,
 }
 

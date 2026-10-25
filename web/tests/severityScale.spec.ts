@@ -12,6 +12,7 @@ import {
   GEOIP_CRAWLER_EXEMPT_BASE,
   GEOIP_CRAWLER_SPOOF_BASE,
   GEOIP_PRECHECK_LIMIT,
+  ZERO_SCORE_PRECHECK_IDS,
   anomalySeverity,
   overlayDetectionGrade,
   zeroScoreSeverity,
@@ -48,8 +49,12 @@ test('检测模式降级梯：拦截事件保持原档，未拦截整体降一�
   assert.equal(overlayDetectionGrade(anomalySeverity(ANOMALY_SCORE_MID), 'detected'), 'low')
 })
 
-test('0 分行回退族：2/3/12/14 高危，GeoIP 三族按段界分档，其余按动作分中低', () => {
-  for (const ruleTriggered of ['2', '3', '12', '14']) {
+test('0 分行回退族：预检固定族（含 4/7）高危，GeoIP 三族按段界分档，其余按动作分中低', () => {
+  // 固定预检族（与后端 Stage1PrecheckIDSQLList 去 GeoIP id 8 同集合）：
+  // 4=遗留黑名单、7=白名单外拒绝——升级前的历史 0 分拦截行若落兜底会被定成
+  // 中危并从大屏「高危」筛选中漏掉；5 为绕过模式信任并集（pass,nolog 不产事件）。
+  assert.ok(ZERO_SCORE_PRECHECK_IDS.includes('4') && ZERO_SCORE_PRECHECK_IDS.includes('7'), '固定族必须含 4/7')
+  for (const ruleTriggered of ZERO_SCORE_PRECHECK_IDS) {
     assert.equal(zeroScoreSeverity(ruleTriggered, 'blocked'), 'high', `${ruleTriggered} 拦截应为高危`)
     assert.equal(zeroScoreSeverity(ruleTriggered, 'detected'), 'mid', `${ruleTriggered} 检测模式降为中危`)
   }
@@ -98,6 +103,35 @@ test('8xxxxx 三族段界与后端 encode/decode 及入库补分同源（跨栈�
   assert.match(events, /case securityEventsIsCrawlerExemptRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 0/)
   assert.match(events, /case securityEventsIsCrawlerSpoofRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 12/)
   assert.match(events, /case securityEventsIsGeoIPScoringRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 6/)
+})
+
+// 固定族同样是跨栈契约：前端 0 分行回退与后端入库补分（securityEventsIsPrecheckRule
+// → 12 分）必须同集合。后端单一事实源 = Stage1PrecheckIDSQLList（与
+// IsStage1PrecheckID / IsStage1PrecheckEventID 同文件维护，Go 侧三集合对账钉死）；
+// GeoIP 的固定 id 8 由前端段界分支单独处理，不在固定族里。新增/删除预检 id 时
+// 任一侧漏改即在此失败（原先前端手抄 2/3/12/14 漏掉 4/7）。
+test('0 分行固定预检族与后端 Stage1PrecheckIDSQLList 同集合（跨栈对表）', () => {
+  const go = repoCode('internal/services/security.go')
+  const decl = /Stage1PrecheckIDSQLList = "\(([^)]*)\)"/.exec(go)
+  const raw = decl ? decl[1] : ''
+  assert.match(raw, /^'\d+'(,'\d+')*$/, '后端 Stage1PrecheckIDSQLList 声明形态漂移（跨栈对表失去锚点）')
+  const backendIDs = raw.split(',').map((token) => token.replace(/'/g, ''))
+  assert.ok(backendIDs.length >= 8, `后端清单解析不完整：${raw}`)
+  assert.ok(backendIDs.includes('8'), 'GeoIP 固定 id 8 必须在后端清单内')
+
+  const backendFixed = backendIDs.filter((id) => id !== '8')
+  assert.deepEqual(
+    [...ZERO_SCORE_PRECHECK_IDS].sort((a, b) => Number(a) - Number(b)),
+    [...backendFixed].sort((a, b) => Number(a) - Number(b)),
+    '前端 0 分行固定族必须与后端预检固定清单（去 GeoIP id 8）同集合',
+  )
+
+  // 后端 Go 谓词是入库补分的判定源：固定族 {2,4,7,8,14} ∪ GeoIP 段；
+  // 预检族 0 分行补 12（高危）——前端 blocked→high 与之一致。
+  assert.match(go, /func IsStage1PrecheckID\(n int\) bool \{\s*switch n \{\s*case 2, 4, 7, 8, 14:/)
+  const events = repoCode('internal/services/securityevents.go')
+  assert.match(events, /return IsStage1PrecheckEventID\(n\)/)
+  assert.match(events, /case securityEventsIsPrecheckRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 12/)
 })
 
 test('大屏定级只做取值：视图不重写分档/降级语义', () => {

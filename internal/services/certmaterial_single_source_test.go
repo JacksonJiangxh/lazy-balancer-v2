@@ -63,7 +63,7 @@ func assertNoInlineMaterialPredicate(t *testing.T, path string) {
 	// 谓词必然在同一段连续文本里。
 	squashed := strings.Join(strings.Fields(string(data)), "")
 	squashed = strings.NewReplacer(`"`, "", "`", "", "+", "").Replace(squashed)
-	for _, marker := range []string{"CertJobCandidatePredicateSQL", "CertJobMaterialPredicateSQL", "CertJobMaterialUsable"} {
+	for _, marker := range []string{"certJobCandidatePredicateSQL", "CertJobMaterialPredicateSQL", "CertJobMaterialUsable"} {
 		squashed = strings.ReplaceAll(squashed, marker, "")
 	}
 	for _, column := range []string{"cert_pem", "key_pem"} {

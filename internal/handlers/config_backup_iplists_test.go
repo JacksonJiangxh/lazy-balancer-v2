@@ -98,12 +98,14 @@ func TestImportConfigBackup_acceptsValidIPListReferences(t *testing.T) {
 	if listCount != 2 {
 		t.Fatalf("imported user ip lists=%d, want 2", listCount)
 	}
-	// 导入后必须重播 system 名单（威胁三源 + 自动封禁）。
+	// 导入后必须补播 system 名单：威胁三源 + 自动封禁 + 四个爬虫官方名单
+	//（备份未携带爬虫 system 行时逐引擎补种内置首版）。
+	wantSystem := len(db.ThreatSystemLists()) + 1 + len(services.CrawlerSystemListNames())
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=1").Scan(&systemCount); err != nil {
 		t.Fatal(err)
 	}
-	if systemCount != 4 {
-		t.Fatalf("system ip lists=%d, want 4", systemCount)
+	if systemCount != wantSystem {
+		t.Fatalf("system ip lists=%d, want %d", systemCount, wantSystem)
 	}
 }
 
@@ -257,13 +259,14 @@ func TestImportConfigBackup_emptyIPListsTableWipesLocalLists(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("security_ip_lists rows=%d after empty-table import, want 0", count)
 	}
-	// 空表导入后 system 名单仍由提交后重播补回。
+	// 空表导入后 system 名单仍由提交后补播补回（威胁三源 + 自动封禁 + 四爬虫）。
+	wantSystem := len(db.ThreatSystemLists()) + 1 + len(services.CrawlerSystemListNames())
 	var systemCount int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=1").Scan(&systemCount); err != nil {
 		t.Fatal(err)
 	}
-	if systemCount != 4 {
-		t.Fatalf("system ip lists=%d after empty-table import, want 4", systemCount)
+	if systemCount != wantSystem {
+		t.Fatalf("system ip lists=%d after empty-table import, want %d", systemCount, wantSystem)
 	}
 }
 

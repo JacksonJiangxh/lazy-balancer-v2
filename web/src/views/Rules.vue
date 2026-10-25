@@ -150,15 +150,20 @@
                   <div class="lock-summary-hint"><el-button link type="primary" @click="openFlowFromLock(row)">查看完整处理流程 →</el-button></div>
                 </div>
               </el-popover>
-              <!-- TCP 灰色锁（2026-10-10 用户裁定）：无弹框，hover 提示不支持原因 -->
+              <!-- TCP 灰色锁（2026-10-10 用户裁定）：无弹框，hover 提示不支持原因。
+                   它不是动作入口（无流程弹框可开），语义按「带名称的图形」暴露给
+                   读屏/键盘：纯装饰的 tabindex 可聚焦却无 role/名称，屏幕阅读器只
+                   读出「锁」图标而没有「为什么」 -->
               <el-tooltip
                 v-else-if="row.protocol === 'tcp'"
                 placement="top"
                 content="TCP 规则不支持安全策略"
               >
-                <el-icon :size="14" class="acl-lock-icon acl-lock-icon--tcp" tabindex="0"><Lock /></el-icon>
+                <el-icon :size="14" class="acl-lock-icon acl-lock-icon--tcp" tabindex="0" role="img" aria-label="TCP 规则不支持安全策略"><Lock /></el-icon>
               </el-tooltip>
-              <a class="rule-name-link" role="button" tabindex="0" :title="row.name" @click.prevent="viewConfig(row)" @keydown.enter.prevent="viewConfig(row)" @keydown.space.prevent="viewConfig(row)">{{ row.name }}</a>
+              <!-- 规则名入口复用 AccessibleLink：手写 <a role=button> 缺按键自动重复
+                   守卫与统一焦点环（同页曾有两套键盘语义） -->
+              <AccessibleLink class="rule-name-link" :title="row.name" @click="viewConfig(row)">{{ row.name }}</AccessibleLink>
             </div>
           </template>
         </el-table-column>
@@ -338,6 +343,7 @@
               v-model="row.enabled"
               :loading="ruleTogglePending[row.caddy_id]"
               :disabled="isReadOnly || isCertJobActive(certJobMap[row.caddy_id]?.status) || ruleTogglePending[row.caddy_id]"
+              :aria-label="`${row.name} 的启用状态`"
               @change="toggleRule(row)"
               class="status-switch"
             />
@@ -475,7 +481,7 @@
 
         <!-- Step 1: TLS 配置 (仅当启用 HTTPS 时显示) -->
         <div v-show="currentStep === WIZARD_STEP.TLS" class="step-content">
-          <div v-if="tlsDetailError" class="info-note-bar">
+          <div v-if="tlsDetailError && wizardForm.tls_source === 'manual'" class="info-note-bar">
             <span class="info-note-desc">证书详情加载失败：手动 TLS 配置可能不完整，已阻止进入下一步与保存。</span>
             <el-button size="small" type="primary" plain :loading="tlsDetailLoading" @click="retryTlsDetail">重新加载</el-button>
           </div>
@@ -945,11 +951,17 @@
               </template>
               <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 恢复窗口 {{ wizardForm.health_check_interval * 3 }}s)</template>
             </el-descriptions-item>
-            <el-descriptions-item label="连接重试" v-if="wizardForm.protocol === 'tcp'">
+            <el-descriptions-item label="连接重试" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
               <template v-if="(wizardForm.tcp_try_duration || 0) > 0">
                 窗口 {{ wizardForm.tcp_try_duration || 0 }}ms / 间隔 {{ wizardForm.tcp_try_interval || 0 }}ms
               </template>
-              <template v-else>禁用</template>
+              <template v-else-if="(wizardForm.tcp_try_duration || 0) < 0">禁用重试（NTLM 模式）</template>
+              <template v-else>{{ wizardForm.protocol === 'tcp' ? '禁用' : '默认 5s 窗口' }}</template>
+            </el-descriptions-item>
+            <!-- 访问日志与连接重试都是高级步可编辑项：预览自称配置核对面，
+                 漏项会让误配置只能保存后从单规则配置查看器发现 -->
+            <el-descriptions-item label="访问日志" v-if="wizardForm.protocol === 'http'">
+              {{ wizardForm.log_enabled ? '开启' : '关闭' }}
             </el-descriptions-item>
             <el-descriptions-item label="PROXY 协议 v2" v-if="wizardForm.protocol === 'tcp'">
               {{ wizardForm.tcp_proxy_protocol ? '启用' : '禁用' }}
@@ -1024,7 +1036,7 @@
           <el-button v-if="hasNextStep" type="primary" @click="nextStep">
             下一步<el-icon><ArrowRight /></el-icon>
           </el-button>
-          <el-button v-if="currentStep === WIZARD_STEP.PREVIEW" type="primary" :loading="saving" :disabled="tlsDetailError" title="证书详情加载失败：请先在 TLS 步骤重新加载" @click="submitWizard">
+          <el-button v-if="currentStep === WIZARD_STEP.PREVIEW" type="primary" :loading="saving" :disabled="tlsDetailError && wizardForm.tls_source === 'manual'" :title="tlsDetailError && wizardForm.tls_source === 'manual' ? '证书详情加载失败：请先在 TLS 步骤重新加载' : ''" @click="submitWizard">
             <span>保存规则</span><el-icon style="margin-left: 6px;"><Check /></el-icon>
           </el-button>
         </div>
@@ -1264,6 +1276,7 @@ import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 import TakeoverBadge from '@/components/common/TakeoverBadge.vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
@@ -2657,34 +2670,48 @@ const selectedDnsFamilies = (value: string | string[]): string[] => {
   return ['ipv4']
 }
 
-const pasteFromFile = async (type: 'cert' | 'key') => {
-  try {
-    // Create a file input element
-    const input = document.createElement('input')
-    input.type = 'file'
-    input.accept = '.pem,.crt,.key,.txt,*'
-    
-    input.onchange = async (e: Event) => {
-      const file = (e.target as HTMLInputElement).files?.[0]
-      if (!file) return
-      
-      const reader = new FileReader()
-      reader.onload = (event) => {
-        const content = event.target?.result as string
-        if (type === 'cert') {
-          wizardForm.tls_cert = content
-        } else {
-          wizardForm.tls_key = content
-        }
-        ElMessage.success('已从文件读取内容')
-      }
-      reader.readAsText(file)
+// 证书/私钥「从文件读取」：证书文件体积有合理上限（1 MiB 足以容纳任何 PEM
+// 链），超限直接拒绝——整份超大文本会进 textarea 并触发后续解析/高亮，主线程
+// 卡顿且无收益。读取失败只在 FileReader.onerror 可达（同步 try/catch 包不住
+// 异步读），旧实现的 catch 恒为死代码、失败则静默无反馈。
+const CERT_FILE_MAX_BYTES = 1024 * 1024
+
+const pasteFromFile = (type: 'cert' | 'key'): void => {
+  const input = document.createElement('input')
+  input.type = 'file'
+  // 不放开 `,*`：它让选择器默认展示任意文件，误选二进制后 readAsText 会把
+  // 一堆替换字符写进证书/私钥表单
+  input.accept = '.pem,.crt,.key,.txt'
+
+  input.onchange = (e: Event) => {
+    const file = (e.target as HTMLInputElement).files?.[0]
+    if (!file) return
+    if (file.size > CERT_FILE_MAX_BYTES) {
+      ElMessage.error(`文件超过 ${Math.round(CERT_FILE_MAX_BYTES / 1024)}KB 上限，请手动粘贴证书或私钥内容`)
+      return
     }
-    
-    input.click()
-  } catch (e) {
-    ElMessage.error('读取文件失败')
+
+    const reader = new FileReader()
+    reader.onload = (event) => {
+      const content = event.target?.result
+      if (typeof content !== 'string') {
+        ElMessage.error('读取文件失败，请重试或手动粘贴')
+        return
+      }
+      if (type === 'cert') {
+        wizardForm.tls_cert = content
+      } else {
+        wizardForm.tls_key = content
+      }
+      ElMessage.success('已从文件读取内容')
+    }
+    reader.onerror = () => {
+      ElMessage.error('读取文件失败，请重试或手动粘贴')
+    }
+    reader.readAsText(file)
   }
+
+  input.click()
 }
 
 const openWizard = async (rule?: Rule) => {
@@ -3021,7 +3048,9 @@ const nextStep = (): void => {
     return
   }
   if (currentStep.value === WIZARD_STEP.TLS) {
-    if (tlsDetailError.value) {
+    // 详情失败只影响「手动 TLS」的证书材料：切到 ACME 后证书正文不再参与保存，
+    // 无条件的门会把用户钉死在 TLS 步（横幅文案本身也自述「手动 TLS 配置」）。
+    if (tlsDetailError.value && wizardForm.tls_source === 'manual') {
       ElMessage.warning('证书详情加载失败：请先在 TLS 步骤点「重新加载」')
       return
     }

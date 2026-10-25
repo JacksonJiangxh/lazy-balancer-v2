@@ -26,10 +26,13 @@ test('引用列表仅精确条目可移除，removed=false 不得报成功', () 
   // 语句级限段用**下一条语句声明**作终点（结构边界），不再用行首注释——
   // 语句内插入一行注释就会提前截断（假红）。两个赋值必须各自按本侧 refs +
   // 精确条目双重过滤。
-  const trustBlock = section(text, 'view.removableTrustRefLists = ipLists.value', '\n  const aclRefIds')
-  assert.match(trustBlock, /trustRefIds\.includes\(l\.id\)/, '信任引用移除列表必须按信任 refs 过滤')
+  // 可移除信任列表单源 trustListsForRefs：refs 过滤 + 精确条目命中在同一处双门
+  // （列表渲染与「取消信任」的写回路径必须算出同一集合，各算一份会漂移）。
+  const trustBlock = section(text, 'const trustListsForRefs =', 'const rowView =')
+  assert.match(trustBlock, /refIds\.includes\(l\.id\)/, '信任引用移除列表必须按信任 refs 过滤')
   assert.match(trustBlock, /ipExactListIds\.value\.has\(l\.id\)/, '信任引用移除列表必须过滤为精确条目命中')
   assert.match(trustBlock, /\.map\(\(l\) => \(\{ id: l\.id, name: l\.name \}\)\)/)
+  assert.match(text, /view\.removableTrustRefLists = trustListsForRefs\(trustRefIds\)/, '行渲染必须复用该单源')
   const aclBlock = section(text, 'view.removableRefLists = ipLists.value', '\n  const { detectionOwner')
   assert.match(aclBlock, /ip_acl_list_refs\)\.includes\(l\.id\)/, 'ACL 引用移除列表必须按 ACL refs 过滤')
   assert.match(aclBlock, /ipExactListIds\.value\.has\(l\.id\)/, 'ACL 引用移除列表必须过滤为精确条目命中')

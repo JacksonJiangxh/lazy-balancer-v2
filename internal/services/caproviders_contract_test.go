@@ -22,7 +22,7 @@ func TestNormalizeCAProviderBounds(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ in, want int }{
-		{-1, 1000}, {0, 1000}, {1000, 1000}, {60000, 60000}, {60001, 60001},
+		{-1, 2000}, {0, 2000}, {1000, 1000}, {2000, 2000}, {60000, 60000}, {60001, 60001},
 	} {
 		if got := NormalizeCAProviderMinIntervalMS(tc.in); got != tc.want {
 			t.Errorf("NormalizeCAProviderMinIntervalMS(%d)=%d, want %d", tc.in, got, tc.want)
@@ -156,8 +156,8 @@ func TestUpdateCAProvider_nameAtLimitAndZeroNormalizationPersist(t *testing.T) {
 	if storedName != okName {
 		t.Fatalf("name=%q, want 100-rune name", storedName)
 	}
-	if storedMax != 1 || storedMin != 1000 {
-		t.Fatalf("max=%d min=%d, want 归一 1/1000", storedMax, storedMin)
+	if storedMax != 1 || storedMin != 2000 {
+		t.Fatalf("max=%d min=%d, want 归一 1/2000", storedMax, storedMin)
 	}
 	if updated.Name == "" {
 		t.Fatal("旧行快照缺失（审计基线契约）")

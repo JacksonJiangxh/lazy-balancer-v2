@@ -136,7 +136,8 @@ func loadIPListEntriesForAllow(q ipListQueryer, ids []int64) (map[int64][]string
 // allowEffectiveListNonEmpty 判定 allow 模式的生效集合是否非空：内联条目 ∪
 // 全部引用名单的**实际条目**并集（不要求每个引用名单非空）。旧写侧
 // 门只看引用个数，引用一个空名单即落库「启用 allow + 空生效集」——发射端
-// len>0 门静默跳过 ACL，实际效果是放行全部。查询失败返回错误，
+// 现对空交集恒发 deny（fail-closed，锁死全部请求），不再静默跳过 ACL；写侧
+// 本门是防「保存即全站 403」的 UX 门，不是防绕过门。查询失败返回错误，
 // 调用方按 500 处理（不得按空集合或非空猜测）。
 func allowEffectiveListNonEmpty(q ipListQueryer, inlineRaw, refsRaw string) (bool, error) {
 	var inline []string
@@ -515,8 +516,26 @@ func validateIPListShape(name, description, category, entriesJSON string) ([]mod
 		if len([]rune(entry.Remark)) > ipListMaxRemarkLength {
 			return nil, 0, fmt.Errorf("条目 %d 的备注长度不能超过 %d 个字符", i+1, ipListMaxRemarkLength)
 		}
+		// 备注控制字符门：导出件以「值 空格 备注」逐行组文本，备注里的换行
+		// 会造出多一行伪条目（导出再被当名单导入即误加 IP），制表/回车同样
+		// 破坏行结构；前端展示也会断行。此处是备注写入的唯一收口（新建/整表
+		// 保存共用），故按单源拒绝。
+		if hasIPListRemarkControlChar(entry.Remark) {
+			return nil, 0, fmt.Errorf("条目 %d 的备注不能包含换行、制表符或其他控制字符", i+1)
+		}
 	}
 	return entries, prunedExpired, nil
+}
+
+// hasIPListRemarkControlChar 报告备注是否含 C0/C1 控制字符或 DEL
+// （含 \n \r \t）。备注是单行展示/导出的文本字段，控制字符无正常用途。
+func hasIPListRemarkControlChar(remark string) bool {
+	for _, r := range remark {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return true
+		}
+	}
+	return false
 }
 
 type ipListRefPolicy struct {
@@ -936,25 +955,26 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		entriesJSON = string(marshaled)
 	}
 	// 条目清空 + 本列表被 allow 模式策略引用 → 该策略
-	// 生效名单变空 → 发射端 fail-open(「其余一律拒绝」实际全放行)且 UI
-	// 仍宣称 IP 控制已启用。判据必须与 RemoveIPListEntry 同源——
+	// 生效名单变空 → 渲染侧对空交集恒发 deny（fail-closed：拒绝所有请求，
+	// 而非旧文档所称的「放行全部」），UI 却仍宣称 IP 控制已启用。判据必须与
+	// RemoveIPListEntry 同源——
 	// 走 allowEmptyingBlockedByPolicies 的「并集是否为空」语义（策略内联或
-	// 其他引用名单仍有条目时清空本列表不会放行全部请求），此前按「是否被
+	// 其他引用名单仍有条目时清空本列表不会锁死全部请求），此前按「是否被
 	// 引用」一律 409 的偏严口径给出的文案在并集非空时是假的。
 	// entries 已是生效集合（到期条目在 validateIPListShape 剔除），因此
 	// 「仅剩已到期条目」的保存同样走本门——否则渲染侧
-	// （AutobanActiveEntries）生效集为空 = allow 策略放行全部。
+	// （AutobanActiveEntries）生效集为空 = allow 策略恒拒全部请求。
 	if req.Entries != nil && len(entries) == 0 {
 		blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, nil)
 		if berr != nil {
-			// 守卫查询失败 fail-closed——静默放行
-			// 「清空被 allow 引用的列表」正是要防的发射端 fail-open 形态。
+			// 守卫查询失败 fail-closed——静默放行「清空被 allow 引用的列表」
+			// 正是要防的「保存即全站 403」形态。
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("校验 IP 列表引用失败", berr)})
 			return
 		}
 		if blocked {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409,
-				Message: "清空后会使引用它的白名单策略生效集合为空（空名单会拒绝所有请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
+				Message: "清空后会使引用它的白名单策略生效集合为空（空名单会拒绝该策略的全部请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
 			return
 		}
 	}

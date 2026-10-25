@@ -6,8 +6,11 @@ package services
 // 各处必须命中同一份缓存。
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -159,5 +162,62 @@ func TestGetCRSRuleIndex_missingDirYieldsEmptyRules(t *testing.T) {
 	}
 	if index.Has("942100") {
 		t.Fatalf("empty index must not report any id")
+	}
+}
+
+// 权限位纳入索引缓存键：chmod 致不可读后 count/mtime/size 不变，旧键会让
+// 「读失败」被健康缓存掩盖（存在性/选组判定停留在旧代）。
+func TestCRSRuleIndexCacheKey_includesMode(t *testing.T) {
+	dir := t.TempDir()
+	old := CRSRuleIndexDir
+	CRSRuleIndexDir = dir
+	t.Cleanup(func() { CRSRuleIndexDir = old })
+	path := filepath.Join(dir, "REQUEST-900.conf")
+	if err := os.WriteFile(path, []byte("SecRule 1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := crsRuleIndexCacheKey("v1")
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if second := crsRuleIndexCacheKey("v1"); second == first {
+		t.Fatalf("权限变化必须改变缓存键（否则不可读故障命中健康缓存）: %q", first)
+	}
+}
+
+// 单文件读失败不得静默：整份规则文件的 ID 会从索引消失（存在性 400/选组
+// 静默少发射），必须留痕。
+func TestBuildCRSRuleIndex_logsReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	old := CRSRuleIndexDir
+	CRSRuleIndexDir = dir
+	t.Cleanup(func() { CRSRuleIndexDir = old })
+	unreadable := filepath.Join(dir, "REQUEST-942-SQLI.conf")
+	if err := os.WriteFile(unreadable, []byte(`SecRule X "@rx a" "id:942100,phase:2,deny,msg:'x'"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+	auditFailureLogMu.Lock()
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	t.Cleanup(func() {
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = map[string]time.Time{}
+		auditFailureLogMu.Unlock()
+	})
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	index := buildCRSRuleIndex("v1")
+	if index.Has("942100") {
+		t.Fatal("读失败文件的规则不得出现在索引")
+	}
+	if out := logs.String(); !strings.Contains(out, "REQUEST-942-SQLI.conf") || !strings.Contains(out, "读取") {
+		t.Fatalf("读失败必须按文件留痕，日志=%q", out)
 	}
 }

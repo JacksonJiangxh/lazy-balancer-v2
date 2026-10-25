@@ -21,12 +21,12 @@ import (
 // 域名适用性（certJobRuleApplicable）与「证书是否仍在有效期」不属于本谓词：
 // 前者由各消费方按规则当前域名单独判定，后者只能解析证书后判定（SQL 表达不了）。
 
-// CertJobCandidatePredicateSQL 返回「持有非空证书材料」的 SQL 谓词（不判
-// status）。渲染候选装载故意保留 disabled 行（SelectCertificate 后置跳过，
+// certJobCandidatePredicateSQL 返回「持有非空证书材料」的 SQL 谓词（不判
+// status）。渲染候选装载故意保留 disabled 行（selectCertificate 后置跳过，
 // 过期回退展示仍需该行；由 TestACMECertCandidatesForRule_preparses_leaf 钉住
 // 「候选数含 disabled」），但 PEM 判空口径必须与 Go 侧 CertJobMaterialUsable
 // 同源——渲染面把空白 PEM 当有材料会让物化把它写盘。
-func CertJobCandidatePredicateSQL(alias string) string {
+func certJobCandidatePredicateSQL(alias string) string {
 	prefix := ""
 	if alias != "" {
 		prefix = alias + "."
@@ -41,7 +41,7 @@ func CertJobCandidatePredicateSQL(alias string) string {
 // CertJobMaterialPredicateSQL 返回「持有可服务证书材料」的 SQL 谓词。alias 为
 // 列前缀（如 "j"），空串=裸列名。所有涉及材料可用性的 SQL 必须复用本函数，
 // 不得另写条件组合；候选装载（需保留 disabled 行）复用其组成部分
-// CertJobCandidatePredicateSQL。
+// certJobCandidatePredicateSQL。
 //
 // 判空必须是 trim 后的判空：只比较 ” 会把 ' ' 这类空白材料当作「有材料」，
 // 而 Go 侧 CertJobMaterialUsable（TrimSpace）判为无材料——同一行在 SQL 扫描
@@ -53,15 +53,15 @@ func CertJobMaterialPredicateSQL(alias string) string {
 	if alias != "" {
 		prefix = alias + "."
 	}
-	return CertJobCandidatePredicateSQL(alias) + " AND COALESCE(" + prefix + "status,'') <> 'disabled'"
+	return certJobCandidatePredicateSQL(alias) + " AND COALESCE(" + prefix + "status,'') <> 'disabled'"
 }
 
-// CertJobMissingMaterialPredicateSQL 是 CertJobMaterialPredicateSQL 的逻辑取反。
+// certJobMissingMaterialPredicateSQL 是 CertJobMaterialPredicateSQL 的逻辑取反。
 // 取反必须经 COALESCE 归一到布尔：SQL 三值逻辑下 NOT(NULL) 仍是 NULL，材料列
 // 为 NULL（任务行创建时的默认形态——签发中断从未写入，正是「材料丢失」最常见
 // 的形态）会被 `NOT (predicate)` 静默排除，而不是被当作「无材料」回收。
 // 正向与取反共用同一表达式，不得另写条件组合。
-func CertJobMissingMaterialPredicateSQL(alias string) string {
+func certJobMissingMaterialPredicateSQL(alias string) string {
 	return "NOT COALESCE(" + CertJobMaterialPredicateSQL(alias) + ", 0)"
 }
 

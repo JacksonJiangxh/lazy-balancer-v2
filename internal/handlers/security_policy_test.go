@@ -1370,3 +1370,63 @@ func TestUpdateSecurityPolicy_builtinListInStoredCRSExclusionsRejected(t *testin
 		t.Fatalf("ip_acl_mode=%q, want 未变更的 deny", mode)
 	}
 }
+
+// 缺省 policy_type 的推断路径（API/MCP 省略类型）与显式类型路径同口径归一
+// 拦截状态码：无拦截页的 deny 恒 403，落 404 会让详情/列表宣称一个不生效的值。
+func TestCreateSecurityPolicy_inferredTypeNormalizesBlockStatusCode(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+
+	// 空内容 → 推断 stage3；无 block_page_id + 显式 404。
+	id := createTestPolicy(t, router, map[string]any{
+		"name":              "推断类型状态码",
+		"block_status_code": 404,
+	})
+	var code int
+	if err := db.DB.QueryRow(`SELECT COALESCE(block_status_code,0) FROM security_policies WHERE id=?`, id).Scan(&code); err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("block_status_code=%d, want 0（无页策略的 deny 恒 403，写侧必须归一）", code)
+	}
+}
+
+// 同一载荷在创建/更新两端必须得到相同结果码：归一先于校验是两端的共同契约。
+// 旧实现 Create 先校验 CRS 再按类型归零（阶段外字段本应被丢弃却报 400），
+// Update 先校验 IP 列表再归一空串（" " 直接 json.Unmarshal 失败 400）。
+func TestSecurityPolicy_normalizeBeforeValidateParity(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+
+	// 显式 stage1 + 阶段外 CRS 载荷：Create 必须先按类型归零再校验（旧实现
+	// 先校验 → 400「规则 ID 不存在」，而该字段本应被丢弃）。
+	// Update 侧对「显式类型 + 阶段外字段」走矛盾载荷显式拒绝（400）——两条
+	// 写路径的既定分工：Create 归零、Update 拒绝二义，故此处不要求同码。
+	id := createTestPolicy(t, router, map[string]any{
+		"name":            "阶段一-忽略CRS",
+		"policy_type":     "stage1",
+		"crs_rule_groups": `["999999"]`,
+	})
+	var storedGroups string
+	if err := db.DB.QueryRow(`SELECT COALESCE(crs_rule_groups,'') FROM security_policies WHERE id=?`, id).Scan(&storedGroups); err != nil {
+		t.Fatal(err)
+	}
+	if storedGroups != "[]" {
+		t.Fatalf("crs_rule_groups=%q, want []（阶段外字段必须归零后落库）", storedGroups)
+	}
+
+	// 空白 IP 列表串：两端都必须先归一为 "[]" 再校验。
+	createBlank := postJSON(t, router, "/security/policies", map[string]any{
+		"name":        "空白列表",
+		"ip_acl_list": " ",
+	})
+	if createBlank.Code != http.StatusOK {
+		t.Fatalf("create 空白 ip_acl_list status=%d body=%s, want 200", createBlank.Code, createBlank.Body.String())
+	}
+	updateBlank := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
+		"ip_acl_list": " ",
+	})
+	if updateBlank.Code != http.StatusOK {
+		t.Fatalf("update 空白 ip_acl_list status=%d body=%s, want 200（归一先于校验）", updateBlank.Code, updateBlank.Body.String())
+	}
+}

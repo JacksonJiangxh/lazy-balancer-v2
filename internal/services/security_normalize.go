@@ -39,8 +39,9 @@ var legacySecurityEnumBackfills = []string{
 	// 429 已剔除出拦截状态码白名单（限流专用语义，
 	// overviewmetrics.go 限流卡片按 code=429 计数，WAF 拦截页 429 会混入
 	// 限流指标口径）——存量 429 行归一为默认拦截状态码 403。
-	// security_block_pages 无 status_code 列（db.go:492-502，遗留列口径见
-	// db.go:1234-1236），429 仅可能存于 security_policies。
+	// security_block_pages 无 status_code 列（建表见 db.go 的
+	// security_block_pages CREATE TABLE；遗留列由 runMigrations 的
+	// dropColumnIfExists 清单清除），429 仅可能存于 security_policies。
 	// 库值唯一真相（批 3）：从 `=429` 扩为枚举外全集（写侧白名单 0/400/401/
 	// 403/404/503，0=未设置跟随默认 403 为类型②省略型合法值）——旧备份/带外
 	// 脏值（如 418）随启动归一，渲染层不再消费枚举外状态码。

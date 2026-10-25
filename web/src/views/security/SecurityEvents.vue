@@ -209,8 +209,8 @@
                  WAF（CRS=详情+快捷排除弹框；自定义=规则详情弹框）/ 请求体异常（纯文本） -->
             <AccessibleLink v-if="stageCategory(row) === 'waf'" type="primary" @click="openTriggerDetail(row)">WAF</AccessibleLink>
             <AccessibleLink v-else-if="['acl', 'crawler', 'trust'].includes(stageCategory(row))" type="primary" @click="openTriggerDetail(row)">{{ stageLabel(row) }}</AccessibleLink>
-            <el-tooltip v-else-if="showTriggeredMsg(row)" :content="row.rule_msg" placement="top" :show-after="200">
-              <span class="cell-tip">{{ stageLabel(row) }}</span>
+            <el-tooltip v-else-if="showTriggeredMsg(row)" :content="row.rule_msg" placement="top" :show-after="200" :trigger="['hover', 'focus']">
+              <span class="cell-tip" tabindex="0" :aria-label="row.rule_msg">{{ stageLabel(row) }}</span>
             </el-tooltip>
             <span v-else>{{ stageLabel(row) }}</span>
           </template>
@@ -958,6 +958,7 @@ const refreshPage = (): void => {
 .filter-actions .el-button { padding-left: 12px; padding-right: 12px; }
 .filter-actions .el-button + .el-button { margin-left: 8px; }
 .cell-tip { cursor: help; border-bottom: 1px dashed #c0c4cc; }
+.cell-tip:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; border-radius: 2px; }
 
 
 /* —— 请求上下文详情弹框 —— */

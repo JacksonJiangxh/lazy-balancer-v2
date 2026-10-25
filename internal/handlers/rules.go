@@ -885,6 +885,22 @@ func recordRuleWriteFailure(c *gin.Context, verb, phase string, err error) {
 	}
 }
 
+// respondCAProviderResolveFailure 是「生效 CA 提供商不可解析」的统一分类：
+// 「跟随默认」解析不到任何启用提供商是用户可修复的配置状态（管理端可添加/
+// 启用提供商，或为规则显式选择）——400 + 可操作指引；DB 驱动/IO 故障才是
+// 500 并留痕。创建/更新/启用三条写路径共用同一分类，避免状态码与文案漂移。
+//
+// 调用点必须是写前门：在事务提交与 Caddy 应用之前判定，否则一个可写前判定
+// 的前置条件会被拖到提交后以 500 整体回滚（一次真实 apply 白做）。
+func respondCAProviderResolveFailure(c *gin.Context, verb string, resolveErr error) {
+	if errors.Is(resolveErr, sql.ErrNoRows) {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "没有可用的 CA 提供商，请先在 CA 提供商页面添加并启用"})
+		return
+	}
+	recordRuleWriteFailure(c, verb, "解析 CA 提供商失败", resolveErr)
+	writeInternalError(c, http.StatusInternalServerError, "解析 CA 提供商失败", resolveErr)
+}
+
 // rollbackRuleWriteTx 规则写端点早退路径的事务回滚：回滚失败必须留一行日志
 // （SQLite busy/IO 时写锁可能滞留，缺这行排障就少了关键证据）；ErrTxDone
 // 表示事务已结束（提交失败路径或 defer 兜底已回滚），不构成失败。调用点仍在
@@ -1557,15 +1573,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	if req.Protocol == "http" && req.EnableTLS && req.TLSSource == "acme_dns" {
 		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(req.CAProviderID)
 		if resolveErr != nil {
-			// 「跟随默认」解析不到任何启用提供商（管理端删除/禁用全部 CA 提供商）
-			// 是可执行的配置状态而非服务器故障——4xx + 可操作指引，避免把用户
-			// 可修复的前置条件报成 500。DB 故障（驱动/IO）才走 500 + 失败审计。
-			if errors.Is(resolveErr, sql.ErrNoRows) {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "没有可用的 CA 提供商，请先在 CA 提供商页面添加并启用"})
-				return
-			}
-			recordRuleWriteFailure(c, "创建", "解析 CA 提供商失败", resolveErr)
-			writeInternalError(c, http.StatusInternalServerError, "解析 CA 提供商失败", resolveErr)
+			// 单源分类：「跟随默认」解析不到任何启用提供商是可执行的配置状态
+			// （400 + 可操作指引），DB 故障（驱动/IO）才走 500 + 失败审计。
+			respondCAProviderResolveFailure(c, "创建", resolveErr)
 			return
 		}
 		req.CAProviderID = resolvedCAProviderID
@@ -2545,6 +2555,23 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
+	// 生效 CA 提供商必须在写前可解析：「跟随默认」解析不到任何启用提供商是
+	// 用户可修复的配置状态（400 + 指引），不是服务端故障。此前该判定发生在
+	// 事务提交 + /load 之后——一个可在写前判定的前置条件把已提交的更新整体
+	// 回滚成 500（一次真实 apply 白做）。前移后，提交后的解析分支只剩并发
+	// 变更/DB 故障面。
+	if *req.EnableTLS && req.TLSSource == "acme_dns" && req.Protocol == "http" && req.Domain != "" {
+		if _, resolveErr := services.ResolveCAProviderID(*req.CAProviderID); resolveErr != nil {
+			respondCAProviderResolveFailure(c, "更新", resolveErr)
+			return
+		}
+		// 存量 CA 是提交后迁移比较的输入（判定是否需要重新签发）；它不可解析
+		// 同样属于写前可判定的配置状态（导入还原留下 ca=0 + 零启用提供商）。
+		if _, resolveExistingErr := services.ResolveCAProviderID(existingRule.CAProviderID); resolveExistingErr != nil {
+			respondCAProviderResolveFailure(c, "更新", resolveExistingErr)
+			return
+		}
+	}
 	// 同端口 TLS/明文混布拦截(更新方向)——nil=保留现值,合并后判定。
 	if req.Protocol == "http" {
 		effTLS := existingRule.EnableTLS
@@ -3114,6 +3141,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if *req.EnableTLS && req.TLSSource == "acme_dns" && req.Protocol == "http" && domain != "" {
 		// 同族：合并区已保证 req.CAProviderID 非 nil，
 		// 原 if 判空恒真，直接解引用。
+		// 写前门已判定两侧 CA 皆可解析（无可用提供商=400，未提交任何状态），
+		// 此处的解析失败只剩并发禁用/删除与 DB 故障面——保留补偿链与 500。
 		caProviderID := *req.CAProviderID
 		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(caProviderID)
 		resolvedExistingCAProviderID, resolveExistingErr := services.ResolveCAProviderID(existingRule.CAProviderID)
@@ -4495,6 +4524,16 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
 		}
+		// 写前解析生效 CA 提供商：无可用提供商是用户可修复的配置状态
+		// （400 + 指引）。此前在提交 + /load 之后才解析——一个可写前判定的
+		// 前置条件把已提交的启用整体回滚成 500。解析结果供提交后入队直接使用，
+		// 提交后不再有「解析 CA 提供商失败」分支。
+		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(caProviderID)
+		if resolveErr != nil {
+			respondCAProviderResolveFailure(c, "启用", resolveErr)
+			return
+		}
+		caProviderID = resolvedCAProviderID
 		certJobsSnapshot, err = services.SnapshotCertJobsForRule(caddyID)
 		if err != nil {
 			recordRuleWriteFailure(c, "启用", "备份证书任务失败", err)
@@ -4684,12 +4723,8 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	domain := ruleDomain
 	services.Logf("info", "EnableRule TLS state for caddy_id=%s: enableTLS=%v tlsSource=%s domain=%s caProviderID=%d", caddyID, enableTLS, tlsSource, domain, caProviderID)
 	if isACME {
-		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(caProviderID)
-		if resolveErr != nil {
-			failEnable("解析 CA 提供商失败", resolveErr)
-			return
-		}
-		caProviderID = resolvedCAProviderID
+		// CA 提供商已在写前门解析（无可用提供商=400，未提交任何状态），
+		// 此处直接使用解析结果，不再引入提交后失败的解析分支。
 		queueManager = services.GetCAQueueManager()
 		enqueueCertJob := func() error {
 			jobID, changed, enqueueErr := createOrRequeueCertJobVerified(caddyID, domain, caProviderID, queueManager)

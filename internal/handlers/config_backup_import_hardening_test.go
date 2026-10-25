@@ -513,6 +513,54 @@ func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	}
 }
 
+// 备份缺 system=1 爬虫行时（v2.3.8 前导出/用户裁剪），导入提交后必须逐引擎
+// 补种内置首版：只 rebuild 不播种会让缺失引擎在 DB 与运行快照里同时缺席，
+// iprange 引擎（so360spider）的豁免与伪装检测静默失效到重启为止。
+func TestImportConfigBackup_seedsMissingCrawlerLists(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedAdminShared(t)
+	snapshotPath := filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(services.SetCrawlerIPListFileForTest(snapshotPath))
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"security"}, Tables: map[string][]map[string]any{
+		"security_crawler_sources": {{"name": "googlebot", "url": "https://developers.google.com/static/crawling/ipranges/common-crawlers.json", "format": "json", "update_enabled": 1}},
+		"security_ip_lists":        {{"id": 41, "name": services.CrawlerIPListName("googlebot"), "category": "搜索引擎爬虫", "entries": `[{"value":"198.51.100.0/24"}]`, "system": 1}},
+	}, Config: nil})
+
+	response := postBackupImport(t, h, body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+
+	// DB：四个内置引擎行全部在位（导入的 googlebot 行保留原条目）。
+	for _, name := range services.CrawlerSystemListNames() {
+		var n int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("内置爬虫名单 %q 行数=%d, want 1（导入后必须逐引擎补种）", name, n)
+		}
+	}
+
+	// 运行快照：每个内置引擎都有非空段集（缺项会让插件对该引擎判 Transient）。
+	raw, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot map[string][]string
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"googlebot", "bingbot", "gptbot", "so360spider"} {
+		if len(snapshot[name]) == 0 {
+			t.Fatalf("运行快照缺引擎 %q 的段集: %s", name, raw)
+		}
+	}
+	if len(snapshot["googlebot"]) != 1 || snapshot["googlebot"][0] != "198.51.100.0/24" {
+		t.Fatalf("导入的 googlebot 条目被覆盖: %v", snapshot["googlebot"])
+	}
+}
+
 // runtime retention fields follow the save-side bounds.
 func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing.T) {
 	tests := []struct {

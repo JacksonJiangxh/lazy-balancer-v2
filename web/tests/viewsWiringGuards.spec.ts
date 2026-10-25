@@ -252,7 +252,7 @@ test('信任关联写动作确认前即占位（双击不再叠确认框）', ()
 test('restart 就绪响应落地后 reload 前复查 isDisposed', () => {
   // 原断言取 260 字符窗口——isDisposed 与 reload 可来自无关语句。
   // 改为函数级限段 + 顺序断言：状态请求成功后的 dispose 复查必须紧邻 reload。
-  const body = section(code('src/utils/restart.ts'), 'const reloadAfterRestart = async', 'export interface RestartServiceOptions')
+  const body = section(code('src/utils/restart.ts'), 'const reloadAfterRestart = async', 'interface RestartServiceOptions')
   const statusAt = body.indexOf("await request.get('/caddy/status'")
   assert.ok(statusAt > 0, '缺就绪探测')
   const afterStatus = body.slice(statusAt)

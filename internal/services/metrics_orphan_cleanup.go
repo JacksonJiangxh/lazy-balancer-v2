@@ -76,7 +76,15 @@ func PurgeOrphanMetricsHistory(ctx context.Context) (int, error) {
 	deletedRules := 0
 	for _, ruleID := range pending {
 		for {
-			result, execErr := db.MetricsDB.ExecContext(ctx,
+			// 每批重读句柄：关停排空超时后 db.Close() 才执行（并把
+			// MetricsDB 置 nil），在途轮可能在下一批撞上 nil——入口只判一次
+			// 不足以防 nil 解引用 panic。nil 时返回可见错误（任务落 failed），
+			// 已删批次不可逆但计数如实。
+			metricsDB := db.MetricsDB
+			if metricsDB == nil {
+				return deletedRules, errMetricsDBUnavailable
+			}
+			result, execErr := metricsDB.ExecContext(ctx,
 				`DELETE FROM metrics_history WHERE rowid IN (SELECT rowid FROM metrics_history WHERE rule_id = ? LIMIT ?)`,
 				ruleID, batch)
 			if execErr != nil {
@@ -89,6 +97,11 @@ func PurgeOrphanMetricsHistory(ctx context.Context) (int, error) {
 			// 本批未打满=该规则已清空，处理下一条。
 			if deleted < int64(batch) {
 				deletedRules++
+				// 清空最后一条后仍须以取消态收尾：否则任务取消/关停被当作
+				// 清理完成（success），与「本轮只删掉了部分规则」的事实不符。
+				if err := ctx.Err(); err != nil {
+					return deletedRules, err
+				}
 				break
 			}
 			if err := ctx.Err(); err != nil {
@@ -123,8 +136,14 @@ func liveRuleIDs(ctx context.Context) (map[string]bool, error) {
 }
 
 // orphanMetricsRuleIDs 读取 metrics 库出现过的非 NULL rule_id（去重排序）。
+// 句柄先取值再判 nil（与 PurgeOrphanMetricsHistory 每批重读同源）：关停时
+// db.Close() 置 nil，入口判过非 nil 之后这里仍可能撞上 nil。
 func orphanMetricsRuleIDs(ctx context.Context) ([]string, error) {
-	rows, err := db.MetricsDB.QueryContext(ctx, `SELECT DISTINCT rule_id FROM metrics_history WHERE rule_id IS NOT NULL`)
+	metricsDB := db.MetricsDB
+	if metricsDB == nil {
+		return nil, errMetricsDBUnavailable
+	}
+	rows, err := metricsDB.QueryContext(ctx, `SELECT DISTINCT rule_id FROM metrics_history WHERE rule_id IS NOT NULL`)
 	if err != nil {
 		return nil, err
 	}

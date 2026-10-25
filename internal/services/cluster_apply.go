@@ -355,7 +355,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
 		}
 	}
-	logSyncSwitchGuards(s.db, snapshot, skip, switches)
+	logSyncSwitchGuards(ctx, s.db, snapshot, skip, switches)
 
 	// 门控常态只走 wafFilesDrifted（stat 签名缓存 + 含版本标签的记账比对），
 	// 不再每次 apply 对 CRS 全树 tar.gz+xdb 做全量内容哈希；仅当本轮记账
@@ -377,27 +377,30 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		// （持 CaddyOpLock 再取 wafFileMu 即 AB-BA）。
 		var aerr error
 		if ferr == nil {
-			WafFileLock().Lock()
-			if syncWafFileLockHook != nil {
-				syncWafFileLockHook()
-			}
-			crsChanged, xdbChanged, threatChanged, aerr = ApplyWafFileBundle(bundle)
-			if aerr == nil {
-				// 收口（SecurityEngine 域移交）：主端删除威胁源后，从端
-				// 残留 threat-<source>.iplist.fast 会让 wafFilesRefDiffers /
-				// wafFilesDrifted 恒判漂移——每轮全量重拉却永不删除，且
-				// 全量重拉永不收敛。应用成功后按主端引用集合真实收敛本地
-				// 文件集（删除失败留下警告，下轮漂移判定重试；方向安全）。
-				pruned, pruneErr := pruneSyncedThreatFiles(snapshot.WafFiles)
-				if pruneErr != nil {
-					Logf("warn", "同步安全数据：威胁库残留文件清理失败（下轮漂移重试）: %v", pruneErr)
+			// defer 释放：本函数在 gin 路由栈内（手动同步端点装了 gin.Recovery），
+			// 临界区内 panic 被恢复为 500 时裸 Unlock 永不执行——包级锁永久泄漏，
+			// 后续重载/导入/规则库更新/同步全部阻塞且无持有者诊断信息。
+			withWafFileLock(func() {
+				if syncWafFileLockHook != nil {
+					syncWafFileLockHook()
 				}
-				if len(pruned) > 0 {
-					threatChanged = true
-					Logf("info", "同步安全数据：清理主端已删除威胁源的本地残留文件: %s", strings.Join(pruned, "、"))
+				crsChanged, xdbChanged, threatChanged, aerr = ApplyWafFileBundle(bundle)
+				if aerr == nil {
+					// 收口（SecurityEngine 域移交）：主端删除威胁源后，从端
+					// 残留 threat-<source>.iplist.fast 会让 wafFilesRefDiffers /
+					// wafFilesDrifted 恒判漂移——每轮全量重拉却永不删除，且
+					// 全量重拉永不收敛。应用成功后按主端引用集合真实收敛本地
+					// 文件集（删除失败留下警告，下轮漂移判定重试；方向安全）。
+					pruned, pruneErr := pruneSyncedThreatFiles(snapshot.WafFiles)
+					if pruneErr != nil {
+						Logf("warn", "同步安全数据：威胁库残留文件清理失败（下轮漂移重试）: %v", pruneErr)
+					}
+					if len(pruned) > 0 {
+						threatChanged = true
+						Logf("info", "同步安全数据：清理主端已删除威胁源的本地残留文件: %s", strings.Join(pruned, "、"))
+					}
 				}
-			}
-			WafFileLock().Unlock()
+			})
 		}
 		if ferr != nil {
 			Logf("error", "同步安全数据失败（数据库版本行已同步）: %v", ferr)
@@ -460,19 +463,21 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || brandingWritten || reloadCompensation
 	var reloadErr error
 	if mustReload {
-		CaddyOpLock.Lock()
-		if syncReloadLockHook != nil {
-			syncReloadLockHook()
-		}
-		if s.caddy == nil {
-			// nil CaddyService 是合法构造（测试/独立运维路径）。
-			// 按「不可判定」走既有重载失败标记语义（marker→304 补偿重拉），
-			// 而不是解引用 panic。
-			reloadErr = errors.New("Caddy 服务未初始化")
-		} else {
-			reloadErr = s.caddy.ApplyConfigForce(GenerateCaddyConfig())
-		}
-		CaddyOpLock.Unlock()
+		// defer 释放：panic（gin.Recovery 恢复）后包级锁不得泄漏——否则后续
+		// 全部配置写窗口永久不可用。
+		withCaddyOpLock(func() {
+			if syncReloadLockHook != nil {
+				syncReloadLockHook()
+			}
+			if s.caddy == nil {
+				// nil CaddyService 是合法构造（测试/独立运维路径）。
+				// 按「不可判定」走既有重载失败标记语义（marker→304 补偿重拉），
+				// 而不是解引用 panic。
+				reloadErr = errors.New("Caddy 服务未初始化")
+			} else {
+				reloadErr = s.caddy.ApplyConfigForce(GenerateCaddyConfig())
+			}
+		})
 	}
 	if reloadErr != nil {
 		err := reloadErr
@@ -840,7 +845,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 					}
 				}
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'') FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(expiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.CreatedAt, cert.UpdatedAt, cert.RuleID); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'') FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, canonicalSnapshotCertDomain(cert.Domain), message, nullableString(expiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.CreatedAt, cert.UpdatedAt, cert.RuleID); err != nil {
 				return fmt.Errorf("写入快照证书 %s: %w", cert.RuleID, err)
 			}
 		}
@@ -1642,6 +1647,17 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 	return nil
 }
 
+// canonicalSnapshotCertDomain 把快照证书行的域串归一为排序规范形；不可规范化
+// （空串/历史畸形形态）时原样返回——空串的 COALESCE 语义（回退规则域）与既有
+// 容错行为保持不变。落库值必须与消费面（任务 upsert 冲突键与精确回查、
+// HasCertJob）的规范串口径一致，否则同规则同域集会在从端并存两行。
+func canonicalSnapshotCertDomain(domain string) string {
+	if canonical, err := CanonicalACMEDomains(domain); err == nil {
+		return canonical
+	}
+	return domain
+}
+
 func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule) error {
 	// 生成式子路由 @id 命名空间保留（与 v2 导入同门）：主端快照若含
 	// <规则ID>_path_<n>/_geoip/_redirect 形态的第二条规则，从端渲染同样会被
@@ -1800,12 +1816,15 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	if settings.BrandingJSON != nil {
 		addBase("branding_json", *settings.BrandingJSON)
 	}
+	// 与主端装载侧共用同一归一（同族 sync_interval/jwt_expire_minutes/
+	// cert_expiry_days/threat_screen_mode 的既有做法）：仅归一「在场但非法」
+	// 的值；nil 是旧主端缺席，跳过而非补默认。归一无条件执行（在 CaddyConfig
+	// 门之前）——装载侧也是无条件归一，apply 侧若受门控，手造/未来构造出
+	// 「CaddyConfig=nil + 数值列非 nil」形态时主端按归一值算 users 节哈希、
+	// 从端保留旧值 → 哈希恒不等（每轮重放+重载）。门只决定是否写入这些列。
+	normalizeSnapshotCaddyNumericSettings(&settings)
 	if snapshot.CaddyConfig != nil {
 		addBase("caddy_config", *snapshot.CaddyConfig)
-		// 与主端装载侧共用同一归一（同族 sync_interval/jwt_expire_minutes/
-		// cert_expiry_days/threat_screen_mode 的既有做法）：仅归一「在场但非法」
-		// 的值；nil 是旧主端缺席，跳过而非补默认。
-		normalizeSnapshotCaddyNumericSettings(&settings)
 		if settings.AccessLogJSON != nil {
 			addBase("access_log_json", *settings.AccessLogJSON)
 		}

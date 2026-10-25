@@ -15,7 +15,10 @@
 
 <script setup lang="ts">
 // 键盘激活：Enter/Space → 合成 click（浏览器对无 href 的 <a> 不提供默认激活行为）。
+// 必须过滤按键自动重复：长按会按系统重复率反复合成 click，落到切换/取数类动作上
+// 会来回切换（结果取决于按住多久）或重复发请求。
 const activate = (event: KeyboardEvent): void => {
+  if (event.repeat) return
   const target = event.currentTarget
   if (target instanceof HTMLElement) target.click()
 }

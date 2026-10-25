@@ -1,6 +1,7 @@
 package services
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,5 +34,42 @@ func TestRuleCount_negativeCacheOnScanFailure(t *testing.T) {
 	m.InvalidateRuleCount()
 	if got := m.RuleCount(); got != 1 {
 		t.Fatalf("失效后 RuleCount=%d, want 1（必须重新扫描）", got)
+	}
+}
+
+// 更新成功后的重扫失败必须让旧正解失效：RuleCount 先判 hasRuleCount、后判
+// retryAfter，只设负缓存不清正解会让 UI 永久显示更新前的规则数（且负缓存
+// 重试路径永不生效）。
+func TestRescanRuleCount_failureClearsStalePositiveCache(t *testing.T) {
+	m := newCRSUpdateManager(func() error { return nil })
+	m.crsDir = t.TempDir()
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-900.conf"), "SecRule a\n")
+	if got := m.RuleCount(); got != 1 {
+		t.Fatalf("前置：RuleCount=%d, want 1", got)
+	}
+
+	// 树被替换成不可读形态（rules 目录删除）→ 重扫失败。
+	if err := os.RemoveAll(filepath.Join(m.crsDir, "rules")); err != nil {
+		t.Fatal(err)
+	}
+	m.rescanRuleCount()
+	m.mu.Lock()
+	has, cachedCount, retryAfter := m.hasRuleCount, m.ruleCount, m.ruleCountRetryAfter
+	m.mu.Unlock()
+	if has {
+		t.Fatalf("重扫失败后 hasRuleCount=true（旧 rule_count=%d 会永久滞留）", cachedCount)
+	}
+	if retryAfter.IsZero() {
+		t.Fatal("重扫失败必须置负缓存截止时刻")
+	}
+	// 负缓存期内返回 0（不再宣称旧值）。
+	if got := m.RuleCount(); got != 0 {
+		t.Fatalf("重扫失败后 RuleCount=%d, want 0（不得回落到陈旧正解）", got)
+	}
+	// 树恢复 + 失效后重扫得新值。
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-900.conf"), "SecRule a\nSecRule b\n")
+	m.InvalidateRuleCount()
+	if got := m.RuleCount(); got != 2 {
+		t.Fatalf("恢复后 RuleCount=%d, want 2", got)
 	}
 }

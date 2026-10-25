@@ -376,6 +376,16 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	if rc != nil && rc.Operator != "" {
 		operator = rc.Operator
 	}
+	// running 复位必须先注册（LIFO 最后执行）：审计 defer 要在 running 仍置位时
+	// 读取本轮终态快照。旧序（审计先注册、复位后注册）让复位先执行，两步之间
+	// StartUpdate 可成功进入并写 checking，旧轮审计读到下一轮状态（「更新检测中
+	// （触发：新）」），本轮真实终态丢失。
+	defer func() {
+		m.mu.Lock()
+		m.running = false
+		m.mu.Unlock()
+	}()
+
 	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）。manager 内联
 	// 结果审计已撤（审计单记——曾是 defer+内联双记）。
 	defer func() {
@@ -405,11 +415,6 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	// runCtx 派生自 rc.Ctx——引擎 demote 中止（SetRole
 	// 取消在途 Scheduled）与手动取消同通道传播；nil rc（测试/内部路径）回退
 	// Background 保持旧语义。ctx 由调用方（StartUpdate/run）预建。
-	defer func() {
-		m.mu.Lock()
-		m.running = false
-		m.mu.Unlock()
-	}()
 
 	// 每次运行起点清空「排程槽未推进」状态：上一轮的读失败不得让本轮成功
 	// 轮仍被引擎判失败（读恢复后必须立即自愈）。

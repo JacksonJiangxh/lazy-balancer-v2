@@ -32,6 +32,15 @@ type middlewareRouteRegistration struct {
 	// 同时按凭证与 IP 计费；单档限流为 0。
 	rateLimitIPPerMin  int
 	rateLimitMessageCN string
+	// group 是注册接收者名（v1/admin/business），line 是注册语句行号：
+	// 「公开（注册于 v1.Use 认证链之前）/受保护」与「admin 组/business 组」
+	// 两种装配态只能由注册位置派生，不能由测试另写一份路由组清单。
+	group string
+	line  int
+	// middleware 是实参区出现的中间件/认证器名（apiKeyAuth、mcpAccessGuard、
+	// clusterTokenAuth、registrationAuth…）——OpenAPI security 契约按真实认证链
+	// 派生，逆向校验 public/mcp/机器端点标注。
+	middleware map[string]bool
 }
 
 // middlewareFuncDecl 取具名函数的声明——限额派生必须读包装器的实现体，
@@ -152,7 +161,13 @@ func middlewareRouteRegistrations(t *testing.T, source []byte) map[string]middle
 		if err != nil {
 			return true
 		}
-		var registration middlewareRouteRegistration
+		registration := middlewareRouteRegistration{
+			line:       fset.Position(call.Pos()).Line,
+			middleware: make(map[string]bool),
+		}
+		if ident, ok := selector.X.(*ast.Ident); ok {
+			registration.group = ident.Name
+		}
 		for _, arg := range call.Args[1:] {
 			// 处理器：实参区里最后一个 h.<Name>（内联闭包里的同样计入）。
 			ast.Inspect(arg, func(node ast.Node) bool {
@@ -162,6 +177,17 @@ func middlewareRouteRegistrations(t *testing.T, source []byte) map[string]middle
 				}
 				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "h" {
 					registration.handler = sel.Sel.Name
+				}
+				return true
+			})
+			// 中间件/认证器名：实参区内的所有调用（顶层与内联闭包内的都计入）。
+			ast.Inspect(arg, func(node ast.Node) bool {
+				callExpr, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if ident, ok := callExpr.Fun.(*ast.Ident); ok {
+					registration.middleware[ident.Name] = true
 				}
 				return true
 			})
@@ -251,6 +277,42 @@ func middlewareSourceForTest(t *testing.T) []byte {
 		t.Fatalf("read middleware.go: %v", err)
 	}
 	return source
+}
+
+// middlewareV1AuthChainLine 返回 v1 组首个 `v1.Use(...)` 的行号：该行之前的
+// v1 注册即公开块（登录/初始化/OIDC/品牌/机器接口），之后才进入
+// apiKeyAuth→jwtAuth→只读门 的认证链。增删公开块路由或把 Use 上移/下移都会
+// 改变派生结果——security 契约反向门据此判定「文档宣称匿名可用」是否成立。
+func middlewareV1AuthChainLine(t *testing.T, source []byte) int {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "middleware.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse middleware.go: %v", err)
+	}
+	line := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "Use" {
+			return true
+		}
+		ident, ok := selector.X.(*ast.Ident)
+		if !ok || ident.Name != "v1" || len(call.Args) == 0 {
+			return true
+		}
+		if position := fset.Position(call.Pos()).Line; line == 0 || position < line {
+			line = position
+		}
+		return true
+	})
+	if line == 0 {
+		t.Fatal("未能从 middleware.go 派生 v1.Use 认证链起点（装配形态变化，扫描器需跟进）")
+	}
+	return line
 }
 
 // 派生扫描器的鉴别力：闭包形态（/mcp）与多行注册都必须在集合里，且处理器

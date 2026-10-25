@@ -3,6 +3,7 @@ package models
 import (
 	"database/sql"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -63,18 +64,18 @@ func TestClusterAccessURLHostMatchesIP(t *testing.T) {
 	}
 }
 
-func TestGlobalConfig_serializes_DNS_credentials(t *testing.T) {
-	// Given
-	config := GlobalConfig{DNSCredentials: "id,token"}
-
-	// When
-	data, err := json.Marshal(config)
-	// Then
-	if err != nil {
-		t.Fatalf("marshal GlobalConfig: %v", err)
-	}
-	if !strings.Contains(string(data), `"dns_credentials":"id,token"`) {
-		t.Fatalf("GlobalConfig JSON=%s, want DNS credentials", data)
+// 全局配置响应模型不得携带 DNS 凭证字段：签发链唯一凭证来源是
+// certificate_configs，/config 又面向全部登录用户——一旦有人在响应装配里
+// 赋值，明文凭证就会随该接口下发，而「原文序列化成功」型断言恰好会把这种
+// 泄漏写成绿灯契约。故按结构体形状钉住「字段不存在」，而非钉住其序列化。
+func TestGlobalConfig_hasNoDNSCredentialsField(t *testing.T) {
+	typ := reflect.TypeOf(GlobalConfig{})
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Name == "DNSCredentials" || strings.Contains(field.Tag.Get("json"), "dns_credentials") {
+			t.Fatalf("GlobalConfig 仍携带 DNS 凭证字段 %s（json=%q）——凭证唯一来源是 certificate_configs，该接口对全部登录用户开放",
+				field.Name, field.Tag.Get("json"))
+		}
 	}
 }
 

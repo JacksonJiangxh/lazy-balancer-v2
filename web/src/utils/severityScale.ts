@@ -45,9 +45,20 @@ export const GEOIP_CRAWLER_SPOOF_BASE = 850000
 /** 预检段右开界（CRS 保留段起点）。 */
 export const GEOIP_PRECHECK_LIMIT = 900000
 
+/**
+ * 0 分行固定预检族：阶段 1 预检固定 id 清单（IP 名单 2/4/7、信任 3/12、
+ * 威胁情报 14），`5` 为绕过模式占用的信任并集（pass,nolog 不产事件，防御位）。
+ * GeoIP 的固定 id `8` 不在此列——它由下方段界分支单独分档。
+ *
+ * 单一事实源在后端 `internal/services/security.go` 的
+ * `Stage1PrecheckIDSQLList` / `IsStage1PrecheckEventID`（入库补分 12），
+ * 此处改动必须与后端同步：`web/tests/severityScale.spec.ts` 按后端口径对表钉住。
+ */
+export const ZERO_SCORE_PRECHECK_IDS: readonly string[] = ['2', '3', '4', '5', '7', '12', '14']
+
 export const zeroScoreSeverity = (ruleTriggered: string, action: string): AnomalySeverity => {
   const blocked = action === 'blocked'
-  if (ruleTriggered === '2' || ruleTriggered === '3' || ruleTriggered === '12' || ruleTriggered === '14') {
+  if (ZERO_SCORE_PRECHECK_IDS.includes(ruleTriggered)) {
     return blocked ? 'high' : 'mid'
   }
   if (/^8\d{5}$/.test(ruleTriggered)) {

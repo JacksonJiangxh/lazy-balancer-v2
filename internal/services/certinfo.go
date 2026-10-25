@@ -38,7 +38,7 @@ func CertificateIssuerDisplay(cert *x509.Certificate) string {
 }
 
 func SelectRuleCertificate(candidates []CertificateCandidate, ruleDomains string, now time.Time) (string, bool) {
-	selection, selected := SelectCertificate(candidates, ruleDomains, now)
+	selection, selected := selectCertificate(candidates, ruleDomains, now)
 	if selected {
 		return selection.Candidate.CertPEM, true
 	}
@@ -157,10 +157,10 @@ func GetCertRenewalDays() int {
 	return days
 }
 
-// GetCertRenewalAttempts returns the configured max renewal attempts.
+// getCertRenewalAttempts returns the configured max renewal attempts.
 // 与 GetCertRenewalDays 同口径——直读库值、无效值 error 级
 // 留痕（此前 <=0 静默返回 5，排障无法区分「配置为 0」与「读失败」）。
-func GetCertRenewalAttempts() int {
+func getCertRenewalAttempts() int {
 	// 未初始化库回退默认 5 次（同 GetCertExpiryThreshold）。
 	if db.DB == nil {
 		return db.DefaultCertRenewalAttempts
@@ -168,17 +168,17 @@ func GetCertRenewalAttempts() int {
 	var attempts int
 	err := db.DB.QueryRow("SELECT cert_renewal_attempts FROM global_config WHERE id = 1").Scan(&attempts)
 	if err != nil {
-		Logf("error", "GetCertRenewalAttempts: failed to read global_config, using default %d: %v", db.DefaultCertRenewalAttempts, err)
+		Logf("error", "getCertRenewalAttempts: failed to read global_config, using default %d: %v", db.DefaultCertRenewalAttempts, err)
 		return db.DefaultCertRenewalAttempts
 	}
 	if attempts <= 0 {
-		Logf("error", "GetCertRenewalAttempts: cert_renewal_attempts 库值无效（%d <=0）——启动回填只处理 <=0，写侧/导入 1-10 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
+		Logf("error", "getCertRenewalAttempts: cert_renewal_attempts 库值无效（%d <=0）——启动回填只处理 <=0，写侧/导入 1-10 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
 		return db.DefaultCertRenewalAttempts
 	}
 	// 读侧上界与写侧（1-10）/导入钳制（1-10）对齐——带外直写
 	// 100 会让失败任务自动重试 100 次（CA 配额与 Caddy 重载压力）。
 	if attempts > 10 {
-		Logf("error", "GetCertRenewalAttempts: cert_renewal_attempts 库值超上界（%d >10）——写侧/导入 1-10 之外，疑似带外直写/旧备份恢复；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
+		Logf("error", "getCertRenewalAttempts: cert_renewal_attempts 库值超上界（%d >10）——写侧/导入 1-10 之外，疑似带外直写/旧备份恢复；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
 		return db.DefaultCertRenewalAttempts
 	}
 	return attempts
@@ -395,7 +395,7 @@ func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, rul
 			info.Error = "ACME 证书已过期"
 			return info
 		}
-		// 已签发但未生效：SelectCertificate 因 now<NotBefore 跳过该候选，
+		// 已签发但未生效：selectCertificate 因 now<NotBefore 跳过该候选，
 		// 回退若仍报「尚未签发或不存在」会诱导运维重复触发签发（白烧 CA
 		// 配额），且与磁盘/Caddy 实际部署状态矛盾。
 		if leaf != nil && now.Before(leaf.NotBefore) {
@@ -421,7 +421,7 @@ func parseCertificateLeafFromPEM(certPEM string) *x509.Certificate {
 	return leaf
 }
 
-// leafCoversRuleDomains 与 SelectCertificate 的覆盖判定同源（逐域名
+// leafCoversRuleDomains 与 selectCertificate 的覆盖判定同源（逐域名
 // VerifyHostname）；它只看 SAN/CN 是否覆盖，不看到期时间。
 func leafCoversRuleDomains(leaf *x509.Certificate, ruleDomain string) bool {
 	if leaf == nil {

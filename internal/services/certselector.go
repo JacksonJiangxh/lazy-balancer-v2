@@ -16,7 +16,7 @@ type CertificateCandidate struct {
 	KeyPEM    string
 	UpdatedAt float64
 	// Leaf 是调用方预解析的证书（快照组选统一解析后传入，避免二次 X509KeyPair
-	// 解析）；为空时 SelectCertificate 自行解析。
+	// 解析）；为空时 selectCertificate 自行解析。
 	Leaf *x509.Certificate
 }
 
@@ -28,9 +28,9 @@ type CertificateSelection struct {
 // ParseCertificateLeaf 解析候选证书为 Leaf。tls.X509KeyPair 会同时校验
 // 证书/私钥配对并解析私钥——是候选筛选里最贵的步骤；批量装载阶段（渲染、
 // 配置巡检、证书信息查询）统一预解析一次并填入 CertificateCandidate.Leaf，
-// SelectCertificate 走已解析快路径，避免同一候选在「选择 + 过期回退」等多
+// selectCertificate 走已解析快路径，避免同一候选在「选择 + 过期回退」等多
 // 次调用间重复解析（与 cluster_snapshot 的同口径做法一致）。
-// 解析失败返回 nil，语义等同未预解析：候选仍由 SelectCertificate 按不可解析
+// 解析失败返回 nil，语义等同未预解析：候选仍由 selectCertificate 按不可解析
 // 跳过（disabled 候选由调用方直接跳过预解析）。
 func ParseCertificateLeaf(certPEM, keyPEM string) *x509.Certificate {
 	pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
@@ -63,7 +63,7 @@ func CertNotAfterFromPEM(certPEM string) (time.Time, bool) {
 	return leaf.NotAfter, true
 }
 
-func SelectCertificate(candidates []CertificateCandidate, ruleDomains string, now time.Time) (CertificateSelection, bool) {
+func selectCertificate(candidates []CertificateCandidate, ruleDomains string, now time.Time) (CertificateSelection, bool) {
 	canonicalDomains, err := CanonicalACMEDomains(ruleDomains)
 	if err != nil {
 		return CertificateSelection{}, false

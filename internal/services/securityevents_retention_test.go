@@ -383,6 +383,31 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 
 // 分钟 rollup 状态键（事件高水位 + 回退迟到基线）与 rollup 同生命周期清理
 // ——写入侧每分钟最多两行 metrics_state，旧实现无任何删除点（1440+ 键/天常驻）。
+// 前缀匹配用 GLOB（`_` 字面量）：前缀含 5 个 `_`，LIKE 下等长的近似命名键
+// 会被误删——误删迟到基线会让该分钟迟到行永久不入聚合。
+func TestSecurityEventsRetentionCleanup_prefixMatchIsLiteral(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	oldMinute := time.Now().UTC().AddDate(0, 0, -40).Format("2006-01-02 15:04")
+	// 近似键：把前缀里的一个 `_` 换成字母（LIKE 会命中，GLOB 不应命中）。
+	lookalike := strings.Replace(ThreatRollupLateBaselinePrefix, "_", "x", 1) + oldMinute
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, '7')`, lookalike); err != nil {
+		t.Fatal(err)
+	}
+
+	securityEventsRetentionCleanup(context.Background())
+
+	var kept int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, lookalike).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 1 {
+		t.Fatal("近似命名键被前缀清理误删（LIKE 通配）；必须用 GLOB 字面量匹配")
+	}
+}
+
 func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) {
 	setupSecurityEventsRetentionTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {

@@ -285,6 +285,131 @@ func TestAuditResultText_auditFailureLiteralsRegistered(t *testing.T) {
 	t.Fatalf("auditFailure 字面量结果码未登记/未映射（请在 auditDynamicResultCodes 登记并补 auditResultTextMap）:\n%s", b.String())
 }
 
+// TestAuditResultText_dynamicAssignmentsRegistered 扫「局部变量字面量赋值 →
+// 结果码实参」这条链路：`result := "..."` / `result = "..."` 后把 result 传给
+// auditFailure / auditFailureWithRule / AuditResultPart 是最常见的动态结果码
+// 形态，却同时落在两道路标之外（字面量扫描只看 AuditResultPart("码")，
+// auditFailure 扫描只看 auditFailure("码")）。本用例按函数作用域收集这些变量
+// 的字符串字面量取值，要求全部登记在 auditDynamicResultCodes——与
+// TestAuditResultText_dynamicClosureCodes（清单 → 映射）构成双向校验：清单值
+// 必有中文映射，实际赋值取值必有清单登记。query_failed 曾因两侧都看不见而
+// 漏登记（渲染未受影响，靠 auditResultTextMap 的既有映射兜住）。
+func TestAuditResultText_dynamicAssignmentsRegistered(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
+	if err != nil {
+		t.Fatalf("resolve internal dir: %v", err)
+	}
+	registered := make(map[string]struct{}, len(auditDynamicResultCodes))
+	for _, code := range auditDynamicResultCodes {
+		registered[code] = struct{}{}
+	}
+	missing := map[string]string{} // 结果码 → 首处证据位置
+	links := 0
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Errorf("parse %s: %v", path, perr)
+			return nil
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			// 函数作用域内的「标识符 → 字面量取值集」（含 := 与 = 两种形态）。
+			assigned := map[string][]string{}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				stmt, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for i, lhs := range stmt.Lhs {
+					if i >= len(stmt.Rhs) {
+						continue
+					}
+					ident, ok := lhs.(*ast.Ident)
+					if !ok {
+						continue
+					}
+					lit, ok := stmt.Rhs[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					value, uerr := strconv.Unquote(lit.Value)
+					if uerr != nil {
+						continue
+					}
+					assigned[ident.Name] = append(assigned[ident.Name], value)
+				}
+				return true
+			})
+			if len(assigned) == 0 {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) == 0 {
+					return true
+				}
+				var name string
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					name = fun.Name
+				case *ast.SelectorExpr:
+					name = fun.Sel.Name
+				}
+				switch name {
+				case "auditFailure", "auditFailureWithRule", "AuditResultPart":
+				default:
+					return true
+				}
+				ident, ok := call.Args[0].(*ast.Ident)
+				if !ok {
+					return true
+				}
+				for _, value := range assigned[ident.Name] {
+					links++
+					if _, ok := registered[value]; ok {
+						continue
+					}
+					if _, seen := missing[value]; !seen {
+						missing[value] = fset.Position(call.Pos()).String()
+					}
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk internal: %v", err)
+	}
+	if links == 0 {
+		t.Fatal("未收集到任何「变量赋值 → 结果码实参」链路——扫描器形态已变更，需同步本用例")
+	}
+	if len(missing) == 0 {
+		return
+	}
+	codes := make([]string, 0, len(missing))
+	for code := range missing {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	var b strings.Builder
+	for _, code := range codes {
+		b.WriteString("  ")
+		b.WriteString(strconv.Quote(code))
+		b.WriteString(" @ ")
+		b.WriteString(missing[code])
+		b.WriteString("\n")
+	}
+	t.Fatalf("动态结果码赋值未登记 auditDynamicResultCodes:\n%s", b.String())
+}
+
 // 审计来源码渲染——
 
 // scanAuditSourceLiterals 扫描 internal/ 非测试源码中给定函数的**字面量**首参，

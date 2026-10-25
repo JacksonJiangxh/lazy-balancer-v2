@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 集群写端点的失败面必须留痕/映射正确：
@@ -225,7 +227,7 @@ func TestUpdateClusterNodeAccessURL_bindFailureLeavesAuditTrail(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
 	}
 	var detail string
-	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新失败' AND resource='集群节点' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新地址' AND resource='集群节点' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("访问地址绑定失败面必须留痕（审计行缺失）: %v", err)
 	}
 	if !strings.Contains(detail, "节点 7") || !strings.Contains(detail, "访问地址格式错误") {
@@ -254,4 +256,154 @@ func TestForgetClusterNodePin_invalidIDLeavesAuditTrail(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("编号非法失败面审计行数=%d, want 1", count)
 	}
+}
+
+// 集群模式/设置两条 explicit 写端点的业务拒绝面必须留痕：审计策略对
+// explicit 路由不代记 4xx（含权限语义的 403），handler 是唯一留痕点。
+// 同端点内此前只有部分失败面有审计，形成「部分可复盘」的方言。
+func TestSetClusterMode_rejectionsLeaveAuditTrail(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		nodeName   string
+		wantStatus int
+		wantDetail string
+	}{
+		{
+			name:       "invalid body",
+			body:       `{"mode":1}`,
+			wantStatus: http.StatusBadRequest,
+			wantDetail: "集群模式参数无效",
+		},
+		{
+			name:       "master mode rejected",
+			body:       `{"mode":"master","master_url":"https://master.example","register_token":"t"}`,
+			wantStatus: http.StatusBadRequest,
+			wantDetail: "请使用提升接口切换为主节点",
+		},
+		{
+			name:       "empty master url",
+			body:       `{"mode":"slave","master_url":"","register_token":""}`,
+			wantStatus: http.StatusBadRequest,
+			wantDetail: "主节点地址和注册令牌不能为空",
+		},
+		{
+			name:       "node name normalizes to empty",
+			body:       `{"mode":"slave","master_url":"https://master.example","register_token":"t"}`,
+			nodeName:   "   ",
+			wantStatus: http.StatusBadRequest,
+			wantDetail: "节点名不能为空",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			h.cfg.NodeName = test.nodeName
+			h.syncService = services.NewSyncService(db.DB, h.cfg, nil)
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.POST("/cluster/mode", h.SetClusterMode)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/cluster/mode", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, request)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), test.wantStatus)
+			}
+			var action, detail string
+			if err := db.AuditDB.QueryRow(`SELECT action, detail FROM audit_log WHERE resource='集群模式' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); err != nil {
+				t.Fatalf("拒绝面必须留痕（审计行缺失）: %v", err)
+			}
+			if action != "切换失败" {
+				t.Fatalf("audit action=%q, want 切换失败", action)
+			}
+			if !strings.Contains(detail, test.wantDetail) {
+				t.Fatalf("audit detail=%q, want 含 %q", detail, test.wantDetail)
+			}
+		})
+	}
+}
+
+// UpdateClusterSettings 的四个失败面（参数 400、服务层 400、从节点只读 403、
+// 内部故障 500）此前零审计——从节点误操作与越权探测最需要可追溯。
+func TestUpdateClusterSettings_failuresLeaveAuditTrail(t *testing.T) {
+	t.Run("invalid body", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/settings", strings.NewReader(`{"sync_interval":"bad"}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		h.UpdateClusterSettings(ctx)
+
+		assertClusterSettingsFailureAudit(t, recorder, http.StatusBadRequest)
+	})
+	t.Run("invalid interval", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/settings", strings.NewReader(`{"sync_interval":5}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		h.UpdateClusterSettings(ctx)
+
+		assertClusterSettingsFailureAudit(t, recorder, http.StatusBadRequest)
+	})
+	t.Run("slave read only", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+			t.Fatalf("demote node: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/settings", strings.NewReader(`{"sync_rules":true}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		h.UpdateClusterSettings(ctx)
+
+		assertClusterSettingsFailureAudit(t, recorder, http.StatusForbidden)
+	})
+	t.Run("internal failure", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		// 角色查询失败 → 500（IsMaster 走独立句柄，不污染包级 db.DB）。
+		h.clusterService = services.NewClusterService(closedTestDB(t), "")
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/settings", strings.NewReader(`{"sync_rules":true}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		h.UpdateClusterSettings(ctx)
+
+		assertClusterSettingsFailureAudit(t, recorder, http.StatusInternalServerError)
+	})
+}
+
+func assertClusterSettingsFailureAudit(t *testing.T, recorder *httptest.ResponseRecorder, wantStatus int) {
+	t.Helper()
+	if recorder.Code != wantStatus {
+		t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), wantStatus)
+	}
+	var action, detail string
+	if err := db.AuditDB.QueryRow(`SELECT action, detail FROM audit_log WHERE resource='集群设置' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); err != nil {
+		t.Fatalf("失败面必须留痕（审计行缺失）: %v", err)
+	}
+	if action != "更新失败" {
+		t.Fatalf("audit action=%q, want 更新失败", action)
+	}
+	if strings.TrimSpace(detail) == "" {
+		t.Fatal("审计详情不得为空")
+	}
+}
+
+func closedTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	closed, err := sql.Open("sqlite", t.TempDir()+"/closed.db")
+	if err != nil {
+		t.Fatalf("open closed-handle database: %v", err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatalf("close handle: %v", err)
+	}
+	return closed
 }

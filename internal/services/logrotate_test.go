@@ -209,7 +209,17 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 // 保留期清理删除证书任务日志须与写入侧共用 ruleID 写锁——
 // 在途写入持锁期间清理必须等待（原实现无锁 os.Remove，与写侧
 // 「stat→轮转移位→append」交错可吞掉刚移位的新一代）。
+//
+// 保留月数口径必须由本用例自己装配：保留期门读不到库就一条都不删（用户裁定），
+// 断言会退化为「Deleted 为空」并把原因误报成「没等写锁」。此前依赖包内某个
+// 先前用例留下的全局库，定向单跑/乱序运行时必红，且失败文案指错方向。
 func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
+	setupIsolatedDB(t)
+	if months, err := auditRetentionMonths(); err != nil {
+		t.Fatalf("前置：审计保留月数口径不可用（保留期清理会被整体跳过，本用例测不到写锁等待）: %v", err)
+	} else if months < 1 {
+		t.Fatalf("前置：审计保留月数=%d，保留期清理不会删任何文件", months)
+	}
 	base := t.TempDir()
 	logFile := filepath.Join(base, "app.log")
 	certDir := filepath.Join(base, "tasks", "certjobs")
@@ -260,7 +270,16 @@ func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
 // 日志尺寸阈值读取必须在路径写锁之外完成（缓存未命中会读库，最坏占满
 // busy_timeout）——写入方阻塞在尺寸求值时不持路径锁，保留期清理不得被它
 // 阻塞；清理在锁内重读 ModTime，写入方随后新建/追加的文件保持 fresh 行。
+//
+// 与写锁用例同理：保留月数口径由本用例自己装配，否则保留期门跳过删除，
+// 断言会把「保留期门未通过」误报成「尺寸求值阻塞了清理」。
 func TestTaskLogsHousekeeping_runsWhileSizeEvalInFlight(t *testing.T) {
+	setupIsolatedDB(t)
+	if months, err := auditRetentionMonths(); err != nil {
+		t.Fatalf("前置：审计保留月数口径不可用（保留期清理会被整体跳过）: %v", err)
+	} else if months < 1 {
+		t.Fatalf("前置：审计保留月数=%d，保留期清理不会删任何文件", months)
+	}
 	base := t.TempDir()
 	logFile := filepath.Join(base, "app.log")
 	tasksDir := filepath.Join(base, "tasks")

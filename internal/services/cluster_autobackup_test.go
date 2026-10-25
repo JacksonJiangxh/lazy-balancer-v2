@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -126,5 +127,27 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAbsentPreservesLocal(t *testin
 	if !gotEnabled || gotFreq != "weekly" || gotTime != "04:30" || gotDay != 3 || gotKeep != 5 || gotSections != `["users"]` || gotLastRun != "2026-09-19T03:00:00+08:00" {
 		t.Fatalf("absent snapshot must preserve local settings, got enabled=%v freq=%q time=%q day=%d keep=%d sections=%q last_run=%q",
 			gotEnabled, gotFreq, gotTime, gotDay, gotKeep, gotSections, gotLastRun)
+	}
+}
+
+// 带外形态：主端 auto_backup_sections 为 NULL（仅直改库可达，ADD COLUMN 时已
+// 带默认）时，快照必须下发与 DDL/补列默认同源的四分类。此前 COALESCE 写死
+// 三分类——从端原样落库，升主后自动备份静默缺 cluster（节点拓扑）节。
+func TestLoadSnapshotGlobalSettings_nullAutoBackupSectionsUsesDDLDefault(t *testing.T) {
+	service, database := newClusterTestService(t)
+	if _, err := database.Exec(`UPDATE global_config SET auto_backup_sections=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	var snapshot models.ClusterSnapshot
+	if err := service.loadSnapshotGlobalSettings(context.Background(), database, &snapshot); err != nil {
+		t.Fatalf("load snapshot settings: %v", err)
+	}
+	sections := snapshot.BasicSettings.AutoBackupSections
+	if sections == nil {
+		t.Fatal("auto_backup_sections 必须恒携带（指针非 nil）")
+	}
+	if *sections != db.DefaultAutoBackupSections {
+		t.Fatalf("auto_backup_sections=%q, want DDL 同源默认 %q（三分类下发会让升主后备份缺 cluster 节）", *sections, db.DefaultAutoBackupSections)
 	}
 }

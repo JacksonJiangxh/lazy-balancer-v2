@@ -70,7 +70,7 @@ test('文档钉：轮询诊断 API 与生产守卫分离（无消费面必须标
   assert.match(taskDoc, /诊断\/测试用[\s\S]{0,80}isDisposed/, 'isDisposed 必须标注为诊断/测试用')
   assert.match(code('src/composables/usePollingTask.ts'), /isDisposed/, 'isDisposed 必须存在')
   const flightDoc = source('src/utils/sessionSingleFlight.ts')
-  const requestBlock = section(flightDoc, 'export interface SessionSingleFlight', '\n}')
+  const requestBlock = section(flightDoc, 'interface SessionSingleFlight', '\n}')
   assert.match(requestBlock, /诊断\/测试用[\s\S]*requestedSession/)
   assert.match(requestBlock, /诊断\/测试用[\s\S]*isInflight/)
 })

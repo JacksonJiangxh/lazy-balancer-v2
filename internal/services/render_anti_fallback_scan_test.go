@@ -13,6 +13,9 @@ package services
 // 命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
 // switch/case 零值守卫与非 map 非空复合字面量默认值，并为每形态配夹具（
 // TestFallbackScan_detectsEquivalentGuardShapes）——语义等价写法不得绕过机制。
+// 复合条件（`&&`/`||`）取两侧兜底分支的并集、`!(cond)` 交换 if 体/else 块
+// 同属命中面：`if x == 0 && flag { x = 5 }` 这类「零值守卫 + 附加条件」是
+// 最常见的现实书写，只看顶层比较会让它们整段逃逸。
 //
 // 字符串列同属失效族（strategy/content_type/log level/protocol 等）：
 // 空字符串守卫（`if s == "" { s = "x" }`）与反向操作数（`0 == x` / `"" == s`）
@@ -67,6 +70,7 @@ var antiFallbackScanTargets = map[string][]string{
 	},
 	"security.go": {
 		"BuildCorazaDirectives",
+		"buildCorazaDirectivesWithIndex",
 		"buildWafHandlerWithPolicy",
 		"buildIPPrecheckDirectives",
 		"emitBodyProcessorRules",
@@ -151,6 +155,10 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	},
 	"ParseCRSExcludedRules": {
 		`entry.Scope = "all"`: "CRS 排除项 scope 缺省→all：旧格式/缺字段（集群同步、带外改库、降级版本写入）的防御归一到全局限定，属类型②省略型归一而非无效库值兜底——可达性 Ruling 披露",
+	},
+	// 「信任名单 + 绕过」复合条件扫描登记：SecRule 编号按发射形态二选一。
+	"buildCorazaDirectivesWithIndex": {
+		"trustID = 5": "SecRule 编号按形态二选一（3=仅信任、5=信任同时覆盖绕过优先级）：两侧均为显式常量选择，不承载任何库值兜底（编号由代码契约固定）——复合条件扫描 Ruling 披露",
 	},
 }
 
@@ -457,11 +465,55 @@ const (
 //
 // GTR 保留 if 体扫描：`if len(x) > 0 { … }` 体内的字面量赋值由旧扫描器纳入，
 // 收窄会让既有 allowlist 条目腐化——命中面只扩不收。
+//
+// 复合条件与逻辑取反同属等价形态（`x == 0 && flag`、`x == 0 || flag`、
+// `!(x != 0)`）：只看顶层二元比较会让这种最常见的现实书写整段逃出命中面。
 func guardBranchOf(cond ast.Expr) guardBranch {
-	bin, isBinary := unparenExpr(cond).(*ast.BinaryExpr)
-	if !isBinary {
+	switch expr := unparenExpr(cond).(type) {
+	case *ast.UnaryExpr:
+		if expr.Op == token.NOT {
+			return flippedGuardBranch(guardBranchOf(expr.X))
+		}
 		return guardNone
+	case *ast.BinaryExpr:
+		switch expr.Op {
+		case token.LAND, token.LOR:
+			// 合取/析取都取两侧兜底分支的并集：任一侧的值无效都会让该分支
+			// 在库里值无效时可达（`x == 0 && flag` 的 if 体里 x 仍为 0；
+			// `x != 0 || flag` 的 else 块里 x 仍为 0）。并集只扩命中面。
+			return mergeGuardBranches(guardBranchOf(expr.X), guardBranchOf(expr.Y))
+		}
+		return comparisonGuardBranch(expr)
 	}
+	return guardNone
+}
+
+// flippedGuardBranch 交换 `!cond` 的兜底分支：`!(x != 0)` ≡ `x == 0`，
+// else 块与 if 体互换；Both/None 不变。
+func flippedGuardBranch(branch guardBranch) guardBranch {
+	switch branch {
+	case guardFallbackBody:
+		return guardFallbackElse
+	case guardFallbackElse:
+		return guardFallbackBody
+	}
+	return branch
+}
+
+// mergeGuardBranches 合并复合条件两侧命中的兜底分支。任一侧指向的分支都可能
+// 在值无效时可达，故两侧不同时两边都扫描（宁严不松）。
+func mergeGuardBranches(left, right guardBranch) guardBranch {
+	if left == guardNone {
+		return right
+	}
+	if right == guardNone || left == right {
+		return left
+	}
+	return guardFallbackBoth
+}
+
+// comparisonGuardBranch 判定单条件（二元比较）的零值/无效值守卫分支。
+func comparisonGuardBranch(bin *ast.BinaryExpr) guardBranch {
 	bin = flippedComparison(bin)
 	lit, isLiteral := unparenExpr(bin.Y).(*ast.BasicLit)
 	if !isLiteral {
@@ -710,6 +762,18 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 		{
 			name:   "unary-plus-literal-default",
 			source: "package p\nfunc f(x int) int { if x == 0 { x = +5 }; return x }\n",
+		},
+		{
+			name:   "conjunction-guard",
+			source: "package p\nfunc f(x int, flag bool) int { if x == 0 && flag { x = 5 }; return x }\n",
+		},
+		{
+			name:   "disjunction-guard",
+			source: "package p\nfunc f(x, y int) int { if x <= 1 || y == 0 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "negated-guard",
+			source: "package p\nfunc f(s string) string { if !(s != \"\") { s = \"x\" }; return s }\n",
 		},
 	}
 	for _, fixture := range fixtures {

@@ -757,8 +757,9 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		p.IPWhitelist = json.RawMessage(whitelistJSON)
 		p.IPWhitelistRefs = whitelistRefsJSON
 		// 策略类型 / 保留检测：IP 族能力首选层的信任分支须镜像
-		// 引擎信任门（security.go:166 `PolicyType != stage0`；预检 id:3 排除 stage0，
-		// 保留检测由 id:12 承载）——不装载则摄入态恒空值，镜像判定失效（stage0 直通
+		// 引擎信任门（emitTrustControl 一族的 `PolicyType != stage0` 条件；
+		// 预检 id:3 排除 stage0，保留检测由 id:12 承载）——不装载则摄入态恒空值，
+		// 镜像判定失效（stage0 直通
 		// 策略会凭「whitelist 非空」抢认它物理上产不出的 logged IP 族事件）。
 		policyByID[p.ID] = p
 		policies = append(policies, p)
@@ -1121,20 +1122,23 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 // 正是配置可能已在发射后变更)。门禁表逐格对照发射侧单一事实:
 //
 //	· IP 控制/GeoIP(id:2/4/8)+预检 allow 交集(id:7):与 WAF 模式无关独立
-//	  发射(security.go:179-181 明文「runs independently of the WAF mode」,
-//	  :220-222 emitIPControl||geoipActive → SecRuleEngine On)——off 模式亦可产
+//	  发射（BuildCorazaDirectives 的 emitIPControl/geoipActive 段，注释原文
+//	  「runs independently of the WAF mode」；引擎按 emitIPControl||geoipActive
+//	  置 SecRuleEngine On）——off 模式亦可产
 //	  blocked（初版门「off 零发射」与发射侧设计明文矛盾,误拒);
-//	· detection 的 id:6 DetectionOnly 切换(security.go:351)发射于 IP 控制/
-//	  自定义规则之后、CRS 之前——phase:1 拦截规则真实阻断(:668 明文保障),
+//	· detection 的 id:6 DetectionOnly 切换发射于 IP 控制/
+//	  自定义规则之后、CRS 之前——phase:1 拦截规则真实阻断（见
+//	  buildCorazaDirectives 的 detection 分支明文保障）,
 //	  blocked 可产={2,4,7,8}+自定义;CRS 在切换后评估,DetectionOnly 零中断
 //	  （初版门 detection+blocked 全量误拒);
-//	· custom_only 零 CRS Include(contains :459 同口径)——CRS 事件全拒;
+//	· custom_only 零 CRS Include（同一构建函数的 custom_only 分支）——CRS 事件全拒;
 //	  无 949 评分链,id:11 守卫(phase:2 pass)恒不产 blocked;
-//	  自定义规则无 id:6 切换任意相位可拦;预检 id:7 与模式无关(:927-935)
-//	  (初版门允许集漏 7,误拒);
+//	  自定义规则无 id:6 切换任意相位可拦;预检 id:7 与模式无关
+//	  (buildIPPrecheckDirectives)(初版门允许集漏 7,误拒);
 //	· id:11 发射面(2026-09-21 实证;收紧):emitBodyProcessorRules
 //	  在 blocking/detection 恒发射,custom_only 收紧为存在启用自定义规则才发射
-//	  (security.go :374,零规则+仅 IP 控制形状 body access 恒 Off、发射即死
+//	  (BuildCorazaDirectives 的 body 处理器调用点,零规则+仅 IP 控制形状 body
+//	  access 恒 Off、发射即死
 //	  指令)——logged 事件三模式物理可能,门放行格与发射面一致(模式粒度,
 //	  custom_only 零规则策略的物理不可能由 fallback 归属兜底吸收);blocked
 //	  任何模式均不可产(phase:2 pass 恒不中断),blocking 的 blocked 11 保持
@@ -1244,11 +1248,12 @@ func securityEventsCustomRulesEventSurface(p *models.SecurityPolicy) bool {
 // IP 族事件 fallback 首选层的物理发射面判定，逐 id 对照发射侧单一事实——
 //
 //	· id 8/800xxx（GeoIP）：PolicyHasGeoIP（mode!=off 且名单非空），与发射门
-//	  （buildIPPrecheckDirectives :964/:1043、contains id:8 分支）同源；
-//	· id 2（ACL 拒绝带）：deny 模式且合并名单非空（BuildCorazaDirectives :287
-//	  「IPACLEnabled && len(ipACLList)>0」+ :306 deny 分支；allow 模式发射的
+//	  （buildIPPrecheckDirectives 的 GeoIP 段、BuildCorazaDirectives 的
+//	  GeoIP 交接）同源；
+//	· id 2（ACL 拒绝带）：deny 模式且合并名单非空（BuildCorazaDirectives 的
+//	  「IPACLEnabled && len(ipACLList)>0」门与其 deny 分支；allow 模式发射的
 //	  id:2 归属口径有意不认（问题，IPACLAllowModeDoesNotOwnDenyEvent 钉）；
-//	· id 4（遗留黑名单）：黑名单非空（:322 无模式门）；
+//	· id 4（遗留黑名单）：黑名单非空（同一构建函数的黑名单段，无模式门）；
 //	· id 7（预检 allow 交集）：allow 模式且合并名单非空（buildIPPrecheckDirectives
 //	  仅 allow 参与交集）；
 //	· 信任名单（ip_whitelist）：仅 logged（检测）语义计入 id 2/4/7 能力——信任
@@ -1257,8 +1262,8 @@ func securityEventsCustomRulesEventSurface(p *models.SecurityPolicy) bool {
 //	  信任门（2026-09-21）**：stage0 + trust_detection=0（直通）
 //	  的信任 IP 走路由层 subroute 短路（零 coraza 事务）、非信任 IP 全链评估且
 //	  无 DetectionOnly 降级 ⇒ 该策略物理上不产任何 logged IP 族事件，故要求
-//	  `PolicyType != stage0 || TrustDetection`（对齐 security.go:166 引擎门与
-//	  security.go:990-1005 预检 id:3 排除 / id:12 承载保留检测）；无 policy_type
+//	  `PolicyType != stage0 || TrustDetection`（对齐 BuildCorazaDirectives 的
+//	  信任发射门与 buildIPPrecheckDirectives 的 id:3 排除 / id:12 承载保留检测）；无 policy_type
 //	  的存量信任策略（mixed 语义，走 id:3 并集）不受影响。
 //
 // 名单读取与 SecurityPolicyHasIPControl 同源（inline ∪ refs；MergedACLList 为
@@ -2484,11 +2489,24 @@ func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f 
 					// 同批光流条目同步改判：大屏光流按 action 着色/计拦截，
 					// 保留首次写入的 logged 会让同一请求在光流显示「检测」而
 					// 事件行显示「拦截」。跨批形态原条目已在上一 pass 落入
-					// 环形缓冲（无法回改）——该边界下光流保留首次结论，属已知
-					// 展示差异，不影响库内事件与自动封禁计数。
+					// 环形缓冲（无法回改）；若上一 pass 根本没入环（logged 且
+					// 爬虫放行族=不计攻击，或采样闸门当时关闭），本批按改判后
+					// 的 blocked 补入一条——否则事件行/拦截率按 blocked 计而
+					// 光流永远缺该拦截弧（同屏两面不一致）。同一去重键只入环
+					// 一次（attackFlowIndex 作存在性判据）。
 					if idx, ok := attackFlowIndex[dedupeKey]; ok {
 						attackFlowBatch[idx].action = rec.Action
 						attackFlowBatch[idx].ruleTriggered = rec.RuleTriggered
+					} else if threatScreenAttackFlowSampleN.Load() > 0 &&
+						SecurityEventCountsAsAttack(rec.Action, rec.RuleTriggered) &&
+						!IsReservedClientIP(rec.ClientIP) {
+						attackFlowIndex[dedupeKey] = len(attackFlowBatch)
+						attackFlowBatch = append(attackFlowBatch, threatScreenAttackFlowItem{
+							at:            time.Unix(prev.atSec, 0).UTC(),
+							clientIP:      rec.ClientIP,
+							action:        rec.Action,
+							ruleTriggered: rec.RuleTriggered,
+						})
 					}
 					// 该分钟 rollup 可能已按 logged 固化：重固让 action/rule
 					// 维度与改判后的行一致。原地 UPDATE 不改 id，增量重固扫不到

@@ -119,6 +119,16 @@ func TestDecideMFAStepUp_shortCircuits(t *testing.T) {
 				return m
 			}(), wantApplies: true, wantVerified: true,
 		},
+		{
+			name:    "未来时间戳按未验证处理",
+			covered: true, method: http.MethodPut, path: "/api/v1/config",
+			sets: func() map[string]any {
+				m := staleMap()
+				// 时钟回拨/VM 快照恢复：负年龄不得等价于「刚验证」。
+				m["mfa_ts"] = float64(time.Now().Add(10 * time.Minute).Unix())
+				return m
+			}(), wantApplies: true, wantVerified: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -227,5 +237,49 @@ func TestCreateAPIKey_localUserStaleMfaTsStillChallenged(t *testing.T) {
 
 	if rec.Code != http.StatusPreconditionRequired {
 		t.Fatalf("status=%d body=%s, want 428", rec.Code, rec.Body.String())
+	}
+}
+
+// 秒数换算必须向上取整：截断实现会把 15.9s 记成 15s，使拆除/重绑 MFA 的
+// ≤15s 免码窗实际放宽到 16s。判定与响应头共用本换算，故直接钉边界值。
+func TestMFAStepUpSecondsAgo_roundsUp(t *testing.T) {
+	cases := []struct {
+		elapsed time.Duration
+		want    int64
+	}{
+		{15400 * time.Millisecond, 16},
+		{15 * time.Second, 15},
+		{200 * time.Millisecond, 1},
+		{0, 0},
+	}
+	for _, tc := range cases {
+		if got := mfaStepUpSecondsAgo(tc.elapsed); got != tc.want {
+			t.Fatalf("mfaStepUpSecondsAgo(%s)=%d, want %d（截断实现会把 15.9s 记成 15s）", tc.elapsed, got, tc.want)
+		}
+	}
+}
+
+// 判定侧同样不得截断：mfa_ts 是整秒时间戳，判定时的年龄必带亚秒余量，
+// 向上取整后至少为 1s——截断实现恒报 0，窄窗判定随之放宽。
+func TestDecideMFAStepUp_freshTimestampReportsRoundedUpSeconds(t *testing.T) {
+	newBackupTestHandlers(t)
+	seedStepUpUsers(t)
+	setMfaWriteGuard(t, true)
+
+	mfaTs := time.Now().Unix()
+	c := stepUpContext(t, http.MethodPut, "/api/v1/config", map[string]any{
+		"auth_type": "jwt",
+		"user_id":   float64(1),
+		"mfa_ts":    float64(mfaTs),
+	})
+	decision, err := DecideMFAStepUp(c, true, db.DB, services.MFAUserEnabled)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !decision.Applies || !decision.Verified {
+		t.Fatalf("decision=%+v, want applies+verified（刚验码）", decision)
+	}
+	if decision.SecondsAgo < 1 {
+		t.Fatalf("SecondsAgo=%d, want ≥1（截断实现报 0，窄窗边界被放宽）", decision.SecondsAgo)
 	}
 }

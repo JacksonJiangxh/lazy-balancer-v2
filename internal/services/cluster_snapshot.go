@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -710,8 +711,8 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	var abDay, abKeep int
 	if err := store.QueryRowContext(ctx, `SELECT COALESCE(auto_backup_enabled,0), COALESCE(auto_backup_frequency,'daily'),
 		COALESCE(auto_backup_time,'03:00'), COALESCE(auto_backup_day,1), COALESCE(auto_backup_keep,7),
-		COALESCE(auto_backup_sections,'["users","rules","security"]')
-		FROM global_config WHERE id=1`).Scan(&abEnabled, &abFrequency, &abTime, &abDay, &abKeep, &abSections); err != nil {
+		COALESCE(auto_backup_sections,?)
+		FROM global_config WHERE id=1`, db.DefaultAutoBackupSections).Scan(&abEnabled, &abFrequency, &abTime, &abDay, &abKeep, &abSections); err != nil {
 		return fmt.Errorf("读取自动备份设置: %w", err)
 	}
 	snapshot.BasicSettings.AutoBackupEnabled = &abEnabled
@@ -1108,7 +1109,7 @@ func (s *ClusterService) dumpTableAsJSON(ctx context.Context, store snapshotStor
 
 func (s *ClusterService) snapshotACME(ctx context.Context, store snapshotStore) (*models.ClusterACMEState, error) {
 	state := &models.ClusterACMEState{CAProviders: make([]models.CAProvider, 0), CertificateConfigs: make([]models.CertificateConfig, 0)}
-	rows, err := store.QueryContext(ctx, `SELECT id,name,provider,directory_url,COALESCE(credentials,''),COALESCE(max_concurrent,1),COALESCE(min_interval_ms,2000),COALESCE(enabled,1),created_at,updated_at FROM ca_providers ORDER BY id`)
+	rows, err := store.QueryContext(ctx, `SELECT id,name,provider,directory_url,COALESCE(credentials,''),COALESCE(max_concurrent,`+strconv.Itoa(db.DefaultCAProviderMaxConcurrent)+`),COALESCE(min_interval_ms,`+strconv.Itoa(db.DefaultCAProviderMinIntervalMS)+`),COALESCE(enabled,1),created_at,updated_at FROM ca_providers ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 CA 提供商: %w", err)
 	}
@@ -1467,7 +1468,7 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 	for _, ruleID := range ruleIDs {
 		// 组选阶段统一解析候选证书（行扫描阶段不再逐候选做 X509KeyPair
 		// 全量解析，消除每候选双解析）。解析/有效期/域名覆盖失败的候选按 rule/job
-		// 限频告警后跳过；解析结果存入 Leaf 供 SelectCertificate 复用。
+		// 限频告警后跳过；解析结果存入 Leaf 供 selectCertificate 复用。
 		canonicalDomains, err := CanonicalACMEDomains(ruleDomains[ruleID])
 		if err != nil {
 			continue
@@ -1501,7 +1502,7 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 			candidate.selection.Leaf = leaf
 			selectionCandidates = append(selectionCandidates, candidate.selection)
 		}
-		selection, selected := SelectCertificate(selectionCandidates, ruleDomains[ruleID], now)
+		selection, selected := selectCertificate(selectionCandidates, ruleDomains[ruleID], now)
 		if !selected {
 			continue
 		}

@@ -58,11 +58,11 @@ test('新建 API 密钥：明文弹框 ESC/X 关闭前二次确认（only-once �
   const keys = code('src/views/Keys.vue')
   assert.match(keys, /:before-close="closeCreatedKey"/)
   assert.match(keys, /@closed="createdKey = ''"/, '关闭后仍须清明明文')
-  const confirm = section(keys, 'const closeCreatedKey = (done: () => void): void => {', '\n}')
-  assert.match(confirm, /密钥仅此一次显示，关闭后将无法再次查看/)
-  assert.match(confirm, /confirmButtonText: '我已保存'/)
-  assert.match(confirm, /cancelButtonText: '继续查看'/)
-  assert.match(confirm, /\.then\(\(\) => done\(\)\)/, '确认后才真正关闭')
+  // 确认文案/按钮/「确认后才关闭」收敛进一次性凭据守卫单源；
+  // 三处（密钥明文、注册令牌、恢复码）行为由该单源统一保证。
+  assert.match(keys, /const closeCreatedKey = createOneTimeSecretCloseGuard\(\{/)
+  assert.match(keys, /密钥仅此一次显示，关闭后将无法再次查看/)
+  assert.match(keys, /title: '保存密钥'/)
 })
 
 // ── ③ 锁摘要 → 流程弹框的键盘入口 ──────────────────────────────
@@ -90,15 +90,21 @@ test('处理流程弹框：prefers-reduced-motion 关闭循环流动与错峰进
 })
 
 // ── ⑤ WAF 模式词单源 ──────────────────────────────────────────
-test('WAF 模式词单源：单词表 + 三处消费方不各自内联', () => {
+test('WAF 模式词单源：单词表 + 消费方不各自内联、不裸下标查表', () => {
   assert.deepEqual({ ...WAF_MODE_TEXT }, { blocking: '拦截', detection: '检测', custom_only: '仅自定义', off: '关闭' })
   assert.equal(wafModeLabel('blocking'), '拦截')
   assert.equal(wafModeLabel('custom_only'), '仅自定义')
   assert.equal(wafModeLabel('off'), '关闭')
   assert.equal(wafModeLabel('future_mode'), 'future_mode', '未登记 mode 回落原文（fail-visible）')
   assert.equal(wafModeLabel(''), '')
+  // 原型键形态（带外改库/备份还原可达）：必须回落原文，不得命中 Object.prototype
+  // 上的函数——否则模板插值把函数源码当展示词。
+  for (const mode of ['constructor', 'toString', '__proto__', 'valueOf']) {
+    assert.equal(wafModeLabel(mode), mode, `${mode} 命中原型链，展示词会变成函数源码`)
+  }
 
-  // 任何视图/组件不得再自建 mode→中文 映射表（单源文件本身除外）
+  // 任何视图/组件不得再自建 mode→中文 映射表，也不得裸下标查表（原型键直读）；
+  // 单源文件本身除外（其查表已过 hasOwn 守卫）。
   const singleSource = 'src/utils/securityStages.ts'
   const offenders: string[] = []
   for (const file of webFiles('src', ['.vue', '.ts'])) {
@@ -107,9 +113,10 @@ test('WAF 模式词单源：单词表 + 三处消费方不各自内联', () => {
     if (/custom_only:\s*'仅自定义/.test(body)) offenders.push(`${file}: 本地 mode 词表`)
     if (/custom_only' ?\? ?'仅自定义规则'/.test(body)) offenders.push(`${file}: 内联「仅自定义规则」`)
     if (/blocking' ?\? ?'阻断'/.test(body)) offenders.push(`${file}: 内联「阻断」`)
+    if (/WAF_MODE_TEXT\[/.test(body)) offenders.push(`${file}: 裸下标查表（须走 wafModeLabel）`)
   }
-  assert.deepEqual(offenders, [], 'WAF 模式词必须取 securityStages.WAF_MODE_TEXT')
-  assert.match(code('src/views/security/SecurityPolicies.vue'), /WAF_MODE_TEXT,/)
+  assert.deepEqual(offenders, [], 'WAF 模式词必须取 securityStages.WAF_MODE_TEXT/wafModeLabel')
+  assert.match(code('src/views/security/SecurityPolicies.vue'), /wafModeLabel,/)
   assert.match(code('src/components/events/TriggerDetailDialog.vue'), /wafModeLabel\s*\}\s*from '@\/utils\/securityStages'/)
 })
 

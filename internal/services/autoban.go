@@ -245,7 +245,8 @@ func ValidateAutobanConfig(cfg AutobanConfig) error {
 }
 
 // SetAutobanConfig 写六项配置；窗口/口径变更时重置计数器（口径语义变了，
-// 旧计数不可与新口径混算）。
+// 旧计数不可与新口径混算）。禁用（enabled=false）同样清空计数桶与观察建议
+// ——停用期无喂入，陈旧计数不得在重新启用后立即封禁（见下方调用点注释）。
 func SetAutobanConfig(cfg AutobanConfig) error {
 	if err := ValidateAutobanConfig(cfg); err != nil {
 		return err
@@ -273,7 +274,13 @@ func SetAutobanConfig(cfg AutobanConfig) error {
 		autobanRecomputeReached(cfg.Threshold)
 	}
 	if !cfg.Enabled {
+		// 禁用即证据作废：先做到期清理（保留「自动解封」语义），再清空整表
+		// 计数桶——禁用期间无喂入，陈旧桶会跨越任意长度的停用期；若只在
+		// 到期时修剪，停用数天/数周后重新启用会以旧计数立即封禁（并从这里
+		// 重算封禁起点/时长），把可能已重新分配或共享 NAT 的 IP 长期封死。
+		// 与到期清理的桶清空同向：两者都表示「该证据不再支撑封禁」。
 		AutobanDisableFlush()
+		ResetAutobanCounters()
 	}
 	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）；
 	// 应用值在锁内按库实态读取，本参数仅作读失败回退。
@@ -1355,13 +1362,42 @@ func autobanAuditExpiredUnban(ips, manual []string) {
 		}
 		autoIPs = append(autoIPs, ip)
 	}
-	if len(autoIPs) > 0 {
-		RecordAuditLog("system", "自动解封", "IP 地址列表",
-			fmt.Sprintf("到期自动解封 %d 个自动封禁 IP：%s", len(autoIPs), strings.Join(autoIPs, "、")), "")
+	autobanAuditUnbanGroup(autoIPs, func(total int, joined string) string {
+		return fmt.Sprintf("到期自动解封 %d 个自动封禁 IP：%s", total, joined)
+	})
+	autobanAuditUnbanGroup(manualIPs, func(total int, joined string) string {
+		return fmt.Sprintf("到期解封 %d 个手动封禁条目（到期时间到达，系统自动执行）：%s", total, joined)
+	})
+}
+
+// autobanUnbanAuditPerLine 单条「自动解封」审计行携带的 IP 数上限：detail
+// 经 auditDetailMaxBytes(4KiB) 净化截断，IPv6 最长 45 字符 +「、」≈48 字节，
+// 40 个 ≈2KB，留足前缀说明余量。旧实现把整批 IP 拼进一行——批量到期（≥~200
+// 个 IP）时后半名单被净化截断静默丢失，与逐 IP 封禁审计的可追溯性不对称。
+const autobanUnbanAuditPerLine = 40
+
+// autobanAuditUnbanGroup 按行预算分片写解封审计（单轮逐条上限
+// autobanAuditPerRoundCap 与封禁审计同口径；超出部分由汇总行点名数量）。
+func autobanAuditUnbanGroup(ips []string, line func(total int, joined string) string) {
+	if len(ips) == 0 {
+		return
 	}
-	if len(manualIPs) > 0 {
+	omitted := 0
+	if len(ips) > autobanAuditPerRoundCap {
+		omitted = len(ips) - autobanAuditPerRoundCap
+		ips = ips[:autobanAuditPerRoundCap]
+	}
+	for start := 0; start < len(ips); start += autobanUnbanAuditPerLine {
+		end := start + autobanUnbanAuditPerLine
+		if end > len(ips) {
+			end = len(ips)
+		}
+		RecordAuditLog("system", "自动解封", "IP 地址列表", line(len(ips), strings.Join(ips[start:end], "、")), "")
+	}
+	if omitted > 0 {
 		RecordAuditLog("system", "自动解封", "IP 地址列表",
-			fmt.Sprintf("到期解封 %d 个手动封禁条目（到期时间到达，系统自动执行）：%s", len(manualIPs), strings.Join(manualIPs, "、")), "")
+			fmt.Sprintf("%s%d 个 IP 省略逐条记录（本轮共 %d 个，逐条上限 %d）",
+				autobanAuditSummaryPrefix, omitted, len(ips)+omitted, autobanAuditPerRoundCap), "")
 	}
 }
 

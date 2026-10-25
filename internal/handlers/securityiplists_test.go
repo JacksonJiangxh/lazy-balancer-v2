@@ -1185,3 +1185,23 @@ func TestIPListRefs_exposeEnabledStateAndBlockingCount(t *testing.T) {
 		t.Fatalf("delete status=%d body=%s, want 200（禁用引用不阻止删除）", delRec.Code, delRec.Body.String())
 	}
 }
+
+// 备注控制字符门：导出件以「值 空格 备注」逐行组文本，备注含换行会造出伪条目
+// （导出再导入即误加 IP）；制表/回车/其他控制字符同样破坏行结构与展示。
+func TestValidateIPListShape_rejectsControlCharsInRemark(t *testing.T) {
+	shape := func(remark string) error {
+		entries := fmt.Sprintf(`[{"value":"198.51.100.1","remark":%q}]`, remark)
+		_, _, err := validateIPListShape("list", "", "cat", entries)
+		return err
+	}
+	for _, bad := range []string{"a\n1.2.3.4", "a\rb", "a\tb", "a\x00b", "a\x1fb", "a\x7fb"} {
+		if err := shape(bad); err == nil {
+			t.Errorf("备注 %q 必须被拒（控制字符破坏导出行结构）", bad)
+		}
+	}
+	for _, ok := range []string{"", "正常备注", "ip 归属地：美国", "a b"} {
+		if err := shape(ok); err != nil {
+			t.Errorf("备注 %q 不应被拒: %v", ok, err)
+		}
+	}
+}

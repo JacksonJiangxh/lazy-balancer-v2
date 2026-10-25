@@ -9,8 +9,11 @@
 // 口径（与全仓 grep 的消费面扫描一致）：
 // - 定义面 = src/utils、src/composables、src/stores、src/types 下的 .ts/.vue；
 // - 消费面 = src/**.ts/.vue + tests/**.ts（含用例对符号的按名引用）；
-// - 两侧都走注释剥离视图：注释掉的 export 不算符号，注释里的引用不算消费
-//   （否则注释掉用法会让死导出永远留在门槛内）；
+// - 定义面走注释剥离视图：注释掉的 export 不算符号；消费面走「标识符扫描」
+//   视图：注释与字符串/模板/正则字面量里的符号名都不算消费——测试用源码切片
+//   marker（`section(code('x'), 'const foo = ' …)`）或正则断言提到某个名字，
+//   并不会让它变成跨模块契约（否则死导出永远留在门槛内）。模板 `${…}` 插值
+//   里的标识符仍是代码，照常计入；
 // - 同名符号跨模块冲突时，任一文件的消费都会算作命中——本门禁是下限，不做
 //   逐模块消歧。
 //
@@ -28,20 +31,18 @@ const SOURCE_EXTENSIONS = ['.ts', '.vue'] as const
 // `export const X` / `export async function X` / `export declare const X` …；
 // `export default` 与 `export * from` 不是具名导出，不参与判定。
 const DECLARATION = /^export\s+(?:(?:declare|abstract)\s+)*(?:(?:async)\s+)?(?:const|let|var|function|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/
-// `export { a, b as c }` / `export type { A }`：导出名取 `as` 右侧。
-const NAMED_EXPORT = /^export\s+(?:type\s+)?\{([^}]*)\}/
+// `export { a, b as c }` / `export type { A }`：导出名取 `as` 右侧。块可跨多行
+// （Prettier 会把长列表换行）——`g` 全扫 + `[\s\S]` 跨行，单行形态是其特例。
+const NAMED_EXPORT = /^export\s+(?:type\s+)?\{([\s\S]*?)\}/gm
 
-/** 源文件里的具名导出名（单行形态；含 `as` 别名取右侧）。 */
+/** 源文件里的具名导出名（声明行 + `export { … }` 块，含多行形态与 `as` 别名）。 */
 const exportedNames = (text: string): string[] => {
   const names: string[] = []
   for (const line of text.split('\n')) {
     const declaration = DECLARATION.exec(line)
-    if (declaration) {
-      names.push(declaration[1])
-      continue
-    }
-    const named = NAMED_EXPORT.exec(line)
-    if (!named) continue
+    if (declaration) names.push(declaration[1])
+  }
+  for (const named of text.matchAll(NAMED_EXPORT)) {
     for (const part of named[1].split(',')) {
       const exported = part.trim().split(/\s+as\s+/).pop()?.trim()
       if (exported) names.push(exported)
@@ -50,11 +51,121 @@ const exportedNames = (text: string): string[] => {
   return names
 }
 
-/** token → 出现过该 token 的文件集合（消费面索引，供逐符号查外部命中）。 */
-const buildTokenIndex = (files: readonly string[]): Map<string, Set<string>> => {
+/** 正则字面量可能出现的上一个有效字符（表达式位置的运算符/开括号/逗号等）。
+ * 刻意不含 `<`/`>`：Vue 模板的闭合标签（`</el-option>`）会让 `<` 后的正斜杠被
+ * 误判成正则起点，一路吞到下一个 `/` —— 整段模板与脚本的标识符消失（假绿）。 */
+const REGEX_PRECEDER_CHARS = '([{,;:=!&|?+-*%^'
+/** 关键字之后的正斜杠是正则字面量起点而不是除号。 */
+const REGEX_KEYWORDS: Record<string, true> = {
+  return: true,
+  typeof: true,
+  instanceof: true,
+  in: true,
+  of: true,
+  new: true,
+  delete: true,
+  void: true,
+  case: true,
+  do: true,
+  else: true,
+  yield: true,
+  await: true,
+  throw: true,
+}
+
+/**
+ * 扫过一段代码，收集「不在字符串/模板/正则字面量里」的标识符。
+ * `stopAtBrace` 供模板 `${ … }` 插值递归使用（返回时 next 指向 `}` 之后）。
+ *
+ * 为什么需要它：`code()` 只剥注释，测试里用源码切片 marker（`section(code('x'), 'const foo = ' …)`）
+ * 与正则断言（`assert.match(src, /rules: Entry\[\]/)`）中的符号名会被当成「消费方」，
+ * 死导出因此永远留在门槛内。字符串里的名字不是消费——消费是代码里的标识符引用。
+ */
+const scanIdentifiers = (text: string, from: number, stopAtBrace: boolean): { tokens: string[]; next: number } => {
+  const tokens: string[] = []
+  let i = from
+  let lastSignificant = ''
+  let lastWord = ''
+  while (i < text.length) {
+    const ch = text[i]
+    if (stopAtBrace && ch === '}') return { tokens, next: i + 1 }
+    if (/[A-Za-z_$]/.test(ch)) {
+      const start = i
+      while (i < text.length && /[\w$]/.test(text[i])) i++
+      lastWord = text.slice(start, i)
+      tokens.push(lastWord)
+      lastSignificant = 'a' // 标识符/数字收尾：后续 `/` 是除号
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const literal = skipLiteral(text, i)
+      tokens.push(...literal.interpolated)
+      i = literal.next
+      lastSignificant = 'v'
+      lastWord = ''
+      continue
+    }
+    if (ch === '/' && (lastSignificant === '' || REGEX_PRECEDER_CHARS.includes(lastSignificant) || REGEX_KEYWORDS[lastWord] === true)) {
+      i = skipRegex(text, i)
+      lastSignificant = 'v'
+      lastWord = ''
+      continue
+    }
+    if (!/\s/.test(ch)) {
+      lastSignificant = ch
+      lastWord = ''
+    }
+    i++
+  }
+  return { tokens, next: i }
+}
+
+/** 跳过 `'…'`/`"…"`/`` `…` ``；模板插值 `${ … }` 内部的标识符仍是代码。 */
+const skipLiteral = (text: string, start: number): { next: number; interpolated: string[] } => {
+  const quote = text[start]
+  const interpolated: string[] = []
+  let i = start + 1
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === '\\') {
+      i += 2
+      continue
+    }
+    if (ch === quote) return { next: i + 1, interpolated }
+    if (quote === '`' && ch === '$' && text[i + 1] === '{') {
+      const inner = scanIdentifiers(text, i + 2, true)
+      interpolated.push(...inner.tokens)
+      i = inner.next
+      continue
+    }
+    i++
+  }
+  return { next: i, interpolated }
+}
+
+/** 跳过 `/…/flags`（字符类内的 `/` 不结束字面量）。 */
+const skipRegex = (text: string, start: number): number => {
+  let i = start + 1
+  let inClass = false
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === '\\') {
+      i += 2
+      continue
+    }
+    if (ch === '[') inClass = true
+    else if (ch === ']') inClass = false
+    else if (ch === '/' && !inClass) return i + 1
+    i++
+  }
+  return i
+}
+
+/** 源文本表（文件名 → 注释剥离后的视图）→ 消费面 token 索引。 */
+const indexSources = (sources: ReadonlyMap<string, string>): Map<string, Set<string>> => {
   const index = new Map<string, Set<string>>()
-  for (const file of files) {
-    for (const [token] of code(file).matchAll(/[A-Za-z_$][\w$]*/g)) {
+  for (const [file, text] of sources) {
+    for (const token of scanIdentifiers(text, 0, false).tokens) {
       const holders = index.get(token)
       if (holders) holders.add(file)
       else index.set(token, new Set([file]))
@@ -90,7 +201,10 @@ const definitionSources = new Map(definitionFiles.map((file) => [file, code(file
 const consumerFiles = [...webFiles('src', SOURCE_EXTENSIONS), ...webFiles('tests', ['.ts'])]
 
 test('定义目录的每个具名导出都有定义文件之外的消费方', () => {
-  const { checked, unused } = findUnusedExports(definitionSources, buildTokenIndex(consumerFiles))
+  const { checked, unused } = findUnusedExports(
+    definitionSources,
+    indexSources(new Map(consumerFiles.map((file) => [file, code(file)] as const))),
+  )
   // 扫描面自检：解析器失效（正则不再匹配）会让清单恒空——那是最容易发生的假绿。
   assert.ok(definitionFiles.length >= 100, `定义面文件数异常偏少（${definitionFiles.length}），扫描目录配置已失效`)
   assert.ok(checked >= 400, `解析到的具名导出异常偏少（${checked}），导出声明正则已失效`)
@@ -115,6 +229,33 @@ test('判据不是空转：外部消费 / 仅本文件自用 / 无任何引用 �
   })
 })
 
+test('测试内字符串/正则 marker 不算消费方（按名切片不得给死导出续命）', () => {
+  const consumerSources = new Map([
+    // 源码存在性钉的两种常见形态：切片 marker 字符串 + 正则断言。
+    ['tests/viewsWiringGuards.spec.ts', [
+      "const body = section(code('src/utils/restart.ts'), 'const reloadAfterRestart = async', 'export interface RestartServiceOptions')",
+      'assert.match(src, /rules: CrsRuleIndexEntry\\[\\]/)',
+    ].join('\n')],
+    // 真实消费：import 绑定与模板插值里的标识符仍是代码。
+    ['tests/realConsumer.spec.ts', [
+      "import { realSymbol } from '../src/utils/real.ts'",
+      'const label = `${realSymbol}`',
+      'const ratio = realSymbol / 2',
+    ].join('\n')],
+  ])
+  const definitions = new Map([
+    ['src/utils/restart.ts', [
+      'export const reloadAfterRestart = async () => {}',
+      'export interface RestartServiceOptions {}',
+      'export const realSymbol = 1',
+    ].join('\n')],
+  ])
+  assert.deepEqual(findUnusedExports(definitions, indexSources(consumerSources)), {
+    checked: 3,
+    unused: ['src/utils/restart.ts → reloadAfterRestart', 'src/utils/restart.ts → RestartServiceOptions'],
+  })
+})
+
 test('导出名解析覆盖声明形态与 as 别名（正则退化会静默漏检）', () => {
   assert.deepEqual(
     exportedNames([
@@ -125,10 +266,38 @@ test('导出名解析覆盖声明形态与 as 别名（正则退化会静默漏�
       'export declare const e: number',
       'export { f, g as h }',
       'export type { I }',
-      'export * from "./x"',
-      'export default {}',
       '// export const commented = 1',
+      'export {',
+      '  multilineOne,',
+      '  multilineTwo as multilineAlias,',
+      '} from "./x"',
+      'export type {',
+      '  MultilineType,',
+      '}',
+      'export * from "./y"',
+      'export default {}',
     ].join('\n')),
-    ['a', 'b', 'C', 'D', 'e', 'f', 'h', 'I'],
+    ['a', 'b', 'C', 'D', 'e', 'f', 'h', 'I', 'multilineOne', 'multilineAlias', 'MultilineType'],
   )
+})
+
+test('多行具名导出块同样参与判定（解析不到即静默假绿）', () => {
+  const definitions = new Map([
+    ['src/utils/multi.ts', [
+      'export {',
+      '  listedUnused,',
+      '} from "./x"',
+      'export type {',
+      '  typeUnused as typeAliased,',
+      '}',
+      'export { consumedMulti } from "./y"',
+    ].join('\n')],
+  ])
+  const tokenIndex = new Map([
+    ['consumedMulti', new Set(['src/utils/multi.ts', 'src/views/Use.vue'])],
+  ])
+  assert.deepEqual(findUnusedExports(definitions, tokenIndex), {
+    checked: 3,
+    unused: ['src/utils/multi.ts → listedUnused', 'src/utils/multi.ts → typeAliased'],
+  })
 })

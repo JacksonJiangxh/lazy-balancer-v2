@@ -10,15 +10,17 @@
 #   id|status|evidence|reason
 #   - status: fixed | maintained | falsified | retired
 #   - fixed 必须有 evidence，多个用 ';' 分隔，支持：
-#       code:<path>:<line>:<token>   该行必须包含 token（token 可含空格）
+#   - code:<path>:<line>:<token>   该行必须包含 token（token 可含空格；在剥注释
+#                                  视图上比对——注释里的 token 不是可执行证据）
 #       test:<TestName>              仓库内必须存在（未注释的）func <TestName>( 或 test('<name>'
 #       ftest:<literal>              web/tests 内必须出现该字面量（describe/it 标题等，不得在注释里）
 #       script:<path>                脚本必须存在（且可执行）
 #       spec:<path>                  前端 spec 文件必须存在，且为 web/tests 下的 *.spec.ts
-#   - ftest/script/spec 的空字面量/空路径一律判失败（grep -F '' 恒命中＝假绿）；
+#   - test/ftest/script/spec 的空名字/空字面量/空路径一律判失败（grep 空模式恒命中＝假绿）；
 #     spec 只接受前端用例路径——任意存在的文件不构成「前端 spec」证据。
-#   - test/ftest 的匹配先剥注释：被注释掉的声明/标题不是可执行证据（原文 grep
-#     会把它们判成命中）。
+#   - test/ftest/code 的匹配先剥注释：被注释掉的声明/标题/token 不是可执行证据
+#     （原文 grep 会把它们判成命中）。code: 用「删注释内容但保持行数」的视图，
+#     行号不漂移；code: 的 token 不得为空（同属空值判失败口径）。
 #   - maintained / falsified / retired 必须写非空 reason
 #
 # --commit 会解析该提交 message 中的 "Fixes: ID[,ID...]" 行，要求每个 ID 在台账
@@ -28,61 +30,81 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-# 剥注释视图（awk 单程，逐文件独立状态）：去掉行注释（`//`）、块注释起始行
-# （`/*`）与续行（`*`），并丢弃 /* ... */ 块内的所有行。证据匹配只在这份视图
-# 上做——被注释掉的测试声明/用例标题不是可执行证据，原文 grep 会把它们判成
-# 命中，R-4b 反向对账就退化为「字符串在仓里」。
-# 只在行首为 `/*` 时进入块态：字符串字面量里的 `/*` 不吞后续代码（假失败）。
-strip_comments() { # <file>
+# 剥注释视图（行数保持，供 code: 证据按行号比对）：注释内容替换为空串而非
+# 删行——code: 证据以「第 N 行」定位，删行会让行号漂移，比对落到相邻行（假
+# 命中或假失败）。逐文件状态独立：行注释（`//`，含行尾）截断；`/* ... */`
+# 整段（含跨行）清空，块注释结束后的同行代码保留。
+# 注释标记只在「行首（可带缩进）或紧跟空白」时成立：脚本里的 glob/路径片段
+# （`scripts/*.py`、`**/*_test.go`）与字符串里的 URL（`http://...`）不是注释
+# 起点——否则一次前导块态会把后续真实代码行整段吞掉（假失败）。
+strip_comments_keep_lines() { # <file>
   awk '
-    { line = $0; sub(/^[[:space:]]+/, "", line) }
-    inblock { if (line ~ /\*\//) inblock = 0; next }
-    line ~ /^\/\*/ { if (line !~ /\*\//) inblock = 1; next }
-    line ~ /^\/\// { next }
-    line ~ /^\*/ { next }
-    { print }
+    # 标记在「行首或前一字符为空白」时的位置；0 表示不存在。
+    function marker_index(s, m,   p, i, before) {
+      p = 1
+      while (1) {
+        i = index(substr(s, p), m)
+        if (i == 0) return 0
+        i = p + i - 1
+        before = (i == 1) ? "" : substr(s, i - 1, 1)
+        if (before == "" || before == " " || before == "\t") return i
+        p = i + 1
+      }
+    }
+    {
+      rest = $0; kept = ""
+      while (1) {
+        if (inblock) {
+          q = index(rest, "*/")
+          if (q == 0) { rest = ""; break }
+          rest = substr(rest, q + 2); inblock = 0
+          continue
+        }
+        p = marker_index(rest, "/*"); c = marker_index(rest, "//")
+        if (c > 0 && (p == 0 || c < p)) { rest = substr(rest, 1, c - 1); break }
+        if (p == 0) break
+        kept = kept substr(rest, 1, p - 1)
+        rest = substr(rest, p + 2); inblock = 1
+      }
+      print kept rest
+    }
   ' "$1"
 }
 
-# 剥注释视图中是否存在匹配（扩展正则）：先按原文挑候选文件，再逐文件剥注释复检。
+# 剥注释视图中是否存在匹配（扩展正则）：先按原文挑候选文件，再逐文件走同一份
+# 剥注释视图复检（单源——三份内联 awk 各自漂移会让某个证据形态悄悄放宽）。
 code_has_regex() { # <pattern> <dir>
-  local pattern="$1" dir="$2" files
+  local pattern="$1" dir="$2" files file view
   files="$(grep -RlE --include='*_test.go' --include='*.spec.ts' -- "$pattern" "$dir" 2>/dev/null || true)"
   [ -z "$files" ] && return 1
-  # shellcheck disable=SC2086 # 仓库文件名不含空白
-  awk -v pat="$pattern" '
-    FNR == 1 { inblock = 0 }
-    { line = $0; sub(/^[[:space:]]+/, "", line) }
-    inblock { if (line ~ /\*\//) inblock = 0; next }
-    line ~ /^\/\*/ { if (line !~ /\*\//) inblock = 1; next }
-    line ~ /^\/\// { next }
-    line ~ /^\*/ { next }
-    line ~ pat { hit = 1; exit }
-    END { exit(hit ? 0 : 1) }
-  ' $files
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    view="$(strip_comments_keep_lines "$file")" || continue
+    if grep -Eq -- "$pattern" <<< "$view"; then
+      return 0
+    fi
+  done <<< "$files"
+  return 1
 }
 
 # 同 code_has_regex，但按字面量（ftest 标题可含正则元字符）。
 code_has_literal() { # <literal> <dir>
-  local literal="$1" dir="$2" files
+  local literal="$1" dir="$2" files file view
   files="$(grep -RlF --include='*.spec.ts' -- "$literal" "$dir" 2>/dev/null || true)"
   [ -z "$files" ] && return 1
-  # shellcheck disable=SC2086 # 仓库文件名不含空白
-  awk -v lit="$literal" '
-    FNR == 1 { inblock = 0 }
-    { line = $0; sub(/^[[:space:]]+/, "", line) }
-    inblock { if (line ~ /\*\//) inblock = 0; next }
-    line ~ /^\/\*/ { if (line !~ /\*\//) inblock = 1; next }
-    line ~ /^\/\// { next }
-    line ~ /^\*/ { next }
-    index($0, lit) > 0 { hit = 1; exit }
-    END { exit(hit ? 0 : 1) }
-  ' $files
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    view="$(strip_comments_keep_lines "$file")" || continue
+    if grep -Fq -- "$literal" <<< "$view"; then
+      return 0
+    fi
+  done <<< "$files"
+  return 1
 }
 
 self_test() {
@@ -296,6 +318,90 @@ EOF
     echo "SELFTEST FAIL: web/tests 下的非 spec 文件被当作前端 spec 证据" >&2; return 1
   fi
 
+  # 21) 反例：code: 证据的 token 只出现在行注释里（原文 grep 会命中；剥注释
+  #     视图不得命中）。行注释行号固定在第 3 行。
+  cat > "$tmp/internal/demo/comments.go" <<'EOF'
+package demo
+
+// demo-line-comment-token
+var realLineValue = "demo-real-token" // demo-trailing-comment-token
+
+/*
+demo-block-comment-token
+*/
+var realBlockNeighbor = "demo-after-block"
+EOF
+  cat > "$tmp/code-line-comment.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|code:internal/demo/comments.go:3:demo-line-comment-token|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger code-line-comment.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 行注释里的 token 被当作 code: 证据" >&2; return 1
+  fi
+
+  # 22) 反例：code: 证据的 token 只出现在块注释里
+  cat > "$tmp/code-block-comment.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|code:internal/demo/comments.go:7:demo-block-comment-token|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger code-block-comment.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 块注释里的 token 被当作 code: 证据" >&2; return 1
+  fi
+
+  # 23) 正例：剥注释不得改行号——真实代码行（行尾带行注释）与块注释结束后的
+  #     代码行仍按原行号命中。
+  cat > "$tmp/code-real-line.tsv" <<'EOF'
+id|status|evidence|reason
+F-6|fixed|code:internal/demo/comments.go:4:demo-real-token;code:internal/demo/comments.go:9:demo-after-block|
+EOF
+  if ! (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger code-real-line.tsv >/dev/null); then
+    echo "SELFTEST FAIL: 剥注释后真实代码行被误判为缺失（行号不得漂移）" >&2; return 1
+  fi
+
+  # 24) 反例：code: 证据 token 为空（`grep -F ''` 恒命中，与其他形态的空值
+  #     拒绝同口径）
+  cat > "$tmp/code-empty-token.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|code:internal/demo/demo.go:3:|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger code-empty-token.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: code: 空 token 被当作证据" >&2; return 1
+  fi
+
+  # 25) 反例：同一行里代码之后的行尾注释同样不算证据（剥注释只保留代码段）
+  cat > "$tmp/code-trailing-comment.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|code:internal/demo/comments.go:4:demo-trailing-comment-token|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger code-trailing-comment.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 行尾注释里的 token 被当作 code: 证据" >&2; return 1
+  fi
+
+  # 26) 反例：test: 名字为空（模式退化为「任意测试声明」，与其他空值拒绝同口径）
+  cat > "$tmp/empty-test-name.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|test:|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger empty-test-name.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: test: 空名字被当作证据" >&2; return 1
+  fi
+
+  # 27) 反例：ftest 字面量只出现在前端用例的块注释里（跨行 /* */ 必须整体剥离；
+  #     剥注释逻辑单源后此形态与 test: 证据同口径）
+  cat > "$tmp/web/tests/block-commented.spec.ts" <<'EOF'
+/*
+ * test('block-commented-frontend-title', () => {})
+ */
+test('real-frontend-title', () => {})
+EOF
+  cat > "$tmp/block-commented-ftest.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|ftest:block-commented-frontend-title|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger block-commented-ftest.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 块注释里的前端用例标题被当作证据" >&2; return 1
+  fi
+
   echo "fix-claims selftest: PASS"
 }
 
@@ -348,12 +454,25 @@ while IFS='|' read -r id status evidence reason; do
               echo "FAIL ${id}: 证据文件不存在: $path" >&2; fail=1; continue
             fi
             case "$line" in ''|*[!0-9]*) echo "FAIL ${id}: 行号非法: $line" >&2; fail=1; continue;; esac
-            if ! sed -n "${line}p" "$path" | grep -Fq -- "$token"; then
-              echo "FAIL ${id}: $path:$line 不含 token: $token" >&2; fail=1
+            if [ -z "${token// /}" ]; then
+              echo "FAIL ${id}: code: token 为空（grep -F '' 恒命中，不构成证据）" >&2; fail=1; continue
             fi
+            # 比对在「剥注释但保持行数」的视图上做：注释里的 token 不是可执行
+            # 证据（原文行匹配会让「只有注释提到 X」的台账声明通过）。
+            code_view="$(strip_comments_keep_lines "$path")" || { echo "FAIL ${id}: 无法读取证据文件: $path" >&2; fail=1; continue; }
+            line_content="$(printf '%s\n' "$code_view" | sed -n "${line}p")"
+            case "$line_content" in
+              *"$token"*) ;;
+              *) echo "FAIL ${id}: $path:$line 不含 token（注释里的 token 不算证据）: $token" >&2; fail=1 ;;
+            esac
             ;;
           test:*)
             name="${item#test:}"
+            # 空名字会退化成 `^[[:space:]]*test[(]` 通用前缀——前端/后端任一条
+            # 测试行都能满足，与 ftest/spec 的空值拒绝同口径必须显式失败。
+            if [ -z "${name// /}" ]; then
+              echo "FAIL ${id}: test: 名字为空（空模式命中任意测试声明，不构成证据）" >&2; fail=1; continue
+            fi
             # 声明必须落在代码行（行首 func / test(）上；注释掉的声明不算证据。
             if ! code_has_regex "^[[:space:]]*func[[:space:]]+${name}[(]|^[[:space:]]*test[(]['\"]${name}" .; then
               echo "FAIL ${id}: 测试不存在（注释掉的声明不算证据）: $name" >&2; fail=1

@@ -1,4 +1,4 @@
-// Package geoipnames 承载 ip2region 地理规范化的四张共享表——单一数据源
+// Package geoipnames 承载 ip2region 地理规范化的共享映射表——单一数据源
 // 消费方两侧
 //
 //   - internal/services（选项树构建 regionTreeFromXDB → GetIP2RegionRegions）
@@ -11,10 +11,14 @@
 // go.mod 先拷）。漂移失效形态（选项树提供某省/市而发射变量发另一形态 →
 // 城市级地域规则静默恒不命中）由单源根治，修改只改本包一处。
 //
-// 归一用的四张映射表（provinceAliases/cityPinyinFixes/autonomousPrefectures/
-// overseasCountries）与台湾城市集均为包内**只读**全局数据：只经本包导出函数
-// （ProvinceForTree/ProvinceForEmit/CityForTree/CityForEmit/NormalizeCountry）
-// 消费，不导出表本身（外部无从改写；新增映射请改表本身并同步 tables_test 钉值）。
+// 映射表共五张：四张归一表（provinceAliases/cityPinyinFixes/
+// autonomousPrefectures/overseasCountries，包内小写、不导出）与
+// CountryNamesCN（ISO 国名英文→中文，**导出且直接进 API 响应**，见该变量注释）。
+// 另有台湾城市集（taiwanCities）。全部为**只读**全局数据：归一表只经本包导出
+// 函数（ProvinceForTree/ProvinceForEmit/CityForTree/CityForEmit/
+// NormalizeCountry）消费，外部无从改写；CountryNamesCN 作为导出 map 由
+// handlers 只读消费，就地改写即污染 API 响应——调用方禁止写。新增/修订映射
+// 请改表本身并同步 tables_test 钉值。
 package geoipnames
 
 import "strings"

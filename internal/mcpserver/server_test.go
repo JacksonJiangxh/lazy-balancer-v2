@@ -1190,7 +1190,7 @@ func TestToolsListHidesReadOnlyForbiddenGets(t *testing.T) {
 	adminReadOnly := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "",
 		func(string) (apiKeyVisibility, error) { return apiKeyVisibility{admin: true, readOnly: true}, nil })
 	names := requestToolNames(t, adminReadOnly, "lb_sk_admin-read-only")
-	for _, hidden := range []string{"export_config", "get_caddy_config"} {
+	for _, hidden := range ReadOnlyHiddenToolNamesForTest() {
 		if names[hidden] {
 			t.Errorf("read-only key tools/list exposes always-403 tool %s", hidden)
 		}
@@ -1199,9 +1199,13 @@ func TestToolsListHidesReadOnlyForbiddenGets(t *testing.T) {
 		t.Fatalf("read-only key tools/list must keep read tools: %v", names)
 	}
 
-	// 元数据同源：两个工具不得标 read_only
+	// 元数据同源：隐藏集合内工具不得标 read_only
+	hiddenNames := make(map[string]bool)
+	for _, name := range ReadOnlyHiddenToolNamesForTest() {
+		hiddenNames[name] = true
+	}
 	for _, spec := range ListToolSpecs() {
-		if spec.Name != "export_config" && spec.Name != "get_caddy_config" {
+		if !hiddenNames[spec.Name] {
 			continue
 		}
 		if spec.ReadOnly {

@@ -3,6 +3,7 @@ package taskengine
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,27 +35,62 @@ func taskLogSizeBytes() int64 {
 // 按路径粒度的写入锁：stat→rotate→append 必须整体互斥——两个写入
 // 方在 stat 与 rotate 之间交错会各写一份「轮转后」内容到同名活动文件，或
 // 互相覆盖归档代（并发跨阈值丢行）。锁表按路径惰性创建；路径集合=任务日志
-// 固定集（注册任务 + 证书任务日志），不随写入行增长。
+// 固定集（注册任务 + 证书任务日志），不随写入行增长；轮转副本（.N/.gz）归一到
+// 活动路径键（见 taskLogActivePath），键集不因归档代增加而增长。
 var (
 	taskLogPathLocksMu sync.Mutex
 	taskLogPathLocks   = map[string]*sync.Mutex{}
 )
 
 // lockTaskLogPath 返回路径写入锁（调用方 Lock/Unlock）。
+// 键=活动日志路径（taskLogActivePath）：写入侧传活动名、保留期删除侧传扫描到
+// 的副本名（x.log.1），两者必须落在同一把互斥量上。
 func lockTaskLogPath(path string) *sync.Mutex {
+	key := taskLogActivePath(path)
 	taskLogPathLocksMu.Lock()
 	defer taskLogPathLocksMu.Unlock()
-	l, ok := taskLogPathLocks[path]
+	l, ok := taskLogPathLocks[key]
 	if !ok {
 		l = &sync.Mutex{}
-		taskLogPathLocks[path] = l
+		taskLogPathLocks[key] = l
 	}
 	return l
+}
+
+// taskLogActivePath 把轮转副本路径归一到其活动文件名（x.log.1 / x.log.3.gz
+// → x.log），非副本路径原样返回。副本删除与写入侧轮转必须同锁：写入侧持活动
+// 路径锁做 stat→移位→append，若删除侧按副本名各自取锁，两把锁互不排斥——
+// 「锁内 stat 判定过期」与 os.Remove 之间插入一次轮转，删掉的就是刚移位出的
+// 当前一代（最多一份 task_log_size_mb），而非本来要删的旧代。
+//
+// 只剥离末尾一段「.纯数字」后缀（先剥 .gz）：活动文件名本身允许含点与数字
+// （任务 ID 白名单含 '.'），x.2.log 不得被当成 x.2 的副本。
+func taskLogActivePath(path string) string {
+	base := strings.TrimSuffix(path, ".gz")
+	dot := strings.LastIndexByte(base, '.')
+	if dot <= 0 {
+		return path
+	}
+	generation := base[dot+1:]
+	if generation == "" {
+		return path
+	}
+	for _, ch := range generation {
+		if ch < '0' || ch > '9' {
+			return path
+		}
+	}
+	if !strings.HasSuffix(base[:dot], ".log") {
+		return path
+	}
+	return base[:dot]
 }
 
 // RemoveTaskLogIfModifiedBefore 在任务日志写入锁内重新 stat 后按保留期删除。
 // 扫描者锁外看到的旧 FileInfo 可能已被「rotate→rename→append」替换；
 // 锁内复核避免误删刚移位或刚写入的新一代文件。
+// path 可以是轮转副本名（x.log.1）——锁键归一到活动路径（taskLogActivePath），
+// 与写入侧持的是同一把锁，轮转无法插进 stat→remove 之间。
 func RemoveTaskLogIfModifiedBefore(path string, cutoff time.Time) (bool, error) {
 	lock := lockTaskLogPath(path)
 	lock.Lock()

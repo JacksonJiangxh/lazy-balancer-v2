@@ -233,3 +233,31 @@ func TestThreatRollupRewind_legacyPredicateRowsKeepLateInserts(t *testing.T) {
 		})
 	}
 }
+
+// 回退队列「消费即丢」修复钉测：DB 写失败后已消费的分钟/改判分钟必须回填，
+// 否则改判（UPDATE，id 不变）永远不再被全量重算，该分钟口径永久陈旧。
+func TestThreatRollupRewind_failureRefillsConsumedQueue(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	m := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	seedThreatRewindWatermark(t, m.Format(threatRewindMinuteLayout))
+	// 注入失败：metrics_state 不可读 → 水位读取失败（threatRollupRewindToInLock 早退 false）。
+	if _, err := db.MetricsDB.Exec(`DROP TABLE metrics_state`); err != nil {
+		t.Fatal(err)
+	}
+	queueThreatRollupRewind(m)
+	queueThreatRollupReclassify([]time.Time{m})
+
+	threatRollupMu.Lock()
+	applyPendingThreatRollupRewindInLock()
+	threatRollupMu.Unlock()
+
+	if got := threatRollupRewindPending.Load(); got != m.Unix() {
+		t.Fatalf("失败后回退队列=%d, want %d（已消费条目必须回填）", got, m.Unix())
+	}
+	if !hasPendingThreatRollupReclassify() {
+		t.Fatal("失败后改判分钟必须回填（否则该分钟永不转全量重算）")
+	}
+	// 清理：回填的全局队列不得泄漏到其他用例。
+	threatRollupRewindPending.Store(0)
+	_ = takeThreatRollupReclassifyPending()
+}

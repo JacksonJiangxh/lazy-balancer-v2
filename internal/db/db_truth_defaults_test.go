@@ -47,6 +47,11 @@ func TestFreshSchemaDefaults_MatchGovernedConstants(t *testing.T) {
 		{"global_config", "cert_renewal_days", fmt.Sprint(DefaultCertRenewalDays), 0},
 		{"global_config", "cert_renewal_attempts", fmt.Sprint(DefaultCertRenewalAttempts), 0},
 		{"security_policies", "anomaly_threshold", fmt.Sprint(DefaultAnomalyThreshold), 0},
+		// CA 提供商并发/间隔：DDL DEFAULT 与写侧归一/读侧 COALESCE/导入回填
+		// 同一常量（此前默认间隔在归一实现里是 1000，与 DDL/COALESCE 的 2000
+		// 相差一倍，按来源不同节流不同）。
+		{"ca_providers", "max_concurrent", fmt.Sprint(DefaultCAProviderMaxConcurrent), 0},
+		{"ca_providers", "min_interval_ms", fmt.Sprint(DefaultCAProviderMinIntervalMS), 0},
 		// 时区：fresh DDL DEFAULT 与读侧兜底单源（空串非法库值，启动归一收敛）。
 		{"global_config", "timezone", "'" + DefaultTimezone + "'", 0},
 		// 任务级排程：fresh DDL DEFAULT 与 services 读失败兜底同源。
@@ -842,6 +847,27 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 			// 启动归一 SQL 的 block_status_code 回退值同样绑定常量。
 			file:     "../services/security_normalize.go",
 			required: []string{"db.DefaultBlockStatusCode"},
+		},
+		{
+			// CA 提供商并发/间隔的读侧 COALESCE 与写侧归一同一对常量：
+			// 默认间隔曾在归一实现里写死 1000（DDL/读侧 2000），按来源不同
+			// 节流差一倍。
+			file:      "../services/caproviders.go",
+			forbidden: []string{"COALESCE(min_interval_ms,2000)", "COALESCE(max_concurrent,1)"},
+			required:  []string{"db.DefaultCAProviderMinIntervalMS", "db.DefaultCAProviderMaxConcurrent"},
+		},
+		{
+			// 集群快照的 CA 行读侧 COALESCE 与从端落库门同源。
+			file:      "../services/cluster_snapshot.go",
+			forbidden: []string{"COALESCE(min_interval_ms,2000)", "COALESCE(max_concurrent,1)"},
+			required:  []string{"db.DefaultCAProviderMinIntervalMS", "db.DefaultCAProviderMaxConcurrent"},
+		},
+		{
+			// 导入的 NULL 回填 + 行级归一必须与 DDL 默认/写侧同源；数值写入
+			// map 用 int64(...) 形态，字符串扫描覆盖不到。
+			file:                    "../handlers/config_backup.go",
+			forbiddenIntConversions: []string{"int64(2000)"},
+			required:                []string{"db.DefaultCAProviderMinIntervalMS", "db.DefaultCAProviderMaxConcurrent"},
 		},
 		{
 			file: "../handlers/config_import_v1.go",

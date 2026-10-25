@@ -801,7 +801,7 @@ func TestLogSyncSwitchGuards_sameVersionDoesNotHashWafFiles(t *testing.T) {
 	WafFileLock().Lock()
 	done := make(chan struct{})
 	go func() {
-		logSyncSwitchGuards(database, snapshot, sk, SyncSwitches{})
+		logSyncSwitchGuards(context.Background(), database, snapshot, sk, SyncSwitches{})
 		close(done)
 	}()
 	select {
@@ -827,7 +827,7 @@ func TestLogSyncSwitchGuards_newVersionHashesAndAdvancesDedup(t *testing.T) {
 	}
 	sk := &sectionSkips{disabled: map[string]bool{"security": true}, unchanged: map[string]bool{}}
 
-	logSyncSwitchGuards(database, snapshot, sk, SyncSwitches{})
+	logSyncSwitchGuards(context.Background(), database, snapshot, sk, SyncSwitches{})
 
 	var applied int
 	if err := database.QueryRow(`SELECT COALESCE(applied_waf_ref_version,0) FROM global_config WHERE id=1`).Scan(&applied); err != nil {

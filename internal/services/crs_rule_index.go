@@ -401,6 +401,7 @@ func crsRuleIndexCacheKey(version string) string {
 	}
 	var maxMtime, totalSize int64
 	count := 0
+	var modeFold uint32
 	for _, entry := range entries {
 		// CRS 发行契约=扁平 rules/ 目录（键只聚合顶层 .conf 的 stat）：子目录
 		// .conf 不进键，其增删改不会触发索引重建——检测到即 WARN（与
@@ -414,15 +415,23 @@ func crsRuleIndexCacheKey(version string) string {
 		}
 		info, err := entry.Info()
 		if err != nil {
+			// 键少算一个文件会让索引缓存停留在旧代（读到已删除/改名的规则
+			// 仍判存在）。按文件限流留痕，不静默。
+			if msg := fmt.Sprintf("CRS 规则索引缓存键: stat %s 失败（该文件不进键，判存/选组可能陈旧）: %v", entry.Name(), err); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		count++
+		// 权限位纳入键：chmod 致不可读后 mtime/size/count 不变，旧缓存继续
+		// 命中会把「读失败」掩盖成健康态；权限变化必须触发重建。
+		modeFold = modeFold*31 + uint32(info.Mode().Perm())
 		if mtime := info.ModTime().UnixNano(); mtime > maxMtime {
 			maxMtime = mtime
 		}
 		totalSize += info.Size()
 	}
-	return fmt.Sprintf("%s|%s|%d|%d|%d", version, CRSRuleIndexDir, count, maxMtime, totalSize)
+	return fmt.Sprintf("%s|%s|%d|%d|%d|%d", version, CRSRuleIndexDir, count, maxMtime, totalSize, modeFold)
 }
 
 // warnCRSSubdirRuleFiles 检测子目录内是否存在 .conf 规则文件：CRS 发行契约
@@ -475,6 +484,12 @@ func buildCRSRuleIndex(version string) *CRSRuleIndex {
 		}
 		content, err := os.ReadFile(filepath.Join(CRSRuleIndexDir, entry.Name()))
 		if err != nil {
+			// 单文件读失败会让整份规则文件的 ID 从索引消失：Has/HasGroup 误判
+			// 导致保存 400「规则组不存在」，选组侧把存在 ID 当陈旧跳过（静默
+			// 少发射）。必须留痕（按文件限流），不得静默 continue。
+			if msg := fmt.Sprintf("CRS 规则索引读取 %s 失败（该文件规则 ID 不进索引，存在性/选组判定可能失真）: %v", entry.Name(), err); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		for _, raw := range parseCRSRuleFileContent(string(content)) {

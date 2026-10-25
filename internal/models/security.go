@@ -423,7 +423,8 @@ type CRSInfo struct {
 	UpdateStatus string `json:"update_status"`
 	Message      string `json:"message"`
 	// Available：规则目录真实可用（探针文件在）——缺库降级（2026-09-24 裁定）
-	// 的前端感知面；false 时安全链整体不渲染（见 SecurityLibrariesAvailable）。
+	// 的前端感知面；false 时安全链整体不渲染（渲染门判据见
+	// services.SecurityLibraryStatus 的两类库布尔）。
 	Available bool   `json:"available"`
 	Trigger   string `json:"trigger"`
 	// 定时更新排程（v2.3.x）：星期集（1=周一…7=周日）+ HH:MM，时区遵循基础设置。

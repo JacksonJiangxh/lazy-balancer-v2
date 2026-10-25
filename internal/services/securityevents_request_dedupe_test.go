@@ -349,6 +349,36 @@ func TestSecurityEventsTick_samePassUpgradeUpdatesAttackFlowAction(t *testing.T)
 	}
 }
 
+// 跨批改判（首轮 logged 属爬虫放行族=不计攻击，未入光流）后收到 blocked：
+// 光流必须补入该拦截弧——同屏事件行/拦截率按 blocked 计，光流不得永久缺弧。
+func TestSecurityEventsTick_crossPassUpgradeAppendsAttackFlow(t *testing.T) {
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	enableAttackFlowSampling(t)
+	// 810017 属爬虫放行族（豁免段 [810016,850000)）：logged 不计攻击，首轮不入环。
+	writeSecurityEventsDedupeLog(t, logPath,
+		securityEventsDedupeNowFixture("tx-flow-cross-a", "0066aabbccddeeff", "/flow-cross", "logged", 810017))
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	runSecurityEventsDedupeTick(t, tailer)
+	if events, _, _ := ThreatScreenAttackFlowSnapshot(0, 0); len(events) != 0 {
+		t.Fatalf("爬虫放行族 logged 不得入光流，got %+v", events)
+	}
+
+	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-flow-cross-b", "0066aabbccddeeff", "/flow-cross", "blocked", 949110))
+	events, _, _ := ThreatScreenAttackFlowSnapshot(0, 0)
+	var matched []string
+	for _, ev := range events {
+		if ev.ClientIP == "45.33.32.9" {
+			matched = append(matched, ev.Action+"|"+ev.RuleTriggered)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("跨批改判后光流条目数=%d, want 1: %v", len(matched), matched)
+	}
+	if matched[0] != "blocked|949110" {
+		t.Fatalf("光流条目=%q, want blocked|949110（与事件行/库内改判一致）", matched[0])
+	}
+}
+
 func TestSecurityEventsTick_samePassUpgradeFeedsAutobanOnce(t *testing.T) {
 	for _, scope := range []string{"all", "blocked"} {
 		t.Run(scope, func(t *testing.T) {

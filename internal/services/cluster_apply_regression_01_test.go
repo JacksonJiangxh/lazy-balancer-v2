@@ -49,6 +49,41 @@ func TestReplaceSnapshotTx_RulesDisabledKeepsLocalCertJobs(t *testing.T) {
 	}
 }
 
+// 集群回写必须落规范域名：主节点行可能来自旧备份/带外改库（大写/空白/顺序
+// 变体），从端原样回写后，按规范串精确匹配的消费面（任务 upsert 冲突键与回查、
+// HasCertJob、签发冷却查询）在规则域变更后无法命中，同域集会并存两行。
+func TestReplaceSnapshotTx_canonicalizesCertJobDomain(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+
+	snapshot := models.ClusterSnapshot{
+		Version: 5,
+		Rules: []models.LbRule{{CaddyID: "lb_acme", Name: "r", Protocol: "http",
+			Domain: "bak-acme.example.test,www.bak-acme.example.test", ListenPort: 443,
+			Enabled: true, EnableTLS: true, TLSSource: "acme_dns"}},
+		Certs: []models.ClusterCertificate{{RuleID: "lb_acme",
+			Domain: " WWW.Bak-Acme.Example.Test , bak-acme.example.test ", CertPEM: "PEM-NEW", KeyPEM: "KEY-NEW"}},
+	}
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	sk := &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}}
+	if err := replaceSnapshotTx(ctx, tx, snapshot, sk); err != nil {
+		t.Fatalf("replaceSnapshotTx: %v", err)
+	}
+
+	var domain string
+	if err := tx.QueryRowContext(ctx, "SELECT domain FROM cert_jobs WHERE rule_id='lb_acme'").Scan(&domain); err != nil {
+		t.Fatal(err)
+	}
+	if want := "bak-acme.example.test,www.bak-acme.example.test"; domain != want {
+		t.Fatalf("cert_jobs.domain=%q, want %q（集群回写必须落规范串）", domain, want)
+	}
+}
+
 // 反向锁定：rules 哈希一致（unchanged，非开关关闭）时证书轴仍全量
 // 不得被本修复误伤。
 func TestReplaceSnapshotTx_RulesUnchangedStillReplaysCertJobs(t *testing.T) {

@@ -56,10 +56,11 @@ var (
 	}
 )
 
-// deploymentLifecycleJobStatuses / deploymentLifecycleJobStatusSQL 由
+// deploymentLifecycleJobStatuses / DeploymentLifecycleJobStatusSQL 由
 // jobLifecycleByStatus 派生（JobLifecycle==downloaded 单源）——状态集新增时
 // 只改映射表，切片与 SQL IN 片段不再双份真源。消费方：transitionJob 的
-// from 集合（certissuer.go）与 cluster_report.go 的 SQL IN。
+// from 集合、启动/补扫装载的 CAS 源态集、cluster_report 与 handlers 的 SQL IN
+// （跨包消费方无法触达切片，必须走导出的 SQL 片段）。
 var (
 	deploymentLifecycleJobStatuses = func() []string {
 		statuses := make([]string, 0, 3)
@@ -71,9 +72,24 @@ var (
 		sort.Strings(statuses)
 		return statuses
 	}()
-	// deploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用（由同一切片派生，
+	// DeploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用（由同一切片派生，
 	// 非编译期常量——拼接点均为运行时字符串构造）。
-	deploymentLifecycleJobStatusSQL = "'" + strings.Join(deploymentLifecycleJobStatuses, "','") + "'"
+	DeploymentLifecycleJobStatusSQL = "'" + strings.Join(deploymentLifecycleJobStatuses, "','") + "'"
+	// deploymentCleanupJobStatuses 是部署生命周期中「仅剩 DNS 清理窗口」的子集：
+	// downloaded 之外的部署态行由补扫的时间窗/settle 分支单独处理（它们不带
+	// window 判据），cleanup_* 行则可能连窗口列都没写成功，必须无条件拾起。
+	deploymentCleanupJobStatuses = func() []string {
+		statuses := make([]string, 0, len(deploymentLifecycleJobStatuses))
+		for _, status := range deploymentLifecycleJobStatuses {
+			if status != "downloaded" {
+				statuses = append(statuses, status)
+			}
+		}
+		return statuses
+	}()
+	// DeploymentCleanupJobStatusSQL 同上，供补扫 cleanup 分支的 SQL IN 复用
+	// （该分支刻意不覆盖 downloaded——否则 downloaded 行会绕过窗口与沉降判据）。
+	DeploymentCleanupJobStatusSQL = "'" + strings.Join(deploymentCleanupJobStatuses, "','") + "'"
 )
 
 type jobTransitionExecutor interface {

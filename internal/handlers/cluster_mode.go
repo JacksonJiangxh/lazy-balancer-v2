@@ -30,14 +30,17 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req models.ClusterModeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标：从节点", "集群模式参数无效", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "集群模式参数无效", err)
 		return
 	}
 	if req.Mode == "master" {
+		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标：主节点", "请使用提升接口切换为主节点", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "请使用提升接口切换为主节点", nil)
 		return
 	}
 	if req.MasterURL == "" || req.RegisterToken == "" {
+		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标：从节点", "主节点地址和注册令牌不能为空", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "主节点地址和注册令牌不能为空", nil)
 		return
 	}
@@ -59,6 +62,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 	// 避免主节点拒绝或把脏名字写入集群。
 	name = models.NormalizeClusterNodeName(name)
 	if name == "" {
+		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标：从节点", models.ErrInvalidClusterNodeName.Error(), services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, models.ErrInvalidClusterNodeName.Error(), models.ErrInvalidClusterNodeName)
 		return
 	}
@@ -173,6 +177,7 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req models.ClusterSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		recordAudit(c, "更新失败", "集群设置", services.FormatAuditDetail("集群设置参数无效", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "集群设置参数无效", err)
 		return
 	}
@@ -193,6 +198,13 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 				msg = err.Error()
 			}
 		}
+		// explicit 路由的 4xx/5xx 中间件不代记——拒绝面（含从节点越权/误操作
+		// 与内部故障）必须由 handler 留痕，与成功面同端点同口径。
+		detail := msg
+		if err.Error() != msg {
+			detail = services.FormatAuditDetail(msg, err.Error())
+		}
+		recordAudit(c, "更新失败", "集群设置", detail)
 		clusterError(c, status, msg, err)
 		return
 	}

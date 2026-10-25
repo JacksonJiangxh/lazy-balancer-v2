@@ -26,12 +26,16 @@ func TestImportConfigBackup_rearmsImportedFutureSlotsToLocalSchedule(t *testing.
 	if _, err := db.DB.Exec(`UPDATE global_config SET timezone='Asia/Shanghai' WHERE id=1`); err != nil {
 		t.Fatalf("seed timezone: %v", err)
 	}
-	// 任务级排程取治理默认 04:00 全周（DDL 默认值），显式固化避免依赖 schema。
-	if _, err := db.DB.Exec(`UPDATE global_config SET crawler_schedule_days='1,2,3,4,5,6,7', crawler_schedule_time='04:00' WHERE id=1`); err != nil {
+	// 任务级排程：全周 + 稳定槽位（避免依赖 schema 默认值，也避开边界窗口）。
+	now := time.Now()
+	// 槽位时间取「当前 + 6h」（分钟对齐）：断言用导入前采样推算期望槽，若槽
+	// 恰好落在导入前/导入内两次采样之间就会误红——留 6h 余量使该窗口不可达。
+	scheduleTime := now.In(services.CurrentLocation()).Add(6 * time.Hour).Format("15:04")
+	// 任务级排程显式固化（避免依赖 schema 默认值），时间取稳定槽。
+	if _, err := db.DB.Exec(`UPDATE global_config SET crawler_schedule_days='1,2,3,4,5,6,7', crawler_schedule_time=? WHERE id=1`, scheduleTime); err != nil {
 		t.Fatalf("seed crawler schedule: %v", err)
 	}
-	now := time.Now()
-	correct := services.NextScheduledSlot(now, []int{1, 2, 3, 4, 5, 6, 7}, "04:00", services.CurrentLocation())
+	correct := services.NextScheduledSlot(now, []int{1, 2, 3, 4, 5, 6, 7}, scheduleTime, services.CurrentLocation())
 	if correct.IsZero() {
 		t.Fatal("测试前提：排程槽不可为零值")
 	}
@@ -67,7 +71,7 @@ func TestImportConfigBackup_rearmsImportedFutureSlotsToLocalSchedule(t *testing.
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&got); err != nil {
 		t.Fatalf("read imported slot: %v", err)
 	}
-	want := services.NextScheduledSlot(time.Now(), []int{1, 2, 3, 4, 5, 6, 7}, "04:00", services.CurrentLocation()).UTC().Format(flatUTCTimeLayout)
+	want := correct.UTC().Format(flatUTCTimeLayout)
 	if got == stale {
 		t.Fatalf("导入槽未被重排：仍为源机形态 %q", stale)
 	}
@@ -86,8 +90,13 @@ func TestImportConfigBackup_keepsExpiredSlotsWhenRearming(t *testing.T) {
 		t.Fatalf("seed timezone: %v", err)
 	}
 	now := time.Now()
+	// 与首个用例同口径：稳定槽位（当前 +6h）避免「导入前后两次采样跨槽边界」误红。
+	scheduleTime := now.In(services.CurrentLocation()).Add(6 * time.Hour).Format("15:04")
+	if _, err := db.DB.Exec(`UPDATE global_config SET crawler_schedule_days='1,2,3,4,5,6,7', crawler_schedule_time=? WHERE id=1`, scheduleTime); err != nil {
+		t.Fatalf("seed crawler schedule: %v", err)
+	}
 	expired := now.UTC().Add(-2 * time.Hour).Format(flatUTCTimeLayout)
-	freshSlot := services.NextScheduledSlot(now, []int{1, 2, 3, 4, 5, 6, 7}, "04:00", services.CurrentLocation())
+	freshSlot := services.NextScheduledSlot(now, []int{1, 2, 3, 4, 5, 6, 7}, scheduleTime, services.CurrentLocation())
 	stale := freshSlot.UTC().Add(8 * time.Hour).Format(flatUTCTimeLayout)
 	payload := backupJSONFixture(t, map[string][]map[string]any{
 		"security_crawler_sources": {
@@ -119,7 +128,7 @@ func TestImportConfigBackup_keepsExpiredSlotsWhenRearming(t *testing.T) {
 	if got := read("googlebot"); got != expired {
 		t.Fatalf("过期槽=%q, want 保留 %q（到期补跑语义）", got, expired)
 	}
-	want := services.NextScheduledSlot(time.Now(), []int{1, 2, 3, 4, 5, 6, 7}, "04:00", services.CurrentLocation()).UTC().Format(flatUTCTimeLayout)
+	want := freshSlot.UTC().Format(flatUTCTimeLayout)
 	if got := read("gptbot"); got != want {
 		t.Fatalf("未来槽=%q, want 重排为 %q（旧槽 %q）", got, want, stale)
 	}
@@ -128,3 +137,55 @@ func TestImportConfigBackup_keepsExpiredSlotsWhenRearming(t *testing.T) {
 // flatUTCTimeLayout 是排程槽落库的平面 UTC 串形态（services.crsTimeLayout
 // 未导出，测试侧按同一形态断言）。
 const flatUTCTimeLayout = "2006-01-02 15:04:05"
+
+// 重排必须幂等：导入提交后已按本机槽重算，随后的时区重排/重复调用不得再改动
+// 未来槽（否则每次时区保存都让「下次更新」漂移一轮，且掩盖真实重排缺陷）。
+func TestImportConfigBackup_rearmIsIdempotent(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedLiveAdminShared(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET timezone='Asia/Shanghai' WHERE id=1`); err != nil {
+		t.Fatalf("seed timezone: %v", err)
+	}
+	now := time.Now()
+	scheduleTime := now.In(services.CurrentLocation()).Add(6 * time.Hour).Format("15:04")
+	if _, err := db.DB.Exec(`UPDATE global_config SET crawler_schedule_days='1,2,3,4,5,6,7', crawler_schedule_time=? WHERE id=1`, scheduleTime); err != nil {
+		t.Fatalf("seed crawler schedule: %v", err)
+	}
+	slot := services.NextScheduledSlot(now, []int{1, 2, 3, 4, 5, 6, 7}, scheduleTime, services.CurrentLocation())
+	if slot.IsZero() {
+		t.Fatal("测试前提：排程槽不可为零值")
+	}
+	stale := slot.UTC().Add(8 * time.Hour).Format(flatUTCTimeLayout)
+
+	payload := backupJSONFixture(t, map[string][]map[string]any{
+		"security_crawler_sources": {
+			{
+				"name": "googlebot", "display_name": "Googlebot", "entry_count": 1,
+				"version": "2026.10.01", "update_status": "idle", "update_enabled": 1,
+				"next_update": stale,
+			},
+		},
+	}, nil, []string{"security"})
+	if rec := postImportBytes(t, h, payload); rec.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	read := func() string {
+		t.Helper()
+		var got string
+		if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&got); err != nil {
+			t.Fatalf("read slot: %v", err)
+		}
+		return got
+	}
+	imported := read()
+	if imported == stale {
+		t.Fatalf("导入槽未被重排：仍为 %q", stale)
+	}
+	for i := 0; i < 2; i++ {
+		services.RearmScheduleSlotsAfterTimezoneChange()
+		if again := read(); again != imported {
+			t.Fatalf("第 %d 次重排改变了未来槽：%q → %q（重排必须幂等）", i+1, imported, again)
+		}
+	}
+}

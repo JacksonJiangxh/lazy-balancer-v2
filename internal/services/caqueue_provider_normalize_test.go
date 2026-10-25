@@ -29,7 +29,7 @@ func seedCAProviderBounds(t *testing.T, id, maxConcurrent, minIntervalMS int) {
 
 // Given 库内 max_concurrent=0、min_interval_ms=0（带外边角）。
 // When 队列加载该 provider。
-// Then 返回的快照必须已归一为 (1,1000)——未归一会让该 CA 的派发闸门恒关闭。
+// Then 返回的快照必须已归一为 (1,2000)——未归一会让该 CA 的派发闸门恒关闭。
 func TestLoadCAProvider_normalizesNonPositiveBounds(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 	seedCAProviderBounds(t, 7, 0, 0)
@@ -38,8 +38,8 @@ func TestLoadCAProvider_normalizesNonPositiveBounds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load ca provider: %v", err)
 	}
-	if provider.MaxConcurrent != 1 || provider.MinIntervalMS != 1000 {
-		t.Fatalf("provider bounds=(%d,%d), want (1,1000)", provider.MaxConcurrent, provider.MinIntervalMS)
+	if provider.MaxConcurrent != 1 || provider.MinIntervalMS != 2000 {
+		t.Fatalf("provider bounds=(%d,%d), want (1,2000)", provider.MaxConcurrent, provider.MinIntervalMS)
 	}
 }
 
@@ -90,7 +90,7 @@ func TestEnqueueLocked_reusedQueueSnapshotIsNormalized(t *testing.T) {
 	q.mu.Lock()
 	snapshot := q.provider
 	q.mu.Unlock()
-	if snapshot.MaxConcurrent != 1 || snapshot.MinIntervalMS != 1000 {
-		t.Fatalf("reused queue snapshot=(%d,%d), want (1,1000)", snapshot.MaxConcurrent, snapshot.MinIntervalMS)
+	if snapshot.MaxConcurrent != 1 || snapshot.MinIntervalMS != 2000 {
+		t.Fatalf("reused queue snapshot=(%d,%d), want (1,2000)", snapshot.MaxConcurrent, snapshot.MinIntervalMS)
 	}
 }

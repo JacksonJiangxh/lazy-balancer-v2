@@ -14,7 +14,7 @@
 | 方式 | Header | 说明 |
 |---|---|---|
 | JWT | `Authorization: Bearer <token>` | 登录 `/api/v1/auth/login` 获取 |
-| API Key | `X-API-Key: lb_sk_...` | 管理面板创建；非管理员用户创建的 Key **恒为只读**（无写能力例外：管理写操作一律 403；仅「只读语义 POST」按豁免清单放行——解析证书、批量查询证书任务、规则证书信息、大屏采集租约、配置预览/导入校验、OIDC 发现探测；自助写 `PATCH /users/me`、`/users/me/api-keys` 系列只对登录会话生效，API Key 不可用） |
+| API Key | `X-API-Key: lb_sk_...` | 管理面板创建；非管理员用户创建的 Key **恒为只读**（无写能力例外：管理写操作一律 403；只读语义写操作按豁免清单放行——解析证书、批量查询证书任务、规则证书信息、大屏采集租约（POST 申请 / DELETE 释放）；配置预览、导入校验、OIDC 发现探测虽在豁免清单内但注册于管理员组，仅管理员属主的只读 Key 可用；自助写 `PATCH /users/me`、`/users/me/api-keys` 系列只对登录会话生效，API Key 不可用） |
 
 ## 端点概览
 

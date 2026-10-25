@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -244,6 +245,18 @@ func TestEmitCustomRules_invalidRuleLogsSkipAndSparesCleanRules(t *testing.T) {
 	originalWriter := log.Writer()
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(originalWriter) })
+	// 结构性 skip 告警走进程级 60s 限流：同包前一用例
+	// （TestEmitCustomRules_invalidTargetOrOperatorSkipsWholeRule）用同一组
+	// rule id/名称触发过同文案，不隔离限流状态会让本用例按执行顺序变红。
+	auditFailureLogMu.Lock()
+	savedThrottle := auditFailureLogTimes
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	t.Cleanup(func() {
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = savedThrottle
+		auditFailureLogMu.Unlock()
+	})
 
 	// Given dirty rules interleaved with a fully valid chained rule
 	var sb strings.Builder

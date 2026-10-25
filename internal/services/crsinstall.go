@@ -407,13 +407,27 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 		return "", fmt.Errorf("安装新 rules: %w", err)
 	}
 	newSetup := filepath.Join(staging, "crs-setup.conf.example")
+	// 写序必须 stock → setup：两步各自原子，崩溃只会落在两者之间。
+	// 旧序（setup→stock）在中间崩溃留下「新 setup + 旧 stock」，下次迁移以旧
+	// stock 为基线、对新 setup 求差 → 上游默认行被当作自定义行写进
+	// zz-user-overrides.conf，重复 SecRule id 使 coraza 拒绝配置再生成，此后
+	// 每轮更新都被拒并回滚（恢复的也是同组合，无法自愈）。
+	// 新序残留「新 stock + 旧 setup」：以新 stock 为基线求差只保留真正的用户
+	// 自定义行，下一次更新自动收敛。
+	stockPath := filepath.Join(m.liveDir(), "crs-setup.stock.conf")
+	if err := copyFile(newSetup, stockPath); err != nil {
+		m.restoreBackupInLock()
+		return "", fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
+	}
 	if err := copyFile(newSetup, setupPath); err != nil {
 		m.restoreBackupInLock()
 		return "", fmt.Errorf("写入 crs-setup.conf: %w", err)
 	}
-	if err := copyFile(newSetup, filepath.Join(m.liveDir(), "crs-setup.stock.conf")); err != nil {
+	// 写后自检：两文件同源，差集必须为空（stock-first 写序的一致性钉子；
+	// 任何非空差都意味着下一步迁移会把它当自定义行）。
+	if diff := extractSetupDiff(readConfLines(stockPath), readConfLines(setupPath)); len(diff) > 0 {
 		m.restoreBackupInLock()
-		return "", fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
+		return "", fmt.Errorf("crs-setup.conf 与基线不一致（差 %d 行），已回滚本次更新", len(diff))
 	}
 	// 新-2：overrides 迁移写入推迟到此处（rules 与新 setup 均已落盘）——
 	// 此点之后的崩溃留下「新 stock setup（不含自定义行）+ 旧 overrides」，
@@ -772,18 +786,26 @@ func restoreRulesBackupInWindow(rulesPath, rulesBak string) bool {
 
 // crsRulesProbeFile 是完整 CRS rules 树必然携带的探针文件（crsProbeFile 去掉
 // rules/ 前缀，相对 rules 树根）。「≥1 个 .conf」只排除全空树，不排除拷贝
-// 中途崩溃留下的部分残树（裸 copyDir 备份、moveTree 直写回退）——
-// 探针缺失即视为退化。
+// 中途崩溃留下的部分残树——探针缺失即视为退化。
+//
+// 单探针判据的强度由写入相位保证，而非靠探针数量：
+//   - copyDir/moveTree 回退把探针排在拷贝序最后（任何中断都缺探针）；
+//   - 备份/替换/移动回退全部 tmp+rename 事务写（半树不落最终路径）；
+//   - 打包/解包/哈希共用一个瞬态谓词。
+//
+// 因此「探针在、树却半份」只能来自带外污染（旧版本遗留残树/手工改盘），
+// 启动 seed 与备份门在探针缺失时按退化处理（重播/拒绝恢复）。
 const crsRulesProbeFile = "REQUEST-901-INITIALIZATION.conf"
 
 // crsRulesTreeIntact reports whether rulesDir looks like a complete CRS rules
-// tree: at least one .conf file AND the release-invariant probe file present.
+// tree: at least one .conf file AND the release-invariant probe file present
+// and non-empty.
 func crsRulesTreeIntact(rulesDir string) bool {
 	if !treeContainsConfFile(rulesDir) {
 		return false
 	}
 	info, err := os.Stat(filepath.Join(rulesDir, crsRulesProbeFile))
-	return err == nil && !info.IsDir()
+	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
 // treeContainsConfFile reports whether dir holds at least one regular .conf
@@ -894,11 +916,35 @@ var copyDirRename = os.Rename
 
 // moveTree relocates a directory tree, falling back to copy + remove when a
 // plain rename is impossible (e.g. overlayfs image layers or bind mounts).
+//
+// 回退路径必须事务化：直写 dst 的中断（ENOSPC/EIO/强杀）会在 dst 留下半棵树，
+// 而完整性门只看探针存在——探针若已落地，半棵树会被当作完整树（seed 不重播、
+// 备份被当权威旧树）。复制到 dst 同父级暂存树后再 rename，失败只在 .tmp 留残
+// （清理），dst 保持「不存在或上一代完整树」。
 func moveTree(src, dst string) error {
 	if err := osRename(src, dst); err == nil {
 		return nil
 	}
-	if err := copyDir(src, dst); err != nil {
+	tmp := dst + ".tmp"
+	if err := os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	if err := copyDir(src, tmp); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean partial move staging %s: %v", tmp, rErr)
+		}
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean move staging %s: %v", tmp, rErr)
+		}
+		return err
+	}
+	if err := copyDirRename(tmp, dst); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean move staging %s after rename failure: %v", tmp, rErr)
+		}
 		return err
 	}
 	return os.RemoveAll(src)
@@ -920,6 +966,11 @@ func copyFile(src, dst string) error {
 	return writeFileAtomicSynced(dst, data, 0644)
 }
 
+// copyDir 逐文件复制（copyFile 单文件原子）。探针文件（crsRulesProbeFile）
+// 恒最后复制：完整性门只以「探针存在」为判据，而 os.ReadDir 是文件名升序——
+// 探针 REQUEST-901-* 在真实 CRS 树里排在头部，排序拷贝中断时它已落地，半树
+// 会被判完整（seed 不重播、备份被当权威旧树）。把它挪到最后后，任何中途失败
+// 都缺探针，门/自愈按退化处理。
 func copyDir(src, dst string) error {
 	entries, err := os.ReadDir(src)
 	if err != nil {
@@ -928,7 +979,14 @@ func copyDir(src, dst string) error {
 	if err := os.MkdirAll(dst, 0755); err != nil {
 		return err
 	}
+	probe := ""
+	if info, statErr := os.Stat(filepath.Join(src, crsRulesProbeFile)); statErr == nil && !info.IsDir() {
+		probe = crsRulesProbeFile
+	}
 	for _, entry := range entries {
+		if entry.Name() == probe {
+			continue // 探针延后到循环末尾
+		}
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 		if entry.IsDir() {
@@ -938,6 +996,11 @@ func copyDir(src, dst string) error {
 			continue
 		}
 		if err := copyFile(srcPath, dstPath); err != nil {
+			return err
+		}
+	}
+	if probe != "" {
+		if err := copyFile(filepath.Join(src, probe), filepath.Join(dst, probe)); err != nil {
 			return err
 		}
 	}

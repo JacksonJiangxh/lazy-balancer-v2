@@ -115,12 +115,6 @@ func ThreatAutoUpdateEnabled() bool { return globalTaskAutoUpdateEnabled("threat
 // 引擎接线测试；与 Reset 返回新实例的更新行为测试区分）。
 func ClearThreatUpdateManagerForTest() { threatUpdateManager = nil }
 
-func (m *ThreatUpdateManager) IsRunning() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.running
-}
-
 // TaskStatus 任务级状态快照（status 端点）。
 type ThreatTaskStatus struct {
 	Running    bool   `json:"running"`
@@ -294,7 +288,12 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 			isEmpty := threatListEmpty(s.name)
 			gated := !isEmpty || consecutiveFailures > 0
 			if gated {
-				if due, err := time.Parse(crsTimeLayout, nextUpdate); err == nil && now.Before(due) {
+				// 到期判定必须与全域「双布局」契约同源（parseUTCSlot 兼容
+				// crsTimeLayout 平面串 + RFC3339）：next_update 可因集群快照/
+				// 备份导入/旧版本残留而出现混格式，单布局解析失败会被当作
+				// 「已到期」→ 未到期源被同轮额外下载一次。解析失败仍按到期
+				// 处理（fail-safe：只会多跑不会漏跑）。
+				if due := parseUTCSlot(nextUpdate); !due.IsZero() && now.Before(due) {
 					continue
 				}
 			}

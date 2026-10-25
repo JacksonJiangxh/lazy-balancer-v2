@@ -707,8 +707,9 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 	}
 	// 与 UpdateConfig 同门、同分类器：DB 故障不得被回成 400 携带底层错误文本
 	// （管理员会误判为载荷非法），纯配置错误才 400 展示全部问题。
+	// 预览是 AuditPolicySkip（不落库的查询）：不产生失败留痕。
 	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
-		writeConfigValidationFailure(c, err)
+		writeConfigValidationFailure(c, err, false)
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: plan})
@@ -736,14 +737,28 @@ func isPureConfigValidationError(err error) bool {
 // 保持 400 且展示全部规则问题；一旦混入非配置类错误（DB 故障
 // 等），改映射 500 通用文案并记日志——否则 400 消息携带底层 DB 错误文本，
 // 客户端会把服务端故障误判为配置问题。
-func writeConfigValidationFailure(c *gin.Context, err error) {
+// auditFailure 由调用方的审计策略决定：保存端点（PUT /config）是 Explicit，
+// 中间件不为失败兜底，5xx 必须在此留痕；预览端点（AuditPolicySkip）必须传
+// false，否则会给不落库的查询产生虚假留痕。4xx 不审计是既定政策。
+func writeConfigValidationFailure(c *gin.Context, err error, auditFailure bool) {
+	// 5xx 留痕只在 Explicit 语义（保存）下发生；4xx 是载荷/配置状态错误，
+	// 按既定政策不入审计。
+	auditServerFailure := func() {
+		if !auditFailure {
+			return
+		}
+		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(
+			"预校验规则配置失败", err.Error(), services.AuditResultPart("failure")))
+	}
 	var validationErr *configValidationError
 	if !errors.As(err, &validationErr) {
+		auditServerFailure()
 		writeInternalError(c, http.StatusInternalServerError, "预校验规则配置失败", err)
 		return
 	}
 	if !isPureConfigValidationError(err) {
 		services.Logf("error", "更新全局配置的规则预校验混入非配置类错误：%v", err)
+		auditServerFailure()
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "预校验规则配置失败"})
 		return
 	}
@@ -811,7 +826,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	}
 
 	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
-		writeConfigValidationFailure(c, err)
+		writeConfigValidationFailure(c, err, true)
 		return
 	}
 
@@ -1241,10 +1256,14 @@ var caddyLogPaths = map[string]string{
 // 读取必须受 128KB 窗口上限约束，不得随增长无界放大）。
 var caddyLogsStatHook func()
 
-// caddyLogTypes 是 caddyLogPaths 的确定性展示顺序（错误文案与文档共用）——
-// 由路径表派生而非第二份手写枚举：新增日志类型时只改路径表，文案不会漏项
-// （sortedStringKeys 保证遍历序稳定，避免直接遍历 map 造成顺序漂移）。
-var caddyLogTypes = sortedStringKeys(caddyLogPaths)
+// caddyLogTypes 返回 caddyLogPaths 的确定性展示顺序（错误文案与文档共用）——
+// 由路径表即时派生而非第二份手写枚举：新增日志类型时只改路径表，文案不会
+// 漏项（sortedStringKeys 保证遍历序稳定，避免直接遍历 map 造成顺序漂移）。
+// 必须是函数而非包级 var：包初始化快照会在测试注入路径表后与查表分叉，
+// 「单源派生」只剩口头保证。
+func caddyLogTypes() []string {
+	return sortedStringKeys(caddyLogPaths)
+}
 
 func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 	logType := c.DefaultQuery("type", "runtime")
@@ -1253,7 +1272,7 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 		// fail-visible：未知类型此前静默回落到 runtime 日志，
 		// 排障者会误读错误文件（不同日志族内容完全不同）。
 		c.JSON(http.StatusBadRequest, models.APIResponse{
-			Code: 400, Message: fmt.Sprintf("未知日志类型 %q，可选值：%s", logType, strings.Join(caddyLogTypes, "、")),
+			Code: 400, Message: fmt.Sprintf("未知日志类型 %q，可选值：%s", logType, strings.Join(caddyLogTypes(), "、")),
 		})
 		return
 	}

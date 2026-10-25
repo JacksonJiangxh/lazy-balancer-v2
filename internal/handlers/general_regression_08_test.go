@@ -352,7 +352,7 @@ func TestWriteConfigValidationFailure_status_mapping(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
-			writeConfigValidationFailure(ctx, tt.err)
+			writeConfigValidationFailure(ctx, tt.err, false)
 			if recorder.Code != tt.wantStatus {
 				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tt.wantStatus)
 			}
@@ -367,5 +367,59 @@ func TestWriteConfigValidationFailure_status_mapping(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// PUT /config 是 Explicit 审计策略（中间件不为失败兜底）：保存链预校验的 5xx
+// 必须留痕，而 4xx 载荷/配置状态错误仍不审计（既定政策）；预览路由是
+// AuditPolicySkip，同一分类器必须不产生虚假留痕。
+func TestWriteConfigValidationFailure_auditOnlyOnExplicitServerErrors(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	const resource = "全局配置"
+	mixed := errors.Join(
+		&configValidationError{message: "规则 a（lb_a）80 端口开启 TLS 跳转无意义"},
+		fmt.Errorf("规则 b（lb_b）ACME 引用校验失败：%w", errors.New("connection reset by peer")),
+	)
+	tests := []struct {
+		name       string
+		err        error
+		audit      bool
+		wantStatus int
+		wantAudits int
+	}{
+		{name: "保存路径纯 DB 故障留痕", err: errors.New("读取待验证规则: database is locked"), audit: true, wantStatus: http.StatusInternalServerError, wantAudits: 1},
+		{name: "保存路径混合错误留痕", err: mixed, audit: true, wantStatus: http.StatusInternalServerError, wantAudits: 1},
+		{name: "保存路径纯配置错误不审计", err: &configValidationError{message: "规则 a（lb_a）端口无效"}, audit: true, wantStatus: http.StatusBadRequest, wantAudits: 0},
+		{name: "预览路径服务端错误不审计", err: errors.New("读取待验证规则: database is locked"), audit: false, wantStatus: http.StatusInternalServerError, wantAudits: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/config", nil)
+			before := auditCountFor(t, "更新失败", resource)
+
+			writeConfigValidationFailure(ctx, tt.err, tt.audit)
+
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tt.wantStatus)
+			}
+			if got := auditCountFor(t, "更新失败", resource) - before; got != tt.wantAudits {
+				t.Fatalf("失败审计条数=%d, want %d（audit=%v）", got, tt.wantAudits, tt.audit)
+			}
+		})
+	}
+	// 两条 5xx 留痕都必须带相位与底层错误（可追溯），且各恰一条。
+	for _, underlying := range []string{"database is locked", "connection reset by peer"} {
+		var audited int
+		if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+			WHERE action='更新失败' AND resource=? AND detail LIKE '%预校验规则配置失败%' AND detail LIKE ?`,
+			resource, "%"+underlying+"%").Scan(&audited); err != nil {
+			t.Fatalf("count audit rows for %q: %v", underlying, err)
+		}
+		if audited != 1 {
+			t.Fatalf("底层错误 %q 的失败审计条数=%d, want 1（相位+底层错误可追溯）", underlying, audited)
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -268,4 +269,59 @@ func TestExtractCRSTarball_skipsNonRegularEntries(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(dest, "rules", "ok.conf")); err != nil || string(got) != "SecRule ok" {
 		t.Fatalf("普通文件应正常落盘: %q err=%v", got, err)
 	}
+}
+
+// 字节门不覆盖 0 字节条目与目录头：海量空条目/目录头会在 staging 建海量
+// inode 并让失败路径逐条删除。文件数/目录数门必须与字节门并行执法。
+func TestExtractCRSTarball_rejectsEntryCountOverLimit(t *testing.T) {
+	build := func(t *testing.T, entries []tarEntry) string {
+		t.Helper()
+		src := filepath.Join(t.TempDir(), "crs.tar.gz")
+		if err := os.WriteFile(src, rawTarGz(t, entries), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return src
+	}
+
+	t.Run("file count", func(t *testing.T) {
+		entries := make([]tarEntry, 0, crsExtractMaxFiles+1)
+		for i := 0; i <= crsExtractMaxFiles; i++ {
+			entries = append(entries, tarEntry{name: "root/rules/" + entryCountName(i)})
+		}
+		err := extractCRSTarball(build(t, entries), t.TempDir())
+		if err == nil || !strings.Contains(err.Error(), "文件条目数超过上限") {
+			t.Fatalf("error=%v, want file-count rejection", err)
+		}
+	})
+
+	t.Run("dir count", func(t *testing.T) {
+		entries := make([]tarEntry, 0, crsExtractMaxDirs+1)
+		for i := 0; i <= crsExtractMaxDirs; i++ {
+			entries = append(entries, tarEntry{name: "root/d" + entryCountName(i) + "/", typeflag: tar.TypeDir})
+		}
+		err := extractCRSTarball(build(t, entries), t.TempDir())
+		if err == nil || !strings.Contains(err.Error(), "目录条目数超过上限") {
+			t.Fatalf("error=%v, want dir-count rejection", err)
+		}
+	})
+
+	t.Run("within limits", func(t *testing.T) {
+		entries := []tarEntry{
+			{name: "root/", typeflag: tar.TypeDir},
+			{name: "root/rules/REQUEST-900.conf", body: []byte("SecRule a")},
+			{name: "root/rules/" + crsRulesProbeFile, body: []byte("SecRule init")},
+		}
+		dest := t.TempDir()
+		if err := extractCRSTarball(build(t, entries), dest); err != nil {
+			t.Fatalf("正常小包不得被条目门拒绝: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dest, "rules", crsRulesProbeFile)); err != nil {
+			t.Fatalf("探针文件应落盘: %v", err)
+		}
+	})
+}
+
+// entryCountName 生成互不相同的定长条目名（条目数门夹具）。
+func entryCountName(i int) string {
+	return "f" + strconv.Itoa(i) + ".conf"
 }

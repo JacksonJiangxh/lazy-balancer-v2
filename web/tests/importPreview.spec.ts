@@ -9,7 +9,8 @@ import assert from 'node:assert/strict'
 
 import { createImportPreviewSession, importPreviewFingerprint, invalidateImportPreviews } from '../src/utils/importPreview.ts'
 import type * as ImportPreviewModule from '../src/utils/importPreview.ts'
-import { code, section } from './_helpers.ts'
+import { importSummaryLabel } from '../src/utils/importSummaryLabels.ts'
+import { code, repoCode, section } from './_helpers.ts'
 
 const deferred = <T>() => Promise.withResolvers<T>()
 
@@ -231,4 +232,27 @@ test('invalidateImportPreviews 清空跨会话缓存，且弹框打开时调用�
   const page = code('src/views/settings/BasicSettings.vue')
   const trigger = section(page, 'const triggerImport = (): void =>', 'const onImportDialogClosed')
   assert.match(trigger, /invalidateImportPreviews\(\)/, '打开导入弹框必须清空预览缓存')
+})
+
+// ── 摘要标签：后端表集全覆盖（预览不得泄漏内部表名） ──────────────
+test('导入摘要标签覆盖后端 configBackupTables 全集（跨栈单源）', () => {
+  const backend = repoCode('internal/handlers/config_backup.go')
+  const tableSet = section(backend, 'var configBackupTables = []string{', '}')
+  const tables = [...tableSet.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1])
+  assert.ok(tables.length >= 18, `后端表集解析异常（仅 ${tables.length} 张）`)
+
+  for (const table of tables) {
+    const label = importSummaryLabel(table)
+    assert.notEqual(label, table, `表 ${table} 缺中文标签——预览会直接显示内部表名`)
+    assert.ok(label.trim().length > 0)
+  }
+  // 页面不再自带第二份键集（标签表单源 utils/importSummaryLabels）
+  const page = code('src/views/settings/BasicSettings.vue')
+  assert.match(page, /\{\{ importSummaryLabel\(key\) \}\}·\{\{ count \}\}/)
+  assert.doesNotMatch(page, /const summaryLabels: Record<string, string>/, '页内标签表必须删除')
+})
+
+test('未知摘要键回退原键（fail-visible，不静默吞成空串）', () => {
+  assert.equal(importSummaryLabel('security_new_table'), 'security_new_table')
+  assert.equal(importSummaryLabel('security_policies'), '安全策略')
 })

@@ -887,22 +887,38 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	c.JSON(http.StatusAccepted, models.APIResponse{Code: 0, Message: "手动备份已开始，完成后可在备份列表查看"})
 }
 
-// autoBackupRowByID 查行；不存在 404、DB 故障响亮 500（历史
-// dbQueryNotFound 分判——此前 Scan 错误一律 404「备份不存在」，DB 故障窗口
-// 误导排障方向；与 GetCurrentUser/requireAutoBackupMaster 已立先例同口径）。
-func (h *Handlers) autoBackupRowByID(c *gin.Context) (autoBackupRowView, bool) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+// autoBackupRowByID 查行；不存在 404、DB 故障响亮 500（此前 Scan 错误一律
+// 404「备份不存在」，DB 故障窗口误导排障方向；与 GetCurrentUser/
+// requireAutoBackupMaster 已立先例同口径）。verb 是调用方的动作词
+// （还原/下载/删除）：行面失败与文件面同属「进入高危操作核心之前」的拒绝面，
+// 三个出口（400 非法 ID、404 行不存在/DB 故障 500、400 文件名非法）此前只有
+// 裸 c.JSON，操作审计页零记录——管理员在列表页点「还原/下载/删除」时行可能
+// 已被保留期裁剪或并发删除，被拒尝试同样要能回答「谁在何时试过哪个备份」。
+func (h *Handlers) autoBackupRowByID(c *gin.Context, verb string) (autoBackupRowView, bool) {
+	rawID := c.Param("id")
+	id, err := strconv.ParseInt(rawID, 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的备份 ID"})
+		failAutoBackupAccess(c, verb, fmt.Sprintf("备份 ID %q", rawID), "无效的备份 ID",
+			http.StatusBadRequest, err)
 		return autoBackupRowView{}, false
 	}
+	subject := fmt.Sprintf("备份 #%d", id)
 	row := db.DB.QueryRow(`SELECT `+autoBackupRowColumns+` FROM auto_backups WHERE id=?`, id)
 	view, err := scanAutoBackupRowView(row)
-	if dbQueryNotFound(c, err, "备份不存在", "查询自动备份行") {
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			failAutoBackupAccess(c, verb, subject, "备份不存在", http.StatusNotFound, err)
+			return autoBackupRowView{}, false
+		}
+		// 5xx 文案与归因沿用 dbQueryNotFound 的口径（固定「数据库错误」，
+		// 底层错误只进日志/审计）——本分支直接调用，故在此显式拼 operation。
+		failAutoBackupAccess(c, verb, subject, "数据库错误", http.StatusInternalServerError,
+			fmt.Errorf("查询自动备份行: %w", err))
 		return autoBackupRowView{}, false
 	}
 	if !autoBackupSafeFilename(view.Filename) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件名非法"})
+		failAutoBackupAccess(c, verb, fmt.Sprintf("备份 #%d", view.ID), "备份文件名非法",
+			http.StatusBadRequest, fmt.Errorf("非法备份文件名 %q", view.Filename))
 		return autoBackupRowView{}, false
 	}
 	return view, true
@@ -913,7 +929,7 @@ func (h *Handlers) DeleteAutoBackup(c *gin.Context) {
 	if !h.requireAutoBackupMaster(c) {
 		return
 	}
-	view, ok := h.autoBackupRowByID(c)
+	view, ok := h.autoBackupRowByID(c, "删除")
 	if !ok {
 		return
 	}
@@ -943,28 +959,38 @@ func (h *Handlers) DeleteAutoBackup(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "备份已删除"})
 }
 
-// failRestoreFileAccess 是自动备份「还原/下载」进入导入核心之前**文件面**失败的
-// 单一收尾：warn 运行日志 + 失败审计 + 原状态码响应。导入族的失败收口已有三层
-// （failImportValidation 事务前 / failImportBegin 建会话前 / failImportAbort
-// 事务内），本函数补齐同一高危操作族的前置阶段——此前还原/下载在这里只有裸
-// c.JSON，被拒尝试在操作审计页零记录（运维无法回答「谁在何时尝试还原/下载哪个
-// 备份、为什么失败」）。与 HTTP 读体超限的 413 不同（那属客户端探测面、不落
-// 审计），这里的 413 来自本地备份文件自身超限，是管理员操作的真实失败面。
+// failAutoBackupAccess 是自动备份高危操作族（还原/下载/删除）失败收尾的单一
+// 来源：失败审计 + 运行日志 + 原状态码信封。行面（autoBackupRowByID 的 400/
+// 404/500）与文件面（failRestoreFileAccess 的 404/413/500）共用本函数——此前
+// 两个阶段各写各的裸 c.JSON，被拒尝试在操作审计页零记录。
 //
-// 动作词取词表内静态字面量（操作标签 ≤4 词）：还原失败 / 下载失败；对象固定
-// 「配置备份」。subject 携带备份标识与阶段供审计复盘，message 保持原 API
-// 文案（客户端契约不变）。download 分支不记「备份下载」成功审计——未交付不得
-// 虚记交付。
-func failRestoreFileAccess(c *gin.Context, download bool, subject, message string, status int, cause error) {
+// 动作词取词表内静态字面量（操作标签 ≤4 词）：还原失败 / 下载失败 / 删除失败；
+// 对象固定「配置备份」。subject 携带备份标识与阶段供审计复盘，message 保持原
+// API 文案（客户端契约不变）。失败分支不记成功审计——未交付不得虚记交付。
+// 5xx 的公开文案仍为固定中文（底层错误只进日志/审计），与本文件其余 5xx 写法
+// 同口径。
+func failAutoBackupAccess(c *gin.Context, verb, subject, message string, status int, cause error) {
 	detail := subject + "：" + message
-	if download {
-		recordAudit(c, "下载失败", "配置备份", detail)
-		services.Logf("warn", "自动备份下载被拒绝（%d）: %s（%v）", status, detail, cause)
-	} else {
-		recordAudit(c, "还原失败", "配置备份", detail)
-		services.Logf("warn", "自动备份还原被拒绝（%d）: %s（%v）", status, detail, cause)
+	recordAudit(c, verb+"失败", "配置备份", detail)
+	level := "warn"
+	if status >= http.StatusInternalServerError {
+		level = "error"
 	}
+	services.Logf(level, "自动备份%s被拒绝（%d）: %s（%v）", verb, status, detail, cause)
 	c.JSON(status, models.APIResponse{Code: status, Message: message})
+}
+
+// failRestoreFileAccess 是自动备份「还原/下载」进入导入核心之前**文件面**失败的
+// 收尾适配器（保留 download 位以维持 9 个调用点的可读性）：文件面与行面同经
+// failAutoBackupAccess 落「还原失败/下载失败」审计 + 运行日志 + 原状态码响应。
+// 与 HTTP 读体超限的 413 不同（那属客户端探测面、不落审计），这里的 413 来自
+// 本地备份文件自身超限，是管理员操作的真实失败面。
+func failRestoreFileAccess(c *gin.Context, download bool, subject, message string, status int, cause error) {
+	verb := "还原"
+	if download {
+		verb = "下载"
+	}
+	failAutoBackupAccess(c, verb, subject, message, status, cause)
 }
 
 // RestoreAutoBackup POST /api/v1/auto-backup/:id/restore：按行读文件并走
@@ -974,7 +1000,7 @@ func (h *Handlers) RestoreAutoBackup(c *gin.Context) {
 	if !h.requireAutoBackupMaster(c) {
 		return
 	}
-	view, ok := h.autoBackupRowByID(c)
+	view, ok := h.autoBackupRowByID(c, "还原")
 	if !ok {
 		return
 	}
@@ -1024,7 +1050,7 @@ func (h *Handlers) DownloadAutoBackup(c *gin.Context) {
 	if !h.requireAutoBackupMaster(c) {
 		return
 	}
-	view, ok := h.autoBackupRowByID(c)
+	view, ok := h.autoBackupRowByID(c, "下载")
 	if !ok {
 		return
 	}

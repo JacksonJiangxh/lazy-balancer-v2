@@ -2417,7 +2417,7 @@ func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 // ---- 回归钉 ----
 
 // 候选装载阶段必须预解析 Leaf（disabled 候选除外），供
-// SelectCertificate 走快路径并供过期回退复用。
+// selectCertificate 走快路径并供过期回退复用。
 func TestACMECertCandidatesForRule_preparses_leaf(t *testing.T) {
 	_, database := newClusterTestService(t)
 	seedRuleWithCAProvider(t, "lb_leaf", "leaf.example.test", 0)

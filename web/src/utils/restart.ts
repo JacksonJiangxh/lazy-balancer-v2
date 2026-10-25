@@ -5,7 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 // 冷启动（DB 迁移/CRS 对账/Caddy 启动）超过 10s 时 reload 命中连接拒绝，落入浏览器原生错误页。
 // 改为每 2s 静默轮询 /caddy/status，服务就绪（任意 200 响应）即触发 reload；
 // 超过 60s 上限提示手动刷新。isDisposed 供组件卸载时提前终止轮询（不触发 reload/提示）。
-export const reloadAfterRestart = async (isDisposed?: () => boolean): Promise<boolean> => {
+const reloadAfterRestart = async (isDisposed?: () => boolean): Promise<boolean> => {
   const deadline = Date.now() + 60_000
   // 不用 Promise.withResolvers（Safari 17.4+/Chrome 119+）：旧浏览器会在
   // 重启成功后抛错，导致页面永不刷新。
@@ -28,7 +28,7 @@ export const reloadAfterRestart = async (isDisposed?: () => boolean): Promise<bo
   return false
 }
 
-export interface RestartServiceOptions {
+interface RestartServiceOptions {
   /** 确认框正文（各入口按场景自述：漂移恢复 vs 设置页手动重启） */
   readonly confirmMessage: string
   readonly confirmTitle: string

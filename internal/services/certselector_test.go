@@ -19,7 +19,7 @@ func TestSelectCertificate_prefersLaterExpiry_overRecentIssuance(t *testing.T) {
 	}
 
 	// When
-	selected, ok := SelectCertificate(candidates, "example.com", now)
+	selected, ok := selectCertificate(candidates, "example.com", now)
 
 	// Then
 	if !ok || selected.Candidate.CertPEM != oldCert {

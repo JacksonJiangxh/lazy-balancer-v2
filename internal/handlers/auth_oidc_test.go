@@ -660,8 +660,10 @@ func TestOIDC_normalize_issuer(t *testing.T) {
 	}
 }
 
-// 场景 9(v2.3.0 裁定):OIDC 用户与本地 MFA 完全解耦——
-// 启用/禁用/激活/管理员重置全 403;登录从节点两道 MFA 门豁免。
+// 场景 9(v2.3.0 裁定):OIDC 用户与本地 MFA 完全解耦——五个入口
+// （自助 setup/activate/disable/recovery-codes + 管理员 reset）全 403;登录从
+// 节点两道 MFA 门豁免。rejectOIDCUserMFAOperation 是每个入口的首道门，逐个
+// 入口钉住才能防止某一条被删（注释曾声称「全 403」而函数体只覆盖两个入口）。
 func TestOIDCUser_mfa_decoupled(t *testing.T) {
 	// 初始化临时库必须完整快照并在 cleanup 恢复
 	// 三个全局句柄（同 setupOIDCTest）——否则后续用例踩已关闭的临时库。
@@ -683,36 +685,46 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 		db.SetDB(oldDB)
 	})
 	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	// OIDC 目标用户 + 本地操作者(admin)
+	// OIDC 目标用户（id=9）+ 本地操作者（id=1，管理员）
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,auth_provider,oidc_subject,oidc_issuer) VALUES (9,'oidcu','','user',1,'oidc','sub9','https://x')"); err != nil {
 		t.Fatal(err)
 	}
-	router.POST("/users/:id/mfa/reset", func(c *gin.Context) {
-		c.Set("user_id", 1)
-		c.Set("auth_type", "jwt")
-		c.Set("auth_method", "local")
-		h.MFAResetByAdmin(c)
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/users/9/mfa/reset", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "不支持本地 MFA") {
-		t.Fatalf("admin reset on oidc user must 403, got %d %s", rec.Code, rec.Body.String())
+
+	cases := []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+		actorID int
+		method  string
+	}{
+		{name: "自助 setup", path: "/auth/mfa/setup", handler: h.MFASetup, actorID: 9, method: "oidc"},
+		{name: "自助 activate", path: "/auth/mfa/activate", handler: h.MFAActivate, actorID: 9, method: "oidc"},
+		{name: "自助 disable", path: "/auth/mfa/disable", handler: h.MFADisable, actorID: 9, method: "oidc"},
+		{name: "自助 recovery-codes", path: "/auth/mfa/recovery-codes", handler: h.MFARecoveryCodes, actorID: 9, method: "oidc"},
+		{name: "管理员 reset", path: "/users/:id/mfa/reset", handler: h.MFAResetByAdmin, actorID: 1, method: "local"},
 	}
-	// 自助端点:OIDC 用户自己 MFASetup → 403
-	router2 := gin.New()
-	router2.POST("/auth/mfa/setup", func(c *gin.Context) {
-		c.Set("user_id", 9)
-		c.Set("auth_type", "jwt")
-		c.Set("auth_method", "oidc")
-		h.MFASetup(c)
-	})
-	rec = httptest.NewRecorder()
-	router2.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/mfa/setup", nil))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("oidc self mfa setup must 403, got %d %s", rec.Code, rec.Body.String())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := gin.New()
+			actorID, actorMethod := tc.actorID, tc.method
+			router.POST(tc.path, func(c *gin.Context) {
+				c.Set("user_id", actorID)
+				c.Set("auth_type", "jwt")
+				c.Set("auth_method", actorMethod)
+				tc.handler(c)
+			})
+			requestPath := tc.path
+			if tc.path == "/users/:id/mfa/reset" {
+				requestPath = "/users/9/mfa/reset"
+			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, requestPath, strings.NewReader(`{}`))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "不支持本地 MFA") {
+				t.Fatalf("%s 对 OIDC 用户必须 403 不支持本地 MFA, got %d %s", tc.name, rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 

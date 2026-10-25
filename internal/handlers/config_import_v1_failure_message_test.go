@@ -6,12 +6,16 @@ package handlers
 // 事务内的插入计数在回滚后全部作废。
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/gin-gonic/gin"
 
@@ -97,5 +101,82 @@ func TestImportV1Config_failureMessageCarriesActionOnce(t *testing.T) {
 	}
 	if existing != 1 || imported != 0 {
 		t.Fatalf("回滚后规则 existing=%d imported=%d, want 1/0", existing, imported)
+	}
+}
+
+// V1 导入的事务前拒绝面与 V2 同族：篡改/误投/损坏文件被拒绝时必须在操作
+// 审计页可见（该路由是 explicit 审计策略，中间件不代记 4xx）。此前六处
+// 事务前 400 直接响应，取证面只剩 stdout。
+func TestImportV1Config_preTransactionRejectionsLeaveAuditTrail(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    func() io.Reader
+		wantMsg string
+	}{
+		{
+			name: "body read failure",
+			body: func() io.Reader {
+				return iotest.ErrReader(errors.New("injected read failure"))
+			},
+			wantMsg: "备份文件读取失败",
+		},
+		{
+			name:    "lbbak directed to v2 endpoint",
+			body:    func() io.Reader { return bytes.NewReader([]byte{0x1f, 0x8b, 0x08, 0x00}) },
+			wantMsg: "V1 导入仅支持旧版 JSON 备份",
+		},
+		{
+			name:    "empty body",
+			body:    func() io.Reader { return strings.NewReader("") },
+			wantMsg: "备份文件内容为空",
+		},
+		{
+			name:    "not json",
+			body:    func() io.Reader { return strings.NewReader("not-json-at-all") },
+			wantMsg: "备份文件不是有效的 JSON",
+		},
+		{
+			name: "v1 parse failure",
+			body: func() io.Reader {
+				return strings.NewReader(`{"proxy_config":{"config":"broken"},"upstream_config":{"config":[]}}`)
+			},
+			wantMsg: "解析 proxy_config 失败",
+		},
+		{
+			name: "no valid rules",
+			body: func() io.Reader {
+				return strings.NewReader(`{"proxy_config":{"config":[]},"upstream_config":{"config":[]}}`)
+			},
+			wantMsg: "备份中没有可导入的有效规则",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.POST("/config/import/v1", h.ImportV1Config)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/config/import/v1", test.body())
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), test.wantMsg) {
+				t.Fatalf("body=%s, want %q", recorder.Body.String(), test.wantMsg)
+			}
+			var action, detail string
+			if err := db.AuditDB.QueryRow(`SELECT action, detail FROM audit_log WHERE resource='配置备份' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); err != nil {
+				t.Fatalf("事务前拒绝必须留痕（审计行缺失）: %v", err)
+			}
+			if action != "导入失败" {
+				t.Fatalf("audit action=%q, want 导入失败", action)
+			}
+			if !strings.Contains(detail, test.wantMsg) {
+				t.Fatalf("audit detail=%q, want 含拒绝原因 %q", detail, test.wantMsg)
+			}
+		})
 	}
 }

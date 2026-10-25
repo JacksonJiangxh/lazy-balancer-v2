@@ -577,6 +577,13 @@ type MFAStepUpDecision struct {
 	SecondsAgo int64
 }
 
+// mfaStepUpSecondsAgo 把验码年龄换算成对外报告/窄窗判定的秒数（向上取整）。
+// int64 截断会把 15.9s 记成 15s，使「≤15s 窄窗」实际放宽到 16s（拆除/重绑
+// MFA 免码窗的边界）；单源在此，判定与响应头共用。
+func mfaStepUpSecondsAgo(elapsed time.Duration) int64 {
+	return int64(math.Ceil(elapsed.Seconds()))
+}
+
 // DecideMFAStepUp 判定请求是否需要 MFA step-up 及是否已在宽限窗内通过。
 // 调用方按自身路由语义给出 covered（守卫：写方法/敏感导出 GET；特权 API Key
 // 创建：固定 true），其余短路条件必须单源——任一侧漏掉 OIDC 会话短路或只读
@@ -636,7 +643,7 @@ func DecideMFAStepUp(c *gin.Context, covered bool, database *sql.DB, mfaEnabledC
 		if elapsed < mfaStepUpGraceWindow {
 			// 向上取整：int64 截断会把 15.9s 记成 15s，使「≤15s 窄窗」实际放宽
 			// 到 16s（拆除/重绑免码窗的边界）。
-			return MFAStepUpDecision{Applies: true, Verified: true, SecondsAgo: int64(math.Ceil(elapsed.Seconds()))}, nil
+			return MFAStepUpDecision{Applies: true, Verified: true, SecondsAgo: mfaStepUpSecondsAgo(elapsed)}, nil
 		}
 	}
 	return MFAStepUpDecision{Applies: true}, nil

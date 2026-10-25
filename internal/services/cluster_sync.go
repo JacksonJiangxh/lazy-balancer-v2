@@ -1141,33 +1141,24 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	if s.beforeApplySnapshot != nil {
 		s.beforeApplySnapshot()
 	}
-	s.pullApplyMu.Lock()
-	s.pullAdmissionMu.Lock()
-	pullsStopped := s.pullsStopped
-	s.pullAdmissionMu.Unlock()
-	if pullsStopped {
-		s.pullApplyMu.Unlock()
+	var pulledStopped bool
+	var applyErr error
+	pulledStopped, applyErr = s.pullAndApplyLocked(ctx, snapshot)
+	if pulledStopped {
 		// 复用 errSyncPullStopped 哨兵包装：errors.Is(pullErr, errSyncPullStopped)
 		// 依赖哨兵识别停机而非普通 validation 失败；此前以
 		// ValidationFailed 落库会覆盖 apply_ok_reload_failed 标记（标记必须跨停机
 		// 存活才能触发 304 补偿重拉）。
 		return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed, errSyncPullStopped)
 	}
-	// 测试缝：admission 已通过、进入 apply 之前的阻塞点（Promote 排干
-	// 语义用例——此处无事务在手，Promote 若不排干会先返回）。
-	if s.beforeApplyWrite != nil {
-		s.beforeApplyWrite()
-	}
-	if err := s.applySnapshot(ctx, snapshot); err != nil {
-		s.pullApplyMu.Unlock()
+	if applyErr != nil {
 		// 同内容失败（含补偿重拉轮）只留一条操作审计。
-		detail := FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error())
+		detail := FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), applyErr.Error())
 		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
 			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
 		}
-		return SyncResult{}, newSyncFailure(models.SyncErrorCodeApplyFailed, err)
+		return SyncResult{}, newSyncFailure(models.SyncErrorCodeApplyFailed, applyErr)
 	}
-	s.pullApplyMu.Unlock()
 	// 本轮应用成功=同步恢复：清空失败去重状态，下一次失败重新记录
 	// （与 Report 成功分支同语义）。
 	s.resetSyncFailureAuditThrottle()
@@ -1176,6 +1167,27 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	s.trackWafRepullConvergence(ctx)
 	s.trackReloadRepullConvergence(ctx)
 	return SyncResult{AppliedVersion: snapshot.Version, Changed: true}, nil
+}
+
+// pullAndApplyLocked 在 pullApplyMu 临界区内做停机复核与快照应用：
+// defer 释放是硬要求——本路径可从 gin 路由（手动同步端点）进入，panic 被
+// gin.Recovery 恢复为 500 时裸 Unlock 永不执行，实例级锁永久泄漏，之后所有
+// 同步/提升排干全部阻塞。返回 stopped 表示停机哨兵（调用方按原语义包装）。
+func (s *SyncService) pullAndApplyLocked(ctx context.Context, snapshot models.ClusterSnapshot) (stopped bool, applyErr error) {
+	s.pullApplyMu.Lock()
+	defer s.pullApplyMu.Unlock()
+	s.pullAdmissionMu.Lock()
+	pullsStopped := s.pullsStopped
+	s.pullAdmissionMu.Unlock()
+	if pullsStopped {
+		return true, nil
+	}
+	// 测试缝：admission 已通过、进入 apply 之前的阻塞点（Promote 排干
+	// 语义用例——此处无事务在手，Promote 若不排干会先返回）。
+	if s.beforeApplyWrite != nil {
+		s.beforeApplyWrite()
+	}
+	return false, s.applySnapshot(ctx, snapshot)
 }
 
 // driftedSections 用本地数据重建节哈希，与已应用记录比对；不一致说明
@@ -2261,12 +2273,14 @@ func (s *SyncService) bumpRegistrationConfirmFailure(ctx context.Context, cluste
 		// helper 直接覆盖，与直写语义等价；闭合「所有写点经 helper」不变式。
 		s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeValidationFailed)
 		RecordAuditLog("system", "注册失败", "集群节点", message, "")
-		// 清除 registration_secret 触发从节点退出注册循环；clusterToken 已存入 global_config 但因 confirm 未成功，主节点未真正确认
-		if _, derr := s.updateSlaveConfig(ctx, "registration_secret='', registration_id=NULL, registration_confirm_failures=0"); derr != nil {
-			Logf("warn", "bumpRegistrationConfirmFailure: clear registration state failed: %v", derr)
-		}
-		if clusterToken != "" {
-			_, _ = s.updateSlaveConfig(ctx, "cluster_token=''")
+		// 终止清空必须一条语句：分步清空在中途瞬时写失败时留下半清空状态
+		//（secret 已清、token 未清 → 下一轮的 401 以通用文案覆盖终止提示并把
+		// 循环置 Halted，明文令牌生命周期也超出设计）。失败必须留痕——静默
+		// 失败会让排障只剩通用 401。
+		if applied, derr := s.updateSlaveConfig(ctx, "registration_secret='', registration_id=NULL, registration_confirm_failures=0, cluster_token=''"); derr != nil {
+			Logf("warn", "bumpRegistrationConfirmFailure: 清除注册态失败（终止文案可能被后续 401 覆盖，需人工重新注册）: %v", derr)
+		} else if !applied {
+			Logf("info", "bumpRegistrationConfirmFailure: 节点已升主，清除注册态按预期 no-op")
 		}
 	} else {
 		Logf("error", "集群注册确认失败 %d/%d：%s", failures, registrationConfirmMaxFailures, reason)
@@ -2275,7 +2289,11 @@ func (s *SyncService) bumpRegistrationConfirmFailure(ctx context.Context, cluste
 
 // resetRegistrationConfirmFailure 在 confirm 成功后清零失败计数。
 func (s *SyncService) resetRegistrationConfirmFailure(ctx context.Context) {
-	_, _ = s.updateSlaveConfig(ctx, "registration_confirm_failures=0")
+	if applied, err := s.updateSlaveConfig(ctx, "registration_confirm_failures=0"); err != nil {
+		Logf("warn", "复位注册确认失败计数失败（陈旧计数可能提前推进终止轨道）: %v", err)
+	} else if !applied {
+		Logf("info", "复位注册确认失败计数：节点已升主，按预期 no-op")
+	}
 }
 
 // clusterSyncFailureSummary 拼接同步轮失败的业务摘要行。

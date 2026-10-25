@@ -89,7 +89,7 @@
       @save="updateNodeConfig"
     />
 
-    <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" class="register-token-dialog">
+    <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" :before-close="closeTokenDialog" @closed="registerToken = null" class="register-token-dialog">
       <template #header>
         <DialogHeader :icon="Key" title="一次性注册令牌" subtitle="仅展示一次，请立即复制并妥善保存" tone="warning" />
       </template>
@@ -118,13 +118,14 @@
         </div>
       </template>
 
-      <div class="service-control-grid">
+      <div class="service-control-grid" role="radiogroup" aria-label="服务控制操作">
         <div
           v-for="item in serviceControlOptions"
           :key="item.value"
           class="service-control-card"
           :class="{ 'is-active': serviceControlAction === item.value, [`is-${item.tone}`]: true }"
-          role="button"
+          role="radio"
+          :aria-checked="serviceControlAction === item.value"
           tabindex="0"
           @click="serviceControlAction = item.value"
           @keydown.enter.prevent="serviceControlAction = item.value"
@@ -182,6 +183,7 @@ import { request, mfaAwareSuccess } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { CLUSTER_SYNC_SWITCHES } from '@/utils/clusterSyncSwitches'
 import { clusterWriteBlocked } from '@/utils/clusterWriteGate'
+import { createOneTimeSecretCloseGuard } from '@/utils/oneTimeSecretGuard'
 import { formatDate } from '@/utils/date'
 import type {
   APIResponse,
@@ -334,6 +336,12 @@ const forgetNodePin = async (): Promise<void> => {
   }
 }
 const registerToken = ref<ClusterRegisterToken | null>(null)
+/** 注册令牌仅此一次下发：ESC / 右上角 X 不得静默关闭（与 API 密钥明文、
+ *  MFA 恢复码同一守卫单源）。确认后才关闭，@closed 清空内存里的令牌。 */
+const closeTokenDialog = createOneTimeSecretCloseGuard({
+  message: '注册令牌仅此一次显示，关闭后将无法再次查看。已复制并妥善保存？',
+  title: '保存注册令牌',
+})
 // 写门单源在 utils/clusterWriteGate（角色独立参与）：stores/auth 的
 // readOnlyReason 先判节点模式，从节点上任何角色都只得到 'slave'——只按 reason
 // 集合判会漏掉「从节点 + 非管理员」，把破坏性按钮呈现为可写（点击 403）。

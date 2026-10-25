@@ -62,20 +62,26 @@ var (
 //	保留/私网地址在固化期已排除（与其余维度同口径）；
 //	先批量解析现存规则，再按计数顺序取前 3 条**现存**目标——已
 //	  删除规则不得挤掉后续真实站点；
-//	- 查询失败不缓存、错误上抛（调用方整卡 500，与现有错误口径一致）。
-func threatTopTargets(sinceMinute string) ([]threatTopTarget, error) {
+//	- 查询失败不缓存、错误上抛（调用方整卡 500，与现有错误口径一致）；
+//	- cacheable=false（宽窗口回填未完成）时既不读也不写缓存：部分窗口的
+//	  Top3 一旦落缓存，回填完成后的下一轮轮询（coverageReaches=true、
+//	  stale=false，不再失效）仍会命中部分结果 ≤60s，而同响应 total/国家
+//	  已是完整窗口——与 threatRollupDimAggregateQuery 的 cacheable 门同口径。
+func threatTopTargets(sinceMinute string, cacheable bool) ([]threatTopTarget, error) {
 	if db.MetricsDB == nil || db.DB == nil {
 		return nil, errors.New("database unavailable")
 	}
 	key := topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, sinceMinute: sinceMinute}
 	now := time.Now()
-	topTargetsCacheMu.Lock()
-	if entry, ok := topTargetsCache[key]; ok && now.Before(entry.expiresAt) {
-		targets := entry.targets
+	if cacheable {
+		topTargetsCacheMu.Lock()
+		if entry, ok := topTargetsCache[key]; ok && now.Before(entry.expiresAt) {
+			targets := entry.targets
+			topTargetsCacheMu.Unlock()
+			return targets, nil
+		}
 		topTargetsCacheMu.Unlock()
-		return targets, nil
 	}
-	topTargetsCacheMu.Unlock()
 
 	rows, err := db.MetricsDB.Query(`SELECT rule_caddy_id, SUM(count) FROM security_event_target_rollup WHERE minute >= ? GROUP BY rule_caddy_id`, sinceMinute)
 	if err != nil {
@@ -164,16 +170,18 @@ func threatTopTargets(sinceMinute string) ([]threatTopTarget, error) {
 		targets = append(targets, threatTopTarget{Name: info.name, Domain: info.domain, Value: counts[id]})
 	}
 
-	topTargetsCacheMu.Lock()
-	// 键含窗口锚点后每分钟产生新键——插入时顺带清过期项，防止 map 无限增长
-	//（旧键 TTL 到期后不再被命中）。
-	for k, entry := range topTargetsCache {
-		if !now.Before(entry.expiresAt) {
-			delete(topTargetsCache, k)
+	if cacheable {
+		topTargetsCacheMu.Lock()
+		// 键含窗口锚点后每分钟产生新键——插入时顺带清过期项，防止 map 无限增长
+		//（旧键 TTL 到期后不再被命中）。
+		for k, entry := range topTargetsCache {
+			if !now.Before(entry.expiresAt) {
+				delete(topTargetsCache, k)
+			}
 		}
+		topTargetsCache[key] = topTargetsCacheEntry{targets: targets, expiresAt: now.Add(topTargetsCacheTTL)}
+		topTargetsCacheMu.Unlock()
 	}
-	topTargetsCache[key] = topTargetsCacheEntry{targets: targets, expiresAt: now.Add(topTargetsCacheTTL)}
-	topTargetsCacheMu.Unlock()
 	return targets, nil
 }
 

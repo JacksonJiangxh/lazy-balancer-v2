@@ -1080,8 +1080,9 @@ func TestAPIDocRoutes_writeEndpointsDocumentMFAStepUp(t *testing.T) {
 		if !writeMethods[route.Method] && !sensitiveExportGets[key] {
 			continue
 		}
-		// 非 JWT 认证面（公开/集群机器/MCP 专用头）无 step-up 语义。
-		if apiDocContractFor(route).security != "" {
+		// 非 JWT 认证面（公开/集群机器/MCP 专用头）无 step-up 语义——
+		// 按 security 枚举判定，新增未知 security 值不会被静默跳过。
+		if apiDocRouteUsesNonJWTAuth(route) {
 			continue
 		}
 		if stepUpExempt[key] {
@@ -1678,7 +1679,7 @@ func TestAPIDocRoutes_nonAdminWriteEndpointsDocument403(t *testing.T) {
 		if !writeMethods[route.Method] && !sensitiveExportGets[key] {
 			continue
 		}
-		if apiDocContractFor(route).security != "" || selfService[key] {
+		if apiDocRouteUsesNonJWTAuth(route) || selfService[key] {
 			continue
 		}
 		if services.IsReadOnlyWriteRoute(route.Method, "/api/v1"+route.Path) {

@@ -536,7 +536,7 @@ func recordAppliedSectionHashes(ctx context.Context, dbh *sql.DB, snapshot model
 // logSyncSwitchGuards surfaces cross-section drift: security-switch-off nodes
 // whose master references newer CRS/IP2Region files (file state follows the
 // security switch after the 3-category merge).
-func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches) {
+func logSyncSwitchGuards(ctx context.Context, dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches) {
 	// 告警对象是「开关关闭导致 WAF 文件滞后」的从节点——开关开启时
 	// applySnapshot 随即拉取文件，无滞后可告。三分类合并后判定挂 security
 	// 开关(waf_files 不再是同步节,sk.disabled 只含 3 节键);dedup 记账走
@@ -572,8 +572,12 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 	}
 	RecordAuditLog("system", "同步警告", "集群同步", "检测到主节点 CRS/IP2Region/威胁库文件已更新（同步开关关闭），本地文件保持不变", "")
 	// 告警后只推进去重版本(哈希不动——security 关闭时哈希列不被
-	// 消费),保证每版本 bump 至多一条告警。
+	// 消费),保证每版本 bump 至多一条告警。推进失败必须留痕：该列是去重唯一
+	// 依据，静默失败会让同一告警按 apply 轮重复刷审计且无信号解释（正是上方
+	// 读失败分支注释要防的形态）；用 ExecContext 与同文件其余写点同口径。
 	if dbh != nil {
-		_, _ = dbh.Exec(`UPDATE global_config SET applied_waf_ref_version=? WHERE id=1`, snapshot.Version)
+		if _, err := dbh.ExecContext(ctx, `UPDATE global_config SET applied_waf_ref_version=? WHERE id=1`, snapshot.Version); err != nil {
+			Logf("warn", "推进文件态告警去重版本失败（下轮可能重复告警）: %v", err)
+		}
 	}
 }

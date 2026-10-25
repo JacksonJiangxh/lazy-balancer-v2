@@ -143,6 +143,66 @@ func TestPurgeOrphanMetricsHistory_batchesRowsPerDelete(t *testing.T) {
 	}
 }
 
+// Given 单规则孤儿行跨多条 DELETE 批，第一批执行完成后 metrics 库句柄被关停
+// 置 nil（关停排空超时后 db.Close 执行，在途轮仍在下一批）。
+// When 执行孤儿清理。
+// Then 返回可见错误而非 nil 解引用 panic；已删除批次不可逆，规则未清空不计入。
+func TestPurgeOrphanMetricsHistory_metricsDBClosedMidRunDoesNotPanic(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	const rows = 12
+	for range rows {
+		seedMetricsHistory(t, "lb_shutdown_orphan", 1)
+	}
+	previousBatch := metricsOrphanPurgeRowsPerBatch
+	metricsOrphanPurgeRowsPerBatch = 5
+	t.Cleanup(func() { metricsOrphanPurgeRowsPerBatch = previousBatch })
+
+	counter, restore := wrapMetricsDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+	counter.afterExec = func(n int) {
+		if n == 1 {
+			db.MetricsDB = nil // 关停尾部 db.Close() 的等价形态
+		}
+	}
+
+	deletedRules, err := PurgeOrphanMetricsHistory(t.Context())
+
+	if err == nil {
+		t.Fatal("metrics 库关停后必须返回错误（任务落 failed），不得静默成功")
+	}
+	if deletedRules != 0 {
+		t.Fatalf("deletedRules=%d, want 0（未清空的规则不得计入）", deletedRules)
+	}
+}
+
+// Given 孤儿规则在本批即被清空（deleted < batch），该批 DELETE 完成后 ctx 已被取消
+// （任务取消/关停）。
+// When 执行孤儿清理。
+// Then 返回真实部分计数 + ctx 错误——清空最后一条后仍以取消态收尾，不得报成功。
+func TestPurgeOrphanMetricsHistory_cancelAfterFinalBatchReturnsContextError(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	seedMetricsHistory(t, "lb_cancel_orphan", 1)
+	counter, restore := wrapMetricsDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	counter.afterExec = func(n int) {
+		if n == 1 {
+			cancel()
+		}
+	}
+
+	deletedRules, err := PurgeOrphanMetricsHistory(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled, got %v", err)
+	}
+	if deletedRules != 1 {
+		t.Fatalf("deletedRules=%d, want 1（已清空的规则须计入真实部分计数）", deletedRules)
+	}
+}
+
 // deleteCountingProbe 统计 metrics_history DELETE 语句数（Prepare 面覆盖
 // ExecContext 回退路径：包装 conn 只暴露 driver.Conn 基础接口）。
 type deleteCountingProbe struct {
@@ -151,6 +211,9 @@ type deleteCountingProbe struct {
 	// failAfter >0 时第 failAfter+1 条 DELETE 起注入错误（钉失败路径的
 	// 部分计数：已完整清空的规则数必须如实返回）。
 	failAfter int
+	// afterExec 在第 n 条 DELETE 执行完成后回调（关停窗口注入点：句柄置
+	// nil / ctx 取消发生在批与批之间，而不是语句执行之前）。
+	afterExec func(n int)
 }
 
 func (p *deleteCountingProbe) record(query string) int {
@@ -195,7 +258,28 @@ func (c *deleteCountingConn) Prepare(query string) (driver.Stmt, error) {
 	if n > 0 && c.probe.failAfter > 0 && n > c.probe.failAfter {
 		return nil, errors.New("injected delete failure")
 	}
-	return c.Conn.Prepare(query)
+	stmt, err := c.Conn.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	return &deleteCountingStmt{Stmt: stmt, probe: c.probe, index: n}, nil
+}
+
+// deleteCountingStmt 只在 driver.Stmt 基础接口上再包一层 Exec：不实现
+// StmtExecContext，保持 database/sql 的「Prepare+Exec」回退路径（与上面
+// 计数面同一条路径），从而能在语句真正执行完成后回调。
+type deleteCountingStmt struct {
+	driver.Stmt
+	probe *deleteCountingProbe
+	index int
+}
+
+func (s *deleteCountingStmt) Exec(args []driver.Value) (driver.Result, error) {
+	result, err := s.Stmt.Exec(args)
+	if s.probe.afterExec != nil {
+		s.probe.afterExec(s.index)
+	}
+	return result, err
 }
 
 // wrapMetricsDBWithDeleteCounter 用同一 metrics 库文件挂计数包装句柄。

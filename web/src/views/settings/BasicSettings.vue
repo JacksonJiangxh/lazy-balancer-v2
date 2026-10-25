@@ -297,7 +297,7 @@
             </el-tag>
             <div class="import-summary">
               <span v-for="(count, key) in importValidation.summary" :key="key" class="import-summary-chip" :class="{ 'is-zero': !count }">
-                {{ summaryLabels[key] || key }}·{{ count }}
+                {{ importSummaryLabel(key) }}·{{ count }}
               </span>
             </div>
             <!-- 勾选「安全防护」但备份无规则库文件时预览提示(后端兜底
@@ -458,13 +458,14 @@
 
   <!-- 写操作验证「支持的操作」清单——与后端 mfaStepUpGuard
        实际覆盖面一致（admin/business 两组的 POST/PUT/PATCH/DELETE，排除
-       readOnlyWriteRoutes 的读语义 POST，以及 step-up 机制本体 verify-step 与
+       readOnlyWriteRoutes 的只读语义写操作（含 DELETE 释放采集租约），以及
+       step-up 机制本体 verify-step 与
        登出（DecideMFAStepUp 仅豁免此二者，setup/activate/disable/恢复码照常
        验码）；WS-05 起「测试」不再一概豁免：证书配置/CA 提供商的 test 会真实
        写 DNS TXT / 申请 EAB）。 -->
   <el-dialog v-model="mfaScopeVisible" class="dialog-body-inset" width="min(640px, 94vw)">
     <template #header>
-      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 验码、登出端点除外）" />
+      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部管理写操作（只读语义写操作与 MFA 验码、登出端点除外）" />
     </template>
     <!-- 与 middleware.go 的 mfaStepUpGuard 挂载面（admin/business 两组级）
          及 readOnlyWriteRoutes 豁免清单同源。注意：证书配置/DNS 凭证/CA 提供商
@@ -498,6 +499,7 @@ import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, neares
 import { BACKUP_SECTIONS, importConfirmMessage, normalizeBackupSectionKeys } from '@/utils/backupSections'
 import { createImportPreviewSession, importPreviewFingerprint, invalidateImportPreviews, type ImportPreviewSession } from '@/utils/importPreview'
 import { importFailureLines, importFailureReport } from '@/utils/importFailure'
+import { importSummaryLabel } from '@/utils/importSummaryLabels'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -978,20 +980,8 @@ let importValidationSeq = 0
 // 上一轮在途请求——勾选分类不再重传整份备份（上限 128MB）。
 let importPreviewSession: ImportPreviewSession<ImportValidation> | null = null
 
-const summaryLabels: Record<string, string> = {
-  lb_rules: '规则',
-  upstreams: '上游',
-  users: '用户',
-  api_keys: 'API 密钥',
-  ca_providers: 'CA 提供商',
-  certificate_configs: 'DNS 提供商',
-  cert_jobs: '证书任务',
-  rules: '规则',
-  tls_rules: '其中 TLS 规则',
-  security_crs_version: 'CRS 版本',
-  security_ip2region_version: 'IP2Region 版本',
-  nodes: '节点拓扑',
-}
+// 摘要标签单源 utils/importSummaryLabels（后端表集完整覆盖由跨栈测试钉住）——
+// 原页内表只覆盖 12 个键，其余按原键回退，用户会在预览里看到后端表名。
 
 const conflictIdentifier = (conflict: { name?: string; caddy_id?: string }): string => conflict.name || conflict.caddy_id || '未命名规则'
 

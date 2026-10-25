@@ -1655,7 +1655,7 @@ func ResolveCAProviderID(id int) (int, error) {
 }
 
 func markJobWaitingCA(jobID int, retryAfter time.Duration) {
-	maxAttempts := GetCertRenewalAttempts()
+	maxAttempts := getCertRenewalAttempts()
 
 	var attempts int
 	if err := db.DB.QueryRow("SELECT COALESCE(renewal_attempts,0) FROM cert_jobs WHERE id=?", jobID).Scan(&attempts); err != nil {
@@ -1721,8 +1721,8 @@ func maxRenewalAttemptsMessage(message string, maxAttempts int) string {
 // failJobFromStatus 无调用方已删除，本函数唯一消费方为 failJob）：尝试次数
 // 封顶文案、消息截断、UPDATE、留痕。
 func failJobTransition(jobID int, fromSet []string, message string) {
-	if attempts := currentRenewalAttempts(jobID); attempts+1 >= GetCertRenewalAttempts() {
-		message = maxRenewalAttemptsMessage(message, GetCertRenewalAttempts())
+	if attempts := currentRenewalAttempts(jobID); attempts+1 >= getCertRenewalAttempts() {
+		message = maxRenewalAttemptsMessage(message, getCertRenewalAttempts())
 	}
 	message = truncateJobMessage(message)
 	err := transitionJob(db.DB, jobID, fromSet, "failed", map[string]any{

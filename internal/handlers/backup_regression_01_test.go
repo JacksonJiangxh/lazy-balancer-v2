@@ -193,7 +193,7 @@ func ipListQuotaRowsShared(userCount int) []map[string]any {
 }
 
 func TestIPListQuotaMatchesPostImportState(t *testing.T) {
-	t.Run("200 users plus four seeded system rows stay within final ceiling", func(t *testing.T) {
+	t.Run("200 users plus seeded system rows stay within final ceiling", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
 		seedLiveAdminShared(t)
 		rec := postImportBytes(t, h, backupJSONFixture(t, map[string][]map[string]any{
@@ -206,8 +206,11 @@ func TestIPListQuotaMatchesPostImportState(t *testing.T) {
 		if err := db.DB.QueryRow(`SELECT COUNT(*),SUM(CASE WHEN COALESCE(system,0)=0 THEN 1 ELSE 0 END) FROM security_ip_lists`).Scan(&total, &users); err != nil {
 			t.Fatal(err)
 		}
-		if total != 204 || users != 200 {
-			t.Fatalf("final lists=%d users=%d, want 204/200", total, users)
+		// 导入提交后补播全部内置 system 名单：威胁三源 + 自动封禁 + 四个爬虫
+		// 官方名单（备份未携带爬虫行时逐引擎补种）。
+		wantSystem := len(db.ThreatSystemLists()) + 1 + len(services.CrawlerSystemListNames())
+		if total != 200+wantSystem || users != 200 {
+			t.Fatalf("final lists=%d users=%d, want %d/200", total, users, 200+wantSystem)
 		}
 	})
 	t.Run("legacy 201 rows with system rows accepted", func(t *testing.T) {
@@ -223,8 +226,9 @@ func TestIPListQuotaMatchesPostImportState(t *testing.T) {
 		if err := db.DB.QueryRow(`SELECT COUNT(*),SUM(CASE WHEN COALESCE(system,0)=0 THEN 1 ELSE 0 END) FROM security_ip_lists`).Scan(&total, &users); err != nil {
 			t.Fatal(err)
 		}
-		if total != 201 || users != 197 {
-			t.Fatalf("final lists=%d users=%d, want 201/197", total, users)
+		wantSystem := len(db.ThreatSystemLists()) + 1 + len(services.CrawlerSystemListNames())
+		if total != 197+wantSystem || users != 197 {
+			t.Fatalf("final lists=%d users=%d, want %d/197", total, users, 197+wantSystem)
 		}
 	})
 	t.Run("201 user rows rejected", func(t *testing.T) {

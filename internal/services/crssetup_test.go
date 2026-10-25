@@ -507,3 +507,47 @@ func TestRestoreBackup_removesFreshlyCreatedOverrides(t *testing.T) {
 		t.Fatal("zz-user-overrides.conf.bak should be consumed")
 	}
 }
+
+// 写序不变量：stock 基线先写、生效 setup 后写（两步各自原子，崩溃只会落在
+// 两者之间）。反向序残留「新 setup + 旧 stock」，下次迁移把上游默认行当自定义
+// 行写入 overrides → 重复 SecRule id → 更新永久失败。两文件内容同源，运行期
+// 无法从终态区分顺序，故以源码注册序钉住；同时钉住 stock-first 残留态的
+// 迁移语义（只保用户自定义行）。
+func TestSwapCRSTreeFromStaging_writesStockBeforeSetup(t *testing.T) {
+	src, err := os.ReadFile("crsinstall.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	stockIdx := strings.Index(body, "copyFile(newSetup, stockPath)")
+	setupIdx := strings.Index(body, "copyFile(newSetup, setupPath)")
+	if stockIdx < 0 || setupIdx < 0 {
+		t.Fatalf("定位失败: stock=%d setup=%d", stockIdx, setupIdx)
+	}
+	if stockIdx > setupIdx {
+		t.Fatal("写序必须 stock → setup（崩溃残留=新 stock+旧 setup，迁移只保留用户自定义行）")
+	}
+}
+
+// stock-first 残留态的迁移语义：新 stock 中存在的上游默认行不得进入
+// overrides（重复 SecRule id 会让 coraza 拒绝配置再生成），用户自定义行保留。
+// 注释行（旧 stock 头部）随 diff 进入 overrides 无害（coraza 忽略注释）。
+func TestExtractSetupDiff_stockFirstResidualKeepsOnlyUserLines(t *testing.T) {
+	newStock := []string{"# new default", `SecAction "id:900001,phase:1,pass"`}
+	oldSetup := []string{"# old default", `SecAction "id:900001,phase:1,pass"`, `SecAction "id:900999,phase:1,pass,setvar:'tx.custom=1'"`}
+	got := extractSetupDiff(newStock, oldSetup)
+	for _, line := range got {
+		if strings.Contains(line, "id:900001") {
+			t.Fatalf("diff=%v 含上游默认行（重复应用会撞 SecRule id）", got)
+		}
+	}
+	custom := 0
+	for _, line := range got {
+		if strings.Contains(line, "id:900999") {
+			custom++
+		}
+	}
+	if custom != 1 {
+		t.Fatalf("diff=%v, want 恰含 1 条用户自定义行（id:900999）", got)
+	}
+}

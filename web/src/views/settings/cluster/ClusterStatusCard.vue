@@ -59,7 +59,7 @@ import type { ClusterStatus } from '@/types'
 const props = defineProps<{
   readonly status: ClusterStatus | null
   readonly loading: boolean
-  /**：父级轮询错误态——无数据时的空态文案据此切「加载失败」。*/
+  /** 父级轮询错误态——无数据时的空态文案据此切「加载失败」。*/
   readonly error?: boolean
 }>()
 

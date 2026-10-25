@@ -240,11 +240,12 @@ func IsValidThreatScreenMode(mode string) bool {
 type GlobalConfig struct {
 	ID          int    `json:"id"`
 	CaddyConfig string `json:"caddy_config"`
-	// DNSProvider/DNSCredentials 是全局配置遗留字段——签发链唯一凭证来源是
+	// DNSProvider 是全局配置遗留字段——签发链唯一凭证来源是
 	// certificate_configs 表；响应面已收敛（omitempty，空值不下发；
-	// 集群快照走 ClusterBasicSettings 独立字段，不受此收敛影响）。
+	// 集群快照走 ClusterBasicSettings 独立字段，不受此收敛影响）。DNS 凭证
+	// 正文不属于该响应模型：/config 面向全部登录用户，凭证列只存
+	// certificate_configs。
 	DNSProvider                string `json:"dns_provider,omitempty"`
-	DNSCredentials             string `json:"dns_credentials,omitempty"`
 	ACMEEmail                  string `json:"acme_email"`
 	CertExpiryDays             int    `json:"cert_expiry_days"`
 	CertRenewalDays            int    `json:"cert_renewal_days"`

@@ -234,10 +234,15 @@ func TestGetCaddyLogs_capsWindowReadAt128KB(t *testing.T) {
 
 // 未知日志类型必须 fail-visible：此前静默回落到 runtime 日志，排障者会
 // 误读另一族日志（runtime/tls/server/proxy 内容完全不同），且响应无任何信号。
+// 文案的可选值必须由**当前**路径表派生：注入一张与生产表不同的路径表后，
+// 400 仍列出生产四类型即证明文案消费的是包初始化快照而非查表本身。
 func TestGetCaddyLogs_unknownTypeRejectedWithValidValues(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	oldPaths := caddyLogPaths
-	caddyLogPaths = map[string]string{"runtime": filepath.Join(t.TempDir(), "caddy.log")}
+	caddyLogPaths = map[string]string{
+		"runtime": filepath.Join(t.TempDir(), "caddy.log"),
+		"audit":   filepath.Join(t.TempDir(), "caddy-audit.log"),
+	}
 	t.Cleanup(func() { caddyLogPaths = oldPaths })
 
 	gin.SetMode(gin.TestMode)
@@ -245,15 +250,20 @@ func TestGetCaddyLogs_unknownTypeRejectedWithValidValues(t *testing.T) {
 	router.GET("/caddy/logs", h.GetCaddyLogs)
 	response := httptest.NewRecorder()
 
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/caddy/logs?type=access", nil))
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/caddy/logs?type=tls", nil))
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	for _, want := range []string{"access", "runtime", "tls", "server", "proxy"} {
+	for _, want := range []string{"tls", "runtime", "audit"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("body=%s, want 点名可选值 %q", body, want)
+			t.Fatalf("body=%s, want 点名未知类型与当前可选值 %q", body, want)
+		}
+	}
+	for _, stale := range []string{"server", "proxy"} {
+		if strings.Contains(body, stale) {
+			t.Fatalf("body=%s, 不得列出当前路径表之外的 %q（文案须由活路径表派生）", body, stale)
 		}
 	}
 }

@@ -5,7 +5,10 @@ package db
 // 成为下次启动的跳过判据，回填永久丢失（mfa_challenges.password_version
 // 会让存量挑战按 0 校验；upstream_keepalive_timeout 残留旧默认 60）。
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestEnsureNewColumns_alterAndBackfillAreAtomic(t *testing.T) {
 	database := openMigrationTestDB(t)
@@ -119,5 +122,24 @@ func TestEnsureNewColumns_crossTableBackfillCopiesCurrentValue(t *testing.T) {
 	}
 	if pv != 7 {
 		t.Fatalf("backfilled password_version=%d, want 7（存量挑战按用户当前密码版本回填）", pv)
+	}
+}
+
+// newColumnBackfills 中未登记到 newColumns 的键必须启动期响亮失败：该键的
+// 回填 SQL 永不执行且零错误（列没补、派生值没落，读侧按零值运行），与本函数
+// 对畸形键「启动期响亮失败」的基调相反。当前三个键均已登记，属防御门。
+func TestOrderNewColumnKeys_rejectsBackfillKeyWithoutColumn(t *testing.T) {
+	columns := map[string]string{"users.password_version": "INTEGER NOT NULL DEFAULT 0"}
+	backfills := map[string]string{
+		"users.password_verison": "UPDATE users SET password_verison=0", // 拼写漂移
+	}
+	if _, err := orderNewColumnKeys(columns, backfills); err == nil {
+		t.Fatal("未登记的 backfill 键必须返回错误（否则回填永不执行且无信号）")
+	} else if !strings.Contains(err.Error(), "backfill") {
+		t.Fatalf("error=%v, want 点名 backfill 登记漂移", err)
+	}
+	// 已登记键不受影响。
+	if _, err := orderNewColumnKeys(columns, map[string]string{"users.password_version": "UPDATE users SET password_version=0"}); err != nil {
+		t.Fatalf("已登记 backfill 键不得报错: %v", err)
 	}
 }

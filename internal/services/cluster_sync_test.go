@@ -1061,8 +1061,12 @@ func TestSyncService_Promote_drains_blocked_manual_pull_without_applying(t *test
 	syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(master.URL))
 	beforeApply := make(chan struct{})
 	releaseApply := make(chan struct{})
+	// 屏障 hook 必须幂等：该 hook 由 Pull 调用，而同一实例可能有引擎 daemon 的
+	// 后台 run 循环或重试轮进来（多一次调用不得 panic——close of closed channel
+	// 会直接崩掉整个测试进程）
+	var beforeApplyOnce sync.Once
 	syncService.beforeApplySnapshot = func() {
-		close(beforeApply)
+		beforeApplyOnce.Do(func() { close(beforeApply) })
 		waitSyncBarrier(releaseApply)
 	}
 	lifecycle := &syncDrainLifecycle{sync: syncService, stopEntered: make(chan struct{})}
@@ -1711,7 +1715,7 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	}
 }
 
-func TestSyncService_driftedSections_绕过esStaleSnapshotCache(t *testing.T) {
+func TestSyncService_driftedSections_bypassesStaleSnapshotCache(t *testing.T) {
 	// 回归：本地规则在同步之外被删改但不递增 cluster_version，快照缓存
 	// 键（version/所有权/开关）不变 → 命中缓存会返回陈旧快照掩盖漂移。
 	// driftedSections 必须绕过缓存、直接重建本地快照才能检测到漂移。

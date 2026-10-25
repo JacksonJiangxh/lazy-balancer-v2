@@ -606,3 +606,72 @@ func TestCRSUpdateRun_thisRunBaksConsumedOnSwapFailure(t *testing.T) {
 		t.Fatalf("version=%q, want v4.14.0（重载失败同代回滚）", version)
 	}
 }
+
+// 探针文件必须在拷贝序最后落地：完整性门只以「探针存在」为判据，而
+// os.ReadDir 是升序——真实 CRS 树的探针（REQUEST-901-*）排在头部，排序拷贝
+// 中断时它已落地，半棵树会被判完整（seed 不重播、备份被当权威旧树）。
+func TestCopyDir_copiesProbeLastSoPartialTreeFailsGate(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "rules")
+	dst := filepath.Join(root, "copy")
+	writeTestFile(t, filepath.Join(src, crsRulesProbeFile), "SecRule init")
+	writeTestFile(t, filepath.Join(src, "REQUEST-900-EXCLUSION-RULES.conf"), "SecRule a")
+	unreadable := filepath.Join(src, "zz-unreadable.conf")
+	writeTestFile(t, unreadable, "SecRule boom")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	if err := copyDir(src, dst); err == nil {
+		t.Fatal("读失败条目必须让拷贝报错")
+	}
+	if _, err := os.Stat(filepath.Join(dst, crsRulesProbeFile)); !os.IsNotExist(err) {
+		t.Fatalf("中断的拷贝不得已含探针（否则完整性门误判完整）: %v", err)
+	}
+	if crsRulesTreeIntact(dst) {
+		t.Fatal("半棵树不得过完整性门")
+	}
+}
+
+// moveTree 的 copy 回退必须事务化：直写 dst 中断会在 dst 留半棵树，而
+// 完整性门只看探针——探针一旦落地，半树被当作完整树。dst 必须保持「不存在
+// 或上一代完整树」，残片只允许留在已清理的 .tmp。
+func TestMoveTree_copyFallbackLeavesNoPartialTreeOnFailure(t *testing.T) {
+	forceRenameFailure(t)
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+	writeTestFile(t, filepath.Join(src, "rules", crsRulesProbeFile), "SecRule init")
+	writeTestFile(t, filepath.Join(src, "rules", "REQUEST-900.conf"), "SecRule a")
+	unreadable := filepath.Join(src, "rules", "zz-unreadable.conf")
+	writeTestFile(t, unreadable, "SecRule boom")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	if err := moveTree(src, dst); err == nil {
+		t.Fatal("读失败必须让回退拷贝报错")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("失败的回退拷贝不得在 dst 留下半棵树: %v", err)
+	}
+	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("暂存树必须清理: %v", err)
+	}
+}
+
+// 空探针文件（0 字节）等同缺失：完整性门不得把 0 字节探针当完整契约。
+func TestCRSRulesTreeIntact_rejectsEmptyProbe(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "REQUEST-900.conf"), "SecRule a")
+	writeTestFile(t, filepath.Join(dir, crsRulesProbeFile), "")
+	if crsRulesTreeIntact(dir) {
+		t.Fatal("0 字节探针不得判完整")
+	}
+	writeTestFile(t, filepath.Join(dir, crsRulesProbeFile), "SecRule init")
+	if !crsRulesTreeIntact(dir) {
+		t.Fatal("非空探针 + .conf 必须判完整")
+	}
+}

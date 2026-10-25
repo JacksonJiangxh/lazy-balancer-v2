@@ -141,6 +141,17 @@ const (
 	DefaultAuditLogSizeMB       = 10
 	DefaultRuntimeLogSizeMB     = 100
 	DefaultAuditRetentionMonths = 3
+	// CA 提供商并发/间隔的治理默认：fresh DDL DEFAULT、读侧 COALESCE
+	// （caproviders.go 列清单 / cluster_snapshot）、写侧归一
+	// （NormalizeCAProvider*）、导入回填与导入行归一五处同源。
+	// 语义上 0/负数即「未设置」——归一后恒为下列默认值，不得出现第二套数字。
+	DefaultCAProviderMaxConcurrent = 1
+	DefaultCAProviderMinIntervalMS = 2000
+	// DefaultAutoBackupSections 是自动备份分类范围的治理默认（四分类，含
+	// cluster 节点拓扑）：fresh DDL DEFAULT、迁移补列与集群快照装载的
+	// COALESCE 参数三处同源。用户未设置（NULL/空串）时读侧语义是「全部」，
+	// 该默认只覆盖「带外 NULL 行」的下发形态。
+	DefaultAutoBackupSections = `["users","rules","security","cluster"]`
 )
 
 // certJobStatuses 是 cert_jobs.status 的规范枚举。
@@ -622,7 +633,7 @@ func createTables() error {
 		auto_backup_time TEXT DEFAULT '03:00',
 		auto_backup_day INTEGER DEFAULT 1,
 		auto_backup_keep INTEGER DEFAULT 7,
-		auto_backup_sections TEXT DEFAULT '["users","rules","security","cluster"]',
+		auto_backup_sections TEXT DEFAULT '` + DefaultAutoBackupSections + `',
 		auto_backup_sections_version INTEGER NOT NULL DEFAULT 0,
 		auto_backup_last_run DATETIME,
 	-- 威胁大屏本站坐标(v3,node-local):面板设置里的公网坐标,0,0=未设置(前端
@@ -782,7 +793,7 @@ func createTables() error {
 		name TEXT NOT NULL,
 		description TEXT DEFAULT '',
 		mode TEXT DEFAULT 'off',
-		anomaly_threshold INTEGER DEFAULT 5,
+		anomaly_threshold INTEGER DEFAULT ` + fmt.Sprint(DefaultAnomalyThreshold) + `,
 		ip_acl_mode TEXT DEFAULT '',
 		ip_acl_list TEXT DEFAULT '[]',
 		ip_acl_enabled BOOLEAN DEFAULT FALSE,
@@ -1286,7 +1297,7 @@ var newColumnsRegistry = map[string]string{
 	"global_config.auto_backup_time":             "TEXT DEFAULT '03:00'",
 	"global_config.auto_backup_day":              "INTEGER DEFAULT 1",
 	"global_config.auto_backup_keep":             "INTEGER DEFAULT 7",
-	"global_config.auto_backup_sections":         "TEXT DEFAULT '[\"users\",\"rules\",\"security\",\"cluster\"]'",
+	"global_config.auto_backup_sections":         "TEXT DEFAULT '" + DefaultAutoBackupSections + "'",
 	"global_config.auto_backup_sections_version": "INTEGER NOT NULL DEFAULT 0",
 	"global_config.auto_backup_last_run":         "DATETIME",
 	// 三分类合并·方案A(2026-09-19):文件态记账专用列(wafFilesDrifted
@@ -1399,6 +1410,9 @@ func runMigrations() error {
 	}
 	if err := migrateNodesDeadColumns(); err != nil {
 		return fmt.Errorf("failed to migrate nodes legacy columns: %w", err)
+	}
+	if err := migrateNodesModeLegacy(); err != nil {
+		return fmt.Errorf("failed to normalize legacy nodes.mode rows: %w", err)
 	}
 	// idx_nodes_status 死索引回收——零查询消费；DDL 与
 	// 两处 nodes 表重建迁移已停止创建，存量库由此处一次性删除。
@@ -1937,46 +1951,8 @@ func runMigrations() error {
 	// 用户预期相悖。marker=1 后表空保持空（cert 签发会显式失败，用户可经导入
 	// 恢复；UI 无新增入口，这是删除路径的唯一来源）。marker 为节点本地语义：
 	// 不进入集群快照（snapshotACME 显式列）与配置备份（显式设置键清单）。
-	var caSeeded int
-	if err := DB.QueryRow(`SELECT COALESCE(ca_providers_seeded,0) FROM global_config WHERE id=1`).Scan(&caSeeded); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to read CA provider seed marker: %w", err)
-	}
-	if caSeeded == 0 {
-		var caCount int
-		if err := DB.QueryRow("SELECT COUNT(*) FROM ca_providers").Scan(&caCount); err != nil {
-			return fmt.Errorf("failed to count CA providers: %w", err)
-		}
-		if caCount == 0 {
-			if _, err := DB.Exec(`
-				INSERT INTO ca_providers (name, provider, directory_url, credentials, max_concurrent, min_interval_ms, enabled)
-				VALUES
-					('ZeroSSL', 'zerossl', 'https://acme.zerossl.com/v2/DV90', '{}', 1, 10000, 1),
-					('Let''s Encrypt', 'letsencrypt', 'https://acme-v02.api.letsencrypt.org/directory', '{}', 2, 5000, 1)
-			`); err != nil {
-				return fmt.Errorf("failed to seed CA providers: %w", err)
-			}
-			// LastInsertId returns the last row of the multi-row insert (Let's Encrypt),
-			// so look up Let's Encrypt's actual ID directly and set it as the default.
-			var leid int64
-			if err := DB.QueryRow("SELECT id FROM ca_providers WHERE provider = 'letsencrypt' ORDER BY id LIMIT 1").Scan(&leid); err != nil {
-				return fmt.Errorf("failed to find seeded Let's Encrypt provider: %w", err)
-			}
-			res, err := DB.Exec("UPDATE global_config SET default_ca_provider_id = ? WHERE id = 1", leid)
-			if err != nil {
-				return fmt.Errorf("failed to set default CA provider: %w", err)
-			}
-			rowsAffected, err := res.RowsAffected()
-			if err != nil {
-				return fmt.Errorf("failed to read default CA provider update result: %w", err)
-			}
-			if rowsAffected == 0 {
-				return fmt.Errorf("failed to set default CA provider: global config singleton not found")
-			}
-			log.Print("已播种默认 CA 提供商（ZeroSSL / Let's Encrypt）")
-		}
-		if _, err := DB.Exec(`UPDATE global_config SET ca_providers_seeded=1 WHERE id=1`); err != nil {
-			return fmt.Errorf("failed to record CA provider seed marker: %w", err)
-		}
+	if err := ensureDefaultCAProviders(); err != nil {
+		return err
 	}
 
 	// Backfill any existing CA providers that were seeded before updated_at had a default.
@@ -2102,6 +2078,16 @@ func migrateDropMergedSyncSwitchColumns() error {
 				WHERE id=1 AND COALESCE(applied_waf_ref_hash,'')=''`); err != nil {
 				return fmt.Errorf("failed to move waf bookkeeping into global_config columns: %w", err)
 			}
+			// 删除前探测「目标列已非空、遗留行却携带不同记账」形态：搬移 UPDATE
+			// 带 WHERE applied_waf_ref_hash='' 谓词，此形态会整体丢弃遗留哈希/
+			// 版本且无任何痕迹。一次性记账丢弃不可恢复，必须留痕（否则事后
+			// 无法解释该版本为何从未触发过从端补偿重拉）。
+			if discarded, err := discardedLegacyAppliedBookkeeping(); err != nil {
+				return err
+			} else if discarded != "" {
+				log.Print(discarded)
+				recordSystemAudit("启动迁移", "系统配置", discarded)
+			}
 			startupMigrationWriteStatements.Add(1)
 			if _, err := DB.Exec(`DELETE FROM cluster_applied_sections WHERE section IN ('global_config','waf_files')`); err != nil {
 				return fmt.Errorf("failed to clear legacy applied sections: %w", err)
@@ -2109,6 +2095,37 @@ func migrateDropMergedSyncSwitchColumns() error {
 		}
 	}
 	return nil
+}
+
+// discardedLegacyAppliedBookkeeping 在删除 cluster_applied_sections 中的
+// waf_files/global_config 记账行之前，探测是否真有值被丢弃：搬移 UPDATE 只在
+// 目标列（applied_waf_ref_hash）为空时生效，目标列已非空且遗留行携带不同记账
+// 时，删除等于静默丢弃一次性迁移数据。返回空串表示无丢弃。
+func discardedLegacyAppliedBookkeeping() (string, error) {
+	var targetHash string
+	var targetVersion int
+	if err := DB.QueryRow(`SELECT COALESCE(applied_waf_ref_hash,''), COALESCE(applied_waf_ref_version,0) FROM global_config WHERE id=1`).Scan(&targetHash, &targetVersion); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to probe target applied waf bookkeeping: %w", err)
+	}
+	if targetHash == "" {
+		return "", nil
+	}
+	var legacyHash string
+	var legacyVersion int
+	if err := DB.QueryRow(`SELECT COALESCE(hash,''), COALESCE(applied_version,0) FROM cluster_applied_sections WHERE section='waf_files'`).Scan(&legacyHash, &legacyVersion); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to probe legacy applied waf bookkeeping: %w", err)
+	}
+	if legacyHash == "" && legacyVersion == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("启动迁移：丢弃遗留文件态应用记账（目标列已非空，搬移谓词不成立）——遗留 hash=%s version=%d，保留目标 hash=%s version=%d",
+		legacyHash, legacyVersion, targetHash, targetVersion), nil
 }
 
 // migrateSecurityPolicyCustomOnlyMode(2026-09-09 裁定):WAF 模式四态化后
@@ -2257,17 +2274,35 @@ func migrateLegacyHTTPSProtocol() error {
 	}
 	// 系统审计走内存缓冲而非 SQL 事务：只在数据库提交成功后入缓冲；
 	// 任一 UPDATE 失败会整体回滚且不留半迁移审计。
+	// 一行聚合 + 计数（caddy_id 清单上限见 formatMigrationRuleIDs）：逐规则
+	// 一条在存量 N 条时写 N 条，受系统审计缓冲上限截断且噪音大。
+	ids := make([]string, 0, len(legacy))
+	certCount := 0
 	for _, rule := range legacy {
-		var detail string
 		if rule.hasCert {
-			detail = fmt.Sprintf("存量 https 协议规则已迁移为 http+TLS：caddy_id=%s name=%s", rule.caddyID, rule.name)
-		} else {
-			detail = fmt.Sprintf("存量 https 协议规则已迁移为普通 HTTP（无可用证书，未启用 TLS）：caddy_id=%s name=%s", rule.caddyID, rule.name)
+			certCount++
 		}
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "系统配置", detail)
+		ids = append(ids, rule.caddyID)
 	}
+	detail := fmt.Sprintf("存量 https 协议规则已迁移：%d 条（有证书归 http+TLS %d 条，无可用证书归普通 HTTP %d 条）；caddy_id：%s",
+		len(legacy), certCount, len(legacy)-certCount, formatMigrationRuleIDs(ids))
+	log.Print(detail)
+	recordSystemAudit("启动迁移", "系统配置", detail)
 	return nil
+}
+
+// formatMigrationRuleIDs 把一次性迁移命中的 caddy_id 收敛为审计详情片段：
+// 最多 20 条（与 queryDuplicateLbRulesCaddyIDs 的上限同源），超出点名总条数，
+// 避免单条审计详情失控。调用方必须已按稳定顺序收集。
+func formatMigrationRuleIDs(ids []string) string {
+	const maxListed = 20
+	if len(ids) == 0 {
+		return "（无）"
+	}
+	if len(ids) <= maxListed {
+		return strings.Join(ids, ", ")
+	}
+	return fmt.Sprintf("%s 等 %d 条", strings.Join(ids[:maxListed], ", "), len(ids))
 }
 
 // migrateTCPRuleStaleDNSServer 一次性迁移：存量
@@ -2328,11 +2363,15 @@ func migrateTCPRuleStaleDNSServer() error {
 	}); err != nil {
 		return err
 	}
+	// 一行聚合 + 计数（与 legacy https 迁移同口径）。
+	ids := make([]string, 0, len(stale))
 	for _, rule := range stale {
-		detail := fmt.Sprintf("存量 TCP 规则携带无效 DNS 服务发现配置（渲染永不消费），已清空 enable_dns_server/dns_server：caddy_id=%s name=%s", rule.caddyID, rule.name)
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "系统配置", detail)
+		ids = append(ids, rule.caddyID)
 	}
+	detail := fmt.Sprintf("存量 TCP 规则携带无效 DNS 服务发现配置（渲染永不消费），已清空 enable_dns_server/dns_server：%d 条；caddy_id：%s",
+		len(stale), formatMigrationRuleIDs(ids))
+	log.Print(detail)
+	recordSystemAudit("启动迁移", "系统配置", detail)
 	return nil
 }
 
@@ -3391,6 +3430,14 @@ func SeedSystemIPLists(database *sql.DB) error {
 // 但回填语义错误。依赖链不允许成环（成环在第二趟执行期自然报错，
 // 启动期响亮失败）。
 func orderNewColumnKeys(columns, backfills map[string]string) ([]string, error) {
+	// 未登记到 newColumns 的 backfill 键在下方按列遍历时不会被访问——其回填
+	// SQL 永不执行且零错误（列没补、派生值没落，读侧按零值运行）。与畸形键
+	// 同口径：启动期响亮失败，而非静默丢弃。
+	for key := range backfills {
+		if _, ok := columns[key]; !ok {
+			return nil, fmt.Errorf("backfill key %q is not registered in newColumns", key)
+		}
+	}
 	keys := make([]string, 0, len(columns))
 	tables := map[string]struct{}{}
 	for col := range columns {
@@ -3805,12 +3852,12 @@ func migrateSecurityPoliciesNullable() error {
 		// rebuild 必须与 fresh CREATE（含 refs 两列）同形状并搬运其数据——
 		// 陈旧 DDL 会把同一 runMigrations 早前 newColumns 刚加的列丢掉
 		//（窗口期库首启安全策略子系统整体 no such column）。
-		if _, err := tx.Exec(`CREATE TABLE security_policies_new (
+		if _, err := tx.Exec(fmt.Sprintf(`CREATE TABLE security_policies_new (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
 			description TEXT DEFAULT '',
 			mode TEXT DEFAULT 'off',
-			anomaly_threshold INTEGER DEFAULT 5,
+			anomaly_threshold INTEGER DEFAULT %d,
 			ip_acl_mode TEXT DEFAULT '',
 			ip_acl_list TEXT DEFAULT '[]',
 			ip_acl_enabled BOOLEAN DEFAULT FALSE,
@@ -3850,7 +3897,7 @@ func migrateSecurityPoliciesNullable() error {
 			COALESCE(log_request_body,0),COALESCE(ip_acl_list_refs,'[]'),COALESCE(ip_whitelist_refs,'[]'),policy_type,COALESCE(trust_detection,0),COALESCE(geoip_crawler_exempt,0),COALESCE(geoip_crawler_engines,'[]')
 		FROM security_policies;
 		DROP TABLE security_policies;
-		ALTER TABLE security_policies_new RENAME TO security_policies;`); err != nil {
+		ALTER TABLE security_policies_new RENAME TO security_policies;`, DefaultAnomalyThreshold)); err != nil {
 			return fmt.Errorf("rebuild security_policies table: %w", err)
 		}
 		return nil
@@ -3938,7 +3985,9 @@ func dedupeNodesTx(tx nodesDedupeExecer) (int64, error) {
 	if rowsErr != nil {
 		// 吞错会把「已删 N 行」伪装成「删了 0 行」——recordNodesDedupeAudit 在
 		// removed<=0 时直接 return，节点从注册表消失的原因就此在操作审计中缺失
-		//（该审计存在的理由）。同族其它 RowsAffected 均上抛错误。
+		//（该审计存在的理由）。口径边界：仓内另有若干 RowsAffected 调用刻意
+		// 吞错——它们的结果仅用于日志/审计条数或按「未知」继续（配 warn 留痕），
+		// 不参与控制流；这里上抛是因为计数就是审计内容本身。
 		return 0, fmt.Errorf("dedupe nodes: read rows affected: %w", rowsErr)
 	}
 	return removed, nil
@@ -3956,6 +4005,99 @@ func recordNodesDedupeAudit(removed int64) {
 	detail := fmt.Sprintf("启动迁移：nodes 去重删除 %d 条重复 (ip_address, port) 行（保留已批准/持令牌/最近上报者）", removed)
 	log.Print("WARN: " + detail)
 	recordSystemAudit("启动迁移", "集群节点", detail)
+}
+
+// ensureDefaultCAProviders 播种内置 CA 提供商（marker 门，一次性）。四条语句
+// ——INSERT 两条、SELECT Let's Encrypt id、UPDATE 默认 CA、写 marker——必须同
+// 事务：分步自动提交时中途失败/进程被杀会留下「提供商已存在 + marker 未写」，
+// 下次启动因 caCount>0 跳过播种却写入 marker，default_ca_provider_id 永久停
+// 在 0——GetDefaultCAProvider 把 0 归为「首个启用提供商」，默认签发商从播种
+// 意图的 Let's Encrypt 静默漂移成 ZeroSSL（限额/端点策略不同），无错误、无
+// 审计且 marker 阻断自愈。
+func ensureDefaultCAProviders() error {
+	var caSeeded int
+	if err := DB.QueryRow(`SELECT COALESCE(ca_providers_seeded,0) FROM global_config WHERE id=1`).Scan(&caSeeded); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to read CA provider seed marker: %w", err)
+	}
+	if caSeeded != 0 {
+		return nil
+	}
+	var caCount int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM ca_providers").Scan(&caCount); err != nil {
+		return fmt.Errorf("failed to count CA providers: %w", err)
+	}
+	seeded := false
+	if err := withWriteTx("seed default CA providers", func(tx *sql.Tx) error {
+		if caCount == 0 {
+			if _, err := tx.Exec(`
+				INSERT INTO ca_providers (name, provider, directory_url, credentials, max_concurrent, min_interval_ms, enabled)
+				VALUES
+					('ZeroSSL', 'zerossl', 'https://acme.zerossl.com/v2/DV90', '{}', 1, 10000, 1),
+					('Let''s Encrypt', 'letsencrypt', 'https://acme-v02.api.letsencrypt.org/directory', '{}', 2, 5000, 1)
+			`); err != nil {
+				return fmt.Errorf("failed to seed CA providers: %w", err)
+			}
+			// LastInsertId returns the last row of the multi-row insert (Let's Encrypt),
+			// so look up Let's Encrypt's actual ID directly and set it as the default.
+			var leid int64
+			if err := tx.QueryRow("SELECT id FROM ca_providers WHERE provider = 'letsencrypt' ORDER BY id LIMIT 1").Scan(&leid); err != nil {
+				return fmt.Errorf("failed to find seeded Let's Encrypt provider: %w", err)
+			}
+			res, err := tx.Exec("UPDATE global_config SET default_ca_provider_id = ? WHERE id = 1", leid)
+			if err != nil {
+				return fmt.Errorf("failed to set default CA provider: %w", err)
+			}
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("failed to read default CA provider update result: %w", err)
+			}
+			if rowsAffected == 0 {
+				return fmt.Errorf("failed to set default CA provider: global config singleton not found")
+			}
+			seeded = true
+		}
+		if _, err := tx.Exec(`UPDATE global_config SET ca_providers_seeded=1 WHERE id=1`); err != nil {
+			return fmt.Errorf("failed to record CA provider seed marker: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if seeded {
+		log.Print("已播种默认 CA 提供商（ZeroSSL / Let's Encrypt）")
+	}
+	return nil
+}
+
+// migrateNodesModeLegacy：nodes.mode 的唯一写点（注册路径）恒写 'slave'，
+// 主节点巡检按 mode='slave' 过滤。旧构建导入/带外直改遗留的其它取值既让该
+// 节点永久退出离线/滞后判定，又会让当前版本导出的自备份在导入行级门被拒
+// （实例无法还原自己的备份）。启动收敛为 'slave'（幂等，收敛库零写）；
+// 导出侧 sanitizeNodeRowsForExport 同口径归一，杜绝再次自毒。
+func migrateNodesModeLegacy() error {
+	write := migrationWrite{
+		table: "nodes",
+		where: "COALESCE(mode,'')<>'slave'",
+		write: "UPDATE nodes SET mode='slave' WHERE COALESCE(mode,'')<>'slave'",
+	}
+	result, err := execMigrationWriteIfNeeded(write)
+	if err != nil {
+		return fmt.Errorf("normalize legacy nodes.mode: %w", err)
+	}
+	if result == nil {
+		return nil
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read normalized legacy nodes.mode count: %w", err)
+	}
+	if affected == 0 {
+		return nil
+	}
+	detail := fmt.Sprintf("启动迁移：nodes.mode 非 slave 的存量行已归一为 slave：%d 条（该列唯一写点恒 slave；不归一会让节点永久退出离线/滞后巡检，且自备份被导入门拒绝）", affected)
+	log.Print(detail)
+	recordSystemAudit("启动迁移", "集群节点", detail)
+	return nil
 }
 
 func migrateNodesDeadColumns() error {
@@ -4314,7 +4456,8 @@ func migrateLbRulesPrimaryKey() error {
 			return err
 		}
 		// caddy_id 即将成为主键：先去重（否则 INSERT 主键冲突 → 回滚 →
-		// 启动永久失败）。RowsAffected 错误上抛，不静默归零。
+		// 启动永久失败）。去重行数不参与任何分支（明确丢弃 result，
+		// 不用 RowsAffected），只要求语句本身成功。
 		if _, err := tx.Exec(lbRulesDedupeSQL); err != nil {
 			return fmt.Errorf("dedupe lb_rules before primary key rebuild: %w", err)
 		}
@@ -5063,8 +5206,11 @@ func migrateRuleTLSModeResidue() error {
 	if stale == 0 {
 		return nil
 	}
+	// 审计数取事务内实际变更行数：探测值可重复计数（同一行命中多条子查询），
+	// 且探测与执行之间行可能已被并发修正——按探测值写会把「未变更」报成
+	// 「已清零 N 处」。
+	var changed int64
 	if err := withWriteTx("rule TLS cross-mode residue cleanup", func(tx *sql.Tx) error {
-		var changed int64
 		for _, statement := range ruleTLSModeResidueResetSQLs {
 			res, err := tx.Exec(statement)
 			if err != nil {
@@ -5085,7 +5231,10 @@ func migrateRuleTLSModeResidue() error {
 	}); err != nil {
 		return err
 	}
-	detail := fmt.Sprintf("存量规则跨模式 TLS 残留已清零：%d 处（非 manual 源不保留证书材料、非 acme_dns 源不保留 CA 引用、manual 源不保留 ACME 配置引用）", stale)
+	if changed == 0 {
+		return nil
+	}
+	detail := fmt.Sprintf("存量规则跨模式 TLS 残留已清零：%d 处（按实际变更计数；非 manual 源不保留证书材料、非 acme_dns 源不保留 CA 引用、manual 源不保留 ACME 配置引用）", changed)
 	log.Print(detail)
 	recordSystemAudit("启动迁移", "系统配置", detail)
 	return nil

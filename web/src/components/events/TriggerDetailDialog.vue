@@ -104,7 +104,7 @@
               : '当前 CRS 索引加载失败，无法展示规则详情' }}</span>
           </div>
           <template v-if="crsEntry">
-            <div class="crs-snippet-toggle" role="button" tabindex="0" @click="toggleCrsSnippet" @keydown.enter.prevent="toggleCrsSnippet" @keydown.space.prevent="toggleCrsSnippet">
+            <div class="crs-snippet-toggle" role="button" tabindex="0" :aria-expanded="crsSnippetExpanded" aria-label="展开或收起规则源码" @click="toggleCrsSnippet" @keydown.enter.prevent="toggleCrsSnippet" @keydown.space.prevent="toggleCrsSnippet">
               <el-icon class="crs-snippet-toggle-icon" :class="{ 'is-expanded': crsSnippetExpanded }"><ArrowRight /></el-icon>
               <span>{{ crsSnippetExpanded ? '收起规则源码' : '展开规则源码' }}</span>
               <span class="crs-snippet-toggle-file">{{ crsEntry.file }} · id:{{ row?.rule_triggered }} 所在行 ±10 行</span>
@@ -766,6 +766,8 @@ watch(() => props.modelValue, (v) => {
 .trg-tip { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 6px; }
 /* CRS 源码折叠 + 排除组（自 SecurityEvents 迁入，风格对齐卡片） */
 .crs-snippet-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--el-color-primary); cursor: pointer; margin-top: 8px; }
+/* 折叠头是键盘入口（Enter/Space）：焦点必须可见 */
+.crs-snippet-toggle:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; border-radius: 2px; }
 .crs-snippet-toggle-icon { transition: transform .2s; }
 .crs-snippet-toggle-icon.is-expanded { transform: rotate(90deg); }
 .crs-snippet-toggle-file { color: var(--el-text-color-secondary); }

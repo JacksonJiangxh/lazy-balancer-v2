@@ -52,7 +52,7 @@ export const certJobStatusLabel = (status: CertJobStatus): string => {
 }
 
 /** 证书任务状态色调（与 certJobStatusLabel 同一状态机）。 */
-export type CertJobStatusTone = 'success' | 'danger' | 'warning' | 'info'
+type CertJobStatusTone = 'success' | 'danger' | 'warning' | 'info'
 
 /** 状态 → Element tag 色调全表（同样受 `satisfies Record<CertJobStatus, …>` 穷尽性约束）。 */
 const CERT_JOB_STATUS_TONES = {

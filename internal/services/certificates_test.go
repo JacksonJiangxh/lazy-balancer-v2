@@ -897,7 +897,7 @@ func TestCertificateService_renewExpiringCertificates_retries_failed_first_issua
 			t.Fatalf("seed rule %s: %v", ruleID, err)
 		}
 	}
-	maxAttempts := GetCertRenewalAttempts()
+	maxAttempts := getCertRenewalAttempts()
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,renewal_attempts,updated_at,ca_provider_id) VALUES
 		('lb_first_retry','lb_first_retry.example.com','failed',1,datetime('now','-31 minutes'),1),
 		('lb_first_cooling','lb_first_cooling.example.com','failed',1,datetime('now','-5 minutes'),1),
@@ -1011,7 +1011,7 @@ func TestCertificateService_renewExpiringCertificates_logs_capped_skip(t *testin
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
-	maxAttempts := GetCertRenewalAttempts()
+	maxAttempts := getCertRenewalAttempts()
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_provider_id) VALUES (?,?, 'issued', datetime('now','+1 day'),?,1)`, ruleID, ruleID+".example.com", maxAttempts); err != nil {
 		t.Fatalf("seed capped job: %v", err)
 	}
@@ -1057,7 +1057,7 @@ func TestCertificateService_renewExpiringCertificates_summaryTiersCappedJobs(t *
 			t.Fatalf("seed rule %s: %v", ruleID, err)
 		}
 	}
-	maxAttempts := GetCertRenewalAttempts()
+	maxAttempts := getCertRenewalAttempts()
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_provider_id) VALUES
 		('lb_sum_normal','lb_sum_normal.example.com','issued',datetime('now','+1 day'),0,1),
 		('lb_sum_capped','lb_sum_capped.example.com','issued',datetime('now','+1 day'),?,1)`, maxAttempts); err != nil {
@@ -2695,7 +2695,7 @@ func TestRenewalScan_capped_waiting_ca_failure_clears_cooldown_fields(t *testing
 	_, database := newClusterTestService(t)
 	resetCertificateServiceForTest(t)
 	seedRuleWithCAProvider(t, "lb_capped_waiting", "capped.example.test", 0)
-	maxAttempts := GetCertRenewalAttempts()
+	maxAttempts := getCertRenewalAttempts()
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_available_after,last_error_code)
 		VALUES ('lb_capped_waiting','capped.example.test','waiting_ca',datetime('now','+10 days'),?,datetime('now','-1 hour'),'429')`, maxAttempts); err != nil {
 		t.Fatalf("seed waiting_ca job: %v", err)

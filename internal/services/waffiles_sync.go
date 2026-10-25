@@ -44,6 +44,15 @@ var wafFileMu sync.Mutex
 // 叶操作、无嵌套重入。
 func WafFileLock() sync.Locker { return &wafFileMu }
 
+// withWafFileLock 在 wafFileMu 临界区内执行 fn，defer 释放：同步/导入路径位于
+// gin 路由栈（gin.Recovery 只恢复 HTTP 栈，不清理互斥状态），临界区 panic 后
+// 裸 Unlock 永不执行会让包级锁永久泄漏（后续重载/导入/规则库更新/同步全阻塞）。
+func withWafFileLock(fn func()) {
+	WafFileLock().Lock()
+	defer WafFileLock().Unlock()
+	fn()
+}
+
 // WafFileBundle carries the CRS rules tree and GeoIP xdb inside a cluster
 // snapshot so slaves converge on the master's actual rule files, not just the
 // version rows. Files are serialized as a deterministic tar.gz (sorted paths,
@@ -827,19 +836,26 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 }
 
 // skipWafSyncTransient 判断相对路径是否为不得进入 waf 同步打包的瞬态文件
-// 任意层级的点前缀路径（.staging/.sync-in/隐藏标记）与
-// *.bak/*.old 后缀（CRS 更新器备份残树，正常已迁往 crs.transient 兄弟目录，
-// 此处兜底旧版本残留/异常路径）。混入会让主从 tar 指纹按瞬态内容计算，
-// 两端永不对齐 → 全量重拉死循环。
+// 任意层级的点前缀路径（.staging/.sync-in/隐藏标记）与任一段 *.bak/*.old
+// 后缀（CRS 更新器备份残树，正常已迁往 crs.transient 兄弟目录，此处兜底旧
+// 版本残留/异常路径）。混入会让主从 tar 指纹按瞬态内容计算，两端永不对齐
+// → 全量重拉死循环。
+//
+// 后缀必须逐段判定：目录形备份树（rules.bak/x.conf）的整串 rel 不以 .bak
+// 结尾，只判整串会让打包收入该子树、而清残阶段按目录段命中整棵删除——同一
+// 谓词在打包/清残两处语义不对称，最终哈希门恒拒（从节点 WAF 永不收敛）。
 func skipWafSyncTransient(rel string) bool {
-	// 复审裁定修复：逐段判断点前缀（.staging/crs.tar.gz 这类子文件此前漏过），
-	// *.bak/*.old 后缀匹配整串相对路径（覆盖目录形 rules.bak/ 与文件形 conf.bak）。
+	// 逐段判断点前缀（.staging/crs.tar.gz 这类子文件此前漏过）与
+	// *.bak/*.old 后缀（目录形 rules.bak/ 与文件形 conf.bak 一并覆盖）。
 	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
 		if strings.HasPrefix(part, ".") {
 			return true
 		}
+		if strings.HasSuffix(part, ".bak") || strings.HasSuffix(part, ".old") {
+			return true
+		}
 	}
-	return strings.HasSuffix(rel, ".bak") || strings.HasSuffix(rel, ".old")
+	return false
 }
 
 // removeTransientWafSyncPaths 删除 staging 树内的瞬态命名路径（与

@@ -1,8 +1,10 @@
 package services
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,7 +41,7 @@ func TestSyncSwitchGuard_threatOnlyUpdateWarns(t *testing.T) {
 	}
 	sk := &sectionSkips{disabled: map[string]bool{"security": true}, unchanged: map[string]bool{}}
 
-	logSyncSwitchGuards(database, snapshot, sk, SyncSwitches{})
+	logSyncSwitchGuards(context.Background(), database, snapshot, sk, SyncSwitches{})
 
 	var action, detail string
 	if err := db.AuditDB.QueryRow(`SELECT action,detail FROM audit_log WHERE resource='集群同步' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); err != nil {
@@ -65,7 +67,7 @@ func TestSyncSwitchGuard_threatOnlyUpdateWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot.Version = 9
-	logSyncSwitchGuards(database, snapshot, sk, SyncSwitches{})
+	logSyncSwitchGuards(context.Background(), database, snapshot, sk, SyncSwitches{})
 	var after int
 	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='同步警告'`).Scan(&after); err != nil {
 		t.Fatal(err)
@@ -130,5 +132,57 @@ func TestWafFilesRefVersionLabelsDiffer_labelsOnly(t *testing.T) {
 	threatMissing := &models.ClusterWafFilesRef{ThreatSha256s: map[string]string{"firehol1": "deadbeef"}}
 	if !wafFilesRefVersionLabelsDiffer(threatMissing) {
 		t.Fatal("本地缺失主端声明的威胁源必须判分叉")
+	}
+}
+
+// 告警去重版本的推进失败必须留痕：该列是「每版本 bump 至多一条告警」的唯一
+// 依据，静默失败会让同一告警按 apply 轮重复刷审计且无信号解释——正是本函数
+// 读失败分支注释要防的形态。
+func TestSyncSwitchGuard_dedupVersionWriteFailureIsVisible(t *testing.T) {
+	_, database := newClusterTestService(t)
+	overrideWafPathsForServicesTest(t)
+	threatDir := t.TempDir()
+	t.Cleanup(OverrideThreatWafDirForTest(threatDir))
+	if err := os.WriteFile(filepath.Join(threatDir, "threat-ustc.iplist.fast"), []byte("local-stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET applied_waf_ref_version=7 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER fail_dedup_version BEFORE UPDATE OF applied_waf_ref_version ON global_config
+		BEGIN SELECT RAISE(ABORT, '注入的去重版本写失败'); END;`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	masterSum := sha256.Sum256([]byte("master-updated"))
+	snapshot := models.ClusterSnapshot{
+		Version:  8,
+		WafFiles: &models.ClusterWafFilesRef{ThreatSha256s: map[string]string{"ustc": hex.EncodeToString(masterSum[:])}},
+	}
+	sk := &sectionSkips{disabled: map[string]bool{"security": true}, unchanged: map[string]bool{}}
+
+	var buffer strings.Builder
+	oldWriter := log.Writer()
+	log.SetOutput(&buffer)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	logSyncSwitchGuards(context.Background(), database, snapshot, sk, SyncSwitches{})
+
+	if !strings.Contains(buffer.String(), "推进文件态告警去重版本失败") {
+		t.Fatalf("推进失败必须留痕（否则重复告警无解释）: %q", buffer.String())
+	}
+	// 告警本身仍须落审计（推进失败只影响去重，不影响告警的事实）。
+	var action string
+	if err := db.AuditDB.QueryRow(`SELECT action FROM audit_log WHERE resource='集群同步' ORDER BY id DESC LIMIT 1`).Scan(&action); err != nil {
+		t.Fatalf("告警审计缺失: %v", err)
+	}
+	if action != "同步警告" {
+		t.Fatalf("audit action=%q, want 同步警告", action)
+	}
+	var applied int
+	if err := database.QueryRow(`SELECT COALESCE(applied_waf_ref_version,0) FROM global_config WHERE id=1`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 7 {
+		t.Fatalf("applied_waf_ref_version=%d, want 7（写失败保持旧值）", applied)
 	}
 }

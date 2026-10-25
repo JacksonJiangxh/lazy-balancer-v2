@@ -21,14 +21,14 @@ func RestoreDBForTest(oldDB, oldMetricsDB, oldAuditDB *sql.DB) {
 	db.SetDB(oldDB)
 }
 
-// NonAdminVisibleToolNamesForTest 按当前注入的「非管理员恒 403」路由集派生
-// 非管理员属主 Key 在 tools/list 能看到（且真能调用）的工具集合——与
-// serveWithToolVisibility 同一判据。外部测试包用它把文档权限表与生产路由
-// 集合机械对账。
+// NonAdminVisibleToolNamesForTest 派生非管理员属主 Key 在 tools/list 能看到
+// （且真能调用）的工具集合——与 serveWithToolVisibility 同一判据：非管理员 Key
+// 写侧恒 read_only=1，故可见性 = 非「恒 403 工具」且 isReadOnlyTool（只读轴与
+// admin 轴同时生效，两轴缺一即与生产过滤分叉）。
 func NonAdminVisibleToolNamesForTest() map[string]struct{} {
 	visible := make(map[string]struct{}, len(tools))
 	for _, spec := range tools {
-		if isForbiddenForNonAdminTool(spec) {
+		if isForbiddenForNonAdminTool(spec) || !isReadOnlyTool(spec) {
 			continue
 		}
 		visible[spec.name] = struct{}{}
@@ -41,6 +41,18 @@ func NonAdminVisibleToolNamesForTest() map[string]struct{} {
 func ReadOnlyProbeToolNamesForTest() []string {
 	names := make([]string, 0, len(ReadOnlyProbeTools))
 	for name := range ReadOnlyProbeTools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ReadOnlyHiddenToolNamesForTest 返回「GET 但对只读 Key 恒 403」的工具名
+// （升序，单源 readOnlyHiddenTools）：人读文档与两份运行时文本必须按集合对账，
+// 新增隐藏工具时未登记文本即报红。
+func ReadOnlyHiddenToolNamesForTest() []string {
+	names := make([]string, 0, len(readOnlyHiddenTools))
+	for name := range readOnlyHiddenTools {
 		names = append(names, name)
 	}
 	sort.Strings(names)

@@ -814,7 +814,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + err.Error()})
+		failImportValidation(c, "导入", "备份文件读取失败: "+err.Error())
 		return
 	}
 	// BOM 剥离先于魔数检测——与 validate/v2 两路径同序。
@@ -824,21 +824,21 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	// lbbak(tar.gz)是 V2 形态:提前给出正确端点指引,避免落入 JSON 解析
 	// 「不是有效的 JSON」困惑(安全面本就必拒,仅提示质量)。
 	if isLbbakBytes(body) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "V1 导入仅支持旧版 JSON 备份；lbbak 备份请使用 /api/v1/config/import"})
+		failImportValidation(c, "导入", "V1 导入仅支持旧版 JSON 备份；lbbak 备份请使用 /api/v1/config/import")
 		return
 	}
 	if len(body) == 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
+		failImportValidation(c, "导入", "备份文件内容为空")
 		return
 	}
 	var v1 v1Backup
 	if err := json.Unmarshal(body, &v1); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件不是有效的 JSON"})
+		failImportValidation(c, "导入", "备份文件不是有效的 JSON")
 		return
 	}
 	proxies, upstreams, err := v1.parse()
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		failImportValidation(c, "导入", err.Error())
 		return
 	}
 	rules, conversionWarnings := convertV1Rules(proxies, upstreams)
@@ -848,7 +848,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	allWarnings = append(allWarnings, validationSkips...)
 	allWarnings = append(allWarnings, normalizations...)
 	if len(validRules) == 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份中没有可导入的有效规则"})
+		failImportValidation(c, "导入", "备份中没有可导入的有效规则")
 		return
 	}
 	disabledConflicts := disableConvertedRuleConflicts(validRules)

@@ -70,7 +70,7 @@ func TestCertIssuer_Issue_fastPath_repairsMismatchedKeyFile(t *testing.T) {
 }
 
 // Given：库内 cert_renewal_attempts 为有效值。
-// When：GetCertRenewalAttempts 读取。
+// When：getCertRenewalAttempts 读取。
 // Then：直读库值（不得被写死兜底常量覆盖）。
 func TestGetCertRenewalAttempts_readsStoredValue(t *testing.T) {
 	oldDB := db.DB
@@ -84,8 +84,8 @@ func TestGetCertRenewalAttempts_readsStoredValue(t *testing.T) {
 	if _, err := db.DB.Exec("UPDATE global_config SET cert_renewal_attempts=9 WHERE id=1"); err != nil {
 		t.Fatalf("seed attempts: %v", err)
 	}
-	if got := GetCertRenewalAttempts(); got != 9 {
-		t.Fatalf("GetCertRenewalAttempts=%d, want 9（读侧直读库值）", got)
+	if got := getCertRenewalAttempts(); got != 9 {
+		t.Fatalf("getCertRenewalAttempts=%d, want 9（读侧直读库值）", got)
 	}
 	if _, err := db.DB.Exec("UPDATE global_config SET cert_renewal_days=17 WHERE id=1"); err != nil {
 		t.Fatalf("seed days: %v", err)

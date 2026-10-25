@@ -340,3 +340,53 @@ func TestLogin_rejectsOverlongCredentials(t *testing.T) {
 		t.Fatalf("audit_log 出现超长用户名（len=%d），未认证请求可放大审计库", maxLen)
 	}
 }
+
+// 等时缓解的结构性回归钉（不做毫秒级时序断言——CI 抖动必然 flaky）：
+// ① dummy 哈希与生产哈希同档（DefaultCost、60 字节）；
+// ② 「用户名不存在」路径确实执行了一次 dummy 比较，且比较对象就是该 dummy 哈希。
+// 删掉比较语句、改用 MinCost 或走格式错误快路径都会使本用例变红。
+func TestLogin_unknownUserRunsDummyBcryptComparison(t *testing.T) {
+	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,0)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
+	if cost, err := bcrypt.Cost(loginDummyBcryptHash); err != nil || cost != bcrypt.DefaultCost {
+		t.Fatalf("dummy bcrypt cost=%v err=%v, want DefaultCost（降成本即恢复时序侧信道）", cost, err)
+	}
+	if len(loginDummyBcryptHash) != 60 {
+		t.Fatalf("dummy hash 长度=%d, want 60（bcrypt 标准形态；格式错误会走快路径）", len(loginDummyBcryptHash))
+	}
+
+	oldCompare := loginDummyCompare
+	calls := 0
+	var comparedHash string
+	var comparedPassword string
+	loginDummyCompare = func(hashedPassword, password []byte) error {
+		calls++
+		comparedHash = string(hashedPassword)
+		comparedPassword = string(password)
+		return bcrypt.ErrMismatchedHashAndPassword
+	}
+	t.Cleanup(func() { loginDummyCompare = oldCompare })
+
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.POST("/auth/login", h.Login)
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"no-such-user","password":"whatever"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", rec.Code, rec.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("未知用户名路径的 dummy 比较次数=%d, want 1（缺比较即恢复用户名枚举时序差）", calls)
+	}
+	if comparedHash != string(loginDummyBcryptHash) {
+		t.Fatalf("未知用户名路径未使用 dummy 哈希（比较对象=%q）", comparedHash)
+	}
+	if comparedPassword != "whatever" {
+		t.Fatalf("dummy 比较的密码=%q, want 请求密码（比较必须真实消耗 bcrypt 时间）", comparedPassword)
+	}
+}

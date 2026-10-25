@@ -60,8 +60,12 @@
     </el-table-column>
     <el-table-column v-if="visibleColumns.has('renewal')" label="自动重签时间" min-width="150">
       <template #default="{ row }">
-        <span v-if="row.status === 'issued' && renewalAt(row)" class="cell-text">{{ formatDate(renewalAt(row)) }}</span>
-        <span v-else class="cell-empty">-</span>
+        <!-- 收敛提示：配置窗口超出寿命可执行区间时按「到期前 7 天」续签，
+             列值不能被读成「配置的 88 天」 -->
+        <el-tooltip :disabled="!renewalConverged" :content="renewalConvergedNote">
+          <span v-if="row.status === 'issued' && renewalAt(row)" class="cell-text">{{ formatDate(renewalAt(row)) }}</span>
+          <span v-else class="cell-empty">-</span>
+        </el-tooltip>
       </template>
     </el-table-column>
     <el-table-column v-if="visibleColumns.has('updated')" label="更新时间" min-width="150">
@@ -152,7 +156,7 @@ import { useAuthStore } from '@/stores/auth'
 import type { APIResponse, CertJobsPage, CertJobListItem } from '@/types'
 import { certJobStatusLabel, certJobStatusTone, certJobRetryReady } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
-import { certJobEffectiveNotAfter, certJobRenewalAt } from '@/utils/certJobExpiry'
+import { certJobEffectiveNotAfter, certJobRenewalAt, certRenewalWindowConverged, certRenewalWindowDays } from '@/utils/certJobExpiry'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 
@@ -253,9 +257,15 @@ const retryDisabledReason = (row: CertJob): string => {
 // 避免同一行一个显示天数、另一个显示「-」（实现单源 utils/certJobExpiry）。
 const effectiveNotAfter = (row: CertJob): string => certJobEffectiveNotAfter(row)
 
-// 自动重签时间 = 证书到期前 certRenewalDays 天；返回 ISO 原值，列内紧凑格式
+// 自动重签时间 = 证书到期前「实际生效窗口」天；返回 ISO 原值，列内紧凑格式
 // 与 tooltip 完整格式各自取用，不在 helper 里预先格式化（避免双口径）。
 const renewalAt = (row: CertJob): string => certJobRenewalAt(row, certRenewalDays.value)
+
+// 配置窗口超出寿命可执行区间（84–88 天）时后端按「到期前 7 天」续签——列值
+// 必须与设置页说明、扫描实际行为同口径，收敛事实显性提示而非静默改写。
+const renewalConverged = computed(() => certRenewalWindowConverged(certRenewalDays.value))
+const renewalConvergedNote = computed(() =>
+  `配置的自动续签天数（${certRenewalDays.value} 天）超出证书寿命可执行窗口，实际按到期前 ${certRenewalWindowDays(certRenewalDays.value)} 天续签`)
 
 const formatCoolingTime = (iso: string): string => {
   // 畸形/缺失时间返回空串（与 utils/certJobExpiry 同族口径）：不做防御会渲染

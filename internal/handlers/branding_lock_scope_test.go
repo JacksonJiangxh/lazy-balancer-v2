@@ -119,3 +119,42 @@ func TestGetBranding_skipsWriteSideEffectsDuringImport(t *testing.T) {
 		t.Fatalf("导入窗口内仍触发了品牌镜像写入: %q", mirrored)
 	}
 }
+
+// 品牌镜像的接线点：主节点修改 branding.json → 越过 60s 采样门 → GET /branding
+// → global_config.branding_json 与文件原文一致（触发器 bump cluster_version，
+// 快照把变更带到从节点）。handlers 包内此前只有反向用例（导入窗口内镜像必须
+// 为空），正向链路只在 services 直调层验证——删除 GetBranding 内的镜像调用后
+// 从节点只能等配置备份/导入路径推进，品牌变更静默滞留主节点。
+func TestGetBranding_mirrorsFileChangeForClusterSnapshot(t *testing.T) {
+	handler := newBackupTestHandlers(t)
+	dir := t.TempDir()
+	handler.cfg.DataDir = dir
+	content := `{"app_name":"镜像正向","landing_text":"镜像正向文案"}`
+	if err := os.WriteFile(filepath.Join(dir, "branding.json"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resetBrandingStore()
+	resetBrandingSyncGateForTest()
+	t.Cleanup(func() {
+		resetBrandingStore()
+		resetBrandingSyncGateForTest()
+	})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/branding", handler.GetBranding)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/branding", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	var mirrored string
+	if err := db.DB.QueryRow(`SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1`).Scan(&mirrored); err != nil {
+		t.Fatalf("read branding_json: %v", err)
+	}
+	if mirrored != content {
+		t.Fatalf("branding_json=%q, want 文件原文 %q（镜像接线缺失/漂移，从节点收不到品牌变更）", mirrored, content)
+	}
+}

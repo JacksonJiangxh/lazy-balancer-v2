@@ -317,12 +317,17 @@ func TestEngine_RearmLoopHasWorkKeepsConsumedSlotWhenAlreadyOn(t *testing.T) {
 // 用户主动停止不留来源标记——两者可区分。
 func TestEngine_ScheduleStopReasonIsMachineReadable(t *testing.T) {
 	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	previousLogDir := LogDir()
+	SetLogDir(t.TempDir())
+	t.Cleanup(func() { SetLogDir(previousLogDir) })
 	pastSlot := time.Now().Add(-time.Minute)
 	const id = "t-stop-reason"
+	const recoverHint = "排程测试恢复入口（业务页保存一次）"
 	if err := e.Register(Descriptor{
 		ID: id, Family: "t", Name: "停调来源", Kind: KindScheduled, RunsOn: RoleAny,
-		NextSlotFn: func() time.Time { return pastSlot },
-		Run:        func(RunContext) error { return os.ErrDeadlineExceeded },
+		LoopRecoveryHint: recoverHint,
+		NextSlotFn:       func() time.Time { return pastSlot },
+		Run:              func(RunContext) error { return os.ErrDeadlineExceeded },
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -348,6 +353,18 @@ func TestEngine_ScheduleStopReasonIsMachineReadable(t *testing.T) {
 	}
 	if m.ScheduleStoppedReason != ScheduleStopReasonFailStreak {
 		t.Fatalf("停调来源=%q, want %q（视图据此区分引擎停调与用户停止）", m.ScheduleStoppedReason, ScheduleStopReasonFailStreak)
+	}
+	// 停调日志必须给出恢复入口提示（按业务驱动唯一清单注入的 hint）——只看
+	// 停调来源字段无法发现提示文案丢失或回退到通用兜底。
+	body, err := os.ReadFile(TaskLogPath(id))
+	if err != nil {
+		t.Fatalf("停调日志未落盘: %v", err)
+	}
+	if !strings.Contains(string(body), recoverHint) {
+		t.Fatalf("停调日志缺少描述符注入的恢复入口提示: %q", body)
+	}
+	if strings.Contains(string(body), "任务页调度开关或重启进程") {
+		t.Fatalf("停调日志回退到通用兜底提示（描述符 hint 未生效）: %q", body)
 	}
 
 	e.StartLoop(id)

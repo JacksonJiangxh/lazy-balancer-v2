@@ -6,15 +6,18 @@ package services
 // 含 942100+942550 两条）。
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -727,5 +730,49 @@ func TestCRSXCScope_hashNamingIsContentIdentity(t *testing.T) {
 		if content != want {
 			t.Fatalf("投影 %q 内容=%q, want %q（同名必同内容）", name, content, want)
 		}
+	}
+}
+
+// 结构性 skip 告警必须走 60s 限流：渲染按（规则×策略）粒度执行，同一脏行
+// 存续期每轮全量渲染都会重打（旧实现裸 Logf，真实告警被淹没、日志盘放大）。
+func TestBuildCorazaDirectives_structuralSkipWarnThrottled(t *testing.T) {
+	scopedExclusionFixture(t)
+	auditFailureLogMu.Lock()
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	now := time.Now()
+	oldClock := auditFailureLogClock
+	auditFailureLogClock = func() time.Time { return now }
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		auditFailureLogClock = oldClock
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = map[string]time.Time{}
+		auditFailureLogMu.Unlock()
+	})
+
+	policy := &models.SecurityPolicy{ID: 77, Name: "throttle", AnomalyThreshold: 5, Mode: "blocking",
+		CRSExcludedRules: json.RawMessage(`[{"target":"942100","scope":"bogus"}]`)}
+	for range 2 {
+		if _, err := BuildCorazaDirectives(policy, nil, "", false, 0, "lb_throttle"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 计「跳过未知 scope」这一整行前缀（消息体内还含一次「未知 scope 不降级」，
+	// 用短子串会把单行数成 2）。
+	const skipLine = "跳过未知 scope 的 CRS 排除条目"
+	if got := strings.Count(logs.String(), skipLine); got != 1 {
+		t.Fatalf("同一结构性 skip 告警两次渲染输出=%d 条, want 1（60s 限流）:\n%s", got, logs.String())
+	}
+	// 窗口过后可再次输出（限流不是永久抑制）。
+	now = now.Add(61 * time.Second)
+	if _, err := BuildCorazaDirectives(policy, nil, "", false, 0, "lb_throttle"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logs.String(), skipLine); got != 2 {
+		t.Fatalf("窗口后输出=%d 条, want 2", got)
 	}
 }

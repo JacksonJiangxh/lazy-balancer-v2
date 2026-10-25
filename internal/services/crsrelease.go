@@ -142,6 +142,15 @@ func parseGitHubLatestTag(body []byte) (string, error) {
 // tar 头声明的 hdr.Size 即解压后写入的确切字节数，跨条目累计超限即中止。
 const crsExtractMaxBytes = 500 << 20
 
+// crsExtractMaxFiles / crsExtractMaxDirs 与 untarGzTo 三门同口径：字节门只
+// 累计 hdr.Size，0 字节条目与目录头不占额度——2GB 下载上限内的包可携带
+// 数百万个空条目/目录头，在 staging 建海量 inode 并让失败路径 RemoveAll
+// 逐条删除。正常 CRS 树 ~50 文件、数个目录，上限留两个数量级余量。
+const (
+	crsExtractMaxFiles = 2000
+	crsExtractMaxDirs  = 2 * crsExtractMaxFiles
+)
+
 // extractCRSTarball extracts a GitHub release tar.gz into destDir, stripping
 // the single top-level root directory GitHub adds to every entry.
 func extractCRSTarball(tarballPath, destDir string) error {
@@ -158,6 +167,7 @@ func extractCRSTarball(tarballPath, destDir string) error {
 
 	tr := tar.NewReader(gz)
 	var totalBytes int64
+	files, dirs := 0, 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -173,6 +183,18 @@ func extractCRSTarball(tarballPath, destDir string) error {
 			return fmt.Errorf("tarball 解压超过大小上限（%d MB）", crsExtractMaxBytes>>20)
 		}
 		totalBytes += hdr.Size
+		// 条目数门（与字节门并行执法）：空条目/目录头不占字节额度。
+		if hdr.Typeflag == tar.TypeDir {
+			dirs++
+			if dirs > crsExtractMaxDirs {
+				return fmt.Errorf("tarball 目录条目数超过上限（%d）", crsExtractMaxDirs)
+			}
+		} else {
+			files++
+			if files > crsExtractMaxFiles {
+				return fmt.Errorf("tarball 文件条目数超过上限（%d）", crsExtractMaxFiles)
+			}
+		}
 		rel, err := stripTarRoot(hdr.Name)
 		if err != nil {
 			return err

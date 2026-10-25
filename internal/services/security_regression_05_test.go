@@ -325,3 +325,50 @@ func TestParseCrawlerCIDRs_jsonRequiresStructuredFields(t *testing.T) {
 		t.Fatalf("非 JSON 格式词法提取回归: got=%v err=%v", got, err)
 	}
 }
+
+// 摘要/列表的存在性判定只取 .fast 头部规模（不展开 []string），且必须与
+// 渲染同源：新 .fast 生效、空 .fast 为假、陈旧文本不得遮蔽新 fast。
+func TestThreatIplistHasEntries_fastFirstWithoutExpansion(t *testing.T) {
+	restore := OverrideThreatWafDirForTest(t.TempDir())
+	defer restore()
+	path := filepath.Join(wafDir, "threat-ustc.iplist")
+	if err := os.WriteFile(path, []byte("198.51.100.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// 空 .fast（新代、零条目）+ 旧文本有 1 条：按 .fast 代际 → 无生效条目。
+	if err := wafiplist.WriteFastFile(wafiplist.FastPath(path), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	has, err := threatIplistHasEntries(path)
+	if err != nil {
+		t.Fatalf("empty fast: %v", err)
+	}
+	if has {
+		t.Fatal("空 .fast 代际必须判无生效条目（不得回落到陈旧文本）")
+	}
+
+	// 写入新 fast 条目 → 有生效条目。
+	if err := wafiplist.WriteFastFile(wafiplist.FastPath(path), []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	has, err = threatIplistHasEntries(path)
+	if err != nil || !has {
+		t.Fatalf("has=%v err=%v, want true", has, err)
+	}
+
+	// 两代际均不可用 → 错误上抛（严格模式由调用方跳过策略），不得静默 false。
+	if err := os.Remove(wafiplist.FastPath(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := threatIplistHasEntries(path); err == nil {
+		t.Fatal("两个代际都不可用必须报错（fail-visible，不得按空集处理）")
+	}
+}

@@ -386,7 +386,7 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 	// allow 方向（否定算子+交集）全拒，且只有一条 warn 可见。按失败上报后
 	// 走既有严格模式（引用策略 IPRefMissing 跳过渲染 + 审计）与 UI 侧
 	// fail-visible，与「自定义名单畸形条目」同一口径。
-	useText := textErr == nil && (fastErr != nil || !fastInfo.ModTime().After(textInfo.ModTime()))
+	useText := !threatIplistPreferFast(textInfo, textErr, fastInfo, fastErr)
 	if useText {
 		vals, err := readText()
 		if err != nil {
@@ -443,7 +443,38 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 	if textErr != nil {
 		return nil, textErr
 	}
-	return nil, fastErr
+	// 当前判据下不可达（textErr==nil 且 fastErr!=nil 时 useText 恒 true，已被
+	// 上方分支覆盖）。保留 fail-visible 返回而非删除死代码：将来判据改写引入
+	// 未覆盖组合时，错误上抛（引用策略按装载失败跳过渲染）而不是静默返回
+	// fastErr（可能为 nil 的旧形态）。
+	return nil, fmt.Errorf("威胁名单 %s 的代际选择未覆盖组合（textErr=%v fastErr=%v）", iplistPath, textErr, fastErr)
+}
+
+// threatIplistPreferFast 报告是否应优先使用 .fast 代际（判据单源：文本缺失
+// 或 .fast 比文本更新）。readThreatIplistPath 的 useText 取本函数反值。
+func threatIplistPreferFast(textInfo os.FileInfo, textErr error, fastInfo os.FileInfo, fastErr error) bool {
+	return fastErr == nil && (textErr != nil || fastInfo.ModTime().After(textInfo.ModTime()))
+}
+
+// threatIplistHasEntries 只判定威胁名单是否有生效条目（摘要/列表路径）：
+// .fast 可优先时只取头部规模（ReadFastFile 后取 len(V4)+len(V6)>0），不再把
+// 整份前缀集展开成 []string（威胁上限 20 万条时省一次 MB 级分配）；.fast
+// 缺失/损坏/更旧时回退完整读取（含文本可解析率门），失败判定与渲染同源。
+func threatIplistHasEntries(iplistPath string) (bool, error) {
+	textInfo, textErr := os.Stat(iplistPath)
+	fastPath := wafiplist.FastPath(iplistPath)
+	fastInfo, fastErr := os.Stat(fastPath)
+	if threatIplistPreferFast(textInfo, textErr, fastInfo, fastErr) {
+		if set, err := wafiplist.ReadFastFile(fastPath); err == nil {
+			return len(set.V4)+len(set.V6) > 0, nil
+		}
+		// .fast 损坏：回退完整读取路径（文本回退 + 可解析率门 + 失败上报）。
+	}
+	vals, err := readThreatIplistPath(iplistPath)
+	if err != nil {
+		return false, err
+	}
+	return len(vals) > 0, nil
 }
 
 // expandThreatFastEntries 展开 .fast 前缀集（已聚合排序，match-set 等价）。
@@ -655,13 +686,15 @@ func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bo
 				continue
 			}
 			if system == 1 && threatSourceByListName(name) != "" {
-				vals, ferr := readThreatIplistEntries(name)
+				// 只判存在性（不构造整份 []string）：摘要/列表按秒级轮询，
+				// 全量展开最坏 3 × 20 万条前缀集纯属浪费。
+				has, ferr := threatIplistHasEntries(filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", threatSourceByListName(name))))
 				if ferr != nil {
 					Logf("error", "摘要: 威胁库 %q 文件读取失败: %v（严格模式：引用该列表的策略按装载失败处理）", name, ferr)
 					failed[id] = true
 					continue
 				}
-				presence[id] = len(vals) > 0
+				presence[id] = has
 				continue
 			}
 			list, perr := parseIPListEntriesStrict(raw)

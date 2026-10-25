@@ -959,14 +959,14 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int, 
 		   OR (j.status='downloaded' AND j.deployment_available_after IS NULL
 		       AND (`+CertJobMaterialPredicateSQL("j")+`)
 		       AND datetime(COALESCE(j.updated_at,j.created_at)) <= datetime('now', '-' || ? || ' minutes'))
-		   OR (j.status IN ('cleanup_dns','cleanup_warning') AND (`+CertJobMaterialPredicateSQL("j")+`))
+		   OR (j.status IN (`+DeploymentCleanupJobStatusSQL+`) AND (`+CertJobMaterialPredicateSQL("j")+`))
 		   -- 部署生命周期 + 无证书材料（ACME 已把状态写成 downloaded/cleanup_*，
 		   -- 材料却从未持久化：下载完成后的 DNS 清理窗口内进程退出，含硬杀与
 		   -- PauseAndDrain 超时后的退出）。这些行原先被下方 hasCertMaterial 守卫
 		   -- 一律跳过，没有任何周期通道回收——规则在重启前整条不发布（TLS 渲染
 		   -- 不命中材料即跳过规则，避免同端口明文降级）。
-		   OR (j.status IN (`+deploymentLifecycleJobStatusSQL+`)
-		       AND `+CertJobMissingMaterialPredicateSQL("j")+`
+		   OR (j.status IN (`+DeploymentLifecycleJobStatusSQL+`)
+		       AND `+certJobMissingMaterialPredicateSQL("j")+`
 		       AND datetime(COALESCE(j.updated_at,j.created_at)) <= datetime('now', '-' || ? || ' minutes'))
 	`, settleMinutes, settleMinutes)
 	if err != nil {
@@ -2137,7 +2137,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 
 	// CheckExpiration locks s.mu internally; the loop below only touches the
 	// DB and the queue, so holding s.mu here would deadlock the renewal.
-	maxAttempts := GetCertRenewalAttempts()
+	maxAttempts := getCertRenewalAttempts()
 	jobs, skippedExpiring, scanErr := s.CheckExpiration()
 	firstIssuance, skippedFirstIssuance, firstErr := s.checkFailedFirstIssuance(maxAttempts)
 	if scanErr != nil || firstErr != nil {
@@ -2656,6 +2656,6 @@ var selectStoredRuleCertificate = func(ctx context.Context, ruleID, ruleDomains 
 	if err := rows.Err(); err != nil {
 		return CertificateSelection{}, false, err
 	}
-	selection, selected := SelectCertificate(candidates, ruleDomains, now)
+	selection, selected := selectCertificate(candidates, ruleDomains, now)
 	return selection, selected, nil
 }

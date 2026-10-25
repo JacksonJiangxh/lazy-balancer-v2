@@ -350,8 +350,8 @@ func TestCertRenewalConfigReadSideClampsUpperBounds(t *testing.T) {
 	if got := GetCertRenewalDays(); got != 30 {
 		t.Fatalf("GetCertRenewalDays()=%d for out-of-range 365, want fallback 30", got)
 	}
-	if got := GetCertRenewalAttempts(); got != 5 {
-		t.Fatalf("GetCertRenewalAttempts()=%d for out-of-range 100, want fallback 5", got)
+	if got := getCertRenewalAttempts(); got != 5 {
+		t.Fatalf("getCertRenewalAttempts()=%d for out-of-range 100, want fallback 5", got)
 	}
 }
 

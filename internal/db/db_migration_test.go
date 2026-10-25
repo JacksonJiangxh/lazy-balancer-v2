@@ -483,12 +483,13 @@ func TestRunMigrations_migratesLegacyHTTPSRulesToHTTPWithTLS(t *testing.T) {
 		t.Fatalf("certless rule protocol=%q enable_tls=%d tls_http_redirect=%d, want http/0/0", protocol, enableTLS, redirect)
 	}
 
-	// And 受影响规则逐条进入操作日志缓冲（待审计库就绪落库），重跑零命中。
-	// 第三个条目是新增的 TCP 死字段清零聚合审计（本夹具的 tcp 行
-	// compress_types 默认 'gzip' 命中死值谓词，首轮被归一）。
+	// And 受影响规则进入操作日志缓冲（待审计库就绪落库），重跑零命中。
+	// https 迁移按批聚合为一行（含 caddy_id 清单）；第二个条目是新增的 TCP
+	// 死字段清零聚合审计（本夹具的 tcp 行 compress_types 默认 'gzip' 命中死值
+	// 谓词，首轮被归一）。
 	entries := drainSystemAuditBuffer()
-	if len(entries) != 3 {
-		t.Fatalf("system audit entries=%d, want 3（2 条 https 逐条 + 1 条 TCP 死字段聚合；重跑幂等）", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("system audit entries=%d, want 2（1 条 https 聚合 + 1 条 TCP 死字段聚合；重跑幂等）", len(entries))
 	}
 	details := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -580,10 +581,13 @@ func TestRunMigrations_migratesLegacyHTTPSRulesWithACMECertJobToHTTPWithTLS(t *t
 		t.Fatalf("certless rule protocol=%q enable_tls=%d, want http/0", protocol, enableTLS)
 	}
 
-	// And 三条受影响规则各入一条迁移审计（重跑零命中）
+	// And 三条受影响规则聚合成一条迁移审计（重跑零命中）
 	entries := drainSystemAuditBuffer()
-	if len(entries) != 3 {
-		t.Fatalf("system audit entries=%d, want 3（重跑幂等）", len(entries))
+	if len(entries) != 1 {
+		t.Fatalf("system audit entries=%d, want 1（按批聚合，避免逐规则写满缓冲）: %+v", len(entries), entries)
+	}
+	if !strings.Contains(entries[0].detail, "3 条") || !strings.Contains(entries[0].detail, "lb_https_acme") {
+		t.Fatalf("audit detail=%q, want 命中条数与 caddy_id 清单", entries[0].detail)
 	}
 }
 
@@ -638,8 +642,8 @@ func TestMigrateLegacyHTTPSProtocol_secondUpdateFailureRollsBackAndDefersAudit(t
 	if migrated != 2 {
 		t.Fatalf("migrated rows=%d after retry, want 2", migrated)
 	}
-	if entries := drainSystemAuditBuffer(); len(entries) != 2 {
-		t.Fatalf("audit entries=%d after complete retry, want 2: %+v", len(entries), entries)
+	if entries := drainSystemAuditBuffer(); len(entries) != 1 {
+		t.Fatalf("audit entries=%d after complete retry, want 1（整批聚合一行）: %+v", len(entries), entries)
 	}
 }
 
@@ -3387,18 +3391,32 @@ func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
 		}
 	}
 
-	// And 受影响规则逐条进入操作日志缓冲，重跑零命中（2 条逐条 DNS + 1 条
-	// 新增的 TCP 死字段清零聚合审计=3 条；第二轮不再新增）。
+	// And 受影响规则进入操作日志缓冲，重跑零命中（1 条 stale DNS 聚合 + 1 条
+	// TCP 死字段聚合=2 条；聚合行携带命中条数与 caddy_id 清单，逐规则写 N 条
+	// 会随存量规模撑爆系统审计缓冲）。
 	entries := drainSystemAuditBuffer()
-	if len(entries) != 3 {
-		t.Fatalf("system audit entries=%d, want 3（2 条 stale DNS 逐条 + 1 条 TCP 死字段聚合；重跑幂等）", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("system audit entries=%d, want 2（1 条 stale DNS 聚合 + 1 条 TCP 死字段聚合；重跑幂等）: %+v", len(entries), entries)
 	}
 	details := make([]string, 0, len(entries))
+	var dnsDetail string
 	for _, entry := range entries {
 		if entry.action != "启动迁移" {
 			t.Fatalf("audit entry action=%q, want 启动迁移", entry.action)
 		}
 		details = append(details, entry.detail)
+		if strings.Contains(entry.detail, "无效 DNS 服务发现配置") {
+			dnsDetail = entry.detail
+		}
+	}
+	if dnsDetail == "" {
+		t.Fatalf("缺少 stale DNS 聚合审计: %v", details)
+	}
+	// 聚合行的可追溯性：条数 + 全部命中的 caddy_id 必须在同一行内。
+	for _, want := range []string{"2 条", "lb_tcp_dns_on", "lb_tcp_dns_addr"} {
+		if !strings.Contains(dnsDetail, want) {
+			t.Fatalf("stale DNS 聚合审计缺 %q: %q", want, dnsDetail)
+		}
 	}
 	for _, want := range []string{"lb_tcp_dns_on", "lb_tcp_dns_addr", "TCP 规则 HTTP 专属死字段已清零"} {
 		found := false

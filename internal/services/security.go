@@ -592,7 +592,11 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 		// emitCRSRuleGroupSelection 同构）：带外直写/集群旧快照/lbbak 旧格式
 		// 可绕过写入面 50 条上限，逐条发射会放大配置体积与生成耗时。
 		if len(excludedEntries) > CRSExcludedRulesMaxEntries {
-			Logf("warn", "策略 %q 的 crs_excluded_rules 条目数 %d 超过上限 %d（疑似带外/旧快照写入），已截断渲染", p.Name, len(excludedEntries), CRSExcludedRulesMaxEntries)
+			// 结构性 skip 告警统一走 60s 限流（与畸形组/解析失败同口径）：渲染按
+			// 规则×策略粒度执行，脏行存续期逐条刷会淹没真实告警。
+			if msg := fmt.Sprintf("策略 %q 的 crs_excluded_rules 条目数 %d 超过上限 %d（疑似带外/旧快照写入），已截断渲染", p.Name, len(excludedEntries), CRSExcludedRulesMaxEntries); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			excludedEntries = excludedEntries[:CRSExcludedRulesMaxEntries]
 		}
 		for _, entry := range excludedEntries {
@@ -602,7 +606,9 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 			// blocking 退化为仅记录。写入面对新提交
 			// 已 400 硬拒（CRSExclusionTargetRemovesInfra），此处拦存量老数据。
 			if CRSExclusionTargetRemovesInfra(entry.Target) {
-				Logf("warn", "跳过命中基础设施组（901/949/959）的 CRS 排除条目 %q（策略 %q）：这些规则为系统强制加载，排除不生效", entry.Target, p.Name)
+				if msg := fmt.Sprintf("跳过命中基础设施组（901/949/959）的 CRS 排除条目 %q（策略 %q）：这些规则为系统强制加载，排除不生效", entry.Target, p.Name); auditFailureShouldLog(msg) {
+					Logf("warn", "%s", msg)
+				}
 				continue
 			}
 			if entry.Scope == "ip" || entry.Scope == "list" {
@@ -613,7 +619,9 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 			// 静默降级为 scope=all——那是「对所有客户端删除该规则」，WAF 保护面
 			// 静默扩大。跳过方向安全（排除减少=拦截更多）。
 			if entry.Scope != "all" {
-				Logf("warn", "跳过未知 scope 的 CRS 排除条目 %q（scope=%q，策略 %q）：未知 scope 不降级为全局排除", entry.Target, entry.Scope, p.Name)
+				if msg := fmt.Sprintf("跳过未知 scope 的 CRS 排除条目 %q（scope=%q，策略 %q）：未知 scope 不降级为全局排除", entry.Target, entry.Scope, p.Name); auditFailureShouldLog(msg) {
+					Logf("warn", "%s", msg)
+				}
 				continue
 			}
 			ruleID := strings.TrimSpace(entry.Target)
@@ -625,7 +633,9 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 				mapped = "9" + ruleID + "000-9" + ruleID + "999"
 			}
 			if !validSecRuleRemoveTarget(mapped) {
-				Logf("warn", "跳过非法 SecRuleRemoveById 条目 %q（策略 %q）：非数字/区间形态或区间越界，coraza 会拒绝编译", ruleID, p.Name)
+				if msg := fmt.Sprintf("跳过非法 SecRuleRemoveById 条目 %q（策略 %q）：非数字/区间形态或区间越界，coraza 会拒绝编译", ruleID, p.Name); auditFailureShouldLog(msg) {
+					Logf("warn", "%s", msg)
+				}
 				continue
 			}
 			scopeAllTargets = append(scopeAllTargets, mapped)
@@ -652,7 +662,9 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 		if _, err := os.Stat(filepath.Join(crsDirectivesDir, "crs-setup.conf")); err == nil {
 			sb.WriteString("Include /app/waf/crs/crs-setup.conf\n")
 		} else {
-			Logf("warn", "CRS 基线配置 crs-setup.conf 缺失，跳过 Include（策略 %q）：请重新安装/恢复规则库", p.Name)
+			if msg := fmt.Sprintf("CRS 基线配置 crs-setup.conf 缺失，跳过 Include（策略 %q）：请重新安装/恢复规则库", p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 		}
 		if _, err := os.Stat(filepath.Join(crsDirectivesDir, "zz-user-overrides.conf")); err == nil {
 			sb.WriteString("Include /app/waf/crs/zz-user-overrides.conf\n")
@@ -698,7 +710,9 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 				if _, err := os.Stat(full); err == nil {
 					sb.WriteString("Include /app/waf/crs/rules/" + name + "\n")
 				} else {
-					Logf("warn", "CRS 基础设施规则文件缺失，跳过强制 Include（%s，策略 %q）", name, p.Name)
+					if msg := fmt.Sprintf("CRS 基础设施规则文件缺失，跳过强制 Include（%s，策略 %q）", name, p.Name); auditFailureShouldLog(msg) {
+						Logf("warn", "%s", msg)
+					}
 				}
 			}
 			// infra 组号/规则 ID 已在上游 stripInfraCRSGroupCodes 剥离，故此处
@@ -1040,8 +1054,11 @@ func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, block
 		// 均在此兜底。
 		if issue := customRuleEmissionIssue(cr); issue != "" {
 			// 分级日志——裸 log.Printf 无级别前缀，日志级别调至 warn/error
-			// 时会被过滤出文件日志（与修复口径一致）。
-			Logf("warn", "自定义规则 %d(%s) %s，已跳过发射，请修正或禁用", cr.ID, cr.Name, issue)
+			// 时会被过滤出文件日志（与修复口径一致）。结构性跳过走 60s 限流：
+			// 渲染按规则×策略粒度执行，存量坏规则存续期逐条刷会淹没真实告警。
+			if msg := fmt.Sprintf("自定义规则 %d(%s) %s，已跳过发射，请修正或禁用", cr.ID, cr.Name, issue); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		// （阶段化模型收紧 890000→790000）:DB id ≥790000 经发射偏移
@@ -1049,7 +1066,9 @@ func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, block
 		// 同 id 冲突会使整份 coraza 配置编译失败;≥890000 仍撞 CRS 保留段
 		// (900000+)。发射侧跳过并告警(镜像上方坏规则兜底同款)。
 		if cr.ID >= customRuleEmitIDBound {
-			Logf("warn", "自定义规则 %d(%s) 发射 id 将撞入 GeoIP 预检段/CRS 保留空间，已跳过发射", cr.ID, cr.Name)
+			if msg := fmt.Sprintf("自定义规则 %d(%s) 发射 id 将撞入 GeoIP 预检段/CRS 保留空间，已跳过发射", cr.ID, cr.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		emitID := cr.ID + 10000
@@ -1375,11 +1394,18 @@ func buildWafHandlerWithIndex(ruleCaddyID string, policy *models.SecurityPolicy,
 }
 
 // ipPrecheckAllowRuleID 是多策略 IP 预检中 allow 模式（白名单交集外拒绝）规则
-// 的 SecRule id。本地 id 空间：2=ACL deny、3=绕过/trust、4=遗留黑名单、5=trust
-// （绕过 占 3 时）、6=DetectionOnly 切换、8=GeoIP 地域拦截（BuildCorazaDirectives
-// 内，不在预检）、900=异常分阈值；7 专用于预检 allow 规则（预检内 deny 并集沿用
-// id:2、黑名单并集沿用 id:4，保持 security events 归因口径；allow 模式事件本就
-// 回退归到首启用策略，id:7 不改变归因结果）。
+// 的 SecRule id。本地 id 空间的**权威来源是各发射函数**（encode*/Decode* 的
+// 段界常量 + emitBodyProcessorRules 等），本注释只列预检段与引擎段的固定 id
+// 归属，段界/新增 id 一律以代码为准，禁止按本清单复写判断：
+// 预检段固定 id：2=ACL deny、3=绕过/trust、4=遗留黑名单、5=trust（绕过占 3
+// 时）、6=DetectionOnly 切换、7=预检 allow 规则（本常量）、12=阶段 0 保留检测
+// 的 DetectionOnly、13=allow 命中全豁免（skipAfter）；
+// 引擎段另发：8=GeoIP（历史 id，现代引擎已不发）、9/10/11=body processor
+// 守卫（emitBodyProcessorRules）、900=异常分阈值；
+// 合成 id：2000001+ 为策略作用域排除（scope 段），800000+policyID 为阶段化
+// GeoIP 链（geoipPrecheckRuleBase）。7 专用于预检 allow 规则（预检内 deny 并集
+// 沿用 id:2、黑名单并集沿用 id:4，保持 security events 归因口径；allow 模式
+// 事件本就回退归到首启用策略，id:7 不改变归因结果）。
 const ipPrecheckAllowRuleID = 7
 
 // ipPrecheckAllowExemptRuleID 是 allow 白名单命中豁免规则（用户裁定）：
@@ -2575,7 +2601,9 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 			}
 		}
 		if len(match) == 0 {
-			Logf("warn", "跳过作用域排除条目 %q（策略 %q）：ips/引用列表合并后为空", entry.Target, p.Name)
+			if msg := fmt.Sprintf("跳过作用域排除条目 %q（策略 %q）：ips/引用列表合并后为空", entry.Target, p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		// 组合键与解析内容无关（名单条目变化不换名）——ips 字面 + 排序后
@@ -2597,7 +2625,9 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 		}
 		for _, id := range expandCRSScopedExclusionTargets(entry.Target, index, p) {
 			if seq >= crsScopedExclusionMaxDirectives {
-				Logf("warn", "策略 %q 的作用域排除展开行数达到上限 %d，其余排除不再发射（少排除=拦截更多，方向安全）", p.Name, crsScopedExclusionMaxDirectives)
+				if msg := fmt.Sprintf("策略 %q 的作用域排除展开行数达到上限 %d，其余排除不再发射（少排除=拦截更多，方向安全）", p.Name, crsScopedExclusionMaxDirectives); auditFailureShouldLog(msg) {
+					Logf("warn", "%s", msg)
+				}
 				return nil
 			}
 			seq++
@@ -2616,7 +2646,9 @@ func expandCRSScopedExclusionTargets(target string, index *CRSRuleIndex, p *mode
 	target = strings.TrimSpace(target)
 	if IsCRSRuleIDTarget(target) {
 		if !index.Has(target) {
-			Logf("warn", "跳过陈旧排除规则 ID %q（策略 %q）：不存在于本地 CRS 规则索引", target, p.Name)
+			if msg := fmt.Sprintf("跳过陈旧排除规则 ID %q（策略 %q）：不存在于本地 CRS 规则索引", target, p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			return nil
 		}
 		return []string{target}
@@ -2624,11 +2656,15 @@ func expandCRSScopedExclusionTargets(target string, index *CRSRuleIndex, p *mode
 	if IsCRSGroupCode(target) {
 		ids := index.RuleIDsByGroup(target)
 		if len(ids) == 0 {
-			Logf("warn", "跳过陈旧排除规则组 %q（策略 %q）：不存在于本地 CRS 规则索引", target, p.Name)
+			if msg := fmt.Sprintf("跳过陈旧排除规则组 %q（策略 %q）：不存在于本地 CRS 规则索引", target, p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 		}
 		return ids
 	}
-	Logf("warn", "跳过作用域排除条目 %q（策略 %q）：该 target 形态仅支持 scope=all", target, p.Name)
+	if msg := fmt.Sprintf("跳过作用域排除条目 %q（策略 %q）：该 target 形态仅支持 scope=all", target, p.Name); auditFailureShouldLog(msg) {
+		Logf("warn", "%s", msg)
+	}
 	return nil
 }
 
@@ -2740,7 +2776,9 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 	// 逐条 HasGroup（O(规则数)）与上万行 Include 会放大配置体积与生成耗时。
 	// 写入 API 已 400，此门只对绕过写侧的数据生效。
 	if len(groups) > CRSRuleGroupsMaxEntries {
-		Logf("warn", "策略 %q 的 crs_rule_groups 条目数 %d 超过上限 %d（疑似带外/旧快照写入），已截断渲染", p.Name, len(groups), CRSRuleGroupsMaxEntries)
+		if msg := fmt.Sprintf("策略 %q 的 crs_rule_groups 条目数 %d 超过上限 %d（疑似带外/旧快照写入），已截断渲染", p.Name, len(groups), CRSRuleGroupsMaxEntries); auditFailureShouldLog(msg) {
+			Logf("warn", "%s", msg)
+		}
 		groups = groups[:CRSRuleGroupsMaxEntries]
 	}
 	groupSet := make(map[string]struct{}, len(groups))
@@ -2777,7 +2815,9 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 		}
 		seenGroup[g] = struct{}{}
 		if !chainIndex().HasGroup(g) {
-			Logf("warn", "CRS 规则组 %q（策略 %q）不存在于本地规则索引，Include 可能零匹配", g, p.Name)
+			if msg := fmt.Sprintf("CRS 规则组 %q（策略 %q）不存在于本地规则索引，Include 可能零匹配", g, p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 		}
 		groupSet[g] = struct{}{}
 		sb.WriteString(fmt.Sprintf("Include /app/waf/crs/rules/REQUEST-9%[1]s-*.conf\n", g))
@@ -2798,14 +2838,18 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 	for _, id := range idTargets {
 		entry := index.Find(id)
 		if entry == nil {
-			Logf("warn", "跳过陈旧 CRS 规则组 ID %q（策略 %q）：不存在于本地规则索引", id, p.Name)
+			if msg := fmt.Sprintf("跳过陈旧 CRS 规则组 ID %q（策略 %q）：不存在于本地规则索引", id, p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		// 响应侧规则与响应检查开关联动：waf_check_response=off 时
 		// SecResponseBodyAccess Off，RESPONSE 父文件的规则永不消费响应体——
 		// 选择零效果。跳过+WARN（保持兼容不 400），UI/摘要侧另有可见性。
 		if !p.WAFCheckResponse && strings.HasPrefix(entry.File, "RESPONSE-") {
-			Logf("warn", "跳过响应侧 CRS 规则 ID %q（策略 %q）：waf_check_response=off 时响应规则零效果，请开启「检查响应体」或移除该选择", id, p.Name)
+			if msg := fmt.Sprintf("跳过响应侧 CRS 规则 ID %q（策略 %q）：waf_check_response=off 时响应规则零效果，请开启「检查响应体」或移除该选择", id, p.Name); auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 			continue
 		}
 		if group := crsFileGroupPattern.FindStringSubmatch(entry.File); group != nil {

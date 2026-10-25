@@ -158,3 +158,23 @@ func TestThreatRuleFamilyLabels_idFiveAndFourteenAligned(t *testing.T) {
 		t.Errorf("stageCategorizeAttack(5)=%q, want 信任名单", got)
 	}
 }
+
+// 固定 id 的族标签必须与事件列表 trigger_type 同词：id:11（请求体解析失败，
+// 客户端声明 JSON 却发非法体即可命中）曾在大屏「命中规则」榜显示裸 "11"，
+// 而事件列表显示「请求体异常」——同屏两面不一致，排障需自行对回规则文件。
+func TestThreatRuleFamilyLabels_bodyAnomalyAligned(t *testing.T) {
+	if got, want := describeThreatRuleNameWithNames("11", nil), "请求体异常（#11）"; got != want {
+		t.Fatalf("describeThreatRuleName(11)=%q, want %q", got, want)
+	}
+	if got, want := triggerTypeForRule("11"), "请求体异常"; got != want {
+		t.Fatalf("triggerTypeForRule(11)=%q, want %q（榜面与事件列表族标签必须一致）", got, want)
+	}
+	if got := attackFamilyClassOf("11", ""); got != attackFamilyBodyAnomaly {
+		t.Fatalf("attackFamilyClassOf(11)=%v, want 请求体异常族", got)
+	}
+	// 聚合入口（labeledThreatRuleCounts）同样不得回裸数字。
+	labeled := labeledThreatRuleCounts(map[string]int{"11": 2})
+	if _, ok := labeled["请求体异常（#11）"]; !ok {
+		t.Fatalf("labeledThreatRuleCounts=%v, want 含「请求体异常（#11）」", labeled)
+	}
+}

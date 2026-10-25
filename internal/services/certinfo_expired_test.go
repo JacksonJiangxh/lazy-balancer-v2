@@ -44,7 +44,7 @@ func expiredShapeCertAndKey(t *testing.T, domain string, notAfter time.Time) (st
 func TestGetRuleCertInfo_reportsExpiredACMECert(t *testing.T) {
 	_, database := newClusterTestService(t)
 
-	// Given:ACME 规则 + cert_jobs 携带已过期证书(SelectCertificate 因过期跳过)
+	// Given:ACME 规则 + cert_jobs 携带已过期证书(selectCertificate 因过期跳过)
 	certPEM, keyPEM := expiredShapeCertAndKey(t, "expired.test", time.Now().Add(-24*time.Hour))
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_expired','expired','expired.test','http',8080,1,1,'acme_dns')`); err != nil {
 		t.Fatal(err)
@@ -187,7 +187,7 @@ func TestGetRuleCertInfo_acme_without_candidates_is_missing_info(t *testing.T) {
 func TestGetRuleCertInfo_reportsNotYetValidACMECert(t *testing.T) {
 	_, database := newClusterTestService(t)
 
-	// Given：ACME 规则 + cert_jobs 携带未来时钟证书（SelectCertificate 因
+	// Given：ACME 规则 + cert_jobs 携带未来时钟证书（selectCertificate 因
 	// now<NotBefore 跳过）
 	certPEM, keyPEM := futureShapeCertAndKey(t, "future.test", time.Now().Add(24*time.Hour))
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_future','future','future.test','http',8080,1,1,'acme_dns')`); err != nil {

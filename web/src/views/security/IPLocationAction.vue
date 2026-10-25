@@ -464,6 +464,13 @@ const ipExactListIds = computed(() => {
   return hit
 })
 
+// 可移除的信任引用列表（本 IP 在其中恰有精确条目、且非系统名单）——键为给定
+// refs，而不是弹层挂载时的策略快照：取消信任的决策与写回都必须用最新 refs。
+const trustListsForRefs = (refIds: readonly number[]): Array<{ id: number; name: string }> =>
+  ipLists.value
+    .filter((l) => refIds.includes(l.id) && ipExactListIds.value.has(l.id))
+    .map((l) => ({ id: l.id, name: l.name }))
+
 const rowView = (policy: PolicyRow): RowView => {
   // 信任口径（内联 ∪ 引用）先行计算——阶段 0 行整行语义即信任，ACL 行也要渲染信任动作。
   // 信任成员判定与 ACL 侧同为 CIDR 感知（entryMatchesIp）——内联/引用
@@ -513,9 +520,7 @@ const rowView = (policy: PolicyRow): RowView => {
   // 条目来源 = ipListEntries 缓存（loadPolicies 拉取 acl+whitelist 全部 refs）；
   // 命中判定走共享 ipHitListIds。
   const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
-  view.removableTrustRefLists = ipLists.value
-    .filter((l) => trustRefIds.includes(l.id) && ipExactListIds.value.has(l.id))
-    .map((l) => ({ id: l.id, name: l.name }))
+  view.removableTrustRefLists = trustListsForRefs(trustRefIds)
   // ACL 引用命中（补）：黑/白名单状态行标注具体来源名单名
   const aclRefIds = parseRefIds(policy.ip_acl_list_refs)
   const aclHitNames = ipLists.value
@@ -659,41 +664,58 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   // 命中引用列表精确条目）与不可移除的残余 CIDR 信任一次算清。原实现仅在
   // 「无内联精确条目」时守卫；IP 同时由内联精确条目与引用 CIDR 信任时跳过
   // 守卫，移除后仍持续信任却弹「已取消信任 / 恢复拦截」的谎报。
-  // 安全结论不得读可能陈旧的显示缓存：弹层可长开（条目缓存 TTL 60s），期间
-  // 他人/另一标签页可能在受引用名单里增删覆盖该 IP 的条目——本次决策前按 TTL
-  // 强制补齐本策略信任侧引用的名单条目（仍在 TTL 内即零请求，过期才重拉，
-  // 不闪空态：本地副本只在补齐返回后整体替换）。补齐失败时条目缺失会让残余
-  // 信任判定漏报，与 listsError 同口径拒绝出结论（禁用全部处置动作 + 横幅重试）。
-  const trustRefIds = parseRefIds(row.policy.ip_whitelist_refs)
-  if (trustRefIds.length > 0) {
+  // 安全结论不得读陈旧快照：弹层可长开，期间他人/另一标签页可能新增覆盖该 IP
+  // 的引用列表或内联 CIDR——挂载时快照既漏判新来源、也不会去移除它们。故决策
+  // 前先取最新策略，一切判定（内联/refs/可移除列表/残余来源）都基于它。
+  let policy: PolicyRow | null = null
+  try {
+    policy = await fetchDetail(row.policy.id)
+  } catch {
+    policy = null
+  }
+  if (!policy) {
+    ElMessage.error('策略最新状态读取失败，无法给出可靠的取消信任结论，请重试')
+    unlockBusy(row.policy.id, 'untrust')
+    return
+  }
+  // 引用列表条目按 TTL 强制补齐（仍在 TTL 内即零请求，过期才重拉，不闪空态：
+  // 本地副本只在补齐返回后整体替换）。返回补齐失败的 id 清单（空 = 可出结论）；
+  // 条目缺失会让残余信任判定漏报，与 listsError 同口径拒绝出结论。
+  const refreshTrustEntries = async (refIds: readonly number[]): Promise<readonly number[]> => {
+    if (refIds.length === 0) return []
     entriesRefreshInFlight = true
-    const missingTrustIds = await ensureSharedEntriesMissing(trustRefIds, loadListEntries)
+    const missing = await ensureSharedEntriesMissing(refIds, loadListEntries)
       .finally(() => { entriesRefreshInFlight = false })
     ipListEntries.value = { ...sharedEntriesCache }
-    if (missingTrustIds.length > 0) {
-      listsError.value = true
-      ElMessage.error('信任名单的最新条目加载失败，无法给出可靠的取消信任结论，请重试')
-      unlockBusy(row.policy.id, 'untrust')
-      return
-    }
+    return missing
   }
-  const plan = planTrustRemoval({
+  const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
+  const missingTrustIds = await refreshTrustEntries(trustRefIds)
+  if (missingTrustIds.length > 0) {
+    listsError.value = true
+    ElMessage.error('信任名单的最新条目加载失败，无法给出可靠的取消信任结论，请重试')
+    unlockBusy(row.policy.id, 'untrust')
+    return
+  }
+  const removableTrustLists = trustListsForRefs(trustRefIds)
+  const buildPlan = (target: PolicyRow) => planTrustRemoval({
     ip,
-    inlineWhitelist: row.policy.ip_whitelist,
-    whitelistRefs: row.policy.ip_whitelist_refs,
+    inlineWhitelist: target.ip_whitelist,
+    whitelistRefs: target.ip_whitelist_refs,
     lists: ipLists.value,
-    removableListIds: row.removableTrustRefLists.map((m) => m.id),
+    removableListIds: trustListsForRefs(parseRefIds(target.ip_whitelist_refs)).map((m) => m.id),
     listEntries: (id) => ipListEntries.value[id] ?? [],
   })
+  const plan = buildPlan(policy)
   const residualTrustSources = plan.residualSources
-  const exactRefLists = row.removableTrustRefLists.filter((m) => plan.exactRefListIds.includes(m.id))
+  const exactRefLists = removableTrustLists.filter((m) => plan.exactRefListIds.includes(m.id))
   const residualNote = residualTrustSources.length > 0
     ? `；该 IP 仍由${residualTrustSources.join('、')}提供信任，需到策略/列表编辑中移除后才恢复拦截`
     : ''
   if (!plan.hasRemovable) {
-    if (parseIPList(row.policy.ip_whitelist).some((e) => entryMatchesIp(e, ip))) {
+    if (parseIPList(policy.ip_whitelist).some((e) => entryMatchesIp(e, ip))) {
       ElMessage.info('该 IP 由内联 CIDR 提供信任，请在策略编辑中移除对应条目')
-    } else if (parseRefIds(row.policy.ip_whitelist_refs).some((id) => ipHitListIds.value.has(id))) {
+    } else if (parseRefIds(policy.ip_whitelist_refs).some((id) => ipHitListIds.value.has(id))) {
       ElMessage.info('该 IP 由引用列表中的 CIDR 条目提供信任，请编辑对应列表移除条目')
     } else {
       ElMessage.warning('该 IP 的信任条目不可在本弹窗移除，请到「安全防护 → 安全策略」编辑该策略处理')
@@ -704,25 +726,34 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   try {
     try {
       await ElMessageBox.confirm(
-        `将把 ${trimmedIp.value} 从策略「${row.policy.name}」的信任名单可移除条目（内联精确条目与命中引用列表的精确条目）移除${residualNote}。是否继续？`,
+        `将把 ${trimmedIp.value} 从策略「${policy.name}」的信任名单可移除条目（内联精确条目与命中引用列表的精确条目）移除${residualNote}。是否继续？`,
         '取消信任',
         { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
       )
     } catch { return }
-    const detail = await fetchDetail(row.policy.id)
-    if (detail) {
-      const inline = parseIPList(detail.ip_whitelist).filter((v) => v !== trimmedIp.value)
-      if (inline.length !== parseIPList(detail.ip_whitelist).length) {
-        await request.put(`/security/policies/${row.policy.id}`, { ip_whitelist: JSON.stringify(inline) })
+    // 确认框可长开：写入前再取一次最新策略，避免用决策时的内联快照覆盖期间
+    // 他人新增的条目（lost update）。读失败时跳过内联 PUT（旧行为同款），
+    // 引用列表的精确条目移除照常进行。
+    const latest = await fetchDetail(policy.id).catch(() => null)
+    if (latest) {
+      const latestInline = parseIPList(latest.ip_whitelist)
+      const inline = latestInline.filter((v) => v !== trimmedIp.value)
+      if (inline.length !== latestInline.length) {
+        await request.put(`/security/policies/${policy.id}`, { ip_whitelist: JSON.stringify(inline) })
       }
     }
     for (const m of exactRefLists) {
       await request.post(`/security/ip-lists/${m.id}/remove-ip`, { value: trimmedIp.value })
     }
-    if (residualTrustSources.length > 0) {
-      ElMessage.warning(`已移除 ${trimmedIp.value} 的可移除信任条目；但该 IP 仍由${residualTrustSources.join('、')}提供信任，拦截尚未恢复`)
+    // 结论按写入后的最新策略复算：本轮写入期间并发的编辑也可能引入新的信任
+    // 来源，沿用决策时的快照会再次把「仍被信任」报成「已取消信任」。
+    const afterWrite = await fetchDetail(policy.id).catch(() => null)
+    const afterMissing = afterWrite ? await refreshTrustEntries(parseRefIds(afterWrite.ip_whitelist_refs)) : []
+    const residualAfterWrite = afterWrite && afterMissing.length === 0 ? buildPlan(afterWrite).residualSources : residualTrustSources
+    if (residualAfterWrite.length > 0) {
+      ElMessage.warning(`已移除 ${trimmedIp.value} 的可移除信任条目；但该 IP 仍由${residualAfterWrite.join('、')}提供信任，拦截尚未恢复`)
     } else {
-      mfaAwareSuccess(`已取消 ${trimmedIp.value} 对「${row.policy.name}」的信任`)
+      mfaAwareSuccess(`已取消 ${trimmedIp.value} 对「${policy.name}」的信任`)
     }
     invalidateSharedEntriesCache()
     await loadPolicies()

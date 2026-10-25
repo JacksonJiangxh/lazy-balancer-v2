@@ -64,8 +64,9 @@ func TestOpenAPIDocumentation_covers_registeredGinAPIRoutes(t *testing.T) {
 
 // /openapi.yaml 与 /docs 此前置于公开块（匿名 200），
 // 完整 API 目录（路径/载荷示例/错误码）可被未认证方枚举。本测试钉住新契约：
-// 规格匿名 401、携带已认证 token 200；/docs 仅 HTML 壳（本体内 Swagger 以
-// localStorage.token 注入 Authorization 头取规格）。
+// 规格匿名 401、携带已认证 token 200；/docs 仅 HTML 壳（匿名 200 text/html，
+// 本体内 Swagger 以 localStorage.token 注入 Authorization 头取规格，壳里不得
+// 内联/转发规格本体）。
 func TestOpenAPISpec_endpointsRequireAuthentication(t *testing.T) {
 	router := newAPIDocTestRouter(t)
 
@@ -74,6 +75,26 @@ func TestOpenAPISpec_endpointsRequireAuthentication(t *testing.T) {
 	router.ServeHTTP(anonymousResponse, anonymous)
 	if anonymousResponse.Code != http.StatusUnauthorized {
 		t.Fatalf("匿名取规格 status=%d, want 401", anonymousResponse.Code)
+	}
+
+	// /docs 公开但只是壳：匿名 200 text/html，响应体不得含规格本体。
+	docs := httptest.NewRequest(http.MethodGet, "/api/v1/docs", nil)
+	docsResponse := httptest.NewRecorder()
+	router.ServeHTTP(docsResponse, docs)
+	if docsResponse.Code != http.StatusOK {
+		t.Fatalf("匿名取 /docs status=%d, want 200（壳公开）", docsResponse.Code)
+	}
+	if contentType := docsResponse.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("/docs Content-Type=%q, want text/html", contentType)
+	}
+	docsBody := docsResponse.Body.String()
+	if !strings.Contains(docsBody, "/api/v1/openapi.yaml") {
+		t.Fatal("/docs 壳未引用已鉴权的规格端点（壳应让浏览器带令牌取规格）")
+	}
+	for _, leaked := range []string{"openapi: 3", `"paths":`} {
+		if strings.Contains(docsBody, leaked) {
+			t.Fatalf("/docs 匿名响应体内嵌了规格本体（%q）——完整 API 目录对匿名方泄露", leaked)
+		}
 	}
 
 	authed := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)

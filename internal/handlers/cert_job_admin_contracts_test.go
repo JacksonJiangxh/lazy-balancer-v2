@@ -44,6 +44,41 @@ func TestRetryCertJobNotFoundRecordsFailureAudit(t *testing.T) {
 	}
 }
 
+// 重试端点的失败归因与删除端点同档：只有 sql.ErrNoRows 才算「任务不存在」，
+// 其余读故障（DB 忙/连接中断/表不可读）必须记查询失败——把瞬时故障呈现为
+// 「任务不存在」会把排障方向带偏（同函数族 DeleteCertJob 已按此分档）。
+func TestRetryCertJobQueryFailureRecordsDistinctAudit(t *testing.T) {
+	// Given：cert_jobs 读取面不可用（非 ErrNoRows 的读故障）
+	h := newBackupTestHandlers(t)
+	router := gin.New()
+	router.POST("/jobs/:id/retry", h.RetryCertJob)
+	if _, err := db.DB.Exec(`ALTER TABLE cert_jobs RENAME TO cert_jobs_unreadable`); err != nil {
+		t.Fatalf("simulate read failure: %v", err)
+	}
+
+	// When
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil))
+
+	// Then：500 + 归因「查询失败」（不得复用「任务不存在」）
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var action, detail string
+	if err := db.AuditDB.QueryRow("SELECT action, detail FROM audit_log WHERE resource='证书任务' ORDER BY id DESC LIMIT 1").Scan(&action, &detail); err != nil {
+		t.Fatalf("read retry failure audit: %v", err)
+	}
+	if action != "重试失败" {
+		t.Fatalf("audit action=%q, want 重试失败", action)
+	}
+	if !strings.Contains(detail, "查询失败") {
+		t.Fatalf("audit detail=%q, want 查询失败（读故障不得归因为任务不存在）", detail)
+	}
+	if strings.Contains(detail, "任务不存在") {
+		t.Fatalf("audit detail=%q 把读故障归因为任务不存在", detail)
+	}
+}
+
 func TestDeleteCertJobGuardedRecordsFailureAudit(t *testing.T) {
 	// Given：规则仍启用 + 任务 issued（删除受 409 守卫）
 	h := newBackupTestHandlers(t)

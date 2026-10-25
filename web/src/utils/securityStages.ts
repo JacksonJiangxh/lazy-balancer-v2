@@ -4,6 +4,7 @@
 // 阶段 3 = WAF（自定义 + CRS）。规则可为阶段 1/3 配拦截页覆盖（0 = 跟随策略，
 // 即 v2.3.1 逐策略归因默认层）。
 import type { RuleFlowPathRule } from '@/types/rules'
+import { hasOwn } from './hasOwn.ts'
 
 interface SecurityStageIPListEntry { value: string; remark?: string }
 export interface SecurityStageIPList {
@@ -607,9 +608,15 @@ export const WAF_MODE_TEXT: Readonly<Record<string, string>> = {
   off: '关闭',
 }
 
-/** WAF 模式展示词（未登记 mode 回落原文；空值回落空串，由调用方决定占位符）。 */
+/**
+ * WAF 模式展示词（未登记 mode 回落原文；空值回落空串，由调用方决定占位符）。
+ *
+ * 查表键可能来自库值（带外改库/备份还原可产生 `constructor`/`toString` 形态），
+ * 裸下标会命中原型链上的函数——`??` 兜底被绕过、模板渲染出函数源码；故先经
+ * `hasOwn` 守卫（视图侧一律调用本函数，不得自行裸下标查表）。
+ */
 export const wafModeLabel = (mode: string | null | undefined): string =>
-  mode ? WAF_MODE_TEXT[mode] ?? mode : ''
+  mode ? (hasOwn(WAF_MODE_TEXT, mode) ? WAF_MODE_TEXT[mode] : mode) : ''
 
 const buildStage3Rows = (
   binding: SecurityStageBinding,
@@ -1246,7 +1253,7 @@ export const missingSharedEntryIds = (ids: Iterable<number>): number[] =>
  * 并发调用去重（in-flight 复用）；单名单失败不阻塞其他名单且不留失败缓存
  * （下次调用可重试）。loader 由调用方注入（axios 请求），本模块保持纯状态机。
  *
- *：代际守卫必须覆盖「复用方」——原实现只让发起者校验代际，写动作
+ * 代际守卫必须覆盖「复用方」——原实现只让发起者校验代际，写动作
  * invalidate 后紧随的 ensure 会命中原 in-flight，唤醒后发现代际已变、结果被丢弃
  * 且自身不补取，调用方返回时缓存仍为空（IP 处置弹框把该 IP 显示为「未在名单」）。
  * 现口径：

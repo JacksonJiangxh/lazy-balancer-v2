@@ -1560,6 +1560,8 @@ func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) 
 		{name: "max concurrent too high", mutateCA: func(row map[string]any) { row["max_concurrent"] = 101 }, wantErrText: "max_concurrent"},
 		{name: "max concurrent malformed", mutateCA: func(row map[string]any) { row["max_concurrent"] = "100.5" }, wantErrText: "max_concurrent"},
 		{name: "min interval too high", mutateCA: func(row map[string]any) { row["min_interval_ms"] = 60001 }, wantErrText: "min_interval_ms"},
+		{name: "min interval negative", mutateCA: func(row map[string]any) { row["min_interval_ms"] = -1 }, wantErrText: "min_interval_ms"},
+		{name: "max concurrent negative", mutateCA: func(row map[string]any) { row["max_concurrent"] = -1 }, wantErrText: "max_concurrent"},
 		{name: "unknown DNS provider", mutateDNS: func(row map[string]any) { row["dns_provider"] = "evil" }, wantErrText: "DNS 提供商"},
 		{name: "DNS provider credentials missing", mutateDNS: func(row map[string]any) { row["dns_credentials"] = `{}` }, wantErrText: "凭证"},
 	}
@@ -1589,6 +1591,39 @@ func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) 
 				t.Fatalf("err=%v, want contains %q", err, tt.wantErrText)
 			}
 		})
+	}
+}
+
+// 导入的「未设置」口径必须与写侧（UpdateCAProvider）同源：max_concurrent=0 /
+// min_interval_ms=0 在写侧归一为默认值，导入若原样落库，列表/集群快照会显示 0
+// 而队列闸门按默认值执行——同一行两种口径。
+func TestImportConfigBackup_normalizesCAProviderBounds(t *testing.T) {
+	// Given：备份携带 0 值边界（等价「未设置」）
+	h := newBackupTestHandlers(t)
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
+		"ca_providers": {{"id": 77, "name": "zero-bounds", "provider": "letsencrypt", "credentials": "",
+			"max_concurrent": 0, "min_interval_ms": 0, "enabled": 1}},
+	}, EmptyConfigIfNil: true})
+
+	router := gin.New()
+	router.POST("/config/import", h.ImportConfigBackup)
+	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, request)
+
+	// Then：落库值即默认值（与 DDL 默认/读侧归一同一数字）
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var maxConcurrent, minInterval int
+	if err := db.DB.QueryRow("SELECT max_concurrent, min_interval_ms FROM ca_providers WHERE id=77").Scan(&maxConcurrent, &minInterval); err != nil {
+		t.Fatalf("read imported provider: %v", err)
+	}
+	if maxConcurrent != 1 || minInterval != 2000 {
+		t.Fatalf("imported bounds=(%d,%d), want (1,2000)——0 值必须在导入落库前归一", maxConcurrent, minInterval)
 	}
 }
 

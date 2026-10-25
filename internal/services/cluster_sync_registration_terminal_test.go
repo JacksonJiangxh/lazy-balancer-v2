@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -107,5 +109,123 @@ func TestSyncService_bumpRegistrationConfirmFailure_readFailureKeepsRegistration
 		if strings.Contains(query, "registration_secret=''") || strings.Contains(query, "cluster_token=''") {
 			t.Fatalf("读失败时不得执行破坏性清空，实际执行: %s", query)
 		}
+	}
+}
+
+// 终止轨道的清空必须是一条语句且失败留痕：多语句分步清空会在中途 DB 写失败时
+// 留下半清空状态（secret 已清、token 未清），后续 401 以通用文案覆盖终止提示
+// 并把循环置 Halted，排障线索与明文令牌生命周期同时失控。
+type registrationTerminalClearFailConn struct {
+	mu    sync.Mutex
+	execs []string
+}
+
+func (c *registrationTerminalClearFailConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("未实现 Prepare")
+}
+func (c *registrationTerminalClearFailConn) Close() error              { return nil }
+func (c *registrationTerminalClearFailConn) Begin() (driver.Tx, error) { return fakeIterErrTx{}, nil }
+
+func (c *registrationTerminalClearFailConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "registration_confirm_failures") {
+		return &singleIntRows{columns: []string{"registration_confirm_failures"}, value: 5}, nil
+	}
+	return &fakeEmptyRows{columns: []string{"a"}}, nil
+}
+
+func (c *registrationTerminalClearFailConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.mu.Lock()
+	c.execs = append(c.execs, query)
+	c.mu.Unlock()
+	if strings.Contains(query, "registration_secret=''") {
+		return nil, errors.New("注入的清空失败")
+	}
+	return driver.RowsAffected(1), nil
+}
+
+func (c *registrationTerminalClearFailConn) executedWrites() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.execs...)
+}
+
+type registrationTerminalClearFailConnector struct {
+	conn *registrationTerminalClearFailConn
+}
+
+func (c *registrationTerminalClearFailConnector) Connect(context.Context) (driver.Conn, error) {
+	return c.conn, nil
+}
+func (c *registrationTerminalClearFailConnector) Driver() driver.Driver { return fakeIterErrDriver{} }
+
+type singleIntRows struct {
+	columns []string
+	value   int64
+	done    bool
+}
+
+func (r *singleIntRows) Columns() []string { return r.columns }
+func (r *singleIntRows) Close() error      { return nil }
+func (r *singleIntRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = r.value
+	return nil
+}
+
+func TestSyncService_bumpRegistrationConfirmFailure_terminalClearIsSingleStatementAndWarns(t *testing.T) {
+	conn := &registrationTerminalClearFailConn{}
+	fake := sql.OpenDB(&registrationTerminalClearFailConnector{conn: conn})
+	t.Cleanup(func() { _ = fake.Close() })
+	service := &SyncService{db: fake}
+
+	var buffer strings.Builder
+	oldWriter := log.Writer()
+	log.SetOutput(&buffer)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	service.bumpRegistrationConfirmFailure(context.Background(), "approved-token", "confirm 端点返回 401")
+
+	var clears []string
+	for _, query := range conn.executedWrites() {
+		if strings.Contains(query, "registration_secret=''") {
+			clears = append(clears, query)
+		}
+	}
+	if len(clears) != 1 {
+		t.Fatalf("终止清空语句数=%d, want 1（分步清空会留下半清空状态）: %v", len(clears), conn.executedWrites())
+	}
+	for _, fragment := range []string{"registration_secret=''", "registration_id=NULL", "registration_confirm_failures=0", "cluster_token=''"} {
+		if !strings.Contains(clears[0], fragment) {
+			t.Fatalf("终止清空语句缺 %q，无法一次收敛: %s", fragment, clears[0])
+		}
+	}
+	if !strings.Contains(buffer.String(), "注入的清空失败") {
+		t.Fatalf("清空失败必须留痕（否则排障只剩通用 401）: %q", buffer.String())
+	}
+}
+
+// 复位计数失败同样必须留痕：静默失败会在「secret 清空也失败」的组合下让陈旧
+// 计数继续推进终止轨道而无可解释信号。
+func TestSyncService_resetRegistrationConfirmFailure_warnsOnWriteFailure(t *testing.T) {
+	var buffer strings.Builder
+	oldWriter := log.Writer()
+	log.SetOutput(&buffer)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	// 该假连接对任何 UPDATE 返回成功；用已关闭连接制造真实驱动写失败。
+	closed, err := sql.Open("sqlite", t.TempDir()+"/closed.db")
+	if err != nil {
+		t.Fatalf("open closed database: %v", err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	(&SyncService{db: closed}).resetRegistrationConfirmFailure(context.Background())
+
+	if !strings.Contains(buffer.String(), "复位注册确认失败计数失败") {
+		t.Fatalf("复位失败必须留痕: %q", buffer.String())
 	}
 }

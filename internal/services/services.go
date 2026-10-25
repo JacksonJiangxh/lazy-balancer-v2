@@ -888,8 +888,9 @@ func (m *MetricsService) cleanupHistory() {
 	}
 }
 
-// errMetricsDBUnavailable 指标库未初始化。生产启动链（db.Initialize 失败即
-// 退出）不可达；守卫防测试/嵌入形态下 goroutine 直接 nil deref 崩溃。
+// errMetricsDBUnavailable 指标库未初始化或已关闭（关停期 db.Close() 置 nil）。
+// 生产启动链（db.Initialize 失败即退出）不可达；守卫防测试/嵌入形态下
+// goroutine 直接 nil deref 崩溃，也是关停尾部在途轮的唯一可见出口。
 var errMetricsDBUnavailable = errors.New("metrics database not initialized")
 
 // storeMetrics 将全局指标写入独立 metrics 库；错误返回给调用方

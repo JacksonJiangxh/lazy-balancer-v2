@@ -5,7 +5,7 @@ import { createSessionSingleFlight } from '@/utils/sessionSingleFlight'
 import type { APIResponse } from '@/types'
 
 /** CRS 规则索引条目（GET /security/crs/rule-index）——rules 由后端按 id 升序返回 */
-export interface CrsRuleIndexEntry {
+interface CrsRuleIndexEntry {
   readonly id: string
   readonly msg: string
   readonly file: string
@@ -118,7 +118,7 @@ export interface CrsRuleOptionView {
  * 失败语义：HTTP 错误已由全局拦截器 toast，这里退化为空列表（loaded 保持 false，
  * 供消费方区分「索引未就绪」与「规则确实不在索引中」）。
  *
- *：状态提升为模块级单例——索引纯只读、仅 CRS 库更新时变化，原先每个消费方
+ * 状态提升为模块级单例——索引纯只读、仅 CRS 库更新时变化，原先每个消费方
  * （策略向导/事件快捷排除/规则集页）各自挂载都全量拉取同一份 ~832 条索引
  * （≈100KB+ JSON）。ref 与 seq 计数器提升为模块顶层：会话序列守卫语义不变
  * （在途失配丢弃、失败不落 loadedSeq 允许同会话重试），并发去重改为跨实例生效

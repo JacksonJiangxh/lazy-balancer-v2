@@ -1,0 +1,211 @@
+// 视图层边界态回归钉：一次性凭据关闭守卫、向导门控与预览完整性、文件读取
+// 失败路径、空态与切窗三态、写侧值域控件、键盘/读屏残余、失败态恢复入口。
+//
+// 运行：cd web && npm test
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+
+import { createOneTimeSecretCloseGuard } from '../src/utils/oneTimeSecretGuard.ts'
+import { code, section } from './_helpers.ts'
+
+// ── 一次性凭据关闭守卫（单源） ─────────────────────────────────
+// 直接驱动守卫：确认框替身记录调用与文案，done 记录是否真正关闭弹框。
+const recordingConfirmer = (outcome: 'confirm' | 'cancel') => {
+  const calls: Array<{ message: string; title: string; options: Record<string, unknown> }> = []
+  const confirmer = (message: string, title: string, options: Record<string, unknown>): Promise<unknown> => {
+    calls.push({ message, title, options })
+    return outcome === 'confirm' ? Promise.resolve('confirm') : Promise.reject(new Error('cancel'))
+  }
+  return { calls, confirmer }
+}
+
+test('一次性凭据守卫：确认后才关闭，取消则弹框保持打开', () => {
+  {
+    const { calls, confirmer } = recordingConfirmer('confirm')
+    let done = 0
+    const close = createOneTimeSecretCloseGuard({ message: '仅此一次', title: '保存' }, confirmer)
+    close(() => { done += 1 })
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0].options, { type: 'warning', confirmButtonText: '我已保存', cancelButtonText: '继续查看' })
+  }
+  {
+    const { calls, confirmer } = recordingConfirmer('cancel')
+    let done = 0
+    const close = createOneTimeSecretCloseGuard({ message: '仅此一次', title: '保存' }, confirmer)
+    close(() => { done += 1 })
+    assert.equal(calls.length, 1)
+    assert.equal(done, 0, '取消关闭确认时不得关闭弹框（秘密仍在屏上）')
+  }
+})
+
+test('一次性凭据守卫：blocked 静默拒绝、skip 直接关闭（均不弹确认）', () => {
+  {
+    const { calls, confirmer } = recordingConfirmer('confirm')
+    let done = 0
+    const close = createOneTimeSecretCloseGuard({ message: 'm', title: 't', blocked: () => true }, confirmer)
+    close(() => { done += 1 })
+    assert.equal(calls.length, 0, '提交在途时不得弹确认框')
+    assert.equal(done, 0)
+  }
+  {
+    const { calls, confirmer } = recordingConfirmer('confirm')
+    let done = 0
+    const close = createOneTimeSecretCloseGuard({ message: 'm', title: 't', skip: () => true }, confirmer)
+    close(() => { done += 1 })
+    assert.equal(calls.length, 0, '无秘密可丢时不得弹确认框')
+    assert.equal(done, 1)
+  }
+})
+
+test('三处一次性凭据弹框都经同一守卫（注册令牌/密钥明文/恢复码）', () => {
+  const cluster = code('src/views/settings/ClusterSettings.vue')
+  assert.match(cluster, /:before-close="closeTokenDialog"/, '注册令牌 ESC/X 必须走关闭守卫')
+  assert.match(cluster, /@closed="registerToken = null"/, '关闭后清空内存中的令牌')
+  assert.match(cluster, /const closeTokenDialog = createOneTimeSecretCloseGuard\(\{/)
+  assert.match(cluster, /注册令牌仅此一次显示/)
+
+  const keys = code('src/views/Keys.vue')
+  assert.match(keys, /const closeCreatedKey = createOneTimeSecretCloseGuard\(\{/)
+
+  const wizard = code('src/components/MfaBindingWizard.vue')
+  assert.match(wizard, /const beforeClose = createOneTimeSecretCloseGuard\(\{/)
+})
+
+// ── 无障碍链接：按键自动重复 ───────────────────────────────────
+test('AccessibleLink 过滤 event.repeat（长按不得按系统重复率反复激活）', () => {
+  const wrapper = code('src/components/common/AccessibleLink.vue')
+  const activate = section(wrapper, 'const activate = (event: KeyboardEvent): void => {', '\n}')
+  assert.match(activate, /if \(event\.repeat\) return/, '首行必须过滤自动重复')
+})
+
+test('规则名入口复用 AccessibleLink（不再手写 <a role=button>）', () => {
+  const rules = code('src/views/Rules.vue')
+  assert.match(rules, /<AccessibleLink class="rule-name-link"[^>]*@click="viewConfig\(row\)">/)
+  assert.doesNotMatch(rules, /<a class="rule-name-link"/, '手写可聚焦 <a> 已退役')
+})
+
+// ── 向导 TLS 门控 / 预览完整性 / 文件读取 ─────────────────────
+test('证书详情失败只拦手动 TLS：改为 ACME 后可进下一步与保存', () => {
+  const rules = code('src/views/Rules.vue')
+  const nextTls = section(rules, "if (currentStep.value === WIZARD_STEP.TLS) {", 'if (wizardForm.tls_source === \'acme_dns\' && !wizardForm.acme_config_id) {')
+  assert.match(nextTls, /if \(tlsDetailError\.value && wizardForm\.tls_source === 'manual'\)/, '步进门必须按证书来源收窄')
+  assert.match(
+    rules,
+    /:disabled="tlsDetailError && wizardForm\.tls_source === 'manual'"/,
+    '保存按钮同样按来源收窄（否则 ACME 路径被钉死）',
+  )
+  assert.match(rules, /v-if="tlsDetailError && wizardForm\.tls_source === 'manual'" class="info-note-bar"/, '横幅只作用于手动 TLS')
+})
+
+test('配置预览补齐「访问日志」与 HTTP 连接重试', () => {
+  const rules = code('src/views/Rules.vue')
+  assert.match(rules, /<el-descriptions title="配置预览"/)
+  const body = section(rules, '<el-descriptions title="配置预览"', '<el-descriptions-item label="上游服务器"')
+  assert.match(body, /<el-descriptions-item label="连接重试" v-if="wizardForm\.protocol === 'http' \|\| wizardForm\.protocol === 'tcp'">/, 'HTTP 也必须展示重试窗口')
+  assert.match(body, /默认 5s 窗口/, 'HTTP 未设置时必须点明默认窗口口径')
+  assert.match(body, /禁用重试（NTLM 模式）/)
+  assert.match(body, /<el-descriptions-item label="访问日志" v-if="wizardForm\.protocol === 'http'">/, '访问日志是高级步可编辑项，预览必须覆盖')
+})
+
+test('证书/私钥从文件读取：onerror 反馈 + 大小上限 + 不放开任意文件', () => {
+  const rules = code('src/views/Rules.vue')
+  assert.match(rules, /const CERT_FILE_MAX_BYTES = 1024 \* 1024/, '证书文件必须有 1MiB 上限')
+  const paste = section(rules, 'const pasteFromFile = ', '\n}\n')
+  assert.match(paste, /if \(file\.size > CERT_FILE_MAX_BYTES\)/)
+  assert.match(paste, /reader\.onerror = \(\) => \{/)
+  assert.match(paste, /input\.accept = '\.pem,\.crt,\.key,\.txt'/, '不得带裸 `,*`（会选中二进制）')
+  assert.doesNotMatch(paste, /catch \{/, '同步 catch 是死代码，已删除')
+  assert.doesNotMatch(rules, /ElMessage\.error\('读取文件失败'\)/, '恒不可达的旧 catch 文案不得残留')
+})
+
+// ── API 密钥缺 key ───────────────────────────────────────────
+test('创建密钥响应缺 key：先报错而非先报成功，且不关创建框', () => {
+  const keys = code('src/views/Keys.vue')
+  const errorAt = keys.indexOf("ElMessage.error('响应异常：密钥未返回")
+  const successAt = keys.indexOf("mfaAwareSuccess('密钥创建成功')")
+  const closeAt = keys.indexOf('createDialogVisible.value = false', successAt)
+  assert.ok(errorAt > 0, '缺 key 必须显性报错')
+  assert.ok(successAt > errorAt, '成功提示必须在 key 校验之后')
+  assert.ok(closeAt > successAt, '只有拿到明文才关创建框')
+})
+
+// ── 大屏空态与切窗三态 ───────────────────────────────────────
+test('大屏空态只用当前窗口的 stats 判定（旧帧不得宣称「无安全事件」）', () => {
+  const screen = code('src/views/security/ThreatScreen.vue')
+  const computed = section(screen, 'const showEmptyState = computed(() =>', '\n\n')
+  assert.match(computed, /stats\.value\.hours === windowHours\.value/, '必须校验帧所属窗口')
+  assert.match(computed, /!statsError\.value/)
+})
+
+// ── 自定义规则名称/描述值域 ──────────────────────────────────
+test('自定义规则名称/描述 maxlength 与后端 rune 上限同源', () => {
+  const rules = code('src/views/security/SecurityRules.vue')
+  const form = section(rules, '<el-form-item label="名称" required>', '<el-form-item label="条件">')
+  assert.match(form, /v-model="ruleForm\.name"[^>]*maxlength="100"[^>]*show-word-limit/)
+  assert.match(form, /v-model="ruleForm\.description"[^>]*maxlength="500"[^>]*show-word-limit/)
+})
+
+// ── 取消信任：决策与结论都取最新策略 ─────────────────────────
+test('取消信任先取最新策略再出计划，写入后再复算残余', () => {
+  const page = code('src/views/security/IPLocationAction.vue')
+  const fn = section(page, 'const cancelTrustAll = async (row: RowView): Promise<void> => {', 'const aclRefsAllSystem')
+  const fetchAt = fn.indexOf('policy = await fetchDetail(row.policy.id)')
+  const planAt = fn.indexOf('planTrustRemoval({')
+  assert.ok(fetchAt > 0 && planAt > fetchAt, '计划必须基于最新策略（不得读弹层挂载快照）')
+  assert.doesNotMatch(fn, /inlineWhitelist: row\.policy\.ip_whitelist/, '计划不得再用 row.policy 快照')
+  assert.doesNotMatch(fn, /removableListIds: row\.removableTrustRefLists/, '可移除列表必须按最新 refs 计算')
+  assert.match(fn, /const latest = await fetchDetail\(policy\.id\)/, '写入前必须再取最新策略（避免覆盖并发新增条目）')
+  assert.match(fn, /const afterWrite = await fetchDetail\(policy\.id\)/, '写入后必须复算残余信任')
+  assert.match(fn, /residualAfterWrite/, '结论文案用写入后的残余来源')
+})
+
+// ── 服务控制卡的选中态 ───────────────────────────────────────
+test('服务控制四选一卡片暴露 radio 语义与选中态', () => {
+  const cluster = code('src/views/settings/ClusterSettings.vue')
+  assert.match(cluster, /class="service-control-grid" role="radiogroup" aria-label="服务控制操作"/)
+  assert.match(cluster, /role="radio"[\s\S]{0,120}:aria-checked="serviceControlAction === item\.value"/)
+})
+
+// ── 无障碍族级残余 ──────────────────────────────────────────
+test('TCP 锁图标有名称、规则开关有名称', () => {
+  const rules = code('src/views/Rules.vue')
+  assert.match(rules, /acl-lock-icon--tcp" tabindex="0" role="img" aria-label="TCP 规则不支持安全策略"/)
+  assert.match(rules, /:aria-label="`\$\{row\.name\} 的启用状态`"/)
+})
+
+test('CRS 源码折叠暴露展开态与焦点环', () => {
+  const dialog = code('src/components/events/TriggerDetailDialog.vue')
+  assert.match(dialog, /class="crs-snippet-toggle" role="button" tabindex="0" :aria-expanded="crsSnippetExpanded"/)
+  assert.match(dialog, /\.crs-snippet-toggle:focus-visible \{ outline: 2px solid var\(--el-color-primary\)/)
+})
+
+test('关联规则 drill-down 与触发明细 tooltip 键盘可达', () => {
+  const policies = code('src/views/security/SecurityPolicies.vue')
+  assert.match(policies, /:trigger="\['hover', 'focus'\]"/)
+  assert.match(policies, /<button v-for="rule in policyBoundRules\(row\.id\)"[^>]*class="policy-rule-row"/, 'popper 内容必须是具名按钮')
+  assert.match(policies, /class="policy-rule-count" tabindex="0" role="button" :aria-label="`关联规则/)
+  assert.match(policies, /\.policy-rule-row:focus-visible/)
+
+  const events = code('src/views/security/SecurityEvents.vue')
+  assert.match(events, /:content="row\.rule_msg" placement="top" :show-after="200" :trigger="\['hover', 'focus'\]"/)
+  assert.match(events, /class="cell-tip" tabindex="0" :aria-label="row\.rule_msg"/)
+  assert.match(events, /\.cell-tip:focus-visible/)
+})
+
+// ── 安全总览：失败态可重试 + 卡片不再伪装成功 ────────────────
+test('安全总览六路数据失败后提供「立即重试」，且并发门防重复点击', () => {
+  const page = code('src/views/security/SecurityOverview.vue')
+  assert.match(page, /const reloadAll = async \(\): Promise<void> => \{/)
+  assert.match(page, /if \(reloading\.value\) return/, '重复点击不得叠发六组请求')
+  assert.equal([...page.matchAll(/@click="reloadAll">立即重试<\/el-button>/g)].length, 3, '总览/最近拦截/限流三处失败态都要有重试入口')
+  assert.match(page, /onMounted\(\(\) => \{ void reloadAll\(\) \}\)/)
+})
+
+test('安全总览威胁/爬虫卡失败时切危险底色并显示「—」', () => {
+  const page = code('src/views/security/SecurityOverview.vue')
+  assert.match(page, /:class="threatError \? 'stat-box--danger' : 'stat-box--success'"/)
+  assert.match(page, /:class="crawlerError \? 'stat-box--danger' : 'stat-box--success'"/)
+  assert.match(page, /\{\{ threatError \? '—' : \(threatLatestVersion \|\| '未更新'\) \}\}/)
+  assert.match(page, /\{\{ crawlerError \? '—' : \(crawlerLatestVersion \|\| '未更新'\) \}\}/)
+})

@@ -34,6 +34,9 @@ import (
 //     调用点）与 config_import_v1.go ImportV1Config 的
 //     动作变量取值仅有导入/还原/导入失败/还原失败/部分失败；handlers/autobackup.go
 //     RunAutoBackupOnce 的动作变量取值仅有 自动备份/手动备份；
+//   - handlers/autobackup.go failAutoBackupAccess 是还原/下载/删除进入高危
+//     操作核心之前的行面/文件面失败收口（动作取 verb+"失败"，取值仅
+//     还原失败/下载失败/删除失败，均 ≤4 词；对象固定「配置备份」）；
 //   - services/certificates.go renewExpiringCertificates 的动作变量取值仅有
 //     续签排队/重试排队；
 //   - handlers/handlers.go finishTxApply 的动作/对象取自 txApplyFinish 的字面量
@@ -63,7 +66,7 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	// 传入（任务监控/安全防护/配置备份等，均 ≤5 词），动作固定为字面量
 	// 「触发」/「触发失败」。TriggerTaskAsync 仅转发上下文，不再直写审计。
 	"services/task_trigger.go": {2: {"RecordTaskTriggerResult"}},
-	"handlers/autobackup.go":   {1: {"RunAutoBackupOnce"}},
+	"handlers/autobackup.go":   {1: {"RunAutoBackupOnce", "failAutoBackupAccess"}},
 	"handlers/handlers.go":     {1: {"finishTxApply", "writeApplyFailureBanner"}, 2: {"finishTxApply", "writeApplyFailureBanner"}},
 	// tryIPListHotPathApply 的动作/对象透传 txApplyFinish 字段（热路径收尾镜像
 	// finishTxApply 家族语义；字面量词条在各名单写路径调用点核清，

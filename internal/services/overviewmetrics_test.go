@@ -435,3 +435,38 @@ func TestParsePromLabelPairs_prometheusEscapes(t *testing.T) {
 		})
 	}
 }
+
+// /load 成功即失效缓存：重载重建 registry（限流计数归零），缓存不感知会让
+// 安全总览在 ≤5s 内继续显示重载前的累计值。
+func TestInvalidateOverviewMetricsCache_forcesRefetch(t *testing.T) {
+	resetOverviewMetricsCacheForTest()
+	oldTTL := overviewMetricsCacheTTL
+	overviewMetricsCacheTTL = time.Minute
+	t.Cleanup(func() {
+		overviewMetricsCacheTTL = oldTTL
+		resetOverviewMetricsCacheForTest()
+	})
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(rateLimit429MetricsFixture))
+	}))
+	t.Cleanup(server.Close)
+
+	for range 2 {
+		if _, err := ScrapeRateLimitBlocks(server.URL); err != nil {
+			t.Fatalf("scrape: %v", err)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("TTL 内抓取次数=%d, want 1", got)
+	}
+
+	InvalidateOverviewMetricsCache()
+	if _, err := ScrapeRateLimitBlocks(server.URL); err != nil {
+		t.Fatalf("scrape after invalidate: %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("失效后抓取次数=%d, want 2（/load 后必须重新抓取）", got)
+	}
+}

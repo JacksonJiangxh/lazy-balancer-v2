@@ -408,7 +408,14 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	err := db.DB.QueryRow("SELECT rule_id, domain, status, updated_at, created_at, COALESCE(ca_provider_id,0), COALESCE(renewal_attempts,0), ca_available_after FROM cert_jobs WHERE id=?", id).Scan(&ruleID, &domain, &status, &updatedAt, &createdAt, &caProviderID, &renewalAttempts, &caAvailableAfter)
 	if dbQueryNotFound(c, err, "任务不存在", "RetryCertJob query job") {
 		if err != nil {
-			auditFailure("job_not_found")
+			// 与 DeleteCertJob 同档：ErrNoRows=任务不存在，其余读故障
+			// （SQLITE_BUSY/连接中断/表不可读）归因查询失败——dbQueryNotFound
+			// 对两者都返回 true，不区分就会把瞬时 DB 故障记成「任务不存在」。
+			result := "query_failed"
+			if errors.Is(err, sql.ErrNoRows) {
+				result = "job_not_found"
+			}
+			auditFailure(result)
 		}
 		return
 	}
@@ -457,7 +464,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 			if errors.Is(err, services.ErrCertificateDeploymentRetryBlocked) {
 				message = "手动重试未触发：规则证书操作被屏障阻塞，等待自动部署"
 			}
-			if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, message, id); updateErr != nil {
+			if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN (`+services.DeploymentLifecycleJobStatusSQL+`)`, message, id); updateErr != nil {
 				services.Logf("error", "Manual deployment retry message update failed for job %d: %v", id, updateErr)
 			}
 		}
@@ -604,7 +611,7 @@ func markDownloadedCertJobDeploymentPending(id int, ruleID, domain string) (bool
 	reversedDomain := reversedCertJobDomain(domain)
 	result, err := db.DB.Exec(`UPDATE cert_jobs
 		SET deployment_available_after=datetime('now'), message='等待重新部署', updated_at=datetime('now')
-		WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')
+		WHERE id=? AND status IN (`+services.DeploymentLifecycleJobStatusSQL+`)
 		  AND `+services.CertJobMaterialPredicateSQL("")+`
 		  AND EXISTS (
 			SELECT 1 FROM lb_rules
@@ -633,7 +640,7 @@ func registerDownloadedCertJobDeploymentRetry(id int, ruleID string) error {
 		// 与 409/500 响应矛盾（报文说失败、DB 说已重排）。窗口推进保留
 		// （启动恢复/周期补扫会接手，可用性收益不变），文案改为如实描述
 		// 自动接管；响应侧同步点明「已登记自动部署」。
-		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, "部署重试未触发，等待自动部署", id); updateErr != nil {
+		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN (`+services.DeploymentLifecycleJobStatusSQL+`)`, "部署重试未触发，等待自动部署", id); updateErr != nil {
 			return errors.Join(err, updateErr)
 		}
 		return err

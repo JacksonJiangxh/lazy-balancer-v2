@@ -250,11 +250,13 @@
           subtitle="按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件为 AND 关系" tone="danger" />
       </template>
       <el-form :model="ruleForm" label-width="80px" label-position="right" :disabled="isReadOnly">
+        <!-- 值与后端写侧门同源（internal/handlers/security.go：名称 ≤100 rune、
+             描述 ≤500 rune）——超长只能等 400 的旧形态没有字段级定位 -->
         <el-form-item label="名称" required>
-          <el-input v-model="ruleForm.name" placeholder="规则名称" />
+          <el-input v-model="ruleForm.name" placeholder="规则名称" maxlength="100" show-word-limit />
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="ruleForm.description" placeholder="规则描述" />
+          <el-input v-model="ruleForm.description" placeholder="规则描述" maxlength="500" show-word-limit />
         </el-form-item>
         <el-form-item label="条件">
           <div style="width: 100%">

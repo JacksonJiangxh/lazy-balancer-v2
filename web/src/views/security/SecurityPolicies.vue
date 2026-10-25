@@ -54,13 +54,16 @@
         </el-table-column>
         <el-table-column label="关联规则" width="100" align="center">
           <template #default="{ row }">
-            <el-tooltip v-if="policyBoundRules(row.id).length > 0" placement="top" popper-class="policy-rules-popper" :popper-options="popperViewportSafe">
+            <!-- 关联规则 drill-down 必须键盘可达：hover-only tooltip 内的 div 既
+                 开不了也点不到。reference 可聚焦 + focus 触发；内容行用具名 button
+                 （Tab 进 popper 后可回车跳到该规则）。 -->
+            <el-tooltip v-if="policyBoundRules(row.id).length > 0" placement="top" popper-class="policy-rules-popper" :popper-options="popperViewportSafe" :trigger="['hover', 'focus']">
               <template #content>
-                <div v-for="rule in policyBoundRules(row.id)" :key="rule.caddy_id" class="policy-rule-row" @click="openRuleInNewTab(rule.caddy_id)">
+                <button v-for="rule in policyBoundRules(row.id)" :key="rule.caddy_id" type="button" class="policy-rule-row" @click="openRuleInNewTab(rule.caddy_id)">
                   {{ rule.name }} ({{ rule.caddy_id }})
-                </div>
+                </button>
               </template>
-              <span>{{ row.rule_count }}</span>
+              <span class="policy-rule-count" tabindex="0" role="button" :aria-label="`关联规则 ${row.rule_count} 条，查看并跳转列表`">{{ row.rule_count }}</span>
             </el-tooltip>
             <template v-else>{{ row.rule_count }}</template>
           </template>
@@ -965,7 +968,7 @@ import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import AccessibleLink from '@/components/common/AccessibleLink.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, WAF_MODE_TEXT, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasOtherStage2Binding, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasOtherStage2Binding, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, wafModeLabel, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy, CrsRuleFileOption } from '@/utils/securityStages'
 import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { updaterName } from '@/utils/updaterName'
@@ -1157,7 +1160,7 @@ const isStage0ChainEntry = (entry: ChainEntry): boolean => {
   const policy = policies.value.find((p) => p.id === entry.policyId)
   return policy ? policyTypeOf(policy) === 'stage0' : false
 }
-// WAF 模式展示词单源已上移 utils/securityStages（WAF_MODE_TEXT）——列表摘要、
+// WAF 模式展示词单源已上移 utils/securityStages（wafModeLabel/WAF_MODE_TEXT）——列表摘要、
 // 只读详情分段、触发详情策略行、流程投影四处同词（此前文件内两份 + 跨文件一份
 // 措辞互斥：拦截/阻断、仅自定义/仅自定义规则）。
 const chainChipText = (entry: ChainEntry, index: number): string => {
@@ -1181,7 +1184,7 @@ const policySummaryLine = (row: PolicySummary): string => {
     // WAF 全关=CRS 与自定义规则均不生效（共享 buildStage3Rows 同门）——不得把
     // 保留的自定义条数说成生效中。
     if (row.mode === 'off') return 'WAF 关闭'
-    const parts = [`WAF ${WAF_MODE_TEXT[row.mode] ?? row.mode}`, `自定义 ${row.custom_rules_count} 条`]
+    const parts = [`WAF ${wafModeLabel(row.mode)}`, `自定义 ${row.custom_rules_count} 条`]
     if (row.mode === 'blocking' || row.mode === 'detection') parts.push(crsCount > 0 ? `CRS 组 ${crsCount}` : 'CRS 全部')
     return parts.join(' · ')
   }
@@ -1407,7 +1410,7 @@ const viewPolicySections = computed<ViewPolicySection[]>(() => {
   const crsGroupCount = parseIPList(d.crs_rule_groups).length
   const excludedCount = parseCrsExcludedRules(d.crs_excluded_rules).length
   const customCount = parseCustomRuleIds(d.custom_rules).length
-  const stage3Rows: Array<{ label: string; value: string }> = [{ label: 'WAF 模式', value: WAF_MODE_TEXT[d.mode] ?? d.mode }]
+  const stage3Rows: Array<{ label: string; value: string }> = [{ label: 'WAF 模式', value: wafModeLabel(d.mode) }]
   if (d.mode === 'blocking' || d.mode === 'detection') {
     stage3Rows.push({ label: '异常阈值', value: String(d.anomaly_threshold) })
     stage3Rows.push({ label: 'CRS 规则组', value: crsGroupCount === 0 ? '全部（默认）' : `${crsGroupCount} 组` })
@@ -3827,14 +3830,23 @@ onMounted(async () => {
 /* 兜底：关联规则多时 popper 可超视口——flip 回退之外由内部滚动承接*/
 .policy-rules-popper { max-height: 60vh; overflow-y: auto; }
 .policy-rules-popper .policy-rule-row {
+  display: block;
+  width: 100%;
   padding: 4px 8px;
-  border-radius: 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   font-size: 12px;
   line-height: 1.6;
+  text-align: left;
+  border-radius: 4px;
   cursor: pointer;
   transition: background-color 0.2s ease;
 }
 .policy-rules-popper .policy-rule-row:hover { background-color: rgba(255, 255, 255, 0.12); }
+.policy-rules-popper .policy-rule-row:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 1px; }
+.policy-rule-count:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; border-radius: 2px; }
 
 /* el-cascader 懒加载面板（teleported 到 body）：菜单放宽，给两行规则叶与组 label 留足宽度 */
 .crs-rule-popper .el-cascader-menu { min-width: 260px; }

@@ -305,7 +305,7 @@ func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		// 审计中间件对 explicit 路由无条件早退（含 4xx），绑定失败在此补记
 		// ——与同族站点坐标端点同构。编号尚未解析，按路径参数留痕。
-		recordAudit(c, "更新失败", "集群节点", services.FormatAuditDetail(
+		recordAudit(c, "更新地址", "集群节点", services.FormatAuditDetail(
 			"节点 "+registerAuditField(c.Param("id")), "访问地址格式错误", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "访问地址格式错误", err)
 		return

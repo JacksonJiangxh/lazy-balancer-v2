@@ -50,6 +50,17 @@ type overviewMetricsCacheEntry struct {
 	expiresAt  time.Time
 }
 
+// InvalidateOverviewMetricsCache 丢弃 /metrics 抓取缓存（生产写点：Caddy
+// /load 成功）。任意成功重载都会重建 Caddy registry——限流 429 计数归零，
+// 而 5s 缓存不感知会让限流卡片/单规则 stage-stats 在窗口内继续显示重载前的
+// 累计值，与「计数据自最近一次重载以来累计」的声明口径矛盾。
+func InvalidateOverviewMetricsCache() {
+	overviewMetricsCache.Lock()
+	defer overviewMetricsCache.Unlock()
+	overviewMetricsCache.entries = nil
+	overviewMetricsCache.inflight = nil
+}
+
 // resetOverviewMetricsCacheForTest 仅供测试隔离。
 func resetOverviewMetricsCacheForTest() {
 	overviewMetricsCache.Lock()

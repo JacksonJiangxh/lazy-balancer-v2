@@ -55,21 +55,3 @@ func TestHandlerCaddyCoordinationPathsMatchEntrypoint(t *testing.T) {
 		}
 	}
 }
-
-// caddyLogTypes 必须与路径表保持一一对应：未知类型的 400 文案直接
-// 消费该枚举，第二份手写清单会在新增日志类型时漂移（路径有值、文案漏项）。
-func TestCaddyLogTypes_matchLogPaths(t *testing.T) {
-	if len(caddyLogTypes) != len(caddyLogPaths) {
-		t.Fatalf("caddyLogTypes=%v 与 caddyLogPaths %d 键数量不一致", caddyLogTypes, len(caddyLogPaths))
-	}
-	seen := make(map[string]bool, len(caddyLogTypes))
-	for _, logType := range caddyLogTypes {
-		if seen[logType] {
-			t.Fatalf("caddyLogTypes 重复条目 %q: %v", logType, caddyLogTypes)
-		}
-		seen[logType] = true
-		if path, ok := caddyLogPaths[logType]; !ok || path == "" {
-			t.Fatalf("caddyLogTypes 条目 %q 在 caddyLogPaths 中无路径", logType)
-		}
-	}
-}

@@ -310,7 +310,7 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	// 生产时序：ProcessLogging（audit Write 先入队）先于计时写点。
 	tx.ProcessLogging()
 	// blocked_counter 同位写点：决策已出，纯评估耗时入注册表，随后终态标记。
-	auditTimingRecord(id, "end", 42)
+	auditTimingRecord(id, timingSegmentEnd, 42)
 	auditTimingClose(id)
 	// 栅栏放行：drain 此刻才执行 Format→查表，必见已终态条目（保序，零调度依赖）。
 	close(fence.release)
@@ -571,7 +571,7 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 	// 改原：tx.Close reset 变量集合（headers/body 归零、事务归还 sync.Pool），
 	// 随后计时终态，最后才放行 drain 侧格式化。
 	tx.Close()
-	auditTimingRecord(id, "end", 77)
+	auditTimingRecord(id, timingSegmentEnd, 77)
 	auditTimingClose(id)
 	close(fmtr.release)
 
@@ -981,7 +981,7 @@ func TestAuditWriter_closeKeepsProcessSingletonPipeline(t *testing.T) {
 	const id1 = "1111111111111111"
 	const id2 = "2222222222222222"
 	id1Tx := driveProbeTx(t, waf, id1)
-	auditTimingRecord(id1, "end", 42)
+	auditTimingRecord(id1, timingSegmentEnd, 42)
 	auditTimingClose(id1)
 	lines := waitAuditLines(t, logPath, 1)
 	if !strings.Contains(lines[0], id1Tx) {
@@ -1007,7 +1007,7 @@ func TestAuditWriter_closeKeepsProcessSingletonPipeline(t *testing.T) {
 	}
 
 	// 关闭后写入：仍由活 drain 消费并注入计时（注入在 drain 侧等待终态）。
-	auditTimingRecord(id2, "end", 7)
+	auditTimingRecord(id2, timingSegmentEnd, 7)
 	auditTimingClose(id2)
 	id2Tx := driveProbeTx(t, waf, id2)
 	if err := w.Write(nil); err != nil {
@@ -1254,14 +1254,14 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 		t.Fatalf("unknown entry must yield empty snapshot: %+v", snap)
 	}
 
-	auditTimingRecord(id, "pre", 11)
+	auditTimingRecord(id, timingSegmentPre, 11)
 	// 未终态：wait 走满超时并返回部分快照（pre 在场）
 	snap = auditTimingWait(id, 30*time.Millisecond)
 	if !snap.preSet || snap.preUs != 11 || snap.closed {
 		t.Fatalf("partial snapshot = %+v; want pre=11 unclosed", snap)
 	}
 
-	auditTimingRecord(id, "end", 22)
+	auditTimingRecord(id, timingSegmentEnd, 22)
 	auditTimingClose(id)
 	auditTimingPollCountForTest.Store(0)
 	snap = auditTimingWait(id, time.Second)
@@ -1276,7 +1276,7 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 	if snap := auditTimingWait("", time.Millisecond); snap.preSet || snap.endSet {
 		t.Fatal("empty id must short-circuit")
 	}
-	auditTimingRecord("", "pre", 1)
+	auditTimingRecord("", timingSegmentPre, 1)
 	auditTimingClose("")
 }
 
@@ -1287,7 +1287,7 @@ func TestAuditTimingRegistry_sweep(t *testing.T) {
 	seedAuditTimingEntryForTest(stale, time.Now().Add(-time.Hour))
 
 	for i := range 128 { // 跨过 sweep 周期（64）多批
-		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbb%04x", i), "pre", int64(i))
+		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbb%04x", i), timingSegmentPre, int64(i))
 	}
 
 	auditTimingMu.Lock()
@@ -1351,7 +1351,7 @@ func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
 	}
 	const fresh = 5000
 	for i := range fresh {
-		auditTimingRecord(fmt.Sprintf("%016x", 0x10000+i), "pre", 0)
+		auditTimingRecord(fmt.Sprintf("%016x", 0x10000+i), timingSegmentPre, 0)
 	}
 
 	auditTimingMu.Lock()
@@ -1381,7 +1381,7 @@ func TestAuditTimingClose_requiresExistingEntry(t *testing.T) {
 		t.Fatalf("close must not create entries, got %d entries", count)
 	}
 
-	auditTimingRecord("eeeeeeeeeeeeeeee", "pre", 5)
+	auditTimingRecord("eeeeeeeeeeeeeeee", timingSegmentPre, 5)
 	auditTimingClose("eeeeeeeeeeeeeeee")
 	if snap := auditTimingLookupForTest(t, "eeeeeeeeeeeeeeee"); !snap.closed {
 		t.Fatal("close must mark an existing entry as terminal")
@@ -1623,7 +1623,7 @@ func TestAuditTimingRegistry_retainsPreAcrossEntryTTL(t *testing.T) {
 	t.Cleanup(func() { auditPreRetentionTTLNs.Store(origRetention) })
 
 	const id = "eeeeeeeeeeeeeeee"
-	auditTimingRecord(id, "pre", 1234)
+	auditTimingRecord(id, timingSegmentPre, 1234)
 	// 越过条目 TTL（useTestAuditPipeline 置 50ms）后清扫：模拟长请求仍在途中。
 	time.Sleep(80 * time.Millisecond)
 	auditTimingMu.Lock()
@@ -1635,7 +1635,7 @@ func TestAuditTimingRegistry_retainsPreAcrossEntryTTL(t *testing.T) {
 	}
 
 	// 终态分段迟到（重建条目）：pre 必须从预检保留区回填。
-	auditTimingRecord(id, "end", 999)
+	auditTimingRecord(id, timingSegmentEnd, 999)
 	snap := auditTimingWait(id, 20*time.Millisecond)
 	if !snap.preSet || snap.preUs != 1234 {
 		t.Fatalf("pre segment lost across entry TTL: %+v（长请求必须保留预检段）", snap)
@@ -1653,7 +1653,7 @@ func TestAuditTimingRegistry_preRetentionExpires(t *testing.T) {
 	t.Cleanup(func() { auditPreRetentionTTLNs.Store(origRetention) })
 
 	const id = "ffffffffffffffff"
-	auditTimingRecord(id, "pre", 7)
+	auditTimingRecord(id, timingSegmentPre, 7)
 	time.Sleep(80 * time.Millisecond)
 	auditTimingMu.Lock()
 	auditTimingSweepLocked(time.Now())                  // 条目过期 → pre 转保留区
@@ -1757,8 +1757,9 @@ func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 
 // 头部密集形态的字节估算必须用快照侧已算出的精确序列化字节：5000 条三字符
 // header（请求+响应各一份）实际序列化 ~131KiB，旧实现按每条 (键 48 + 值 16)
-// 固定开销重估成 ~700KiB（5.7×），越过 auditItemMaxBytes 单条上限→整行被
-// 丢弃（丢的恰是头部密集的高价值行）。钉两点：估算不低于实际、不超限丢行。
+// 固定开销重估成 ~700KiB（5.7×），在按字节预算执法/单条上限判定下会把真实
+// ~131KiB 的头部密集高价值行误判成超限。钉两点：估算不低于实际、不夸大实际
+// （旧固定开销口径的数倍高估不得回归），且入队不因估算失真丢行。
 func TestEstimateAuditSnapshotBytes_headerDenseExactBytesUnderItemCap(t *testing.T) {
 	// 5000 个互不相同的三字符键（aaa..，26 进制）。
 	headers := make(map[string][]string, 5000)
@@ -1792,7 +1793,9 @@ func TestEstimateAuditSnapshotBytes_headerDenseExactBytesUnderItemCap(t *testing
 	if got < int64(len(serialized)) {
 		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", got, len(serialized))
 	}
-	// 旧口径（36/48/16 固定开销）对照：同一快照会被估成 ~5.7×，必须越过单条上限。
+	// 旧口径（48/16 固定开销）对照：同一快照会被估成 ~5.7×——精确估算必须
+	// 显著低于该高估（比值下界 3×），否则「按条固定开销」回归会再次把真实
+	// ~131KiB 估算成数百 KiB 挤压队列预算与单条上限。
 	var legacy int64 = auditSnapshotFixedBytes
 	for _, hs := range []map[string][]string{reqHeaders, respHeaders} {
 		for k, vs := range hs {
@@ -1802,8 +1805,8 @@ func TestEstimateAuditSnapshotBytes_headerDenseExactBytesUnderItemCap(t *testing
 			}
 		}
 	}
-	if legacy <= auditItemMaxBytes {
-		t.Fatalf("夹具无效：旧固定开销口径估算 %d 本应越过单条上限 %d", legacy, auditItemMaxBytes)
+	if legacy < 3*got {
+		t.Fatalf("夹具无效：旧固定开销口径估算 %d 未显著高于精确估算 %d（应 ≥3×）", legacy, got)
 	}
 	if got > auditItemMaxBytes {
 		t.Fatalf("精确估算 %d > 单条上限 %d（整行仍会被丢弃）", got, auditItemMaxBytes)
@@ -1821,6 +1824,54 @@ func TestEstimateAuditSnapshotBytes_headerDenseExactBytesUnderItemCap(t *testing
 	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"header-dense"}`)}})
 	if dropped := p.dropped.Load(); dropped != 0 {
 		t.Fatalf("dropped=%d, want 0（头部密集行不得因估算失真被整行丢弃）", dropped)
+	}
+	if length := len(p.queue); length != 1 {
+		t.Fatalf("queue length=%d, want 1", length)
+	}
+}
+
+// 转义密集体的最坏形态：64KiB 全 `&`（表单体天然密集）在 JSON 转义口径下
+// 展开为 384KiB/段。单条上限必须按最坏转义比推导——旧「四段原始字节+余量」
+// 的 320KiB 上限让请求/响应体仅体一项就超限，整条安全事件被丢弃（攻击者
+// 可用体字符分布让自身事件不留库）。钉：估算 ≥ 实际序列化、≤ 单条上限，
+// 且入队零丢弃。
+func TestEstimateAuditSnapshotBytes_escapeDenseBodiesUnderItemCap(t *testing.T) {
+	dense := strings.Repeat("&", auditBodyMaxBytes)
+	if got, truncated := snapshotAuditBody(dense); truncated || len(got) != auditBodyMaxBytes {
+		t.Fatalf("夹具无效：64KiB 原始体不应被体截断（len=%d truncated=%v）", len(got), truncated)
+	}
+	snap := &auditSnapshot{}
+	snap.Transaction_.Request_ = &auditSnapshotRequest{Body_: dense}
+	snap.Transaction_.Response_ = &auditSnapshotResponse{Body_: dense}
+
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := estimateAuditSnapshotBytes(snap)
+	if got < int64(len(serialized)) {
+		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", got, len(serialized))
+	}
+	// 旧上限（四段原始字节 + 余量 = 320KiB）必被越限——夹具有效性反证。
+	const legacyItemCap int64 = 320 * 1024
+	if got <= legacyItemCap {
+		t.Fatalf("夹具无效：转义密集体估算 %d 本应越过旧上限 %d", got, legacyItemCap)
+	}
+	if got > auditItemMaxBytes {
+		t.Fatalf("转义密集体估算 %d > 单条上限 %d（整行仍会被丢弃）", got, auditItemMaxBytes)
+	}
+
+	p := &auditPipeline{
+		target: filepath.Join(t.TempDir(), "audit.log"),
+		queue:  make(chan lbAuditItem, 2),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"escape-dense"}`)}})
+	if dropped := p.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped=%d, want 0（64KiB 全 `&` 体不得整行丢弃）", dropped)
 	}
 	if length := len(p.queue); length != 1 {
 		t.Fatalf("queue length=%d, want 1", length)
@@ -1974,9 +2025,9 @@ func TestAuditPipeline_enqueueDropsWhenByteBudgetExceeded(t *testing.T) {
 		t.Fatalf("queue length=%d, want 1（被丢弃条不占队）", got)
 	}
 
-	// 超单条上限的快照即使空队也直接丢弃。
+	// 超单条上限的快照即使空队也直接丢弃（2MiB 体 > 1MiB 单条上限）。
 	huge := &auditSnapshot{}
-	huge.Transaction_.Request_ = &auditSnapshotRequest{Body_: strings.Repeat("y", 400*1024)}
+	huge.Transaction_.Request_ = &auditSnapshotRequest{Body_: strings.Repeat("y", 2<<20)}
 	p.enqueue(lbAuditItem{snap: huge, formatter: cannedFormatter{body: []byte(`{"row":"HHH999"}`)}})
 	if got := p.dropped.Load(); got != 2 {
 		t.Fatalf("dropped=%d, want 2（单条超限丢弃）", got)
@@ -2397,9 +2448,11 @@ func (l messageOnlyAuditLog) Messages() []plugintypes.AuditLogMessage { return l
 // 越过 auditItemMaxBytes 被**整行丢弃**（命中规则多的高价值行反而丢失）。
 // 截断后整行保留，并在 messages_dropped 显性披露丢弃条数。
 func TestSnapshotAuditLog_truncatesMessagesUnderItemCap(t *testing.T) {
+	// 每条 6KB：200 条未截断共 ~1.2MB，必然越过 1MiB 单条上限（钉子有效性
+	// 反证的分母；截断后 messages 自身口径仍受 32KiB 预算约束）。
 	raw := make([]plugintypes.AuditLogMessage, 0, 200)
-	for i := 0; i < 200; i++ {
-		raw = append(raw, estimateTestMessage{Message_: strings.Repeat("m", 100)})
+	for range 200 {
+		raw = append(raw, estimateTestMessage{Message_: strings.Repeat("m", 6000)})
 	}
 	snap := snapshotAuditLog(messageOnlyAuditLog{msgs: raw})
 	if got := len(snap.Messages_); got > auditMessagesMaxEntries {
@@ -2417,12 +2470,15 @@ func TestSnapshotAuditLog_truncatesMessagesUnderItemCap(t *testing.T) {
 		t.Fatalf("messages 估算 %d 字节 > 上限 %d", used, auditMessagesMaxBytes)
 	}
 
-	// 四段全满（请求/响应体与头各 64KiB）+ 截断后的 messages：必须落在单条
-	// 上限内；同形但未截断的 messages 集合必然超限（钉子有效性反证）。
-	full := strings.Repeat("x", auditBodyMaxBytes)
+	// 四段全满（请求/响应体与头各 64KiB）且体取转义最坏比（全 `&`）+
+	// 截断后的 messages：必须落在单条上限内；同形但未截断的 messages 集合
+	// 必然超限（钉子有效性反证）。
+	dense := strings.Repeat("&", auditBodyMaxBytes)
+	reqHeaders, reqExact := snapshotAuditHeaders(map[string][]string{"h": {dense}})
+	respHeaders, respExact := snapshotAuditHeaders(map[string][]string{"h": {dense}})
 	snap.Transaction_ = auditSnapshotTransaction{
-		Request_:  &auditSnapshotRequest{Body_: full, Headers_: map[string][]string{"h": {full}}},
-		Response_: &auditSnapshotResponse{Body_: full, Headers_: map[string][]string{"h": {full}}},
+		Request_:  &auditSnapshotRequest{Body_: dense, Headers_: reqHeaders, HeadersBytes_: reqExact},
+		Response_: &auditSnapshotResponse{Body_: dense, Headers_: respHeaders, HeadersBytes_: respExact},
 	}
 	if size := estimateAuditSnapshotBytes(snap); size > auditItemMaxBytes {
 		t.Fatalf("截断后 size=%d > 单条上限 %d（整行仍会被丢弃）", size, auditItemMaxBytes)
@@ -2500,5 +2556,14 @@ func TestSnapshotAuditLog_keepsThreatEvaluationMessagesWhenTruncated(t *testing.
 		if m.Data().ID() != raw[i].Data().ID() {
 			t.Fatalf("未超限形态顺序改变：第 %d 条 id=%d", i, m.Data().ID())
 		}
+	}
+}
+
+// 分段键常量即审计行字段的 wire 契约（pre_us/end_us）：常量值被改动会改变
+// 已落盘行的语义解释，必须显式钉住；注册表按常量分派（字面量 switch 会在
+// 改值时静默丢分段）。
+func TestAuditTimingSegmentConstants_wireContract(t *testing.T) {
+	if timingSegmentPre != "pre" || timingSegmentEnd != "end" {
+		t.Fatalf("分段键=%q/%q, want pre/end（审计行 pre_us/end_us 字段语义）", timingSegmentPre, timingSegmentEnd)
 	}
 }

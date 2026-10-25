@@ -73,7 +73,7 @@ func TestRollupQueries_includeCurrentPartialMinute(t *testing.T) {
 		t.Fatalf("分桶总量必须与总量同口径: %+v", agg.bucketTotals)
 	}
 
-	targets, err := threatTopTargets(since.Format("2006-01-02 15:04"))
+	targets, err := threatTopTargets(since.Format("2006-01-02 15:04"), true)
 	if err != nil {
 		t.Fatalf("top targets: %v", err)
 	}
@@ -221,5 +221,50 @@ func TestThreatRollupDimAggregateQuery_cachesOnlyWhenWindowCovered(t *testing.T)
 	resetThreatScreenCachesForTest()
 	if got := query(true); got != 3 {
 		t.Fatalf("total=%d, want 3（清缓存后读到全部已固化行）", got)
+	}
+}
+
+// 宽窗口回填未完成时的 Top3 不得落缓存：部分窗口结果一旦缓存，回填完成后的
+// 下一轮轮询（coverageReaches=true、stale=false，不再失效）仍会命中它 ≤60s，
+// 而同响应 total/国家已是完整窗口（与聚合查询的 cacheable 门同口径）。
+func TestThreatTopTargets_cacheableGateSkipsPartialResults(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	now := time.Date(2026, 10, 19, 12, 0, 30, 0, time.UTC)
+	installThreatClock(t, now)
+	since := now.Add(-24 * time.Hour).Truncate(time.Minute)
+	sinceStr := since.Format("2006-01-02 15:04")
+	seedThreatLBRule(t, "lb_cache", "缓存站点", "cache.example.com")
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_target_rollup (minute, rule_caddy_id, count) VALUES (?, 'lb_cache', 5)`, sinceStr); err != nil {
+		t.Fatal(err)
+	}
+
+	// cacheable=false：结果不写缓存。
+	if _, err := threatTopTargets(sinceStr, false); err != nil {
+		t.Fatal(err)
+	}
+	topTargetsCacheMu.Lock()
+	_, cached := topTargetsCache[topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, sinceMinute: sinceStr}]
+	topTargetsCacheMu.Unlock()
+	if cached {
+		t.Fatal("回填未完成的 Top3 不得落缓存（回填完成后 ≤60s 仍返回部分结果）")
+	}
+	// 补全后按完整窗口重算：结果反映新增行。
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_target_rollup (minute, rule_caddy_id, count) VALUES (?, 'lb_cache', 7)`, now.Format("2006-01-02 15:04")); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := threatTopTargets(sinceStr, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Value != 12 {
+		t.Fatalf("完整窗口 Top3=%+v, want 12", targets)
+	}
+	// cacheable=true：结果落缓存。
+	topTargetsCacheMu.Lock()
+	_, cached = topTargetsCache[topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, sinceMinute: sinceStr}]
+	topTargetsCacheMu.Unlock()
+	if !cached {
+		t.Fatal("完整窗口结果必须落缓存")
 	}
 }

@@ -57,12 +57,13 @@
 
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { Lock } from '@element-plus/icons-vue'
 import QRCode from 'qrcode'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { copyText } from '@/utils/copy'
+import { createOneTimeSecretCloseGuard } from '@/utils/oneTimeSecretGuard'
 import type { APIResponse } from '@/types'
 
 // MFA 绑定/换绑向导（个人自助）：父组件负责在打开前取到 pending secret/uri
@@ -85,19 +86,14 @@ const code = ref('')
 const recoveryCodes = ref<string[]>([])
 const loading = ref(false)
 
-/** 恢复码是仅此一次下发的登录凭证：关闭前必须明确确认已保存。 */
-const beforeClose = (done: () => void): void => {
-  if (loading.value) return
-  if (step.value !== 2) {
-    done()
-    return
-  }
-  ElMessageBox.confirm('恢复代码仅此一次显示，关闭后将无法再次查看。确认已保存？', '保存恢复代码', {
-    type: 'warning',
-    confirmButtonText: '我已保存',
-    cancelButtonText: '继续查看',
-  }).then(() => done()).catch(() => undefined)
-}
+/** 恢复码是仅此一次下发的登录凭证：关闭前必须明确确认已保存；提交中不得关闭，
+ *  未走到恢复码步（无秘密可丢）直接关闭（一次性凭据守卫单源）。 */
+const beforeClose = createOneTimeSecretCloseGuard({
+  message: '恢复代码仅此一次显示，关闭后将无法再次查看。确认已保存？',
+  title: '保存恢复代码',
+  blocked: () => loading.value,
+  skip: () => step.value !== 2,
+})
 
 const handleClosed = (): void => {
   step.value = 0

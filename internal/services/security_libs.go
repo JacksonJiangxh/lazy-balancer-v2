@@ -27,12 +27,6 @@ func SecurityLibraryStatus() (crsOK, ip2regionOK bool) {
 	return
 }
 
-// SecurityLibrariesAvailable 两类库齐全才允许渲染安全链。
-func SecurityLibrariesAvailable() bool {
-	crsOK, ip2regionOK := SecurityLibraryStatus()
-	return crsOK && ip2regionOK
-}
-
 // securityLibrariesMissingDesc 供告警日志的缺失描述（如「CRS 规则库」）。
 // 接收已探测结果——调用方刚做过 SecurityLibraryStatus（rules 树 WalkDir +
 // xdb stat），不得在描述里再探一轮。

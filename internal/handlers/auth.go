@@ -49,6 +49,12 @@ func guardAuthJSONBody(c *gin.Context) bool {
 // DefaultCost 与生产真实哈希同档；对不存在的用户也跑一次注定失败的比较。
 var loginDummyBcryptHash []byte
 
+// loginDummyCompare 是未知用户名等时比较的注入点：生产恒为
+// bcrypt.CompareHashAndPassword，测试可替换它以断言「未知用户路径确实执行了
+// 一次 dummy 比较」（删掉比较语句或改写快路径都会变红）。时序本身不做毫秒级
+// 断言（CI 抖动必然 flaky）。
+var loginDummyCompare = bcrypt.CompareHashAndPassword
+
 func init() {
 	loginDummyBcryptHash, _ = bcrypt.GenerateFromPassword([]byte("lazy-balancer timing-equalizer dummy"), bcrypt.DefaultCost)
 }
@@ -191,7 +197,7 @@ func (h *Handlers) Login(c *gin.Context) {
 	if err == sql.ErrNoRows {
 		// 对不存在的用户名也执行一次注定失败的 bcrypt 比较（结果刻意
 		// 丢弃，只取等时副作用），消除与「密码错误」路径的时序差后返回同形 401。
-		_ = bcrypt.CompareHashAndPassword(loginDummyBcryptHash, []byte(req.Password))
+		_ = loginDummyCompare(loginDummyBcryptHash, []byte(req.Password))
 		services.RecordAuditLog(req.Username, "登录失败", "用户认证", services.AuditResultPart("invalid_credentials"), c.ClientIP())
 		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户名或密码错误"})
 		return

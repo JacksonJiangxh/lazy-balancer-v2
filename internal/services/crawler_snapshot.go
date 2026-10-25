@@ -117,20 +117,40 @@ func (m *CrawlerUpdateManager) Prime() error {
 	if err := refreshCrawlerSources(); err != nil {
 		return err
 	}
+	return seedAndRebuildCrawlerIPListSnapshot()
+}
+
+// seedAndRebuildCrawlerIPListSnapshot 逐引擎补种缺失的内置名单（判据同
+// Prime：缺哪补哪），随后以 DB 为唯一真相单次写全量运行快照。
+//
+// 启动（Prime）与备份导入（RestoreCrawlerIPListSnapshot）共用本收敛体：
+// 导入是全表替换，旧备份可能不含 system=1 爬虫行（v2.3.8 前导出/用户裁剪），
+// 只 rebuild 不补种会让运行快照缺失整引擎——该引擎的地域/ACL 豁免与伪装
+// 检测静默失效，直到进程重启或下一轮源更新，面板零告警。
+func seedAndRebuildCrawlerIPListSnapshot() error {
 	all, err := loadCrawlerIPListsFromDB()
 	if err != nil {
 		return err
 	}
 	bundled := loadCrawlerBundledSeed()
+	var missing []string
 	for _, src := range crawlerBotSources {
 		if _, ok := all[src.Name]; ok {
 			continue
 		}
-		if seed, ok := bundled[src.Name]; ok && len(seed) > 0 {
-			all[src.Name] = append([]string(nil), seed...)
+		seed, ok := bundled[src.Name]
+		if !ok || len(seed) == 0 {
+			missing = append(missing, src.Name)
+			continue
 		}
+		all[src.Name] = append([]string(nil), seed...)
 	}
-	// 名单名迁移已在上方读库前完成一次（逐引擎 upsert 不再各自重跑：那等于
+	if len(missing) > 0 {
+		// 内置首版也没有该引擎条目：快照将缺该引擎（iprange 引擎在快照缺项时
+		// 判 Transient，豁免静默失效），必须留痕而不是成功静默。
+		Logf("warn", "爬虫内置名单补种缺引擎 %v：运行快照不含该引擎，其豁免/伪装检测暂不生效", missing)
+	}
+	// 名单名迁移由调用方在读库前完成一次（逐引擎 upsert 不再各自重跑：那等于
 	// 每引擎 N 条 UPDATE，且迁移晚于读库会让旧键行被重复写入）。
 	for engineID, entries := range all {
 		// 逐引擎只落 DB：带快照形态会在 DB 尚未补种完的中间态各写一次全量
@@ -145,8 +165,17 @@ func (m *CrawlerUpdateManager) Prime() error {
 	return writeCrawlerIPListSnapshotAll(all)
 }
 
+// RestoreCrawlerIPListSnapshot 备份导入后的收敛入口：补种缺失的内置爬虫名单
+// 并以 DB 为唯一真相重建运行交换文件（与 Prime 的收敛体同源；不跑启动期的
+// 源 canonical 刷新与名单名迁移——那些由重启路径承担，导入请求内保持最小面）。
+func RestoreCrawlerIPListSnapshot() error {
+	return seedAndRebuildCrawlerIPListSnapshot()
+}
+
 // RebuildCrawlerIPListSnapshot 以当前 DB 名单为唯一真相重建运行交换文件。
-// 与 Prime 不同，不播种、不回写名单；适用于备份替换后的无副作用收敛。
+// 与 Prime 不同，不播种、不回写名单；适用于「名单行已由外部全量写定」的
+// 无副作用收敛（集群同步）。备份导入是**全表替换**语义，必须走
+// RestoreCrawlerIPListSnapshot 才会补种缺失的 system 行。
 func RebuildCrawlerIPListSnapshot() error {
 	all, err := loadCrawlerIPListsFromDB()
 	if err != nil {

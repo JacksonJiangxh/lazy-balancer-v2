@@ -385,7 +385,7 @@ func expectedRenderedRules() (map[string]string, error) {
 		return nil, err
 	}
 
-	// 与 caddy.go 渲染门同源：ACME 候选查询 + SelectCertificate（域匹配/有效期/
+	// 与 caddy.go 渲染门同源：ACME 候选查询 + selectCertificate（域匹配/有效期/
 	// 可解析性）。证书候选只服务于 enabled+TLS+acme 规则，无此类规则时零查询。
 	acmeCerts := make(map[string][]CertificateCandidate)
 	// 本轮 ACME 候选证书 Leaf 去重缓存（PEM 内容 → 解析结果）。
@@ -434,7 +434,7 @@ func expectedRenderedRules() (map[string]string, error) {
 		case "manual":
 			return r.tlsCert != "" && r.tlsKey != ""
 		case "acme_dns":
-			_, ok := SelectCertificate(acmeCerts[r.caddyID], r.domain, selectionNow)
+			_, ok := selectCertificate(acmeCerts[r.caddyID], r.domain, selectionNow)
 			return ok
 		default:
 			// 渲染层 availableCerts 只认 manual/acme_dns；其他形态无证可载，

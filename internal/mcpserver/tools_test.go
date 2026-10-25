@@ -523,7 +523,7 @@ func TestSchemaDeclaresPaginationFollowsSchema(t *testing.T) {
 	for _, spec := range tools {
 		byName[spec.name] = spec
 	}
-	for _, name := range []string{"list_security_events", "list_audit_logs", "list_cert_jobs", "list_crs_rules"} {
+	for _, name := range []string{"list_security_events", "list_audit_logs", "list_cert_jobs", "list_crs_rules", "list_certificates"} {
 		if !schemaDeclaresPagination(byName[name]) {
 			t.Errorf("%s schema 声明了 page/page_size，判据却为 false", name)
 		}

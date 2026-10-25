@@ -16,12 +16,18 @@
 
     <el-alert
       v-if="overviewError"
-      title="安全总览数据加载失败，请稍后刷新"
       type="error"
       show-icon
       :closable="false"
       class="polling-error-alert error-banner"
-    />
+    >
+      <template #title>
+        <div class="polling-error-title">
+          <span>安全总览数据加载失败</span>
+          <el-button link type="danger" :loading="reloading" @click="reloadAll">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
 
     <!-- 采集健康位（任务已停/连续失败/审计写侧降级）：判据与文案与事件列表/大屏同源 -->
     <div v-if="ingestionWarning" class="info-note-bar">
@@ -121,10 +127,10 @@
               </div>
             </div>
             <div class="stat-col">
-              <div class="stat-box stat-box--success">
+              <div class="stat-box" :class="threatError ? 'stat-box--danger' : 'stat-box--success'">
                 <div class="stat-box__icon"><el-icon><Aim /></el-icon></div>
                 <div class="stat-box__body">
-                  <div class="stat-box__value">{{ threatLatestVersion || '未更新' }}</div>
+                  <div class="stat-box__value">{{ threatError ? '—' : (threatLatestVersion || '未更新') }}</div>
                   <div class="stat-box__label">威胁情报库</div>
                   <el-tag v-if="threatError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
                   <el-tag v-else-if="threatStatus" :type="libraryStatusTagType(threatStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(threatStatus) }}</el-tag>
@@ -132,10 +138,10 @@
               </div>
             </div>
             <div class="stat-col">
-              <div class="stat-box stat-box--success">
+              <div class="stat-box" :class="crawlerError ? 'stat-box--danger' : 'stat-box--success'">
                 <div class="stat-box__icon"><el-icon><Link /></el-icon></div>
                 <div class="stat-box__body">
-                  <div class="stat-box__value">{{ crawlerLatestVersion || '未更新' }}</div>
+                  <div class="stat-box__value">{{ crawlerError ? '—' : (crawlerLatestVersion || '未更新') }}</div>
                   <div class="stat-box__label">爬虫地址库</div>
                   <el-tag v-if="crawlerError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
                   <el-tag v-else-if="crawlerStatus" :type="libraryStatusTagType(crawlerStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(crawlerStatus) }}</el-tag>
@@ -199,7 +205,14 @@
               <AccessibleLink type="primary" @click="goToEvents">查看全部</AccessibleLink>
             </div>
           </template>
-          <el-alert v-if="blockedEventsError" title="最近拦截事件加载失败" type="error" show-icon :closable="false" class="error-banner" />
+          <el-alert v-if="blockedEventsError" type="error" show-icon :closable="false" class="error-banner">
+            <template #title>
+              <div class="polling-error-title">
+                <span>最近拦截事件加载失败</span>
+                <el-button link type="danger" :loading="reloading" @click="reloadAll">立即重试</el-button>
+              </div>
+            </template>
+          </el-alert>
           <el-table v-else :data="blockedEvents" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
             <template #empty><el-empty description="暂无拦截事件" :image-size="60" /></template>
             <el-table-column prop="event_time" label="时间" width="170" :formatter="(row: SecurityEvent) => formatDate(row.event_time)" />
@@ -230,7 +243,14 @@
             </el-tooltip>
             </div>
           </template>
-          <el-alert v-if="rateLimitError" title="限流拦截数据加载失败" type="error" show-icon :closable="false" class="error-banner" />
+          <el-alert v-if="rateLimitError" type="error" show-icon :closable="false" class="error-banner">
+            <template #title>
+              <div class="polling-error-title">
+                <span>限流拦截数据加载失败</span>
+                <el-button link type="danger" :loading="reloading" @click="reloadAll">立即重试</el-button>
+              </div>
+            </template>
+          </el-alert>
           <template v-else>
             <div class="rate-limit-total">
               <span class="stat-label">累计拦截</span>
@@ -463,7 +483,28 @@ const openThreatScreen = (): void => {
   authStore.setCurrentPage('threat-screen')
 }
 
-onMounted(() => { fetchData(); fetchBlockedEvents(); fetchRateLimitBlocks(); fetchIP2RegionInfo(); fetchThreatLib(); fetchCrawlerLib() })
+// 六路数据一次拉齐；失败后页面此前只提供整页刷新这一个恢复入口（瞬态 5xx 后
+// 面板长期不可用）。横幅的「立即重试」走同一路径，reloading 兼作并发门——
+// 连续点击不会叠发六组请求。
+const reloading = ref(false)
+const reloadAll = async (): Promise<void> => {
+  if (reloading.value) return
+  reloading.value = true
+  try {
+    await Promise.all([
+      fetchData(),
+      fetchBlockedEvents(),
+      fetchRateLimitBlocks(),
+      fetchIP2RegionInfo(),
+      fetchThreatLib(),
+      fetchCrawlerLib(),
+    ])
+  } finally {
+    reloading.value = false
+  }
+}
+
+onMounted(() => { void reloadAll() })
 </script>
 
 <style scoped>

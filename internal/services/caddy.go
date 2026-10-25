@@ -274,6 +274,15 @@ func (l *CaddyWriteLock) TryLock() bool { return l.mu.TryLock() }
 
 var CaddyOpLock = &CaddyWriteLock{}
 
+// withCaddyOpLock 在 CaddyOpLock 临界区内执行 fn，defer 释放：临界区含渲染与
+// /load，panic 若逃出（被 gin.Recovery 兜住）会让全局写锁永久泄漏——之后所有
+// 配置写窗口（规则保存/证书部署/重载/导入）永久阻塞。
+func withCaddyOpLock(fn func()) {
+	CaddyOpLock.Lock()
+	defer CaddyOpLock.Unlock()
+	fn()
+}
+
 // errSameConfig 渲染产物与运行配置字节一致（Caddy changeConfig 同源短路）。
 // 审计真实性裁定（2026-09-25 用户裁定：审计事件必须真实有效）——同字节时
 // 跳过 /load 调用（Caddy 端本就零 provision），调用方据此不落「重载」审计。
@@ -455,6 +464,9 @@ func (s *CaddyService) applyConfigWithOptions(config map[string]interface{}, opt
 	}
 
 	Logf("info", "Caddy config applied successfully")
+	// 重载重建 registry：限流 429 计数归零，/metrics 抓取缓存必须同步失效
+	//（否则安全总览在 ≤5s 内仍显示重载前累计值）。
+	InvalidateOverviewMetricsCache()
 	if opts.persistLastGood {
 		s.persistLastGoodLocked(data)
 	}
@@ -574,6 +586,8 @@ func (s *CaddyService) ApplyLastKnownGood() error {
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("apply last-known-good config failed: %s", string(readCaddyErrorBody(resp.Body)))
 	}
+	// 启动兜底同样是一次真实 /load：registry 已重建，缓存口径必须失效。
+	InvalidateOverviewMetricsCache()
 	return nil
 }
 
@@ -1924,10 +1938,10 @@ func mergeTrustedProxyServerFields(servers map[string]interface{}, store caddyCo
 }
 
 // acmeCertCandidatesQuery 只取「启用 + TLS + acme_dns」规则名下未禁用任务的
-// 证书候选（与 db 迁移的 legacyHTTPSHasCertPredicate 及 SelectCertificate 的
+// 证书候选（与 db 迁移的 legacyHTTPSHasCertPredicate 及 selectCertificate 的
 // 跳过口径同源）。前为全库全量拉取：已删除规则的残留行、disabled 任务与
 // 非 acme 规则的历史 PEM 都会在每次全量生成时载入内存，而后置消费方
-// （resolveACMECert 仅按 allRules 中 acme_dns 规则查表、SelectCertificate
+// （resolveACMECert 仅按 allRules 中 acme_dns 规则查表、selectCertificate
 // 跳过 disabled）根本不会使用这些行——过滤前移只减 IO/内存，不改变候选集语义。
 // var（非 const）：谓词由 CertJobMaterialPredicateSQL（带 alias 的函数）单源
 // 生成——本查询在包初始化时求值一次。
@@ -2197,7 +2211,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 				closeErr := certRows.Close()
 				return generationFailure("读取 ACME 证书阶段解析失败: %v", errors.Join(scanErr, closeErr))
 			}
-			// 装载阶段统一预解析（disabled 候选由 SelectCertificate
+			// 装载阶段统一预解析（disabled 候选由 selectCertificate
 			// 直接跳过，无需付解析成本），选择/后续复用走 Leaf 快路径。
 			if candidate.Status != "disabled" {
 				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
@@ -2220,7 +2234,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		// 写 cert_jobs 的调用点是 DisableRule 置 disabled、DeleteRule 删行、
 		// UpdateRule tcp 切换删除；UpdateRule 域名迁移的证书 UPDATE 在 commit 后
 		// 独立 certTx。对 tx 内写者，事务视图恰是渲染目标状态，行为正确）；
-		// SelectCertificate 仍按 status 过滤 disabled。
+		// selectCertificate 仍按 status 过滤 disabled。
 		// 门控显式化：补查仅当调用方声明 rulesWrittenInTx（事务写过 lb_rules，
 		// 规则视图与 certSource 已提交视图可能分叉）时执行；UpdateConfig（tx 只写
 		// global_config）、名单-only 热路径等形态传 false——两视图恒一致，
@@ -2238,7 +2252,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	}
 	selectionNow := time.Now()
 	resolveACMECert := func(ruleID, domain string) (CertMaterial, bool) {
-		selected, ok := SelectCertificate(acmeCerts[ruleID], domain, selectionNow)
+		selected, ok := selectCertificate(acmeCerts[ruleID], domain, selectionNow)
 		if ok {
 			return CertMaterial{RuleID: ruleID, CertPEM: selected.Candidate.CertPEM, KeyPEM: selected.Candidate.KeyPEM}, true
 		}
@@ -3150,7 +3164,7 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 // acmeCertCandidatesForRule 查询指定规则的 ACME 证书候选（PEM 非空行，
 // updated_at/id 倒序）。谓词 miss 补查与 loadACMECertificateFromStore
 // 共用本查询体（去重——此前两处同一 SELECT+扫描循环逐字
-// 重复）；status 过滤由调用方 SelectCertificate 后置执行。查询/解析失败仅记
+// 重复）；status 过滤由调用方 selectCertificate 后置执行。查询/解析失败仅记
 // 日志返回 nil（调用点按无证书渲染/判定，语义不变）。
 func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []CertificateCandidate {
 	rows, err := store.Query(`
@@ -3158,7 +3172,7 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0)
 		FROM cert_jobs
 		WHERE rule_id=?
-		  AND `+CertJobCandidatePredicateSQL("")+`
+		  AND `+certJobCandidatePredicateSQL("")+`
 		ORDER BY updated_at DESC, id DESC`, ruleID)
 	if err != nil {
 		Logf("warn", "ACME 证书候选查询失败（规则 %s，按无证书处理）: %v", ruleID, err)
@@ -3190,9 +3204,9 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 // cert_jobs (via store) for the given rule and domain. Returns
 // (certPEM, keyPEM, true) if issued.
 // 查询体委托 acmeCertCandidatesForRule，本函数只做
-// SelectCertificate 择优（此前两函数 SELECT+扫描循环逐字重复）。
+// selectCertificate 择优（此前两函数 SELECT+扫描循环逐字重复）。
 func loadACMECertificateFromStore(store caddyConfigStore, caddyID, domain string) (string, string, bool) {
-	selected, ok := SelectCertificate(acmeCertCandidatesForRule(store, caddyID), domain, time.Now())
+	selected, ok := selectCertificate(acmeCertCandidatesForRule(store, caddyID), domain, time.Now())
 	if ok {
 		return selected.Candidate.CertPEM, selected.Candidate.KeyPEM, true
 	}

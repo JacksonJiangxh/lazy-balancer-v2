@@ -97,7 +97,7 @@ test('MFA「支持的操作」清单覆盖 middleware 各写端点族', () => {
   for (const anchor of ['任务监控 运行', '服务控制', '节点站点坐标', '指纹钉', '自动封禁', '爬虫库', 'IP 名单', 'DNS 凭证连通性测试']) {
     assert.ok(flat.includes(anchor), `MFA 清单缺「${anchor}」——用户对这些写操作会被要求验码`)
   }
-  assert.match(page, /subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 验码、登出端点除外）"/)
+  assert.match(page, /subtitle="覆盖全部管理写操作（只读语义写操作与 MFA 验码、登出端点除外）"/)
   // 副标题的豁免集必须与 DecideMFAStepUp 同源：step-up 只豁免 verify-step
   // 与 logout，setup/activate/disable/recovery-codes 全部在覆盖面内（同弹框
   // 清单也列了「启用/禁用/重新生成恢复码（自己的）」）。写成「MFA 自助端点

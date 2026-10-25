@@ -25,7 +25,7 @@ interface AdminTlsSelection {
   mode: string
 }
 
-export interface StagedAdminTlsCert {
+interface StagedAdminTlsCert {
   certFile: File
   keyFile: File
   certInfo: AdminTlsCertInfo
