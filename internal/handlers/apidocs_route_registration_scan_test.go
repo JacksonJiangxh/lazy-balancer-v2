@@ -374,6 +374,16 @@ func TestAPIDocs_rateLimitedRoutesDocument429AndNumbers(t *testing.T) {
 			continue
 		}
 		text := strings.Join(texts, "；")
+		// 双档限流（凭证 + IP）是 clusterMachineRateLimit 的**失败预算**：
+		// 401 保留额度、非 401 回滚（releaseRateLimitReservation），合法
+		// 节点成功请求不消耗额度。文档写成无条件请求速率会让从节点把
+		// 30/min 误当吞吐上限，或把连续 401 后的 429 误判为网络限流而非
+		// 凭证失效。
+		if registration.rateLimitIPPerMin > 0 {
+			if !strings.Contains(text, "失败") || !strings.Contains(text, "401") {
+				t.Errorf("%s 文档 429 未说明「仅 401 失败尝试计入」（该族是失败预算而非请求速率）: %s", key, text)
+			}
+		}
 		numbers := rateLimitNumbersIn(text)
 		if len(numbers) == 0 {
 			continue

@@ -35,15 +35,16 @@ func (m *IP2RegionUpdateManager) StatusSnapshot() IP2RegionUpdateStatusSnapshot 
 	return ip2RegionStoredStatusSnapshot()
 }
 
-// setSlotAdvanceError 记录「状态行已落库、但排程槽未推进」——任务引擎 Run 体
-// 据此把本轮按失败返回（更新本身成功；失败的是调度契约，引擎需要失败才能
-// 退避重投同一槽，而不是把本槽记入消费水位）。
+// setSlotAdvanceError 记录「本轮排程槽未推进」的原因（排程不可读，或状态行
+// 写入失败连带槽一起没落地）——任务引擎 Run 体据此把本轮按失败返回（更新
+// 本身可能已成功；失败的是调度契约，引擎需要失败才能退避重投同一槽，而不是
+// 把本槽记入消费水位）。
 func (m *IP2RegionUpdateManager) setSlotAdvanceError(err error) {
 	m.mu.Lock()
 	m.scheduleSlotErr = err
 	m.mu.Unlock()
 	if err != nil {
-		Logf("error", "ip2region update: 排程不可读，本轮排程槽未推进（引擎将退避重投，读恢复后自愈）: %v", err)
+		Logf("error", "ip2region update: 本轮排程槽未推进（引擎按 1s/5s/30s 退避重投；连续 4 轮仍未推进即停调，需在业务页重新保存自动更新或重启进程恢复）: %v", err)
 	}
 }
 

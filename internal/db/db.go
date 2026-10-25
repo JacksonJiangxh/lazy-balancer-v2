@@ -5039,17 +5039,17 @@ func migrateTCPRuleDeadFields() error {
 const ruleTLSModeResidueProbeSQL = `SELECT
 	(SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''))
 	+ (SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(ca_provider_id,0)<>0)
-	+ (SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')='manual' AND COALESCE(acme_config_id,0)<>0)`
+	+ (SELECT COUNT(*) FROM lb_rules WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(acme_config_id,0)<>0)`
 
 // ruleTLSModeResidueResetSQLs 跨模式 TLS 残留复位（顺序无关、幂等）：
 // 非 manual 源不保留证书材料（私钥正文随导出/备份/快照放大）；非 acme_dns
-// 源不保留 CA 提供商引用（ResolveCAProviderID 对非 0 不校验存在性，残留死
-// 引用签发期才暴露）；manual 源不保留 ACME 配置引用。三种残留渲染零消费，
+// 源不保留 CA 提供商引用与 ACME 配置引用（ResolveCAProviderID 对非 0 不校验
+// 存在性，残留死引用签发期才暴露；空来源与 manual 同理）。三种残留渲染零消费，
 // 但会让同一终态在「主端库 / 导出 canonical / 从端落库」呈现两种形态。
 var ruleTLSModeResidueResetSQLs = []string{
 	`UPDATE lb_rules SET tls_cert='', tls_key='' WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>'')`,
 	`UPDATE lb_rules SET ca_provider_id=0 WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(ca_provider_id,0)<>0`,
-	`UPDATE lb_rules SET acme_config_id=0 WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')='manual' AND COALESCE(acme_config_id,0)<>0`,
+	`UPDATE lb_rules SET acme_config_id=0 WHERE protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(acme_config_id,0)<>0`,
 }
 
 // migrateRuleTLSModeResidue：HTTP 规则跨模式 TLS 残留清零（存储侧自愈）。

@@ -275,7 +275,8 @@ func SetAutobanConfig(cfg AutobanConfig) error {
 	if !cfg.Enabled {
 		AutobanDisableFlush()
 	}
-	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）。
+	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）；
+	// 应用值在锁内按库实态读取，本参数仅作读失败回退。
 	applyBusinessTaskLoop(AutobanTaskID, cfg.Enabled)
 	return nil
 }

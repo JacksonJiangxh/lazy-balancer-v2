@@ -144,7 +144,13 @@ func (p *Provider) CleanUp(ctx context.Context, zone, tokenFQDN string) error {
 // CleanUpValue removes only the record this issuance created (same challenge
 // value), plus legacy/stale leftovers under the same name; a concurrent
 // issuance's recent record of another value is spared.
+//
+// 空值必须 fail-fast：与 dnspod 侧同构（ownership MatchingValue("") 退化为
+// 按名匹配，内存兜底只选空值条目——双语义，未来空值调用会误删并发挑战）。
 func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("按值清理必须提供非空挑战值（按名清空请使用 CleanUp）")
+	}
 	return p.cleanUp(ctx, zone, tokenFQDN, value, true)
 }
 

@@ -1,7 +1,7 @@
 package handlers
 
-// 任务流/横幅域修复钉测：退化提交两态横幅文案、规则 apply 失败横幅持久化、
-// 任务日志轮转副本兜底、cert-job 日志路径单行查询。
+// 任务流/横幅域修复钉测：退化提交两态横幅文案、规则 apply 失败横幅分类
+// （配置拒绝不写 / 传输失败写）、任务日志轮转副本兜底、cert-job 日志路径单行查询。
 
 import (
 	"net/http"
@@ -48,11 +48,12 @@ func TestFinishTxApply_degradedCommitWritesSavedNotLiveBanner(t *testing.T) {
 	}
 }
 
-// Given 规则更新的事务内 apply 传输失败。
+// Given 规则更新的事务内 apply 被 Caddy 拒绝（CLI/admin 4xx）。
 // When UpdateRule 走 apply 失败分支。
-// Then 持久化 caddy_apply_error 横幅（刷新页面后分叉仍可见）——此前五处
-// 规则分支只回 500+审计，不写横幅事实源。
-func TestUpdateRule_applyFailurePersistsBanner(t *testing.T) {
+// Then 返回 400、DB 回滚、且不写 caddy_apply_error 横幅——配置拒绝时候选未
+// /load、运行配置仍是提交前形态，库态与运行态无分叉；写横幅会让用户追一个
+// 不存在的不一致（与 finishTxApply 拒绝分支同口径）。
+func TestUpdateRule_configRejectionDoesNotPersistBanner(t *testing.T) {
 	harness := newUpdateAuditRuleHandlers(t, "lb_banner", 1, false)
 	handler := harness.handler
 	seedAuditRule(t, "lb_banner", "before", "banner.example.test", 8080, true, "manual", false)
@@ -65,14 +66,20 @@ func TestUpdateRule_applyFailurePersistsBanner(t *testing.T) {
 
 	router.ServeHTTP(response, request)
 
-	// 夹具失败形态=Caddy 400 拒绝（IsConfigRejected）——横幅持久化对拒绝/
-	// 传输两形态同写点（respondRuleApplyError 内统一收口）。
+	// 夹具失败形态=Caddy 400 拒绝（IsConfigRejected）。
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("apply 拒绝应 400, status=%d body=%s", response.Code, response.Body.String())
 	}
-	banner := readApplyError(t)
-	if !strings.Contains(banner, "旧配置已保留") {
-		t.Fatalf("规则 apply 失败未持久化「未保存（旧配置已保留）」横幅, got %q", banner)
+	if banner := readApplyError(t); banner != "" {
+		t.Fatalf("配置拒绝不得写失败横幅（无分叉事实）, got %q", banner)
+	}
+	// 拒绝仍须留操作审计（Explicit 策略下中间件不补）。
+	var auditCount int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%Caddy 配置应用失败%'`).Scan(&auditCount); err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if auditCount == 0 {
+		t.Fatal("配置拒绝缺少操作审计")
 	}
 	// DB 回滚不破（同钉测家族口径）。
 	var name string
@@ -81,6 +88,31 @@ func TestUpdateRule_applyFailurePersistsBanner(t *testing.T) {
 	}
 	if name != "before" {
 		t.Fatalf("apply 失败后 DB 应回滚, name=%q", name)
+	}
+}
+
+// Given 规则更新的事务内 apply 传输失败（admin 5xx，非配置拒绝）。
+// When UpdateRule 走 apply 失败分支。
+// Then 持久化 caddy_apply_error 横幅——运行配置可能已吸收候选（传输错误
+// 发生在请求断连/超时），刷新页面后分叉必须可见。
+func TestUpdateRule_transportFailurePersistsBanner(t *testing.T) {
+	handler, _ := newFailingLoadHandlers(t)
+	seedAuditRule(t, "lb_banner_tx", "before", "banner-tx.example.test", 8080, true, "manual", false)
+	seedAuditUpstream(t, "lb_banner_tx")
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_banner_tx", strings.NewReader(`{"name":"after"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("传输失败应 500, status=%d body=%s", response.Code, response.Body.String())
+	}
+	banner := readApplyError(t)
+	if !strings.Contains(banner, "Caddy 配置应用失败") || !strings.Contains(banner, caddyApplyOldConfigKeptLabel) {
+		t.Fatalf("传输失败未持久化「旧配置已保留」横幅, got %q", banner)
 	}
 }
 

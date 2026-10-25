@@ -31,7 +31,7 @@
         </template>
         <el-table-column prop="name" label="页面名称" min-width="180">
           <template #default="{ row }">
-            <el-link type="primary" @click="previewPage(row)">{{ row.name }}</el-link>
+            <AccessibleLink type="primary" @click="previewPage(row)">{{ row.name }}</AccessibleLink>
             <el-tag v-if="row.is_default || row.is_builtin" size="small" type="info" effect="plain" style="margin-left: 8px">内置</el-tag>
           </template>
         </el-table-column>
@@ -138,6 +138,7 @@ import { updaterName } from '@/utils/updaterName'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import CodeEditor from '@/components/CodeEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import type { APIResponse, UserListItem } from '@/types'
 interface BlockPage { id: number; name: string; description: string; content: string; content_type?: string; rule_ref_count?: number; is_default: boolean; is_builtin?: boolean; updated_at: string; updated_by: number }
 

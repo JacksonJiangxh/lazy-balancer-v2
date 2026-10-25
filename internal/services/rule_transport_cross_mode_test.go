@@ -49,6 +49,17 @@ func TestNormalizeRuleForTransport_httpCrossModeTLSResidue(t *testing.T) {
 	if manual.TLSCert != "CERT2" || manual.TLSKey != "KEY2" {
 		t.Fatalf("manual rule cert=%q key=%q, want 保留", manual.TLSCert, manual.TLSKey)
 	}
+
+	// 空来源（API 创建 TLS 关闭且未选来源 / 旧版本行）：同样非 acme_dns，
+	// ACME/CA 引用清零——不清理会让死引用随导出/备份/集群快照放大。
+	empty := models.LbRule{Protocol: "http", TLSSource: "", TLSCert: "CERT3", TLSKey: "KEY3", ACMEConfigID: 5, CAProviderID: 6}
+	normalizeRuleForTransport(&empty)
+	if empty.ACMEConfigID != 0 || empty.CAProviderID != 0 {
+		t.Fatalf("empty source rule acme=%d ca=%d, want 0/0", empty.ACMEConfigID, empty.CAProviderID)
+	}
+	if empty.TLSCert != "" || empty.TLSKey != "" {
+		t.Fatalf("empty source rule cert=%q key=%q, want 清零（非 manual 不保留材料）", empty.TLSCert, empty.TLSKey)
+	}
 }
 
 // TCP 传输归一的清零清单必须与保存族/迁移 SQL 同口径：domain /

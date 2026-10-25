@@ -217,7 +217,10 @@ func TestAutobanConfig_putTogglesLoopScheduling(t *testing.T) {
 	services.SetConfigLoadRerun(func(operator string) error { return nil })
 	t.Cleanup(func() { services.SetConfigLoadRerun(nil) })
 	te := services.InitTaskEngine("", t.TempDir()+"/app.log")
-	t.Cleanup(te.Stop)
+	// 收尾必须清全局指针（StopTaskEngine 会 Swap(nil)）：只停实例会把
+	// 「已停止但非 nil」的引擎留给后续用例，任何只判 nil 的装配（如
+	// 自动备份执行器）都会拿到死引擎，门禁随测试顺序变红。
+	t.Cleanup(services.StopTaskEngine)
 
 	base := map[string]any{"threshold": 100, "window_minutes": 5, "duration": "1h", "scope": "all", "dry_run": true}
 	body := func(enabled bool) map[string]any {
@@ -595,7 +598,8 @@ func TestAutobanConfig_putDisableFlushesExpiredEntries(t *testing.T) {
 	services.SetConfigLoadRerun(func(operator string) error { return nil })
 	t.Cleanup(func() { services.SetConfigLoadRerun(nil) })
 	te := services.InitTaskEngine("", t.TempDir()+"/app.log")
-	t.Cleanup(te.Stop)
+	// 同族收尾：清全局指针，不留 stopped 非 nil 引擎给后续用例。
+	t.Cleanup(services.StopTaskEngine)
 	id := autobanPresetID(t)
 	seedAutobanListEntries(t, `[
 		{"value":"198.51.100.1","remark":"自动封禁","created_at":"2026-10-13 10:00:00","expires_at":"2020-01-01 00:00:00"},

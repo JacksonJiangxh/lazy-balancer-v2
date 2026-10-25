@@ -16,13 +16,13 @@ func TestStageCategorizeAttack_buckets(t *testing.T) {
 		ruleMsg       string
 		want          string
 	}{
-		// 信任名单：id 3/12
+		// 信任名单：id 3/12 + id 5（绕过模式占位的同族 DetectionOnly 规则）
 		{"trust id 3", "3", "", "信任名单"},
+		{"trust bypass id 5", "5", "", "信任名单"},
 		{"trust id 12", "12", "", "信任名单"},
-		// IP 访问控制：黑白名单（2/4/5/7）+ 地域（8/8xxxxx）+ 威胁库（14）
+		// IP 访问控制：黑白名单（2/4/7）+ 地域（8/8xxxxx）+ 威胁库（14）
 		{"acl blacklist id 2", "2", "", "IP 访问控制"},
 		{"acl blacklist id 4", "4", "", "IP 访问控制"},
-		{"acl allow id 5", "5", "", "IP 访问控制"},
 		{"acl allow id 7", "7", "", "IP 访问控制"},
 		{"geo legacy id 8", "8", "", "IP 访问控制"},
 		{"geo precheck id", "800123", "", "IP 访问控制"},

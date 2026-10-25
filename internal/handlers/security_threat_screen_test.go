@@ -375,7 +375,7 @@ func TestGetSecurityThreatScreen_recentRateUsesInjectedClock(t *testing.T) {
 }
 
 func TestTriggerTypeForRule_legacyTrustAndACL(t *testing.T) {
-	for rule, want := range map[string]string{"3": "信任名单", "5": "IP 访问控制", "12": "信任名单", "2": "IP 访问控制"} {
+	for rule, want := range map[string]string{"3": "信任名单", "5": "信任名单", "12": "信任名单", "2": "IP 访问控制"} {
 		if got := triggerTypeForRule(rule); got != want {
 			t.Fatalf("triggerTypeForRule(%q)=%q, want %q", rule, got, want)
 		}
@@ -811,7 +811,7 @@ func TestTriggerTypeForRule_fullTaxonomy(t *testing.T) {
 		"2":       "IP 访问控制",
 		"3":       "信任名单",
 		"4":       "IP 访问控制",
-		"5":       "IP 访问控制",
+		"5":       "信任名单",
 		"7":       "IP 访问控制",
 		"8":       "地域拦截",
 		"12":      "信任名单",

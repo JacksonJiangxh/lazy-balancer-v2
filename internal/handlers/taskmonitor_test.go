@@ -883,8 +883,16 @@ func TestListSystemTasks_exposesRetryCooldownSeconds(t *testing.T) {
 		if got == nil {
 			t.Fatalf("任务行 %s 冷却=null, want %d", id, want)
 		}
-		if *got != want {
-			t.Fatalf("任务行 %s 冷却=%d, want %d", id, *got, want)
+		if want == 0 {
+			if *got != 0 {
+				t.Fatalf("任务行 %s 冷却=%d, want 0（已过期/无冷却必须精确为零）", id, *got)
+			}
+			return
+		}
+		// 造行时间 datetime('now') 是秒级截断：恰好跨秒时剩余窗口比完整时长少
+		// 1 秒。按区间断言，避免慢机/-race 下偶发假红（与证书任务列表同口径）。
+		if *got > want || *got < want-1 {
+			t.Fatalf("任务行 %s 冷却=%d, want %d（容许 1 秒秒级截断误差）", id, *got, want)
 		}
 	}
 	if got := cooldownOf("cert-job:1"); got == nil || *got < 7100 || *got > 7200 {

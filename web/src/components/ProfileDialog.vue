@@ -185,7 +185,12 @@ const startEnable = async (): Promise<void> => {
   mfaSubmitting.value = true
   try {
     const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', {}, { silent: true })
-    if (!res.data) return
+    // 200 但无 data = 后端契约违约（弱网截断/网关改包）：必须显性报错，
+    // 静默 return 会让按钮复位、弹框不动，与「没点上」不可区分
+    if (!res.data) {
+      ElMessage.error('响应异常，请重试')
+      return
+    }
     pendingSecret.value = res.data.secret
     pendingUri.value = res.data.uri
     wizardVisible.value = true
@@ -215,7 +220,11 @@ const confirmMfaAction = async (): Promise<void> => {
       return
     }
     const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', { code: mfaCode.value }, { silent: true })
-    if (!res.data) return
+    // 同 startEnable：200 无 data 必须显性报错（验码弹框保持打开，凭据不复位）
+    if (!res.data) {
+      ElMessage.error('响应异常，请重试')
+      return
+    }
     mfaCodeDialog.value = false
     pendingSecret.value = res.data.secret
     pendingUri.value = res.data.uri

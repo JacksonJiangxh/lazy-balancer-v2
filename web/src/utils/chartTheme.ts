@@ -8,9 +8,9 @@ const chartPalette = {
 } as const
 
 /** 状态 → 色（任务监控/安全总览共用语义色）——键=TaskStatus 实际产出值
- * （running/idle/failed 三态；清理：cancelled/stopped/queued/disabled
- * 均为零产出死键——stopped/disabled/queued 已退役、cancelled 仅存在于
- * task_runs result 字段非状态列；passive/no_runs 曾为零产出死条目， 清理）*/
+ * （running/idle/failed 三态）。已删除的零产出死键：cancelled/stopped/queued/
+ * disabled（stopped/disabled/queued 已退役；cancelled 仅存在于 task_runs 的
+ * result 字段，不是状态列）与 passive/no_runs（曾为零产出死条目）。*/
 export const statusColor: Record<string, string> = {
   running: chartPalette.primary,
   idle: chartPalette.slate,

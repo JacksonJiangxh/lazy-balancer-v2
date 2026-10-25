@@ -143,9 +143,13 @@ func TestAuditResultText_dynamicCallSitesTripwire(t *testing.T) {
 	//     user_unavailable/database_error）
 	//   cluster_registration.go 节点操作闭包 2 处——clusterNodeAction 与站点
 	//     坐标保存各 1（blocked/invalid_request/failed）
+	//   certjobs.go 2 处——retryCertJobByID 的失败出口闭包（auditFailure 与
+	//     auditFailureWithRule 各 1，取值域见 auditDynamicResultCodes 的
+	//     证书任务重试/删除失败组）
+	//   certjobs.go DeleteCertJob 1 处——失败出口闭包
 	// 取值域逐项登记在 auditDynamicResultCodes，新增码仍受
 	// TestAuditResultText_auditFailureLiteralsRegistered 与本表约束。
-	const want = 12
+	const want = 15
 	if dynamic != want {
 		t.Fatalf("AuditResultPart 动态调用点=%d，want %d：新增动态入口必须审查取值域并更新本绊线", dynamic, want)
 	}

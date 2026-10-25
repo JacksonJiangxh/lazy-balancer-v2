@@ -185,8 +185,8 @@ func GetCertRenewalAttempts() int {
 }
 
 // FormatRuleCertInfo 从 PEM 证书内容生成展示用 RuleCertInfo——批量
-// (handlers.GetRulesCertInfo)与单规则(ParseCertInfo)两路径同用
-// 收敛：原 handlers.parseBatchRuleCertInfo 与本文件 ParseCertInfo 两份实现历史
+// (handlers.GetRulesCertInfo)与单规则(parseCertInfo)两路径同用
+// 收敛：原 handlers.parseBatchRuleCertInfo 与本文件 parseCertInfo 两份实现历史
 // 三度分叉）。参数显式化：expiryDays=expiring 阈值天数、now=判定基准（批量取
 // 统一快照，避免逐规则 time.Now 漂移）；caddyID 非空时回填。source=acme_dns 且
 // PEM 为空时给出 ACME 专属「尚未签发」文案（其余来源「证书不存在」）。
@@ -271,10 +271,10 @@ func formatRuleCertInfo(certPEM string, cert *x509.Certificate, source, ruleDoma
 	return info
 }
 
-// ParseCertInfo parses a PEM certificate and returns structured display info.
+// parseCertInfo parses a PEM certificate and returns structured display info.
 // 阈值取配置值(cert_expiry_days)、基准取当前时刻——批量路径改用
 // FormatRuleCertInfo 显式传参（同一实现）。
-func ParseCertInfo(certPEM, source, ruleDomains string) *models.RuleCertInfo {
+func parseCertInfo(certPEM, source, ruleDomains string) *models.RuleCertInfo {
 	return FormatRuleCertInfo(certPEM, source, ruleDomains, "", GetCertExpiryThreshold(), time.Now())
 }
 
@@ -303,14 +303,14 @@ func GetRuleCertInfo(caddyID string) (*models.RuleCertInfo, error) {
 
 	switch tlsSource {
 	case "manual":
-		info := ParseCertInfo(tlsCert, "manual", ruleDomain)
+		info := parseCertInfo(tlsCert, "manual", ruleDomain)
 		info.CaddyID = caddyID
 		return info, nil
 	case "acme_dns":
 		return getACMECertInfo(caddyID, ruleDomain)
 	default:
 		// Fallback to manual cert if source is unrecognized but tls_cert exists
-		info := ParseCertInfo(tlsCert, tlsSource, ruleDomain)
+		info := parseCertInfo(tlsCert, tlsSource, ruleDomain)
 		info.CaddyID = caddyID
 		return info, nil
 	}
@@ -323,7 +323,7 @@ func GetRuleCertInfo(caddyID string) (*models.RuleCertInfo, error) {
 // DB 故障与「确实还没有证书」对操作者必须可区分。仅「无候选行」返回 missing。
 func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 	// 阈值/基准取一次，供候选选择与过期回退共用——此前
-	// ExpiredACMECertInfoFallback 对每个候选调用 ParseCertInfo，每候选一次
+	// ExpiredACMECertInfoFallback 对每个候选调用 parseCertInfo，每候选一次
 	// global_config 读 + 重复 X509 解析。
 	now := time.Now()
 	expiryDays := GetCertExpiryThreshold()

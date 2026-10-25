@@ -79,11 +79,11 @@ type IP2RegionUpdateManager struct {
 	runCancel   context.CancelCauseFunc
 	downloadXDB func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
 
-	// scheduleSlotErr 本运行「状态行已落库、但排程槽未推进」的原因（写路径
-	// 严格读排程失败）。setSlotAdvanceError 置位；Run 体把本轮按失败返回给
-	// 任务引擎——成功轮不推进槽却回 success 会被引擎记入本槽消费水位，此后
-	// 同一槽永不再投递（该族自动更新静默停摆，没有下一轮可以自愈）。每次
-	// 运行起点清空。
+	// scheduleSlotErr 本运行「排程槽未推进」的原因：排程不可读（写路径严格
+	// 读排程失败）或状态行写入失败（槽随之未落地）。setSlotAdvanceError
+	// 置位；Run 体把本轮按失败返回给任务引擎——成功轮不推进槽却回 success
+	// 会被引擎记入本槽消费水位，此后同一槽永不再投递（该族自动更新静默
+	// 停摆，没有下一轮可以自愈）。每次运行起点清空。
 	scheduleSlotErr error
 }
 
@@ -381,9 +381,11 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			"UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 			slotArgs...,
 		); err != nil {
-			// 成功轮排程槽推进写失败=引擎已消费过期槽而业务槽停滞（静默停摆），
-			// 级别与后果匹配。
-			Logf("error", "ip2region update: failed to record latest-version skip（排程槽可能未推进）: %v", err)
+			// 状态行没落地=本轮对调度契约而言失败（排程槽同样未推进）：并入
+			// 「槽未推进」通道，由 Run 体按失败返回（引擎退避重投，写成功即
+			// 推进槽）。吞错按 success 收尾会让引擎消费过期槽而库里槽仍旧，
+			// 该族自动更新再无自愈路径。
+			slotErr = errors.Join(slotErr, fmt.Errorf("%w: 状态行写入失败: %w", errScheduleSlotNotAdvanced, err))
 		}
 		m.setSlotAdvanceError(slotErr)
 		m.mu.Lock()
@@ -550,7 +552,9 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		append([]any{tag}, slotArgs...)...,
 	); err != nil {
-		Logf("error", "ip2region update: failed to record success: %v", err)
+		// 同「已是最新」分支：状态行没落地即本轮失败（槽也未推进），走同一
+		// 「槽未推进」通道让引擎退避重投。
+		slotErr = errors.Join(slotErr, fmt.Errorf("%w: 状态行写入失败: %w", errScheduleSlotNotAdvanced, err))
 	}
 	m.setSlotAdvanceError(slotErr)
 	SetIP2RegionVersion(tag)
@@ -993,7 +997,9 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message=?, finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		append([]any{tag, warn}, slotArgs...)...,
 	); err != nil {
-		Logf("error", "ip2region update: failed to record fail-open success: %v", err)
+		// fail-open 成功同属成功轮：状态行没落地即本轮失败（槽也未推进），
+		// 并入同一通道让引擎退避重投。
+		slotErr = errors.Join(slotErr, fmt.Errorf("%w: 状态行写入失败: %w", errScheduleSlotNotAdvanced, err))
 	}
 	m.setSlotAdvanceError(slotErr)
 	SetIP2RegionVersion(tag)

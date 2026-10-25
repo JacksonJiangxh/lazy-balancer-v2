@@ -114,16 +114,15 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 	}
 	// HTTP 跨模式 TLS 残留（与保存族 / 导入后置归一 / 启动迁移同一不变量）：
 	// 生效来源非 manual 不保留证书材料（私钥正文随快照/备份放大）；非
-	// acme_dns 不保留 CA 提供商引用（ResolveCAProviderID 对非 0 不校验存在性，
-	// 残留死引用签发期才暴露）；manual 不保留 ACME 配置引用。渲染侧按来源
-	// 分流，残留列零消费——不回填只会让主端存储/导出/从端落库三面分叉。
+	// acme_dns 不保留 CA 提供商引用与 ACME 配置引用（ResolveCAProviderID 对
+	// 非 0 不校验存在性，残留死引用签发期才暴露；空来源与 manual 同理）。
+	// 渲染侧按来源分流，残留列零消费——不回填只会让主端存储/导出/从端落库
+	// 三面分叉。
 	if rule.TLSSource != "manual" {
 		rule.TLSCert, rule.TLSKey = "", ""
 	}
 	if rule.TLSSource != "acme_dns" {
 		rule.CAProviderID = 0
-	}
-	if rule.TLSSource == "manual" {
 		rule.ACMEConfigID = 0
 	}
 }

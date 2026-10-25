@@ -112,7 +112,7 @@ import { useTrustAssociation } from '@/composables/useTrustAssociation'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
-import { aclAssociateSides, inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntries, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues, trustHitMode } from '@/utils/securityStages'
+import { aclAssociateSides, inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntriesMissing, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues, trustHitMode } from '@/utils/securityStages'
 import { popperViewportSafe } from '@/utils/popper'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
 import { planTrustRemoval } from '@/utils/trustRemoval'
@@ -249,9 +249,15 @@ interface IpListWithEntries extends IpListOption {
 // 与 TriggerDetailDialog 共用模块级缓存：原为组件内 ref，
 // 每事件行一个实例 → 同一 IP 弹层多次打开/多行弹层各自整批下载条目。
 const ipListEntries = ref<Record<number, string[]>>({ ...sharedEntriesCache })
+// 「取消信任」决策前刷新条目期间抑制缓存中间态回写本地副本：ensure 对过期 id
+// 先静默删除、再逐个回填，每次回填都会通知一次——若中间态照抄进显示，其余仍在
+// 拉取的名单会瞬时显示成「未在该名单」（空态闪烁）。刷新由调用方在结束时整体
+// 替换副本，故中间态一律跳过。
+let entriesRefreshInFlight = false
 let unregisterEntriesCache: (() => void) | null = null
 onMounted(() => {
   unregisterEntriesCache = subscribeSharedEntriesCache(() => {
+    if (entriesRefreshInFlight) return
     ipListEntries.value = { ...sharedEntriesCache }
   })
 })
@@ -259,6 +265,13 @@ onUnmounted(() => {
   unregisterEntriesCache?.()
   unregisterEntriesCache = null
 })
+
+// 单名单条目加载器：loadIpLists 的按需拉取与「取消信任」的决策前强制刷新共用
+// 同一实现（两处各写一份会在请求形态/归一规则变化时漂移）。
+const loadListEntries = async (id: number): Promise<string[]> => {
+  const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)
+  return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
+}
 
 const loadIpLists = async (): Promise<void> => {
   try {
@@ -272,14 +285,11 @@ const loadIpLists = async (): Promise<void> => {
     }
     // 仅拉取共享缓存缺失的名单 id：跨组件/跨实例共享，
     // 写入动作经 invalidate 清空后自动重拉；成员判定保持即时正确
-    await ensureSharedEntries(refIds, async (id) => {
-      const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)
-      return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
-    })
+    const missing = await ensureSharedEntriesMissing(refIds, loadListEntries)
     ipListEntries.value = { ...sharedEntriesCache }
-    // ensureSharedEntries 的单名单失败保持「未缓存」（securityStages 契约：下次可重试）
-    // ——引用条目缺失即成员判定不完整，与列表接口失败同口径暴露。
-    listsError.value = [...refIds].some((id) => !(id in sharedEntriesCache))
+    // 单名单失败保持「未缓存」且过期缓存按缺失计（securityStages 契约：下次可
+    // 重试）——引用条目缺失即成员判定不完整，与列表接口失败同口径暴露。
+    listsError.value = missing.length > 0
   } catch {
     // 单弹层加载失败不清全局共享缓存：其它组件可能仍持有有效条目；
     // 下次 ensureSharedEntries 会按名单 ID 自行重拉。
@@ -649,6 +659,24 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   // 命中引用列表精确条目）与不可移除的残余 CIDR 信任一次算清。原实现仅在
   // 「无内联精确条目」时守卫；IP 同时由内联精确条目与引用 CIDR 信任时跳过
   // 守卫，移除后仍持续信任却弹「已取消信任 / 恢复拦截」的谎报。
+  // 安全结论不得读可能陈旧的显示缓存：弹层可长开（条目缓存 TTL 60s），期间
+  // 他人/另一标签页可能在受引用名单里增删覆盖该 IP 的条目——本次决策前按 TTL
+  // 强制补齐本策略信任侧引用的名单条目（仍在 TTL 内即零请求，过期才重拉，
+  // 不闪空态：本地副本只在补齐返回后整体替换）。补齐失败时条目缺失会让残余
+  // 信任判定漏报，与 listsError 同口径拒绝出结论（禁用全部处置动作 + 横幅重试）。
+  const trustRefIds = parseRefIds(row.policy.ip_whitelist_refs)
+  if (trustRefIds.length > 0) {
+    entriesRefreshInFlight = true
+    const missingTrustIds = await ensureSharedEntriesMissing(trustRefIds, loadListEntries)
+      .finally(() => { entriesRefreshInFlight = false })
+    ipListEntries.value = { ...sharedEntriesCache }
+    if (missingTrustIds.length > 0) {
+      listsError.value = true
+      ElMessage.error('信任名单的最新条目加载失败，无法给出可靠的取消信任结论，请重试')
+      unlockBusy(row.policy.id, 'untrust')
+      return
+    }
+  }
   const plan = planTrustRemoval({
     ip,
     inlineWhitelist: row.policy.ip_whitelist,

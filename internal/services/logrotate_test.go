@@ -386,9 +386,11 @@ func TestRuntimeLogCleanupOnce_outOfRangeRetentionFallsBackToDefault(t *testing.
 	}
 }
 
-// 库未初始化时不得整体跳过应用日志副本清理（此前 db 为 nil 直接
-// return，AppRemoved=0 静默跳过——与「清理不得静默跳过」口径相反）。
-func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
+// 库未初始化/已关闭时保留月数口径未知：保留期删除（应用日志副本与任务日志）
+// 一律跳过——nil 覆盖的正是「关停后 db.Close()、在途清理轮仍在跑」的形态，
+// 按默认 3 月删除会把用户更长保留期内的日志不可逆删掉。不依赖保留期口径的
+// 清理段（waf-audit 兜底、规则日志孤儿）仍在保留期门之前执行并各自留痕。
+func TestRuntimeLogCleanupOnce_nilDBSkipsRetentionDeletion(t *testing.T) {
 	oldDB, oldMetrics, oldAudit := db.DB, db.MetricsDB, db.AuditDB
 	oldCurrent := db.GetDB()
 	db.DB, db.MetricsDB, db.AuditDB = nil, nil, nil
@@ -401,13 +403,44 @@ func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "app.log")
 	writeStaleAppLogCopy(t, dir, "app.log.1")
+	tasksDir := filepath.Join(dir, "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleTaskLog := filepath.Join(tasksDir, "stale.log")
+	if err := os.WriteFile(staleTaskLog, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().AddDate(0, -13, 0)
+	if err := os.Chtimes(staleTaskLog, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	oldAuditLogPath := auditLogPath
+	auditLogPath = filepath.Join(dir, "audit.log") // 不存在：兜底 stat 不算失败
+	t.Cleanup(func() { auditLogPath = oldAuditLogPath })
 
 	res := RuntimeLogCleanupOnce(context.Background(), logFile)
-	if res.AppRemoved != 1 {
-		t.Fatalf("nil 库时 AppRemoved=%d, want 1（不得跳过应用日志副本清理）", res.AppRemoved)
+	if res.RetentionError == "" {
+		t.Fatal("nil 库时保留月数口径未知，必须记入 RetentionError")
 	}
-	if res.RetentionMonths != 3 {
-		t.Fatalf("nil 库时 RetentionMonths=%d, want 3（默认保留期）", res.RetentionMonths)
+	if res.AppRemoved != 0 {
+		t.Fatalf("nil 库时 AppRemoved=%d, want 0（口径未知时不得按默认保留期删除）", res.AppRemoved)
+	}
+	if len(res.TaskLogs.Deleted) != 0 {
+		t.Fatalf("nil 库时 TaskLogs.Deleted=%v, want 空（口径未知时不得删除）", res.TaskLogs.Deleted)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app.log.1")); err != nil {
+		t.Fatalf("应用日志副本必须保留: %v", err)
+	}
+	if _, err := os.Stat(staleTaskLog); err != nil {
+		t.Fatalf("任务日志必须保留: %v", err)
+	}
+	if err := res.Err(); err == nil {
+		t.Fatal("保留期口径未知必须让本轮失败（不得静默成功）")
+	}
+	// 不依赖保留期口径的清理段仍执行：nil 库时孤儿规则日志扫描进错误面且不删除。
+	if res.RuleLogs.ScanError == "" {
+		t.Fatal("规则日志孤儿清理应在保留期门之前执行并留痕（nil 库=无可判定存活规则）")
 	}
 }
 

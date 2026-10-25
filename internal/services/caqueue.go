@@ -1607,7 +1607,7 @@ func loadCAProvider(id int) (models.CAProvider, error) {
 	if explicitID != 0 {
 		var enabled bool
 		var name string
-		stateErr := db.DB.QueryRow("SELECT enabled, COALESCE(name,'') FROM ca_providers WHERE id=?", explicitID).Scan(&enabled, &name)
+		stateErr := db.DB.QueryRow("SELECT COALESCE(enabled,0), COALESCE(name,'') FROM ca_providers WHERE id=?", explicitID).Scan(&enabled, &name)
 		switch {
 		case stateErr == nil && !enabled:
 			return p, fmt.Errorf("CA 提供商 %d（%s）已禁用：显式选择不会静默改派，请先启用该提供商或修改规则选择", explicitID, name)

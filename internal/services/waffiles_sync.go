@@ -1014,32 +1014,40 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	// 树再次回滚（无声明哈希的调用方（测试/独立调用）保留「非空 live 不覆盖」
 	// 的旧口径）。
 	if _, statErr := os.Stat(backup); statErr == nil {
-		restoreNeeded := wafTreeEmptyOrMissing(destDir)
-		liveMatchesDeclared := false
-		if !restoreNeeded && expectSum != "" {
-			if sum, sumErr := tarGzDirSum(destDir); sumErr == nil && sum == expectSum {
-				liveMatchesDeclared = true
-			} else {
-				restoreNeeded = true
+		// 完整性门：备份本身也可能是残缺的（拷贝中途 ENOSPC/EIO 留下的半份
+		// 旧树）。残缺备份一律按「无备份」处理——用它写回 live 等于把健康旧树
+		// 换成半份旧树，恢复方向反了。保留现场不动（下方替换段的陈旧备份清理
+		// 会覆盖它），本轮照常 apply，成功即自愈。
+		if !crsRulesTreeIntact(filepath.Join(backup, "rules")) {
+			Logf("warn", "waf sync: 残留备份 %s 不完整（缺 %s 或 .conf 文件），拒绝以其恢复 live 树，按无备份继续本轮 apply", backup, crsRulesProbeFile)
+		} else {
+			restoreNeeded := wafTreeEmptyOrMissing(destDir)
+			liveMatchesDeclared := false
+			if !restoreNeeded && expectSum != "" {
+				if sum, sumErr := tarGzDirSum(destDir); sumErr == nil && sum == expectSum {
+					liveMatchesDeclared = true
+				} else {
+					restoreNeeded = true
+				}
 			}
-		}
-		if restoreNeeded {
-			// 恢复同样整树清空+复制 live——必须处于树交换窗口内（旧树恢复期间
-			// live 可能为空/部分）。
-			if rErr := withTreeSwapWindow(func() error {
-				return restoreWafTreeFromBackup(backup, destDir)
-			}); rErr != nil {
-				return fmt.Errorf("按上次同步备份恢复崩溃窗口的规则树: %w", rErr)
+			if restoreNeeded {
+				// 恢复同样整树清空+复制 live——必须处于树交换窗口内（旧树恢复期间
+				// live 可能为空/部分）。
+				if rErr := withTreeSwapWindow(func() error {
+					return restoreWafTreeFromBackup(backup, destDir)
+				}); rErr != nil {
+					return fmt.Errorf("按上次同步备份恢复崩溃窗口的规则树: %w", rErr)
+				}
+				if rmErr := os.RemoveAll(backup); rmErr != nil {
+					Logf("warn", "waf sync: 恢复旧树后清理备份 %s 失败（下轮入口会再次判定）: %v", backup, rmErr)
+				}
+				Logf("warn", "waf sync: 上次同步中断残留备份（live 可能为空/部分新树），已按备份 %s 恢复旧树后继续本轮 apply", backup)
+			} else if liveMatchesDeclared {
+				if rmErr := os.RemoveAll(backup); rmErr != nil {
+					Logf("warn", "waf sync: live 规则树已与声明哈希一致，但清理残留备份 %s 失败: %v", backup, rmErr)
+				}
+				Logf("warn", "waf sync: 上次同步已完成（live 哈希与声明一致），清理残留备份 %s 后继续本轮 apply", backup)
 			}
-			if rmErr := os.RemoveAll(backup); rmErr != nil {
-				Logf("warn", "waf sync: 恢复旧树后清理备份 %s 失败（下轮入口会再次判定）: %v", backup, rmErr)
-			}
-			Logf("warn", "waf sync: 上次同步中断残留备份（live 可能为空/部分新树），已按备份 %s 恢复旧树后继续本轮 apply", backup)
-		} else if liveMatchesDeclared {
-			if rmErr := os.RemoveAll(backup); rmErr != nil {
-				Logf("warn", "waf sync: live 规则树已与声明哈希一致，但清理残留备份 %s 失败: %v", backup, rmErr)
-			}
-			Logf("warn", "waf sync: 上次同步已完成（live 哈希与声明一致），清理残留备份 %s 后继续本轮 apply", backup)
 		}
 	}
 	if err := os.MkdirAll(staging, 0755); err != nil {
@@ -1163,8 +1171,12 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	_, destStatErr := os.Stat(destDir)
 	destExisted := destStatErr == nil
 	if destExisted {
-		if err := copyDir(destDir, backup); err != nil {
-			return err
+		// 备份构造事务化（复用 CRS 更新器的 tmp 完整构建 → rename 语义）：
+		// 拷贝中途失败（ENOSPC/EIO/EACCES）只会在 .sync-bak.tmp 留残树并被
+		// 清理，绝不会留下「半份 .sync-bak」——下一轮入口会把它当权威旧树
+		// 写回 live，把健康树换成半份旧树。失败时 live 原样保全。
+		if err := copyDirTransactional(destDir, backup); err != nil {
+			return fmt.Errorf("备份当前规则树 %s: %w", backup, err)
 		}
 	}
 	if err := osRename(staging, destDir); err != nil {
@@ -1205,10 +1217,15 @@ func wafTreeEmptyOrMissing(dir string) bool {
 
 // restoreWafTreeFromBackup 尽力从 backup 恢复 destDir：先整树清空再从备份复制，
 // 保证恢复结果为纯旧树而非旧+新混合树（对齐 untarGzTo 的清空语义）。
-// backup 不存在（备份时刻 destDir 不存在）时无可恢复对象，按空操作收尾。
+// backup 不存在（备份时刻 destDir 不存在）时无可恢复对象，按空操作收尾；
+// backup 残缺（拷贝中途失败遗留）时拒绝恢复并返回错误——先验完整性再删 live，
+// 不得用半份备份覆盖 live（清空后才发现备份不可用会让 live 停在残缺态）。
 func restoreWafTreeFromBackup(backup, destDir string) error {
 	if _, statErr := os.Stat(backup); statErr != nil {
 		return nil
+	}
+	if !crsRulesTreeIntact(filepath.Join(backup, "rules")) {
+		return fmt.Errorf("从备份恢复旧树: 备份 %s 不完整（缺 %s 或 .conf 文件），已拒绝以残缺树覆盖 live", backup, crsRulesProbeFile)
 	}
 	if removeErr := os.RemoveAll(destDir); removeErr != nil {
 		return fmt.Errorf("清空目标规则树以恢复旧树: %w", removeErr)

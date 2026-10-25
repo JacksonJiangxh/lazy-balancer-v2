@@ -578,6 +578,9 @@ func TestLbbakImport_crsFailureRestoresLocalVersionRow(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT version,COALESCE(auto_update,0),COALESCE(next_update,''),COALESCE(update_status,'') FROM security_crs_version WHERE id=1`).Scan(&version, &autoUpdate, &nextUpdate, &status); err != nil {
 		t.Fatalf("read restored version: %v", err)
 	}
+	// 行的身份/开关/状态必须原样保留（备份的 v-backup/auto_update=1 不得落库）；
+	// 恢复行的时间列以驱动串形态写回（"…+00:00"），导入后重排按「不可解析即
+	// 跳过」保持原值——与补跑/自愈语义同口径。
 	if version != "v-local" || autoUpdate != 0 || !strings.HasPrefix(nextUpdate, "2026-12-01 03:00:00") || status != "idle" {
 		t.Fatalf("restored version=(%q,%d,%q,%q), want local row unchanged", version, autoUpdate, nextUpdate, status)
 	}

@@ -280,10 +280,12 @@ func TestDeleteCertJob_restore_failedFallbackMarksFailedWhenStillDisabled(t *tes
 // 函数 rows.Err() 500 口径及 「warn 留痕+continue」口径不对称。
 // 修复：warn+continue。钉：单行 scan 失败 → warn 留痕 + 不 500 + 其余行照常返回。
 func TestListCertificates_scanFailureWarnsAndKeepsRemainingRows(t *testing.T) {
-	// Given：假驱动首行 id 列类型错误（Scan 必然失败），次行正常
+	// Given：假驱动首行 id 列类型错误（Scan 必然失败），次行正常；
+	// COUNT(*) 分页统计单独路由（子串匹配随机顺序，两条查询须用互斥前缀）。
 	h := newBackupTestHandlers(t)
 	fakeDB(t, map[string]driver.Rows{
-		"FROM cert_jobs": &fakeQueryRows{values: [][]driver.Value{
+		"SELECT COUNT(*) FROM cert_jobs": &fakeQueryRows{values: [][]driver.Value{{int64(2)}}},
+		"SELECT j.id": &fakeQueryRows{values: [][]driver.Value{
 			{"bad-id", "lb_bad", "bad.example.test", "ok", "", "", ""},
 			{int64(2), "lb_good", "good.example.test", "ok", "", "", ""},
 		}},

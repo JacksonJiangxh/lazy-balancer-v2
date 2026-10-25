@@ -6,11 +6,13 @@ package handlers
 // IP2Region 状态/日志、导入失败收尾（failImportTx）。
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -571,5 +573,135 @@ func TestParseTCPRuleMetricsFromPrometheus_aggregatesListedUpstreams(t *testing.
 		if _, err := parseTCPRuleMetricsFromPrometheus(emptyBody, upstreams); err == nil || !strings.Contains(err.Error(), "不包含有效样本") {
 			t.Fatalf("正文 %q err=%v, want 无有效样本错误", emptyBody, err)
 		}
+	}
+}
+
+// 实时流量端点：500 分支固定信封文案（底层路径/错误不回显），成功分支恒带
+// bytes_in/bytes_out——仪表盘直接读这两个键，字段名或信封结构漂移会让首屏
+// 静默空白。同名采样 helper 已有多条单测，端点装配此前零覆盖。
+func TestGetRealtimeTraffic_envelopeOnFailureAndSuccess(t *testing.T) {
+	h := NewHandlers(Dependencies{})
+	disableNetSampleWindowForTest(t)
+	original := systemMetricsReadFile
+	t.Cleanup(func() { systemMetricsReadFile = original })
+	lastNetStats.mu.Lock()
+	lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.iface = 0, 0, ""
+	lastNetStats.time = time.Time{}
+	lastNetStats.hasValue = false
+	lastNetStats.mu.Unlock()
+
+	// Given 网卡计数器读取失败。Then 500 信封 + 固定文案，且不回显底层错误。
+	systemMetricsReadFile = func(path string) ([]byte, error) {
+		if path == "/proc/net/dev" {
+			return nil, errors.New("read /proc/net/dev: permission denied")
+		}
+		return original(path)
+	}
+	recorder := getRoute(t, h, "/api/v1/metrics/realtime", h.GetRealtimeTraffic)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+	}
+	var failure models.APIResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &failure); err != nil {
+		t.Fatalf("decode failure envelope: %v", err)
+	}
+	if failure.Code != http.StatusInternalServerError || failure.Message != "读取实时流量失败" {
+		t.Fatalf("信封=%+v, want code=500 message=读取实时流量失败", failure)
+	}
+	if strings.Contains(recorder.Body.String(), "permission denied") {
+		t.Fatalf("底层错误回显给客户端: %s", recorder.Body.String())
+	}
+
+	// When 采样成功。Then code=0 且两个速率字段恒在（不依赖非零值）。
+	systemMetricsReadFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/net/route":
+			return []byte("Iface Destination Gateway Flags\neth0 00000000 0100000A 0003\n"), nil
+		case "/proc/net/dev":
+			return []byte("Inter-| Receive | Transmit\neth0: 4096 0 0 0 0 0 0 0 2048 0 0 0 0 0 0 0\n"), nil
+		}
+		return original(path)
+	}
+	recorder = getRoute(t, h, "/api/v1/metrics/realtime", h.GetRealtimeTraffic)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var success struct {
+		Code int                    `json:"code"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &success); err != nil {
+		t.Fatalf("decode success envelope: %v", err)
+	}
+	if success.Code != 0 || success.Data == nil {
+		t.Fatalf("信封=%+v, want code=0 且 data 非空", success)
+	}
+	for _, key := range []string{"bytes_in", "bytes_out"} {
+		if _, ok := success.Data[key]; !ok {
+			t.Fatalf("data 缺少 %q（仪表盘直接读该键）: %v", key, success.Data)
+		}
+	}
+}
+
+// 连接统计端点：与实时流量同族信封契约（底层 netstat 错误只进运行日志），
+// 成功分支的十个连接状态键恒在。
+func TestGetConnectionStats_envelopeOnFailureAndSuccess(t *testing.T) {
+	h := NewHandlers(Dependencies{})
+	resetConnectionStatsCacheForTest(t)
+	original := netstatCommand
+	t.Cleanup(func() { netstatCommand = original })
+
+	// Given netstat 执行失败。Then 500 + 固定文案。
+	netstatCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "false")
+	}
+	recorder := getRoute(t, h, "/api/v1/metrics/connections", h.GetConnectionStats)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+	}
+	var failure models.APIResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &failure); err != nil {
+		t.Fatalf("decode failure envelope: %v", err)
+	}
+	if failure.Code != http.StatusInternalServerError || failure.Message != "读取连接统计失败" {
+		t.Fatalf("信封=%+v, want code=500 message=读取连接统计失败", failure)
+	}
+
+	// When 解析成功。Then code=0 且状态键齐全（缺键会让面板按零值渲染假空闲）。
+	resetConnectionStatsCacheForTest(t)
+	sample := strings.Join([]string{
+		"Proto Recv-Q Send-Q Local Address Foreign Address (state)",
+		"tcp4 0 0 127.0.0.1.8080 127.0.0.1.5000 ESTABLISHED",
+		"tcp4 0 0 127.0.0.1.8080 127.0.0.1.5001 ESTABLISHED",
+		"tcp4 0 0 127.0.0.1.8080 127.0.0.1.5002 TIME_WAIT",
+		"tcp4 0 0 *.8080 *.* LISTEN",
+	}, "\n")
+	netstatCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "printf", "%s", sample)
+	}
+	recorder = getRoute(t, h, "/api/v1/metrics/connections", h.GetConnectionStats)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var success struct {
+		Code int                    `json:"code"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &success); err != nil {
+		t.Fatalf("decode success envelope: %v", err)
+	}
+	if success.Code != 0 || success.Data == nil {
+		t.Fatalf("信封=%+v, want code=0 且 data 非空", success)
+	}
+	for _, key := range []string{"established", "time_wait", "syn_sent", "syn_recv", "fin_wait1", "fin_wait2", "close_wait", "last_ack", "listening", "closing", "total"} {
+		if _, ok := success.Data[key]; !ok {
+			t.Fatalf("data 缺少 %q: %v", key, success.Data)
+		}
+	}
+	if got := success.Data["established"]; got != float64(2) {
+		t.Fatalf("established=%v, want 2（ESTABLISHED 行计数）", got)
+	}
+	if got := success.Data["listening"]; got != float64(1) {
+		t.Fatalf("listening=%v, want 1", got)
 	}
 }

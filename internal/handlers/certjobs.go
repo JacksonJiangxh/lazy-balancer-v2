@@ -395,15 +395,36 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	operationLock := certJobOperationLock(id)
 	operationLock.Lock()
 	defer operationLock.Unlock()
+	// 失败出口审计：两条路由是 AuditPolicyExplicit，中间件不做自动审计——
+	// 出口不补记会让被拒/失败的重试与越权尝试完全不可追溯（同域
+	// IssueCertificate.auditFailure 覆盖全部出口）。detail 只放固定归因，
+	// 底层错误（SQL/队列内部态）只进运行日志。
+	auditFailure := func(result string) {
+		recordAudit(c, "重试失败", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditResultPart(result)))
+	}
 	var ruleID, domain, status string
 	var caProviderID, renewalAttempts int
 	var updatedAt, createdAt, caAvailableAfter sql.NullTime
 	err := db.DB.QueryRow("SELECT rule_id, domain, status, updated_at, created_at, COALESCE(ca_provider_id,0), COALESCE(renewal_attempts,0), ca_available_after FROM cert_jobs WHERE id=?", id).Scan(&ruleID, &domain, &status, &updatedAt, &createdAt, &caProviderID, &renewalAttempts, &caAvailableAfter)
 	if dbQueryNotFound(c, err, "任务不存在", "RetryCertJob query job") {
+		if err != nil {
+			auditFailure("job_not_found")
+		}
 		return
 	}
+	auditFailureWithRule := func(result string) {
+		recordAudit(c, "重试失败", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), services.AuditResultPart(result)))
+	}
+	// 冷却门禁与文案共用同一 now：分别取墙钟会让边界（<1s 剩余）出现
+	// 「门禁说冷却中、文案说 0s」的自相矛盾。
+	now := time.Now()
 
-	if blocked, statusCode, message := certJobRetryBlocked(status, updatedAt, createdAt, time.Now()); blocked {
+	if blocked, statusCode, message := certJobRetryBlocked(status, updatedAt, createdAt, now); blocked {
+		result := "cooldown"
+		if statusCode == http.StatusConflict {
+			result = "permanent"
+		}
+		auditFailureWithRule(result)
 		c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 		return
 	}
@@ -415,10 +436,11 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 冷却是否真的未到期——429 判定与「手动越过 CA 冷却」审计片段共用同一
 	// 布尔：冷却已自然到期时带 force 的重试并未越过任何东西，记入会让越权
 	// 留痕被稀释。
-	cooldownActive := certJobCAcooldownActive(status, caAvailableAfter, time.Now())
+	cooldownActive := certJobCAcooldownActive(status, caAvailableAfter, now)
 	if cooldownActive && !forceRetry {
+		auditFailureWithRule("ca_cooldown")
 		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: http.StatusTooManyRequests,
-			Message: certJobCAcooldownMessage(caAvailableAfter.Time)})
+			Message: certJobCAcooldownMessage(caAvailableAfter.Time, now)})
 		return
 	}
 
@@ -443,6 +465,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 		if statusCode >= http.StatusInternalServerError {
 			services.Logf("error", "Manual deployment retry failed for job %d: %v", id, err)
 		}
+		auditFailureWithRule("deployment_retry_failed")
 		c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 		return
 	} else if rescheduled {
@@ -454,6 +477,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	qm := services.GetCAQueueManager()
 	if qm == nil {
 		services.Logf("error", "Manual retry enqueue failed for job %d: CA queue manager not initialized", id)
+		auditFailureWithRule("queue_unavailable")
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "CA queue manager not initialized"})
 		return
 	}
@@ -478,6 +502,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	})
 	if err != nil {
 		services.Logf("error", "Manual retry enqueue failed for job %d: %v", id, err)
+		auditFailureWithRule("enqueue_failed")
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to enqueue retry"})
 		return
 	}
@@ -489,6 +514,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 		if errors.Is(scanErr, sql.ErrNoRows) {
 			// 行被并发删除（DeleteRule/DeleteCertJob）时归因 404 而非 500
 			// （对齐 DeleteCertJob 三分归因）。
+			auditFailureWithRule("job_not_found")
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "Job not found"})
 			return
 		}
@@ -496,19 +522,23 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 			// 重读失败属瞬时 DB 错误（SQLITE_BUSY 等），归因为规则禁用会误导用户，
 			// 显式区分 500。
 			services.Logf("error", "RetryCertJob reread job %d status failed: %v", id, scanErr)
+			auditFailureWithRule("status_read_failed")
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取任务状态失败"})
 			return
 		}
 		if currentStatus != status {
+			auditFailureWithRule("state_changed")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务状态已变更，请刷新后重试"})
 			return
 		}
 		// EnqueueIfActive 的在途命中同样走!changed 且重读
 		// 状态未变，需优先归因"任务正在队列中"，避免误导为规则禁用/配置变更。
 		if qm.IsJobActive(id) {
+			auditFailureWithRule("in_flight")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务正在签发队列中，请勿重复操作"})
 			return
 		}
+		auditFailureWithRule("not_retryable")
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务关联规则已禁用、证书配置已变更或队列已暂停"})
 		return
 	}
@@ -639,36 +669,35 @@ func certJobRetryRemainingSeconds(status string, updatedAt, createdAt, caAvailab
 
 // certJobRetryBlocked 返回任务是否被重试门拦截，以及应返回的 HTTP 状态码。
 // 429 =「稍后重试可成功」（执行中/冷却），409 =「永久条件不可重试」（已退役）。
+//
+// 通用冷却窗口计算必须复用 services.CertJobRetryRemaining（下发剩余秒/任务
+// 监控证书行同一判据）——handlers 自算 updated_at 回退与 fail-closed 会与
+// 策略源各自漂移（窗口变更后文案说谎）。CA 退避窗口不在本门内：它由
+// certJobCAcooldownActive 单独判定，force 才能越过，传入零值 NullTime 使
+// CertJobRetryRemaining 只看通用窗口。
 func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now time.Time) (bool, int, string) {
-	cooldown, retryable := certJobRetryCooldown(status)
+	window, retryable := certJobRetryCooldown(status)
 	if !retryable {
 		// 永久条件不得用 429（SDK/前端会按限流退避轮询）。规则仍启用但任务行
 		// 已退役（历史残留/脏快照）时，唯一恢复路径是让规则重新解析证书任务：
 		// 文案必须给出可执行指引，而不是让用户以为需要等冷却。
 		return true, http.StatusConflict, "已退役的证书任务不能重试；请先禁用再启用该规则以重新创建签发任务"
 	}
-	// cert_jobs.updated_at 在 DDL 中可空（行/带外插入可
-	// 为 NULL），此前 NULL 直接放行冷却门（fail-open）——连点可连续绕过 15/5
-	// 分钟冷却、放大 CA 配额消耗。回退 created_at 计算；两列都缺失时 fail-
-	// closed（视为刚更新，按冷却拒绝），避免不可归因的即时重试。
-	reference := updatedAt
-	if !reference.Valid {
-		reference = createdAt
+	remaining, retryable := services.CertJobRetryRemaining(status, updatedAt, createdAt, sql.NullTime{}, now)
+	if retryable && remaining > 0 {
+		if status == "failed" {
+			return true, http.StatusTooManyRequests, fmt.Sprintf("失败后请等待 %d 分钟再重试", int(window/time.Minute))
+		}
+		message := "任务正在执行中，请稍后重试"
+		// 部署生命周期（downloaded/cleanup_dns/cleanup_warning）签发已完成（证书在库），
+		// 停在部署退避窗口——复用在途文案会误导用户以为签发流程卡住，单列部署口径。
+		// 冷却到期后再点重试 = 立即重排部署（不重签）。
+		if services.JobLifecycle(status) == services.JobLifecycleDownloaded {
+			message = "证书已下载完成，正在等待部署生效；稍后可重试以立即重新部署（不会重新签发）"
+		}
+		return true, http.StatusTooManyRequests, message
 	}
-	if cooldown == 0 || (reference.Valid && now.Sub(reference.Time) >= cooldown) {
-		return false, 0, ""
-	}
-	if status == "failed" {
-		return true, http.StatusTooManyRequests, "失败后请等待 5 分钟再重试"
-	}
-	message := "任务正在执行中，请稍后重试"
-	// 部署生命周期（downloaded/cleanup_dns/cleanup_warning）签发已完成（证书在库），
-	// 停在部署退避窗口——复用在途文案会误导用户以为签发流程卡住，单列部署口径。
-	// 冷却到期后再点重试 = 立即重排部署（不重签）。
-	if services.JobLifecycle(status) == services.JobLifecycleDownloaded {
-		message = "证书已下载完成，正在等待部署生效；稍后可重试以立即重新部署（不会重新签发）"
-	}
-	return true, http.StatusTooManyRequests, message
+	return false, 0, ""
 }
 
 // certJobCAcooldownActive 报告任务是否仍处于 CA 限流退避窗口（waiting_ca 且
@@ -682,9 +711,12 @@ func certJobCAcooldownActive(status string, caAvailableAfter sql.NullTime, now t
 
 // certJobCAcooldownMessage 是 CA 冷却拦截的统一文案（availableAfter=冷却到期
 // 时刻），两个入口的 429 文案必须一致，避免用户以为只有任务重试受限。
-func certJobCAcooldownMessage(availableAfter time.Time) string {
-	remaining := time.Until(availableAfter).Round(time.Second)
-	return fmt.Sprintf("CA 限流冷却未到期（剩余约 %s）。冷却到期后将自动重排；确需立即重签请确认后强制重试（可能再次被 CA 拒绝）", remaining)
+// 剩余秒复用 services.CertJobRetryCooldownSeconds（向上取整，<1s 下发 1）——
+// 门禁与文案必须用同一 now：原实现对墙钟 Round，使被门禁判定为「冷却中」的
+// 任务在下发侧显示「剩余约 0s」，引导用户点一次必然 429 的重试。
+func certJobCAcooldownMessage(availableAfter, now time.Time) string {
+	seconds := services.CertJobRetryCooldownSeconds(availableAfter.Sub(now))
+	return fmt.Sprintf("CA 限流冷却未到期（剩余约 %s）。冷却到期后将自动重排；确需立即重签请确认后强制重试（可能再次被 CA 拒绝）", time.Duration(seconds)*time.Second)
 }
 
 // reversedCertJobDomain 交换双域名任务的域名顺序：cert_jobs.domain 存排序
@@ -722,13 +754,21 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	// 原 id，删除会命中导入后同 id 的另一条任务，且可能连带删掉刚物化的证书
 	// 文件）。与 retryCertJobByID 共用同一探测。
 	if configImportBusy() {
+		recordAudit(c, "删除失败", "证书任务", services.FormatAuditDetail(services.AuditResultPart("import_in_progress")))
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "配置导入进行中，暂不能删除证书任务"})
 		return
 	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
+		recordAudit(c, "删除失败", "证书任务", services.FormatAuditDetail(services.AuditResultPart("invalid_id")))
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
 		return
+	}
+	// 失败出口审计（同 retryCertJobByID）：本路由与重试同为 AuditPolicyExplicit，
+	// 中间件不自动记审计——被拒/失败的删除尝试必须可追溯，且 detail 只放固定
+	// 归因，底层错误（SQL/文件系统）只进运行日志。
+	auditFailure := func(result string) {
+		recordAudit(c, "删除失败", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditResultPart(result)))
 	}
 	// TOCTOU：守卫读规则 enabled 状态后、删除前，EnableRule
 	// （持 caddyOpMu）可完成启用并恢复任务，守卫放行被竞态绕过。caddyOpMu
@@ -768,6 +808,11 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	var caProviderID int
 	if err := db.DB.QueryRow("SELECT rule_id, domain, status, COALESCE(ca_provider_id,0), COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id = ?", id).Scan(&ruleID, &domain, &status, &caProviderID, &certPEM, &keyPEM); err != nil {
 		h.caddyOpMu.Unlock()
+		result := "query_failed"
+		if errors.Is(err, sql.ErrNoRows) {
+			result = "job_not_found"
+		}
+		auditFailure(result)
 		dbQueryNotFound(c, err, "Job not found", "DeleteCertJob query job")
 		return
 	}
@@ -788,11 +833,13 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 			  AND lower(replace(domain,' ','')) IN (?,?)`,
 			ruleID, domain, reversedCertJobDomain(domain)).Scan(&active); err != nil {
 			h.caddyOpMu.Unlock()
+			auditFailure("rule_state_read_failed")
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule state"})
 			return
 		}
 		if active > 0 {
 			h.caddyOpMu.Unlock()
+			auditFailure("guarded_active_rule")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: message})
 			return
 		}
@@ -803,12 +850,14 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	result, err := db.DB.Exec("UPDATE cert_jobs SET status='disabled', updated_at=datetime('now') WHERE id=? AND status=?", id, status)
 	if err != nil {
 		h.caddyOpMu.Unlock()
+		auditFailure("disable_failed")
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to disable job"})
 		return
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		h.caddyOpMu.Unlock()
+		auditFailure("disable_verify_failed")
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to verify disabled job"})
 		return
 	}
@@ -821,16 +870,19 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		scanErr := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", id).Scan(&currentStatus)
 		if errors.Is(scanErr, sql.ErrNoRows) {
 			h.caddyOpMu.Unlock()
+			auditFailure("job_not_found")
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "Job not found"})
 			return
 		}
 		if scanErr != nil {
 			h.caddyOpMu.Unlock()
 			services.Logf("error", "DeleteCertJob reread job %d status failed: %v", id, scanErr)
+			auditFailure("status_read_failed")
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取任务状态失败"})
 			return
 		}
 		h.caddyOpMu.Unlock()
+		auditFailure("state_changed")
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务状态已变更，请刷新后重试"})
 		return
 	}
@@ -955,6 +1007,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 			}
 		}
 		services.Logf("error", "DeleteCertJob failed for job %d: %v", id, deleteErr)
+		auditFailure("delete_failed")
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to delete job"})
 		return
 	}
@@ -967,6 +1020,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		rowsAffected = -1
 	}
 	if rowsAffected == 0 {
+		auditFailure("job_not_found")
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "Job not found"})
 		return
 	}
@@ -1012,7 +1066,14 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 	// 响应上限：从最新文件开始累计，达到 256KB 即停止读更旧文件（更旧内容
 	// 必然落在尾窗之外，读了也会被裁掉）。此前 6 次读 ≈768KB/请求，100 个
 	// 失败任务刷新一轮即 ~600 次读、~76MB IO。
-	content, truncated := readCertJobLogTail(logPath, certJobLogMaxRotatedBackups, certJobLogsMaxResponseBytes)
+	content, truncated, readErr := readCertJobLogTail(logPath, certJobLogMaxRotatedBackups, certJobLogsMaxResponseBytes)
+	if readErr != nil {
+		// 读不出与「尚无日志」必须可区分（与 services.rulelog 同口径）：
+		// 恒 200 空内容会让排障把权限漂移/目录被替换误判为「没有签发记录」。
+		services.Logf("warn", "读取证书任务 %d 日志失败（规则 %s，路径 %s）: %v", id, ruleID, logPath, readErr)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取任务日志失败"})
+		return
+	}
 
 	if len(content) > certJobLogsMaxResponseBytes {
 		content = content[len(content)-certJobLogsMaxResponseBytes:]
@@ -1032,10 +1093,15 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 // readCertJobLogTail 从最新（活动文件 → .1 → .2 …）逐份读取，累计达到
 // budget 后停止——更旧的轮转内容只可能落在响应尾窗之外。返回值按最旧→最新
 // 顺序拼接；truncated 表示确有更旧内容未读取（存在被跳过的备份文件）。
-func readCertJobLogTail(path string, maxBackups, budget int) (string, bool) {
+// 文件不存在不是错误（「尚无日志」是正常态），其余 I/O 错误上抛。
+func readCertJobLogTail(path string, maxBackups, budget int) (string, bool, error) {
 	newestFirst := make([]string, 0, maxBackups+1)
-	newestFirst = append(newestFirst, readCertJobLogFile(path))
-	total := len(newestFirst[0])
+	head, err := readCertJobLogFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	newestFirst = append(newestFirst, head)
+	total := len(head)
 	truncated := false
 	for i := 1; i <= maxBackups; i++ {
 		if total >= budget {
@@ -1047,7 +1113,10 @@ func readCertJobLogTail(path string, maxBackups, budget int) (string, bool) {
 			}
 			break
 		}
-		backup := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i))
+		backup, err := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i))
+		if err != nil {
+			return "", false, err
+		}
 		if backup == "" {
 			continue
 		}
@@ -1059,25 +1128,41 @@ func readCertJobLogTail(path string, maxBackups, budget int) (string, bool) {
 	for i := len(newestFirst) - 1; i >= 0; i-- {
 		builder.WriteString(newestFirst[i])
 	}
-	return builder.String(), truncated
+	return builder.String(), truncated, nil
 }
 
 // prependTaskLogRotations 按 maxBackups 把 .1～.N 逐代前置到活动日志
 // 内容之前，最终顺序恒为最旧→最新→活动文件。普通任务写侧 keep=1，
 // 证书任务 keep=5；调用方必须传本族真实保留数，禁止统一扫满证书代数。
+// 轮转代数读失败按「该代缺失」处理并留 warn（展示型接口，不因单个历史
+// 文件不可读丢掉新一代内容）。
 func prependTaskLogRotations(path, content string, maxBackups int) string {
 	for i := 1; i <= maxBackups; i++ {
-		if backup := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i)); backup != "" {
+		backup, err := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i))
+		if err != nil {
+			services.Logf("warn", "读取任务日志轮转副本失败（%s.%d）: %v", path, i, err)
+			continue
+		}
+		if backup != "" {
 			content = backup + content
 		}
 	}
 	return content
 }
 
-func readCertJobLogFile(path string) string {
+// readCertJobLogFile 读取单个日志文件的尾部窗口（128KB/500 行）。
+// 文件不存在返回 ("", nil)；其余 I/O 错误（权限、目录被替换、磁盘只读）
+// 必须上抛——吞掉会让「读不出」与「无日志」不可区分。
+func readCertJobLogFile(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return ""
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("read %s: 路径是目录而非日志文件", path)
 	}
 
 	const maxBytes = 128 * 1024
@@ -1088,17 +1173,20 @@ func readCertJobLogFile(path string) string {
 
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
 
 	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return ""
+		return "", fmt.Errorf("seek %s: %w", path, err)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("read %s: %w", path, err)
 	}
 
 	data = tailLogWindow(f, data, startOffset)
@@ -1108,5 +1196,5 @@ func readCertJobLogFile(path string) string {
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), nil
 }

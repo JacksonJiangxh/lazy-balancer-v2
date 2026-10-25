@@ -2037,6 +2037,10 @@ func TestAPIDocs_mfaVerifyDocumentsConcurrent409(t *testing.T) {
 // read_only=true，且 /users/me 与 /users/me/api-keys 不在豁免清单里——自助写
 // 只对登录会话放行。文档若把它们写成「Key 自助写除外」，按文档编排的脚本会
 // 100% 收 403，并掩盖「Key 恒只读」这一更简单的事实。
+//
+// 反方向同样要钉：豁免清单里的只读语义写方法（解析证书/批量任务查询/规则
+// 证书信息/大屏采集租约/预览/导入校验/OIDC 探测）对只读 Key 真实放行，
+// 文档写成「写方法一律 403」会把可用的只读自动化判成必失败。
 func TestAPIDocs_readOnlyKeyClaimMatchesWriteWhitelist(t *testing.T) {
 	source, err := os.ReadFile(filepath.Join("..", "..", "docs", "api.zh-CN.md"))
 	if err != nil {
@@ -2072,5 +2076,41 @@ func TestAPIDocs_readOnlyKeyClaimMatchesWriteWhitelist(t *testing.T) {
 		if !strings.Contains(row, want) {
 			t.Errorf("API Key 行缺 %q（须说明 Key 无写例外、自助写走登录会话）: %s", want, row)
 		}
+	}
+
+	// 派生侧前提：豁免清单同时含只读语义写方法（解析证书/批量查询证书任务/
+	// 规则证书信息/大屏采集租约/预览/导入校验/OIDC 探测）——它们对只读 Key
+	// 放行，文档写成「写方法一律 403」会把可用的只读自动化判死。
+	readOnlySemanticProbes := []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/certificates/parse"},
+		{http.MethodPost, "/api/v1/certificates/jobs/current"},
+		{http.MethodPost, "/api/v1/rules/cert-info"},
+		{http.MethodPost, "/api/v1/config/preview"},
+		{http.MethodPost, "/api/v1/config/import/validate"},
+		{http.MethodPost, "/api/v1/settings/oidc/test"},
+		{http.MethodPost, "/api/v1/security/overview/threat-screen/collector"},
+		{http.MethodDelete, "/api/v1/security/overview/threat-screen/collector"},
+	}
+	exempt := 0
+	for _, probe := range readOnlySemanticProbes {
+		if services.IsReadOnlyWriteRoute(probe.method, probe.path) {
+			exempt++
+		}
+	}
+	if exempt == 0 {
+		t.Fatal("前提变化：只读语义写豁免清单为空——文档才可恢复「写方法一律 403」口径")
+	}
+	// 豁免面存在 ⇒ 文档必须交代只读语义 POST 例外，且不得留无限定的写 403 承诺。
+	if !strings.Contains(row, "只读语义") {
+		t.Errorf("API Key 行未交代只读语义 POST 例外（豁免清单有 %d 条写方法对只读 Key 放行）: %s", exempt, row)
+	}
+	for _, forbidden := range []string{"写方法一律 403", "所有写方法均 403", "写方法一律403"} {
+		if strings.Contains(row, forbidden) {
+			t.Errorf("API Key 行仍宣称「%s」，但只读语义 POST 按豁免清单放行: %s", forbidden, row)
+		}
+	}
+	// 只读语义 POST 不等于只读 Key 可写：管理写操作仍必须写明 403。
+	if !strings.Contains(row, "管理写操作一律 403") {
+		t.Errorf("API Key 行须明确管理写操作仍为 403（只读语义 POST 是唯一写方法例外）: %s", row)
 	}
 }

@@ -126,13 +126,13 @@ func TestDescribeThreatRuleName_syntheticCustomRuleIsLabeled(t *testing.T) {
 }
 
 // id:5 是「绕过模式占位」的信任名单 DetectionOnly 规则（id:3 同族变体），
-// id:14 才是历史威胁情报库段——大屏榜面标签必须与 triggerTypeForRule /
-// attackFamilyClassOf 的族标签同集合（三处口径曾把 5 标成威胁情报库）。
+// id:14 才是历史威胁情报库段——大屏榜面标签、事件列表触发类型、总览攻击族
+// 三面口径必须同源（id→家族单一事实源），历史/导入的 id:5 行一律归信任名单。
 func TestThreatRuleFamilyLabels_idFiveAndFourteenAligned(t *testing.T) {
 	cases := []struct {
 		key, wantDesc, wantTrigger string
 	}{
-		{"5", "信任名单检测（#5）", "IP 访问控制"},
+		{"5", "信任名单检测（#5）", "信任名单"},
 		{"14", "威胁情报库（#14）", "威胁情报库"},
 	}
 	for _, c := range cases {
@@ -143,10 +143,18 @@ func TestThreatRuleFamilyLabels_idFiveAndFourteenAligned(t *testing.T) {
 			t.Errorf("triggerTypeForRule(%q)=%q, want %q（榜面与事件列表族标签必须一致）", c.key, got, c.wantTrigger)
 		}
 	}
-	if got := attackFamilyClassOf("5", ""); got != attackFamilyIPACL {
-		t.Errorf("attackFamilyClassOf(5)=%v, want IP 访问控制族", got)
+	if got := attackFamilyClassOf("5", ""); got != attackFamilyTrust {
+		t.Errorf("attackFamilyClassOf(5)=%v, want 信任名单族", got)
 	}
 	if got := attackFamilyClassOf("14", ""); got != attackFamilyThreatIntel {
 		t.Errorf("attackFamilyClassOf(14)=%v, want 威胁情报库族", got)
+	}
+	// 历史 id:5 行在两个总览视图同口径（旧实现三面分叉：榜面/列表归信任，
+	// 攻击族分桶归 IP 访问控制）。
+	if got := categorizeAttack("5", ""); got != "信任名单" {
+		t.Errorf("categorizeAttack(5)=%q, want 信任名单", got)
+	}
+	if got := stageCategorizeAttack("5", ""); got != "信任名单" {
+		t.Errorf("stageCategorizeAttack(5)=%q, want 信任名单", got)
 	}
 }

@@ -305,3 +305,62 @@ func TestRuleTriggeredMultiFilterSQL_ignoresEmptySegments(t *testing.T) {
 		}
 	}
 }
+
+// 历史/导入的 id:5 行（绕过模式占位的信任名单 DetectionOnly 规则，现网发射
+// 恒 pass,nolog 不产事件——只可能来自历史或带外写入）必须被「信任名单」族
+// 命中、不被「IP 访问控制」族命中：族筛选与 triggerTypeForRule /
+// attackFamilyClassOf 共用同一张 id→家族表。
+func TestRuleTriggeredFilterSQL_legacyTrustBypassIdFive(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	if _, err := db.DB.Exec(`CREATE TABLE rule_triggered_trust_probe (rule_triggered TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"2", "3", "4", "5", "7", "8", "12", "14"} {
+		if _, err := db.DB.Exec(`INSERT INTO rule_triggered_trust_probe (rule_triggered) VALUES (?)`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matchSet := func(t *testing.T, family string) map[string]bool {
+		t.Helper()
+		var args []any
+		cond := ruleTriggeredFilterSQL(family, &args)
+		matched := map[string]bool{}
+		rows, err := db.DB.Query(`SELECT rule_triggered FROM rule_triggered_trust_probe WHERE `+cond, args...)
+		if err != nil {
+			t.Fatalf("query %q family filter: %v", family, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			matched[id] = true
+		}
+		return matched
+	}
+
+	trust := matchSet(t, "信任名单")
+	for _, id := range []string{"3", "5", "12"} {
+		if !trust[id] {
+			t.Errorf("信任名单 family 必须命中历史 id:%s: %v", id, trust)
+		}
+	}
+	for _, id := range []string{"2", "4", "7", "8", "14"} {
+		if trust[id] {
+			t.Errorf("信任名单 family 不得命中 %s: %v", id, trust)
+		}
+	}
+
+	acl := matchSet(t, "IP 访问控制")
+	for _, id := range []string{"2", "4", "7"} {
+		if !acl[id] {
+			t.Errorf("IP 访问控制 family 必须命中 %s: %v", id, acl)
+		}
+	}
+	for _, id := range []string{"3", "5", "12", "8", "14"} {
+		if acl[id] {
+			t.Errorf("IP 访问控制 family 不得命中信任名单 id:%s: %v", id, acl)
+		}
+	}
+}

@@ -336,6 +336,7 @@
       class="dialog-body-inset"
       width="min(560px, 92vw)"
       :close-on-click-modal="false"
+      :before-close="closeCreatedKey"
       @closed="createdKey = ''"
     >
       <template #header>
@@ -402,6 +403,15 @@ const togglePendingId = ref<number | null>(null)
 const deletingIds = ref(new Set<number>())
 const createdKey = ref('')
 const createdKeyVisible = ref(false)
+/** 明文密钥仅此一次下发（库内只存哈希）：ESC / 右上角 X 关闭前必须确认已保存，
+ *  否则误触即永久丢失、只能删除重建（与 MfaBindingWizard 恢复码步同范式）。 */
+const closeCreatedKey = (done: () => void): void => {
+  ElMessageBox.confirm('密钥仅此一次显示，关闭后将无法再次查看。确认已保存？', '保存密钥', {
+    type: 'warning',
+    confirmButtonText: '我已保存',
+    cancelButtonText: '继续查看',
+  }).then(() => done()).catch(() => undefined)
+}
 const mcpDocsVisible = ref(false)
 const mcpTools = ref<readonly MCPToolSpec[]>([])
 const mcpToolsLoading = ref(false)

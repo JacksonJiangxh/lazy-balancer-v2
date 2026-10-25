@@ -386,7 +386,9 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"trust precheck id 3", "3", "", "信任名单"},
 		{"trust precheck id 12", "12", "", "信任名单"},
 		{"ip acl via id 4", "4", "", "IP 访问控制"},
-		{"ip trust list via id 5", "5", "", "IP 访问控制"},
+		// id:5 是「绕过模式占位」的信任名单 DetectionOnly 规则（id:3 同族
+		// 变体）：历史/导入行按发射侧语义归「信任名单」。
+		{"trust bypass id 5", "5", "", "信任名单"},
 		{"geoip legacy id 8", "8", "", "地域拦截"},
 		{"geoip precheck segment id", "800123", "", "地域拦截"},
 		{"geoip precheck segment via msg", "800123", "GeoIP 区域拦截", "地域拦截"},

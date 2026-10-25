@@ -795,6 +795,17 @@ const handleSave = async () => {
     ElMessage.warning('请选择 CA 提供商')
     return
   }
+  // CA 提供商列表未就绪时不能把「加载失败/加载中」误报成「不存在」：前者
+  // 下拉本就没有选项，用户「重新选择」无从下手，且整卡保存被无故阻断。
+  // 前置门按「加载态 → 失败态 → 真不存在」排序。
+  if (loadingCAProviders.value) {
+    ElMessage.warning('CA 提供商列表加载中，请稍后再保存')
+    return
+  }
+  if (caProvidersError.value) {
+    ElMessage.warning('CA 提供商列表加载失败，请点顶部「立即重试」后再保存')
+    return
+  }
   // 默认 CA 被禁用/删除后，整卡任何保存都会被写侧门拒绝（英文 400）——
   // 前置为可定位的中文提示，避免只改其它字段也无法保存。
   const defaultCA = caProviders.value.find((p) => p.id === global.value.default_ca_provider_id)

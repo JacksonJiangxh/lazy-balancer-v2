@@ -1,16 +1,18 @@
 // MFA 端点 401 分类验收：凭证/挑战错误豁免会话失效流程，
-// 同端点的「未登录或登录已过期」必须继续走重新登录。
+// 同端点经 jwtAuth 发出的会话 401 必须继续走重新登录。
 //
 // 运行：cd web && npm test
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { isMfaCredentialRejection } from '../src/utils/mfaErrors.ts'
+import { isMfaCredentialRejection, MFA_CREDENTIAL_REJECTION_MESSAGES } from '../src/utils/mfaErrors.ts'
 import { MFA_SCOPE_GROUPS } from '../src/utils/mfaScopeGroups.ts'
 import { repoCode, section, code } from './_helpers.ts'
 
-const SESSION_EXPIRED = '未登录或登录已过期'
+// jwtAuth 的真实过期文案（MFA 端点先经它鉴权）；「未登录或登录已过期」只来自
+// handlers/auth.go 的资料接口，与这些端点无关。
+const SESSION_EXPIRED = '登录状态已过期，请重新登录'
 
 test('验码/挑战错误 → 豁免会话失效（只传播文案供重试）', () => {
   assert.equal(isMfaCredentialRejection('/auth/mfa/verify-step', 401, '验证码错误'), true)
@@ -41,6 +43,37 @@ test('同端点的会话过期 401 不得被豁免（428→verify-step 窗口）
   assert.equal(isMfaCredentialRejection('/auth/mfa/verify-step', 401, SESSION_EXPIRED), false)
   assert.equal(isMfaCredentialRejection('/auth/mfa/status', 401, SESSION_EXPIRED), false)
   assert.equal(isMfaCredentialRejection('/users/3/mfa/reset', 401, SESSION_EXPIRED), false)
+})
+
+// jwtAuth 发出的全部 401 文案（过期/吊销/改密/凭证无效/用户不可用）在 MFA
+// 端点必须一律不豁免——这些端点在验码前先经 jwtAuth 鉴权，白名单按文案匹配，
+// 误加一条真实会话文案会让过期令牌被判成「验证码错误」，用户卡在弹码循环。
+test('jwtAuth 会话 401 文案一律不豁免（真实过期/吊销/改密/凭证无效）', () => {
+  const jwtAuth = section(repoCode('internal/middleware/middleware.go'), 'func jwtAuth(', 'func apiKeyAuth(')
+  const messages = [
+    ...new Set([...jwtAuth.matchAll(/StatusUnauthorized, gin\.H\{[^}]*"message": "([^"]+)"/g)]
+      .map((match) => match[1])),
+  ]
+  // 扫描器鉴别力：派生为空或缺分支时本用例会恒绿，先钉住真实文案集。
+  for (const expected of [
+    '缺少认证信息',
+    '登录状态已过期，请重新登录',
+    '登录状态已失效，请重新登录',
+    '密码已修改，请重新登录',
+    '登录凭证无效',
+    '用户不存在或已禁用',
+  ]) {
+    assert.ok(messages.includes(expected), `jwtAuth 未派生「${expected}」——中间件形态或文案变化，扫描器需跟进`)
+  }
+  for (const msg of messages) {
+    assert.ok(
+      !MFA_CREDENTIAL_REJECTION_MESSAGES.includes(msg),
+      `「${msg}」是 jwtAuth 的会话失效文案，不得进 MFA 凭证错误白名单`,
+    )
+    for (const url of ['/auth/mfa/verify-step', '/auth/mfa/status', '/users/3/mfa/reset']) {
+      assert.equal(isMfaCredentialRejection(url, 401, msg), false, `${url} 的 401「${msg}」被误判为凭证错误`)
+    }
+  }
 })
 
 test('非 MFA 端点与其它状态码一律不豁免', () => {

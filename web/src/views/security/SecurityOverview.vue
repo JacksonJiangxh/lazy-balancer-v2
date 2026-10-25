@@ -20,7 +20,7 @@
       type="error"
       show-icon
       :closable="false"
-      class="mb-5 error-banner"
+      class="polling-error-alert error-banner"
     />
 
     <!-- 采集健康位（任务已停/连续失败/审计写侧降级）：判据与文案与事件列表/大屏同源 -->
@@ -196,7 +196,7 @@
                 <el-icon class="title-icon"><Warning /></el-icon>
                 <span>最近拦截事件</span>
               </div>
-              <el-link type="primary" @click="goToEvents">查看全部</el-link>
+              <AccessibleLink type="primary" @click="goToEvents">查看全部</AccessibleLink>
             </div>
           </template>
           <el-alert v-if="blockedEventsError" title="最近拦截事件加载失败" type="error" show-icon :closable="false" class="error-banner" />
@@ -287,6 +287,7 @@ import { Aim, DataAnalysis, TrendCharts, PieChart, Location, Warning, Odometer, 
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { formatDate } from '@/utils/date'
 import { pageUrl } from '@/utils/deepLink'
 import { libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources, type LibrarySourceRow } from '@/utils/securityLibraries'

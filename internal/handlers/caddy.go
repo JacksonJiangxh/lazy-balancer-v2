@@ -960,12 +960,17 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 			// 漂移形态，必须留下审计而不只是可能被过滤的 warn 日志）。
 			h.recordCompensationSideEffects("Caddy 配置应用失败", pinErr)
 		}
-		// 回弹也可能失败（Caddy 不可达/超时）——运行
-		// 配置可能停留候选态而 DB 已回滚，仅响应+审计会在重启后消失。
-		h.recordCaddyApplyFailure(applyErr, restoreErr)
+		// 横幅事实源：只有库态与运行态可能分叉的失败才写——配置拒绝（CLI
+		// 校验/admin 4xx）时候选未 /load、事务已回滚，运行配置仍是旧形态，
+		// 横幅会制造不存在的不一致（finishTxApply 拒绝分支即不写）；恢复失败
+		// （Caddy 不可达/超时）则运行配置状态未知，必须落横幅。
+		rejected := services.IsConfigRejected(applyErr)
+		if !rejected || restoreErr != nil {
+			h.recordCaddyApplyFailure(applyErr, restoreErr)
+		}
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure")))
 		// 2026-09-07：与规则域统一——配置拒绝→400，传输/系统→500。
-		if services.IsConfigRejected(applyErr) {
+		if rejected {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，配置未保存: " + applyErr.Error()})
 		} else {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置应用失败，配置未保存: " + applyErr.Error()})
@@ -1236,9 +1241,10 @@ var caddyLogPaths = map[string]string{
 // 读取必须受 128KB 窗口上限约束，不得随增长无界放大）。
 var caddyLogsStatHook func()
 
-// caddyLogTypes 是 caddyLogPaths 的确定性展示顺序（错误文案与文档共用），
-// 避免直接遍历 map 造成顺序漂移。
-var caddyLogTypes = []string{"runtime", "tls", "server", "proxy"}
+// caddyLogTypes 是 caddyLogPaths 的确定性展示顺序（错误文案与文档共用）——
+// 由路径表派生而非第二份手写枚举：新增日志类型时只改路径表，文案不会漏项
+// （sortedStringKeys 保证遍历序稳定，避免直接遍历 map 造成顺序漂移）。
+var caddyLogTypes = sortedStringKeys(caddyLogPaths)
 
 func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 	logType := c.DefaultQuery("type", "runtime")
@@ -1588,11 +1594,16 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		if pinErr := h.pinLastGoodAfterCompensation(); pinErr != nil {
 			h.recordCompensationSideEffects("Caddy 配置应用失败", pinErr)
 		}
-		// 回弹失败持久化横幅（事务已显式回滚）。
-		h.recordCaddyApplyFailure(err, restoreErr)
+		// 横幅事实源：配置拒绝（admin 4xx）时候选未生效、事务已回滚，库态与
+		// 运行态无分叉——不写横幅（与 finishTxApply 拒绝分支同口径）；恢复失败
+		// 表示运行配置状态未知，必须持久化（事务已显式回滚）。
+		rejected := services.IsConfigRejected(err)
+		if !rejected || restoreErr != nil {
+			h.recordCaddyApplyFailure(err, restoreErr)
+		}
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("Caddy 配置应用失败", err.Error(), services.AuditResultPart("failure")))
 		// 2026-09-07：与统一——配置拒绝→400，传输/系统→500。
-		if services.IsConfigRejected(err) {
+		if rejected {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 拒绝配置: " + err.Error()})
 		} else {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置应用失败，配置未保存: " + err.Error()})
@@ -1718,10 +1729,13 @@ const accessLogRedactionLine = "request>headers>X-API-Key -> delete"
 // services.ParseAccessLogFormat（按行号定位脱敏行，其余行原文保留）；
 // 非法行由写侧 validateAccessLogFormat 先行 400，本函数不重复拒绝。
 // 空白格式原样返回（默认形态：不裁剪原生字段，渲染层注入脱敏行）。
+// 尾随换行先裁剪——否则 Split 产生的末尾空元素会被当成一行保留，追加脱敏行
+// 后落库值多一行空行（渲染零差异，但 UI/导出/回显多出空白行）。
 func normalizeAccessLogRedaction(format string) string {
 	if strings.TrimSpace(format) == "" {
 		return format
 	}
+	format = strings.TrimRight(format, "\n")
 	const path = "request>headers>X-API-Key"
 	redactLines := make(map[int]bool)
 	for _, r := range services.ParseAccessLogFormat(format).Rules {

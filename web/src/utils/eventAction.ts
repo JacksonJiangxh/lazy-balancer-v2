@@ -7,7 +7,9 @@
 // 未知动作 fail-visible：原样回显后端值（空值兜底「—」），不再把未知动作一律
 // 当作「检测」——那会把「拦截语义的新动作」静默呈现为未拦截。
 
-export type EventActionTone = 'danger' | 'warning'
+// 色调联合只服务本文件的映射表与返回类型（全仓零外部消费——不导出，避免被
+// 误当作跨模块稳定契约而在视图里直接构造动作色）。
+type EventActionTone = 'danger' | 'warning'
 
 const EVENT_ACTION_LABELS: Readonly<Record<string, { readonly short: string; readonly full: string; readonly tone: EventActionTone }>> = {
   blocked: { short: '拦截', full: '已拦截', tone: 'danger' },

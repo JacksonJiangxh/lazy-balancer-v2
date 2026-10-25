@@ -51,11 +51,23 @@ func newMiddlewareTestRouterAtPort(t *testing.T, port int) *gin.Engine {
 
 func addClusterRouteTestAPIKey(t *testing.T, userID int, username, role, plain string) {
 	t.Helper()
+	addRouteTestAPIKeyWithReadOnly(t, userID, username, role, plain, false)
+}
+
+// addRouteTestAPIKeyWithReadOnly 建一个可显式指定 read_only 的 Key：生产写侧对
+// 非管理员恒写 1，管理员可经改授流程决定；只有 read_only=1 的 Key 会经过
+// apiKeyReadOnlyGuard 的拦截面。
+func addRouteTestAPIKeyWithReadOnly(t *testing.T, userID int, username, role, plain string, readOnly bool) {
+	t.Helper()
+	readOnlyFlag := 0
+	if readOnly {
+		readOnlyFlag = 1
+	}
 	if _, err := db.DB.Exec("INSERT INTO users (id, username, password_hash, role, is_enabled) VALUES (?, ?, '', ?, 1)", userID, username, role); err != nil {
 		t.Fatalf("insert %s user: %v", role, err)
 	}
 	hash := sha256.Sum256([]byte(plain))
-	if _, err := db.DB.Exec("INSERT INTO api_keys (name, key_hash, key_prefix, created_by, is_enabled) VALUES (?, ?, ?, ?, 1)", username+"-key", hex.EncodeToString(hash[:]), plain[:12], userID); err != nil {
+	if _, err := db.DB.Exec("INSERT INTO api_keys (name, key_hash, key_prefix, created_by, is_enabled, read_only) VALUES (?, ?, ?, ?, 1, ?)", username+"-key", hex.EncodeToString(hash[:]), plain[:12], userID, readOnlyFlag); err != nil {
 		t.Fatalf("insert %s API key: %v", role, err)
 	}
 }

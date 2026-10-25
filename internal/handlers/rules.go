@@ -791,12 +791,16 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, runtimeErr, s
 	h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 	allErr := errors.Join(applyErr, runtimeErr, sideErr)
 	// 横幅事实源收口（与配置域 UpdateConfig/PutCaddyConfig/finishTxApply
-	// 同写点）：apply 失败只回 500+审计时，刷新页面后分叉完全不可见
-	// （看门狗只比对路由 id，纯策略/限流变化不触发漂移横幅）。运行配置恢复
-	// 成功时横幅为「旧配置已保留」；恢复失败（双失败）时改口「状态未知」，
-	// 不得在同一行里既称已保留又称恢复失败。
+	// 同口径）：只有库态与运行态可能分叉的失败才写横幅——配置拒绝（CLI
+	// 校验/admin 4xx）时候选未 /load、事务已回滚，运行配置仍是提交前形态，
+	// 写横幅会让用户追一个不存在的不一致（finishTxApply 的拒绝分支即不写）。
+	// 恢复失败（runtimeErr≠nil）时运行配置状态未知，无条件落横幅；恢复成功
+	// 时横幅为「旧配置已保留」，恢复失败（双失败）改口「状态未知」，不得在
+	// 同一行里既称已保留又称恢复失败。
 	h.recordCompensationSideEffects("Caddy 配置应用失败，规则未"+verb, sideErr)
-	h.recordCaddyApplyFailure(allErr, runtimeErr)
+	if !services.IsConfigRejected(applyErr) || runtimeErr != nil {
+		h.recordCaddyApplyFailure(allErr, runtimeErr)
+	}
 	// 规则五端点均为 Explicit 审计策略（中间件对 Explicit 整体
 	// 跳过）——此前 apply 失败只写 HTTP 响应，操作审计完全缺席。与配置域
 	// finishTxApply（拒绝/未校验分支）及安全域同口径：失败必须留痕。
@@ -1464,9 +1468,11 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	// 库值唯一真相（批 1+2）：健康检查 interval/timeout 为类型①值型列——
 	// 0→10/2 的写侧静默归一废除（0 由 validateRulePayloadBeforeSave 的 <1
 	// 边界 400；前端表单初值=默认，清空提交被拦）。
-	// 手动证书模式不消费 acme_config_id（签发/渲染均按 tls_source
-	// 分流）——清理跨模式死引用，避免随导出/快照放大不可达配置。
-	if req.TLSSource == "manual" {
+	// 非 acme_dns 来源不消费 acme_config_id（签发/渲染均按 tls_source
+	// 分流）——清理跨模式死引用，避免随导出/快照放大不可达配置。条件按
+	// 「非 acme_dns」而非「== manual」：空来源（API 创建 TLS 关闭且未选来源、
+	// 旧版本行）同样不消费 ACME 引用。
+	if req.TLSSource != "acme_dns" {
 		req.ACMEConfigID = 0
 	}
 	// 生效来源非 manual 时一律弃置证书材料——API/MCP/导入
@@ -2069,11 +2075,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.ACMEConfigID == 0 {
 		req.ACMEConfigID = existingRule.ACMEConfigID
 	}
-	// 手动证书模式同格清理残留 ACME 配置引用（存量导入/旧版本
-	// 行可携带 acme_config_id 而 tls_source=manual；渲染/签发零消费）。必须在
-	// validateRulePayloadBeforeSave 之前——否则残留引用指向已删除配置时，
+	// 非 acme_dns 来源同格清理残留 ACME 配置引用（存量导入/旧版本
+	// 行可携带 acme_config_id 而 tls_source 为 manual 或空串；渲染/签发零消费）。
+	// 必须在 validateRulePayloadBeforeSave 之前——否则残留引用指向已删除配置时，
 	// 编辑会被不存在的 ACME 引用门 400 卡死，清理永远不可达。
-	if req.TLSSource == "manual" {
+	if req.TLSSource != "acme_dns" {
 		req.ACMEConfigID = 0
 	}
 	// （写侧）：nil=保留现值先合并，validateRulePayloadBeforeSave
@@ -2630,16 +2636,14 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	// acme→manual 切换时清理 ACME 关联——acme_config_id 清零(渲染层
-	// 不再引用 ACME 配置)。在途/排队任务的收敛分两步（镜像 DisableRule
-	// 正确序):事务内先把非终态 cert_jobs 翻转为终态(见下方 tx 内翻转——否则主
-	// UPDATE 的 NOT EXISTS 守卫恒 409、queued/waiting_ca 行被 30s 补扫复活重签)，
-	// 事务提交后再取消队列在途签发(见 committed 之后的 cancelRuleJobs——提交前
-	// 取消会在回滚/重试窗口留下「队列已摘、行仍非终态」的复活态)。
-	switchingFromACME := existingRule.TLSSource == "acme_dns" && req.TLSSource == "manual"
-	if switchingFromACME {
-		req.ACMEConfigID = 0
-	}
+	// 离开 ACME 时（禁用 TLS / 切手动 / 切空来源 / 切 TCP）的在途/排队任务
+	// 收敛分两步（镜像 DisableRule 正确序）：事务内先把非终态 cert_jobs 翻转为
+	// 终态（见下方 orphanACME 分支——否则主 UPDATE 的 NOT EXISTS 守卫恒 409、
+	// queued/waiting_ca 行被 30s 补扫复活重签），事务提交后再取消队列在途签发
+	// （见 committed 之后的 cancelRuleJobs——提交前取消会在回滚/重试窗口留下
+	// 「队列已摘、行仍非终态」的复活态）。
+	// acme_config_id 的清零在同格合并后的「非 acme_dns」门统一完成（覆盖 manual
+	// 与空来源，见上方合并块），此处不再重复。
 	// 生效证书来源非 manual 时不保留任何证书材料——
 	// manual→acme_dns 此前保留 tls_cert/tls_key（渲染按 tls_source 分流零消费，
 	// 但私钥正文长期留在 lb_rules 并随导出/备份/集群快照放大）。与
@@ -2649,7 +2653,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		req.TLSCert, req.TLSKey = "", ""
 	}
 	// 生效来源非 acme_dns 时 ca_provider_id 归零（与
-	// CreateRule 非 ACME 分支同口径）。此前仅 switchingFromACME / tcp 归零，
+	// CreateRule 非 ACME 分支同口径）。此前仅 acme→manual 切换 / tcp 归零，
 	// manual→manual 编辑把存量残留值原样写回；而 ResolveCAProviderID 对非 0
 	// 直接返回（不校验存在性），残留死引用会随导出放大并在签发期才暴露。
 	if req.TLSSource != "acme_dns" {
@@ -3215,7 +3219,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				// 跳过终态），needJob 又为新域另建行，破坏「一规则一任务」且无留痕。
 				// 与下方 UPDATE 失败/commit 失败分支同语义：回滚 + 退役旧域任务。
 				if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
-					if rbErr := certTx.Rollback(); rbErr != nil {
+					if rbErr := certTx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 						services.Logf("error", "UpdateRule: cert job domain migration lookup rollback failed for caddy_id=%s: %v", caddyID, rbErr)
 					}
 					services.Logf("error", "UpdateRule: failed to read cert job during domain migration for caddy_id=%s: %v", caddyID, queryErr)
@@ -3230,7 +3234,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 						// 同后果——旧域任务未迁移，稍后 needJob 路径会为新域另建任务，
 						// 旧域 'issued'+PEM 行永驻且「一规则一任务」被破坏。回滚本事务
 						// （其内无其他有效写），并与开启失败分支同语义退役旧域任务。
-						if rbErr := certTx.Rollback(); rbErr != nil {
+						if rbErr := certTx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 							services.Logf("error", "UpdateRule: cert job domain migration rollback failed for caddy_id=%s: %v", caddyID, rbErr)
 						}
 						services.Logf("error", "UpdateRule: failed to update cert job %d domain for caddy_id=%s: %v", existingJobID, caddyID, err)
@@ -3809,9 +3813,9 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			}
 		}
 	}
-	// 手动 TLS 源的残留 acme_config_id 不被消费——副本不放大该
-	// 跨模式死引用（与 Create/Update/导入同口径；两协议同判）。
-	if rule.TLSSource == "manual" {
+	// 非 acme_dns 来源的残留 acme_config_id 不被消费——副本不放大该
+	// 跨模式死引用（与 Create/Update/导入同口径；两协议同判；空来源同理）。
+	if rule.TLSSource != "acme_dns" {
 		rule.ACMEConfigID = 0
 	}
 	// 副本同样按生效来源清理跨模式残留——
@@ -4285,7 +4289,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		writeInternalError(c, http.StatusInternalServerError, "开启数据库事务失败", err)
 		return
 	}
-	defer tx.Rollback()
+	defer func() { rollbackRuleWriteTx(tx, "BatchRuleBlockPages", "") }()
 	type skippedRule struct {
 		RuleID string `json:"rule_id"`
 		Reason string `json:"reason"`
@@ -4702,7 +4706,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		err := db.DB.QueryRow("SELECT id, status, COALESCE(message,''), expires_at, COALESCE(ca_provider_id,0) FROM cert_jobs WHERE rule_id=? AND domain=? ORDER BY id DESC LIMIT 1", caddyID, canonicalACMEDomainForJobLookup(domain)).Scan(&jobID, &jobStatus, &jobMsg, &jobExpiresAt, &jobProviderID)
 		if err == nil {
 			hasJob = true
-		} else if err != sql.ErrNoRows {
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			failEnable("读取证书任务失败", err)
 			return
 		}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1016,8 +1017,15 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 		t.Fatalf("丢路径规则直返列: %+v", config.PathRules)
 	}
 	// 有意子集钉零：TLS 材料不随预检渲染（单规则形态约定，勿回填）。
-	if config.EnableTLS || config.TLSCert != "" || config.TLSKey != "" {
-		t.Fatalf("预检输入不应携带 TLS 形态: enable_tls=%v", config.EnableTLS)
+	// 该不变量现由类型强制：SingleRuleConfig 不持有 TLS 字段，任何回填都会
+	// 先在编译期失败；此处再用反射钉住字段名，防止有人「以别名字段」绕回
+	// 私钥载荷路径（单规则渲染不得再出现 apps.tls / tls_connection_policies）。
+	configType := reflect.TypeOf(config)
+	for i := range configType.NumField() {
+		switch field := configType.Field(i).Name; field {
+		case "EnableTLS", "TLSSource", "TLSCert", "TLSKey":
+			t.Fatalf("SingleRuleConfig 重新引入了 TLS 字段 %s：单规则渲染不得承载证书/私钥", field)
+		}
 	}
 }
 

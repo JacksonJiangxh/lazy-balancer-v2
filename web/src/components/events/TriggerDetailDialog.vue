@@ -162,7 +162,7 @@ import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
 import { eventActionFull, eventActionTone } from '@/utils/eventAction'
-import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, missingSharedEntryIds, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, missingSharedEntryIds, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet, wafModeLabel } from '@/utils/securityStages'
 import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
@@ -544,7 +544,8 @@ const crawlerSummary = computed(() => {
 const wafSummary = computed(() => {
   const p = policy.value
   if (!p) return '—'
-  const mode = p.mode === 'blocking' ? '阻断' : p.mode === 'detection' ? '检测' : p.mode === 'custom_only' ? '仅自定义规则' : p.mode === 'off' ? '关闭' : p.mode || '—'
+  // 模式词取 securityStages.WAF_MODE_TEXT 单源（与策略列表摘要/流程投影同词）
+  const mode = wafModeLabel(p.mode) || '—'
   let groups = ''
   try {
     const g = (JSON.parse(p.crs_rule_groups ?? '[]') as string[]) || []
@@ -615,11 +616,13 @@ const ipHitScan = computed(() => {
   return { aclHit, trustHit, inlineAcl, ownerTrust, sysAclHit: aclHit.some((l) => l.system), exemptingPolicy }
 })
 const allHitLists = computed(() => ipHitScan.value.aclHit)
-// 白名单外拒绝形态（补漏2）：id:5/7 = allow 交集外——IP 不在任何名单
-// 中，「命中列表」恒空是正确语义，须显式说明而非「未定位到」。
+// 白名单外拒绝形态（补漏2）：id:7 = allow 交集外（security.go
+// ipPrecheckAllowRuleID）——IP 不在任何名单中，「命中列表」恒空是正确语义，
+// 须显式说明而非「未定位到」。id:5 不在此列：它是绕过模式占用 id:3 时的
+// 信任名单并集（归信任族，见 triggerStageFamily）。
 const isAllowOutside = computed(() => {
   const n = Number(props.row?.rule_triggered)
-  return kind.value === 'acl' && (n === 5 || n === 7)
+  return kind.value === 'acl' && n === 7
 })
 
 const inlineAclHit = computed(() => ipHitScan.value.inlineAcl)

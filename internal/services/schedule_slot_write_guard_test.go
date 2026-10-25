@@ -14,6 +14,7 @@ package services
 // 以及引擎侧「失败轮不消费槽→退避重投→读恢复后推进」的端到端链。
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -23,23 +24,30 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// injectScheduleReadFailure 让指定表的排程列读不出来，返回恢复函数（幂等）。
-func injectScheduleReadFailure(t *testing.T, table, column string) func() {
+// injectColumnRename 把列改名使引用该列的语句失败（用于区分「哪一条写入
+// 失败」：排程列读取走的是 schedule_days/schedule_time，改 message/finished_at
+// 之类状态列不会连带打掉排程读取），返回恢复函数（幂等）。
+func injectColumnRename(t *testing.T, table, column string) func() {
 	t.Helper()
-	renamed := column + "_unreadable"
+	renamed := column + "_unavailable"
 	if _, err := db.DB.Exec(`ALTER TABLE ` + table + ` RENAME COLUMN ` + column + ` TO ` + renamed); err != nil {
-		t.Fatalf("注入排程读失败（%s.%s）: %v", table, column, err)
+		t.Fatalf("注入列不可用（%s.%s）: %v", table, column, err)
 	}
 	var once sync.Once
 	restore := func() {
 		once.Do(func() {
 			if _, err := db.DB.Exec(`ALTER TABLE ` + table + ` RENAME COLUMN ` + renamed + ` TO ` + column); err != nil {
-				t.Errorf("恢复排程列（%s.%s）: %v", table, column, err)
+				t.Errorf("恢复列（%s.%s）: %v", table, column, err)
 			}
 		})
 	}
 	t.Cleanup(restore)
 	return restore
+}
+
+// injectScheduleReadFailure 让指定表的排程列读不出来，返回恢复函数（幂等）。
+func injectScheduleReadFailure(t *testing.T, table, column string) func() {
+	return injectColumnRename(t, table, column)
 }
 
 // threatSourceStatus 读威胁源状态列（本文件只需状态与槽两列）。
@@ -275,6 +283,195 @@ func TestEngine_ThreatScheduleReadFailureRetriesSameSlot(t *testing.T) {
 	waitRun("success", 6*time.Second)
 	assertFutureSlot(t, "读恢复后的威胁源槽", threatSourceSlot(t, id))
 	if m, ok := e.Lookup("threat"); !ok || !m.LoopOn {
+		t.Fatalf("恢复轮后调度开关应为开启（失败退避不得等同停调）: ok=%v", ok)
+	}
+}
+
+// ip2RegionRowStatusSlot 读 IP2Region 状态列与排程槽（不碰 message/finished_at，
+// 以便在状态列被注入不可用期间断言）。
+func ip2RegionRowStatusSlot(t *testing.T) (status, slot string) {
+	t.Helper()
+	if err := db.DB.QueryRow(`SELECT COALESCE(update_status,''), COALESCE(next_update,'') FROM security_ip2region_version WHERE id=1`).Scan(&status, &slot); err != nil {
+		t.Fatal(err)
+	}
+	return status, slot
+}
+
+// Given 版本表成功轮的状态行 UPDATE 本身失败（状态列不可写，排程读取正常）。
+// When 「已是最新」成功轮落库。
+// Then 本轮按「排程槽未推进」上报（不得以 success 收尾），状态列与槽都保持
+// 原值；写恢复后同一路径成功落库并推进槽。
+func TestVersionTableSlotSuccess_stateWriteFailureReportsUnadvancedSlot(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.30.0", true)
+	expired := expiredSlot()
+	setCRSSlot(t, expired)
+
+	restore := injectColumnRename(t, "security_crs_version", "message")
+	m.recordLatestSkip("auto")
+	var status string
+	if err := db.DB.QueryRow(`SELECT COALESCE(update_status,'') FROM security_crs_version WHERE id=1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == string(CRSStatusSuccess) {
+		t.Fatalf("update_status=%q：状态行写入失败却落了 success（引擎会把过期槽记入消费水位）", status)
+	}
+	if got := crsNextUpdate(t); got != expired {
+		t.Fatalf("状态行写入失败时 next_update=%q, want 保持原值 %q", got, expired)
+	}
+	if err := m.ScheduleSlotError(); !errors.Is(err, errScheduleSlotNotAdvanced) {
+		t.Fatalf("ScheduleSlotError()=%v, want 排程槽未推进（写失败必须并入同一失败通道）", err)
+	}
+
+	restore()
+	m.recordLatestSkip("auto")
+	if err := m.ScheduleSlotError(); err != nil {
+		t.Fatalf("写恢复后不应再报排程槽未推进: %v", err)
+	}
+	_, status, _, _, _, _, _ = crsVersionRow(t)
+	if status != string(CRSStatusSuccess) {
+		t.Fatalf("update_status=%q, want success", status)
+	}
+	assertFutureSlot(t, "写恢复后的 CRS 槽", crsNextUpdate(t))
+}
+
+// Given IP2Region 真实成功轮的状态行 UPDATE 失败。When 一轮手动更新跑完
+// （下载/安装/重载全部成功）。
+// Then 本轮按「排程槽未推进」上报，状态列保持原值、槽不推进；写恢复后同一次
+// 更新成功落库并推进槽。
+func TestVersionTableSlotSuccess_ip2RegionStateWriteFailureReportsUnadvancedSlot(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	expired := expiredSlot()
+	if _, err := db.DB.Exec(`UPDATE security_ip2region_version SET next_update=? WHERE id=1`, expired); err != nil {
+		t.Fatal(err)
+	}
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = fakeIP2RegionDownload(t, true)
+	m.reloader = func() error { return nil }
+
+	restore := injectColumnRename(t, "security_ip2region_version", "message")
+	m.run("manual", nil)
+	status, slot := ip2RegionRowStatusSlot(t)
+	if status == string(IP2RegionStatusSuccess) {
+		t.Fatalf("update_status=%q：状态行写入失败却落了 success（引擎会把过期槽记入消费水位）", status)
+	}
+	if slot != expired {
+		t.Fatalf("状态行写入失败时 next_update=%q, want 保持原值 %q", slot, expired)
+	}
+	if err := m.ScheduleSlotError(); !errors.Is(err, errScheduleSlotNotAdvanced) {
+		t.Fatalf("ScheduleSlotError()=%v, want 排程槽未推进（写失败必须并入同一失败通道）", err)
+	}
+
+	restore()
+	m.run("manual", nil)
+	if err := m.ScheduleSlotError(); err != nil {
+		t.Fatalf("写恢复后不应再报排程槽未推进: %v", err)
+	}
+	status, slot = ip2RegionRowStatusSlot(t)
+	if status != string(IP2RegionStatusSuccess) {
+		t.Fatalf("update_status=%q, want success", status)
+	}
+	assertFutureSlot(t, "写恢复后的 IP2Region 槽", slot)
+}
+
+// Given IP2Region「已是最新」轮的状态行 UPDATE 失败。When 一轮手动更新跑完。
+// Then 同假成功轮一律按排程槽未推进上报，槽保持原值；写恢复后成功推进槽。
+func TestVersionTableSlotSuccess_ip2RegionLatestSkipStateWriteFailure(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	expired := expiredSlot()
+	if _, err := db.DB.Exec(`UPDATE security_ip2region_version SET next_update=? WHERE id=1`, expired); err != nil {
+		t.Fatal(err)
+	}
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.0.0", nil }
+
+	restore := injectColumnRename(t, "security_ip2region_version", "message")
+	m.run("manual", nil)
+	status, slot := ip2RegionRowStatusSlot(t)
+	if status == string(IP2RegionStatusSuccess) {
+		t.Fatalf("update_status=%q：状态行写入失败却落了 success", status)
+	}
+	if slot != expired {
+		t.Fatalf("状态行写入失败时 next_update=%q, want 保持原值 %q", slot, expired)
+	}
+	if err := m.ScheduleSlotError(); !errors.Is(err, errScheduleSlotNotAdvanced) {
+		t.Fatalf("ScheduleSlotError()=%v, want 排程槽未推进", err)
+	}
+
+	restore()
+	m.run("manual", nil)
+	if err := m.ScheduleSlotError(); err != nil {
+		t.Fatalf("写恢复后不应再报排程槽未推进: %v", err)
+	}
+	status, slot = ip2RegionRowStatusSlot(t)
+	if status != string(IP2RegionStatusSuccess) {
+		t.Fatalf("update_status=%q, want success", status)
+	}
+	assertFutureSlot(t, "写恢复后的 IP2Region 槽", slot)
+}
+
+// Given 版本表成功轮的状态行写入持续失败（写路径读排程正常）。
+// When 引擎按过期槽投递自动轮。
+// Then 失败轮不消费本槽（过期槽不得进 schedDoneSlot）；写恢复后同一槽仍会
+// 被投递、成功推进到未来槽——吞错按 success 收尾的形态会让 tick 的
+// 「槽 > 消费水位」门永久拒绝该槽（自动更新静默停摆，无自愈路径）。
+func TestEngine_VersionTableStateWriteFailureRetriesSameSlot(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.30.0", true)
+	expired := expiredSlot()
+	setCRSSlot(t, expired)
+
+	restore := injectColumnRename(t, "security_crs_version", "message")
+
+	e := taskengine.NewEngine(taskengine.Options{TickInterval: 20 * time.Millisecond})
+	t.Cleanup(e.Stop)
+	e.Register(taskengine.Descriptor{
+		ID: "crs", Family: "security", Name: "CRS 规则库更新",
+		Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly,
+		NextSlotFn: func() time.Time {
+			if !versionTableAutoUpdateEnabled("security_crs_version") {
+				return time.Time{}
+			}
+			return parseUTCSlot(versionTableNextUpdate("security_crs_version"))
+		},
+		EnabledFn: func() bool { return versionTableAutoUpdateEnabled("security_crs_version") },
+		Run: func(rc taskengine.RunContext) error {
+			// 真实成功落库路径：状态行写失败时以「槽未推进」上报。
+			m.recordLatestSkip(rc.Trigger)
+			return m.ScheduleSlotError()
+		},
+	})
+	e.SetRole(true)
+	e.StartLoop("crs")
+
+	waitRun := func(want string, deadline time.Duration) {
+		t.Helper()
+		end := time.Now().Add(deadline)
+		for time.Now().Before(end) {
+			if run := e.LatestRun("crs"); run != nil && run.Status == want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		run := e.LatestRun("crs")
+		if run == nil {
+			t.Fatalf("%v 内无任何运行记录, want 终态 %s", deadline, want)
+		}
+		t.Fatalf("%v 内最新运行 status=%s（message=%s）, want %s", deadline, run.Status, run.Message, want)
+	}
+
+	// 第一次自动轮：状态行写失败 → 失败（不得以 success 消费本槽）。
+	waitRun("failed", 3*time.Second)
+	if got := crsNextUpdate(t); got != expired {
+		t.Fatalf("状态行写失败时 next_update=%q, want 保持原值 %q", got, expired)
+	}
+
+	// 写恢复后，同一过期槽仍会被重投（未消费）并推进到未来槽。
+	restore()
+	waitRun("success", 6*time.Second)
+	assertFutureSlot(t, "写恢复后的 CRS 槽", crsNextUpdate(t))
+	if info, ok := e.Lookup("crs"); !ok || !info.LoopOn {
 		t.Fatalf("恢复轮后调度开关应为开启（失败退避不得等同停调）: ok=%v", ok)
 	}
 }

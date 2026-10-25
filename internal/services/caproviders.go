@@ -25,7 +25,11 @@ const (
 	// Official directory URLs. These are fixed and not user-editable.
 	LetsEncryptDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 	ZeroSSLDirectoryURL     = "https://acme.zerossl.com/v2/DV90"
-	caProviderColumns       = "id, name, provider, directory_url, COALESCE(credentials,''), max_concurrent, min_interval_ms, enabled, created_at, updated_at"
+	// caProviderColumns 的可空列统一 COALESCE（带外 NULL 不得让整表扫描/解析
+	// 500）：max_concurrent/min_interval_ms 取 DDL 默认值；enabled 取 0 而非
+	// DDL 默认 1——所有取用门都是 `WHERE enabled=1`，SQL 三值逻辑下 NULL 本就
+	// 不会命中，读成「启用」会让列表显示与队列准入自相矛盾（fail-closed 口径）。
+	caProviderColumns = "id, name, provider, directory_url, COALESCE(credentials,''), COALESCE(max_concurrent,1), COALESCE(min_interval_ms,2000), COALESCE(enabled,0), created_at, updated_at"
 )
 
 // CredentialsSemanticallyEqual 报告两段凭证 JSON 语义相等（键序/空白无关）：

@@ -65,10 +65,10 @@
             </el-button>
           </el-form-item>
           <div class="mfa-switch">
-            <el-link type="primary" underline="never" @click="mfaUseRecovery = !mfaUseRecovery; mfaCode = ''">
+            <AccessibleLink type="primary" underline="never" @click="mfaUseRecovery = !mfaUseRecovery; mfaCode = ''">
               {{ mfaUseRecovery ? '使用验证码' : '使用恢复代码' }}
-            </el-link>
-            <el-link type="info" underline="never" @click="resetToPasswordStep">返回重新登录</el-link>
+            </AccessibleLink>
+            <AccessibleLink type="info" underline="never" @click="resetToPasswordStep">返回重新登录</AccessibleLink>
           </div>
         </el-form>
 
@@ -149,6 +149,7 @@ import { useAuthStore } from '@/stores/auth'
 import { ApiRequestError, normalizeMfaCodeInput, request } from '@/utils/api'
 import { User, Lock, Postcard, Key, ArrowLeft } from '@element-plus/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { appName, appVersion } from '@/utils/branding'
 import { validatePassword, validateUsername } from '@/utils/credentials'
 import type { FormInstance, FormRules, InputOtpInstance } from 'element-plus'

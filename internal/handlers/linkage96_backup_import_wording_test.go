@@ -4,8 +4,8 @@ package handlers
 //   - 部分成功响应的阶段描述只出现一次（此前 message/warnings 各拼一次协调器
 //     自带的「导入部分失败（…）：」前缀）；
 //   - CA 提供商悬挂文案只有一处字面量（单源函数），响应侧不得再手写；
-//   - 导入后置归一的「manual 不保留 ACME 引用」与启动迁移/传输归一同一读取口径
-//     （COALESCE(tls_source,'manual')），NULL 行不得被漏清。
+//   - 导入后置归一的「非 acme_dns 不保留 ACME 引用」与启动迁移/传输归一同一
+//     读取口径（COALESCE(tls_source,'manual')）：NULL 与空串行都不得漏清。
 
 import (
 	"context"
@@ -132,8 +132,8 @@ func TestCertJobProviderDangling_wordingHasSingleSource(t *testing.T) {
 	}
 }
 
-// 导入后置归一：tls_source 为 NULL 的 manual 行必须与启动迁移/传输归一同样
-// 清掉死引用（acme_config_id）；acme_dns 行的引用保持不变。
+// 导入后置归一：tls_source 为 NULL 或空串的 manual 族行必须与启动迁移/
+// 传输归一同样清掉死引用（acme_config_id）；acme_dns 行的引用保持不变。
 func TestNormalizeRuleRowsForTransport_manualSourceNullClearsACMEReference(t *testing.T) {
 	newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,credentials,enabled)
@@ -172,11 +172,11 @@ func TestNormalizeRuleRowsForTransport_manualSourceNullClearsACMEReference(t *te
 	if ref := readRef("lb_null_manual"); ref != 0 {
 		t.Fatalf("tls_source=NULL 的 manual 行 acme_config_id=%d, want 0（与启动迁移同口径清零）", ref)
 	}
-	// 正向对照（有意设计，不是遗漏）：tls_source='' 在四个面（写侧读列、值域门、
-	// 启动迁移、传输归一）都按空值处理而不等同 manual——COALESCE 只替换 NULL，
-	// 故该形态的引用四面一致地保留。
-	if ref := readRef("lb_empty_source"); ref != 7 {
-		t.Fatalf("tls_source='' 行 acme_config_id=%d, want 7（四面一致：空值不等同 manual）", ref)
+	// 空来源（''）：非 acme_dns 一律清零——保存族、启动迁移、传输归一、
+	// 导入后置归一四面同一不变量，避免死引用随导出/备份/集群快照放大
+	// （COALESCE 只把 NULL 视作 manual，空串必须由「非 acme_dns」谓词覆盖）。
+	if ref := readRef("lb_empty_source"); ref != 0 {
+		t.Fatalf("tls_source='' 行 acme_config_id=%d, want 0（非 acme_dns 不保留 ACME 引用）", ref)
 	}
 	if ref := readRef("lb_acme_ref"); ref != 7 {
 		t.Fatalf("acme_dns 行的 acme_config_id=%d, want 7（正向对照：引用必须保留）", ref)

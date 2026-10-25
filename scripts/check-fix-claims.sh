@@ -11,11 +11,14 @@
 #   - status: fixed | maintained | falsified | retired
 #   - fixed 必须有 evidence，多个用 ';' 分隔，支持：
 #       code:<path>:<line>:<token>   该行必须包含 token（token 可含空格）
-#       test:<TestName>              仓库内必须存在 func <TestName>( 或前端 test('<name>'
-#       ftest:<literal>              web/tests 内必须出现该字面量（describe/it 标题等）
+#       test:<TestName>              仓库内必须存在（未注释的）func <TestName>( 或 test('<name>'
+#       ftest:<literal>              web/tests 内必须出现该字面量（describe/it 标题等，不得在注释里）
 #       script:<path>                脚本必须存在（且可执行）
-#       spec:<path>                  前端 spec 文件必须存在
-#   - ftest/script 的空字面量/空路径一律判失败（grep -F '' 恒命中＝假绿）。
+#       spec:<path>                  前端 spec 文件必须存在，且为 web/tests 下的 *.spec.ts
+#   - ftest/script/spec 的空字面量/空路径一律判失败（grep -F '' 恒命中＝假绿）；
+#     spec 只接受前端用例路径——任意存在的文件不构成「前端 spec」证据。
+#   - test/ftest 的匹配先剥注释：被注释掉的声明/标题不是可执行证据（原文 grep
+#     会把它们判成命中）。
 #   - maintained / falsified / retired 必须写非空 reason
 #
 # --commit 会解析该提交 message 中的 "Fixes: ID[,ID...]" 行，要求每个 ID 在台账
@@ -25,10 +28,62 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 剥注释视图（awk 单程，逐文件独立状态）：去掉行注释（`//`）、块注释起始行
+# （`/*`）与续行（`*`），并丢弃 /* ... */ 块内的所有行。证据匹配只在这份视图
+# 上做——被注释掉的测试声明/用例标题不是可执行证据，原文 grep 会把它们判成
+# 命中，R-4b 反向对账就退化为「字符串在仓里」。
+# 只在行首为 `/*` 时进入块态：字符串字面量里的 `/*` 不吞后续代码（假失败）。
+strip_comments() { # <file>
+  awk '
+    { line = $0; sub(/^[[:space:]]+/, "", line) }
+    inblock { if (line ~ /\*\//) inblock = 0; next }
+    line ~ /^\/\*/ { if (line !~ /\*\//) inblock = 1; next }
+    line ~ /^\/\// { next }
+    line ~ /^\*/ { next }
+    { print }
+  ' "$1"
+}
+
+# 剥注释视图中是否存在匹配（扩展正则）：先按原文挑候选文件，再逐文件剥注释复检。
+code_has_regex() { # <pattern> <dir>
+  local pattern="$1" dir="$2" files
+  files="$(grep -RlE --include='*_test.go' --include='*.spec.ts' -- "$pattern" "$dir" 2>/dev/null || true)"
+  [ -z "$files" ] && return 1
+  # shellcheck disable=SC2086 # 仓库文件名不含空白
+  awk -v pat="$pattern" '
+    FNR == 1 { inblock = 0 }
+    { line = $0; sub(/^[[:space:]]+/, "", line) }
+    inblock { if (line ~ /\*\//) inblock = 0; next }
+    line ~ /^\/\*/ { if (line !~ /\*\//) inblock = 1; next }
+    line ~ /^\/\// { next }
+    line ~ /^\*/ { next }
+    line ~ pat { hit = 1; exit }
+    END { exit(hit ? 0 : 1) }
+  ' $files
+}
+
+# 同 code_has_regex，但按字面量（ftest 标题可含正则元字符）。
+code_has_literal() { # <literal> <dir>
+  local literal="$1" dir="$2" files
+  files="$(grep -RlF --include='*.spec.ts' -- "$literal" "$dir" 2>/dev/null || true)"
+  [ -z "$files" ] && return 1
+  # shellcheck disable=SC2086 # 仓库文件名不含空白
+  awk -v lit="$literal" '
+    FNR == 1 { inblock = 0 }
+    { line = $0; sub(/^[[:space:]]+/, "", line) }
+    inblock { if (line ~ /\*\//) inblock = 0; next }
+    line ~ /^\/\*/ { if (line !~ /\*\//) inblock = 1; next }
+    line ~ /^\/\// { next }
+    line ~ /^\*/ { next }
+    index($0, lit) > 0 { hit = 1; exit }
+    END { exit(hit ? 0 : 1) }
+  ' $files
+}
 
 self_test() {
   local tmp
@@ -148,6 +203,99 @@ EOF
     echo "SELFTEST FAIL: script 不可执行却通过" >&2; return 1
   fi
 
+  # 12) 正例：spec 指向真实前端用例（web/tests 下的 *.spec.ts）
+  cat > "$tmp/ok-spec.tsv" <<'EOF'
+id|status|evidence|reason
+F-4|fixed|spec:web/tests/demo.spec.ts|
+EOF
+  if ! (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger ok-spec.tsv >/dev/null); then
+    echo "SELFTEST FAIL: spec 正例被拒" >&2; return 1
+  fi
+
+  # 13) 反例：spec 目标文件不存在
+  cat > "$tmp/bad-spec.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|spec:web/tests/absent.spec.ts|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger bad-spec.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: spec 不存在却通过" >&2; return 1
+  fi
+
+  # 14) 反例：spec 路径为空（与其他证据形态的空值拒绝同口径）
+  cat > "$tmp/empty-spec.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|spec:|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger empty-spec.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: spec 路径为空却通过" >&2; return 1
+  fi
+
+  # 15) 反例：路径存在但不是前端 spec（任意文件存在即通过＝假绿；spec 语义是
+  #     web/tests 下的前端用例）
+  cat > "$tmp/non-spec.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|spec:internal/demo/demo.go|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger non-spec.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 非前端 spec 路径却通过" >&2; return 1
+  fi
+
+  # 16) 反例：行注释里的 Go 测试声明（原文 grep 会命中，剥注释视图不得命中）
+  printf 'package demo\n\n// func TestCommentedOut(t *testing.T) {}\n' > "$tmp/internal/demo/commented_test.go"
+  cat > "$tmp/commented-test.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|test:TestCommentedOut|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger commented-test.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 注释掉的 Go 测试声明被当作证据" >&2; return 1
+  fi
+
+  # 17) 反例：块注释里的 Go 测试声明（多行 /* */ 状态必须被剥离）
+  cat > "$tmp/internal/demo/block_test.go" <<'EOF'
+package demo
+
+/*
+func TestBlockCommentedOut(t *testing.T) {
+}
+*/
+EOF
+  cat > "$tmp/block-commented-test.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|test:TestBlockCommentedOut|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger block-commented-test.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 块注释里的 Go 测试声明被当作证据" >&2; return 1
+  fi
+
+  # 18) 反例：注释掉的前端用例标题
+  printf "// test('commented-frontend-title', () => {})\n" > "$tmp/web/tests/commented.spec.ts"
+  cat > "$tmp/commented-ftest.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|ftest:commented-frontend-title|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger commented-ftest.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: 注释掉的前端用例标题被当作证据" >&2; return 1
+  fi
+
+  # 19) 正例：剥注释不得把真实声明吃掉（同上两个夹具目录里真实用例仍在）
+  cat > "$tmp/real-decl.tsv" <<'EOF'
+id|status|evidence|reason
+F-5|fixed|test:TestDemoBehavior;ftest:demo-fixture-title|
+EOF
+  if ! (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger real-decl.tsv >/dev/null); then
+    echo "SELFTEST FAIL: 剥注释后真实声明被误判为缺失" >&2; return 1
+  fi
+
+  # 20) 反例：web/tests 下的非 spec 文件（路径以 spec 形态存在但扩展名不符）
+  printf 'fixture\n' > "$tmp/web/tests/notes.md"
+  cat > "$tmp/near-miss-spec.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|spec:web/tests/notes.md|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger near-miss-spec.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: web/tests 下的非 spec 文件被当作前端 spec 证据" >&2; return 1
+  fi
+
   echo "fix-claims selftest: PASS"
 }
 
@@ -206,8 +354,9 @@ while IFS='|' read -r id status evidence reason; do
             ;;
           test:*)
             name="${item#test:}"
-            if ! grep -RqsE --include='*_test.go' --include='*.spec.ts' "func[[:space:]]+${name}\(|test\(['\"]${name}" .; then
-              echo "FAIL ${id}: 测试不存在: $name" >&2; fail=1
+            # 声明必须落在代码行（行首 func / test(）上；注释掉的声明不算证据。
+            if ! code_has_regex "^[[:space:]]*func[[:space:]]+${name}[(]|^[[:space:]]*test[(]['\"]${name}" .; then
+              echo "FAIL ${id}: 测试不存在（注释掉的声明不算证据）: $name" >&2; fail=1
             fi
             ;;
           ftest:*)
@@ -215,12 +364,21 @@ while IFS='|' read -r id status evidence reason; do
             if [ -z "$literal" ]; then
               echo "FAIL ${id}: ftest 字面量为空（grep -F '' 恒命中，不构成证据）" >&2; fail=1; continue
             fi
-            if ! grep -RqsF --include='*.spec.ts' -- "$literal" web/tests; then
-              echo "FAIL ${id}: 前端用例不存在: $literal" >&2; fail=1
+            if ! code_has_literal "$literal" web/tests; then
+              echo "FAIL ${id}: 前端用例不存在（注释掉的标题不算证据）: $literal" >&2; fail=1
             fi
             ;;
           spec:*)
             spec="${item#spec:}"
+            if [ -z "$spec" ]; then
+              echo "FAIL ${id}: spec 路径为空" >&2; fail=1; continue
+            fi
+            # spec 的语义是「前端用例文件」：任意存在的文件（Go 源码/配置/文档）
+            # 都能满足 [ -f ]，那样的形状等于「写一个存在路径即通过」的假绿。
+            case "$spec" in
+              web/tests/*.spec.ts) ;;
+              *) echo "FAIL ${id}: spec 必须是 web/tests 下的 *.spec.ts 前端用例: $spec" >&2; fail=1; continue ;;
+            esac
             if [ ! -f "$spec" ]; then
               echo "FAIL ${id}: 前端 spec 不存在: $spec" >&2; fail=1
             fi

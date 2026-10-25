@@ -4,7 +4,8 @@ import "testing"
 
 // 2026-10-04 用户裁定：dns_server 多地址逐地址守卫——splitDnsAddresses 拆分后
 // 逐地址跑现有单地址校验（host[:port]/端口范围/非法字符），而非整串当单 host 放过。
-// 当前 validateDnsServerShape 把 "a,b" 整串当 host 通过——RED。
+// 已实现：validateDnsServerShape 先经 services.SplitDnsAddresses 拆分再逐地址
+// 校验（handlers.go 的 validateDnsServerShape/validateSingleDnsAddress）。
 
 func TestValidateDnsServerShape_multiAddressPerEntryValidation(t *testing.T) {
 	cases := []struct {

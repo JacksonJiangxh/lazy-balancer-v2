@@ -29,6 +29,10 @@ export const planTrustRemoval = (input: {
   readonly whitelistRefs: string | undefined
   readonly lists: readonly TrustRemovalList[]
   readonly removableListIds: readonly number[]
+  /** 名单条目读取：**必须新鲜**。本函数据此给出「移除后该 IP 是否仍被信任」的
+   *  安全结论——陈旧条目会漏掉他人新增的 CIDR 覆盖（把「引擎仍信任」谎报成
+   *  「已取消信任」）。调用方须在决策前强制刷新：仍在 TTL 内可复用缓存，过期
+   *  必须重拉；重拉失败（条目缺失）时不得出结论。 */
   readonly listEntries: (listId: number) => readonly string[]
 }): TrustRemovalPlan => {
   const ip = input.ip.trim()

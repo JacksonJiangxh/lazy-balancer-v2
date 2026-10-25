@@ -1149,12 +1149,14 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 	if _, err := tx.ExecContext(ctx, db.TCPRuleUpstreamOriginResetSQL); err != nil {
 		return 0, fmt.Errorf("规则 TCP 上游回源域名归一失败: %w", err)
 	}
-	// 手动证书模式不消费 acme_config_id——导入行清理跨模式死引用
-	// （与 Create/Update/Duplicate 保存链同口径）。tls_source 的读取口径全族是
-	// COALESCE(tls_source,'manual')（写侧列清单、值域门、启动迁移、传输归一），
-	// 裸比较会把 NULL 行排除在外——同一行在启动迁移被清零、在导入被保留。
-	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET acme_config_id=0 WHERE COALESCE(tls_source,'manual')='manual' AND COALESCE(acme_config_id,0)<>0`); err != nil {
-		return 0, fmt.Errorf("规则手动 TLS 残留 ACME 引用归一失败: %w", err)
+	// 非 acme_dns 来源不消费 acme_config_id——导入行清理跨模式死引用
+	// （与 Create/Update/Duplicate 保存链、启动迁移、传输归一同一谓词）。
+	// tls_source 的读取口径全族是 COALESCE(tls_source,'manual')（写侧列清单、
+	// 值域门、启动迁移、传输归一）：NULL 视作 manual，空串同样非 acme_dns，
+	// 两者都必须清零——裸比较会把 NULL/空串行排除在外，导致同一行在启动迁移
+	// 被清零、在导入被保留。
+	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET acme_config_id=0 WHERE COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(acme_config_id,0)<>0`); err != nil {
+		return 0, fmt.Errorf("规则非 ACME TLS 残留 ACME 引用归一失败: %w", err)
 	}
 	// 跨模式残留归一——非 manual 源不保留证书材料
 	// （私钥正文随导出/备份/快照放大）；非 acme_dns 源不保留 CA 提供商引用
@@ -1198,7 +1200,13 @@ func pruneTCPRuleBindings(ctx context.Context, tx *sql.Tx) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("清理 TCP 规则安全策略绑定失败: %w", err)
 	}
-	dropped, _ := result.RowsAffected()
+	// DELETE 已成功：计数失败只影响审计/响应里的条数展示，不影响导入结果
+	// ——按 0 计并留痕（与同文件悬挂绑定清理同口径，不得独吞错误）。
+	dropped, countErr := result.RowsAffected()
+	if countErr != nil {
+		services.Logf("warn", "清理 TCP 规则安全策略绑定：读取影响行数失败（按 0 计，清理动作已成功）: %v", countErr)
+		return 0, nil
+	}
 	return dropped, nil
 }
 
@@ -1720,7 +1728,10 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 //   - server_map_lat/lon：数值门 + 范围（与 validateServerMapCoordinates
 //     单源同边界：-90/90、-180/180）；
 //   - protocol：仅 http/https，空串归一为 http（schema DEFAULT 语义）；
-//     cluster_token_hash：字符串或 NULL（NULL=待重新注册）。
+//     cluster_token_hash：字符串或 NULL（NULL=待重新注册）；
+//   - mode：仅 slave，空串归一为 slave（schema DEFAULT 语义）；master 行点名
+//     拒绝——该列由注册路径独占写入，巡检按 slave 过滤，放行 master 行会让
+//     节点静默退出离线/滞后判定。
 //
 // name 落库前走 models.NormalizeClusterNodeName
 // 单源归一（去首尾空白/剥离控制字符/截断 100 rune），但只静默归一
@@ -1840,11 +1851,17 @@ func validateV2BackupNodeRows(rows []map[string]any) error {
 				return fmt.Errorf("%s mode 必须为字符串", line)
 			}
 			switch mode {
-			case "slave", "master":
+			case "slave":
+			case "master":
+				// 节点模式列由注册路径独占写入（RegisterNode 恒写 slave），
+				// nodes 表只登记从节点；巡检按 mode='slave' 过滤。放行 master
+				// 行会让该节点永久退出离线/滞后判定（节点列表仍展示、上报仍
+				// 被接受），故行级门直接点名拒绝，不做静默改写。
+				return fmt.Errorf("%s mode=master 不受支持（nodes 只登记从节点，模式由注册路径写入）", line)
 			case "":
 				row["mode"] = "slave" // schema DEFAULT 语义归一
 			default:
-				return fmt.Errorf("%s mode 仅支持 slave/master，实际 %q", line, mode)
+				return fmt.Errorf("%s mode 仅支持 slave，实际 %q", line, mode)
 			}
 		}
 		if raw, exists := row["cluster_token_hash"]; exists && raw != nil {
@@ -6362,6 +6379,14 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 	// 提交后立即应用运行期设置（此前导入只 SyncBusinessTaskDrivers
 	// + 清缓存，log_level 变更要等重启；管理面板 HTTPS 变更需重启才能生效）。
 	services.ApplyLogLevel()
+	// 导入替换四个规则库排程族的行（版本表整行 / 威胁与爬虫源行），而
+	// next_update 是按**导出机**时区算出的 UTC 槽：只导入 security 分类时本机
+	// 时区不变，「下次更新」展示与实际触发会按源机偏移错位一周期。保存时区路径
+	// 已接同一重排（caddy.go UpdateConfig），导入在此补齐。调用安全性：该函数
+	// 幂等——只改未来槽、过期槽保留补跑、空槽不动（首槽武装归
+	// RearmSecurityLibrarySlots），故无条件调用（不能只在 timezone 随备份变化
+	// 时调用——分区导入正是时区不变而槽属他机的形态）。
+	services.RearmScheduleSlotsAfterTimezoneChange()
 	// 导入可改 task_log_size_mb——服务端 5 分钟 TTL 缓存必须立即失效。
 	invalidateImportTaskLogCache()
 	// 重启判定必须用严格读取变体（与集群同步后判定同口径）：宽容版读失败

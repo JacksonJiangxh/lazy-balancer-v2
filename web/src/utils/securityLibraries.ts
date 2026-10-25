@@ -72,7 +72,8 @@ interface LibrarySummary {
 /**
  * 多源规则库聚合（威胁情报库/爬虫地址库共用）：
  * - latestVersion = 各源 version 最大值（compareVersion，日期/semver 通用；
- *   等值取行序最后一行，API 为 id 序——后端 latestSourceVersion 同口径）；
+ *   等值取行序最后一行，API 为 id 序——后端 latestSourceVersion 同口径；
+ *   空/纯空白值先 trim 再跳过，与后端 TrimSpace 后 continue 同口径）；
  * - totalEntries = 各源 entry_count 之和；
  * - status = 任一更新中 > 任一失败 > 有版本=success > never（空源/无版本）。
  *   「从未更新」独立成 never，不折叠为 idle/「已最新」——原两页对空列表的
@@ -88,7 +89,15 @@ export const summarizeLibrarySources = (
   const active = sources.filter((s) => s.update_enabled !== false)
   const anyRunning = active.some((s) => s.update_status === 'running')
   const anyFailed = !anyRunning && active.some((s) => s.update_status === 'failed')
-  const latestVersion = sources.map((s) => s.version).filter((v): v is string => !!v).sort(compareVersion).pop() || ''
+  // 版本先 trim 再判空：后端 latestSourceVersion 对空/纯空白源 continue，
+  // 前端在 trim 前用 !!v 过滤会把 " " 当有值——同一库在集群 hover（后端）
+  // 显示未更新、在规则库页（前端）显示已最新。跨栈夹具
+  // web/tests/fixtures/library-aggregate.tsv 由两端同读。
+  const latestVersion = sources
+    .map((s) => (s.version ?? '').trim())
+    .filter((v) => v !== '')
+    .sort(compareVersion)
+    .pop() || ''
   const totalEntries = sources.reduce((sum, s) => sum + (s.entry_count || 0), 0)
   // 上次更新取最晚、下次更新取最早（空源 → '—'）；下次排程只看启用源。
   const lastChecked = sources.map((s) => formatDate(s.last_checked)).filter(Boolean).sort().pop() || '—'

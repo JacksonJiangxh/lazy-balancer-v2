@@ -180,7 +180,7 @@
         </div>
       </div>
 
-      <el-alert v-if="eventsLoadError" type="error" :closable="false" show-icon class="error-banner mb-5">
+      <el-alert v-if="eventsLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
         <template #title>
           <div class="polling-error-title">
             <span>{{ events.length > 0 ? '安全事件加载失败：当前显示的是上次成功结果（与筛选/分页条件不符）' : '安全事件加载失败：表格为空不代表没有事件' }}</span>
@@ -199,7 +199,7 @@
         </el-table-column>
         <el-table-column label="规则" min-width="130">
           <template #default="{ row }">
-            <el-link v-if="row.rule_name || row.rule_caddy_id" type="primary" @click="goToRule(row)">{{ row.rule_name || row.rule_caddy_id || '—' }}</el-link>
+            <AccessibleLink v-if="row.rule_name || row.rule_caddy_id" type="primary" @click="goToRule(row)">{{ row.rule_name || row.rule_caddy_id || '—' }}</AccessibleLink>
             <span v-else>—</span>
           </template>
         </el-table-column>
@@ -207,8 +207,8 @@
           <template #default="{ row }">
             <!-- 触发阶段展示：信任名单 / IP 访问控制（黑白名单+地域+威胁库，点击看触发详情）/
                  WAF（CRS=详情+快捷排除弹框；自定义=规则详情弹框）/ 请求体异常（纯文本） -->
-            <el-link v-if="stageCategory(row) === 'waf'" type="primary" @click="openTriggerDetail(row)">WAF</el-link>
-            <el-link v-else-if="['acl', 'crawler', 'trust'].includes(stageCategory(row))" type="primary" @click="openTriggerDetail(row)">{{ stageLabel(row) }}</el-link>
+            <AccessibleLink v-if="stageCategory(row) === 'waf'" type="primary" @click="openTriggerDetail(row)">WAF</AccessibleLink>
+            <AccessibleLink v-else-if="['acl', 'crawler', 'trust'].includes(stageCategory(row))" type="primary" @click="openTriggerDetail(row)">{{ stageLabel(row) }}</AccessibleLink>
             <el-tooltip v-else-if="showTriggeredMsg(row)" :content="row.rule_msg" placement="top" :show-after="200">
               <span class="cell-tip">{{ stageLabel(row) }}</span>
             </el-tooltip>
@@ -222,7 +222,7 @@
         </el-table-column>
         <el-table-column label="策略" min-width="150">
           <template #default="{ row }">
-            <el-link v-if="row.policy_name || row.policy_id > 0" type="primary" @click="goToPolicy(row)">{{ row.policy_name || row.policy_id }}</el-link>
+            <AccessibleLink v-if="row.policy_name || row.policy_id > 0" type="primary" @click="goToPolicy(row)">{{ row.policy_name || row.policy_id }}</AccessibleLink>
             <span v-else>—</span>
           </template>
         </el-table-column>
@@ -404,6 +404,7 @@ import { request, mfaAwareSuccess } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { formatDurationUs, isWafDurationFamily, triggerStageFamily } from '@/utils/securityStages'
 import { TRIGGERED_CATEGORIES, serializeTriggeredFilter, CRAWLER_FAMILY_LABEL } from '@/utils/triggeredFilter'
 import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
@@ -689,8 +690,8 @@ const stageLabel = (row: SecurityEvent): string => {
     default: return row.rule_triggered || '—'
   }
 }
-// tooltip 分支仅在模板 else 分支可达（trust/acl/crawler/waf 已由前两个 el-link
-// 分支截走）——原再排除 2/3/4/5/^949 是永不命中的死条件，误导读者以为 ACL/
+// tooltip 分支仅在模板 else 分支可达（trust/acl/crawler/waf 已由前两个
+// AccessibleLink 分支截走）——原再排除 2/3/4/5/^949 是永不命中的死条件，误导读者以为 ACL/
 // 信任行会走 tooltip。
 const showTriggeredMsg = (row: SecurityEvent): boolean =>
   !!row.rule_triggered && !!row.rule_msg

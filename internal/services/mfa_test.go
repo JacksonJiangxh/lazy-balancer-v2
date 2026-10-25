@@ -182,8 +182,20 @@ func TestMFAChallengeLifecycle(t *testing.T) {
 	if ok, err := MFAConsumeChallenge(tok, 5); ok || err != nil {
 		t.Fatalf("replay consume must fail without service error: ok=%v err=%v", ok, err)
 	}
-	if ok, err := MFAConsumeChallenge(tok, 999); ok || err != nil {
+	// 属主绑定必须在**未消费**挑战上观测：复用上面已消费的 token 时
+	// consumed=1 已让 RowsAffected=0，删掉 user_id 谓词断言仍然通过。
+	// （属主来自挑战行而非请求参数——MFAVerifyLogin 按 token 定位挑战后
+	// 用行内 user_id 调用本函数，故观测点在服务层。）
+	ownedTok, ownedErr := MFAIssueChallenge(5)
+	if ownedErr != nil || ownedTok == "" {
+		t.Fatalf("issue challenge for owner binding: tok=%q err=%v", ownedTok, ownedErr)
+	}
+	if ok, err := MFAConsumeChallenge(ownedTok, 999); ok || err != nil {
 		t.Fatalf("wrong owner must fail without service error: ok=%v err=%v", ok, err)
+	}
+	// 错属主尝试不得改行：属主随后仍可消费同一挑战。
+	if ok, err := MFAConsumeChallenge(ownedTok, 5); !ok || err != nil {
+		t.Fatalf("owner must still consume challenge untouched by wrong-owner attempt: ok=%v err=%v", ok, err)
 	}
 	// 过期：手工回拨
 	tok2, _ := MFAIssueChallenge(5)

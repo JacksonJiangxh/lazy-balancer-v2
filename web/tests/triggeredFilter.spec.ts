@@ -63,8 +63,13 @@ test('族段跨栈对表：前端段必须是后端 ruleTriggeredFamilyPrefixes 
   // 段名打错一字筛选即从「该族全部事件」退化为「消息含该串的事件」，纯前端
   // 断言无法发现；必须读 Go 源对表。
   const go = repoCode('internal/handlers/security.go')
-  const block = section(go, 'var ruleTriggeredFamilyPrefixes = map[string][]string{', '\n}')
-  const backendKeys = new Set([...block.matchAll(/"([^"]+)":\s*\{/g)].map((m) => m[1]))
+  // 后端键 = 手写形态族（buildRuleTriggeredFamilyPrefixes 的 families 字面量）
+  // ∪ 单 ID 族（由 legacyRuleFamilies 表派生，key 即族键）——两侧都要读，
+  // 只看字面量会在单 ID 族改名时假绿。
+  const build = section(go, 'func buildRuleTriggeredFamilyPrefixes() map[string][]string {', '\n}')
+  const backendKeys = new Set([...build.matchAll(/"([^"]+)":\s*\{/g)].map((m) => m[1]))
+  const table = section(go, 'var legacyRuleFamilies = map[int]legacyRuleFamily{', '\n}')
+  for (const [, key] of table.matchAll(/\{key:\s*"([^"]+)"/g)) backendKeys.add(key)
   assert.ok(backendKeys.size >= 8, `后端 family 键解析异常（仅 ${backendKeys.size} 个）`)
   // 「WAF·CRS」为复合 GLOB 特判段（ruleTriggeredFilterSQL 内单独匹配，不在前缀表）
   assert.ok(go.includes('if input == "WAF 规则（CRS）" || input == "WAF·CRS"'), 'WAF·CRS 特判段缺失')

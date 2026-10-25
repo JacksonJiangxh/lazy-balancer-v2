@@ -820,7 +820,9 @@ var clusterSmallRequestTimeout = 10 * time.Second
 // ctx 截止互补（ctx 覆盖整轮，本值兜住后续新增小请求漏套 ctx 的形态）。
 // 只挂在小请求 transport 上：快照/规则包的大传输在服务端同步构建后才写
 // 响应头，首字节时限会把慢主机构建的合法大响应误判为挂死。
-const clusterSmallResponseHeaderTimeout = 15 * time.Second
+// 变量而非常量：测试注入短预算验证「transport 自身即截止」，避免 15s 级实测
+// 等待（与 clusterSmallRequestTimeout 同形态）。
+var clusterSmallResponseHeaderTimeout = 15 * time.Second
 
 // newClusterSmallRequestContext 是小请求 ctx 的单源构造点，测试经
 // clusterSmallRequestTimeout 覆盖预算。

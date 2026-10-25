@@ -58,6 +58,26 @@ var auditResultTextMap = map[string]string{
 	// 曾因映射表与钉测清单双缺而渲染成英文 conflict）。
 	"conflict":           "状态冲突",
 	"deleted_unverified": "已删除（结果未确认）",
+	// 证书任务重试/删除失败出口（AuditPolicyExplicit 路由无中间件自动审计，
+	// 失败/被拒尝试按固定归因补记）。
+	"import_in_progress":      "配置导入进行中",
+	"invalid_id":              "任务标识无效",
+	"job_not_found":           "任务不存在",
+	"cooldown":                "冷却中",
+	"permanent":               "永久不可重试",
+	"ca_cooldown":             "CA 冷却中",
+	"deployment_retry_failed": "部署重试失败",
+	"queue_unavailable":       "队列不可用",
+	"enqueue_failed":          "入队失败",
+	"status_read_failed":      "读取状态失败",
+	"state_changed":           "状态已变更",
+	"in_flight":               "任务在执行中",
+	"not_retryable":           "暂不可重试",
+	"rule_state_read_failed":  "读取规则状态失败",
+	"guarded_active_rule":     "规则仍启用",
+	"disable_failed":          "禁用任务失败",
+	"disable_verify_failed":   "禁用结果校验失败",
+	"delete_failed":           "删除任务失败",
 }
 
 // auditDynamicResultCodes 是「动态实参」进入 AuditResultPart 的结果码取值域
@@ -78,6 +98,13 @@ var auditDynamicResultCodes = []string{
 	"enabled", "disabled",
 	// handlers/cluster_ticket.go 登录票据失败归因
 	"database_error", "invalid_ticket", "invalid_signature", "expired", "replay", "user_unavailable",
+	// handlers/certjobs.go 证书任务重试/删除失败出口（retryCertJobByID 的
+	// auditFailure/auditFailureWithRule 与 DeleteCertJob 的 auditFailure 均以
+	// 动态实参进入 AuditResultPart）
+	"job_not_found", "cooldown", "permanent", "ca_cooldown", "deployment_retry_failed",
+	"queue_unavailable", "enqueue_failed", "status_read_failed", "state_changed",
+	"in_flight", "not_retryable", "rule_state_read_failed", "guarded_active_rule",
+	"disable_failed", "disable_verify_failed", "delete_failed",
 }
 
 func AuditResultText(result string) string {

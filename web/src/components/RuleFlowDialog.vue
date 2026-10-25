@@ -934,4 +934,12 @@ const onDialogOpen = (): void => {
 .flow-detail-meta { color: #9ca3af; text-align: right; }
 .flow-detail-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .flow-detail-line { font-size: 12px; color: #6b7280; line-height: 1.8; }
+
+/* 动效无障碍：系统「减少动态效果」下取消装饰性动画——竖向连接线的 0.7s
+   循环流动与卡片错峰进场（弹框常驻直到关闭，循环动效对前庭敏感用户不友好）。
+   同族范式见 views/security/ThreatScreen.vue 的 reduced-motion 段。 */
+@media (prefers-reduced-motion: reduce) {
+  .tl-row { animation: none; }
+  .tl-line { animation: none; background-position-y: 0; }
+}
 </style>

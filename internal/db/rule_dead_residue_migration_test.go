@@ -78,7 +78,8 @@ func TestMigrateRuleTLSModeResidue(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO lb_rules (id, caddy_id, name, protocol, domain, listen_port, tls_source, tls_cert, tls_key, acme_config_id, ca_provider_id)
 		VALUES (1, 'lb_acme_residue', 'acme-residue', 'http', 'acme.example.test', 443, 'acme_dns', 'CERT', 'KEY', 2, 3),
 		       (2, 'lb_manual_residue', 'manual-residue', 'http', 'manual.example.test', 443, 'manual', 'KEEP_CERT', 'KEEP_KEY', 7, 9),
-		       (3, 'lb_manual_clean', 'manual-clean', 'http', 'clean.example.test', 443, 'manual', 'CERT2', 'KEY2', 0, 0)`); err != nil {
+		       (3, 'lb_manual_clean', 'manual-clean', 'http', 'clean.example.test', 443, 'manual', 'CERT2', 'KEY2', 0, 0),
+		       (4, 'lb_empty_source', 'empty-source', 'http', 'empty.example.test', 443, '', 'CERT3', 'KEY3', 5, 6)`); err != nil {
 		t.Fatalf("seed rules: %v", err)
 	}
 
@@ -117,6 +118,15 @@ func TestMigrateRuleTLSModeResidue(t *testing.T) {
 	}
 	if cleanCert != "CERT2" {
 		t.Fatalf("clean manual rule cert=%q, want 保留", cleanCert)
+	}
+	// 空来源（NULL 之外的第二形态）：COALESCE 视作 manual，非 acme_dns 一律
+	// 清零 ACME/CA 引用与证书材料——与保存族/导入/传输归一同一不变量。
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0) FROM lb_rules WHERE caddy_id='lb_empty_source'`).
+		Scan(&cert, &key, &acmeID, &caID); err != nil {
+		t.Fatalf("read empty source rule: %v", err)
+	}
+	if cert != "" || key != "" || acmeID != 0 || caID != 0 {
+		t.Fatalf("empty source rule cert=%q key=%q acme=%d ca=%d, want 全清零", cert, key, acmeID, caID)
 	}
 	var version int
 	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {

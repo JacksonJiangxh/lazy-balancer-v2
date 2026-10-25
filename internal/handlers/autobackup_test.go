@@ -42,7 +42,9 @@ func wireAutoBackupEngineForTest(t *testing.T, h *Handlers) {
 		_, err := h.RunAutoBackupOnce(ctx, trigger, operator, engineRunID)
 		return err
 	})
-	if services.TaskEngine() == nil {
+	// 判据与 initTaskEngineForTest 同源：nil 或已停止都必须重建。只判 nil 时
+	// 会拿到前一用例停掉但未清全局指针的引擎，端点回 503「任务引擎已停止」。
+	if te := services.TaskEngine(); te == nil || te.IsStopped() {
 		services.InitTaskEngine("", t.TempDir()+"/app.log")
 	}
 	t.Cleanup(func() {
@@ -971,6 +973,31 @@ func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 	})
 	if username != "operator-zhang" {
 		t.Fatalf("手动备份 audit username=%q, want operator-zhang(调度路径才记 system)", username)
+	}
+}
+
+// Given 全局引擎被前一用例停成「已停止但非 nil」（只停实例、未清全局指针）。
+// When 装配自动备份执行器并调用 /auto-backup/run。
+// Then 装配必须重建引擎并受理（202）——判据只判 nil 时端点回 503
+// 「任务引擎已停止」，全包运行结果随测试顺序变化。
+func TestWireAutoBackupEngineForTest_replacesStoppedEngine(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	services.InitTaskEngine("", t.TempDir()+"/app.log").Stop()
+	if te := services.TaskEngine(); te == nil || !te.IsStopped() {
+		t.Fatal("前置态不成立：全局引擎应为 stopped 非 nil")
+	}
+	wireAutoBackupEngineForTest(t, h)
+	if te := services.TaskEngine(); te == nil || te.IsStopped() {
+		t.Fatal("装配必须替换已停止的全局引擎（否则 TriggerTaskAsync 恒 ErrEngineStopped）")
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/auto-backup/run", h.RunAutoBackupNow)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/auto-backup/run", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s, want 202（不得沿用已停止引擎）", response.Code, response.Body.String())
 	}
 }
 

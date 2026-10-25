@@ -64,21 +64,25 @@ func describeThreatRuleNameWithNames(key string, customNames map[int]string) str
 	switch n {
 	case 2:
 		return "IP 访问控制拦截（#2）"
-	case 3, 5, 12:
-		// id:5 是「绕过模式占位」的信任名单 DetectionOnly 规则（id:3 的同族
-		// 变体）——与 triggerTypeForRule/attackFamilyClassOf 的族标签同集合；
-		// 威胁情报库的历史段是 id:14，二者不得共用一个标签。
-		return "信任名单检测（#" + key + "）"
 	case 4:
 		return "IP 黑名单（#4）"
-	case 14:
-		return "威胁情报库（#" + key + "）"
 	case 7:
 		return "IP 白名单拒绝（#7）"
-	case 8:
-		return "地域拦截（#8）"
 	case 429:
 		return "限流触发（#429）"
+	}
+	// 其余固定 id 的族标签由 legacyRuleFamilies 派生（与 triggerTypeForRule/
+	// attackFamilyClassOf/筛选表同源）：id:5 是「绕过模式占位」的信任名单
+	// DetectionOnly 规则（id:3 的同族变体）；威胁情报库的历史段是 id:14，
+	// 二者不得共用一个标签。IP 族三个 id 的细标签差异较大（拦截/黑名单/白名单），
+	// 已在上面单独给出。
+	switch legacyRuleFamilyOf(n).class {
+	case attackFamilyTrust:
+		return "信任名单检测（#" + key + "）"
+	case attackFamilyThreatIntel:
+		return "威胁情报库（#" + key + "）"
+	case attackFamilyGeoIP:
+		return "地域拦截（#" + key + "）"
 	}
 	// 阶段 1 预检段经 services.DecodePrecheckRuleID 单一事实源解码
 	// （段界字面量禁止复写——段基址调整时 handlers 不得静默分叉）。
@@ -276,7 +280,8 @@ const (
 	// 与安全总览（直读原始表、用当前分类）在同一窗口分裂。分类口径变更必须
 	// 递增 threatRollupClassifierVersion，代际不一致按空覆盖重固。
 	threatRollupClassifierVersionKey = "threat_rollup_classifier_version"
-	threatRollupClassifierVersion    = "2"
+	// v3：固定 id:5 归信任名单（id→家族表统一：此前分桶误记 IP 访问控制）。
+	threatRollupClassifierVersion = "3"
 	// threatRollupPredicateVersionKey / threatRollupPredicateVersion 固化口径
 	// 代际：保留地址排除谓词与攻击口径（爬虫放行不计入攻击）都会让已固化
 	// 分钟的口径静默过时（水位机制只保护迟到事件，不保护语义变更）——口径
@@ -1830,7 +1835,8 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		}
 	}
 	// 活跃攻击源：近 10min 去重 client_ip，保留/私网排除（与总量同口径）。
-	// 短 TTL（≤10s）缓存同窗口结果——大屏 30s 轮询不再每轮重扫原始表。
+	// TTL 30s（与 30s 轮询同周期）：同一分钟锚点内命中一次，大屏轮询不再
+	// 每轮重扫原始表。
 	activeSources, activeErr := threatActiveSourcesCount(db.MetricsDB, activeSince, now)
 	trackErr(activeErr)
 	// top_targets：前 3 被攻击目标（读分钟 rollup 的目标
@@ -2299,41 +2305,29 @@ func (h *Handlers) GetSecurityEventFeed(c *gin.Context) {
 // triggerTypeForRule 触发类型显示映射（v2.3.8 单源）：阶段 id → 业务语义类型。
 // 爬虫事件独立于地域拦截（豁免/伪装不再落「IP 访问控制」桶，消除歧义）；
 // WAF 拆 CRS/自定义（各数值段互斥：10000-799999 与 1000000+=自定义、
-// 900000-999999=CRS）；429→限流、GeoIP 老 id:8 兼容。
+// 900000-999999=CRS）；固定 id（429/2/3/4/5/7/8/11/12/14）的族归属统一取
+// legacyRuleFamilies（与总览攻击族分桶、事件页族筛选同源）。
 func triggerTypeForRule(ruleTriggered string) string {
 	// 预检段家族判定经 services.PrecheckRuleFamilyOf 单一事实源（段界
 	// 字面量禁止复写——段基址调整时 handlers 不得静默分叉）。
 	n, err := strconv.Atoi(ruleTriggered)
-	if err == nil {
-		switch services.PrecheckRuleFamilyOf(n) {
-		case services.PrecheckRuleFamilyGeoIP:
-			return "地域拦截"
-		case services.PrecheckRuleFamilyCrawlerExempt, services.PrecheckRuleFamilyCrawlerSpoof:
-			return "爬虫Bot"
-		}
-		switch {
-		case n >= services.GeoIPPrecheckSegmentLimit && n < services.SyntheticCustomRuleIDBase:
-			return "WAF·CRS"
-		case n >= 10000 && n < services.GeoIPPrecheckSegmentBase, n >= services.SyntheticCustomRuleIDBase:
-			return "WAF·自定义"
-		}
-	}
-	switch ruleTriggered {
-	case "429":
-		// 防御性分支：限流由 caddy-ratelimit 直接返回，无 security_events 行
-		// （生产者缺失见 categorizeAttack 注释）。保留以对齐事件列表口径。
-		return "限流"
-	case "2", "4", "5", "7":
-		return "IP 访问控制"
-	case "8":
-		return "地域拦截"
-	case "3", "12":
-		return "信任名单"
-	case "14":
-		return "威胁情报库"
-	case "11":
-		return "请求体异常"
-	default:
+	if err != nil {
 		return "其他"
 	}
+	switch services.PrecheckRuleFamilyOf(n) {
+	case services.PrecheckRuleFamilyGeoIP:
+		return "地域拦截"
+	case services.PrecheckRuleFamilyCrawlerExempt, services.PrecheckRuleFamilyCrawlerSpoof:
+		return "爬虫Bot"
+	}
+	switch {
+	case n >= services.GeoIPPrecheckSegmentLimit && n < services.SyntheticCustomRuleIDBase:
+		return "WAF·CRS"
+	case n >= 10000 && n < services.GeoIPPrecheckSegmentBase, n >= services.SyntheticCustomRuleIDBase:
+		return "WAF·自定义"
+	}
+	if family := legacyRuleFamilyOf(n); family.key != "" {
+		return family.key
+	}
+	return "其他"
 }

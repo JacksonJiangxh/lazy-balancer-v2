@@ -17,8 +17,12 @@ test('名单加载失败不得静默：catch 置 listsError 并清空名单，�
   assert.match(page, /const listsError = ref\(false\)/)
 
   const loadIpLists = section(page, 'const loadIpLists = async', '\n}\n')
-  assert.match(loadIpLists, /listsError\.value = \[\.\.\.refIds\]\.some\(\(id\) => !\(id in sharedEntriesCache\)\)/,
+  // 补齐与失败判定走 securityStages 单源：「补齐后仍不新鲜」（含过期缓存）才算
+  // 缺失——手写 !(id in sharedEntriesCache) 会把过期缓存当成就绪。
+  assert.match(loadIpLists, /const missing = await ensureSharedEntriesMissing\(refIds, loadListEntries\)/,
     'ensureSharedEntries 单名单失败保持未缓存——引用条目缺失同属加载失败')
+  assert.match(loadIpLists, /listsError\.value = missing\.length > 0/,
+    '失败判定必须取自 securityStages 回报的缺失 id 清单')
   // 失败分支：清空本次名单 → 置错误态（顺序按语句位置判定，不耦合空行/缩进）
   const catchAt = loadIpLists.indexOf('} catch {')
   assert.ok(catchAt >= 0, 'loadIpLists 必须有 catch 分支')

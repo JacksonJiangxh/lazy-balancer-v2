@@ -1,5 +1,6 @@
 // 触发 id → 阶段族映射行为验收：逐项对照后端 v2.3.8 权威分类
 //   internal/handlers/security.go attackFamilyClassOf（ID 形态）
+//   internal/handlers/security.go legacyRuleFamilies（固定 SecRule id 族单表）
 //   internal/handlers/security_threat_screen.go triggerTypeForRule（数值段）
 //
 // 运行：cd web && npm test
@@ -11,11 +12,12 @@ import { detectionModeExplains, triggerStageFamily, type TriggerStageFamily } fr
 import { repoCode, section } from './_helpers.ts'
 
 const cases: ReadonlyArray<readonly [string, TriggerStageFamily]> = [
-  // 空 / 请求体异常 / 威胁情报 / 信任
+  // 空 / 请求体异常 / 威胁情报 / 信任（id:5 = 绕过模式占用 id:3 时的信任名单并集）
   ['', 'other'],
   ['11', 'body'],
   ['14', 'threat'],
   ['3', 'trust'],
+  ['5', 'trust'],
   ['12', 'trust'],
   // 自定义规则：5 位任意（含 9 开头——5 位恒自定义，CRS 恒 6 位）
   ['10000', 'wafCustom'],
@@ -45,11 +47,11 @@ const cases: ReadonlyArray<readonly [string, TriggerStageFamily]> = [
   ['850000', 'crawler'],
   ['899999', 'crawler'],
   // IP 访问控制
-  // （有意设计登记）：'8' 与后端 attackFamilyClassOf（8→GeoIP）不同——
-  // 历史共享 id，现代引擎地域事件改发 800xxx，本例外无现实影响且被刻意钉住。
+  // （有意设计登记）：'8' 与后端 legacyRuleFamilies（8→地域拦截）不同——
+  // 历史共享 id，现代引擎地域事件改发 800xxx，本例外无现实影响且被刻意钉住；
+  // 例外集合由下方「legacyRuleFamilies 单表派生」用例显式登记。
   ['2', 'ipAcl'],
   ['4', 'ipAcl'],
-  ['5', 'ipAcl'],
   ['7', 'ipAcl'],
   ['8', 'ipAcl'],
   // 其他（429 限流在列表层单独处理，非阶段族）
@@ -87,10 +89,10 @@ test('检测模式归因：仅 WAF 族（CRS/自定义含 body 目标）', () =>
   }
 })
 
-test('段界与 ID 集合跨栈对表（后端段界/分支调整必须红）', () => {
+test('段界与形态分支跨栈对表（后端段界/分支调整必须红）', () => {
   // 段界单一事实源 = services/security.go 段基址常量；attackFamilyClassOf 是
-  // if-链无法纯文本全量对表——钉住段界常量 + 关键形态分支锚（msg 关键词分支
-  // 为 Go 侧表达力超集，人工同步，豁免机械钉）。
+  // 形态判定的唯一入口（固定 id 族的族归属已收敛到 legacyRuleFamilies，
+  // 由下一条用例逐 id 对表）。
   const svc = repoCode('internal/services/security.go')
   for (const anchor of [
     'geoipPrecheckRuleBase     = 800000',
@@ -102,15 +104,56 @@ test('段界与 ID 集合跨栈对表（后端段界/分支调整必须红）', 
   const handler = repoCode('internal/handlers/security.go')
   const fn = section(handler, 'func attackFamilyClassOf(', '\n}')
   for (const anchor of [
-    'len(ruleTriggered) == 5',
-    "ruleTriggered[0] >= '1' && ruleTriggered[0] <= '7'",
-    'len(ruleTriggered) >= 7',
-    'ruleTriggered == "11"',
-    'ruleTriggered == "14"',
-    'ruleTriggered == "3" || ruleTriggered == "12"',
-    'ruleTriggered == "2" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7"',
+    'case len(ruleTriggered) == 5:',
+    "case len(ruleTriggered) == 6 && ruleTriggered[0] >= '1' && ruleTriggered[0] <= '7':",
+    'case strings.HasPrefix(ruleTriggered, "1") && len(ruleTriggered) >= 7:',
+    'legacyFamily := legacyRuleFamily{}',
+    'case legacyFamily.class == attackFamilyTrust:',
   ]) {
     assert.ok(fn.includes(anchor), `attackFamilyClassOf 分支锚漂移：${anchor}`)
   }
-  // 「8」前端归 ipAcl vs 后端归 GeoIP——有意设计例外（见上方用例注释），不钉。
+  // 筛选表（ruleTriggeredFamilyPrefixes）的单 ID 族必须仍由该表派生——
+  // 前端段名与该表键同词，表被改回逐条字面量会让族筛选与触发类型再次分叉。
+  const build = section(handler, 'func buildRuleTriggeredFamilyPrefixes() map[string][]string {', '\n}')
+  assert.match(build, /legacyRuleFamilies\[id\]\.key/, '筛选表必须由 legacyRuleFamilies 派生')
+})
+
+// 固定 id 的族归属单一事实源 = legacyRuleFamilies（事件列表触发类型 / 总览攻击族
+// / 事件页族筛选 / 大屏命中标签四处派生）。逐 id 对表而不是逐条抄写：表改族而
+// 前端未同步、或前端自造映射，都在此变红（曾把 id:5 的分叉钉进用例当契约）。
+const GO_KEY_TO_FAMILY: Readonly<Record<string, TriggerStageFamily>> = {
+  'IP 访问控制': 'ipAcl',
+  '信任名单': 'trust',
+  '地域拦截': 'geoip',
+  '威胁情报库': 'threat',
+  '请求体异常': 'body',
+  // 限流（429）：后端有族键，但无 sec_events 数据源、列表层不设类别与阶段桶
+  // （见 triggeredFilter 的固定八类），本函数的阶段族归 other。
+  '限流': 'other',
+}
+
+// 前端有意的阶段族例外（必须显式登记；除下列 id 外一律按后端表取值）：
+// 存量 id 8 按历史共享 id 口径归 IP 访问控制——SecurityEvents.stageLabel 另有
+// 「地域拦截（旧 id）」中和文案，现代引擎地域事件改发 800xxx，仅历史/带外
+// 数据可见；不按「与后端同步」改回 geoip。
+const FRONTEND_FAMILY_EXCEPTIONS: Readonly<Record<string, TriggerStageFamily>> = { '8': 'ipAcl' }
+
+test('固定 id 族归属从后端 legacyRuleFamilies 单表派生（改族即红）', () => {
+  const handler = repoCode('internal/handlers/security.go')
+  const table = section(handler, 'var legacyRuleFamilies = map[int]legacyRuleFamily{', '\n}')
+  const entries = [...table.matchAll(/^\s*(\d+):\s*\{key:\s*"([^"]+)"/gm)]
+  assert.ok(entries.length >= 10, `legacyRuleFamilies 解析异常（仅 ${entries.length} 条）`)
+  for (const [, id, key] of entries) {
+    const goFamily = GO_KEY_TO_FAMILY[key]
+    assert.ok(goFamily, `后端族键「${key}」未在 GO_KEY_TO_FAMILY 登记（新增族需先定前端投影）`)
+    const expected = FRONTEND_FAMILY_EXCEPTIONS[id] ?? goFamily
+    assert.equal(triggerStageFamily(id), expected, `id=${id} 后端族「${key}」`)
+  }
+  // 信任族三兄弟必须都在表内（id:5 是绕过模式占位，曾按 ACL 记账）
+  for (const id of ['3', '5', '12']) {
+    assert.ok(entries.some(([, entryId]) => entryId === id), `后端表缺信任族 id:${id}`)
+    assert.equal(triggerStageFamily(id), 'trust', `id:${id} 必须归信任名单`)
+  }
+  // 例外集合 = 登记值；新增例外必须显式写进 FRONTEND_FAMILY_EXCEPTIONS
+  assert.deepEqual(Object.keys(FRONTEND_FAMILY_EXCEPTIONS).sort(), ['8'])
 })

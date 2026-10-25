@@ -185,7 +185,15 @@ func canonicalDatetime(v sql.NullTime) any {
 	if !v.Valid {
 		return nil
 	}
-	return v.Time.UTC().Format("2006-01-02 15:04:05")
+	return canonicalDatetimeValue(v.Time)
+}
+
+// canonicalDatetimeValue 把时刻归一为 cert_jobs DATETIME 列的规范墙钟串
+// （UTC、无时区标识），与 canonicalDatetime 同一布局。所有 cert_jobs 时间列
+// 写点必须共用：直接绑 time.Time 会落成 `+00:00` 形态，与 API 文档声明的
+// 「UTC 墙钟串（无时区标识）」及 rescan 的解析布局不一致。
+func canonicalDatetimeValue(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
 // RestoreCertJobsForRule restores UPSERT-overwritten rows and removes jobs
@@ -1316,7 +1324,7 @@ func backfillIssuedCertExpiry(ctx context.Context) (int, error) {
 		if gateErr := certReconcileWriteGate(ctx); gateErr != nil {
 			return filled, gateErr
 		}
-		result, err := db.DB.Exec(`UPDATE cert_jobs SET expires_at=? WHERE id=? AND status='issued' AND expires_at IS NULL`, update.notAfter, update.id)
+		result, err := db.DB.Exec(`UPDATE cert_jobs SET expires_at=? WHERE id=? AND status='issued' AND expires_at IS NULL`, canonicalDatetimeValue(update.notAfter), update.id)
 		if err != nil {
 			return filled, fmt.Errorf("回填证书任务 %d 的到期时间: %w", update.id, err)
 		}
@@ -2232,7 +2240,14 @@ func (s *CertificateService) renewExpiringCertificates() error {
 			source = "first_issuance_retry"
 		}
 		_, changed, err := qm.EnqueueIfActive(j.CAProviderID, j.ID, j.RuleID, j.Domain, func() (int, bool, error) {
-			err := transitionJob(db.DB, j.ID, []string{"issued", "failed", "waiting_ca"}, "queued", map[string]any{"message": message})
+			// 冷却残留必须与 markJobWaitingCA/上限分支同字段集清理：
+			// waiting_ca→queued 后若以非 429 原因失败，failed 行仍带旧 429
+			// 错误码与过期冷却时刻，导出/备份/未来消费方会看到与终态矛盾的字段。
+			err := transitionJob(db.DB, j.ID, []string{"issued", "failed", "waiting_ca"}, "queued", map[string]any{
+				"message":            message,
+				"ca_available_after": nil,
+				"last_error_code":    nil,
+			})
 			if errors.Is(err, ErrJobTransitionConflict) {
 				return j.ID, false, nil
 			}

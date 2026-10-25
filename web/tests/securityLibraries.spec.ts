@@ -6,6 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import {
   crsRuleCountLabel,
@@ -210,4 +211,38 @@ test('原型链键不得冒充词表命中：返回状态原文而非函数', ()
     assert.equal(typeof label, 'string', `${status} 不得返回函数`)
     assert.equal(label, status, `${status} 未登记 → 原样回显`)
   }
+})
+
+// 跨栈共享夹具：与 Go internal/services 的 latestSourceVersion 同读一份
+// （web/tests/fixtures/library-aggregate.tsv）。两端各写一套空值过滤曾让
+// 纯空白版本分叉——后端 trim 后跳过（报未更新）、前端 !!v 视为有值（报已最新）。
+test('多源聚合：跨栈共享夹具（Go latestSourceVersion 同源）', () => {
+  const fixture = readFileSync(new URL('./fixtures/library-aggregate.tsv', import.meta.url), 'utf8')
+  let checked = 0
+  for (const [index, line] of fixture.split('\n').entries()) {
+    if (line.startsWith('#') || line.trim() === '') continue
+    const fields = line.split('\t')
+    assert.equal(fields.length, 4, `夹具第 ${index + 1} 行字段数`)
+    const rawVersions = fields[1] as string
+    const versions = rawVersions === ''
+      ? []
+      : rawVersions.split(';').map((token) => (token === '<empty>' ? '' : token === '<blank>' ? ' ' : token))
+    const summary = summarizeLibrarySources(versions.map((version) => ({ version, update_status: 'idle' })))
+    assert.equal(
+      summary.latestVersion,
+      fields[2],
+      `夹具第 ${index + 1} 行 latestVersion：纯空白版本必须与后端一样在 trim 后跳过`,
+    )
+    assert.equal(summary.status, fields[3], `夹具第 ${index + 1} 行 status`)
+    checked++
+  }
+  assert.ok(checked > 0, '跨栈聚合夹具为空')
+})
+
+// version 是可选列（API 行可缺该键）：缺省与空串同口径——不参与聚合，
+// 不得因 undefined 落进比较器（Number(undefined)=NaN 的字符串兜底语义）。
+test('多源聚合：缺省 version 键与空串同口径', () => {
+  const summary = summarizeLibrarySources([{ update_status: 'idle' }])
+  assert.equal(summary.latestVersion, '')
+  assert.equal(summary.status, 'never')
 })

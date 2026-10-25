@@ -34,6 +34,12 @@ const certificateConfigNameMaxRunes = 100
 // 配置项无关——2MB 足以容纳最长链，且对齐 admin-tls inspect 的量级。
 const maxParseCertificateBytes = 2 << 20
 
+// maxBatchIssueTargets 是批量签发（{"all":true}）单次目标数上限：该分支在
+// 全局 caddyOpMu 内逐目标做查询+upsert/入队（原子性所需），规则数百条时
+// 规则写、配置写与 Caddy 启停全部排队且 failed 切片无界。超上限显式 400
+// 提示分批执行，而不是静默截断或让全局锁无限期占用。
+const maxBatchIssueTargets = 500
+
 // normalizeCertificateConfigName 统一 trim + 非空 + 长度校验，写入 trimmed 值。
 func normalizeCertificateConfigName(raw string) (string, error) {
 	name := strings.TrimSpace(raw)
@@ -773,17 +779,40 @@ func (h *Handlers) TestCertificateConfig(c *gin.Context) {
 func (h *Handlers) ListCertificates(c *gin.Context) {
 	// 可选 rule_id 过滤（附加参数，默认行为不变）：全表扫描 + 临时排序在大规模
 	// 部署下是每请求一次 O(N)，而 UI/MCP 的常见消费面是「按规则查证书」。
-	query := `
-		SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,''), COALESCE(j.expires_at,''), COALESCE(j.updated_at,'')
-		FROM cert_jobs j`
+	// 分页与 /certificates/jobs 同口径（parsePaginationParam，缺省即全量上限）：
+	// 此前无 LIMIT，规则数×域名数增长后单请求全表扫描+全量序列化。默认
+	// page_size=maxCertJobPage（1000）对常规部署等价于原「全量」，响应新增
+	// total 报告匹配总数，超出时调用方可翻页。
+	pageValue, ok := parsePaginationParam(c, "page", 1, maxCertJobPage)
+	if !ok {
+		return
+	}
+	pageSize, ok := parsePaginationParam(c, "page_size", maxCertJobPage, maxCertJobPage)
+	if !ok {
+		return
+	}
+	page := int64(pageValue)
+	offset := (page - 1) * int64(pageSize)
+	whereClause := ""
 	var args []any
 	if ruleID := strings.TrimSpace(c.Query("rule_id")); ruleID != "" {
-		query += ` WHERE j.rule_id = ?`
+		whereClause = ` WHERE j.rule_id = ?`
 		args = append(args, ruleID)
 	}
+	// total 与分页语句同过滤条件：非快照隔离（两条语句），但同一响应内
+	// 「total 大于本页条数」始终表示存在更多行。
+	var total int64
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs j"+whereClause, args...).Scan(&total); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询证书任务失败"})
+		return
+	}
+	query := `
+		SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,''), COALESCE(j.expires_at,''), COALESCE(j.updated_at,'')
+		FROM cert_jobs j` + whereClause
 	// ORDER BY 与唯一索引 (rule_id, domain) 的最左前缀对齐，避免临时排序 B-tree。
-	query += ` ORDER BY j.rule_id, j.domain`
-	rows, err := db.DB.Query(query, args...)
+	query += ` ORDER BY j.rule_id, j.domain LIMIT ? OFFSET ?`
+	queryArgs := append(append([]any{}, args...), pageSize, offset)
+	rows, err := db.DB.Query(query, queryArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询证书任务失败"})
 		return
@@ -806,7 +835,7 @@ func (h *Handlers) ListCertificates(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "遍历证书任务失败"})
 		return
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"certificates": certs, "total": len(certs)}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"certificates": certs, "total": total, "page": page, "page_size": pageSize}})
 }
 
 // formulaSkippedNote 生成批量签发跳过归因片段：仅列出非零项，
@@ -933,6 +962,14 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		if issueCertificateBatchSnapshotHook != nil {
 			issueCertificateBatchSnapshotHook()
 		}
+		// 规模上限必须在取全局锁之前拒绝：批量分支的逐目标查询+upsert 在
+		// caddyOpMu 临界区内执行（保持「当前态复核→upsert 同临界区」不变量），
+		// 无上限时一次请求可让全部规则写/Caddy 应用线性排队。
+		if len(batchTargets) > maxBatchIssueTargets {
+			auditFailure("failed", fmt.Sprintf("批量目标数 %d 超过单次上限 %d", len(batchTargets), maxBatchIssueTargets))
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次批量签发最多 %d 个规则（本次匹配 %d 个），请分批执行", maxBatchIssueTargets, len(batchTargets))})
+			return
+		}
 	}
 	h.caddyOpMu.Lock()
 	// 部署重试登记（scheduleDeploymentRetry）可能对在途部署回调做有界等待，
@@ -1013,7 +1050,9 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			FROM cert_jobs WHERE rule_id=? AND domain=?`, req.CaddyID, canonicalRuleDomain).
 			Scan(&jobID, &jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter, &jobMaterialUsable)
 		if err == nil {
-			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
+			// 冷却门禁与文案共用同一 now（边界 <1s 时不得出现「门禁拦截、文案 0s」）。
+			now := time.Now()
+			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, now); blocked {
 				auditFailure("blocked", message)
 				c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 				return
@@ -1021,9 +1060,9 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			// waiting_ca 的 CA 退避窗口与任务重试共用同一契约：未到期且未
 			// force 时 429 并给出剩余时长，否则手动「重新签发」会把退避窗口
 			// 静默清零、立即再次撞上 CA 限流并继续消耗配额。
-			if certJobCAcooldownActive(jobStatus, jobCAAvailableAfter, time.Now()) {
+			if certJobCAcooldownActive(jobStatus, jobCAAvailableAfter, now) {
 				if !forceIssue {
-					message := certJobCAcooldownMessage(jobCAAvailableAfter.Time)
+					message := certJobCAcooldownMessage(jobCAAvailableAfter.Time, now)
 					auditFailure("blocked", message)
 					c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: http.StatusTooManyRequests, Message: message})
 					return
@@ -1208,7 +1247,10 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 					// rescheduled=false：规则/材料在窗口内刚变化，回落整轮重签。
 				}
 			case !errors.Is(jobErr, sql.ErrNoRows):
-				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, jobErr))
+				// 响应体只回固定分类文案：jobErr 含表名/SQL/驱动内部态，只进
+				// 运行日志（与全失败 500 出口的脱敏口径一致）。
+				services.Logf("error", "Batch issue job lookup failed for %s: %v", target.ruleID, jobErr)
+				failed = append(failed, fmt.Sprintf("%s(%s)", target.domain, "查询签发任务失败"))
 				continue
 			}
 			jobID, changed, err := createOrRequeueCertJob(target.ruleID, canonicalDomain, 0, qm)
@@ -1219,14 +1261,17 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				// 入队族 409（规则状态冲突/队列暂停/规则屏障）单列计数：全部目标
 				// 都是这类可行动冲突时统一按 409 回报（见下方「全部目标未入队」
 				// 分支）；仍保留在 failed 清单里，部分成功出口的「N 个失败」
-				// 计数与既有契约不变。err 原文只进运行日志（5xx 出口已脱敏）。
-				if statusCode, message := certEnqueueErrorResponse("创建签发任务失败", err); statusCode == http.StatusConflict {
+				// 计数与既有契约不变。失败明细恒用映射后的分类文案——err 原文
+				// （SQL/队列内部态）只进运行日志，与全失败 5xx 脱敏口径一致；
+				// certEnqueueErrorResponse 对非冲突错误即返回固定前缀。
+				statusCode, message := certEnqueueErrorResponse("创建签发任务失败", err)
+				if statusCode == http.StatusConflict {
 					enqueueConflict++
 					if enqueueConflictMessage == "" {
 						enqueueConflictMessage = message
 					}
 				}
-				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, err))
+				failed = append(failed, fmt.Sprintf("%s(%s)", target.domain, message))
 				continue
 			}
 			if !changed {

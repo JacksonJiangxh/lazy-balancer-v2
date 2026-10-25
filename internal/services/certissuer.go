@@ -20,6 +20,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/dnsprovider"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/retryafter"
 
 	xacme "golang.org/x/crypto/acme"
 )
@@ -83,28 +84,12 @@ func (e *CAProviderRateLimitError) Error() string {
 
 // parseRetryAfter parses an HTTP header value into a duration.
 //
-// 本函数与 internal/dnsprovider/internal/retry.After 是
-// 同语义双实现（包边界所致：dnsprovider/internal 不可被 services 导入）。
-// 两者都接受 delay-seconds 与 HTTP-date、不可解析/非正值（含零/负数秒）归零；
-// 任一侧修改解析口径（例如支持毫秒、处理负值）MUST 同步另一侧并保持语义一致。
+// 解析实现单源在 internal/retryafter.Parse（与 dnsprovider/internal/retry.After
+// 共用同一份代码与同一张测试表）；本函数只保留包内调用点与 now=time.Now()
+// 的绑定。语义（delay-seconds/HTTP-date、不可解析或非正归零）以该包为准，
+// 任一侧不再各自维护副本。
 func parseRetryAfter(header string) time.Duration {
-	if header == "" {
-		return 0
-	}
-	if seconds, err := strconv.Atoi(header); err == nil {
-		// 非正值显式归零（此前 "-5" 返回 -5s，仅靠下游 >0 判断
-		// 才无害）——与 dnsprovider/retry.After 及本条契约注释同口径。
-		if seconds <= 0 {
-			return 0
-		}
-		return time.Duration(seconds) * time.Second
-	}
-	if t, err := http.ParseTime(header); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
+	return retryafter.Parse(header, time.Now())
 }
 
 // computeBackoff returns the cooling duration based on attempt count and CA.
@@ -354,7 +339,7 @@ func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate,
 	if material.certPEM != "" {
 		fields["cert_pem"] = material.certPEM
 		fields["key_pem"] = material.keyPEM
-		fields["expires_at"] = material.notAfter
+		fields["expires_at"] = canonicalDatetimeValue(material.notAfter)
 		fields["ca_provider_id"] = material.providerID
 	}
 	updateErr := deploymentFailureWriteback(db.DB, jobID, from, "downloaded", fields)
@@ -541,11 +526,17 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 			// 告警 + 非正回退语义收敛于 GetCertRenewalDays。
 			renewalDays := GetCertRenewalDays()
 			if notAfter, perr := parseCertNotAfter(existingCert); perr == nil && time.Until(notAfter) > time.Duration(renewalDays)*24*time.Hour {
-				// 规则 ca_provider_id=0（跟随默认）时不能拿 0 与任务中已解析的具体
-				// 提供商 ID 直接比较而误判为"提供商已切换"；先解析出规则实际使用的
-				// 提供商，只有真正切换才需要走完整签发流程。
+				// 规则/任务两侧的 ca_provider_id=0 都表示「跟随默认」：任务行在
+				// 补偿重排队、导入回插、集群恢复等通道可能仍是 0（正常签发会把
+				// 解析结果写回），此时不能拿 0 与规则侧解析出的具体 ID 直接比较
+				// 而误判为"提供商已切换"——否则本应只重部署的任务会走完整 ACME
+				// 重签，白烧一次 CA 订单与 DNS 挑战。两侧都经同一默认解析后比较。
 				resolvedRuleProvider, resolveErr := ResolveCAProviderID(ruleProviderID)
-				if resolveErr == nil && resolvedRuleProvider == jobProviderID {
+				resolvedJobProvider := jobProviderID
+				if resolveErr == nil && resolvedJobProvider == 0 {
+					resolvedJobProvider, resolveErr = ResolveCAProviderID(resolvedJobProvider)
+				}
+				if resolveErr == nil && resolvedRuleProvider == resolvedJobProvider {
 					material := issuedCertificate{ruleID: ruleID, certPEM: existingCert, keyPEM: existingKey, notAfter: notAfter, providerID: jobProviderID, deploymentAttempt: deploymentAttempt}
 					return s.redeployDownloadedInLock(ctx, jobID, material, logger)
 				}
@@ -728,7 +719,7 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 		}
 		if err := transitionJob(db.DB, jobID, []string{"downloaded", "issued"}, "issued", map[string]any{
 			"message":                    "证书已部署，无需重新部署",
-			"expires_at":                 material.notAfter,
+			"expires_at":                 canonicalDatetimeValue(material.notAfter),
 			"deployment_attempts":        0,
 			"deployment_available_after": nil,
 		}); err != nil {
@@ -780,7 +771,7 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 	// 不匹配状态 → 自愈路径断裂（job 保持 issued、磁盘永远错）。
 	err := transitionJob(db.DB, jobID, []string{"downloaded", "issued"}, "issued", map[string]any{
 		"message":                    "证书文件重新部署成功",
-		"expires_at":                 material.notAfter,
+		"expires_at":                 canonicalDatetimeValue(material.notAfter),
 		"deployment_attempts":        0,
 		"deployment_available_after": nil,
 	})
@@ -818,7 +809,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 	err := transitionJob(db.DB, jobID, []string{"downloaded", "cleanup_dns", "cleanup_warning"}, "downloaded", map[string]any{
 		"cert_pem":                   material.certPEM,
 		"key_pem":                    material.keyPEM,
-		"expires_at":                 material.notAfter,
+		"expires_at":                 canonicalDatetimeValue(material.notAfter),
 		"ca_provider_id":             material.providerID,
 		"deployment_attempts":        0,
 		"deployment_available_after": nil,

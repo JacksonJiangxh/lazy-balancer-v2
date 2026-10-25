@@ -77,7 +77,7 @@
       </div>
     </el-card>
 
-    <el-alert v-if="rulesLoadError" type="error" :closable="false" show-icon class="error-banner mb-5">
+    <el-alert v-if="rulesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
       <template #title>
         <div class="polling-error-title">
           <span>{{ rules.length === 0 ? 'CRS 规则文件加载失败，「暂无规则文件」不代表真实状态' : 'CRS 规则文件加载失败：当前显示的是上次成功结果（与分页/搜索条件不符）' }}</span>
@@ -131,7 +131,7 @@
             </template>
             <el-table-column prop="name" label="规则名称" min-width="150">
               <template #default="{ row }">
-                <el-link type="primary" @click="openRuleDialog(row)">{{ row.name }}</el-link>
+                <AccessibleLink type="primary" @click="openRuleDialog(row)">{{ row.name }}</AccessibleLink>
               </template>
             </el-table-column>
             <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
@@ -189,7 +189,7 @@
             </template>
             <el-table-column prop="name" label="名称" min-width="150">
               <template #default="{ row }">
-                <el-link type="primary" @click="openIpListDialog(row)">{{ row.name }}</el-link>
+                <AccessibleLink type="primary" @click="openIpListDialog(row)">{{ row.name }}</AccessibleLink>
                 <el-tag v-if="row.preset_autoban" size="small" type="danger" effect="plain" style="margin-left: 6px;">自动封禁</el-tag>
                 <el-tag v-else-if="row.system" size="small" type="warning" effect="plain" style="margin-left: 6px;">内置</el-tag>
               </template>
@@ -647,6 +647,7 @@ import { DEEP_LINK_PARAMS } from '@/utils/deepLink'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { formatBytes } from '@/utils/formatBytes'

@@ -647,8 +647,9 @@ func markCrawlerSourceSuccess(name, trigger string, entryCount int) error {
 		return err
 	}
 	// 状态列已落库但排程槽未推进（排程不可读）：按错误上抛，让调用方把本轮
-	// 记为失败（引擎退避重投同一槽，读恢复后自愈）——源状态 success + 过期
-	// 槽会让引擎按「成功未推进」消费本槽，该族自动更新静默停摆。
+	// 记为失败（引擎退避重投 1s/5s/30s；连续 4 轮仍未推进由引擎停调）——源
+	// 状态 success + 过期槽会让引擎按「成功未推进」消费本槽，该族自动更新
+	// 静默停摆。
 	if slotErr != nil {
 		Logf("error", "crawlerbot-update: 源 %s 排程不可读，本轮排程槽未推进（引擎将退避重投）: %v", name, slotErr)
 	}

@@ -377,7 +377,8 @@ func (i *Issuer) Cleanup(ctx context.Context, challenges []ChallengeInfo) {
 // 清理在 8min 内被 ctx 截断（cleanup_warning + 残留延长）。下限保留原
 // 2min，上限 8min 保证「CA 队列执行预算 60min + 清理 ≤8min <
 // StaleOwnershipAge 75min」——ownership 条目不会在清理进行中被他方判为
-// 陈旧（耦合由 TestDNSCleanupBudget_staysBelowStaleOwnershipAge 钉住）。
+// 陈旧（耦合由 services 包的 TestCleanupBudget_staysBelowStaleOwnershipAge
+// 钉住，见 internal/services/cert_cleanup_budget_coupling_test.go）。
 // 超出上限时按 8min 尽力清理，失败条目由 ownership 自愈兜底（记录不泄漏）。
 const (
 	dnsCleanupBudgetMin       = 2 * time.Minute
@@ -1252,7 +1253,9 @@ func sameDNSName(a, b string) bool {
 	return normalizeDNSName(a) == normalizeDNSName(b)
 }
 
-// labelCount 返回 DNS 名的标签数（去掉末尾点后按 "." 切分；空名计 0）。
+// labelCount 返回 DNS 名的标签数（去掉末尾点后按 "." 切分）。空名计 1
+// （单标签口径：递归上溯的 `<2` 判定据此把空名/根形态当作不可再上溯，
+// 与「无标签」在行为上等价，但返回值不是 0）。
 func labelCount(name string) int {
 	trimmed := strings.TrimSuffix(normalizeDNSName(name), ".")
 	if trimmed == "" {

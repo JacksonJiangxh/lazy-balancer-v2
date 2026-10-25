@@ -208,3 +208,50 @@ func TestRegisterClusterNode_bindFailureLeavesAuditTrail(t *testing.T) {
 		t.Fatalf("绑定失败审计行数=%d, want 1", count)
 	}
 }
+
+// 访问地址端点同样是 Explicit 路由：请求体绑定失败此前零审计（同族站点坐标
+// 端点已补），探测/前端旧缓存提交在操作审计页不可回溯。
+func TestUpdateClusterNodeAccessURL_bindFailureLeavesAuditTrail(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/nodes/7/access-url", strings.NewReader(`{"access_url":123}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "7"}}
+
+	h.UpdateClusterNodeAccessURL(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新失败' AND resource='集群节点' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("访问地址绑定失败面必须留痕（审计行缺失）: %v", err)
+	}
+	if !strings.Contains(detail, "节点 7") || !strings.Contains(detail, "访问地址格式错误") {
+		t.Fatalf("审计详情必须点名节点与失败原因，got %q", detail)
+	}
+}
+
+// 单节点指纹清除的编号非法分支此前零审计：同函数其余失败面（无钉/失败/
+// 成功）均有留痕，仅 400 早退分支空白。
+func TestForgetClusterNodePin_invalidIDLeavesAuditTrail(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/cluster/nodes/abc/forget-pin", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "abc"}}
+
+	h.ForgetClusterNodePin(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='清除失败' AND resource='证书指纹' AND detail LIKE '%节点编号无效（abc）%'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("编号非法失败面审计行数=%d, want 1", count)
+	}
+}

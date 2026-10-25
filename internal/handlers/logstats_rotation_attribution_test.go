@@ -122,6 +122,28 @@ func TestIsTaskLogFamilyName_coversRotationShapes(t *testing.T) {
 	}
 }
 
+func TestIsRuleAccessLogName_matchesAggregateFamily(t *testing.T) {
+	// 规则访问日志目录聚合（LogStats 的 rule_access 无规则筛选分支）逐文件判定
+	// 必须与任务日志族同口径：活跃文件、移位副本、.gz 归档全计入；非日志名
+	// （同目录的其他任务日志/杂项）不得混进合计。
+	cases := map[string]bool{
+		"lb_cooldown.log":          true,
+		"lb_cooldown.log.1":        true,
+		"lb_cooldown.log.2.gz":     true,
+		"lb_cooldown.log.gz":       true,
+		"lb_cooldown.log.3":        true,
+		"lb_cooldown.txt":          false,
+		"task-crs.log":             true, // 族判定不含前缀语义：目录隔离由调用方给
+		"lb_cooldown.log.20261018": false,
+		"":                         false,
+	}
+	for name, want := range cases {
+		if got := isRuleAccessLogName(name); got != want {
+			t.Errorf("isRuleAccessLogName(%q)=%v, want %v", name, got, want)
+		}
+	}
+}
+
 // 任务日志族（isTaskLogFamilyName 作聚合 match）与单文件口径等值。
 func TestTaskLogFamily_timestampAndShiftGzipCountBothPaths(t *testing.T) {
 	dir := writeRotationFixture(t, map[string]int64{

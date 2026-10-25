@@ -864,6 +864,28 @@ func TestUpdateConfig_rollbackFailurePersistsApplyBanner(t *testing.T) {
 	}
 }
 
+// 配置拒绝（Caddy 4xx/CLI 校验拒绝）不写 caddy_apply_error 横幅：候选未
+// /load、事务已回滚，库态与运行态仍是提交前形态，无分叉事实（与
+// finishTxApply 拒绝分支同口径）。传输/恢复失败仍写横幅（上方用例）。
+func TestUpdateConfig_configRejectionDoesNotPersistBanner(t *testing.T) {
+	handler, _, _ := newAuditRuleHandlers(t, 1)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/config", handler.UpdateConfig)
+	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"log_level":"debug"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（配置拒绝）", response.Code, response.Body.String())
+	}
+	if banner := readApplyError(t); banner != "" {
+		t.Fatalf("配置拒绝不得写失败横幅（无分叉事实）, got %q", banner)
+	}
+}
+
 // 安全事件保留两列 0=自动语义废除，写侧 1..max。
 func TestUpdateConfig_rejectsZeroRetentionValues(t *testing.T) {
 	h := newBackupTestHandlers(t)

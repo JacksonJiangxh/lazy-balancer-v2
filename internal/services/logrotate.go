@@ -323,18 +323,17 @@ func RuntimeLogCleanupOnce(ctx context.Context, logFile string) RuntimeCleanupRe
 	// 规则访问日志孤儿兜底同样不依赖保留期口径（按「规则是否还存活」判定），
 	// 先于保留期门执行——事件型删除失败后残留的规则日志不再永久占盘。
 	result.RuleLogs = PurgeOrphanRuleLogs(ctx)
-	// 库未初始化不再整体跳过——保留期单源
-	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
-	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
-	// 静默跳过」口径相反。死初值一并删除（唯一使用点必被 auditRetentionMonths
-	// 覆盖）。
+	// 保留期口径未知（含 nil 库）时跳过保留期删除，但不清屏其余清理：
+	// 上面的 waf-audit 兜底与规则日志孤儿清理已先执行（它们不依赖保留期），
+	// 库里读不到口径就一条都不删——不可逆删除不得按默认 3 月执行（用户设 12
+	// 月时那是 9 个月的日志证据）。nil 库覆盖关停后 db.Close() 的形态：排空
+	// 放弃的在途轮仍可能跑到这里。
 	months, monthsErr := auditRetentionMonths()
 	result.RetentionMonths = months
 	result.TaskLogs = taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
 	if monthsErr != nil {
-		// 保留期口径未知：应用日志副本与任务日志的保留期删除一律跳过
-		// （不可逆删除不得按更短默认执行）；taskLogsHousekeeping 内部同口径
-		// 自行跳过，此处只需记录失败原因。
+		// taskLogsHousekeepingWithRetention 内部同口径跳过删除，此处只需
+		// 记录失败原因。
 		result.RetentionError = monthsErr.Error()
 		return result
 	}

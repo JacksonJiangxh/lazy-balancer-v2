@@ -127,6 +127,24 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 		t.Fatalf("decode list response: %v", err)
 	}
 	want := map[int64]int64{101: 900, 102: 300, 104: 0, 106: 120, 107: 0, 108: 0, 109: 0}
+	// 造行用 datetime('now')（秒级截断），handler 取 now 的亚秒余量会被向上
+	// 取整吸收——恰好跨秒时下发值比完整窗口少 1 秒。断言按区间（0 除外）：
+	// 等值断言在慢机/-race 下会偶发假红。
+	assertCooldown := func(id int64, got *int64, want int64) {
+		t.Helper()
+		if got == nil {
+			t.Fatalf("id=%d cooldown=null, want %d", id, want)
+		}
+		if want == 0 {
+			if *got != 0 {
+				t.Fatalf("id=%d cooldown=%d, want 0（已过期/无冷却必须精确为零）", id, *got)
+			}
+			return
+		}
+		if *got > want || *got < want-1 {
+			t.Fatalf("id=%d cooldown=%d, want %d（容许 1 秒秒级截断误差）", id, *got, want)
+		}
+	}
 	seen := make(map[int64]bool)
 	for _, job := range payload.Data.List {
 		seen[job.ID] = true
@@ -140,9 +158,7 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 				t.Fatalf("waiting_ca with CA window cooldown=%v, want ~7200", job.RetryCooldownSeconds)
 			}
 		default:
-			if job.RetryCooldownSeconds == nil || *job.RetryCooldownSeconds != want[job.ID] {
-				t.Fatalf("id=%d status=%q cooldown=%v, want %d", job.ID, job.Status, job.RetryCooldownSeconds, want[job.ID])
-			}
+			assertCooldown(job.ID, job.RetryCooldownSeconds, want[job.ID])
 		}
 	}
 	for id := range want {
@@ -632,30 +648,37 @@ func TestDeleteCertJob_restores_downloaded_job_with_material_when_delete_fails(t
 
 func TestCertJobOperationLock_serializes_retry_and_delete(t *testing.T) {
 	lock := certJobOperationLock(9876)
-	firstEntered := make(chan struct{})
+	firstHeld := make(chan struct{})
 	releaseFirst := make(chan struct{})
+	secondProbe := make(chan bool, 1)
 	secondEntered := make(chan struct{})
 	go func() {
 		lock.Lock()
-		close(firstEntered)
+		close(firstHeld)
 		<-releaseFirst
 		lock.Unlock()
 	}()
-	<-firstEntered
+	<-firstHeld
 	go func() {
+		// 非阻塞探测取代「等一小段时间确认没进入」的墙钟窗口：首持有者
+		// 未释放时 TryLock 必然失败，与调度速度无关。
+		if acquired := lock.TryLock(); acquired {
+			lock.Unlock()
+			secondProbe <- true
+			return
+		}
+		secondProbe <- false
 		lock.Lock()
 		close(secondEntered)
 		lock.Unlock()
 	}()
-	select {
-	case <-secondEntered:
-		t.Fatal("second operation entered before first operation released the job lock")
-	case <-time.After(50 * time.Millisecond):
+	if acquired := <-secondProbe; acquired {
+		t.Fatal("second operation acquired the job lock while the first still held it")
 	}
 	close(releaseFirst)
 	select {
 	case <-secondEntered:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("second operation did not enter after first operation released the job lock")
 	}
 }
@@ -968,7 +991,10 @@ func TestReadCertJobLogTail_stopsAtByteBudget(t *testing.T) {
 		}
 	}
 
-	content, truncated := readCertJobLogTail(base, 5, 2<<10)
+	content, truncated, err := readCertJobLogTail(base, 5, 2<<10)
+	if err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
 	if want := lineFor(".1") + lineFor("base"); content != want {
 		t.Fatalf("content=%q, want 最新的两份（.1 + 当前）", content)
 	}
@@ -980,12 +1006,32 @@ func TestReadCertJobLogTail_stopsAtByteBudget(t *testing.T) {
 	}
 
 	// 正向对照：预算充足时全量按旧→新拼接且不标记截断。
-	content, truncated = readCertJobLogTail(base, 5, 16<<10)
+	content, truncated, err = readCertJobLogTail(base, 5, 16<<10)
+	if err != nil {
+		t.Fatalf("read tail with full budget: %v", err)
+	}
 	if want := lineFor(".3") + lineFor(".2") + lineFor(".1") + lineFor("base"); content != want {
 		t.Fatalf("content=%q, want 全部轮转按旧→新拼接", content)
 	}
 	if truncated {
 		t.Fatal("预算充足时不得标记截断")
+	}
+}
+
+// 非 ENOENT 的 I/O 错误必须上抛（「读不出」与「无日志」不可区分会让排障
+// 误判为「尚无签发日志」）：用同名目录制造 read 失败。
+func TestReadCertJobLogTail_reportsIOErrors(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "certjob-ioerr.log")
+	if err := os.Mkdir(base+".1", 0o755); err != nil {
+		t.Fatalf("mkdir fake rotated file: %v", err)
+	}
+	if _, _, err := readCertJobLogTail(base, 2, 16<<10); err == nil {
+		t.Fatal("轮转副本是目录时必须返回 I/O 错误，而不是当作无日志")
+	}
+	// 文件不存在不是错误。
+	if content, _, err := readCertJobLogTail(filepath.Join(dir, "absent.log"), 2, 16<<10); err != nil || content != "" {
+		t.Fatalf("缺失文件必须返回 (\"\", nil)，实得 content=%q err=%v", content, err)
 	}
 }
 
@@ -1005,7 +1051,11 @@ func TestReadCertJobLogFile_tailWindowDropsPartialFirstLine(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.content), 0644); err != nil {
 				t.Fatal(err)
 			}
-			if got := readCertJobLogFile(path); got != tc.want {
+			got, err := readCertJobLogFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			if got != tc.want {
 				t.Fatalf("content length=%d, want %d (%q)", len(got), len(tc.want), tc.want)
 			}
 		})
@@ -1201,7 +1251,9 @@ func TestDeleteCertJob_recoveryKeepsCanonicalLockOrder(t *testing.T) {
 		t.Fatal("并发方未取得 caddyOpMu（夹具前置失败）")
 	}
 	// 给 T2 足够时间排到桶锁上——修复前 T1 解阻后会在此反向取 caddyOpMu。
-	time.Sleep(50 * time.Millisecond)
+	// 这是负面条件的夹具窗口（T2 尚未排队时只会削弱断言，不会误红），
+	// 留 200ms 余量以适应负载较高的 CI/并行测试。
+	time.Sleep(200 * time.Millisecond)
 	close(allowCancelReturn)
 
 	select {

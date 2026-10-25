@@ -77,22 +77,22 @@ func TestValidateV2BackupNodeRows_rejectsDuplicateIdentity(t *testing.T) {
 	}
 }
 
-// nodes.mode 导入值域：仅 slave/master 合法——非法值若只落到写库才报错，
-// 与「畸形输入=400 并点名行」口径不一致；空串按 schema DEFAULT（slave）归一。
+// nodes.mode 导入值域：仅 slave 合法——模式列由注册路径独占写入，巡检按
+// mode='slave' 过滤，放行 master 行会让该节点永久退出离线/滞后判定（节点
+// 列表仍展示、上报仍被接受）。非法值/越界值点名 400，空串按 schema DEFAULT
+// （slave）归一。
 func TestValidateV2BackupNodeRows_validatesModeEnum(t *testing.T) {
 	base := func() map[string]any {
 		return map[string]any{"name": "edge-mode", "ip_address": "10.0.0.9", "port": int64(8000)}
 	}
-	// 合法值域放行
-	for _, mode := range []string{"slave", "master"} {
-		rows := []map[string]any{base()}
-		rows[0]["mode"] = mode
-		if err := validateV2BackupNodeRows(rows); err != nil {
-			t.Fatalf("mode=%q 应放行: %v", mode, err)
-		}
+	// 从节点行放行
+	rows := []map[string]any{base()}
+	rows[0]["mode"] = "slave"
+	if err := validateV2BackupNodeRows(rows); err != nil {
+		t.Fatalf("mode=slave 应放行: %v", err)
 	}
 	// 空串归一为 schema DEFAULT slave（与 protocol 空串归一同口径）
-	rows := []map[string]any{base()}
+	rows = []map[string]any{base()}
 	rows[0]["mode"] = ""
 	if err := validateV2BackupNodeRows(rows); err != nil {
 		t.Fatalf("空 mode 应归一放行: %v", err)
@@ -100,10 +100,17 @@ func TestValidateV2BackupNodeRows_validatesModeEnum(t *testing.T) {
 	if rows[0]["mode"] != "slave" {
 		t.Fatalf("空 mode 归一=%q, want slave", rows[0]["mode"])
 	}
+	// master 行点名拒绝（不静默改写：改写会掩盖备份来自别的角色/旧版本）
+	rows = []map[string]any{base()}
+	rows[0]["mode"] = "master"
+	err := validateV2BackupNodeRows(rows)
+	if err == nil || !strings.Contains(err.Error(), "master") || !strings.Contains(err.Error(), "第 1 行") {
+		t.Fatalf("err=%v, want master 行点名拒绝", err)
+	}
 	// 非法值域点名拒绝
 	rows = []map[string]any{base()}
 	rows[0]["mode"] = "primary"
-	err := validateV2BackupNodeRows(rows)
+	err = validateV2BackupNodeRows(rows)
 	if err == nil || !strings.Contains(err.Error(), "mode") {
 		t.Fatalf("err=%v, want mode 值域点名拒绝", err)
 	}

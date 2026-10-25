@@ -111,11 +111,11 @@ type CRSUpdateManager struct {
 	// 之后再改全局，构造期快照会让更新写相位与渲染读相位分叉。
 	crsDir string
 
-	// scheduleSlotErr 本运行「状态行已落库、但排程槽未推进」的原因（写路径
-	// 严格读排程失败）。setSlotAdvanceError 置位；Run 体把本轮按失败返回给
-	// 任务引擎——成功轮不推进槽却回 success 会被引擎记入本槽消费水位，此后
-	// 同一槽永不再投递（该族自动更新静默停摆，没有下一轮可以自愈）。每次
-	// 运行起点清空。
+	// scheduleSlotErr 本运行「排程槽未推进」的原因：排程不可读（写路径严格
+	// 读排程失败）或状态行写入失败（槽随之未落地）。setSlotAdvanceError
+	// 置位；Run 体把本轮按失败返回给任务引擎——成功轮不推进槽却回 success
+	// 会被引擎记入本槽消费水位，此后同一槽永不再投递（该族自动更新静默
+	// 停摆，没有下一轮可以自愈）。每次运行起点清空。
 	scheduleSlotErr error
 
 	latestMu         sync.Mutex
@@ -342,9 +342,11 @@ func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
 		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		slotArgs...,
 	); err != nil {
-		// 成功轮的排程槽推进写失败 = 引擎成功轮已消费过期槽而业务槽停滞
-		// （四族自动更新会静默停摆直到下次成功写），日志级别须与后果匹配。
-		Logf("error", "crs update: failed to record latest-version skip（排程槽可能未推进）: %v", err)
+		// 状态行没落地=本轮对调度契约而言失败（排程槽同样未推进）：并入
+		// 「槽未推进」通道，由 Run 体按失败返回给引擎——引擎据失败退避重投，
+		// 再次成功落库即推进槽；若吞错按 success 收尾，引擎会把过期槽记入
+		// 消费水位而库里的槽仍是旧值，该族自动更新此后无路径自愈。
+		slotErr = errors.Join(slotErr, fmt.Errorf("%w: 状态行写入失败: %w", errScheduleSlotNotAdvanced, err))
 	}
 	m.setSlotAdvanceError(slotErr)
 	m.mu.Lock()
@@ -554,7 +556,9 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		append([]any{tag}, slotArgs...)...,
 	); err != nil {
-		Logf("error", "crs update: failed to record success: %v", err)
+		// 同「已是最新」分支：版本/状态行没落地即本轮失败（槽也未推进），
+		// 走同一「槽未推进」通道让引擎退避重投（重投幂等：写成功即推进槽）。
+		slotErr = errors.Join(slotErr, fmt.Errorf("%w: 状态行写入失败: %w", errScheduleSlotNotAdvanced, err))
 	}
 	m.setSlotAdvanceError(slotErr)
 	m.rescanRuleCount()
@@ -725,15 +729,16 @@ func (m *CRSUpdateManager) CancelRunning() bool {
 	return true
 }
 
-// setSlotAdvanceError 记录「状态行已落库、但排程槽未推进」——任务引擎 Run 体
-// 据此把本轮按失败返回（不是把状态行改成 failed：更新本身成功，失败的是调度
-// 契约；引擎需要失败才能退避重投同一槽，而不是把本槽记入消费水位）。
+// setSlotAdvanceError 记录「本轮排程槽未推进」的原因（排程不可读，或状态行
+// 写入失败连带槽一起没落地）——任务引擎 Run 体据此把本轮按失败返回（不是把
+// 状态行改成 failed：更新本身可能已成功，失败的是调度契约；引擎需要失败才能
+// 退避重投同一槽，而不是把本槽记入消费水位）。
 func (m *CRSUpdateManager) setSlotAdvanceError(err error) {
 	m.mu.Lock()
 	m.scheduleSlotErr = err
 	m.mu.Unlock()
 	if err != nil {
-		Logf("error", "crs update: 排程不可读，本轮排程槽未推进（引擎将退避重投，读恢复后自愈）: %v", err)
+		Logf("error", "crs update: 本轮排程槽未推进（引擎按 1s/5s/30s 退避重投；连续 4 轮仍未推进即停调，需在业务页重新保存自动更新或重启进程恢复）: %v", err)
 	}
 }
 

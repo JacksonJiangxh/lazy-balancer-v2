@@ -47,7 +47,8 @@ func setGlobalTaskAutoUpdate(prefix string, enabled bool) error {
 		id = "crawlerbot-update"
 	}
 	// 调度应用走与业务驱动整轮对齐共用的互斥（setter 与对齐交错的
-	// 「库新/loop 旧」错态没有重试纠正路径）。
+	// 「库新/loop 旧」错态没有重试纠正路径）；应用值在锁内按库实态读取，
+	// 本参数仅作读失败回退。
 	applyBusinessTaskLoop(id, enabled)
 	return nil
 }

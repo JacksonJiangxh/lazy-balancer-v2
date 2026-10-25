@@ -152,8 +152,13 @@ func TestClusterClients_smallRequestTransportCarriesHeaderTimeout(t *testing.T) 
 	if !ok {
 		t.Fatalf("small client transport=%T, want *http.Transport", service.smallClient.Transport)
 	}
-	if smallTransport.ResponseHeaderTimeout != clusterSmallResponseHeaderTimeout {
-		t.Fatalf("small transport ResponseHeaderTimeout=%s, want %s", smallTransport.ResponseHeaderTimeout, clusterSmallResponseHeaderTimeout)
+	// 与生产行为对表而非「赋值发生」：0 = 时限被关掉（ctx 之外的兜底失效），
+	// 超过整轮预算两倍 = transport 反客为主（正常小请求会被提前掐断）。
+	// ctx 与 transport 双时限共存时，transport 必须是更宽松的那一层。
+	if got := smallTransport.ResponseHeaderTimeout; got <= 0 {
+		t.Fatalf("small transport ResponseHeaderTimeout=%s, want > 0（0 等于关闭首字节时限，漏套 ctx 的新小请求会永久停摆）", got)
+	} else if got > 2*clusterSmallRequestTimeout {
+		t.Fatalf("small transport ResponseHeaderTimeout=%s, want <= %s（不得超过整轮预算的两倍）", got, 2*clusterSmallRequestTimeout)
 	}
 	if service.smallClient.Timeout != 0 {
 		t.Fatalf("small client must not set a total timeout (got %s)", service.smallClient.Timeout)
@@ -167,6 +172,49 @@ func TestClusterClients_smallRequestTransportCarriesHeaderTimeout(t *testing.T) 
 	}
 	if largeTransport.ResponseHeaderTimeout != 0 {
 		t.Fatalf("large-transfer transport must not bound time-to-first-byte (got %s)", largeTransport.ResponseHeaderTimeout)
+	}
+}
+
+// Given 小请求 transport 的首字节时限收窄到 50ms；服务端接受连接后不写响应头。
+// When 直接用 smallClient 发请求、**不套任何 ctx**（模拟后续新增小请求漏套
+// newClusterSmallRequestContext 的形态）。
+// Then transport 自身在时限内失败（net/http 首字节超时）——证明该时限是真实
+// 生效的设置而不是一处未接线的赋值。
+func TestClusterSmallClient_transportBoundsTimeToFirstByteWithoutContext(t *testing.T) {
+	previous := clusterSmallResponseHeaderTimeout
+	clusterSmallResponseHeaderTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { clusterSmallResponseHeaderTimeout = previous })
+
+	service := NewSyncService(nil, &config.Config{}, nil)
+	server := hangingMasterServer(t)
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		resp, err := service.smallClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("未写响应头的服务端不得被当作成功响应")
+		}
+		if !strings.Contains(err.Error(), "timeout awaiting response headers") {
+			t.Fatalf("err=%v, want net/http 首字节超时（transport 层自行截止）", err)
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			t.Fatalf("首字节时限生效太晚: %s", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("无 ctx 的请求 5s 内未返回：首字节时限未生效（时限被关掉时漏套 ctx 的小请求会永久停摆）")
 	}
 }
 

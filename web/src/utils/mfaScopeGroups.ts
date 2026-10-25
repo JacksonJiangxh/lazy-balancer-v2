@@ -2,7 +2,9 @@
 // （admin/business 两组级）及 readOnlyWriteRoutes 豁免清单逐族对齐。新增写端点族
 // 必须同步入列（否则弹框会低估受保护范围），测试按本清单反查缺失项。
 
-export interface MfaScopeGroup {
+// 形状只作下方清单的元素类型——全仓零外部消费，不导出（避免视图绕开清单
+// 单源自行构造受保护操作集合）。
+interface MfaScopeGroup {
   title: string
   items: string[]
 }

@@ -194,6 +194,12 @@ func reconcileTaskEngineRoleFor(te *taskengine.Engine) {
 // mustRegisterTask 装配期统一注册入口：描述符非法属于静态装配错误，
 // 必须启动即响亮失败，不得静默少一个任务。
 func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
+	// 业务驱动任务的调度开关在任务页只读（唯一事实源是业务表）：引擎停调日志
+	// 的恢复入口提示按 businessTaskDrivers 唯一清单注入，引擎层因此不必依赖
+	// 业务清单，也不会在调度层出现第二份「业务驱动」ID 表。
+	if d.LoopRecoveryHint == "" && IsBusinessDrivenTask(d.ID) {
+		d.LoopRecoveryHint = "对应业务页保存一次自动更新/备份设置（任务页调度开关对该任务只读），或重启进程"
+	}
 	if err := te.Register(d); err != nil {
 		panic(fmt.Sprintf("taskengine: %s 注册失败: %v", d.ID, err))
 	}
@@ -745,9 +751,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
 				return fmt.Errorf("CRS 更新失败: %s", snap.Message)
 			}
-			// 状态行 success 但排程槽未推进（写路径严格读排程失败）：不得以
-			// success 收尾——引擎会把本槽记入消费水位，该族自动更新静默停摆。
-			// 按失败返回走退避重投，读恢复后的下一轮自然推进槽。
+			// 状态行 success 但排程槽未推进（写路径严格读排程失败，或状态行
+			// 写入失败）：不得以 success 收尾——引擎会把本槽记入消费水位，该族
+			// 自动更新静默停摆。按失败返回走退避重投（1s/5s/30s；连续 4 轮
+			// 仍未推进由引擎停调，需在业务页重新保存或重启）。
 			if serr := m.ScheduleSlotError(); serr != nil {
 				return serr
 			}
@@ -820,8 +827,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusFailed) {
 				return fmt.Errorf("IP2Region 更新失败: %s", snap.Message)
 			}
-			// 状态行 success 但排程槽未推进（写路径严格读排程失败）：按失败
-			// 返回让引擎退避重投同一槽（见 CRS 族同型说明）。
+			// 状态行 success 但排程槽未推进（见 CRS 族同型说明）：按失败返回
+			// 让引擎退避重投同一槽。
 			if serr := m.ScheduleSlotError(); serr != nil {
 				return serr
 			}
@@ -1022,14 +1029,16 @@ func roleReconcilerDoneFor(te *taskengine.Engine) <-chan struct{} {
 	return roleReconcilerState.done
 }
 
-// businessTaskDriver 业务开关与引擎调度同步的唯一任务清单。
+// businessTaskDriver 业务开关与引擎调度同步的唯一任务清单条目。
 // 启动装配与任务监控只读门共用，禁止在 handler 另维护第二份 ID 列表。
 // stateFn 返回 (enabled, known)：known=false=启用状态不可判定（读库失败）——
 // 对齐必须保持上一次生效的调度态，不得把一次读失败固化为调度关闭。
-var businessTaskDrivers = []struct {
+type businessTaskDriver struct {
 	id      string
 	stateFn func() (enabled, known bool)
-}{
+}
+
+var businessTaskDrivers = []businessTaskDriver{
 	{id: "threat", stateFn: func() (bool, bool) { return globalTaskAutoUpdateState("threat") }},
 	{id: "crs", stateFn: func() (bool, bool) { return versionTableAutoUpdateState("security_crs_version") }},
 	{id: "ip2region", stateFn: func() (bool, bool) { return versionTableAutoUpdateState("security_ip2region_version") }},
@@ -1078,28 +1087,46 @@ func retryPendingBusinessTaskDrivers() {
 	}
 }
 
-// IsBusinessDrivenTask 返回任务是否只能由对应业务页开关驱动调度。
-func IsBusinessDrivenTask(id string) bool {
+// businessTaskDriverOf 按 ID 取业务驱动清单条目（唯一清单见
+// businessTaskDrivers）。
+func businessTaskDriverOf(id string) (businessTaskDriver, bool) {
 	for _, driver := range businessTaskDrivers {
 		if driver.id == id {
-			return true
+			return driver, true
 		}
 	}
-	return false
+	return businessTaskDriver{}, false
+}
+
+// IsBusinessDrivenTask 返回任务是否只能由对应业务页开关驱动调度。
+func IsBusinessDrivenTask(id string) bool {
+	_, ok := businessTaskDriverOf(id)
+	return ok
 }
 
 // applyBusinessTaskLoop 业务开关 setter 的调度应用入口：与
 // SyncBusinessTaskDrivers 共用 businessDriverSyncMu，串行化「单点应用」与
-// 「整轮对齐」。
+// 「整轮对齐」。fallbackEnabled 只是读库失败时的回退值（调用方刚提交的值）。
 //
 // setter 提交 DB 后直接调 syncTaskLoop 会与整轮对齐交错：对齐先读旧态 →
 // setter 提交并应用新态 → 对齐再应用旧态，最终「库已新、loop 仍旧」且
 // businessDriverSyncPending=false（对齐全部读数成功），60s 对账不会纠正。
-// DB 写入保持在锁外（锁只保护「读实态并应用」这一段）：最后完成的一次应用
-// 即最后一次开关决定的语义。
-func applyBusinessTaskLoop(id string, enabled bool) {
+// DB 写入保持在锁外（锁只保护「读实态并应用」这一段）。
+//
+// 应用值同样必须来自锁内读库，而不是调用方参数：两个方向相反的开关请求
+// 并发时提交顺序与应用顺序无关（OFF 先提交、ON 后提交，但 OFF 的应用段可能
+// 后进锁）——按调用方参数应用会让最后一次应用落在过期意图上，留下「库=开 /
+// loop=关」的持久错态（四族 Scheduled 零投递，且两端读数成功、无重试纠正）。
+// 锁内读库后，最后一次应用恒等于应用时刻的库值，交错只产生与库一致的终态。
+func applyBusinessTaskLoop(id string, fallbackEnabled bool) {
 	businessDriverSyncMu.Lock()
 	defer businessDriverSyncMu.Unlock()
+	enabled := fallbackEnabled
+	if driver, ok := businessTaskDriverOf(id); ok {
+		if state, known := driver.stateFn(); known {
+			enabled = state
+		}
+	}
 	syncTaskLoop(id, enabled)
 }
 

@@ -794,7 +794,7 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 	// 排程不可读时槽片段为 no-op（保留旧预约），其余状态列照常落库；随后把
 	// 「槽未推进」作为错误返回——源状态 success + 过期槽原样保留会让引擎
 	// 按「成功未推进」消费本槽，该族自动更新从此静默停摆（失败轮由引擎退避
-	// 重投，读恢复后的下一轮自然推进槽）。
+	// 重投 1s/5s/30s；连续 4 轮仍未推进由引擎停调，需业务页重新保存或重启）。
 	slotSQL, slotArgs, slotErr := threatSlotSuccessAssign(trigger)
 	// entry_count 的唯一口径是**聚合后**条数（writeThreatSystemList 的
 	// len(merged)，与内置名单 .iplist 行数一致）。entryCount<0 = 内容未变化

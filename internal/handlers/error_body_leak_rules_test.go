@@ -151,6 +151,15 @@ func collect5xxErrorTextLeaks(fset *token.FileSet, node ast.Node) []string {
 			if len(call.Args) > 0 && mentionsErrorText(fset, call.Args[0]) {
 				leaks = append(leaks, printNode(fset, call))
 			}
+		case "failRestoreFileAccess":
+			// 自动备份「还原/下载」前置文件面的单源收尾
+			// （c, download, subject, message, status, cause）：状态位在第 5 个实参，
+			// 响应正文是第 4 个。不登记本形态，把 c.JSON 收敛进单源 helper 就成了
+			// 5xx 详情扫描器的逃逸面——清单条目会因「已不再拼接」被要求删除，
+			// 而实际泄漏面仍在。
+			if len(call.Args) >= 5 && isInternalStatusExpr(call.Args[4]) && mentionsErrorText(fset, call.Args[3]) {
+				leaks = append(leaks, printNode(fset, call))
+			}
 		}
 		return true
 	})

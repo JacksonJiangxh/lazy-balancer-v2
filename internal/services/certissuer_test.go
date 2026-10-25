@@ -696,6 +696,58 @@ func TestCertIssuer_Issue_fast_path_skips_redeploy_when_deployed_cert_matches(t 
 	}
 }
 
+// 规则与任务两侧都是「跟随默认 CA」（ca_provider_id=0）时，任务行未固化解析
+// 结果（补偿重排队/导入回插/集群恢复可留下 0）。两侧必须经同一默认解析后比较：
+// 此前规则侧解析为具体 ID、任务侧保持 0，被判为「提供商已切换」而白跑一次
+// 完整 ACME 重签（CA 订单 + DNS 挑战），已签发材料却被丢弃。
+func TestCertIssuer_Issue_fast_path_treats_both_follow_default_as_same_provider(t *testing.T) {
+	// Given：默认 CA 指向一个必然连接失败的本地端口——若误走完整签发会立刻报错
+	jobID, ruleID := seedCertificateJob(t, "downloaded")
+	useTemporaryCertDir(t)
+	certPEM := testCertificatePEM(t, time.Now().Add(90*24*time.Hour))
+	const providerID = 7
+	if _, err := db.DB.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled) VALUES (?, 'Default CA', 'letsencrypt', 'http://127.0.0.1:1/directory', '{}', 1, 0, 1)`, providerID); err != nil {
+		t.Fatalf("seed default CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET default_ca_provider_id=? WHERE id=1", providerID); err != nil {
+		t.Fatalf("set default CA provider: %v", err)
+	}
+	// 两侧都跟随默认：规则与任务行均为 0。
+	if _, err := db.DB.Exec("UPDATE lb_rules SET ca_provider_id=0 WHERE caddy_id=?", ruleID); err != nil {
+		t.Fatalf("reset rule CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem='persisted-key', ca_provider_id=0 WHERE id=?", certPEM, jobID); err != nil {
+		t.Fatalf("seed downloaded certificate material: %v", err)
+	}
+	certPath, keyPath := CertFilePaths(ruleID)
+	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
+		t.Fatalf("write deployed certificate file: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte("persisted-key"), 0600); err != nil {
+		t.Fatalf("write deployed key file: %v", err)
+	}
+	reloads := 0
+	issuer := NewCertIssuer(func() error {
+		reloads++
+		return nil
+	})
+
+	// When
+	err := issuer.Issue(context.Background(), jobID, ruleID, "example.com", models.CAProvider{ID: providerID})
+
+	// Then：走「已部署且材料一致」快速路径，不重签不重载
+	if err != nil {
+		t.Fatalf("issue with both sides following default CA: %v", err)
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
+		t.Fatalf("read fast-path job: %v", err)
+	}
+	if status != "issued" || reloads != 0 {
+		t.Fatalf("job status=%q reloads=%d, want issued and 0（两侧 0 应视为同一默认提供商）", status, reloads)
+	}
+}
+
 func TestCertIssuer_Issue_fast_path_redeploys_when_deployed_cert_differs(t *testing.T) {
 	// Given：已部署证书内容与任务证书不同，走原有重新部署路径
 	jobID, ruleID := seedCertificateJob(t, "downloaded")

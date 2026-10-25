@@ -178,6 +178,10 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 	}
 	nodeID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || nodeID <= 0 {
+		// 编号非法属客户端可修正输入，但 explicit 路由的审计中间件对 4xx
+		// 无条件早退——本分支必须自行留痕（与同文件其余失败面同口径）。
+		recordAudit(c, "清除失败", "证书指纹", services.FormatAuditDetail(
+			"节点编号无效（"+registerAuditField(c.Param("id"))+"）", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
 		return
 	}

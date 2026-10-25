@@ -18,10 +18,7 @@ import (
 )
 
 // replaceBusinessTaskDrivers 用可控驱动清单替换生产清单（测试结束恢复）。
-func replaceBusinessTaskDrivers(t *testing.T, drivers []struct {
-	id      string
-	stateFn func() (enabled, known bool)
-}) {
+func replaceBusinessTaskDrivers(t *testing.T, drivers []businessTaskDriver) {
 	t.Helper()
 	previous := businessTaskDrivers
 	businessTaskDrivers = drivers
@@ -37,10 +34,7 @@ func replaceBusinessTaskDrivers(t *testing.T, drivers []struct {
 // 清零——覆盖写不再可能丢失待重试标记。
 func TestSyncBusinessTaskDrivers_serializesConcurrentPasses(t *testing.T) {
 	var inside, maxInside atomic.Int32
-	replaceBusinessTaskDrivers(t, []struct {
-		id      string
-		stateFn func() (enabled, known bool)
-	}{
+	replaceBusinessTaskDrivers(t, []businessTaskDriver{
 		{id: "t-probe", stateFn: func() (bool, bool) {
 			n := inside.Add(1)
 			for {
@@ -78,10 +72,7 @@ func TestSyncBusinessTaskDrivers_serializesConcurrentPasses(t *testing.T) {
 func TestSyncBusinessTaskDrivers_pendingFollowsLastCompletedPass(t *testing.T) {
 	var fail atomic.Bool
 	fail.Store(true)
-	replaceBusinessTaskDrivers(t, []struct {
-		id      string
-		stateFn func() (enabled, known bool)
-	}{
+	replaceBusinessTaskDrivers(t, []businessTaskDriver{
 		{id: "t-flaky", stateFn: func() (bool, bool) {
 			if fail.Load() {
 				return false, false
@@ -170,5 +161,62 @@ func TestAutobanEnabledState_readFailureLeavesWarnTrace(t *testing.T) {
 	}
 	if got := strings.Count(buf.String(), "读取任务排程已恢复（schedule-read-autoban-enabled）"); got != 1 {
 		t.Fatalf("恢复留痕次数=%d, want 1\n%s", got, buf.String())
+	}
+}
+
+// newBusinessLoopTestEngine 装配只含一个调度任务的引擎并设为全局（测试结束
+// 恢复），供调度应用断言直接读 LoopOn。
+func newBusinessLoopTestEngine(t *testing.T, id string) *taskengine.Engine {
+	t.Helper()
+	te := taskengine.NewEngine(taskengine.Options{TickInterval: time.Hour})
+	t.Cleanup(te.Stop)
+	te.Register(taskengine.Descriptor{ID: id, Family: "security", Name: id,
+		Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleAny,
+		NextSlotFn: func() time.Time { return time.Time{} },
+		Run:        func(taskengine.RunContext) error { return nil }})
+	previous := TaskEngine()
+	SetTaskEngineForTest(te)
+	t.Cleanup(func() { SetTaskEngineForTest(previous) })
+	return te
+}
+
+// Given 库实态与 setter 入参相反（两个相反方向的开关请求提交顺序与应用顺序
+// 交错后的形态）。When 应用段进锁。
+// Then 应用结果恒等于锁内读到的库实态——按调用方参数应用会让最后一次应用落在
+// 过期意图上，留下「库=开 / loop=关」的持久错态（Scheduled 零投递，且两端读数
+// 都成功、60s 对账不纠正）。
+func TestBusinessTaskLoopAppliesDatabaseStateOverCallerArg(t *testing.T) {
+	te := newBusinessLoopTestEngine(t, "threat")
+
+	// 库=关、调用方参数=开：库为准。
+	replaceBusinessTaskDrivers(t, []businessTaskDriver{
+		{id: "threat", stateFn: func() (bool, bool) { return false, true }},
+	})
+	applyBusinessTaskLoop("threat", true)
+	if info, ok := te.Lookup("threat"); !ok || info.LoopOn {
+		t.Fatalf("库=关时 loopOn=%v（ok=%v）, want false（应用值必须取锁内库实态，不得用调用方入参）", info.LoopOn, ok)
+	}
+
+	// 库=开、调用方参数=关：反方向同样以库为准。
+	replaceBusinessTaskDrivers(t, []businessTaskDriver{
+		{id: "threat", stateFn: func() (bool, bool) { return true, true }},
+	})
+	applyBusinessTaskLoop("threat", false)
+	if info, ok := te.Lookup("threat"); !ok || !info.LoopOn {
+		t.Fatalf("库=开时 loopOn=%v（ok=%v）, want true", info.LoopOn, ok)
+	}
+}
+
+// Given 驱动实态不可判定（提交后紧接着读库失败）。When 应用段执行。
+// Then 按调用方刚提交的值应用（该值就是本次提交的意图，且已落库）——若保持
+// 旧态不动，库=开/loop=关 的静默停摆将无路径恢复。
+func TestBusinessTaskLoopFallsBackToSetterIntentWhenStateUnknown(t *testing.T) {
+	te := newBusinessLoopTestEngine(t, "threat")
+	replaceBusinessTaskDrivers(t, []businessTaskDriver{
+		{id: "threat", stateFn: func() (bool, bool) { return false, false }},
+	})
+	applyBusinessTaskLoop("threat", true)
+	if info, ok := te.Lookup("threat"); !ok || !info.LoopOn {
+		t.Fatalf("读库不可判定时必须按调用方提交值应用: loopOn=%v（ok=%v）", info.LoopOn, ok)
 	}
 }

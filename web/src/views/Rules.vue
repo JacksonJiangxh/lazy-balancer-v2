@@ -82,8 +82,12 @@
         <el-table-column prop="name" label="规则名称" min-width="140">
           <template #default="{ row }">
             <div class="rule-name-cell">
-              <!-- 锁 hover 摘要（不可点击）：按阶段 0/1/2/3 分组的紧凑摘要；
+              <!-- 锁 hover 摘要（鼠标悬停）：按阶段 0/1/2/3 分组的紧凑摘要；
                    「查看完整处理流程」链接跳转流程弹框（跳转前 hide 本 popover 防遮挡）。
+                   键盘可达：popover 内容 teleport 到 body，Tab 序到不了里面的按钮，
+                   故锁图标本身是 role=button —— Enter/Space 直接打开流程弹框（弹框内
+                   含完整阶段链路，信息面覆盖本摘要）；trigger-keys 置空是关掉 EP
+                   默认的 Enter/Space 开关 popover（否则同键既开弹框又弹只读面板）。
                    2026-09-21 用户裁定：HTTP/HTTPS 规则恒显示锁（未绑定=warning 黄锁，
                    四阶段灰态「未启用」；绑定=is-allow 绿锁现状）；TCP 规则显示灰色锁
                    （2026-10-10 用户裁定，无弹框，hover 提示不支持原因）。 -->
@@ -92,12 +96,22 @@
                 :ref="(el: unknown) => setLockPopover(row.caddy_id, el)"
                 placement="right-start"
                 trigger="hover"
+                :trigger-keys="[]"
                 :width="360"
                 :popper-options="popperViewportSafe"
                 popper-class="rule-lock-popper"
               >
                 <template #reference>
-                  <el-icon :size="14" class="acl-lock-icon" :class="ruleStageModel(row).ruleDisabled ? 'is-unbound' : ruleStageModel(row).hasAnyPolicy ? 'is-allow' : 'is-unbound'" tabindex="0"><Lock /></el-icon>
+                  <el-icon
+                    :size="14"
+                    class="acl-lock-icon"
+                    :class="ruleStageModel(row).ruleDisabled ? 'is-unbound' : ruleStageModel(row).hasAnyPolicy ? 'is-allow' : 'is-unbound'"
+                    role="button"
+                    tabindex="0"
+                    :aria-label="`查看「${row.name}」的安全处理流程`"
+                    @keydown.enter.prevent="openFlowFromLock(row)"
+                    @keydown.space.prevent="openFlowFromLock(row)"
+                  ><Lock /></el-icon>
                 </template>
                 <div class="lock-summary">
                   <div class="lock-summary-title">安全防护 · 阶段摘要</div>
@@ -4014,6 +4028,8 @@ onUnmounted(() => {
 
 .rule-name-cell { display: flex; align-items: center; flex-wrap: nowrap; gap: 6px; white-space: nowrap; }
 .acl-lock-icon { flex: 0 0 auto; cursor: pointer; }
+/* 键盘焦点可见：锁图标是流程弹框的键盘入口（Enter/Space），默认 el-icon 无焦点环 */
+.acl-lock-icon:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; border-radius: 2px; }
 .acl-lock-icon.is-allow { color: var(--el-color-success); }
 .acl-lock-icon.is-unbound { color: var(--el-color-warning); }
 .acl-lock-icon--tcp { color: var(--el-text-color-placeholder); cursor: default; }

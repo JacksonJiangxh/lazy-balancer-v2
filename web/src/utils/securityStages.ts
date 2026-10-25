@@ -255,8 +255,10 @@ export const STAGE_TITLES: Record<0 | 1 | 2 | 3, string> = {
 // 阶段副标题（流程弹框节点）与阶段 1 脚注：渲染链语义的唯一文案源。
 // 阶段 1 副标题/脚注此前漏列 v2.3.8 爬虫校验（豁免 id 810000-849999 /
 // 伪装拦截 850000-899999），脚注另漏列遗留黑名单字段 ip_blacklist（id:4 仍由
-// security.go 发射）。链序按发射顺序：信任(id:3/12) → 黑名单(id:2) → 遗留黑名单
-// (id:4) → 白名单外拒绝(id:5/7) → 白名单豁免 → 爬虫校验 → 地域拦截(id:800000+)。
+// security.go 发射）。链序按发射顺序：信任(id:3/5/12) → 黑名单(id:2) → 遗留黑名单
+// (id:4) → 白名单外拒绝(id:7) → 白名单豁免 → 爬虫校验 → 地域拦截(id:800000+)。
+// id:5 只在「IP ACL 绕过模式占用 id:3」时承载同一信任名单并集
+// （security.go trustID 分支）——归信任族，不是白名单外拒绝。
 export const stageSubLabel = (stage: 1 | 2 | 3): string => {
   if (stage === 1) return 'IP 名单 · 爬虫校验 · 地域 · 威胁库'
   if (stage === 2) return '速率限制'
@@ -594,6 +596,21 @@ const buildStage1Rows = (
   return rows
 }
 
+// WAF 模式展示词单源：策略列表摘要 / 触发详情策略行 / 阶段 3 流程投影三处共用。
+// 此前三份实现措辞互斥（拦截 vs 阻断、仅自定义 vs 仅自定义规则），同一策略在
+// 列表、事件详情、流程弹框需要人工翻译；未登记的新 mode 回落原文 token
+// （fail-visible：不会静默显示空串）。
+export const WAF_MODE_TEXT: Readonly<Record<string, string>> = {
+  blocking: '拦截',
+  detection: '检测',
+  custom_only: '仅自定义',
+  off: '关闭',
+}
+
+/** WAF 模式展示词（未登记 mode 回落原文；空值回落空串，由调用方决定占位符）。 */
+export const wafModeLabel = (mode: string | null | undefined): string =>
+  mode ? WAF_MODE_TEXT[mode] ?? mode : ''
+
 const buildStage3Rows = (
   binding: SecurityStageBinding,
   policy: SecurityStagePolicy | undefined,
@@ -605,10 +622,12 @@ const buildStage3Rows = (
   // WAF 全关（off）= CRS 与自定义规则均不生效，阶段 3 引擎不为该策略渲染——
   // 拦截页归因无从谈起，整组不出组（实体单职化后阶段外能力同此裁剪）
   if (mode === 'off') return rows
-  if (mode === 'blocking') rows.push({ label: 'WAF（拦截）', detail: '命中即阻断' })
-  else if (mode === 'detection') rows.push({ label: 'WAF（检测）', detail: '仅记录不阻断' })
+  // 模式行词取 WAF_MODE_TEXT（与列表摘要/触发详情同源），明细行各模式专属
+  const modeWord = wafModeLabel(mode)
+  if (mode === 'blocking') rows.push({ label: `WAF（${modeWord}）`, detail: '命中即阻断' })
+  else if (mode === 'detection') rows.push({ label: `WAF（${modeWord}）`, detail: '仅记录不阻断' })
   // 仅自定义：CRS 不参与评估由模式名承载，明细行保持短句不折行（2026-09-21 用户裁定）
-  else if (mode === 'custom_only') rows.push({ label: 'WAF（仅自定义）', detail: '自定义规则按动作执行' })
+  else if (mode === 'custom_only') rows.push({ label: `WAF（${modeWord}）`, detail: '自定义规则按动作执行' })
   // 「CRS 规则组」行（blocking/detection 才有 CRS 评估；0=全部默认）
   if (mode === 'blocking' || mode === 'detection') {
     const crsRaw = policy?.crs_rule_groups
@@ -1262,6 +1281,23 @@ export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: nu
   }))
 }
 
+/**
+ * 补齐条目并回报**补齐后**仍未就绪的名单 id（空数组 = 全部就绪）。
+ *
+ * `ensureSharedEntries` 对单名单失败保持「未缓存」而不抛出——调用方必须把这种
+ * 缺失显性化为失败（禁用动作/拒绝出结论），否则条目缺失会退化成「未命中名单」
+ * 或「无残余信任」的业务结论。本函数是该失败判定的单源：命中展示
+ * （IPLocationAction 加载态）与安全决策（「取消信任」计划）两处共用，避免各自
+ * 手写 `!(id in sharedEntriesCache)` 时的口径漂移。
+ *
+ * 注意：这里判的是「补齐后仍不新鲜」而不只是「不在缓存里」——过期缓存同样不可
+ * 用于结论（TTL 到期即按缺失重拉，见 ensureSharedEntries）。
+ */
+export async function ensureSharedEntriesMissing(ids: Iterable<number>, loader: (id: number) => Promise<string[]>): Promise<number[]> {
+  await ensureSharedEntries(ids, loader)
+  return missingSharedEntryIds(ids)
+}
+
 export const invalidateSharedEntriesCache = (): void => {
   entriesCacheGeneration++
   for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
@@ -1338,8 +1374,9 @@ export const SECURITY_BULK_LIMITS = { policyBindings: 100, ruleBlockPages: 500 }
 // 冲突检测注释/夹紧）共用，前两份本地常量各写一遍，后端调整时易漏改。
 export const MAX_POLICIES_PER_RULE = 8
 
-/** 绑定行的最小形状（策略类型由策略摘要推断，精简载荷缺摘要时回退限流标志）。 */
-export interface PolicyBindingRef {
+/** 绑定行的最小形状（策略类型由策略摘要推断，精简载荷缺摘要时回退限流标志）。
+ *  仅作本文件 hasOtherStage2Binding 的入参约束——全仓零外部消费，不导出。 */
+interface PolicyBindingRef {
   policy_id: number
   rate_limit_enabled?: boolean
 }
@@ -1407,6 +1444,11 @@ export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服�
 //      爬虫两族 [810000,900000)（豁免 [810000,850000) + 伪装 [850000,900000)）
 //      独立于地域 [800000,810000)；原实现把整段 800000-899999 归 geoip，
 //      爬虫事件详情显示「地域拦截规则（区域：…）」。
+//   ③ 固定 SecRule id 的族归属单一事实源 = handlers 的 legacyRuleFamilies 表
+//      （id:2/4/7 IP 访问控制、3/5/12 信任名单、8 地域拦截、11 请求体异常、
+//      14 威胁情报库、429 限流）。id:5 是「IP ACL 绕过模式占用 id:3 时的信任
+//      名单并集」（services/security.go trustID 分支，pass,nolog）——归信任族；
+//      曾按白名单外拒绝记账，与本表及发射侧语义分叉。
 // 返回（细粒度，消费方各自投影）:
 //   'trust'|'ipAcl'|'geoip'|'crawler'|'threat'|'wafCustom'|'wafCrs'|'body'|'other'
 // 视图投影：SecurityEvents —— trust→trust，crawler→crawler（独立阶段标签「爬虫
@@ -1416,6 +1458,8 @@ export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服�
 //   合成自定义 id 上界段 [900000,1000000)（DB 规则 id
 //   ≥90000 → 触发 id ≥910000，会与 9\d{5} CRS 段重叠）——自定义规则 id 达 9 万
 //   不现实（不可达），边界不修，仅登记留痕。
+//   限流 id 429 后端归「限流」族，但该族无 sec_events 数据源、列表层不设筛选/
+//   阶段桶（见 triggeredFilter 的类别清单）——本函数归 other。
 // （有意设计，勿"统一"）：id '8' 例外——本函数归 ipAcl，而后端权威分类
 // （attackFamilyClassOf）把 8 归 GeoIP。这是 历史共享 id 口径，现代引擎
 // 地域事件已改发 800xxx、不再走 id 8，无现实影响；triggerFamily.spec.ts 与
@@ -1434,12 +1478,13 @@ export const triggerStageFamily = (ruleTriggered: string): TriggerStageFamily =>
   if (/^9\d{5}$/.test(t)) return 'wafCrs'
   const n = Number(t)
   if (!Number.isFinite(n)) return 'other'
-  if (n === 3 || n === 12) return 'trust'
+  // ② 固定 id 族（后端 legacyRuleFamilies 表派生口径）
+  if (n === 3 || n === 5 || n === 12) return 'trust'
   if (n === 14) return 'threat'
-  // ② 数值段：爬虫两族与地域段互斥（后端口径）
+  // ③ 数值段：爬虫两族与地域段互斥（后端口径）
   if (n >= 810000 && n < 900000) return 'crawler'
   if (n >= 800000 && n < 810000) return 'geoip'
-  if (n === 2 || n === 4 || n === 5 || n === 7 || n === 8) return 'ipAcl'
+  if (n === 2 || n === 4 || n === 7 || n === 8) return 'ipAcl'
   return 'other'
 }
 

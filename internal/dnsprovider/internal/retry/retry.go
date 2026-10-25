@@ -14,9 +14,10 @@ import (
 	"bytes"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
+
+	"lazy-balancer-v2/internal/retryafter"
 )
 
 const (
@@ -34,26 +35,11 @@ func Retryable(status int) bool {
 // After parses a header value (delay-seconds or HTTP-date) into a
 // duration. Unparseable, empty, or past values yield zero.
 //
-// 本函数与 services/certissuer.go 的 parseRetryAfter 是
-// 同语义双实现（包边界所致：本包属 dnsprovider/internal，services 不可导入）。
-// 解析口径（delay-seconds/HTTP-date、不可解析或非正归零）任一侧变更 MUST
-// 同步另一侧并保持语义一致。
+// 解析实现单源在 internal/retryafter.Parse（与 services.parseRetryAfter 共用
+// 同一份代码与测试表）；本函数只保留包内调用点与 now=time.Now() 的绑定，
+// 不再各自维护副本（此前靠注释互相约束「任一侧变更 MUST 同步」，无机器拦截）。
 func After(header string) time.Duration {
-	if header == "" {
-		return 0
-	}
-	if seconds, err := strconv.Atoi(header); err == nil {
-		if seconds <= 0 {
-			return 0
-		}
-		return time.Duration(seconds) * time.Second
-	}
-	if date, err := http.ParseTime(header); err == nil {
-		if until := time.Until(date); until > 0 {
-			return until
-		}
-	}
-	return 0
+	return retryafter.Parse(header, time.Now())
 }
 
 // createRecordAction 判定创建类 DNS 请求：DNSPod 走 URL 路径

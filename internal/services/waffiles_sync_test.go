@@ -463,8 +463,10 @@ func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
 	// 让 copyDir 在复制完 a-new.conf 后失败。
 	// Given：非空旧树 + 含一个新文件的同步包 + staging 内预置只读子目录
 	destDir := filepath.Join(t.TempDir(), "crs")
-	os.MkdirAll(destDir, 0755)
+	os.MkdirAll(filepath.Join(destDir, "rules"), 0755)
 	os.WriteFile(filepath.Join(destDir, "old.conf"), []byte("SecRule OLD"), 0644)
+	// 完整 CRS 树形态（探针文件）：备份完整性门通过后才进入恢复拷贝路径。
+	os.WriteFile(filepath.Join(destDir, "rules", crsRulesProbeFile), []byte("SecRule INIT"), 0644)
 	newTree := t.TempDir()
 	os.WriteFile(filepath.Join(newTree, "a-new.conf"), []byte("SecRule NEW"), 0644)
 	data, _, err := tarGzDir(newTree)
@@ -504,12 +506,16 @@ func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if len(entries) != 1 || entries[0].Name() != "old.conf" {
-		names := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			names = append(names, entry.Name())
-		}
-		t.Fatalf("destDir entries=%v, want exactly [old.conf]（纯旧树）", names)
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	// 纯旧树 = 备份的完整内容（old.conf + rules/ 探针），无新树残留。
+	if len(names) != 2 || names[0] != "old.conf" || names[1] != "rules" {
+		t.Fatalf("destDir entries=%v, want exactly [old.conf rules]（纯旧树）", names)
+	}
+	if got, err := os.ReadFile(filepath.Join(destDir, "rules", crsRulesProbeFile)); err != nil || string(got) != "SecRule INIT" {
+		t.Fatalf("rules/%s=(%q,%v), want intact（纯旧树含探针）", crsRulesProbeFile, got, err)
 	}
 }
 
@@ -573,6 +579,14 @@ func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(locked, "inner.conf"), []byte("SecRule LOCKED"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// 完整 CRS 树形态（探针文件）：备份完整性门通过后才进入恢复拷贝路径，
+	// 本用例考的正是恢复失败的错误透传。
+	if err := os.MkdirAll(filepath.Join(destDir, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destDir, "rules", crsRulesProbeFile), []byte("SecRule INIT"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(locked, 0555); err != nil {
 		t.Fatal(err)
 	}
@@ -625,8 +639,11 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 	// 的 RemoveAll(destDir) 失败。
 	// Given：非空旧树 + 含大文件的同步包 + staging 内预置只读子目录
 	destDir := filepath.Join(t.TempDir(), "crs")
-	os.MkdirAll(destDir, 0755)
+	os.MkdirAll(filepath.Join(destDir, "rules"), 0755)
 	os.WriteFile(filepath.Join(destDir, "old.conf"), []byte("SecRule OLD"), 0644)
+	// 完整 CRS 树形态（探针文件）：备份完整性门通过后才进入恢复拷贝路径，
+	// 本用例考的正是恢复失败的错误透传。
+	os.WriteFile(filepath.Join(destDir, "rules", crsRulesProbeFile), []byte("SecRule INIT"), 0644)
 	newTree := t.TempDir()
 	os.WriteFile(filepath.Join(newTree, "a-new.conf"), make([]byte, 32<<20), 0644)
 	data, _, err := tarGzDir(newTree)
@@ -1170,8 +1187,9 @@ func TestBuildWafFileBundleResponse_incompleteBundleNotCached(t *testing.T) {
 func TestUntarGzTo_healsCrashWindowResidueFromBackup(t *testing.T) {
 	root := t.TempDir()
 	destDir := filepath.Join(root, "crs")
-	// 崩溃窗口形态：live 整体缺失，备份在场。
+	// 崩溃窗口形态：live 整体缺失，备份在场（完整树）。
 	writeTestFile(t, filepath.Join(destDir+".sync-bak", "rules", "REQUEST-900.conf"), "SecRule old")
+	writeTestFile(t, filepath.Join(destDir+".sync-bak", "rules", crsRulesProbeFile), "SecRule init")
 	// staging 残骸（上一轮中断留下）：必须被丢弃重建，不得合并进备份/新树。
 	writeTestFile(t, filepath.Join(destDir+".sync-in", "rules", "STALE.conf"), "SecRule stale")
 

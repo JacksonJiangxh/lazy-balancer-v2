@@ -2249,7 +2249,10 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	materials := make([]CertMaterial, 0)
 	for _, ru := range allRules {
 		r := ru.rule
-		if !r.EnableTLS {
+		// 与发布门（下方 isTCP/TLS 策略段）同判据：TCP/layer4 规则不能终止
+		// TLS，写侧/迁移/导入已把 TCP 的 TLS 字段归零；带外保留 enable_tls 的
+		// TCP 行不得在此物化私钥文件（纵深防御，不是功能判据）。
+		if r.Protocol != "http" || !r.EnableTLS {
 			continue
 		}
 		if r.TLSSource == "manual" && r.TLSCert != "" && r.TLSKey != "" {
@@ -2472,10 +2475,6 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 				HealthCheckTimeout:             r.HealthCheckTimeout,
 				HealthCheckUnhealthyThreshold:  r.HealthCheckUnhealthyThreshold,
 				HealthCheckHealthyThreshold:    r.HealthCheckHealthyThreshold,
-				EnableTLS:                      r.EnableTLS,
-				TLSSource:                      r.TLSSource,
-				TLSCert:                        r.TLSCert,
-				TLSKey:                         r.TLSKey,
 				TLSHTTPRedirect:                r.TLSHTTPRedirect,
 				EnableCompress:                 r.EnableCompress,
 				CompressTypes:                  r.CompressTypes,
@@ -2763,7 +2762,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	var tlsCertFiles []map[string]interface{}
 	for _, ru := range allRules {
 		r := ru.rule
-		if !r.EnableTLS {
+		// 同上方 materials 循环：TCP 规则不参与 TLS 材料（带外 enable_tls 不得
+		// 把私钥列进 load_files）。
+		if r.Protocol != "http" || !r.EnableTLS {
 			continue
 		}
 		if _, hasCert := availableCerts[r.CaddyID]; hasCert {
@@ -3290,24 +3291,23 @@ func httpsRedirectLocation(listenPort int) string {
 }
 
 type SingleRuleConfig struct {
-	CaddyID                        string
-	Protocol                       string
-	Domain                         string
-	ListenPort                     int
-	Strategy                       string
-	DynamicDNS                     bool
-	EnableDnsServer                bool
-	DnsServer                      string
-	DnsFamily                      string
-	HealthCheckPath                string
-	HealthCheckInterval            int
-	HealthCheckTimeout             int
-	HealthCheckUnhealthyThreshold  int
-	HealthCheckHealthyThreshold    int
-	EnableTLS                      bool
-	TLSSource                      string
-	TLSCert                        string
-	TLSKey                         string
+	CaddyID                       string
+	Protocol                      string
+	Domain                        string
+	ListenPort                    int
+	Strategy                      string
+	DynamicDNS                    bool
+	EnableDnsServer               bool
+	DnsServer                     string
+	DnsFamily                     string
+	HealthCheckPath               string
+	HealthCheckInterval           int
+	HealthCheckTimeout            int
+	HealthCheckUnhealthyThreshold int
+	HealthCheckHealthyThreshold   int
+	// 单规则渲染不承载 TLS 材料：EnableTLS/TLSSource/TLSCert/TLSKey 曾在此
+	// 结构上但无任何读者（预检不填、全量渲染的消费者只读路由字段），
+	// 保留即暗示单规则路径支持 TLS 并可能把私钥 PEM 带进渲染载荷。
 	TLSHTTPRedirect                bool
 	EnableCompress                 bool
 	CompressTypes                  string
@@ -3504,8 +3504,6 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 	servers := make(map[string]interface{})
 
 	if rule.Protocol == "http" {
-		domainHosts := splitAndTrim(rule.Domain)
-
 		// 委托生产路径的构建器生成路由对象（GeoIP + 路径路由 + 主路由），
 		// 避免与 generateCaddyConfigFromStore 的逻辑分叉。
 		routes, _, err := generateHTTPRouteObjects(rule)
@@ -3517,6 +3515,12 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 		// 不填 EnableTLS/TLSHTTPRedirect）——HTTP→HTTPS 跳转路由由全量渲染的
 		// redirectRoutes 统一生成，此处不插跳转分支。automatic_https 与全量
 		// 渲染同判据（恒 disable，见下方发射点）。
+		//
+		// 本函数**不发射任何 TLS 配置**：单规则渲染曾带
+		// tls_connection_policies（manual 证书）与 apps.tls.load_pem（内联私钥）
+		// 两个分支，但唯一生产调用方（预检）刻意不填 TLS 字段，分支恒不可达；
+		// 若未来回填 TLS 字段即把私钥 PEM 写进渲染载荷/转储。TLS 材料只经
+		// 全量渲染（availableCerts → MaterializeCertPairs → load_files）。
 		routeValues := make([]interface{}, len(routes))
 		for i, r := range routes {
 			routeValues[i] = r
@@ -3527,20 +3531,6 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 		server := map[string]interface{}{
 			"listen": []string{fmt.Sprintf(":%d", rule.ListenPort)},
 			"routes": routeValues,
-		}
-
-		// Add TLS configuration for manual certificates
-		if rule.EnableTLS && rule.TLSSource == "manual" && rule.TLSCert != "" && rule.TLSKey != "" {
-			server["tls_connection_policies"] = []interface{}{
-				map[string]interface{}{
-					"match": map[string]interface{}{
-						"sni": domainHosts,
-					},
-					"certificate_selection": map[string]interface{}{
-						"any_tag": []string{rule.CaddyID},
-					},
-				},
-			}
 		}
 
 		// 与全量渲染同判据：引擎 auto-HTTPS 一律关闭（证书签发/续期由
@@ -3589,21 +3579,8 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			"servers": servers,
 		},
 	}
-
-	// Add TLS certificates configuration for manual certificates
-	if rule.EnableTLS && rule.TLSSource == "manual" && rule.TLSCert != "" && rule.TLSKey != "" {
-		apps["tls"] = map[string]interface{}{
-			"certificates": map[string]interface{}{
-				"load_pem": []map[string]interface{}{
-					{
-						"certificate": rule.TLSCert,
-						"key":         rule.TLSKey,
-						"tags":        []string{rule.CaddyID},
-					},
-				},
-			},
-		}
-	}
+	// 此处不注入 apps.tls：单规则渲染不承载证书材料（见上方注释），
+	// 私钥只经全量渲染物化到文件并由 load_files 引用。
 
 	conf := map[string]interface{}{
 		"admin": map[string]interface{}{

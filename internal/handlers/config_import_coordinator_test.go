@@ -217,6 +217,9 @@ func TestBeginConfigImport_preservesStoppedCAQueue(t *testing.T) {
 	// Given：cert-issuance 已被停止，CA 队列为 inactive。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
+	// 本用例刻意把单例留在 inactive：不登记收尾的话，后续用例的发证入队会拿到
+	// 「证书签发任务未运行」（409）而不是各自的预期失败，全包结果随顺序变红。
+	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.InitCAQueueManager(func() error { return nil })
 	services.GetCAQueueManager().Start()
 	manager := services.GetCAQueueManager()

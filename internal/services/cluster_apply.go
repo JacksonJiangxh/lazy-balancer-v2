@@ -48,11 +48,13 @@ func SetRestartRequiredHandler(handler func()) {
 	restartRequiredHandler.installed = true
 }
 
-func requestRestart() {
+// RestartRequiredHandlerInstalled 报告 main 是否注入了优雅重启处理器：
+// 未注入时 RequestRestart 返回 false，且默认实现会 os.Exit——调用方据此在
+// 触发前决定「先审计再重启」还是「可见失败留痕」，不必先触发再回退。
+func RestartRequiredHandlerInstalled() bool {
 	restartRequiredHandler.RLock()
-	handler := restartRequiredHandler.fn
-	restartRequiredHandler.RUnlock()
-	handler()
+	defer restartRequiredHandler.RUnlock()
+	return restartRequiredHandler.installed
 }
 
 // RequestRestart 是管理面板触发的统一重启入口：admin TLS 更新与用户
@@ -519,9 +521,19 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	if adminTLS, tlsErr := LoadAdminTLSConfigE(); tlsErr != nil {
 		Logf("warn", "集群同步后读取 Admin TLS 配置失败，跳过重启判定（不触发重启）: %v", tlsErr)
 	} else if RuntimeAdminTLSChanged(adminTLS) {
-		RecordAuditLog("system", "重启", "系统", "同步到新的 HTTPS 访问配置，自动重启生效", "")
-		Logf("info", "Admin TLS config changed via sync, restarting to apply")
-		requestRestart()
+		if RestartRequiredHandlerInstalled() {
+			// 先审计后触发：优雅停机信号会让进程在数秒内退出，审计行必须
+			// 先落库（与 handlers.RestartService 的「审计→重启」同序）。
+			RecordAuditLog("system", "重启", "系统", "同步到新的 HTTPS 访问配置，自动重启生效", "")
+			Logf("info", "Admin TLS config changed via sync, restarting to apply")
+			RequestRestart()
+		} else {
+			// 未注入优雅重启处理器（独立运维/测试构造）：默认实现是
+			// os.Exit(0)，落到那里既不重启侧可见也不留痕，测试进程更会被
+			// 静默截断且判通过。改为可见失败：warn + 审计 + 跳过本轮重启。
+			Logf("warn", "集群同步：Admin TLS 配置已变化，但进程未安装优雅重启处理器，跳过自动重启")
+			RecordAuditLog("system", "重启失败", "系统", "同步到新的 HTTPS 访问配置，但进程未安装优雅重启处理器，未自动重启", "")
+		}
 	}
 	// 三分类合并:全局配置随 users 节恒同步,不存在「基本设置:开关关闭」
 	// 形态;unchanged 侧由节级审计(哈希一致)正确区分。

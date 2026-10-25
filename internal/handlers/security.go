@@ -1693,10 +1693,6 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("无效的策略类型：%s（可选 stage1/stage2/stage3）", *req.PolicyType)})
 			return
 		}
-		if *req.PolicyType != models.PolicyTypeStage2 && req.BlockPageID != nil && *req.BlockPageID == 0 {
-			zero := 0
-			req.BlockStatusCode = &zero
-		}
 	}
 	// refs 派生 ID 必须在类型归一**之后**解析——显式类型切换会把
 	// 阶段外 refs 指针改写为 "[]"，旧顺序仍用切换前的 ID 做存在性/内置名单
@@ -1746,9 +1742,11 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	if req.GeoIPMode != nil {
 		geoIPMode = *req.GeoIPMode
 	}
-	// anomaly_threshold 显式 0 按创建侧口径归一为 5：0 非合法枚举值，
-	// 直接落库会让发射端 services/security.go:157 的 `AnomalyThreshold > 0` 判断
-	// 跳过 SecAction id:900，CRS 回落到默认阈值 5，UI 显示 0 与实际行为不符。
+	// anomaly_threshold 显式 0 按创建侧口径归一为 5：0 非合法枚举值。
+	// 写侧归一即可——带外写入 <=0 的行由渲染层显性拒绝生成整份配置
+	// （services/security.go buildCorazaDirectivesWithIndex 的
+	// AnomalyThreshold <= 0 分支），
+	// 不会静默回落到 CRS 默认阈值，也不会出现「UI 显示 0 但实际按 5 生效」。
 	// 与 CreateSecurityPolicy 的 max1(req.AnomalyThreshold, 5) 同口径；nil 保持
 	// 未提供语义，不参与写入。
 	if req.AnomalyThreshold != nil && *req.AnomalyThreshold == 0 {
@@ -2275,6 +2273,25 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			// 与同函数审计名读取失败的留痕口径一致）。
 			services.Logf("warn", "更新策略 #%s 后重推断读取失败（policy_type 未按合并内容校正，审计不含类型变更）: %v", id, err)
 		}
+	}
+	// 写侧拦截状态码归一与 Create 同口径（单源 normalizeBlockStatusCode）：
+	// 以写入后读回的终态判定——类型可能是本请求显式提交，也可能是上方按合并
+	// 内容重推断的结果；页面 id 同理（显式提交 ?? 存量）。此前只有「显式
+	// policy_type ∧ 显式 block_page_id=0」才归零，PUT {"block_status_code":404}
+	// 这类部分更新会落库一个不会被渲染消费的值。读取失败只告警不阻断（主更新
+	// 已就绪，下次编辑收敛；与同函数审计名读取失败的留痕口径一致）。
+	var finalPolicyType string
+	var finalBlockPageID, finalBlockStatus int
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(policy_type,''), COALESCE(block_page_id,0), COALESCE(block_status_code,0) FROM security_policies WHERE id=?", id).Scan(&finalPolicyType, &finalBlockPageID, &finalBlockStatus); err != nil {
+		services.Logf("warn", "更新策略 #%s 后读取拦截状态码终态失败（未执行写侧归一）: %v", id, err)
+	} else if normalized := normalizeBlockStatusCode(finalBlockStatus, finalPolicyType, finalBlockPageID); normalized != finalBlockStatus {
+		if _, err := tx.ExecContext(c.Request.Context(), "UPDATE security_policies SET block_status_code=? WHERE id=?", normalized, id); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新拦截状态码失败"})
+			return
+		}
+		// 审计 delta 以实际落库值为准：归零同样是本次写入的真实变更。
+		normalizedVal := normalized
+		req.BlockStatusCode = &normalizedVal
 	}
 	// 审计用 username（非数字 ID）+ 真 delta 变更详情（2026-09-25 用户裁定
 	// A 方案）：只记「提交值≠存量值」的字段（旧值→新值），IP 弹窗一键操作和
@@ -3346,9 +3363,16 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拆分后的子策略名称将超过 100 字符，请先缩短原策略名称"})
 		return
 	}
-	// 拆分是「新建策略」路径，与 Create 完全同门：按本次将落库的子策略字段
-	// 并集做引用存在性校验（拦截页/自定义规则/IP 名单 refs/CRS 排除作用域名单）
-	// 与内置威胁名单禁令。禁用态混合策略的引用可悬空（删除门只拦启用策略，
+	// 拆分的校验面（与 Create 共享的三门，非「完全同门」）：①按本次将落库的
+	// 子策略字段并集做引用存在性校验（拦截页/自定义规则/IP 名单 refs/CRS 排除
+	// 作用域名单）；②内置威胁名单禁令；③全局策略数量上限。Create 的语义校验
+	// （枚举、GeoIP 条目、限流形状、CIDR 列表、自定义规则 JSON、爬虫豁免、
+	// CRS 字段）在此不重复执行：子策略是原策略列值的原样复制，这些列在原始
+	// 写入路径（Create/Update 写侧校验）已过同款门；历史/带外写入的脏值由
+	// 渲染层 fail-visible 兜底。对复制值再跑一遍只会把这些存量脏值从
+	// 「渲染层拒绝生成配置」升级成「拆分端点整体不可用」，把迁移通道也堵死。
+	// 渲染层仍是最后闸门。
+	// 禁用态混合策略的引用可悬空（删除门只拦启用策略，
 	// security_regression_13 钉住），直接复制给子策略会让 ACL/信任合并集静默
 	// 缩窄为 inline-only、自定义拦截/拦截页静默缺席，且归因困难（启用门在
 	// 「另一次操作」才报错）。拒绝拆分并指引先修原策略——不产生半截子策略。
@@ -3692,33 +3716,41 @@ func formatIP2RegionLocation(region string) string {
 // 各消费面必须逐点相等，否则会出现「入口不排、出口才排」的配额挤占）。
 func isReservedIP(ip string) bool { return services.IsReservedClientIP(ip) }
 
-// ruleTriggeredFamilyPrefixes 触发规则筛选的 family 标签 → ID 前缀集合
-// （「WAF 规则（CRS）」为复合 GLOB 条件单独处理，不在此表；「自定义规则」无
+// ruleTriggeredFamilyPrefixes 触发规则筛选的 family 标签 → ID 精确值集合
+// （单 ID 族全部由 legacyRuleFamilies 派生——族归属只有一处定义；
+// 「WAF 规则（CRS）」为复合 GLOB 条件单独处理，不在此表；「自定义规则」无
 // LIKE 前缀可表达长度约束，由 customRuleFamilyCondition 整体承载）。本表与
 // ruleTriggeredFilterSQL 的单段解析、ruleTriggeredMultiFilterSQL 的逐段结构化
 // 判定共用，改动需与前端筛选选项/triggeredLabel 显示标签、categorizeAttack
 // 总览口径三侧同步。
-var ruleTriggeredFamilyPrefixes = map[string][]string{
-	// 历史触发阶段四分类（用户裁定）：信任独立成族；IP 访问控制合并黑白
-	// 名单/地域/威胁库三族（前端合并选项值以逗号拆分为三段 OR，口径不变）。
-	"信任名单":    {"3", "12"},
-	"IP 访问控制": {"2", "4", "5", "7"},
-	"请求体异常":   {"11"},
-	"地域拦截":    {"8"}, // + geoipFamilyCondition（预检精确段 800000-899999）
-	"威胁情报库":   {"14"},
-	// v2.3.8 触发类型扩展：爬虫Bot（810000-899999 全段）、限流（429 精确）、
-	// IP 黑名单（自维护 id:4）、WAF·自定义（customRuleFamilyCondition 复用）
-	// 爬虫族数值段单一事实源 [810000,900000)——旧两位前缀
-	// "81"/"85" 生成 rule_triggered='81' 精确匹配，永不命中 6 位真实 id。
-	// 形态条件由 crawlerFamilyCondition 承载（互斥 6 位 GLOB）。
-	"爬虫Bot": {},
-	"限流":    {"429"},
+var ruleTriggeredFamilyPrefixes = buildRuleTriggeredFamilyPrefixes()
 
-	"WAF·自定义": {},
-	"评分拦截":    {"949", "959"},
-	"协议异常":    {"920"},
-	"协议攻击":    {"921"},
-	"自定义规则":   {}, // 见 customRuleFamilyCondition（与 categorizeAttack 同口径）
+func buildRuleTriggeredFamilyPrefixes() map[string][]string {
+	// 形态条件族与多字符 CRS 前缀族保持手写；单 ID 族（信任名单/IP 访问
+	// 控制/地域拦截/威胁情报库/请求体异常/限流）由 id→家族表派生。
+	families := map[string][]string{
+		// v2.3.8 触发类型扩展：爬虫Bot（810000-899999 全段）形态条件由
+		// crawlerFamilyCondition 承载（互斥 6 位 GLOB）。旧两位前缀
+		// "81"/"85" 生成 rule_triggered='81' 精确匹配，永不命中 6 位真实 id。
+		"爬虫Bot": {},
+		// WAF·自定义（customRuleFamilyCondition 复用）；「自定义规则」同条件。
+		"WAF·自定义": {},
+		"自定义规则":   {},
+		"评分拦截":    {"949", "959"},
+		"协议异常":    {"920"},
+		"协议攻击":    {"921"},
+	}
+	ids := make([]int, 0, len(legacyRuleFamilies))
+	for id := range legacyRuleFamilies {
+		ids = append(ids, id)
+	}
+	// 排序保证生成的 SQL 条件与参数顺序稳定（映射遍历顺序随机）。
+	sort.Ints(ids)
+	for _, id := range ids {
+		key := legacyRuleFamilies[id].key
+		families[key] = append(families[key], strconv.Itoa(id))
+	}
+	return families
 }
 
 // customRuleFamilyCondition 自定义规则族的 ID 形态条件——与 attackFamilyClassOf
@@ -4406,7 +4438,8 @@ func maskSecurityEventRequestContextIfNeeded(c *gin.Context, e *models.SecurityE
 // attackFamilyClass 攻击族 ID 形态分类——收敛的单一事实源
 // categorizeAttack（概览具体分类）与 stageCategorizeAttack（阶段五桶）此前各
 // 复写同一组形态谓词（5 位自定义/≥7 位 1 开头合成/11/14/8/2/4/5/7/3/12/msg
-// 关键词门），判定顺序分叉已出过一次事故。
+// 关键词门），判定顺序分叉已出过一次事故；固定 id 的族归属统一由
+// legacyRuleFamilies 一张表提供（筛选表与触发类型映射同源派生）。
 // SQL 筛选侧（ruleTriggeredFamilyPrefixes/customRuleFamilyCondition/
 // geoipFamilyCondition）为 GLOB 文本形态，受引擎约束保持独立（同步义务不变）。
 //
@@ -4425,9 +4458,41 @@ const (
 	attackFamilyThreatIntel                   // id 14 / msg「威胁情报库拦截」
 	attackFamilyGeoIP                         // id 8 / 6 位 80xxxx / msg「GeoIP 区域拦截」
 	attackFamilyCrawler                       // 6 位 8[1-9]xxxx（爬虫豁免/伪装）
-	attackFamilyIPACL                         // msg「IP 黑/白名单/访问控制」/ id 2/4/5/7
-	attackFamilyTrust                         // id 3/12 信任名单
+	attackFamilyIPACL                         // msg「IP 黑/白名单/访问控制」/ id 2/4/7
+	attackFamilyTrust                         // id 3/5/12 信任名单
+	attackFamilyRateLimit                     // id 429 限流（状态码精确匹配，防御性分支）
 )
+
+// legacyRuleFamily 阶段化模型之前的固定 SecRule id 的族归属。
+type legacyRuleFamily struct {
+	// key 是事件列表触发类型/筛选族键的权威词（triggerTypeForRule 与
+	// ruleTriggeredFamilyPrefixes 的 map 键同词）。
+	key   string
+	class attackFamilyClass
+}
+
+// legacyRuleFamilies 固定 SecRule id → 族 的单一事实源：事件列表触发类型
+// （triggerTypeForRule）、总览攻击族分桶（attackFamilyClassOf）、事件页族
+// 筛选（ruleTriggeredFamilyPrefixes 由本表派生）、大屏命中规则标签
+// （describeThreatRuleNameWithNames）四处口径均由此派生。此前四处各自
+// 复写 id 字面量，id:5（绕过模式占位的信任名单 DetectionOnly 规则，发射
+// 动作恒 pass,nolog）在三处被记成 IP 访问控制。
+var legacyRuleFamilies = map[int]legacyRuleFamily{
+	2:   {key: "IP 访问控制", class: attackFamilyIPACL},
+	3:   {key: "信任名单", class: attackFamilyTrust},
+	4:   {key: "IP 访问控制", class: attackFamilyIPACL},
+	5:   {key: "信任名单", class: attackFamilyTrust},
+	7:   {key: "IP 访问控制", class: attackFamilyIPACL},
+	8:   {key: "地域拦截", class: attackFamilyGeoIP},
+	11:  {key: "请求体异常", class: attackFamilyBodyAnomaly},
+	12:  {key: "信任名单", class: attackFamilyTrust},
+	14:  {key: "威胁情报库", class: attackFamilyThreatIntel},
+	429: {key: "限流", class: attackFamilyRateLimit},
+}
+
+// legacyRuleFamilyOf 返回固定 id 的族归属（表外 id 得零值：key ""、
+// class attackFamilyOther）。
+func legacyRuleFamilyOf(id int) legacyRuleFamily { return legacyRuleFamilies[id] }
 
 // attackFamilyClassOf 共享形态谓词——两个 Go 视图函数的唯一分类入口。
 // 预检 8xxxxx 段的家族/边界经 services.DecodePrecheckRuleID 单一事实源
@@ -4437,8 +4502,10 @@ func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 	// 禁止在 handlers 复写——历史分叉：n>800000 vs n>=800000）；非数字/段外
 	// ID 得 Unknown，不影响后续形态分支。
 	precheckFamily := services.PrecheckRuleFamilyUnknown
+	legacyFamily := legacyRuleFamily{}
 	if n, perr := strconv.Atoi(ruleTriggered); perr == nil {
 		precheckFamily = services.PrecheckRuleFamilyOf(n)
+		legacyFamily = legacyRuleFamilyOf(n)
 	}
 	switch {
 	case len(ruleTriggered) == 5:
@@ -4457,9 +4524,13 @@ func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 		// 权威：SQL 筛选族 customRuleFamilyCondition 与前端
 		// triggeredLabel 须与本分支保持一致。
 		return attackFamilyCustomRule
-	case ruleTriggered == "11":
+	case legacyFamily.class == attackFamilyRateLimit:
+		// 429 精确命中（限流由 caddy-ratelimit 直接返回、无审计行，见
+		// categorizeAttack 的生产者声明）。
+		return attackFamilyRateLimit
+	case legacyFamily.class == attackFamilyBodyAnomaly:
 		return attackFamilyBodyAnomaly
-	case ruleTriggered == "14" || strings.Contains(ruleMsg, "威胁情报库拦截"):
+	case legacyFamily.class == attackFamilyThreatIntel || strings.Contains(ruleMsg, "威胁情报库拦截"):
 		// 14 = 威胁情报库预检拦截（阶段 1，v2.3.x）。精确匹配——LIKE 前缀
 		// 会误并自定义规则发射 id 14xxxx（emit=DB id+10000）。
 		return attackFamilyThreatIntel
@@ -4467,18 +4538,17 @@ func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 		// 爬虫两族 [810000,900000) 与地域段 [800000,810000) 互斥（段界由
 		// services 单一事实源保证）。
 		return attackFamilyCrawler
-	case ruleTriggered == "8" || precheckFamily == services.PrecheckRuleFamilyGeoIP || strings.Contains(ruleMsg, "GeoIP 区域拦截"):
+	case legacyFamily.class == attackFamilyGeoIP || precheckFamily == services.PrecheckRuleFamilyGeoIP || strings.Contains(ruleMsg, "GeoIP 区域拦截"):
 		// 8 = 旧共享 GeoIP id（策略引擎时代历史事件）；预检 GeoIP 族 = 逐策略
 		// 精确段 800000+policyID（阶段化模型，buildIPPrecheckDirectives 逐策略链）。
 		return attackFamilyGeoIP
 	case strings.Contains(ruleMsg, "IP 黑名单") || strings.Contains(ruleMsg, "IP 白名单") || strings.Contains(ruleMsg, "IP 访问控制") ||
-		ruleTriggered == "2" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7":
+		legacyFamily.class == attackFamilyIPACL:
 		return attackFamilyIPACL
-	case ruleTriggered == "3" || ruleTriggered == "12":
-		// 信任预检 id:3/12（对齐 family 表/stage 桶三侧口径）——
-		// 置于 msg 门之后：带「IP 黑/白名单」消息的 id:3 历史行
-		// 仍归 IP 访问控制（既有钉），裸 id 形态（当前发射为 pass,nolog 永不产
-		// 事件——防御性归族）归信任名单。
+	case legacyFamily.class == attackFamilyTrust:
+		// 信任预检 id:3/5/12（id→家族单一事实源）——置于 msg 门之后：带
+		// 「IP 黑/白名单」消息的历史行仍归 IP 访问控制（既有钉），裸 id 形态
+		//（当前发射为 pass,nolog 永不产事件——防御性归族）归信任名单。
 		return attackFamilyTrust
 	default:
 		return attackFamilyOther
@@ -4565,9 +4635,6 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 	// Prometheus 指标，一旦将来把 429 也落审计行，此处即为正确归类点；
 	// 改动本函数会改变 rollup 固化口径——必须同步递增
 	// threatRollupClassifierVersion（见 security_threat_screen.go 代际注释）。
-	if ruleTriggered == "429" {
-		return "限流"
-	}
 	// 5 位 ID 恒为自定义规则——先于 3 位前缀判定,crID≥82000
 	// 发射 92000-99999 时不再被 9 前缀遮蔽误标。
 	if len(ruleTriggered) == 5 {
@@ -4579,6 +4646,8 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 	// 9 开头但未列名 3 位前缀的 CRS 段：继续走共享形态门（收敛前
 	// fall-through 同口径——历史脏数据 msg 命中 IP 黑白名单仍归 IP 访问控制）。
 	switch attackFamilyClassOf(ruleTriggered, ruleMsg) {
+	case attackFamilyRateLimit:
+		return "限流"
 	case attackFamilyCustomRule:
 		return "自定义规则"
 	case attackFamilyBodyAnomaly:
@@ -4615,9 +4684,6 @@ func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
 	// 此前落「其他」——同一事件在列表与总览口径分叉。
 	// 生产者声明同 categorizeAttack：当前无 429 审计行（限流不经 coraza），
 	// 属防御性分支；分类口径变更须递增 threatRollupClassifierVersion。
-	if ruleTriggered == "429" {
-		return "限流"
-	}
 	class := attackFamilyClassOf(ruleTriggered, ruleMsg)
 	// WAF=自定义规则类+CRS 9 前缀段（categorizeAttack 的 crsAttackLabel 细分段
 	// 此处整段归一）。msg 门命中的 9 开头形态同样归 WAF（不 fall-through）。
@@ -4625,6 +4691,8 @@ func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
 		return "WAF"
 	}
 	switch class {
+	case attackFamilyRateLimit:
+		return "限流"
 	case attackFamilyBodyAnomaly:
 		return "请求体异常"
 	case attackFamilyThreatIntel, attackFamilyGeoIP, attackFamilyCrawler, attackFamilyIPACL:
@@ -5083,10 +5151,18 @@ func truncateLogTail(text string, maxBytes int) string {
 }
 
 // readUpdateLogWithRotation 读更新日志（含上一代 .1 轮转副本，旧代在前）——
-// CRS/IP2Region/威胁三库更新日志端点共用。
+// CRS/IP2Region/威胁三库更新日志端点共用。单份读取失败留 warn（文件不存在
+// 不算错误），不因历史副本不可读丢掉当前文件内容。
 func readUpdateLogWithRotation(path string) string {
-	content := readCertJobLogFile(path)
-	if oldData := readCertJobLogFile(path + ".1"); oldData != "" {
+	content, err := readCertJobLogFile(path)
+	if err != nil {
+		services.Logf("warn", "读取更新日志失败（%s）: %v", path, err)
+	}
+	oldData, oldErr := readCertJobLogFile(path + ".1")
+	if oldErr != nil {
+		services.Logf("warn", "读取更新日志轮转副本失败（%s.1）: %v", path, oldErr)
+	}
+	if oldData != "" {
 		content = oldData + content
 	}
 	return truncateLogTail(content, updateLogMaxBytes)
@@ -5531,6 +5607,17 @@ func outOfStageZeroFamilies(policyType string) []stageZeroFamily {
 	return nil
 }
 
+// normalizeBlockStatusCode 写侧拦截状态码归一口径（Create/Update 单一事实源）：
+// 状态码只在「非 stage2 ∧ 已绑定自定义拦截页」时被渲染消费——stage2 限流拦截
+// 恒 429（状态码列无意义），无页策略的 deny 恒 403（blockStatusForPolicy 仅对
+// 有有效页的策略分配合成码）。其余形态落零，避免详情/列表宣称一个不生效的值。
+func normalizeBlockStatusCode(statusCode int, policyType string, blockPageID int) int {
+	if policyType == models.PolicyTypeStage2 || blockPageID == 0 {
+		return 0
+	}
+	return statusCode
+}
+
 // applyStageZerosToCreate 按矩阵把创建请求的阶段外字段赋为类型零值。
 // IPWhitelistEnabled 赋 &falseVal 而非 nil——nil 经
 // policyWhitelistDefault 落默认 1，与 Update 路径（false → 0）形状漂移。
@@ -5566,10 +5653,9 @@ func applyStageZerosToCreate(req *models.CreateSecurityPolicyRequest, policyType
 			req.TrustDetection = false
 		}
 	}
-	if policyType != models.PolicyTypeStage2 && req.BlockPageID == 0 {
-		// 无自定义页面时状态码不被渲染消费；写侧归一，避免 UI 宣称生效。
-		req.BlockStatusCode = 0
-	}
+	// 无自定义页面时状态码不被渲染消费；写侧归一，避免 UI 宣称生效
+	// （与 Update 的写后归一单源，见 normalizeBlockStatusCode）。
+	req.BlockStatusCode = normalizeBlockStatusCode(req.BlockStatusCode, policyType, req.BlockPageID)
 }
 
 // applyStageZerosToUpdate 按同一矩阵把更新请求的阶段外字段指针赋为零值

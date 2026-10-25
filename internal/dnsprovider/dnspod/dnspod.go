@@ -164,7 +164,14 @@ func (p *Provider) CleanUp(ctx context.Context, zone, tokenFQDN string) error {
 // CleanUpValue removes only the record this issuance created (same challenge
 // value), plus legacy/stale leftovers under the same name; a concurrent
 // issuance's recent record of another value is spared.
+//
+// 空值必须 fail-fast：ownership 路径的 MatchingValue("") 会委托给按名匹配
+// （命中同名全部记录），而内存兜底路径只选空值条目——同一入参两种语义，
+// 一旦未来出现空值调用方，前者会删掉并发挑战的 TXT。按名清理只属于 CleanUp。
 func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("按值清理必须提供非空挑战值（按名清空请使用 CleanUp）")
+	}
 	return p.cleanUp(ctx, zone, tokenFQDN, value, true)
 }
 

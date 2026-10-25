@@ -64,6 +64,32 @@ func TestUpdateConfig_normalizesAPIKeyRedactionOnWrite(t *testing.T) {
 	}
 }
 
+// 尾随换行不是一行空映射：规范化必须在追加脱敏行前裁掉尾随 '\n'——否则
+// Split 的末尾空元素被保留，落库值多一行空行（UI 文本域/导出/回显多出空白；
+// 渲染层忽略空行，故无行为差异，但库内形态不规范）。
+func TestUpdateConfig_accessLogFormatTrailingNewlineNoBlankLine(t *testing.T) {
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+
+	rec := putAccessLogFormat(t, handler, "request>remote_ip -> src\n")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var stored string
+	if err := db.DB.QueryRow("SELECT COALESCE(access_log_format,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+		t.Fatalf("read stored format: %v", err)
+	}
+	want := "request>remote_ip -> src\n" + accessLogRedactionLine
+	if stored != want {
+		t.Fatalf("落库格式=%q, want %q（尾随换行不得留成空行）", stored, want)
+	}
+
+	// 幂等：再保存同一值不产生变化（空行不会随保存次数累积）。
+	rec = putAccessLogFormat(t, handler, stored)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "配置无变化") {
+		t.Fatalf("重复保存 status=%d body=%s, want 200 配置无变化", rec.Code, rec.Body.String())
+	}
+}
+
 // 空格式是受支持形态（「不裁剪原生字段」），写侧保持原样；渲染层恒注入
 // 脱敏行（services 侧测试钉住）。
 func TestUpdateConfig_keepsEmptyAccessLogFormat(t *testing.T) {

@@ -238,6 +238,9 @@ func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
 // 日志：只删过期文件、活跃文件必须保留；保留期删除被移除/阈值失效即红。
 func TestCertJobFileLogger_housekeepingDeletesOnlyExpiredFiles(t *testing.T) {
 	// Given：certjobs 目录下有过期（10 年前）与活跃（现在）两个日志文件
+	// 保留期删除需要「口径已知」的库（nil 库=口径未知，一律不删——本用例
+	// 的断言面是保留期删除本身，必须先装配库）。
+	initServicesDB(t)
 	useCertJobLogTestEnv(t, 1<<20)
 	dir := CertJobLogDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

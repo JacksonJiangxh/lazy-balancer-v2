@@ -108,7 +108,7 @@
           <el-form-item label="写操作验证">
             <el-switch v-model="settings.mfa_write_guard" :disabled="isReadOnly" />
             <span class="form-tip-inline">写操作需 1 分钟内的 MFA 验证</span>
-            <el-link type="info" underline="never" size="small" class="tip-link" style="margin-left: 6px" @click="mfaScopeVisible = true">支持的操作</el-link>
+            <AccessibleLink type="info" underline="never" size="small" class="tip-link" style="margin-left: 6px" @click="mfaScopeVisible = true">支持的操作</AccessibleLink>
           </el-form-item>
           <el-form-item label="登录失败锁定">
             <el-switch v-model="settings.mfa_lockout_enabled" :disabled="isReadOnly" />
@@ -121,13 +121,13 @@
                  用户必须先知道「不可信」再考虑其它动作（重试走同一读路径）。 -->
             <template v-if="adminTlsUnavailable">
               <el-text type="danger" size="small" style="margin-left: 8px">配置读取失败，显示的开关不可信</el-text>
-              <el-link type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</el-link>
+              <AccessibleLink type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</AccessibleLink>
             </template>
             <el-text v-else-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
             <!-- 读取失败显性化 + 重试（与 githubProxyLoaded 的提示同口径）-->
             <template v-else-if="adminTlsLoadFailed">
               <el-text type="danger" size="small" style="margin-left: 8px">TLS 配置读取失败，开关暂不可用</el-text>
-              <el-link type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</el-link>
+              <AccessibleLink type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</AccessibleLink>
             </template>
             <span v-else class="form-tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</span>
             <!-- 库内证书不可读（fail-visible）：后端以 cert_info_error 显式申报，
@@ -501,6 +501,7 @@ import { importFailureLines, importFailureReport } from '@/utils/importFailure'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import type { SystemInfo } from '@/types'
 
 const authStore = useAuthStore()

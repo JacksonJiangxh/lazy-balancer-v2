@@ -236,3 +236,63 @@ func TestUpdateRule_clearsCrossSourceTLSResidue(t *testing.T) {
 		}
 	})
 }
+
+// 空 tls_source（API/MCP 创建时省略来源且 TLS 关闭，或旧版本/导入行）
+// 同样不消费 acme_config_id——Create 与 Update 都必须清零该跨模式死引用，
+// 否则引用会随导出/备份/集群快照长期携带（渲染/签发零消费，全部消费方都以
+// enable_tls=1 && tls_source='acme_dns' 门控）。
+func TestRuleWrites_emptyTLSSourceClearsACMEReference(t *testing.T) {
+	t.Run("create-omitted-source", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		router := gin.New()
+		router.POST("/rules", handler.CreateRule)
+		body := `{"name":"empty-src-create","protocol":"http","domain":"empty-src-create.example.test","listen_port":8090,"enable_tls":false,"acme_config_id":7,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK && recorder.Code != http.StatusCreated {
+			t.Fatalf("status=%d body=%s, want 2xx", recorder.Code, recorder.Body.String())
+		}
+		var source string
+		var acmeID int
+		if err := db.DB.QueryRow("SELECT COALESCE(tls_source,''), COALESCE(acme_config_id,0) FROM lb_rules WHERE name='empty-src-create'").Scan(&source, &acmeID); err != nil {
+			t.Fatalf("read created rule: %v", err)
+		}
+		if source != "" {
+			t.Fatalf("tls_source=%q, want 空来源（省略即空）", source)
+		}
+		if acmeID != 0 {
+			t.Fatalf("acme_config_id=%d, want 0（非 acme_dns 不保留 ACME 引用）", acmeID)
+		}
+	})
+
+	t.Run("update-stored-empty-source", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		seedAuditRule(t, "lb_empty_acme", "empty-acme", "empty-acme.example.test", 8091, true, "", false)
+		seedAuditUpstream(t, "lb_empty_acme")
+		if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=7 WHERE caddy_id='lb_empty_acme'"); err != nil {
+			t.Fatalf("seed stale acme reference: %v", err)
+		}
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_empty_acme", strings.NewReader(`{"description":"touch"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var acmeID int
+		if err := db.DB.QueryRow("SELECT COALESCE(acme_config_id,0) FROM lb_rules WHERE caddy_id='lb_empty_acme'").Scan(&acmeID); err != nil {
+			t.Fatalf("read rule: %v", err)
+		}
+		if acmeID != 0 {
+			t.Fatalf("acme_config_id=%d, want 0（空来源不保留 ACME 引用）", acmeID)
+		}
+	})
+}

@@ -49,7 +49,7 @@
         </template>
         <el-table-column prop="name" label="策略名称" min-width="200">
           <template #default="{ row }">
-            <el-link type="primary" @click="openDialog(row)">{{ row.name }}</el-link>
+            <AccessibleLink type="primary" @click="openDialog(row)">{{ row.name }}</AccessibleLink>
           </template>
         </el-table-column>
         <el-table-column label="关联规则" width="100" align="center">
@@ -521,7 +521,7 @@
               <el-select v-model="selectedCustomRules" :disabled="form.mode === 'off'" multiple filterable placeholder="选择要包含的自定义规则" style="width: 100%">
                 <el-option v-for="rule in allCustomRules" :key="rule.id" :label="rule.name" :value="rule.id" />
               </el-select>
-              <div class="form-tip-line">自定义规则在"规则集"页面创建，<el-link type="primary" @click="goToCustomRulesPage">去创建/编辑</el-link></div>
+              <div class="form-tip-line">自定义规则在"规则集"页面创建，<AccessibleLink type="primary" @click="goToCustomRulesPage">去创建/编辑</AccessibleLink></div>
             </el-form-item>
           </el-form>
         </div>
@@ -611,7 +611,7 @@
                 <!-- 加载失败显性化+重试；已保存的地域值保留不清空-->
                 <div v-if="regionsError" class="form-tip-line">
                   <el-text type="danger" size="small">地域数据加载失败，已保存的地域配置仍保留。</el-text>
-                  <el-link type="primary" size="small" @click="fetchRegions">重试</el-link>
+                  <AccessibleLink type="primary" size="small" @click="fetchRegions">重试</AccessibleLink>
                 </div>
               </el-form-item>
               <!-- v2.3.8 爬虫豁免（方案 B）：已验证搜索引擎/AI 爬虫跳过地域拦截。
@@ -756,7 +756,7 @@
                 <el-option v-for="p in blockPages" :key="p.id" :label="p.name" :value="p.id" />
               </el-select>
               <div v-if="form.block_page_id === 0" class="form-tip-line">{{ editorPolicyType === 'stage2' ? '不配置拦截页：429 返回空响应体（可选内置「限流拦截页面」）' : '不配置拦截页；规则无阶段页覆盖且同规则无其他策略页时，拦截返回 Caddy 默认 403' }}</div>
-              <div v-else class="form-tip-line">拦截时返回给客户端的自定义页面，在"拦截页面"页面管理，<el-link type="primary" @click="goToBlockPagesPage">去创建/编辑</el-link></div>
+              <div v-else class="form-tip-line">拦截时返回给客户端的自定义页面，在"拦截页面"页面管理，<AccessibleLink type="primary" @click="goToBlockPagesPage">去创建/编辑</AccessibleLink></div>
               <!-- 拦截页归因分层口径：规则可配阶段页覆盖；未覆盖时按触发策略显示。
                    逐阶段按后端渲染事实判定（阶段 1/2 取绑定链首个有页策略，
                    阶段 3 逐策略合成码；规则级覆盖压过策略页），不再恒渲染绿色「生效中」。 -->
@@ -964,7 +964,8 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasOtherStage2Binding, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, WAF_MODE_TEXT, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasOtherStage2Binding, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy, CrsRuleFileOption } from '@/utils/securityStages'
 import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { updaterName } from '@/utils/updaterName'
@@ -1156,8 +1157,9 @@ const isStage0ChainEntry = (entry: ChainEntry): boolean => {
   const policy = policies.value.find((p) => p.id === entry.policyId)
   return policy ? policyTypeOf(policy) === 'stage0' : false
 }
-// WAF 模式展示词单源：列表摘要与只读详情分段共用（两处曾各写一份同值表）。
-const WAF_MODE_TEXT: Record<string, string> = { blocking: '拦截', detection: '检测', custom_only: '仅自定义', off: '关闭' }
+// WAF 模式展示词单源已上移 utils/securityStages（WAF_MODE_TEXT）——列表摘要、
+// 只读详情分段、触发详情策略行、流程投影四处同词（此前文件内两份 + 跨文件一份
+// 措辞互斥：拦截/阻断、仅自定义/仅自定义规则）。
 const chainChipText = (entry: ChainEntry, index: number): string => {
   const name = entry.isSelf ? '本策略' : entry.name
   if (isStage0ChainEntry(entry)) return `${name} · 阶段 0·拦截判定前优先生效`

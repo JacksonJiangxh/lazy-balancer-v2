@@ -184,9 +184,14 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 // 三消费点（CleanupAuditLogs/RuntimeLogCleanupOnce/taskLogsHousekeeping）
 // 统一口径，返回 (月数, 错误)：
 //
-//   - 只有「口径已知」的错误形态才回退默认：nil 库（脚手架/极端测试形态）与
-//     ErrNoRows（全新库/配置行缺失——从未配置过，默认即用户口径）按默认 3 月
-//     继续，不返回错误。
+//   - 只有「口径已知」的错误形态才回退默认：ErrNoRows（全新库/配置行缺失
+//     ——从未配置过，默认即用户口径）按默认 3 月继续，不返回错误。
+//   - nil 库同样按「口径未知」返回错误，且不能回退默认：nil 覆盖两种生命
+//     周期——启动前的脚手架形态，和关停后 db.Close() 置 nil 的形态。后者
+//     发生在进程排空放弃、在途清理轮仍在跑时（关停预算耗尽后遗留 goroutine
+//     随进程退出回收），按默认 3 月删除会把用户 12 月保留期内的应用日志副本
+//     与任务日志不可逆删掉。调用方据此跳过本轮保留期删除（waf-audit 兜底与
+//     规则日志孤儿清理在保留期门之前执行，不受影响）。
 //   - 其他读错误（迁移窗口缺列、锁超时、库瞬断）返回 error：**不可逆删除不得
 //     在口径未知时按更短默认执行**——用户配置 12 月保留时一次读失败会让
 //     当日清理按 3 月永久删掉 9 个月审计证据。调用方据此跳过本轮删除并让
@@ -199,7 +204,8 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 func auditRetentionMonths() (int, error) {
 	defaultMonths := db.DefaultAuditRetentionMonths
 	if db.DB == nil {
-		return defaultMonths, nil
+		Logf("warn", "审计保留月数口径未知（数据库未初始化或已关闭），本轮跳过保留期删除")
+		return 0, fmt.Errorf("保留月数口径未知：数据库未初始化或已关闭")
 	}
 	var months int
 	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months, ?) FROM global_config WHERE id=1", db.DefaultAuditRetentionMonths).Scan(&months); err != nil {

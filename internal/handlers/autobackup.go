@@ -943,6 +943,30 @@ func (h *Handlers) DeleteAutoBackup(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "备份已删除"})
 }
 
+// failRestoreFileAccess 是自动备份「还原/下载」进入导入核心之前**文件面**失败的
+// 单一收尾：warn 运行日志 + 失败审计 + 原状态码响应。导入族的失败收口已有三层
+// （failImportValidation 事务前 / failImportBegin 建会话前 / failImportAbort
+// 事务内），本函数补齐同一高危操作族的前置阶段——此前还原/下载在这里只有裸
+// c.JSON，被拒尝试在操作审计页零记录（运维无法回答「谁在何时尝试还原/下载哪个
+// 备份、为什么失败」）。与 HTTP 读体超限的 413 不同（那属客户端探测面、不落
+// 审计），这里的 413 来自本地备份文件自身超限，是管理员操作的真实失败面。
+//
+// 动作词取词表内静态字面量（操作标签 ≤4 词）：还原失败 / 下载失败；对象固定
+// 「配置备份」。subject 携带备份标识与阶段供审计复盘，message 保持原 API
+// 文案（客户端契约不变）。download 分支不记「备份下载」成功审计——未交付不得
+// 虚记交付。
+func failRestoreFileAccess(c *gin.Context, download bool, subject, message string, status int, cause error) {
+	detail := subject + "：" + message
+	if download {
+		recordAudit(c, "下载失败", "配置备份", detail)
+		services.Logf("warn", "自动备份下载被拒绝（%d）: %s（%v）", status, detail, cause)
+	} else {
+		recordAudit(c, "还原失败", "配置备份", detail)
+		services.Logf("warn", "自动备份还原被拒绝（%d）: %s（%v）", status, detail, cause)
+	}
+	c.JSON(status, models.APIResponse{Code: status, Message: message})
+}
+
 // RestoreAutoBackup POST /api/v1/auto-backup/:id/restore：按行读文件并走
 // 导入 core 还原（action=「还原」，审计由 core 记录）。还原的是备份实际
 // 包含的内容——未选分类在导出时即未写入。
@@ -955,24 +979,26 @@ func (h *Handlers) RestoreAutoBackup(c *gin.Context) {
 		return
 	}
 	path := filepath.Join(h.cfg.BackupDir, view.Filename)
+	subject := fmt.Sprintf("备份 #%d 文件 %s", view.ID, view.Filename)
 	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "备份文件已不存在"})
+			failRestoreFileAccess(c, false, subject, "备份文件已不存在", http.StatusNotFound, err)
 			return
 		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
+		failRestoreFileAccess(c, false, subject, "读取备份文件失败: "+err.Error(), http.StatusInternalServerError, err)
 		return
 	}
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
+		failRestoreFileAccess(c, false, subject, "读取备份文件失败: "+err.Error(), http.StatusInternalServerError, err)
 		return
 	}
 	if info.Size() > maxConfigImportBytes {
 		_ = file.Close()
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
+		failRestoreFileAccess(c, false, subject, configImportLimitMessage(), http.StatusRequestEntityTooLarge,
+			fmt.Errorf("备份文件 %d 字节超过导入上限 %d 字节", info.Size(), maxConfigImportBytes))
 		return
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxConfigImportBytes+1))
@@ -981,11 +1007,12 @@ func (h *Handlers) RestoreAutoBackup(c *gin.Context) {
 		err = closeErr
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
+		failRestoreFileAccess(c, false, subject, "读取备份文件失败: "+err.Error(), http.StatusInternalServerError, err)
 		return
 	}
 	if int64(len(data)) > maxConfigImportBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
+		failRestoreFileAccess(c, false, subject, configImportLimitMessage(), http.StatusRequestEntityTooLarge,
+			fmt.Errorf("备份文件读取 %d 字节超过导入上限 %d 字节", len(data), maxConfigImportBytes))
 		return
 	}
 	h.importConfigBackupCore(c, data, view.Filename, "还原")
@@ -1002,22 +1029,23 @@ func (h *Handlers) DownloadAutoBackup(c *gin.Context) {
 		return
 	}
 	path := filepath.Join(h.cfg.BackupDir, view.Filename)
+	subject := fmt.Sprintf("备份 #%d 文件 %s", view.ID, view.Filename)
 	// 句柄先行——os.Open 成功后才审计并流式交付，
 	// 消除 Stat→FileAttachment 窗口内备份完成 prune 掉目标文件导致的
 	// 打开失败 panic/500 与「审计先于交付」虚记。
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "备份文件已不存在"})
+			failRestoreFileAccess(c, true, subject, "备份文件已不存在", http.StatusNotFound, err)
 			return
 		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
+		failRestoreFileAccess(c, true, subject, "读取备份文件失败: "+err.Error(), http.StatusInternalServerError, err)
 		return
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
+		failRestoreFileAccess(c, true, subject, "读取备份文件失败: "+err.Error(), http.StatusInternalServerError, err)
 		return
 	}
 	recordAudit(c, "备份下载", "配置备份", services.FormatAuditDetail(

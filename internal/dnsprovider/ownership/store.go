@@ -74,11 +74,12 @@ type Record struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
-// Stale 报告该条目是否已超出任何在途签发的生命周期（CA 队列 60min + 清理
+// stale 报告该条目是否已超出任何在途签发的生命周期（CA 队列 60min + 清理
 // 预算 8min 的上界，见 StaleOwnershipAge），即已可被任意后续清理回收。
 // 零值 CreatedAt（更早版本写入且从未回填）不判 stale：无法证明它已过期，
 // 保守按「可能仍在本轮签发中」处理（与 MatchingValue 的既有口径一致）。
-func (r Record) Stale(now time.Time) bool {
+// 仅本包消费，故不导出（跨包契约无消费者）。
+func (r Record) stale(now time.Time) bool {
 	return !r.CreatedAt.IsZero() && now.Sub(r.CreatedAt) > StaleOwnershipAge
 }
 
@@ -124,7 +125,7 @@ func DecideRemoval(record Record, account string, now time.Time) Disposition {
 		}
 		return DispositionDrop
 	case record.Account == "":
-		if record.Stale(now) {
+		if record.stale(now) {
 			return DispositionDrop
 		}
 		return DispositionDelete
@@ -257,8 +258,8 @@ func (s *Store) MatchingValue(provider, zone, fqdn, value string) ([]Record, err
 		// 账户维度不参与选择：他账户/legacy 条目必须能被
 		// 清理方看到——看不到就只能永久留存（每次清理重读、永不回收），而
 		// 归属判定与「只丢弃不删除」的处置在 DecideRemoval。
-		stale := record.Stale(now)
-		if record.Value == value || legacy || stale {
+		staleRecord := record.stale(now)
+		if record.Value == value || legacy || staleRecord {
 			matching = append(matching, record)
 		}
 	}

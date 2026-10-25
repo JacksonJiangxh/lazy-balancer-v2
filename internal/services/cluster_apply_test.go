@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 	"lazy-balancer-v2/internal/models"
 )
@@ -755,5 +756,46 @@ func TestClusterRuleLibVersionRows_diffSeesScheduleColumns(t *testing.T) {
 	}
 	if !differ(t) {
 		t.Fatal("schedule_days change must be visible to the differ (shared column list)")
+	}
+}
+
+// 未注入优雅重启处理器（独立运维/测试构造）时，Admin TLS 热切换分支不得落到
+// 默认处理器的 os.Exit(0)——那会让进程无审计静默退出、测试进程被截断仍判
+// 通过。必须改记「重启失败」审计并跳过本轮重启。
+func TestSyncService_applySnapshot_marksRestartSkippedWithoutGracefulHandler(t *testing.T) {
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`UPDATE global_config SET is_master=0, admin_tls_enabled=1, admin_tls_mode='upload', admin_tls_cert='old-cert', admin_tls_key='old-key' WHERE id=1`); err != nil {
+		t.Fatalf("seed slave admin TLS: %v", err)
+	}
+	RecordRuntimeAdminTLS(AdminTLSConfig{Enabled: true, Mode: "upload", Cert: "old-cert", Key: "old-key"})
+	t.Cleanup(func() { runtimeAdminTLS.Store(nil) })
+	SetRestartRequiredHandler(nil)
+	t.Cleanup(func() { SetRestartRequiredHandler(nil) })
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	service := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 2, BasicSettings: models.ClusterBasicSettings{
+		LogLevel: new("info"), Timezone: new("Asia/Shanghai"), AdminTLSEnabled: new(true), AdminTLSMode: new("upload"), AdminTLSCert: new("new-cert"), AdminTLSKey: new("new-key"),
+	}})
+
+	if err := service.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='重启失败' AND resource='系统' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("未安装优雅重启处理器时必须留痕（审计行缺失）: %v", err)
+	}
+	if !strings.Contains(detail, "优雅重启处理器") {
+		t.Fatalf("审计详情必须点明原因，got %q", detail)
+	}
+	var restarted int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='重启' AND resource='系统'`).Scan(&restarted); err != nil {
+		t.Fatal(err)
+	}
+	if restarted != 0 {
+		t.Fatalf("未重启却记了成功重启审计（%d 行）", restarted)
 	}
 }

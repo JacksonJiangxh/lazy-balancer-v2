@@ -370,6 +370,13 @@ func TestPutCaddyConfig_uses_service_load_and_preserves_database_when_Caddy_reje
 	if stored != "old-config" || currentConfig != `{"old":true}` || loads != 1 {
 		t.Fatalf("stored=%q runtime=%s loads=%d, want DB and runtime restored（restore 同字节短路=空操作）", stored, currentConfig, loads)
 	}
+	var banner string
+	if err := db.DB.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if banner != "" {
+		t.Fatalf("配置拒绝不得写失败横幅（无分叉事实）, got %q", banner)
+	}
 }
 
 func TestUpdateConfig_restores_Caddy_when_commit_fails(t *testing.T) {

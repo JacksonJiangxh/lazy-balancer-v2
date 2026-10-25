@@ -1,6 +1,10 @@
 package handlers
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -42,12 +46,29 @@ func TestInvalidateThreatScreenRollupCaches_clearsTopTargets(t *testing.T) {
 	}
 }
 
-// 活跃攻击源缓存 TTL 必须覆盖大屏 30s 轮询周期：小于轮询周期时每轮必然
+// 活跃攻击源缓存 TTL 必须覆盖大屏轮询周期：小于轮询周期时每轮必然
 // miss，缓存与代码复杂度为零收益，10 分钟窗口全扫照常每轮发生。
+//
+// 轮询周期从大屏源码取（web/src/views/security/ThreatScreen.vue 的
+// STATS_POLL_MS），不在测试内另存副本：副本会让前端把周期改成 60s 时这里
+// 依旧绿（缓存每轮必 miss），正是「期望与实现各持一份」的漂移形态。前端
+// 同主题用例反向读本侧 TTL，两侧任一改动都会有一处红。
 func TestThreatActiveSourcesCacheTTL_coversPollingInterval(t *testing.T) {
-	const polling = 30 * time.Second
+	vue, err := os.ReadFile(filepath.Join("..", "..", "web", "src", "views", "security", "ThreatScreen.vue"))
+	if err != nil {
+		t.Fatalf("读取大屏源码（轮询周期单源）失败: %v", err)
+	}
+	match := regexp.MustCompile(`(?m)^\s*const\s+STATS_POLL_MS\s*=\s*(\d+)\s*$`).FindSubmatch(vue)
+	if match == nil {
+		t.Fatal("大屏源码缺 STATS_POLL_MS 常量声明（跨栈对表需同步本用例）")
+	}
+	pollMs, err := strconv.Atoi(string(match[1]))
+	if err != nil || pollMs <= 0 {
+		t.Fatalf("STATS_POLL_MS=%q 非法", match[1])
+	}
+	polling := time.Duration(pollMs) * time.Millisecond
 	if threatActiveSourcesCacheTTL < polling {
-		t.Fatalf("threatActiveSourcesCacheTTL=%v, want >= %v（与轮询同周期，否则缓存永不命中）", threatActiveSourcesCacheTTL, polling)
+		t.Fatalf("threatActiveSourcesCacheTTL=%v, want >= %v（与大屏轮询同周期，否则缓存永不命中）", threatActiveSourcesCacheTTL, polling)
 	}
 }
 

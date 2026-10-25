@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -65,8 +66,9 @@ func TestDownloadAutoBackup_streamsFileAndAuditsAfterOpen(t *testing.T) {
 
 // Given 行在而文件已消失（prune 竞态后形态）。
 // When GET download。
-// Then 404 且**不落下载审计**（任何打开失败路径均无虚记审计）。
-func TestDownloadAutoBackup_missingFileNoAudit(t *testing.T) {
+// Then 404 且**不落成功交付审计**（虚记交付），但必须落恰一条「下载失败」
+// 拒绝审计——下载是敏感文件交付，被拒尝试同样要能复盘「谁在何时试过」。
+func TestDownloadAutoBackup_missingFileAuditsRejectionNotDelivery(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -87,6 +89,13 @@ func TestDownloadAutoBackup_missingFileNoAudit(t *testing.T) {
 		t.Fatalf("missing file status=%d, want 404", rec.Code)
 	}
 	if n := downloadAuditCount(t); n != 0 {
-		t.Fatalf("缺失文件下载审计行=%d, want 0", n)
+		t.Fatalf("缺失文件下载成功审计行=%d, want 0（未交付不得记成功）", n)
+	}
+	failures := restoreRejectionAuditRows(t, "下载失败")
+	if len(failures) != 1 {
+		t.Fatalf("下载失败 审计行=%d, want 1", len(failures))
+	}
+	if filename := rows[0]["filename"].(string); !strings.Contains(failures[0], filename) {
+		t.Fatalf("审计 detail=%q 必须含备份文件名 %q", failures[0], filename)
 	}
 }

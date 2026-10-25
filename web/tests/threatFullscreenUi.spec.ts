@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { PAGE_IDS } from '../src/utils/pageIds.ts'
-import { code, codeSection, member, section } from './_helpers.ts'
+import { code, codeSection, member, repoCode, section } from './_helpers.ts'
 
 test('大屏全屏分支不进 AppLayout（侧栏顶栏不得渲染）', () => {
   const app = code('src/App.vue')
@@ -67,6 +67,28 @@ test('威胁大屏死选择器清理与「被攻击目标」空态文案', () =>
 test('统计响应窗口与当前窗口不一致时丢弃', () => {
   const statsTask = codeSection('src/views/security/ThreatScreen.vue', 'const statsTask = usePollingTask', '// ============ 逐请求正常流量事件流')
   assert.match(statsTask, /if \(res\.data\.hours !== windowHours\.value\) return/)
+})
+
+test('统计轮询周期与后端活跃源缓存 TTL 跨栈对表', () => {
+  const page = code('src/views/security/ThreatScreen.vue')
+  const pollMatch = page.match(/const STATS_POLL_MS = (\d+)/)
+  assert.ok(pollMatch, 'ThreatScreen.vue 缺 STATS_POLL_MS（统计轮询周期单源）')
+  const pollMs = Number(pollMatch[1])
+  assert.ok(pollMs > 0, `STATS_POLL_MS=${pollMs}, want > 0`)
+  // 常量必须真正喂给统计轮询：存在但未接线不构成周期钉。
+  const statsTask = codeSection('src/views/security/ThreatScreen.vue', 'const statsTask = usePollingTask', '// ============ 逐请求正常流量事件流')
+  assert.match(statsTask, /interval: STATS_POLL_MS/)
+
+  // 后端「活跃攻击源」缓存 TTL 必须覆盖本周期：小于周期时每轮请求都换窗口
+  // 键并 miss，缓存（连同其全窗口扫描的开销假设）收益归零。
+  const cache = repoCode('internal/handlers/threat_active_sources_cache.go')
+  const ttlMatch = cache.match(/threatActiveSourcesCacheTTL = (\d+) \* time\.Second/)
+  assert.ok(ttlMatch, '后端 threatActiveSourcesCacheTTL 声明缺失或形态变化（跨栈对表需同步）')
+  const ttlMs = Number(ttlMatch[1]) * 1000
+  assert.ok(
+    ttlMs >= pollMs,
+    `后端活跃源缓存 TTL=${ttlMs}ms 小于大屏轮询周期 ${pollMs}ms：每轮必 miss（Go 侧同主题用例会一并红）`,
+  )
 })
 
 test('两条光流的空洞标记贯通到独立横幅（不与加载失败混报）', () => {

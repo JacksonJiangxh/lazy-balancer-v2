@@ -78,15 +78,17 @@ const (
 	noopSlotAssignSQL = `next_update=next_update`
 )
 
-// errScheduleSlotNotAdvanced 标记「状态列已落库，但本轮排程槽未推进」
-// （写路径严格读排程失败/库未初始化）。
+// errScheduleSlotNotAdvanced 标记「本轮排程槽未推进」——写路径严格读排程
+// 失败（库未初始化/排程列不可读），或状态行写入失败（槽随之没落地）。
 //
 // 成功路径必须把该结果按失败返回给任务引擎，不得以 success 收尾：引擎的
 // 「成功落定+槽仍到期」分支会把本槽记入 schedDoneSlot（同一槽只执行一次的
 // 水位），此后 tick 的「槽 > 已消费水位」门永久拒绝该槽——业务槽停在过去、
 // 也没有「下一次成功/失败落库」可以自愈，该族自动更新就此静默停摆。失败轮
-// 走引擎的退避重投（读恢复后的下一轮自然推进槽并清零退避/连续失败计数）。
-var errScheduleSlotNotAdvanced = errors.New("排程不可读，本轮排程槽未推进")
+// 走引擎的退避重投（1s/5s/30s）；连续 4 轮仍未推进即由引擎停调
+// （ScheduleStopReasonFailStreak），读恢复后需在业务页重新保存一次或重启
+// 进程重新武装——不是静默停摆，但也不是无人工自愈。
+var errScheduleSlotNotAdvanced = errors.New("本轮排程槽未推进（排程不可读或状态行写入失败）")
 
 // userCancelledRun 本轮是否由用户显式取消（任务监控「取消」/前端取消入口）。
 // 引擎在用户取消路径给运行 ctx 标记 ErrUserCancelled 取消原因；demote 中止/
@@ -168,7 +170,8 @@ func setVersionTableAutoUpdate(table, label, seed, taskID string, enabled bool) 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交 %s 自动更新事务: %w", label, err)
 	}
-	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）。
+	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）；
+	// 应用值在锁内按库实态读取，本参数仅作读失败回退。
 	applyBusinessTaskLoop(taskID, enabled)
 	return nil
 }

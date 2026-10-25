@@ -94,6 +94,10 @@ type Descriptor struct {
 	// 不换代则分支与角色脱钩）。未置位的 RoleAny 常驻（如
 	// security-events-ingestion）翻转不重启，无换代噪音。
 	RestartOnRoleFlip bool
+	// LoopRecoveryHint 引擎停调（连续失败达上限）时任务日志给出的恢复入口
+	// 提示；空=通用「任务页调度开关或重启进程」。调度层不掌握业务页归属，
+	// 业务驱动任务（任务页开关只读）由注册方在装配时注入。
+	LoopRecoveryHint string
 }
 
 // RunRecord task_runs 行视图。stage/entry_count 两列
@@ -1747,7 +1751,11 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 				r.schedFailStreak = 0
 				r.schedRetryAfter = time.Time{}
 				r.schedStopReason = ScheduleStopReasonFailStreak
-				taskLogAppend(id, fmt.Sprintf("[error] 排程槽连续 %d 轮未推进且本轮%s，已停止该任务调度（修复失败原因后重新开启调度：任务页调度开关或对应业务页「自动更新」保存一次；重启进程同样恢复）", scheduledFailStreakStopLimit, outcome))
+				recoverHint := r.desc.LoopRecoveryHint
+				if recoverHint == "" {
+					recoverHint = "任务页调度开关或重启进程"
+				}
+				taskLogAppend(id, fmt.Sprintf("[error] 排程槽连续 %d 轮未推进且本轮%s，已停止该任务调度（修复失败原因后重新开启调度：%s）", scheduledFailStreakStopLimit, outcome, recoverHint))
 			}
 		default:
 			r.schedFailStreak = 0
