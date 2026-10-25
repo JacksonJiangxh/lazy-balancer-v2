@@ -747,14 +747,19 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	}
 	// 条数口径单源——聚合后条数（与 writeThreatSystemList 写入.iplist
 	// 的行数一致）；此前传原始 len(entries)，后写者胜使「N 条」恒为聚合前值。
-	if rawHash != "" {
-		if err := markSourceSuccess(source.id, len(merged), finished, trigger, rawHash); err != nil {
-			return changed, true
+	markErr := func() error {
+		if rawHash != "" {
+			return markSourceSuccess(source.id, len(merged), finished, trigger, rawHash)
 		}
-	} else {
-		if err := markSourceSuccess(source.id, len(merged), finished, trigger); err != nil {
-			return changed, true
+		return markSourceSuccess(source.id, len(merged), finished, trigger)
+	}()
+	if markErr != nil {
+		// 排程不可读（槽未推进）与落库失败同按本源失败收口：源状态已 success
+		// 但本轮必须让引擎按失败退避重投，否则过期槽会被引擎消费（静默停摆）。
+		if errors.Is(markErr, errScheduleSlotNotAdvanced) {
+			AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 已更新但排程不可读，本轮排程槽未推进（引擎将退避重投）", source.name))
 		}
+		return changed, true
 	}
 	return changed, false
 }
@@ -786,8 +791,11 @@ func threatWriteGateAbort(source string, gerr error) (bool, bool) {
 // 返回成功状态落库错误（吞错会让任务终态 success 掩盖状态机不闭环）。
 func markSourceSuccess(id int, entryCount int, finished string, trigger string, rawHash ...string) error {
 	version := time.Now().UTC().Format("2006.01.02")
-	// 排程不可读时槽片段为 no-op（保留旧预约），其余状态列照常落库。
-	slotSQL, slotArgs := threatSlotSuccessAssign(trigger)
+	// 排程不可读时槽片段为 no-op（保留旧预约），其余状态列照常落库；随后把
+	// 「槽未推进」作为错误返回——源状态 success + 过期槽原样保留会让引擎
+	// 按「成功未推进」消费本槽，该族自动更新从此静默停摆（失败轮由引擎退避
+	// 重投，读恢复后的下一轮自然推进槽）。
+	slotSQL, slotArgs, slotErr := threatSlotSuccessAssign(trigger)
 	// entry_count 的唯一口径是**聚合后**条数（writeThreatSystemList 的
 	// len(merged)，与内置名单 .iplist 行数一致）。entryCount<0 = 内容未变化
 	// 快路径：不覆写该列（源行已是上次聚合后值；用本次原始解析条数覆盖会让
@@ -825,6 +833,10 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 	} else {
 		Logf("info", "威胁情报库: 源 %s 更新成功（内容未变化，版本 %s）", name, version)
 		AppendThreatUpdateLog("INFO", "success", fmt.Sprintf("源 %s 更新成功（内容未变化，版本 %s）", name, version))
+	}
+	if slotErr != nil {
+		Logf("error", "威胁情报库: 源 %s 排程不可读，本轮排程槽未推进（引擎将退避重投）: %v", name, slotErr)
+		return slotErr
 	}
 	return nil
 }
@@ -903,20 +915,24 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 	}
 	entryCount := len(entryStrs)
 	if listExists == 0 {
-		// 行缺失自愈补建
-		if _, ierr := db.DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
-			VALUES (?, ?, '恶意 IP', '', 1, datetime('now'), datetime('now'))`, name, threatListDescription(source)); ierr != nil {
-			return false, fmt.Errorf("补建内置名单失败: %w", ierr)
+		// 行缺失自愈补建——统一走 db.EnsureSystemIPList（OR IGNORE 幂等 +
+		// 描述归一 + 同名用户列表留痕），不再手写 INSERT（三条播种路径的
+		// category/描述/幂等性曾漂移）。
+		created, cerr := db.EnsureSystemIPList(db.DB, name, threatListDescription(source), "恶意 IP")
+		if cerr != nil {
+			return false, fmt.Errorf("补建内置名单失败: %w", cerr)
 		}
-		// 同名用户自建列表与内置行并存时显式留痕（不静默双名）。
-		var userOwned int
-		if uerr := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, name).Scan(&userOwned); uerr == nil && userOwned > 0 {
-			Logf("warn", "威胁情报库: 内置名单 %q 已补建，但存在同名用户自建列表——请重命名用户列表以消除选择器歧义", name)
-			RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 已补建（存在同名用户列表，建议重命名用户列表）", name), "")
+		if created {
+			// 同名用户自建列表与内置行并存时显式留痕（不静默双名）。
+			var userOwned int
+			if uerr := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, name).Scan(&userOwned); uerr == nil && userOwned > 0 {
+				Logf("warn", "威胁情报库: 内置名单 %q 已补建，但存在同名用户自建列表——请重命名用户列表以消除选择器歧义", name)
+				RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 已补建（存在同名用户列表，建议重命名用户列表）", name), "")
+			}
+			// 补建产生新 id
+			Logf("warn", "威胁情报库: 内置名单 %q 已重建为新 id，原策略引用已失效，需重新绑定", name)
+			RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 重建为新 id，原策略引用已失效，需重新绑定", name), "")
 		}
-		// 补建产生新 id
-		Logf("warn", "威胁情报库: 内置名单 %q 已重建为新 id，原策略引用已失效，需重新绑定", name)
-		RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 重建为新 id，原策略引用已失效，需重新绑定", name), "")
 	} else {
 		if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='', updated_at=datetime('now') WHERE name=? AND system=1`, name); err != nil {
 			return false, fmt.Errorf("更新内置名单元数据失败: %w", err)

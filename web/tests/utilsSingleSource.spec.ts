@@ -53,6 +53,9 @@ test('highlight 的 Prism 异常兜底必须转义（注入面不得回退原文
   const highlight = code('src/utils/highlight.ts')
   const catchBlock = section(highlight, '} catch {', '\n  }\n}')
   assert.match(catchBlock, /return escapeHtml\(content\)/, '兜底必须走共享 escapeHtml，不得返回原文')
+  // Prism.languages 是普通对象：原型键（constructor 等）直接下标会拿到函数当
+  // grammar → 每帧抛错并被兜底吞掉（高亮静默丢失），必须走自有属性守卫。
+  assert.match(highlight, /hasOwn\(Prism\.languages, lang\)/, 'grammar 查表必须做原型键守卫')
 })
 
 // 品牌状态（appName/footerText/footerUsesDefault）是模块单例：两个用例各自

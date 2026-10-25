@@ -585,6 +585,54 @@ func normalizeSnapshotCaddyNumericSettings(settings *models.ClusterBasicSettings
 	normalizePositive(&settings.CaddyLogSizeMB, db.DefaultCaddyLogSizeMB)
 }
 
+// normalizeSnapshotSecurityEventsRetentionDays 归一安全事件保留天数：
+// 写侧只接受 1..MaxSecurityEventsRetentionDays（handlers/caddy.go），
+// 0/越界只可能带外产生——读侧按默认值消费，快照与 apply 必须同口径。
+func normalizeSnapshotSecurityEventsRetentionDays(days int) int {
+	if days <= 0 || days > db.MaxSecurityEventsRetentionDays {
+		return securityEventsRetentionDefaultDays
+	}
+	return days
+}
+
+// normalizeSnapshotSecurityEventsRowCap 归一安全事件行数上限，判据同上。
+func normalizeSnapshotSecurityEventsRowCap(rowCap int) int {
+	if rowCap <= 0 || rowCap > db.MaxSecurityEventsRowCap {
+		return securityEventsRetentionDefaultMax
+	}
+	return rowCap
+}
+
+// normalizeSnapshotThreatTrafficSampleN 归一威胁大屏采样口径：合法域只有
+// -1（自适应）与 0（关闭），其余归默认（写侧白名单同源）。
+func normalizeSnapshotThreatTrafficSampleN(sample int) int {
+	if sample != db.DefaultThreatTrafficSampleN && sample != 0 {
+		return db.DefaultThreatTrafficSampleN
+	}
+	return sample
+}
+
+// normalizeSnapshotSecurityRetentionSettings 归一安全事件保留/采样三列。
+// 主端装载侧（loadSnapshotGlobalSettings）与从端 apply 侧
+// （updateSnapshotSettings）必须共用本函数：从端 apply 会把 0/越界值归一后
+// 落库并重算 users 节哈希，主端若按脏值算哈希，两边恒不等——每同步周期强制
+// 重放 users 节并重载 Caddy（一次性启动回填 marker 置位后永不收敛）。
+// nil 保持 nil（旧主端缺席语义）。
+func normalizeSnapshotSecurityRetentionSettings(settings *models.ClusterBasicSettings) {
+	if settings.SecurityEventsRetentionDays != nil {
+		normalized := normalizeSnapshotSecurityEventsRetentionDays(*settings.SecurityEventsRetentionDays)
+		settings.SecurityEventsRetentionDays = &normalized
+	}
+	if settings.SecurityEventsRowCap != nil {
+		normalized := normalizeSnapshotSecurityEventsRowCap(*settings.SecurityEventsRowCap)
+		settings.SecurityEventsRowCap = &normalized
+	}
+	if settings.ThreatTrafficSampleN != nil {
+		normalized := normalizeSnapshotThreatTrafficSampleN(*settings.ThreatTrafficSampleN)
+		settings.ThreatTrafficSampleN = &normalized
+	}
+}
+
 // loadSnapshotGlobalSettings 装载快照的全局配置区(BasicSettings+
 // CaddyConfig,含 branding 镜像与 Caddy 全局列)——buildSnapshot(全量快照)
 // 与 driftGuardSectionHashes(漂移守卫三节重建)共用同一装载函数:三分类
@@ -708,6 +756,11 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.SecurityEventsRetentionDays = &seDays
 	snapshot.BasicSettings.SecurityEventsRowCap = &seCap
 	snapshot.BasicSettings.ThreatTrafficSampleN = &trafficSample
+	// 三列与 apply 侧同口径归一（库值唯一真相：0/越界值读侧本按默认消费，
+	// 哈希输入必须同源）。写侧只接受合法域，脏值仅带外直写可达——若按脏值
+	// 参与 users 节哈希，从端 apply 落默认后主从哈希恒不等，每同步周期强制
+	// 重放 users 节并重载 Caddy，且一次性启动回填 marker 使重启也不收敛。
+	normalizeSnapshotSecurityRetentionSettings(&snapshot.BasicSettings)
 	// 主端装载侧同口径归一（与 sync_interval 同理由）：从端 apply 会把非法
 	// 枚举归为默认后落库并重算节哈希；主端若按脏值算哈希，两边恒不等，
 	// 每次版本递增都重放 users 节。

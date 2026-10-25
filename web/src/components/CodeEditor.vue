@@ -5,6 +5,7 @@
       class="code-editor-input"
       :value="modelValue"
       :placeholder="placeholder"
+      :aria-label="ariaLabel || undefined"
       spellcheck="false"
       @input="onInput"
       @scroll="onScroll"
@@ -22,7 +23,10 @@ const props = withDefaults(defineProps<{
   readonly language: string
   readonly placeholder?: string
   readonly height?: string
-}>(), { placeholder: '', height: '520px' })
+  /** 可访问名：placeholder 不是合法替代（读屏不读占位符为名称），
+   *  每个消费方必须提供业务语义名。 */
+  readonly ariaLabel?: string
+}>(), { placeholder: '', height: '520px', ariaLabel: '' })
 
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 

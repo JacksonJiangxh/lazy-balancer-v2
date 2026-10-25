@@ -477,6 +477,10 @@ test('DNS 凭证字段可见性按 visible_when 求值，无元数据时恒显�
   assert.equal(credentialFieldVisible(fields[3], {}), true, '新 provider 无元数据字段不得被隐藏')
   assert.equal(credentialOptionLabel(fields[0], 'dnspod'), 'DNSPod API')
   assert.equal(credentialOptionLabel(fields[0], 'unknown'), 'unknown')
+  // option_labels 是普通对象：原型键必须回退原始值（直接下标会渲染出函数源码）
+  for (const key of ['constructor', 'toString', '__proto__']) {
+    assert.equal(credentialOptionLabel(fields[0], key), key)
+  }
   assert.deepEqual(defaultCredentialsFor(fields), { auth_mode: 'dnspod' })
   assert.deepEqual(defaultCredentialsFor([]), {})
 })

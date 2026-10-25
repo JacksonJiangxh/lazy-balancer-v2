@@ -83,7 +83,8 @@ func TestCertJobRetryBlocked_downloaded_job_uses_deployment_message(t *testing.T
 }
 
 func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
-	// Given：各冷却档位的真实任务行。
+	// Given：各冷却档位的真实任务行，含「冷却已到期」的历史行（updated_at 早于
+	// 冷却窗口）——静态时长下发会让已过期任务永久禁用重试。
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,updated_at) VALUES
 		(101,'lb_cooldown','queued.example','queued',datetime('now')),
@@ -92,7 +93,9 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 		(104,'lb_cooldown','issued.example','issued',datetime('now')),
 		(105,'lb_cooldown','waiting.example','waiting_ca',datetime('now')),
 		(106,'lb_cooldown','downloaded.example','downloaded',datetime('now')),
-		(107,'lb_cooldown','waiting-open.example','waiting_ca',datetime('now'))`); err != nil {
+		(107,'lb_cooldown','waiting-open.example','waiting_ca',datetime('now')),
+		(108,'lb_cooldown','failed-old.example','failed',datetime('now','-6 minutes')),
+		(109,'lb_cooldown','queued-old.example','queued',datetime('now','-16 minutes'))`); err != nil {
 		t.Fatalf("seed cooldown jobs: %v", err)
 	}
 	// CA 限流退避（waiting_ca ∧ ca_available_after 未到期）比通用冷却晚得多：
@@ -123,7 +126,7 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode list response: %v", err)
 	}
-	want := map[int64]int64{101: 900, 102: 300, 104: 0, 106: 120, 107: 0}
+	want := map[int64]int64{101: 900, 102: 300, 104: 0, 106: 120, 107: 0, 108: 0, 109: 0}
 	seen := make(map[int64]bool)
 	for _, job := range payload.Data.List {
 		seen[job.ID] = true

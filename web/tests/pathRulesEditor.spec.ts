@@ -122,3 +122,21 @@ test('跳转地址校验：空/相对路径/控制字符被拒，绝对地址与
   assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: 'http://example.com' })), '')
   assert.equal(pathRuleResponseError(rule({ response_mode: 'static' })), '', '静态返回不校验跳转地址')
 })
+
+test('跳转地址形状按原串判定（前导空格行内即拒，不拖到整组校验）', () => {
+  // 后端按原串 HasPrefix；行内若 trim 后放行，" http://x" 会在离开该步时被整组
+  // 拒绝——正是「行内已修漂移」在行内层复发的形态。
+  assert.equal(
+    pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: ' http://example.com' })),
+    '跳转地址须为 http(s):// 绝对地址或 / 开头路径',
+  )
+  assert.equal(
+    pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: ' /x' })),
+    '跳转地址须为 http(s):// 绝对地址或 / 开头路径',
+  )
+  assert.equal(
+    pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: '   ' })),
+    '301 跳转需要填写跳转地址',
+    '仅空判使用 trim（纯空白仍算未填）',
+  )
+})

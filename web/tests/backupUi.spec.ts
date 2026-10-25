@@ -123,6 +123,9 @@ test('legacy 分类键归一行为（映射/去重/保序/未知键透传）', (
   assert.deepEqual(normalizeBackupSectionKeys(['waf_files', 'global_config']), ['security', 'users'], '保序')
   assert.deepEqual(normalizeBackupSectionKeys(['future_key']), ['future_key'], '未知键透传（向前兼容）')
   assert.deepEqual(normalizeBackupSectionKeys([]), [])
+  // 别名表是普通对象：备份文件里的原型键必须原样透传（直接下标会返回函数）
+  assert.deepEqual(normalizeBackupSectionKeys(['constructor', 'toString']), ['constructor', 'toString'],
+    '原型键归一结果不得变成函数')
 })
 
 test('导出/自动备份默认全选四分类，恢复路径必经归一', () => {

@@ -433,7 +433,7 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 	// 会导致「广东省/广州市」类城市级规则对这些段恒不命中。
 	// 台湾城市误入省列的段：城市名在省列（城市列是该段的乱码罗马化值）——
 	// 城市变量改发省列值，与树侧归并语义一致，使「台湾省/台中市」可命中。
-	if rawProv := strings.TrimSpace(fields[1]); geoipnames.TaiwanCities[rawProv] {
+	if rawProv := strings.TrimSpace(fields[1]); geoipnames.IsTaiwanCity(rawProv) {
 		out.City = rawProv
 	} else if c := strings.TrimSpace(fields[2]); c != "" && c != "0" {
 		out.City = normalizeCity(c)

@@ -35,8 +35,8 @@
         <div class="trg-hero-meta">
           <span>来源 IP {{ row?.client_ip }}</span>
           <span v-if="(row?.duration_us ?? 0) > 0"><template v-if="isWafFamily">处理时长 {{ formatDurationUs((row?.duration_us ?? 0) + (row?.precheck_us ?? 0)) }}<template v-if="(row?.precheck_us ?? 0) > 0">（预检 {{ formatDurationUs(row?.precheck_us) }} + WAF 段 {{ formatDurationUs(row?.duration_us) }}）</template></template><template v-else>处理时长 {{ formatDurationUs(row?.duration_us ?? 0) }}（预检耗时）</template></span>
-          <el-tag size="small" :type="row?.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
-            {{ row?.action === 'blocked' ? '已拦截' : '已记录（检测）' }}
+          <el-tag size="small" :type="eventActionTone(row?.action)" effect="plain">
+            {{ eventActionFull(row?.action) }}
           </el-tag>
           <span v-if="detectionNote">{{ detectionNote }}</span>
         </div>
@@ -161,6 +161,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
+import { eventActionFull, eventActionTone } from '@/utils/eventAction'
 import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, missingSharedEntryIds, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet } from '@/utils/securityStages'
 import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
@@ -428,6 +429,7 @@ const loadAll = async (): Promise<void> => {
         policy.value = res.data?.policy ?? null
         if (!res.data?.policy) policyMissing.value = true
       } catch (err) {
+        if (seq !== loadSeq) return // 会话已被新一代接管：不得把旧会话失败写进新会话
         // 网络/5xx 与「策略已删除」不可混同——404 归缺失，
         // 其余按加载失败提示（hero 不误标「已删除」）。
         policyMissing.value = err instanceof Error && 'status' in err && (err as { status?: number }).status === 404

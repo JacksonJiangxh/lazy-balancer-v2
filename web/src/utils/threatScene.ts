@@ -17,6 +17,7 @@ import {
   type Cam2D,
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
+import { hasOwn } from '@/utils/hasOwn'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, buildCountryCellGrid, countryGridCell, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, polysBounds, trafficOriginForCountry } from '@/utils/threatShared'
 import type { Centroid } from '@/utils/countryCentroids'
@@ -675,7 +676,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       opts?.onProvinceLoadError?.()
       return null
     }
-    return tables[country] ?? []
+    // 表是普通对象且国家名来自点击/事件数据：原型键直接下标会拿到函数
+    // （非省表数组），必须走自有属性守卫。
+    return hasOwn(tables, country) ? tables[country] ?? [] : []
   }
 
   function buildProvinceLayer(country: string, provinces: { name: string; polys: number[][][]; centroid?: [number, number] }[], zoom: number): void {

@@ -78,6 +78,13 @@ type IP2RegionUpdateManager struct {
 	// 用户取消路径携带 ErrUserCancelled 原因，取消终态据此推进排程槽。
 	runCancel   context.CancelCauseFunc
 	downloadXDB func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
+
+	// scheduleSlotErr 本运行「状态行已落库、但排程槽未推进」的原因（写路径
+	// 严格读排程失败）。setSlotAdvanceError 置位；Run 体把本轮按失败返回给
+	// 任务引擎——成功轮不推进槽却回 success 会被引擎记入本槽消费水位，此后
+	// 同一槽永不再投递（该族自动更新静默停摆，没有下一轮可以自愈）。每次
+	// 运行起点清空。
+	scheduleSlotErr error
 }
 
 var (
@@ -262,6 +269,12 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		m.mu.Unlock()
 	}()
 
+	// 每次运行起点清空「排程槽未推进」状态：上一轮的读失败不得让本轮成功
+	// 轮仍被引擎判失败（读恢复后必须立即自愈）。
+	m.mu.Lock()
+	m.scheduleSlotErr = nil
+	m.mu.Unlock()
+
 	// 函数内 recover：本 defer 注册在上方审计 defer 之后，恢复先于审计执行
 	// ——panic 轮先落定 failed 终态，审计读到终态（此前 goroutine 层 recover
 	// 在审计 defer 之后才运行，审计读到 downloading/installing/reloading 等
@@ -360,11 +373,11 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			Logf("error", "ip2region update: failed to refresh .version sidecar at latest: %v", err)
 		}
 		WriteIP2RegionUpdateLog("INFO", string(IP2RegionStatusSuccess), "已是最新版本，无需更新")
-		slotSQL, slotArgs := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
+		slotSQL, slotArgs, slotErr := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
 		if _, err := db.DB.Exec(
 			// 排程槽：成功轮 auto/manual 同权、仅现存槽空/过期才推进——未来槽不回拨
 			// （手动成功必须推进过期槽，否则引擎已消费而业务槽停滞，四族自动更新停摆）。
-			// 排程不可读时槽保持原值（读失败已由严格读单源留痕）。
+			// 排程不可读时槽保持原值，由调用方把本轮按失败上报（严格读单源留痕）。
 			"UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 			slotArgs...,
 		); err != nil {
@@ -372,6 +385,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			// 级别与后果匹配。
 			Logf("error", "ip2region update: failed to record latest-version skip（排程槽可能未推进）: %v", err)
 		}
+		m.setSlotAdvanceError(slotErr)
 		m.mu.Lock()
 		m.state.status = IP2RegionStatusSuccess
 		m.state.message = "已是最新版本"
@@ -531,13 +545,14 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		os.Remove(ip2regionLivePath + ".bak")
 	}
 
-	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
+	slotSQL, slotArgs, slotErr := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
 	if _, err := db.DB.Exec(
 		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		append([]any{tag}, slotArgs...)...,
 	); err != nil {
 		Logf("error", "ip2region update: failed to record success: %v", err)
 	}
+	m.setSlotAdvanceError(slotErr)
 	SetIP2RegionVersion(tag)
 	// 主节点补写.version sidecar——waffiles_sync 的
 	// BuildWafFileRef（ref.IP2RegionTag）与从节点 rewriteVersionIfMissingOrStale
@@ -973,13 +988,14 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 	}
 	// 触发来源单次快照：成功门两次绑定同一值（两次读取间不得出现翻转）。
 	trigger := m.currentTrigger()
-	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
+	slotSQL, slotArgs, slotErr := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
 	if _, err := db.DB.Exec(
 		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message=?, finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		append([]any{tag, warn}, slotArgs...)...,
 	); err != nil {
 		Logf("error", "ip2region update: failed to record fail-open success: %v", err)
 	}
+	m.setSlotAdvanceError(slotErr)
 	SetIP2RegionVersion(tag)
 	// fail-open 成功同样补写 sidecar（与 success() 同因）。
 	if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", tag); err != nil {

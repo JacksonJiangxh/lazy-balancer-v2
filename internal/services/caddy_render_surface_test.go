@@ -25,9 +25,9 @@ func TestUpstreamEnabledPredicateHasOneLiteral(t *testing.T) {
 	if got := strings.Count(normalizeSQL(code), "u.enabled in("); got != 1 {
 		t.Fatalf("caddy.go 含 %d 处上游启用 IIF 字面量, want 1（只允许 upstreamEnabledSQLValue 定义，注释不计）", got)
 	}
-	// 单规则服务上下文预览的两处 EXISTS 必须引用常量而非内联表达式。
-	if got := strings.Count(code, "u.rule_id = lb_rules.caddy_id AND `+UpstreamEnabledSQLPredicate+`"); got != 2 {
-		t.Fatalf("GenerateRuleServerContext 引用单源谓词 %d 处, want 2", got)
+	// 发布规则集合谓词必须引用常量而非内联表达式。
+	if got := strings.Count(code, "u.rule_id = lb_rules.caddy_id AND ` + UpstreamEnabledSQLPredicate + `"); got != 1 {
+		t.Fatalf("publishableRulesSQLPredicate 引用单源谓词 %d 处, want 1", got)
 	}
 	for _, path := range []string{"configwatchdog.go"} {
 		data, err := os.ReadFile(path)

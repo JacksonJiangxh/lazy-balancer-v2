@@ -77,6 +77,10 @@ type CRSUpdateManager struct {
 	runDone      chan struct{}
 	ruleCount    int
 	hasRuleCount bool
+	// ruleCountRetryAfter 扫描失败后的负缓存截止时刻：坏树（缺失/不可读/
+	// 树交换窗口）期间 UI 轮询不再每次付递归 WalkDir + ERROR 日志。树被替换
+	// 的通道（InvalidateRuleCount）会清零，允许立即重扫。
+	ruleCountRetryAfter time.Time
 
 	// overridesBakCreated 标记本次运行已在迁移分支创建 zz-user-overrides.conf.bak
 	// restoreBackup 只消费本运行创建的 bak——三-1 跨运行保全的恢复
@@ -106,6 +110,13 @@ type CRSUpdateManager struct {
 	// 晚绑定全局 crsLiveDir——ConfigureWafDirs（自定义 data_dir）可能在构造
 	// 之后再改全局，构造期快照会让更新写相位与渲染读相位分叉。
 	crsDir string
+
+	// scheduleSlotErr 本运行「状态行已落库、但排程槽未推进」的原因（写路径
+	// 严格读排程失败）。setSlotAdvanceError 置位；Run 体把本轮按失败返回给
+	// 任务引擎——成功轮不推进槽却回 success 会被引擎记入本槽消费水位，此后
+	// 同一槽永不再投递（该族自动更新静默停摆，没有下一轮可以自愈）。每次
+	// 运行起点清空。
+	scheduleSlotErr error
 
 	latestMu         sync.Mutex
 	latestTag        string
@@ -326,7 +337,7 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 
 // recordLatestSkip 记录「已是最新版本」终态（DB 行与内存状态单点实现）。
 func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
-	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_crs_version", trigger)
+	slotSQL, slotArgs, slotErr := versionTableSlotSuccessAssign("security_crs_version", trigger)
 	if _, err := db.DB.Exec(
 		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		slotArgs...,
@@ -335,6 +346,7 @@ func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
 		// （四族自动更新会静默停摆直到下次成功写），日志级别须与后果匹配。
 		Logf("error", "crs update: failed to record latest-version skip（排程槽可能未推进）: %v", err)
 	}
+	m.setSlotAdvanceError(slotErr)
 	m.mu.Lock()
 	m.state.status = CRSStatusSuccess
 	m.state.message = "已是最新版本"
@@ -396,6 +408,12 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		m.running = false
 		m.mu.Unlock()
 	}()
+
+	// 每次运行起点清空「排程槽未推进」状态：上一轮的读失败不得让本轮成功
+	// 轮仍被引擎判失败（读恢复后必须立即自愈）。
+	m.mu.Lock()
+	m.scheduleSlotErr = nil
+	m.mu.Unlock()
 
 	// 起点角色复查：调度器 tick 的 is_master 守卫与更新启动之间存在
 	// demote 竞态窗口——tick 越过守卫、更新刚发出时节点被降级，从节点继续执行
@@ -531,13 +549,14 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		m.advanceSlotIfAuto(trigger)
 		return
 	}
-	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_crs_version", trigger)
+	slotSQL, slotArgs, slotErr := versionTableSlotSuccessAssign("security_crs_version", trigger)
 	if _, err := db.DB.Exec(
 		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
 		append([]any{tag}, slotArgs...)...,
 	); err != nil {
 		Logf("error", "crs update: failed to record success: %v", err)
 	}
+	m.setSlotAdvanceError(slotErr)
 	m.rescanRuleCount()
 	m.mu.Lock()
 	m.state.status = CRSStatusSuccess
@@ -704,6 +723,27 @@ func (m *CRSUpdateManager) CancelRunning() bool {
 	}
 	cancel(taskengine.ErrUserCancelled)
 	return true
+}
+
+// setSlotAdvanceError 记录「状态行已落库、但排程槽未推进」——任务引擎 Run 体
+// 据此把本轮按失败返回（不是把状态行改成 failed：更新本身成功，失败的是调度
+// 契约；引擎需要失败才能退避重投同一槽，而不是把本槽记入消费水位）。
+func (m *CRSUpdateManager) setSlotAdvanceError(err error) {
+	m.mu.Lock()
+	m.scheduleSlotErr = err
+	m.mu.Unlock()
+	if err != nil {
+		Logf("error", "crs update: 排程不可读，本轮排程槽未推进（引擎将退避重投，读恢复后自愈）: %v", err)
+	}
+}
+
+// ScheduleSlotError 本运行成功落库但排程槽未推进的原因（nil=槽已推进或本轮
+// 未成功）。驱动任务引擎 Run 体在状态为 success 时复核：非 nil 时返回该错误，
+// 让引擎按失败退避重投而不是消费本槽。
+func (m *CRSUpdateManager) ScheduleSlotError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.scheduleSlotErr
 }
 
 // StatusSnapshot returns the in-memory task view, falling back to the stored

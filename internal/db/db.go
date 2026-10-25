@@ -96,6 +96,13 @@ const (
 	// DDL DEFAULT + 启动归一（security_normalize.go legacySecurityEnumBackfills）
 	// + DB 侧钉测三处单源。
 	DefaultAnomalyThreshold = 5
+	// DefaultBlockStatusCode 是 security_policies.block_status_code 的拦截
+	// 回退默认值（0=未设置也跟随本值）。它不是 DDL DEFAULT（列为 0 省略型）：
+	// 枚举外/缺失值的归一三处消费点——启动归一 SQL
+	// （security_normalize.go）、v2 备份导入门（config_backup.go）与集群 apply
+	// 归一（cluster_apply.go）——必须绑定本常量，否则调整默认拦截状态码时
+	// 三者静默分叉。
+	DefaultBlockStatusCode = 403
 	// 安全事件保留 / 威胁大屏口径默认值
 	// 此前 90 天 / 100 万行 / 采样 -1 / 模式 'map' 在 DDL（newColumns）、启动
 	// 迁移、读侧 COALESCE、导入归一四处各写一份字面量，改默认值需同步 4+ 处
@@ -3602,13 +3609,58 @@ func withTableRebuild(ctx context.Context, label string, fn func(tx *sql.Tx) err
 // 崩溃后残留的同名临时表会让本轮 CREATE TABLE 报 already exists —— 之后每次
 // 启动同样失败（启动死循环，只能人工 DROP）。幂等：正常库恒零命中。表名仅来自
 // 代码常量（拼接安全），且必须在事务内（回滚不改变残留状态，重跑仍清理）。
-func dropRebuildResidue(tx *sql.Tx, names ...string) error {
-	for _, name := range names {
+//
+// 安全边界：旧构建的崩溃窗口是「DROP 旧主表之后、RENAME 新表之前」——此时残留
+// 表是**唯一**数据副本，而下次启动的 CREATE TABLE IF NOT EXISTS 会先建出空主表。
+// 无条件 DROP 会把唯一副本静默删除（cert_jobs 为证书任务历史，lb_rules 连带
+// upstreams）。因此残留表有行而主表为空/缺失时中止迁移并响亮报错，交人工恢复。
+func dropRebuildResidue(tx *sql.Tx, mainTable string, residues ...string) error {
+	for _, name := range residues {
+		exists, err := tableExistsTx(tx, name)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		residueRows, err := tableRowCountTx(tx, name)
+		if err != nil {
+			return err
+		}
+		mainRows, err := tableRowCountTx(tx, mainTable)
+		if err != nil {
+			return err
+		}
+		if residueRows > 0 && mainRows == 0 {
+			return fmt.Errorf("检测到旧构建崩溃残留表 %s（%d 行）而主表 %s 为空或缺失：该残留可能是唯一数据副本，已中止迁移以免静默丢失数据；请核对后将 %s 改名为 %s 再重启", name, residueRows, mainTable, name, mainTable)
+		}
 		if _, err := tx.Exec("DROP TABLE IF EXISTS " + name); err != nil {
 			return fmt.Errorf("清理重建残留表 %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// tableExistsTx 报告事务视图内是否存在该表。
+func tableExistsTx(tx *sql.Tx, table string) (bool, error) {
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count); err != nil {
+		return false, fmt.Errorf("检查表 %s 是否存在: %w", table, err)
+	}
+	return count > 0, nil
+}
+
+// tableRowCountTx 返回事务视图内表的行数；表不存在返回 0。
+func tableRowCountTx(tx *sql.Tx, table string) (int64, error) {
+	exists, err := tableExistsTx(tx, table)
+	if err != nil || !exists {
+		return 0, err
+	}
+	var rows int64
+	if err := tx.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&rows); err != nil {
+		return 0, fmt.Errorf("统计表 %s 行数: %w", table, err)
+	}
+	return rows, nil
 }
 
 // dropColumnIfExists 幂等删除表列：列存在才 DROP，返回
@@ -3639,7 +3691,7 @@ func migrateCrawlerSourcesID() error {
 		return nil
 	}
 	return withTableRebuild(context.Background(), "security_crawler_sources", func(tx *sql.Tx) error {
-		if err := dropRebuildResidue(tx, "security_crawler_sources_with_id"); err != nil {
+		if err := dropRebuildResidue(tx, "security_crawler_sources", "security_crawler_sources_with_id"); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`CREATE TABLE security_crawler_sources_with_id (
@@ -3681,7 +3733,7 @@ func migrateUsersIsEnabledNotNull() error {
 		return nil
 	}
 	return withTableRebuild(context.Background(), "users", func(tx *sql.Tx) error {
-		if err := dropRebuildResidue(tx, "users_not_null"); err != nil {
+		if err := dropRebuildResidue(tx, "users", "users_not_null"); err != nil {
 			return err
 		}
 		// 本迁移可被直接调用（测试/历史路径）而未经 newColumns 补列：先确认
@@ -3747,7 +3799,7 @@ func migrateSecurityPoliciesNullable() error {
 		return nil
 	}
 	if err := withTableRebuild(context.Background(), "security_policies", func(tx *sql.Tx) error {
-		if err := dropRebuildResidue(tx, "security_policies_new"); err != nil {
+		if err := dropRebuildResidue(tx, "security_policies", "security_policies_new"); err != nil {
 			return err
 		}
 		// rebuild 必须与 fresh CREATE（含 refs 两列）同形状并搬运其数据——
@@ -3926,7 +3978,7 @@ func migrateNodesDeadColumns() error {
 		// nodesRebuildCopySQL 单源——本路径与 migrateNodesDropMasterID 曾各自
 		// 手写一份并已文本分叉（cluster_token_delivered DEFAULT 0/FALSE），
 		// 未来给 nodes 加列只需改单源。
-		if err := dropRebuildResidue(tx, "nodes_without_legacy_sync"); err != nil {
+		if err := dropRebuildResidue(tx, "nodes", "nodes_without_legacy_sync"); err != nil {
 			return err
 		}
 		deduped, dedupeErr := dedupeNodesTx(tx)
@@ -4253,8 +4305,12 @@ func migrateLbRulesPrimaryKey() error {
 
 	if err := withTableRebuild(context.Background(), "lb_rules", func(tx *sql.Tx) error {
 		// 两条临时表同属本重建（lb_rules 与 upstreams）；旧构建残留的任一
-		// 同名表都会让 CREATE 报 already exists。
-		if err := dropRebuildResidue(tx, "lb_rules_new", "upstreams_new"); err != nil {
+		// 同名表都会让 CREATE 报 already exists。逐表按各自主表裁决数据副本
+		// 风险——两张残留表的主表不同，不能共用 lb_rules 的空判据。
+		if err := dropRebuildResidue(tx, "lb_rules", "lb_rules_new"); err != nil {
+			return err
+		}
+		if err := dropRebuildResidue(tx, "upstreams", "upstreams_new"); err != nil {
 			return err
 		}
 		// caddy_id 即将成为主键：先去重（否则 INSERT 主键冲突 → 回滚 →
@@ -4550,7 +4606,7 @@ func migrateCertJobsStatusConstraint() error {
 	if err := withTableRebuild(context.Background(), "cert_jobs", func(tx *sql.Tx) error {
 		// 旧构建在 RENAME 之后崩溃会留下 cert_jobs_old，本轮 RENAME 即报
 		// already exists；先清残留（cert_jobs 本体存在性由事务提交语义保证）。
-		if err := dropRebuildResidue(tx, "cert_jobs_old"); err != nil {
+		if err := dropRebuildResidue(tx, "cert_jobs", "cert_jobs_old"); err != nil {
 			return err
 		}
 		if _, err := tx.Exec("ALTER TABLE cert_jobs RENAME TO cert_jobs_old"); err != nil {
@@ -4707,7 +4763,7 @@ func migrateNodesDropMasterID() error {
 	err := withTableRebuild(context.Background(), "nodes master_id", func(tx *sql.Tx) error {
 		// DDL/拷贝 SELECT 与 migrateNodesDeadColumns
 		// 共用 nodesRebuildDDL/nodesRebuildCopySQL 单源。
-		if err := dropRebuildResidue(tx, "nodes_new"); err != nil {
+		if err := dropRebuildResidue(tx, "nodes", "nodes_new"); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_nodes_master;`); err != nil {
@@ -4818,7 +4874,7 @@ func normalizeRuleTimestampsMigration() error {
 // 私钥正文因此可长期随备份/快照放大——tls_cert/tls_key 非空必须入选。
 // TCPRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（HTTP 头/健康检查/
 // 压缩/请求体/NTLM/force_http1 + TLS 来源、跳转与材料 + 代理超时族七列 +
-// 自定义路由 + dynamic_dns + strategy(cookie) + dns_family(ipv4) + 阶段页四列
+// 自定义路由 + dynamic_dns + strategy(cookie/空串) + dns_family(ipv4) + 阶段页四列
 // + log_enabled，共 32 列 SET）的 SQL 字面量单源——启动迁移（migrateTCPRuleDeadFields）
 // 与导入归一（handlers normalizeRuleRowsForTransport）共用本常量；此前跨包
 // 双份逐字镜像靠测试字符串 parity 维系，任一侧扩列漏同步即终态漂移。
@@ -4828,7 +4884,7 @@ const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 	request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
 	proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
 	custom_routes_enabled=0, dynamic_dns=0,
-	strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
+	strategy=CASE WHEN strategy='cookie' OR strategy='' OR strategy IS NULL THEN 'weighted_round_robin' ELSE strategy END,
 	dns_family='ipv4',
 	enable_tls=0, tls_source='manual', tls_http_redirect=0, tls_cert='', tls_key='',
 	block_page_stage1_id=0, block_page_stage1_status=0, block_page_stage3_id=0, block_page_stage3_status=0, log_enabled=0
@@ -4838,7 +4894,7 @@ const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 		OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
 		OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
 		OR custom_routes_enabled=1 OR dynamic_dns=1
-		OR COALESCE(strategy,'')='cookie'
+		OR COALESCE(strategy,'') IN ('cookie','')
 		OR COALESCE(dns_family,'')<>'ipv4'
 		OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
 		OR COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''
@@ -4899,7 +4955,7 @@ const tcpDeadFieldsProbeSQL = `SELECT
 			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
 			OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
 			OR custom_routes_enabled=1 OR dynamic_dns=1
-			OR COALESCE(strategy,'')='cookie'
+			OR COALESCE(strategy,'') IN ('cookie','')
 			OR COALESCE(dns_family,'')<>'ipv4'
 			OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
 			OR COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''

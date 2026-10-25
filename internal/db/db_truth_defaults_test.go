@@ -783,9 +783,14 @@ func TestFreshDDLColumns_registeredOrBaseline(t *testing.T) {
 // 的 AST 登记豁免。
 func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 	cases := []struct {
-		file      string
+		file string
+		// forbidden 是不得回流的字符串字面量片段（SQL 兜底形态）。
 		forbidden []string
-		required  []string
+		// forbiddenIntConversions 是不得回流的整数字面量换算形态，写成
+		// int64(<n>)——快照行归一/导入门用 int64 写入 map，数值默认值不会
+		// 出现在字符串字面量里，只扫字符串会漏掉这一族。
+		forbiddenIntConversions []string
+		required                []string
 	}{
 		{
 			file:      "../handlers/caddy.go",
@@ -820,9 +825,23 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 			required:  []string{"db.DefaultTimezone"},
 		},
 		{
-			file:      "../handlers/config_backup.go",
-			forbidden: []string{`"anomaly_threshold": int64(5)`, `policy["anomaly_threshold"] = int64(5)`},
-			required:  []string{"db.DefaultAnomalyThreshold"},
+			file:                    "../handlers/config_backup.go",
+			forbidden:               []string{`"anomaly_threshold": int64(5)`, `policy["anomaly_threshold"] = int64(5)`},
+			forbiddenIntConversions: []string{"int64(403)"},
+			required:                []string{"db.DefaultAnomalyThreshold", "db.DefaultBlockStatusCode"},
+		},
+		{
+			// 快照策略行归一（apply 写侧与 security 节哈希输入共用）是治理
+			// 默认值的第三份副本：此前写死 int64(5)/int64(403)，常量调整后
+			// 创建侧默认与从端归一静默分叉。
+			file:                    "../services/cluster_apply.go",
+			forbiddenIntConversions: []string{"int64(5)", "int64(403)"},
+			required:                []string{"db.DefaultAnomalyThreshold", "db.DefaultBlockStatusCode"},
+		},
+		{
+			// 启动归一 SQL 的 block_status_code 回退值同样绑定常量。
+			file:     "../services/security_normalize.go",
+			required: []string{"db.DefaultBlockStatusCode"},
 		},
 		{
 			file: "../handlers/config_import_v1.go",
@@ -880,6 +899,7 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 			t.Fatalf("parse %s: %v", tc.file, err)
 		}
 		var literals []string
+		var intConversions []string
 		selectors := map[string]bool{}
 		ast.Inspect(file, func(node ast.Node) bool {
 			switch n := node.(type) {
@@ -887,6 +907,13 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 				if n.Kind == token.STRING {
 					if value, err := strconv.Unquote(n.Value); err == nil {
 						literals = append(literals, value)
+					}
+				}
+			case *ast.CallExpr:
+				// int64(<字面量>)：快照/导入侧写 map 的数值默认值形态。
+				if ident, ok := n.Fun.(*ast.Ident); ok && ident.Name == "int64" && len(n.Args) == 1 {
+					if lit, ok := n.Args[0].(*ast.BasicLit); ok && lit.Kind == token.INT {
+						intConversions = append(intConversions, "int64("+lit.Value+")")
 					}
 				}
 			case *ast.SelectorExpr:
@@ -900,6 +927,14 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 			for _, lit := range literals {
 				if strings.Contains(lit, literal) {
 					t.Errorf("%s 字符串字面量仍含写死治理默认值 %q（应绑定 db.Default* 常量）", tc.file, literal)
+					break
+				}
+			}
+		}
+		for _, conversion := range tc.forbiddenIntConversions {
+			for _, got := range intConversions {
+				if got == conversion {
+					t.Errorf("%s 仍有写死数值默认值 %q（应绑定 db.Default* 常量）", tc.file, conversion)
 					break
 				}
 			}

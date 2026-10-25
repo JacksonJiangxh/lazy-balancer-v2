@@ -14,6 +14,8 @@
 #       test:<TestName>              仓库内必须存在 func <TestName>( 或前端 test('<name>'
 #       ftest:<literal>              web/tests 内必须出现该字面量（describe/it 标题等）
 #       script:<path>                脚本必须存在（且可执行）
+#       spec:<path>                  前端 spec 文件必须存在
+#   - ftest/script 的空字面量/空路径一律判失败（grep -F '' 恒命中＝假绿）。
 #   - maintained / falsified / retired 必须写非空 reason
 #
 # --commit 会解析该提交 message 中的 "Fixes: ID[,ID...]" 行，要求每个 ID 在台账
@@ -37,6 +39,14 @@ self_test() {
   mkdir -p "$tmp/internal/demo"
   printf 'package demo\n\nfunc TestDemoBehavior(t *testing.T) {}\n' > "$tmp/internal/demo/demo_test.go"
   printf 'package demo\n\nvar token = "demo-marker"\n' > "$tmp/internal/demo/demo.go"
+  # 前端用例与脚本证据形态的夹具：真实命中、可执行、存在但不可执行三形态。
+  mkdir -p "$tmp/web/tests"
+  printf "test('demo-fixture-title', () => {})\n" > "$tmp/web/tests/demo.spec.ts"
+  mkdir -p "$tmp/tools"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/tools/ok.sh"
+  chmod +x "$tmp/tools/ok.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/tools/noexec.sh"
+  chmod -x "$tmp/tools/noexec.sh"
 
   # 1) 正例：code 行含 token + test 存在 + maintained 有理由
   cat > "$tmp/ok.tsv" <<'EOF'
@@ -91,6 +101,51 @@ EOF
 Fixes: F-2")
   if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger ok.tsv --commit HEAD >/dev/null 2>&1); then
     echo "SELFTEST FAIL: Fixes 声明非 fixed 项却通过" >&2; return 1
+  fi
+
+  # 7) 正例：ftest 命中真实前端用例 + script 存在且可执行
+  cat > "$tmp/ok-forms.tsv" <<'EOF'
+id|status|evidence|reason
+F-3|fixed|ftest:demo-fixture-title;script:tools/ok.sh|
+EOF
+  if ! (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger ok-forms.tsv >/dev/null); then
+    echo "SELFTEST FAIL: ftest/script 正例被拒" >&2; return 1
+  fi
+
+  # 8) 反例：ftest 字面量在前端用例中不存在
+  cat > "$tmp/bad-ftest.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|ftest:absent-frontend-title|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger bad-ftest.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: ftest 字面量不存在却通过" >&2; return 1
+  fi
+
+  # 9) 反例：ftest 空字面量（grep -F '' 恒命中，必须显式拒绝）
+  cat > "$tmp/empty-ftest.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|ftest:|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger empty-ftest.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: ftest 空字面量却通过" >&2; return 1
+  fi
+
+  # 10) 反例：script 不存在
+  cat > "$tmp/bad-script.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|script:tools/absent.sh|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger bad-script.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: script 不存在却通过" >&2; return 1
+  fi
+
+  # 11) 反例：script 存在但不可执行
+  cat > "$tmp/noexec-script.tsv" <<'EOF'
+id|status|evidence|reason
+F-1|fixed|script:tools/noexec.sh|
+EOF
+  if (cd "$tmp" && bash scripts/check-fix-claims.sh --ledger noexec-script.tsv >/dev/null 2>&1); then
+    echo "SELFTEST FAIL: script 不可执行却通过" >&2; return 1
   fi
 
   echo "fix-claims selftest: PASS"
@@ -157,12 +212,24 @@ while IFS='|' read -r id status evidence reason; do
             ;;
           ftest:*)
             literal="${item#ftest:}"
+            if [ -z "$literal" ]; then
+              echo "FAIL ${id}: ftest 字面量为空（grep -F '' 恒命中，不构成证据）" >&2; fail=1; continue
+            fi
             if ! grep -RqsF --include='*.spec.ts' -- "$literal" web/tests; then
               echo "FAIL ${id}: 前端用例不存在: $literal" >&2; fail=1
             fi
             ;;
+          spec:*)
+            spec="${item#spec:}"
+            if [ ! -f "$spec" ]; then
+              echo "FAIL ${id}: 前端 spec 不存在: $spec" >&2; fail=1
+            fi
+            ;;
           script:*)
             script="${item#script:}"
+            if [ -z "$script" ]; then
+              echo "FAIL ${id}: script 路径为空" >&2; fail=1; continue
+            fi
             if [ ! -f "$script" ]; then
               echo "FAIL ${id}: 脚本不存在: $script" >&2; fail=1
             elif [ ! -x "$script" ]; then

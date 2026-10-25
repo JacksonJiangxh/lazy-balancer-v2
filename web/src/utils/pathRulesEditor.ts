@@ -92,11 +92,13 @@ export const applyResponseMode = (rule: PathRule): void => {
 /** 行内校验（与后端 validateRuleFeatures / ruleValidation.ts 同口径）。 */
 export const pathRuleResponseError = (rule: PathRule): string => {
   if (rule.response_mode === 'redirect') {
-    const target = (rule.redirect_to ?? '').trim()
-    if (!target) return '301 跳转需要填写跳转地址'
+    // 形状判定查原串（仅空判用 trim）：后端 HasPrefix 按原串——`" http://x"`
+    // 若前端 trim 后放行，会在离开该步时被整组拒绝（late failure 复发）。
+    const raw = rule.redirect_to ?? ''
+    if (!raw.trim()) return '301 跳转需要填写跳转地址'
     // eslint-disable-next-line no-control-regex
-    if (/[\x00-\x1f\x7f]/.test(target)) return '跳转地址含非法字符'
-    if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径'
+    if (/[\x00-\x1f\x7f]/.test(raw)) return '跳转地址含非法字符'
+    if (!raw.startsWith('/') && !raw.startsWith('http://') && !raw.startsWith('https://')) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径'
   }
   return ''
 }

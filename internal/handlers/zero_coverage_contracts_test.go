@@ -288,21 +288,43 @@ func TestLibUpdateLogs_readTaskLogWithRotation(t *testing.T) {
 }
 
 // Caddy 重启 watcher 幂等门：重复调用不得启动第二个 watcher（双 watcher 会
-// 让同一触发文件被执行两次全量渲染 + /load）。
-func TestStartCaddyRestartWatcher_isIdempotent(t *testing.T) {
-	oldStat := caddyRestartStat
-	caddyRestartStat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+// 让同一触发文件被执行两次全量渲染 + /load）。断言启动次数而非标志位——
+// 标志位区分不了「第二次提前返回」与「第二次又起了一个 goroutine」。
+func TestStartCaddyRestartWatcher_secondCallStartsNoSecondLoop(t *testing.T) {
+	oldLoop := caddyRestartWatcherLoop
+	release := make(chan struct{})
+	starts := make(chan struct{}, 2)
+	// 替身循环：登记一次启动后挂起，既证明「起了一个」也不让真实 2s 轮询
+	// 泄漏到后续用例。
+	caddyRestartWatcherLoop = func(*Handlers) {
+		starts <- struct{}{}
+		<-release
+	}
 	caddyRestartWatcherStarted.Store(false)
 	t.Cleanup(func() {
-		caddyRestartStat = oldStat
+		close(release) // 先停替身循环，再还原 seam
 		caddyRestartWatcherStarted.Store(false)
+		caddyRestartWatcherLoop = oldLoop
 	})
+
 	h := NewHandlers(Dependencies{})
 	h.StartCaddyRestartWatcher()
+	select {
+	case <-starts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("首次调用未启动 watcher 循环")
+	}
 	if !caddyRestartWatcherStarted.Load() {
 		t.Fatal("首次调用必须置位 started 标记")
 	}
+
+	// 第二次调用必须被 CAS 门挡住：200ms 内不得出现第二个循环实例。
 	h.StartCaddyRestartWatcher()
+	select {
+	case <-starts:
+		t.Fatal("第二次调用又启动了 watcher 循环（幂等门失效）")
+	case <-time.After(200 * time.Millisecond):
+	}
 	if !caddyRestartWatcherStarted.Load() {
 		t.Fatal("幂等门被重置（第二调用不应改状态）")
 	}
@@ -336,15 +358,20 @@ func TestGetMetricsOverview_returnsStructuredZeroValue(t *testing.T) {
 func TestGetIP2RegionUpdateStatus_managerLifecycle(t *testing.T) {
 	// manager 初始化会写版本行（ensureVersionTableRow）——必须有可用测试库。
 	_ = newBackupTestHandlers(t)
+	// manager 是进程级单例：用例前后都复位，否则 -shuffle/重复执行时前序
+	// 用例留下的 manager 会让「未初始化 → 500」契约整段消失。
+	services.ResetIP2RegionUpdateManagerForTest()
+	t.Cleanup(services.ResetIP2RegionUpdateManagerForTest)
 	h := NewHandlers(Dependencies{})
-	if services.GetIP2RegionUpdateManager() == nil {
-		recorder := getRoute(t, h, "/status", h.GetIP2RegionUpdateStatus)
-		if recorder.Code != http.StatusInternalServerError {
-			t.Fatalf("manager 缺席 status=%d, want 500", recorder.Code)
-		}
+	if manager := services.GetIP2RegionUpdateManager(); manager != nil {
+		t.Fatal("前置态错误：IP2Region 更新 manager 应为未初始化")
+	}
+	recorder := getRoute(t, h, "/status", h.GetIP2RegionUpdateStatus)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("manager 缺席 status=%d, want 500", recorder.Code)
 	}
 	services.InitIP2RegionUpdateManager(func() error { return nil })
-	recorder := getRoute(t, h, "/status", h.GetIP2RegionUpdateStatus)
+	recorder = getRoute(t, h, "/status", h.GetIP2RegionUpdateStatus)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("初始化后 status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -406,5 +433,143 @@ func TestFailImportTx_auditsAndResponds(t *testing.T) {
 	}
 	if n := countAuditRows(t, "导入失败", "配置备份"); n != 2 {
 		t.Fatalf("第二次失败审计累计=%d, want 2", n)
+	}
+}
+
+// 24h 分小时统计端点：引擎缺席 → 显式空数组；有引擎 → 24 个墙面小时桶。
+// 图表按数组迭代，null 会在前端炸成运行时异常；桶数/升序/零值是数据契约。
+func TestGetSystemTaskStats24hSeries_bothBranches(t *testing.T) {
+	h := NewHandlers(Dependencies{})
+	// 分支一：引擎缺席。全局引擎属包级单例，先显式停止以避免依赖用例顺序。
+	services.StopTaskEngine()
+	recorder := getRoute(t, h, "/system/tasks/stats-24h-series", h.GetSystemTaskStats24hSeries)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("引擎缺席 status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var empty struct {
+		Data struct {
+			Series []taskengine.TaskHourlyStat `json:"series"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if empty.Data.Series == nil {
+		t.Fatalf("引擎缺席时必须下发空数组（null 会让前端图表迭代失败）: %s", recorder.Body.String())
+	}
+	if len(empty.Data.Series) != 0 {
+		t.Fatalf("引擎缺席 series=%v, want 空", empty.Data.Series)
+	}
+
+	// 分支二：有引擎 → 24 桶、时间升序，且已落库的运行进入对应小时桶。
+	// 引擎装配本身可能写当日启动行，故不在当前小时断零；改为在窗口内
+	// 5 小时前种一组已知计数，按桶键精确断言。
+	initTaskEngineForTest(t)
+	seededAt := time.Now().Add(-5 * time.Hour)
+	seededHour := seededAt.Format("2006-01-02 15") + ":00:00"
+	for _, status := range []string{"success", "success", "failed"} {
+		if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, status, started_at) VALUES ('stats-series-probe','test',?,?)`, status, seededHour); err != nil {
+			t.Fatalf("seed task_runs: %v", err)
+		}
+	}
+	recorder = getRoute(t, h, "/system/tasks/stats-24h-series", h.GetSystemTaskStats24hSeries)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Series []taskengine.TaskHourlyStat `json:"series"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.Series) != 24 {
+		t.Fatalf("series 桶数=%d, want 24（最近 24 个墙面小时）", len(payload.Data.Series))
+	}
+	seededSeen := false
+	for i, stat := range payload.Data.Series {
+		if _, err := time.Parse("2006-01-02 15:04:05", stat.Hour); err != nil {
+			t.Fatalf("桶 %d hour=%q 非预期格式: %v", i, stat.Hour, err)
+		}
+		if i > 0 && stat.Hour <= payload.Data.Series[i-1].Hour {
+			t.Fatalf("桶未按小时升序: %q 之后是 %q", payload.Data.Series[i-1].Hour, stat.Hour)
+		}
+		if stat.Hour == seededHour {
+			seededSeen = true
+			if stat.Success != 2 || stat.Failed != 1 {
+				t.Fatalf("桶 %s 计数=%d/%d, want 2 成功/1 失败", stat.Hour, stat.Success, stat.Failed)
+			}
+		}
+	}
+	if !seededSeen {
+		t.Fatalf("窗口内缺已种入的小时桶 %s（series=%v）", seededHour, payload.Data.Series)
+	}
+}
+
+// TCP 规则指标解析：L4 指标只带 upstream 标签，按规则启用的上游地址归集；
+// 未列出的上游 / 无 upstream 标签的样本不计入（共享上游合计口径见实现注释）。
+func TestParseTCPRuleMetricsFromPrometheus_aggregatesListedUpstreams(t *testing.T) {
+	body := strings.Join([]string{
+		`# HELP caddy_layer4_proxy_connections_total L4 proxy connections`,
+		`caddy_layer4_proxy_connections_total{upstream="10.0.0.1:9001"} 5`,
+		`caddy_layer4_proxy_active_connections{upstream="10.0.0.1:9001"} 2`,
+		`caddy_layer4_proxy_connections_total{upstream="10.0.0.2:9002"} 7`,
+		`caddy_layer4_proxy_connections_total{upstream="10.0.0.9:9009"} 99`,
+		`caddy_layer4_proxy_connections_total 42`,
+	}, "\n")
+	upstreams := []models.Upstream{
+		{Host: "10.0.0.1", Port: 9001, Enabled: true},
+		{Host: "10.0.0.2", Port: 9002, Enabled: true},
+		{Host: "10.0.0.3", Port: 9003, Enabled: false},
+	}
+	metrics, err := parseTCPRuleMetricsFromPrometheus(body, upstreams)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := map[string]int64{
+		"requests_total":     12, // 5+7；0.0.0.9 未在上游表内、禁用上游不计
+		"requests_in_flight": 2,
+		"status_2xx":         0,
+		"status_3xx":         0,
+		"status_4xx":         0,
+		"status_5xx":         0,
+		"bytes_in":           0,
+		"bytes_out":          0,
+	}
+	if len(metrics) != len(want) {
+		t.Fatalf("指标键集=%v, want %d 个统一键", metrics, len(want))
+	}
+	for key, expected := range want {
+		if got, ok := metrics[key].(int64); !ok || got != expected {
+			t.Fatalf("%s=%v, want %d（metrics=%v）", key, metrics[key], expected, metrics)
+		}
+	}
+	if _, ok := metrics["blocked"]; ok {
+		t.Fatal("解析层不得写 blocked（TCP 端点在 handler 侧恒置 0）")
+	}
+
+	// 空上游表：八个键齐全且全零，不得返回 nil（调用方直接写响应）。
+	zeroed, err := parseTCPRuleMetricsFromPrometheus(`caddy_layer4_proxy_connections_total{upstream="10.0.0.1:9001"} 3`, nil)
+	if err != nil {
+		t.Fatalf("空上游表 parse: %v", err)
+	}
+	if len(zeroed) != len(want) {
+		t.Fatalf("空上游表指标=%v, want 统一键集", zeroed)
+	}
+	for key := range want {
+		if got, ok := zeroed[key].(int64); !ok || got != 0 {
+			t.Fatalf("空上游表 %s=%v, want 0", key, zeroed[key])
+		}
+	}
+
+	// 畸形形态：样本值非数字必须报错（带行号），全无效正文同样报错。
+	if _, err := parseTCPRuleMetricsFromPrometheus("caddy_layer4_proxy_connections_total{upstream=\"10.0.0.1:9001\"} not-a-number", upstreams); err == nil || !strings.Contains(err.Error(), "第 1 行") {
+		t.Fatalf("畸形样本值 err=%v, want 带行号的解析错误", err)
+	}
+	for _, emptyBody := range []string{"", "# 只有注释\n", "caddy_layer4_proxy_connections_total{upstream=\"x\"} NaN"} {
+		if _, err := parseTCPRuleMetricsFromPrometheus(emptyBody, upstreams); err == nil || !strings.Contains(err.Error(), "不包含有效样本") {
+			t.Fatalf("正文 %q err=%v, want 无有效样本错误", emptyBody, err)
+		}
 	}
 }

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// 生产渲染（GenerateRuleServerContext / 全量生成）从不产出
+// 生产渲染（全量生成）从不产出
 // tls.automation（证书由应用层任务管理），旧实现扫描该段的分支恒不可达且
 // 让配置查看响应携带恒空字段。此处钉住：即使运行配置被外部注入 automation
 // 段，context 也不再声明/返回 automation_policies。
@@ -24,7 +24,7 @@ func TestBuildRuleCaddyContext_doesNotExposeDeadAutomationPolicies(t *testing.T)
 		},
 	}
 
-	result := buildRuleCaddyContext(fullConfig, "lb_testrule", "example.com")
+	result := buildRuleCaddyContext(fullConfig, "lb_testrule")
 
 	if _, exists := result["automation_policies"]; exists {
 		t.Fatalf("automation_policies=%v, want field removed（生产渲染无该段）", result["automation_policies"])
@@ -50,16 +50,22 @@ func tlsConnPolicyFixture(anyTag []string, sni ...string) map[string]interface{}
 	return policy
 }
 
-func tlsConnPoliciesConfigFixture(caddyID string, policies []interface{}) map[string]interface{} {
+func tlsConnPoliciesConfigFixture(caddyID string, hosts []string, policies []interface{}) map[string]interface{} {
+	route := map[string]interface{}{"@id": caddyID}
+	if len(hosts) > 0 {
+		hostValues := make([]interface{}, 0, len(hosts))
+		for _, host := range hosts {
+			hostValues = append(hostValues, host)
+		}
+		route["match"] = []interface{}{map[string]interface{}{"host": hostValues}}
+	}
 	return map[string]interface{}{
 		"apps": map[string]interface{}{
 			"http": map[string]interface{}{
 				"servers": map[string]interface{}{
 					"srv0": map[string]interface{}{
-						"listen": []interface{}{":443"},
-						"routes": []interface{}{
-							map[string]interface{}{"@id": caddyID},
-						},
+						"listen":                  []interface{}{":443"},
+						"routes":                  []interface{}{route},
 						"tls_connection_policies": policies,
 					},
 				},
@@ -104,50 +110,50 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 	tests := []struct {
 		name             string
 		caddyID          string
-		domain           string
+		serverHosts      []string
 		policies         []interface{}
 		wantFingerprints []string
 	}{
 		{
-			name:    "entry whose any_tag contains the rule caddy id is kept",
-			caddyID: "lb_rule1",
-			domain:  "other-rule-domain.com",
+			name:        "entry whose any_tag contains the rule caddy id is kept",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"other-rule-domain.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_rule1"}, "go029.com"),
 			},
 			wantFingerprints: []string{"tag=lb_rule1,sni=go029.com"},
 		},
 		{
-			name:    "entry tagged with a different rule id is dropped",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "entry tagged with a different rule id is dropped",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_otherrule"}),
 			},
 			wantFingerprints: []string{},
 		},
 		{
-			name:    "entry without any_tag but sni intersecting rule domains is kept",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "entry without any_tag but sni intersecting the running server hosts is kept",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture(nil, "www.go029.com", "go029.com"),
 			},
 			wantFingerprints: []string{"sni=www.go029.com,sni=go029.com"},
 		},
 		{
-			name:    "entry with neither any_tag nor sni match is dropped",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "entry with neither any_tag nor sni match is dropped",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_otherrule"}, "unrelated.com"),
 			},
 			wantFingerprints: []string{},
 		},
 		{
-			name:    "server context and top level carry the same filtered set",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "server context and top level carry the same filtered set",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_rule1"}, "go029.com"),
 				tlsConnPolicyFixture([]string{"lb_otherrule"}, "ry029.com"),
@@ -155,24 +161,34 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 			wantFingerprints: []string{"tag=lb_rule1,sni=go029.com"},
 		},
 		{
-			name:    "rule with no matching entries gets empty non-nil policies",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "rule with no matching entries gets empty non-nil policies",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_otherrule"}, "ry029.com"),
 				tlsConnPolicyFixture(nil, "quanyi.go029.com"),
 			},
 			wantFingerprints: []string{},
 		},
+		{
+			name:        "stale library domain never widens the running-config scope",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"new.example.test"},
+			policies: []interface{}{
+				tlsConnPolicyFixture(nil, "old.example.test"),
+				tlsConnPolicyFixture(nil, "new.example.test"),
+			},
+			wantFingerprints: []string{"sni=new.example.test"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given: an http server hosting the rule's route plus policies from sibling rules
-			fullConfig := tlsConnPoliciesConfigFixture(tt.caddyID, tt.policies)
+			fullConfig := tlsConnPoliciesConfigFixture(tt.caddyID, tt.serverHosts, tt.policies)
 
 			// When
-			result := buildRuleCaddyContext(fullConfig, tt.caddyID, tt.domain)
+			result := buildRuleCaddyContext(fullConfig, tt.caddyID)
 
 			// Then: both the top-level array and the server context carry the rule-scoped set
 			gotTop := tlsConnPolicyFingerprints(t, result["tls_connection_policies"])
@@ -212,7 +228,7 @@ func TestBuildRuleCaddyContext_deterministicServerSelection(t *testing.T) {
 		},
 	}
 	for i := range 30 {
-		result := buildRuleCaddyContext(fullConfig, "lb_drift", "drift.example.test")
+		result := buildRuleCaddyContext(fullConfig, "lb_drift")
 		server, ok := result["server"].(map[string]interface{})
 		if !ok {
 			t.Fatalf("iteration %d: server context missing", i)

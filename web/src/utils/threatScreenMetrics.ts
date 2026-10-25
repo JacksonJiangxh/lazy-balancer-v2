@@ -101,8 +101,16 @@ export function bucketTerminology(windowHours: number): {
   readonly unit: '小时' | '天'
   readonly peakLabel: string
   readonly countLabel: string
+  /** 窗口长度本身的展示词（`7 天` / `24 小时`）：页头、KPI、趋势标题共用，
+   *  不得再写 `{{ windowHours }} 小时`——7d 视图会渲染成「168 小时」。 */
+  readonly windowLabel: string
 } {
   return windowHours > 24
-    ? { unit: '天', peakLabel: '峰值日期', countLabel: '有事件天' }
-    : { unit: '小时', peakLabel: '峰值时段', countLabel: '有事件小时' }
+    ? {
+      unit: '天',
+      peakLabel: '峰值日期',
+      countLabel: '有事件天',
+      windowLabel: `${Math.round(windowHours / 24)} 天`,
+    }
+    : { unit: '小时', peakLabel: '峰值时段', countLabel: '有事件小时', windowLabel: `${windowHours} 小时` }
 }

@@ -118,9 +118,40 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	for _, tk := range payload.Data.Tasks {
 		got[tk.ID] = tk.Category
 	}
-	// 期望集合由引擎注册表派生（DescribeAll 是视图的唯一事实源）：手抄清单是
-	// 子集断言——生产新增族不红，改名/漏列也不易被发现。数量、身份、分类三项
-	// 全对表；cert-job: 是 task_runs 派生的动态行，不属于注册表。
+	// 期望集合独立冻结（族身份 + 分类）：从 DescribeAll 派生会与响应同源，
+	// 注册表误删一族、族 ID 改名或分类漂移时两侧同步变化、门禁零告警。
+	// 新增族不在本表 → 由下方「响应 ⊆ 注册表」反向检查兜住（新增不红）；
+	// cert-job: 是 task_runs 派生的动态行，不属于注册表。
+	wantCategories := map[string]string{
+		"threat":                    "安全防护",
+		"crs":                       "安全防护",
+		"ip2region":                 "安全防护",
+		"crawlerbot-update":         "安全防护",
+		"autoban":                   "安全防护",
+		"cert-renewal-scan":         "证书",
+		"cert-reconcile":            "证书",
+		"cert-manual-poll":          "证书",
+		"cert-waiting-ca":           "证书",
+		"cert-issuance":             "证书",
+		"auto-backup":               "备份",
+		"cluster-sync":              "集群",
+		"config-watchdog":           "系统",
+		"log-cleanup":               "系统",
+		"audit-retention":           "系统",
+		"security-events-retention": "系统",
+		"metrics-orphan-cleanup":    "系统",
+		"security-events-ingestion": "系统",
+		"startup:config-load":       "系统",
+	}
+	for id, wantCategory := range wantCategories {
+		category, ok := got[id]
+		if !ok {
+			t.Fatalf("任务族 %s 缺失; got=%v", id, got)
+		}
+		if category != wantCategory {
+			t.Fatalf("任务族 %s 分类=%q, want %q", id, category, wantCategory)
+		}
+	}
 	metas := services.TaskEngine().DescribeAll()
 	if len(metas) == 0 {
 		t.Fatal("引擎注册表为空——任务族对账失效")
@@ -128,13 +159,6 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	registered := make(map[string]struct{}, len(metas))
 	for _, meta := range metas {
 		registered[meta.ID] = struct{}{}
-		category, ok := got[meta.ID]
-		if !ok {
-			t.Fatalf("任务族 %s 缺失; got=%v", meta.ID, got)
-		}
-		if category != meta.Category {
-			t.Fatalf("任务族 %s 分类=%q, want %q（引擎注册表口径）", meta.ID, category, meta.Category)
-		}
 	}
 	for id := range got {
 		if strings.HasPrefix(id, "cert-job:") {
@@ -779,18 +803,24 @@ func TestTriggerSystemTask_triggerAuditMatchesManualRuns(t *testing.T) {
 	}
 }
 
-// Given 一条 waiting_ca 证书任务（CA 退避窗口在未来 2 小时）与一条 issued
-// 证书任务（无冷却）。When GET /system/tasks。
-// Then 每行恒带 retry_cooldown_seconds（0=现在即可运行，无 omitempty）：
-// waiting_ca ≈7200（CA 剩余秒）、issued=0、非证书任务行=0——前端任务行
-// 「运行」按钮的冷却判定与证书任务列表（/certificates/jobs）同源。
+// Given waiting_ca/failed/queued/issued/disabled 证书任务行（含冷却已到期的
+// 历史行）。When GET /system/tasks。
+// Then 每行恒带 retry_cooldown_seconds：下发「此刻剩余秒」（0=现在即可运行，
+// null=永久不可重试）。waiting_ca 取 CA 退避剩余、通用冷却按 updated_at 扣减
+// （已到期行=0），disabled=null，非证书行=0——前端任务行「运行」按钮的冷却
+// 判定与证书任务列表（/certificates/jobs）同源同判据。
 func TestListSystemTasks_exposesRetryCooldownSeconds(t *testing.T) {
 	newBackupTestHandlers(t)
 	initTaskEngineForTest(t)
 	caWindow := time.Now().UTC().Add(2 * time.Hour).Format("2006-01-02 15:04:05")
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id, rule_id, domain, status, message, ca_available_after, created_at, updated_at)
 		VALUES (1,'lb_ca','ca.example','waiting_ca','',?,datetime('now'),datetime('now')),
-		       (2,'lb_ok','ok.example','issued','',NULL,datetime('now'),datetime('now'))`, caWindow); err != nil {
+		       (2,'lb_ok','ok.example','issued','',NULL,datetime('now'),datetime('now')),
+		       (3,'lb_failed','failed.example','failed','',NULL,datetime('now'),datetime('now')),
+		       (4,'lb_failed_old','failed-old.example','failed','',NULL,datetime('now','-6 minutes'),datetime('now','-6 minutes')),
+		       (5,'lb_queued','queued.example','queued','',NULL,datetime('now'),datetime('now')),
+		       (6,'lb_queued_old','queued-old.example','queued','',NULL,datetime('now','-16 minutes'),datetime('now','-16 minutes')),
+		       (7,'lb_disabled','disabled.example','disabled','',NULL,datetime('now'),datetime('now'))`, caWindow); err != nil {
 		t.Fatalf("seed cert jobs: %v", err)
 	}
 	r, _ := taskMonitorRouter()
@@ -825,7 +855,7 @@ func TestListSystemTasks_exposesRetryCooldownSeconds(t *testing.T) {
 			t.Fatalf("任务行 %s 缺少 retry_cooldown_seconds（该字段不得 omitempty）", id)
 		}
 	}
-	cooldownOf := func(id string) int64 {
+	cooldownOf := func(id string) *int64 {
 		t.Helper()
 		for _, row := range payload.Data.Tasks {
 			var rowID string
@@ -835,22 +865,38 @@ func TestListSystemTasks_exposesRetryCooldownSeconds(t *testing.T) {
 			if rowID != id {
 				continue
 			}
+			if string(row["retry_cooldown_seconds"]) == "null" {
+				return nil
+			}
 			var seconds int64
 			if err := json.Unmarshal(row["retry_cooldown_seconds"], &seconds); err != nil {
 				t.Fatalf("任务行 %s retry_cooldown_seconds 解析失败: %v", id, err)
 			}
-			return seconds
+			return &seconds
 		}
 		t.Fatalf("任务行 %s 不存在", id)
-		return 0
+		return nil
 	}
-	if got := cooldownOf("cert-job:1"); got < 7100 || got > 7200 {
-		t.Fatalf("waiting_ca 行冷却=%d, want ≈7200（CA 退避剩余秒）", got)
+	wantCooldown := func(id string, want int64) {
+		t.Helper()
+		got := cooldownOf(id)
+		if got == nil {
+			t.Fatalf("任务行 %s 冷却=null, want %d", id, want)
+		}
+		if *got != want {
+			t.Fatalf("任务行 %s 冷却=%d, want %d", id, *got, want)
+		}
 	}
-	if got := cooldownOf("cert-job:2"); got != 0 {
-		t.Fatalf("issued 行冷却=%d, want 0（无冷却）", got)
+	if got := cooldownOf("cert-job:1"); got == nil || *got < 7100 || *got > 7200 {
+		t.Fatalf("waiting_ca 行冷却=%v, want ≈7200（CA 退避剩余秒）", got)
 	}
-	if got := cooldownOf("threat"); got != 0 {
-		t.Fatalf("非证书任务行冷却=%d, want 0", got)
+	wantCooldown("cert-job:2", 0)   // issued：无通用冷却。
+	wantCooldown("cert-job:3", 300) // failed：刚更新，剩余完整窗口。
+	wantCooldown("cert-job:4", 0)   // failed：updated_at 早于冷却窗口 → 已可重试。
+	wantCooldown("cert-job:5", 900) // queued：刚更新。
+	wantCooldown("cert-job:6", 0)   // queued：已过期。
+	if got := cooldownOf("cert-job:7"); got != nil {
+		t.Fatalf("disabled 行冷却=%d, want null（永久不可重试不得表达为 0=现在可重试）", *got)
 	}
+	wantCooldown("threat", 0) // 非证书任务行：无证书重试冷却概念。
 }

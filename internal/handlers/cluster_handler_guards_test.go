@@ -67,10 +67,14 @@ func TestGetClusterWafFiles_409DuringImportWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	configImportBeginMu.Lock()
 	busyRecorder := httptest.NewRecorder()
-	h.GetClusterWafFiles(ginTestContext(busyRecorder))
-	configImportBeginMu.Unlock()
+	func() {
+		// 导入会话锁是包级全局：handler panic 若跳过 Unlock，会永久泄漏
+		// 导入窗口（后续无关写用例全变 409）——defer 保证解锁。
+		configImportBeginMu.Lock()
+		defer configImportBeginMu.Unlock()
+		h.GetClusterWafFiles(ginTestContext(busyRecorder))
+	}()
 	if busyRecorder.Code != http.StatusConflict {
 		t.Fatalf("导入窗口内 status=%d body=%s, want 409", busyRecorder.Code, busyRecorder.Body.String())
 	}

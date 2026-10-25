@@ -9,6 +9,7 @@
  * - `visible_when`: { 其它字段名: 允许的取值[] }——全部条件命中才显示；
  * - `option_labels`: { 选项值: 显示文案 }——缺失时回退原始值。
  */
+import { hasOwn } from './hasOwn.ts'
 
 export interface CredentialFieldMeta {
   readonly name: string
@@ -32,8 +33,12 @@ export const credentialFieldVisible = (
 }
 
 /** 选项显示文案：优先元数据 label，缺失回退选项值。 */
-export const credentialOptionLabel = (field: CredentialFieldMeta, option: string): string =>
-  field.option_labels?.[option] ?? option
+export const credentialOptionLabel = (field: CredentialFieldMeta, option: string): string => {
+  const labels = field.option_labels
+  // 元数据是普通对象且 option 来自提供商字段定义（后端下发）：原型键直接下标
+  // 会返回函数，下拉文案渲染出函数源码。
+  return (labels && hasOwn(labels, option) ? labels[option] : undefined) ?? option
+}
 
 /**
  * 新建/切换提供商时的凭证初始值：每个 select 字段取首个选项。

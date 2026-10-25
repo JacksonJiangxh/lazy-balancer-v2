@@ -109,6 +109,7 @@ type SyncService struct {
 	caddy                *CaddyService
 	cluster              *ClusterService
 	client               *http.Client
+	smallClient          *http.Client
 	transportOnce        sync.Once
 	pinMu                sync.Mutex
 	verifiedPins         map[string]string
@@ -188,6 +189,24 @@ func NewSyncService(database *sql.DB, cfg *config.Config, caddy *CaddyService) *
 }
 
 func (s *SyncService) do(req *http.Request) (*http.Response, error) {
+	return s.doWithClient(req, nil)
+}
+
+// doSmall 与 do 共用 pin 复核与重定向语义，但走小请求客户端：其 transport
+// 携带首字节时限（见 initClusterClient）。注册/上报/注册状态轮询/注册确认
+// 这类几百字节的请求必须走本入口——走大传输客户端时首字节之外没有任何
+// transport 级兜底，只能靠调用方 ctx。
+func (s *SyncService) doSmall(req *http.Request) (*http.Response, error) {
+	s.initClusterClient()
+	client := s.smallClient
+	if client == nil {
+		// 自定义 client 注入（测试）或初始化竞态：退回主客户端，ctx 截止仍在。
+		client = s.client
+	}
+	return s.doWithClient(req, client)
+}
+
+func (s *SyncService) doWithClient(req *http.Request, client *http.Client) (*http.Response, error) {
 	if req.URL.Scheme != "https" && req.URL.Scheme != "http" {
 		return nil, errors.New("集群主节点地址必须使用 HTTP 或 HTTPS")
 	}
@@ -209,7 +228,10 @@ func (s *SyncService) do(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
-	return DoWithSameHostTLSUpgradeRedirect(s.client, req)
+	if client == nil {
+		client = s.client
+	}
+	return DoWithSameHostTLSUpgradeRedirect(client, req)
 }
 
 // verifyClusterPinIfPresent 校验 pin 文件与已验证指纹一致；文件缺失返回 nil
@@ -235,18 +257,20 @@ func (s *SyncService) initClusterClient() {
 		if s.cfg != nil {
 			dataDir = s.cfg.DataDir
 		}
-		transport := newClusterTOFUTransport(dataDir, s.db, func(pinPath, fingerprint string) {
+		recordVerifiedPin := func(pinPath, fingerprint string) {
 			s.pinMu.Lock()
 			s.verifiedPins[pinPath] = fingerprint
 			s.pinMu.Unlock()
-		})
+		}
+		transport := newClusterTOFUTransport(dataDir, s.db, recordVerifiedPin)
 		s.verifiedPins = make(map[string]string)
 		if s.client == nil {
 			// 不设 http.Client.Timeout：该客户端同时承载 256MB 快照与 64MB
 			// 规则包拉取，30s 总超时（含读 body）与上限不相容（256MB/30s
 			// ≈68Mbps、64MB/30s≈17Mbps），慢链路/大配置下从端同步会**永久**
 			// 失败且无自愈路径。大体积传输仅由每次尝试的 ctx 截止兜底
-			// （clusterLargeTransferTimeout）；注册/上报等小请求各自带 10s ctx。
+			// （clusterLargeTransferTimeout）；注册/上报等小请求走 smallClient
+			// （每请求 10s ctx + transport 首字节时限）。
 			// 与 CRS 下载路径（crshttp.go 的 crsDownloadClient）同口径。
 			s.client = &http.Client{}
 		}
@@ -254,6 +278,18 @@ func (s *SyncService) initClusterClient() {
 		s.client.CheckRedirect = func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
+		// 小请求客户端：与主客户端共用 TOFU 校验实现，但 transport 额外带
+		// 首字节时限——ctx 截止覆盖整轮请求，本值是同一缺陷类的 transport 级
+		// 兜底（未来新增的小请求漏套 ctx 时不会再次永久停摆）。大传输客户端
+		// 刻意不设：主节点同步构建快照（BuildWafFileRef 全树哈希）后才写响应
+		// 头，首字节时限会把慢主机构建的合法大响应误判为挂死。
+		if s.smallClient == nil {
+			s.smallClient = &http.Client{}
+		}
+		smallTransport := newClusterTOFUTransport(dataDir, s.db, recordVerifiedPin)
+		smallTransport.ResponseHeaderTimeout = clusterSmallResponseHeaderTimeout
+		s.smallClient.Transport = smallTransport
+		s.smallClient.CheckRedirect = s.client.CheckRedirect
 	})
 }
 
@@ -709,14 +745,14 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 	if err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("编码注册请求: %w", err)
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	callCtx, cancel := newClusterSmallRequestContext(ctx)
 	defer cancel()
 	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/register", bytes.NewReader(payload))
 	if err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("创建注册请求: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := s.do(httpReq)
+	resp, err := s.doSmall(httpReq)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return models.ClusterRegistration{}, errors.New("连接主节点超时，请检查主节点地址与网络")
@@ -771,6 +807,25 @@ var clusterLargeTransferTimeout = 10 * time.Minute
 // WAF 规则包共用），测试经 clusterLargeTransferTimeout 覆盖预算。
 func newClusterTransferContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, clusterLargeTransferTimeout)
+}
+
+// clusterSmallRequestTimeout 是集群小请求（注册、节点上报、注册状态轮询、
+// 注册确认）的单次端到端时限。这类请求体只有几百字节，10s 覆盖慢链路仍有余
+// 量；没有截止时对端「接受连接但永不响应」（进程挂起/反代后端挂死/连接黑洞）
+// 会让同步 daemon 停在首字节之前——不拉取、不上报、不写 last_sync_error、
+// 零日志，恢复只能靠进程重启。变量而非常量：测试注入短预算验证截止生效。
+var clusterSmallRequestTimeout = 10 * time.Second
+
+// clusterSmallResponseHeaderTimeout 是小请求 transport 的首字节时限，与
+// ctx 截止互补（ctx 覆盖整轮，本值兜住后续新增小请求漏套 ctx 的形态）。
+// 只挂在小请求 transport 上：快照/规则包的大传输在服务端同步构建后才写
+// 响应头，首字节时限会把慢主机构建的合法大响应误判为挂死。
+const clusterSmallResponseHeaderTimeout = 15 * time.Second
+
+// newClusterSmallRequestContext 是小请求 ctx 的单源构造点，测试经
+// clusterSmallRequestTimeout 覆盖预算。
+func newClusterSmallRequestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, clusterSmallRequestTimeout)
 }
 
 // maxSnapshotResponseBytes caps the Pull snapshot response body: 合法快照内嵌
@@ -1938,12 +1993,16 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 	if masterURL == "" || registrationID == 0 || secret == "" {
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/api/v1/cluster/register/%d/status", strings.TrimRight(masterURL, "/"), registrationID), nil)
+	// 小请求截止：状态轮询每 10s 一轮，对端挂起时无截止会让注册态节点永久
+	// 卡在首字节之前（不写 last_sync_error、无日志），只能重启进程。
+	callCtx, cancel := newClusterSmallRequestContext(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, fmt.Sprintf("%s/api/v1/cluster/register/%d/status", strings.TrimRight(masterURL, "/"), registrationID), nil)
 	if err != nil {
 		return
 	}
 	req.Header.Set("X-Registration-Secret", secret)
-	resp, err := s.do(req)
+	resp, err := s.doSmall(req)
 	if err != nil {
 		// 主节点 5xx/网络故障在注册轮询期同样要可见（否则节点页显示正常但一直
 		// 注册中）；随 401/404/410 走同一 persistSyncError 通道。
@@ -2041,12 +2100,16 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 // 具备摧毁注册态的能力。只有凭证类拒绝（401/404/410）推进 5 连败终止轨道。
 // 返回 true 表示终止轨道已清空集群令牌，调用方本周期不得再按令牌拉取。
 func (s *SyncService) redeemRegistrationConfirm(ctx context.Context, masterURL, clusterToken string) bool {
-	confirm, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/registration/confirm", nil)
+	// 小请求截止：confirm 是每同步周期重试一次的冗余确认，对端挂起时无截止
+	// 会把整条同步循环（含 Pull 与上报）一起冻住。
+	callCtx, cancel := newClusterSmallRequestContext(ctx)
+	defer cancel()
+	confirm, err := http.NewRequestWithContext(callCtx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/registration/confirm", nil)
 	if err != nil {
 		return false
 	}
 	confirm.Header.Set("X-Cluster-Token", clusterToken)
-	confirmed, err := s.do(confirm)
+	confirmed, err := s.doSmall(confirm)
 	if err != nil {
 		s.combineOrReplaceSyncError(ctx, "集群注册确认暂时失败（网络错误），稍后自动重试: "+err.Error(), models.SyncErrorCodeTransportError)
 		return false

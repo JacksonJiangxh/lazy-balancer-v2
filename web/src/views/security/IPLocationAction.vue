@@ -203,7 +203,13 @@ const loadEventCount = async (): Promise<void> => {
   }
 }
 
-const onPopoverShow = (): void => { void loadPolicies(); void loadEventCount() }
+const onPopoverShow = (): void => {
+  // 先清空计数：el-table 刷新数据时单元格实例按索引复用，props.ip 可能已换，
+  // 不清空会在新 IP 上先显示上一行 IP 的「30 天事件」数（亚秒级但会误导）。
+  eventCount.value = null
+  void loadPolicies()
+  void loadEventCount()
+}
 
 // —— 信任直接动作（统一模型）：与触发详情弹框共享实现。
 // 信任此 IP 不再依赖顶部列表选择：策略已有信任用途列表→直接加入；

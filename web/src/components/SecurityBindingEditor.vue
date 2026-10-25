@@ -162,6 +162,7 @@ import type { APIResponse } from '@/types'
 import {
   POLICY_TYPE_SHORT_LABELS,
   inferPolicyType,
+  hasOtherStage2Binding,
   resolveStageOverride,
   chunkForBulk,
   SECURITY_BULK_LIMITS,
@@ -291,7 +292,7 @@ const pickerBlockReason = (rule: BindingEditorRule): string => {
   if (current.some((b) => b.policy_id === props.policyId)) return ''
   if (pickerSelected.value.includes(rule.caddy_id)) return ''
   if (currentPolicyType.value === 'stage2'
-    && current.some((b) => policyTypeById.value.get(b.policy_id) === 'stage2')) {
+    && hasOtherStage2Binding(current, props.policyId, (id) => policyTypeById.value.get(id))) {
     return '该规则已绑定其它限流策略（每规则仅一条），需先解绑'
   }
   if (current.length >= MAX_POLICIES_PER_RULE) {

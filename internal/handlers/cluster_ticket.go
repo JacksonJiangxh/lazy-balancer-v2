@@ -27,10 +27,15 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 	if c.GetString("auth_method") != "oidc" {
 		mfaEnabled, err := services.MFAUserEnabled(int(contextUserID(c)))
 		if err != nil {
+			// 失败留痕单源：审计中间件对 explicit 路由无条件早退（含 5xx），
+			// 本 handler 的每条失败面必须自行补记——票据签发失败（MFA 未启用/
+			// step-up 缺失/节点离线/DB 故障）此前只剩 stdout clusterError 日志。
+			recordAudit(c, "生成失败", "登录票据", "读取 MFA 状态失败")
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "读取 MFA 状态失败"})
 			return
 		}
 		if !mfaEnabled {
+			recordAudit(c, "生成失败", "登录票据", "当前账号未启用 MFA，拒绝登录从节点")
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "登录从节点需先启用 MFA（在「系统设置 → 用户管理」中对自己的账号绑定）"})
 			return
 		}
@@ -44,12 +49,14 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 	if c.GetString("auth_type") == "jwt" && c.GetString("auth_method") != "oidc" {
 		mfaTs, _ := c.Get("mfa_ts")
 		if ts, ok := mfaTs.(float64); !ok || time.Since(time.Unix(int64(ts), 0)) >= 60*time.Second {
+			recordAudit(c, "生成失败", "登录票据", "缺少有效的 MFA 验证（step-up 未完成）")
 			c.AbortWithStatusJSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "登录从节点需要 MFA 验证"})
 			return
 		}
 	}
 	nodeID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || nodeID <= 0 {
+		recordAudit(c, "生成失败", "登录票据", services.FormatAuditDetail("节点编号无效（"+registerAuditField(c.Param("id"))+"）", services.AuditResultPart("invalid_request")))
 		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
 		return
 	}
@@ -59,10 +66,14 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 	if err != nil {
 		status := http.StatusInternalServerError
 		message := "生成登录票据失败"
+		auditCode := "failed"
+		auditReason := err.Error()
 		if errors.Is(err, services.ErrNotMasterNode) {
 			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
 			status = http.StatusForbidden
 			message = err.Error()
+			auditCode = "blocked"
+			auditReason = "节点角色已降级"
 		}
 		if errors.Is(err, services.ErrNodeNotFound) {
 			// 节点不存在属客户端寻址错误,与同族端点
@@ -76,6 +87,7 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 			status = http.StatusConflict
 			message = "目标从节点尚未上报或已离线，请确认从节点在线后重试"
 		}
+		recordAudit(c, "生成失败", "登录票据", services.FormatAuditDetail(fmt.Sprintf("节点 %d", nodeID), auditReason, services.AuditResultPart(auditCode)))
 		clusterError(c, status, message, err)
 		return
 	}

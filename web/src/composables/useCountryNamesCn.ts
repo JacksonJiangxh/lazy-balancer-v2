@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import { request } from '@/utils/api'
+import { hasOwn } from '@/utils/hasOwn'
 import { createLazyLoader } from '@/utils/lazyOnce'
 import type { APIResponse } from '@/types'
 
@@ -31,6 +32,9 @@ export function useCountryNamesCn() {
 // 哨兵/未收录名原样返回（展示层零值改动）。三处消费方（IPLocationAction/
 // TriggerDetailDialog/RuleFlowDialog）需锁步同语义回退——单源小函数在此是
 // 锁步契约载体，非纯重命名。
+// 映射是普通对象且 name 来自外部数据：原型键（constructor/toString 等）直接下标
+// 会返回函数并绕过回退，必须走自有属性守卫。
 export function countryLabel(zh: Record<string, string>, name: string): string {
-  return zh[name] || name
+  const label = hasOwn(zh, name) ? zh[name] : undefined
+  return label || name
 }

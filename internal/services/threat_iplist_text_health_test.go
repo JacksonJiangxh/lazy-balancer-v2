@@ -66,7 +66,8 @@ func TestReadThreatIplistPath_corruptTextFallsBackToFast(t *testing.T) {
 	t.Run("partially valid text stays authoritative", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "threat-z.iplist")
-		// 2/3 可解析 ≥ 50%：正常名单的偶发坏行不得触发回退。
+		// 2/3 可解析 ≥ 50%：正常名单的偶发坏行不得触发回退；坏行按下载解析
+		// 同口径从渲染集剔除（透传会让 @ipListFast 整份解析失败）。
 		if err := os.WriteFile(path, []byte("203.0.113.0/24\n198.51.100.0/24\nbad-line\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -82,8 +83,8 @@ func TestReadThreatIplistPath_corruptTextFallsBackToFast(t *testing.T) {
 		if err != nil {
 			t.Fatalf("读取失败: %v", err)
 		}
-		if len(vals) != 3 || vals[0] != "203.0.113.0/24" {
-			t.Fatalf("可解析率达标时必须沿用文本，got %v", vals)
+		if len(vals) != 2 || vals[0] != "203.0.113.0/24" || vals[1] != "198.51.100.0/24" {
+			t.Fatalf("可解析率达标时必须沿用文本且剔除坏行，got %v", vals)
 		}
 	})
 }

@@ -83,6 +83,91 @@ func TestRearmScheduleSlotsAfterTimezoneChange(t *testing.T) {
 	assertSlot("security_threat_sources", "name=?", "src-legacy", false, futureSh) // 槽域=运行域
 }
 
+// Given 威胁/爬虫源表已有未来槽，且任务级排程列不可读。
+// When 时区变更重排。
+// Then 两张源表槽保持原值（不得用读侧 fail-soft 的默认 04:00 回写）；版本表族
+// 照常重排；读恢复后源表族按新时区重排。
+func TestRearmScheduleSlotsAfterTimezoneChange_scheduleReadFailureKeepsSourceSlots(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	if _, err := ConfigureLocation("Asia/Shanghai"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = ConfigureLocation("UTC") })
+
+	shanghai, _ := time.LoadLocation("Asia/Shanghai")
+	futureSh := NextScheduledSlot(time.Now(), allWeek(), "04:00", shanghai).UTC().Format(crsTimeLayout)
+
+	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO security_crs_version (id, version, auto_update, next_update) VALUES (1,'v1',1,?)`, futureSh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=1, next_update=? WHERE name='ustc'`, futureSh); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatal(err)
+	}
+	const crawlerSource = "googlebot"
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=1, next_update=? WHERE name=?`, futureSh, crawlerSource); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ConfigureLocation("UTC"); err != nil {
+		t.Fatal(err)
+	}
+	restoreThreat := injectScheduleReadFailure(t, "global_config", "threat_schedule_days")
+	restoreCrawler := injectScheduleReadFailure(t, "global_config", "crawler_schedule_days")
+	t.Cleanup(func() {
+		restoreThreat()
+		restoreCrawler()
+	})
+
+	RearmScheduleSlotsAfterTimezoneChange()
+
+	sourceSlot := func(table, where string, arg any) string {
+		t.Helper()
+		var s string
+		if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM `+table+` WHERE `+where, arg).Scan(&s); err != nil {
+			t.Fatalf("读取 %s 排程槽: %v", table, err)
+		}
+		return s
+	}
+	assertAt4UTC := func(label, slot string) {
+		t.Helper()
+		ts := parseUTCSlot(slot)
+		if ts.IsZero() {
+			t.Fatalf("%s 槽不可解析: %q", label, slot)
+		}
+		if h, m := ts.In(time.UTC).Hour(), ts.In(time.UTC).Minute(); h != 4 || m != 0 {
+			t.Fatalf("%s 重排后应为 04:00 UTC（新时区本地日历）, got %02d:%02d", label, h, m)
+		}
+	}
+
+	crsSlot := crsNextUpdate(t)
+	if crsSlot == futureSh {
+		t.Fatalf("版本表族槽未重排（任务级读失败不得影响版本表读取）: %q", crsSlot)
+	}
+	if got := sourceSlot("security_threat_sources", "name=?", "ustc"); got != futureSh {
+		t.Fatalf("威胁源槽=%q, want 保持原值 %q（排程不可读不得写默认 04:00）", got, futureSh)
+	}
+	if got := crawlerSourceSlot(t, crawlerSource); got != futureSh {
+		t.Fatalf("爬虫源槽=%q, want 保持原值 %q（排程不可读不得写默认 04:00）", got, futureSh)
+	}
+
+	restoreThreat()
+	restoreCrawler()
+	RearmScheduleSlotsAfterTimezoneChange()
+
+	assertAt4UTC("威胁源槽（读恢复后）", sourceSlot("security_threat_sources", "name=?", "ustc"))
+	assertAt4UTC("爬虫源槽（读恢复后）", crawlerSourceSlot(t, crawlerSource))
+}
+
 // Given 常驻任务运行中但 task_runs boot 行缺失（插入失败仅 WARN 的残留形态）。
 // When CollectSystemTasks 聚合。
 // Then started_at 置零（UI '—'），不回退引擎进程启动时刻（uptime 语义与

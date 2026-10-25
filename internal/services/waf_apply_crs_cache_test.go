@@ -3,6 +3,7 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,5 +53,42 @@ func TestApplyWafFileBundle_invalidatesCRSRuleCount(t *testing.T) {
 	}
 	if got := m.RuleCount(); got != 1 {
 		t.Fatalf("带外替换后 RuleCount=%d, want 1（缓存未失效）", got)
+	}
+}
+
+// 失败路径同样可能改写 live 树：入口 .sync-bak 自愈会回滚整棵树，替换段的
+// 失败恢复会把旧树拷回。规则数缓存必须随树变更失效，否则面板 rule_count
+// 与实际树分叉到进程重启（成功路径的失效钩子覆盖不到此处）。
+func TestApplyWafFileBundle_failureInvalidatesCRSRuleCount(t *testing.T) {
+	liveDir := filepath.Join(t.TempDir(), "crs")
+	if err := os.MkdirAll(filepath.Join(liveDir, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(liveDir, "rules", "REQUEST-900.conf"), []byte("SecRule old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldLive, oldXdb := crsLiveDir, ip2regionLivePath
+	t.Cleanup(func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb })
+	crsLiveDir = liveDir
+	ip2regionLivePath = filepath.Join(t.TempDir(), "ip2region.xdb")
+
+	m := newCRSUpdateManager(func() error { return nil })
+	m.crsDir = liveDir
+	m.ruleCount = 3
+	m.hasRuleCount = true
+	oldMgr := crsUpdateManager
+	crsUpdateManager = m
+	t.Cleanup(func() { crsUpdateManager = oldMgr })
+
+	payload := rawTarGz(t, []tarEntry{{name: "rules/REQUEST-901.conf", body: []byte("SecRule new\n")}})
+	bundle := &WafFileBundle{CRSTarGz: payload, CRSSha256: strings.Repeat("0", 64)}
+	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil {
+		t.Fatal("声明哈希不符必须拒绝落盘")
+	}
+	m.mu.Lock()
+	hasCount := m.hasRuleCount
+	m.mu.Unlock()
+	if hasCount {
+		t.Fatal("失败路径（可能已回滚/恢复 live 树）必须失效规则数缓存")
 	}
 }

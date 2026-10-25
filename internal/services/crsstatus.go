@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -100,18 +102,35 @@ func IsActiveCRSStatus(status string) bool {
 	return false
 }
 
+// crsRuleCountFailureRetry 规则数扫描失败的负缓存期（与安全总览聚合缓存
+// 同族 30s）：树不可读时 UI 轮询按此节流，树恢复/被替换（Invalidate）后
+// 立即重扫。
+const crsRuleCountFailureRetry = 30 * time.Second
+
 // RuleCount returns the cached SecRule count, scanning the live rules dir on
-// first use.
+// first use. 扫描失败按 crsRuleCountFailureRetry 负缓存（失败不缓存正解会让
+// 坏树状态下每次轮询各付一次递归 Walk + 一条 ERROR）。
 func (m *CRSUpdateManager) RuleCount() int {
 	m.mu.Lock()
 	if m.hasRuleCount {
 		defer m.mu.Unlock()
 		return m.ruleCount
 	}
+	if !m.ruleCountRetryAfter.IsZero() && time.Now().Before(m.ruleCountRetryAfter) {
+		m.mu.Unlock()
+		return 0
+	}
 	m.mu.Unlock()
 	count, err := countSecRules(filepath.Join(m.liveDir(), "rules"))
 	if err != nil {
-		Logf("error", "crs update: failed to count SecRules: %v", err)
+		if msg := fmt.Sprintf("crs update: failed to count SecRules: %v", err); auditFailureShouldLog(msg) {
+			Logf("error", "%s", msg)
+		}
+		m.mu.Lock()
+		if !m.hasRuleCount {
+			m.ruleCountRetryAfter = time.Now().Add(crsRuleCountFailureRetry)
+		}
+		m.mu.Unlock()
 		return 0
 	}
 	// 放锁扫描期间 rescan 可能已写入新值——
@@ -123,29 +142,38 @@ func (m *CRSUpdateManager) RuleCount() int {
 	}
 	m.ruleCount = count
 	m.hasRuleCount = true
+	m.ruleCountRetryAfter = time.Time{}
 	return count
 }
 
 func (m *CRSUpdateManager) rescanRuleCount() {
 	count, err := countSecRules(filepath.Join(m.liveDir(), "rules"))
 	if err != nil {
-		Logf("error", "crs update: failed to rescan SecRules: %v", err)
+		if msg := fmt.Sprintf("crs update: failed to rescan SecRules: %v", err); auditFailureShouldLog(msg) {
+			Logf("error", "%s", msg)
+		}
+		m.mu.Lock()
+		m.ruleCountRetryAfter = time.Now().Add(crsRuleCountFailureRetry)
+		m.mu.Unlock()
 		return
 	}
 	m.mu.Lock()
 	m.ruleCount = count
 	m.hasRuleCount = true
+	m.ruleCountRetryAfter = time.Time{}
 	m.mu.Unlock()
 }
 
 // InvalidateRuleCount 丢弃规则数缓存：/security/crs 的
 // rule_count 是首次扫描后的进程内缓存，而集群同步（ApplyWafFileBundle）与
 // lbbak 备份导入都会带外替换 live CRS 树——不失效则规则数滞留旧值直到进程
-// 重启或下一次成功更新。下次 RuleCount() 调用重新扫描。
+// 重启或下一次成功更新。下次 RuleCount() 调用重新扫描（负缓存一并清零：
+// 树已变化，先前的失败结论不再适用）。
 func (m *CRSUpdateManager) InvalidateRuleCount() {
 	m.mu.Lock()
 	m.ruleCount = -1
 	m.hasRuleCount = false
+	m.ruleCountRetryAfter = time.Time{}
 	m.mu.Unlock()
 }
 

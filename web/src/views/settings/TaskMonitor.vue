@@ -372,7 +372,7 @@ import { formatDate } from '@/utils/date'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { statusColor } from '@/utils/chartTheme'
-import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
+import { certJobStatusLabel, certJobRetryReady, type CertJobStatus } from '@/utils/certJobStatus'
 import { CERT_QUEUE_VISIBLE_JOBS, certQueueHasLive, certQueueIsBusy, certQueueMoreCount } from '@/utils/certQueue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import LogStorageBar from '@/components/LogStorageBar.vue'
@@ -388,7 +388,7 @@ interface TaskInfo {
   loop_on?: boolean; started_at?: string; business_driven?: boolean // 常驻族：循环启停态/引擎启动时刻
   schedule_stopped_reason?: string // 引擎自行停调来源（fail-streak=自动轮连续失败未推进排程槽）
   role_applicable?: boolean // 本节点角色是否允许该任务运行（false=仅主节点，从节点视图标注）
-  retry_cooldown_seconds?: number // 证书行剩余重试冷却（秒，0=可运行；其它行为 0）
+  retry_cooldown_seconds?: number | null // 证书行剩余重试冷却（秒，0=可运行；null=永久不可重试；其它行为 0）
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; operator?: string; status: string
@@ -664,7 +664,10 @@ async function runTaskAction(row: TaskInfo, options: TaskActionOptions): Promise
 
 const runCooldownReason = (row: TaskInfo): string => {
   const seconds = Number(row.retry_cooldown_seconds ?? 0)
-  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  if (!Number.isFinite(seconds)) return ''
+  // 判据与证书任务页同源（utils/certJobStatus）：后端下发「此刻剩余秒」，
+  // 0 即可运行；null（永久不可重试）由 triggerable 呈现禁用态。
+  if (certJobRetryReady(seconds)) return ''
   return `冷却中，约 ${Math.ceil(seconds / 60)} 分钟后可运行`
 }
 

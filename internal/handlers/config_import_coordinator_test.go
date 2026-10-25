@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,6 +45,17 @@ func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
 				t.Fatalf("detail=%q want fragment=%q", detail, test.want)
 			}
 		})
+	}
+}
+
+// assertNoConfigImportWindowLeak 把「导入窗口泄漏」钉到真正的前序用例：
+// configImportBeginMu 是包级全局，异步导入 goroutine 若在本用例开始前仍未
+// 收尾，无关写端点会收到 409「配置导入进行中」而非真实业务码——原形态表现
+// 为随机假红（无法归因）。入口显式失败，消息直指泄漏源。
+func assertNoConfigImportWindowLeak(t *testing.T) {
+	t.Helper()
+	if configImportBusy() {
+		t.Fatal("导入窗口泄漏：configImportBeginMu 仍被前序用例的异步导入持有")
 	}
 }
 
@@ -223,6 +236,134 @@ func TestBeginConfigImport_preservesStoppedCAQueue(t *testing.T) {
 	if manager.IsActive() {
 		t.Fatal("导入恢复了用户停止的 CA 队列（cert-issuance 生命周期被旁路）")
 	}
+}
+
+// 证书队列排空超时（409）与建会话失败的 500 同属「高危操作被拒」的复盘面：
+// 与在途任务排空分支对称，必须留 warn 运行日志与失败审计，不能只在响应里出现。
+func TestBeginConfigImport_certQueueDrainTimeoutAudits(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	services.ResetCAQueueManagerForTest()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	services.InitCAQueueManager(func() error { return nil })
+	services.GetCAQueueManager().Start()
+	// 执行中且不响应取消的条目：PauseAndDrain 退役队列后 active 仍非空。
+	services.GetCAQueueManager().MarkJobRunningForTest("rule-drain", 4242)
+
+	var logs strings.Builder
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+
+	session, err := h.beginConfigImport(context.Background(), "还原")
+	if session != nil {
+		session.close()
+	}
+	if !errors.Is(err, errCertQueueDrainIncomplete) {
+		t.Fatalf("err=%v, want 证书队列排空未完成", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondImportBeginError(ctx, err)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("排空失败 status=%d body=%s, want 409", recorder.Code, recorder.Body.String())
+	}
+
+	var action, detail string
+	if queryErr := db.AuditDB.QueryRow(`SELECT action,detail FROM audit_log WHERE resource='配置备份' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); queryErr != nil {
+		t.Fatalf("证书排空失败必须写审计: %v", queryErr)
+	}
+	if action != "还原失败" {
+		t.Fatalf("审计 action=%q, want 还原失败（动作词必须跟随调用方）", action)
+	}
+	if !strings.Contains(detail, "证书任务执行中") || !strings.Contains(detail, "未执行") {
+		t.Fatalf("审计 detail=%q, want 证书任务执行中/未执行", detail)
+	}
+	if !strings.Contains(logs.String(), "WARNING:") || !strings.Contains(logs.String(), "证书任务执行中") {
+		t.Fatalf("运行日志缺少 warn 留痕: %q", logs.String())
+	}
+}
+
+// 建会话的两条 500 分支（读现有规则/开导入事务）同样必须留痕：事务内失败走
+// failImportAbort，事务外失败若静默，操作审计页对高危操作被拒零记录。
+func TestBeginConfigImport_ruleReadFailureAudits(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	services.ResetCAQueueManagerForTest()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+
+	oldRead := importRuleIDsForBegin
+	importRuleIDsForBegin = func(context.Context) ([]string, error) { return nil, errors.New("injected read failure") }
+	t.Cleanup(func() { importRuleIDsForBegin = oldRead })
+
+	session, err := h.beginConfigImport(context.Background(), "导入")
+	if session != nil {
+		session.close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "读取现有规则") {
+		t.Fatalf("err=%v, want 读取现有规则失败", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondImportBeginError(ctx, err)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", recorder.Code)
+	}
+	var action, detail string
+	if queryErr := db.AuditDB.QueryRow(`SELECT action,detail FROM audit_log WHERE resource='配置备份' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); queryErr != nil {
+		t.Fatalf("读规则失败必须写审计: %v", queryErr)
+	}
+	if action != "导入失败" || !strings.Contains(detail, "读取现有规则") || !strings.Contains(detail, "未执行") {
+		t.Fatalf("审计 action=%q detail=%q, want 导入失败/读取现有规则/未执行", action, detail)
+	}
+
+	// 失败收尾必须恢复调度与串行锁：下一次 begin 能正常建立会话。
+	importRuleIDsForBegin = oldRead
+	retry, retryErr := h.beginConfigImport(context.Background(), "导入")
+	if retryErr != nil {
+		t.Fatalf("失败收尾后调度/锁未释放: %v", retryErr)
+	}
+	retry.close()
+}
+
+func TestBeginConfigImport_beginTxFailureAudits(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	services.ResetCAQueueManagerForTest()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+
+	oldBegin := importBeginTx
+	importBeginTx = func(context.Context) (*sql.Tx, error) { return nil, errors.New("injected tx failure") }
+	t.Cleanup(func() { importBeginTx = oldBegin })
+
+	session, err := h.beginConfigImport(context.Background(), "还原")
+	if session != nil {
+		session.close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "开始导入事务") {
+		t.Fatalf("err=%v, want 开始导入事务失败", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondImportBeginError(ctx, err)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", recorder.Code)
+	}
+	var action, detail string
+	if queryErr := db.AuditDB.QueryRow(`SELECT action,detail FROM audit_log WHERE resource='配置备份' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); queryErr != nil {
+		t.Fatalf("开事务失败必须写审计: %v", queryErr)
+	}
+	if action != "还原失败" || !strings.Contains(detail, "开启导入事务") || !strings.Contains(detail, "未执行") {
+		t.Fatalf("审计 action=%q detail=%q, want 还原失败/开启导入事务/未执行", action, detail)
+	}
+
+	importBeginTx = oldBegin
+	retry, retryErr := h.beginConfigImport(context.Background(), "还原")
+	if retryErr != nil {
+		t.Fatalf("失败收尾后调度/锁未释放: %v", retryErr)
+	}
+	retry.close()
 }
 
 func TestConfigImport_mapsCaddyTransportAndRejectionDifferently(t *testing.T) {

@@ -3271,7 +3271,7 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 		}
 		if raw, exists := policy["block_status_code"]; exists {
 			if n, ok := backupInteger(raw); !ok || !services.ValidBlockStatusCode(int(n)) {
-				policy["block_status_code"] = int64(403)
+				policy["block_status_code"] = int64(db.DefaultBlockStatusCode)
 			}
 		}
 		mode := backupString(policy["mode"])
@@ -5939,7 +5939,14 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
 		}
-		prunedBindings, _ = result.RowsAffected()
+		// DELETE 已成功：计数失败只影响审计/响应里的条数展示，不影响导入结果
+		// ——按 0 计并留痕（同文件其余 RowsAffected 调用均判错，此处不得独吞）。
+		counted, countErr := result.RowsAffected()
+		if countErr != nil {
+			services.Logf("warn", "配置%s：读取悬挂安全策略绑定清理条数失败（按 0 计，清理动作已成功）: %v", action, countErr)
+		} else {
+			prunedBindings = counted
+		}
 	}
 
 	// 四态化启动迁移只覆盖启动路径——pre-v2.2.7 备份
@@ -5951,7 +5958,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 	// 归一为 custom_only(规则从全关静默变生效)。行为与启动迁移一致(旧世界
 	// 数据归一),但在此留审计提示,运维可从事件日志追溯。
 	if policiesReplaced {
-		if result, err := tx.ExecContext(ctx, ImportSecurityPolicyCustomOnlyModeSQL); err != nil {
+		if result, err := tx.ExecContext(ctx, db.SecurityPolicyCustomOnlyModeNormalizationSQL); err != nil {
 			err = failImportAbort(c, session, action, "off→custom_only 归一", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
@@ -6163,8 +6170,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 		threatFilesSnapshotted := lbbakFiles != nil && (len(lbbakFiles.ThreatIplists) > 0 || threatFileReconcile)
 		snapshot, snapshotErr := snapshotLbbakWafTargets(lbbakFiles, threatFilesSnapshotted)
 		if snapshotErr != nil {
-			err = session.abort(fmt.Errorf("快照规则库文件失败: %w", snapshotErr))
-			recordAudit(c, action+"失败", "配置备份", "快照规则库文件失败（未写入任何文件）: "+snapshotErr.Error())
+			err = failImportAbort(c, session, action, "快照规则库文件失败（未写入任何文件）", fmt.Errorf("快照规则库文件失败: %w", snapshotErr))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
 		}
@@ -6206,8 +6212,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 		if crsTreeReplaced && wafApply.FailedCRS {
 			crsTreeReplaced = false
 			if verifyErr := validateV2BackupSecurityPolicies(backup.Tables, false); verifyErr != nil {
-				err = session.abort(verifyErr)
-				recordAudit(c, action+"失败", "配置备份", "CRS 文件未落盘，安全策略按现有规则库校验失败: "+verifyErr.Error())
+				err = failImportAbort(c, session, action, "CRS 文件未落盘，安全策略按现有规则库校验失败", verifyErr)
 				respondAfterWafFailure(http.StatusBadRequest, "CRS 规则库文件未落盘，备份安全策略与现有规则库不兼容，已回滚: "+verifyErr.Error())
 				return
 			}

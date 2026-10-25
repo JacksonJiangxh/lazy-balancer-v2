@@ -1092,18 +1092,22 @@ var caddyRestartWatcherStarted atomic.Bool
 // 流程完成，重放无意义）。
 var caddyRestartProcessStart = time.Now()
 
+// caddyRestartWatcherLoop 是 watcher 循环体（测试缝：用例注入空跑替身，
+// 避免真实的 2s 轮询 stat 泄漏到后续用例）。
+var caddyRestartWatcherLoop = func(h *Handlers) {
+	for {
+		time.Sleep(2 * time.Second)
+		h.caddyRestartWatcherOnce(caddyRestartTriggerFile, caddyRestartProcessStart)
+	}
+}
+
 // StartCaddyRestartWatcher 启动 Caddy 重启监听(2s 轮询 trigger 文件)。
 // 幂等(已运行不重启);main.go 在启动应用完成后调用。
 func (h *Handlers) StartCaddyRestartWatcher() {
 	if !caddyRestartWatcherStarted.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			h.caddyRestartWatcherOnce(caddyRestartTriggerFile, caddyRestartProcessStart)
-		}
-	}()
+	go caddyRestartWatcherLoop(h)
 }
 
 // caddyRestartBackoff 是 caddy-restart 重试的退避状态（指数退避 + 落行降频）：

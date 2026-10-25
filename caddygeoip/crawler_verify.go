@@ -480,13 +480,16 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 // parsePayload 解析 JSON 段集，并按引擎聚合为「升序不相交」前缀集——判定
 // 期二分查找的正确性依赖该不变量（与 @ipListFast 共用聚合原语）。坏条目逐条
 // 跳过（单条损坏不得放大成整份豁免失效、产生误报事件），但必须可见。
-// 返回 false = 内容不可用（fail-closed）。
+// 返回 false = 内容不可用（fail-closed）：聚合后总前缀数为 0（null/{}/
+// 全坏条目）同样是不可用——把空集当 ok 会让判定侧 10 分钟缓存期内恒瞬态
+// （空集=瞬态），且诊断被成功路径的 clearCrawlerSnapshotLogs 抹掉。
 func (s *crawlerIPRangeSnapshot) parsePayload(raw []byte) bool {
 	var all map[string][]string
 	if err := json.Unmarshal(raw, &all); err != nil {
 		return false
 	}
 	badCIDRs := 0
+	total := 0
 	for engine, cidrs := range all {
 		prefixes := make([]netip.Prefix, 0, len(cidrs))
 		for _, cidr := range cidrs {
@@ -497,13 +500,14 @@ func (s *crawlerIPRangeSnapshot) parsePayload(raw []byte) bool {
 			}
 		}
 		s.prefixes[engine] = wafiplist.AggregateParsedPrefixes(prefixes)
+		total += len(prefixes)
 	}
 	if badCIDRs > 0 {
 		crawlerSnapshotLogfThrottled(s.filePath, "bad-cidr",
 			"crawler ip list snapshot %s has %d unparsable CIDR entries; snapshot still cached (fail-open on those entries, engines affected may over-report)",
 			s.filePath, badCIDRs)
 	}
-	return true
+	return total > 0
 }
 
 // commitCrawlerIPRangeSnapshot 在锁内落定快照，并拒绝旧代际/陈旧失败覆盖：

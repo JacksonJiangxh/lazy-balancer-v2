@@ -62,4 +62,10 @@ test('getStrategyLabel 覆盖后端全部枚举值，未知值原样回退', () 
   // 未知/空值回退原文（后端未来新增枚举时面板不炸）
   assert.equal(getStrategyLabel('least_response_time'), 'least_response_time')
   assert.equal(getStrategyLabel(''), '')
+  // 映射是普通对象：原型键必须原样回退（直接下标会返回函数并渲染出源码）
+  for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
+    const label = getStrategyLabel(key)
+    assert.equal(typeof label, 'string', `${key} 策略文案必须是字符串`)
+    assert.equal(label, key)
+  }
 })

@@ -132,10 +132,20 @@ func TestAuditResultText_dynamicCallSitesTripwire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 10 = 既有 9 处 + cluster_registration.go 节点操作的 auditFailure(code, reason)
-	// 闭包（结果码为变量、原因文本只进 detail；取值域 blocked/invalid_request/failed
-	// 均在 auditDynamicResultCodes 内，新增码仍受 TestAuditResultText_auditFailureLiteralsRegistered 与本表约束）。
-	const want = 10
+	// 12 处动态入口（结果码为变量、原因文本只进 detail），逐项取值域：
+	//   certificates.go IssueCertificate 的 auditFailure 闭包 1 处
+	//     （blocked/conflict/failed/invalid_request/skipped）
+	//   caproviders.go 测试 CA 提供商 6 处（provider_error/register_failed/
+	//     invalid_config/missing_acme_email/not_found）
+	//   users.go 修改用户状态 1 处（enabled/disabled）
+	//   cluster_ticket.go 2 处——生成失败（failed/blocked）与 TicketLogin
+	//     失败归因（invalid_ticket/invalid_signature/expired/replay/
+	//     user_unavailable/database_error）
+	//   cluster_registration.go 节点操作闭包 2 处——clusterNodeAction 与站点
+	//     坐标保存各 1（blocked/invalid_request/failed）
+	// 取值域逐项登记在 auditDynamicResultCodes，新增码仍受
+	// TestAuditResultText_auditFailureLiteralsRegistered 与本表约束。
+	const want = 12
 	if dynamic != want {
 		t.Fatalf("AuditResultPart 动态调用点=%d，want %d：新增动态入口必须审查取值域并更新本绊线", dynamic, want)
 	}

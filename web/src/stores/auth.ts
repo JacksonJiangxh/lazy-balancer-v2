@@ -395,8 +395,11 @@ interface LoginResult {
       localLogout()
       return
     }
-    await fetchUser()
-    await fetchConfig()
+    // 两个请求并行：首屏 loading 覆盖整页，串行等待会把最坏路径叠成两次全局
+    // 30s 超时（60s 白屏）；二者互不依赖（/config 定节点模式，/users/me 定
+    // 身份），任一方未就绪都由 readOnlyReason 的 fail-closed 只读态兜底，
+    // 失败重试由各自 15s 链负责。
+    await Promise.all([fetchUser(), fetchConfig()])
   }
 
   return {

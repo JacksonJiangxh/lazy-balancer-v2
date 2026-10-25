@@ -10,6 +10,7 @@ import type { GlobeInstance } from 'globe.gl'
 import * as THREE from 'three'
 import type { Centroid } from '@/utils/countryCentroids'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
+import { hasOwn } from '@/utils/hasOwn'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
@@ -420,7 +421,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   /** 下钻省数据源（中国走内置高精度表；其余取按需加载表，未加载=空）。 */
   function provinceSource(country: string): { name: string; polys: number[][][]; short?: string }[] {
     if (country === '中国') return CHINA_PROVINCES
-    return loadedAdmin1Tables()?.[country] ?? []
+    const tables = loadedAdmin1Tables()
+    // 表是普通对象且 country 来自点击/事件数据：原型键直接下标会拿到函数
+    // （非省表），必须走自有属性守卫。
+    return tables && hasOwn(tables, country) ? tables[country] ?? [] : []
   }
 
   let drillSeq = 0
@@ -442,10 +446,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         if (!disposed) opts?.onProvinceLoadError?.()
         return
       }
-      if (!tables[name]?.length) return
+      const table = hasOwn(tables, name) ? tables[name] : undefined
+      // 表是普通对象（国家名来自点击/事件数据）：原型键直接下标会拿到函数，
+      // 其 length 为形参个数而非省数——必须走自有属性守卫。
+      if (!table?.length) return
     }
     drilledName = name
-    const c2 = COUNTRY_CENTROIDS[name] ?? FALLBACK_CENTROID
+    const c2 = hasOwn(COUNTRY_CENTROIDS, name) ? COUNTRY_CENTROIDS[name] : FALLBACK_CENTROID
     // 暂停态无动画帧驱动：直接落点并补绘一帧（与地图版同语义）。
     globe.pointOfView({ lat: c2[1], lng: c2[0], altitude: flyAltitudeFor(name) }, paused ? 0 : 700)
     globe.controls().autoRotate = false

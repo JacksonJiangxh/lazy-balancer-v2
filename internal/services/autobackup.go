@@ -101,7 +101,7 @@ func SetAutoBackupEnabledTx(tx *sql.Tx, enabled bool) error {
 }
 
 // SyncAutoBackupTaskLoop 事务提交后同步自动备份调度（启用态即开/关循环）。
-func SyncAutoBackupTaskLoop(enabled bool) { syncTaskLoop("auto-backup", enabled) }
+func SyncAutoBackupTaskLoop(enabled bool) { applyBusinessTaskLoop("auto-backup", enabled) }
 
 func currentAutoBackupExecutor() func(ctx context.Context, trigger, operator string, engineRunID int64) error {
 	autoBackupExecMu.Lock()

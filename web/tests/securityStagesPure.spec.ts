@@ -7,6 +7,7 @@
 //
 // 运行：cd web && npm test
 
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
@@ -185,6 +186,27 @@ test('compareVersion：段数值比较，v 前缀与长短段等价', () => {
   // （securityLibraries 的各源 version 最大值）当前只处理日期形态（2026.10.01），
   // 预发布形态不可达；未来若引入 -beta/-rc，必须先改实现并同步本断言。
   assert.ok(compareVersion('1.0.0-beta', '1.0.0') > 0, '设计边界：预发布方向与 semver 相反（消费方仅日期形态）')
+})
+
+// 跨栈共享夹具：与 Go internal/services 的 compareLibraryVersion 同读一份
+// （web/tests/fixtures/version-compare.tsv）。两端各自维护用例表曾让
+// 「缺段 vs 数值 0」判定相反（前端等价、Go 走字符串兜底）而两边都绿。
+test('compareVersion：跨栈共享夹具（Go 同源）', () => {
+  const fixture = readFileSync(new URL('./fixtures/version-compare.tsv', import.meta.url), 'utf8')
+  let checked = 0
+  for (const [index, line] of fixture.split('\n').entries()) {
+    if (line.startsWith('#') || line.trim() === '') continue
+    const fields = line.split('\t')
+    assert.equal(fields.length, 3, `夹具第 ${index + 1} 行字段数`)
+    const a = fields[0] as string
+    const b = fields[1] as string
+    const want = Number((fields[2] as string).trim())
+    // `|| 0` 把 Math.sign 的 -0 归一为 0，与夹具的 0 可直接比较。
+    assert.equal((Math.sign(compareVersion(a, b)) || 0), want, `夹具第 ${index + 1} 行 ${JSON.stringify(a)} vs ${JSON.stringify(b)}`)
+    assert.equal((Math.sign(compareVersion(b, a)) || 0), want === 0 ? 0 : -want, `夹具第 ${index + 1} 行反向 ${JSON.stringify(b)} vs ${JSON.stringify(a)}`)
+    checked++
+  }
+  assert.ok(checked > 0, '跨栈夹具为空')
 })
 
 // 不可达性机械钉：唯一消费方把各源 version 交给 compareVersion，版本来源为

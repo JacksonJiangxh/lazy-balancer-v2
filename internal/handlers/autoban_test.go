@@ -407,6 +407,10 @@ func TestAutobanStatus_listReferencedFailClosed(t *testing.T) {
 // 安全事件列表同源富化（handlers 侧 enrichIPLocation 单源装填）。保留地址无需
 // xdb 即可钉装填链路（私网前置拦截），普通 IP 无 xdb 时降级空串、永不报错。
 func TestAutobanStatus_suggestionsCarryIPLocation(t *testing.T) {
+	// 「无 xdb」必须是显式前置，而不是「测试进程恰好没装载」——导入落盘等
+	// 用例会经 Reload 装上真实库，-shuffle 下顺序一变，下面的空串断言即红。
+	services.ResetIP2RegionSearcherForTest()
+	t.Cleanup(services.ResetIP2RegionSearcherForTest)
 	router := newAutobanTestEnv(t)
 	services.AutobanSetSuggestionsForTest([]services.AutobanSuggestion{
 		{IP: "185.199.109.9", Count: 2},

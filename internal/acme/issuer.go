@@ -30,6 +30,40 @@ type Issuer struct {
 	AccountPreRegistered bool
 }
 
+// 签发分段预算（下发/执行使用的实际值）。每一段都独立设 ctx 预算，让卡住的
+// CA 停在该阶段并以阶段错误暴露，而不是耗尽外层任务预算后报泛化超时。
+//
+// 跨层耦合：这些分段之和必须严格小于 CA 队列的外层执行预算
+// （services.caExecutionTimeout / caExecutionTimeoutFor），否则最坏路径被外层
+// ctx 抢先取消——错误归因退化、白烧一次 renewal_attempts。常量关系由 services
+// 侧断言（IssuanceSegmentBudgetFor 与 caExecutionTimeoutFor 逐域对比），上调
+// 任一分段会立刻失败而不是等线上出现泛化超时。
+const (
+	registrationSegmentBudget = 30 * time.Second
+	propagationSegmentBudget  = 5 * time.Minute
+	// recursiveDNSSegmentBudget 是传播判定内的递归可见性二次确认预算：必须
+	// 覆盖公共递归负缓存刷新抖动的一个有意义比例。它在传播预算内执行，故求和
+	// 时按独立分段累加属保守上界。
+	recursiveDNSSegmentBudget = 120 * time.Second
+	validationSegmentBudget   = 10 * time.Minute
+	orderReadySegmentBudget   = 3 * time.Minute
+	finalizeSegmentBudget     = 10 * time.Minute
+	orderValidSegmentBudget   = 5 * time.Minute
+)
+
+// IssuanceSegmentBudgetFor 返回给定域名数下单次签发的分段预算之和（保守上界）：
+// 注册/订单就绪/finalize/有效期等待各一次；传播、递归确认、验证按域名串行。
+// 供上层（services）断言其小于 CA 队列外层执行预算——acme 是被依赖层，无法
+// 导入 services 的常量，故断言放在 services 侧、由本 getter 取值。
+func IssuanceSegmentBudgetFor(domainCount int) time.Duration {
+	if domainCount < 1 {
+		domainCount = 1
+	}
+	perDomain := propagationSegmentBudget + recursiveDNSSegmentBudget + validationSegmentBudget
+	return registrationSegmentBudget + time.Duration(domainCount)*perDomain +
+		orderReadySegmentBudget + finalizeSegmentBudget + orderValidSegmentBudget
+}
+
 // Issue obtains a certificate for the given domains via DNS-01 challenge.
 // It logs each stage through the Logger and cleans up DNS records afterwards.
 func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM string, err error) {
@@ -49,7 +83,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		log("creating_account", "ACME 账户已在预检中注册，跳过重复注册")
 	} else {
 		log("creating_account", "确认 ACME 账户（新账户注册，已注册则复用）")
-		regCtx, regCancel := context.WithTimeout(ctx, 30*time.Second)
+		regCtx, regCancel := context.WithTimeout(ctx, registrationSegmentBudget)
 		defer regCancel()
 		if err := i.Client.RegisterAccount(regCtx); err != nil {
 			return "", "", fmt.Errorf("register account: %w", err)
@@ -192,7 +226,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 			return "", "", err
 		}
 		log("waiting_propagation", fmt.Sprintf("等待 DNS 传播 %s, 期望值: %s", ci.tokenFQDN, keyAuth))
-		if err := i.waitForDNS(ctx, ci.tokenFQDN, keyAuth, 5*time.Minute); err != nil {
+		if err := i.waitForDNS(ctx, ci.tokenFQDN, keyAuth, propagationSegmentBudget); err != nil {
 			return "", "", fmt.Errorf("dns propagation %s: %w", ci.tokenFQDN, err)
 		}
 		log("dns_propagated", fmt.Sprintf("DNS 已传播 %s", ci.tokenFQDN))
@@ -221,7 +255,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 
 	// Step 5.5: Wait for the order to become ready before finalizing.
 	log("waiting_order_ready", "等待订单就绪")
-	readyCtx, readyCancel := context.WithTimeout(ctx, 3*time.Minute)
+	readyCtx, readyCancel := context.WithTimeout(ctx, orderReadySegmentBudget)
 	readyOrder, err := i.Client.WaitOrder(readyCtx, order.URI)
 	readyCancel()
 	if err != nil {
@@ -259,7 +293,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	// finalize 已在 client 缓存证书字节；此后的失败路径（wait-valid/状态非
 	// valid/下载失败）必须显式丢弃缓存条目，不依赖 FIFO 上限兜底。
 	log("waiting_order_valid", "等待订单最终完成")
-	validCtx, validCancel := context.WithTimeout(ctx, 5*time.Minute)
+	validCtx, validCancel := context.WithTimeout(ctx, orderValidSegmentBudget)
 	validOrder, err := i.Client.WaitOrder(validCtx, order.URI)
 	validCancel()
 	if err != nil {
@@ -299,7 +333,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 // finalizeTimeout 为 finalize 提交（POST CSR + 轮询出证）设定的独立预算，
 // 对齐邻近的 ready 3min / valid 5min 分段预算——卡死的 CA 以 finalize 阶段
 // 错误暴露，而不是耗尽整个任务执行预算后报泛化超时。
-var finalizeTimeout = 10 * time.Minute
+var finalizeTimeout = finalizeSegmentBudget
 
 // finalizeOrder submits the CSR with its own execution budget so a stalled CA
 // is attributable to the finalize stage.
@@ -411,7 +445,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 
 	// ZeroSSL validation can legitimately take several minutes, so allow a
 	// generous budget instead of failing fast into an order-recreating retry.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, validationSegmentBudget)
 	defer cancel()
 
 	ticker := time.NewTicker(validationPollInterval)
@@ -773,7 +807,7 @@ var (
 	// 验证 10m + 就绪 3m + finalize 10m + 有效 5m = 35.5m < 外层
 	// caExecutionTimeout（40m，services/caqueue.go）——原注释的
 	// 「5+2+15min < 30min」算式漏计就绪/finalize/有效三段且外层值错误。
-	recursiveDNSDeadline = 120 * time.Second
+	recursiveDNSDeadline = recursiveDNSSegmentBudget
 )
 
 // recursiveDNSCheckError 区分父上下文取消/截止与独立递归预算用尽。

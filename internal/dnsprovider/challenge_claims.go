@@ -21,8 +21,16 @@ import (
 
 // challengeClaimTTL 是登记的兜底有效期：正常路径由签发链的 deferred 清理注销，
 // TTL 只防御调用方异常退出（panic 捕获外的进程内泄漏）后残留的登记永久压制
-// 同值清理。取值覆盖 CA 队列单任务执行上限（60min）并留余量。
+// 同值清理。取值必须大于「CA 队列执行上限 + 清理上限」并留余量，否则第二条同值
+// 签发会在第一条仍在验证时把对方登记判为过期，随后双方都自认最后一方而删掉
+// 对方仍在等待验证的 TXT。该关系由 services 侧跨层断言钉住（dnsprovider 不能
+// 反向导入 services）。
 const challengeClaimTTL = 90 * time.Minute
+
+// ChallengeClaimTTL 暴露登记兜底有效期，供上层（services）做跨层耦合断言：
+// 「CA 队列执行预算上限 + DNS 清理上限 < TTL」是同值并发互斥不被 TTL 清扫
+// 打断的论证基础。
+func ChallengeClaimTTL() time.Duration { return challengeClaimTTL }
 
 // challengeClaim 是一次在途挑战值的登记句柄。句柄身份（指针）是注销的唯一
 // 凭据——重复调用 Release 不得二次扣减其他在途签发的计数。

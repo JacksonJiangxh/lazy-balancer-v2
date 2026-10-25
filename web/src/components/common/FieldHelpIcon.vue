@@ -3,7 +3,14 @@
     <template #content>
       <slot name="content">{{ content }}</slot>
     </template>
-    <el-icon class="field-help-icon"><QuestionFilled /></el-icon>
+    <!-- 键盘/读屏可达：hover-only 的角标对键盘用户不存在（EP tooltip 在
+         reference 聚焦后按 Enter/Space 展开，triggerKeys 默认即如此）。 -->
+    <el-icon
+      class="field-help-icon"
+      role="button"
+      tabindex="0"
+      :aria-label="content || '字段说明'"
+    ><QuestionFilled /></el-icon>
   </el-tooltip>
 </template>
 
@@ -24,5 +31,10 @@ withDefaults(defineProps<{
 .field-help-icon {
   color: #9ca3af;
   font-size: 14px;
+}
+.field-help-icon:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+  border-radius: 2px;
 }
 </style>

@@ -6,6 +6,9 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -294,5 +297,40 @@ func TestImportConfigBackup_trustedProxyReadFailureReturns500(t *testing.T) {
 	}
 	if strings.Contains(raw, "注入的迭代失败") {
 		t.Fatalf("body=%s 透出了底层错误文本", raw)
+	}
+}
+
+// v1 导入的事务内失败收尾必须与 v2 core 共用 failImportAbort/failImportTx
+// （「回滚 → 失败审计 → 响应」单源）。第三套内联方言（session.abort +
+// recordAudit + 手拼响应）会让文案/审计字段分叉，改一处不覆盖另一处。
+func TestImportV1Config_failureEndingsUseSharedHelpers(t *testing.T) {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, "config_import_v1.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse config_import_v1.go: %v", err)
+	}
+	helpers := 0
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fun := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			if fun.Sel.Name != "abort" {
+				return true
+			}
+			if ident, ok := fun.X.(*ast.Ident); ok && ident.Name == "session" {
+				t.Errorf("%s: v1 导入失败收尾不得内联 session.abort（应经 failImportAbort/failImportTx）", fset.Position(call.Pos()))
+			}
+		case *ast.Ident:
+			if fun.Name == "failImportTx" || fun.Name == "failImportAbort" {
+				helpers++
+			}
+		}
+		return true
+	})
+	if helpers < 10 {
+		t.Fatalf("v1 导入仅 %d 处失败收尾走共享 helper, want ≥10（收尾不得退回内联方言）", helpers)
 	}
 }

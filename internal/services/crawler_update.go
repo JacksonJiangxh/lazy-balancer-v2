@@ -505,6 +505,16 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			changedCount++
 		}
 		if merr := markCrawlerSourceSuccess(src.Name, rc.Trigger, len(entries)); merr != nil {
+			if errors.Is(merr, errScheduleSlotNotAdvanced) {
+				// 源行已 success、名单已写；只是排程槽未推进。不得补写 failed
+				// 源态（与事实相反）——本轮按失败返回让引擎退避重投同一槽。
+				WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 已更新但排程不可读，本轮排程槽未推进: %v", src.Name, merr))
+				failedCount++
+				if firstErr == nil {
+					firstErr = fmt.Errorf("源 %s 排程槽未推进: %w", src.Name, merr)
+				}
+				continue
+			}
 			// 名单内容已写，但源状态机未闭环（源行停留 running/旧槽）：
 			// 任务终态必须与源状态一致地记为失败，不得 success 掩盖。
 			if firstErr == nil {
@@ -603,14 +613,15 @@ const crawlerSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, ne
 const crawlerSlotSuccessSQL = `next_update=IIF(` + slotSuccessGateSQL + `, ?, next_update)`
 
 // crawlerSlotSuccessAssign 爬虫源族成功落的赋值片段与参数（成功门 trigger
-// 两次 + 槽值）。排程不可读时返回 no-op 片段与零参数：状态照常落库、预约
-// 保持旧值——写路径不得用默认排程覆盖用户的星期/HH:MM。
-func crawlerSlotSuccessAssign(trigger string) (string, []any) {
+// 两次 + 槽值）。排程不可读时返回 no-op 片段与错误：状态照常落库、预约保持
+// 旧值，调用方必须把本轮按失败返回给任务引擎（成功轮不推进槽却回 success
+// 会被引擎消费本槽——该族自动更新静默停摆，见 errScheduleSlotNotAdvanced）。
+func crawlerSlotSuccessAssign(trigger string) (string, []any, error) {
 	slot, err := crawlerNextSlotStrict(time.Now().UTC())
 	if err != nil {
-		return noopSlotAssignSQL, nil
+		return noopSlotAssignSQL, nil, fmt.Errorf("%w: %v", errScheduleSlotNotAdvanced, err)
 	}
-	return crawlerSlotSuccessSQL, []any{trigger, trigger, slot}
+	return crawlerSlotSuccessSQL, []any{trigger, trigger, slot}, nil
 }
 
 // crawlerSlotAdvanceAssign 爬虫源族失败落的赋值片段与参数（仅 auto 推进）。
@@ -627,14 +638,21 @@ func crawlerSlotAdvanceAssign(trigger string) (string, []any) {
 // （与威胁族 markSourceSuccess 同口径）：吞错会让任务终态 success 而源行停留
 // running、next_update 不推进——任务日志与源状态机互相矛盾。
 func markCrawlerSourceSuccess(name, trigger string, entryCount int) error {
-	slotSQL, slotArgs := crawlerSlotSuccessAssign(trigger)
+	slotSQL, slotArgs, slotErr := crawlerSlotSuccessAssign(trigger)
 	args := append(append([]any{entryCount, time.Now().UTC().Format("2006.01.02")}, slotArgs...), name)
 	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET entry_count=?, version=?, update_status='success', message='', consecutive_failures=0, `+slotSQL+`, finished_at=datetime('now') WHERE name=?`,
 		args...)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写成功态失败: %v", name, err)
+		return err
 	}
-	return err
+	// 状态列已落库但排程槽未推进（排程不可读）：按错误上抛，让调用方把本轮
+	// 记为失败（引擎退避重投同一槽，读恢复后自愈）——源状态 success + 过期
+	// 槽会让引擎按「成功未推进」消费本槽，该族自动更新静默停摆。
+	if slotErr != nil {
+		Logf("error", "crawlerbot-update: 源 %s 排程不可读，本轮排程槽未推进（引擎将退避重投）: %v", name, slotErr)
+	}
+	return slotErr
 }
 
 // markCrawlerSourceCancelled 用户取消终态：保留上次快照、版本与失败计数，

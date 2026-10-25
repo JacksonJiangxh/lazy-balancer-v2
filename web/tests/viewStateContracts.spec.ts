@@ -7,7 +7,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, section } from './_helpers.ts'
+import { code, member, section, source } from './_helpers.ts'
+import { bucketTerminology } from '../src/utils/threatScreenMetrics.ts'
 
 test('规则向导切 TCP 清空动态上游与 DNS 字段（隐藏控件不得留下恒拒残留）', () => {
   const rules = code('src/views/Rules.vue')
@@ -167,7 +168,7 @@ test('视图口径与样式契约：端口门、CA 门、摘要披露、分页�
   assert.match(dash, /chart-stale-hint/, '采集失败保留曲线并标陈旧')
   const screen = code('src/views/security/ThreatScreen.vue')
   assert.doesNotMatch(screen, /'mixed'/, '动作分支仅 blocked/logged，mixed 不可达')
-  assert.match(screen, /actionLabel\(t\.action\)/, '弹框动作文案复用单源映射')
+  assert.match(screen, /eventActionFull\(t\.action\)/, '弹框动作文案复用单源映射')
   const overview = code('src/views/security/SecurityOverview.vue')
   assert.doesNotMatch(overview, /<el-col :span="(16|8)"/, '下两行必须补响应式断点')
   const css = code('src/styles/main.css')
@@ -180,3 +181,142 @@ test('视图口径与样式契约：端口门、CA 门、摘要披露、分页�
   const retry = section(task, 'const retryPolling = async', 'interface CertJobRow')
   assert.match(retry, /refreshing\.value = true/)
 })
+
+test('窗口粒度术语：窗口词与峰值/计数词同源派生（7d 不得渲染 168 小时）', () => {
+  assert.deepEqual(bucketTerminology(1), { unit: '小时', peakLabel: '峰值时段', countLabel: '有事件小时', windowLabel: '1 小时' })
+  assert.deepEqual(bucketTerminology(24), { unit: '小时', peakLabel: '峰值时段', countLabel: '有事件小时', windowLabel: '24 小时' })
+  assert.deepEqual(bucketTerminology(168), { unit: '天', peakLabel: '峰值日期', countLabel: '有事件天', windowLabel: '7 天' })
+})
+
+test('大屏：配置重试联动引擎重装、切换失败三态互斥、窗口词随粒度派生', () => {
+  const screen = code('src/views/security/ThreatScreen.vue')
+  // 配置重试必须重装引擎：模式（map/globe）由 /config 决定，只改 screenMode 会让
+  // HUD（地球标题/竖扫/操作提示）与舞台引擎错配。mountEngine 幂等。
+  const retry = section(screen, 'async function retryConfigLoad', 'const feedError = ref(false)')
+  assert.match(retry, /await loadServerCentroid\(\)/)
+  assert.match(retry, /await mountEngine\(\)/)
+  assert.match(screen, /@click="retryConfigLoad"/)
+  // 失败时不得同时呈现「切换中」：旧帧改标「上次结果 · 窗口 X」
+  assert.match(screen, /const statsPending = computed\(\(\) => !statsError\.value && stats\.value !== null/)
+  assert.match(screen, /上次结果 · /)
+  // 7d 窗口不得再渲染「168 小时 / 168h」（窗口词由 bucketTerms.windowLabel 派生）
+  assert.doesNotMatch(screen, /windowHours \}\} 小时/)
+  assert.doesNotMatch(screen, /windowHours \}\}h/)
+  assert.match(screen, /bucketTerms\.windowLabel/)
+})
+
+test('大屏死样式与重复常量收敛（调色板单源、转发别名已删）', () => {
+  const screen = code('src/views/security/ThreatScreen.vue')
+  assert.doesNotMatch(screen, /\.kpi-value small/, '模板内无 small，规则为死样式')
+  assert.doesNotMatch(screen, /class="mono"/, '全仓无 .mono 选择器')
+  assert.doesNotMatch(screen, /hint-desktop/, '无匹配规则')
+  assert.doesNotMatch(screen, /countryBarColor/, '纯转发别名必须删除')
+  assert.doesNotMatch(screen, /SHARE_PALETTE|TYPE_PALETTE/, '两份同值调色板收敛为单源')
+  assert.match(screen, /const THREAT_PALETTE = \[/)
+})
+
+test('规则库四库回刷：silent 拉取 + 每库请求序号守卫', () => {
+  const page = code('src/views/security/SecurityRules.vue')
+  const cases = [
+    ['fetchThreatLib', 'threatLibInfoSeq'],
+    ['fetchCrawlerLib', 'crawlerLibInfoSeq'],
+    ['fetchCRS', 'crsInfoSeq'],
+    ['fetchIP2RegionInfo', 'ip2regionInfoSeq'],
+  ] as const
+  for (const [fn, seq] of cases) {
+    const body = member(page, `const ${fn} = async`)
+    assert.match(body, /, \{ silent: true \}\)/, `${fn} 失败态由健康标签承载，不得逐分钟弹全局 toast`)
+    assert.match(body, new RegExp(`const seq = \\+\\+${seq}`), `${fn} 缺请求序号`)
+    assert.equal(
+      (body.match(new RegExp(`seq !== ${seq}`, 'g')) ?? []).length,
+      2,
+      `${fn} 成功与失败分支都要守卫（乱序响应不得覆盖新值）`,
+    )
+  }
+})
+
+test('样式契约收敛：scoped 重复删除、main.css 合并、死重量清理', () => {
+  for (const file of ['src/views/Rules.vue', 'src/views/settings/CertJobs.vue', 'src/views/AuditLog.vue']) {
+    assert.doesNotMatch(
+      code(file),
+      /^\.polling-error-alert \{ margin-bottom: 16px; \}$/m,
+      `${file} 仍逐字重复全局 .polling-error-alert`,
+    )
+  }
+  const css = code('src/styles/main.css')
+  assert.match(css, /^\.polling-error-alert \{ margin-bottom: 16px; \}$/m, '全局单源必须保留')
+  assert.equal((css.match(/\.dialog-body-inset \.el-dialog__body \{/g) ?? []).length, 1, '两条同名声明必须合并')
+  assert.doesNotMatch(code('src/views/security/SecurityPolicies.vue'), /mb-5/, 'mb-5 被同权重后置声明覆盖，属死重量')
+})
+
+test('顶栏消费 /caddy/status 的 status：非仪表盘页可见 Caddy 停摆', () => {
+  const layout = code('src/components/layout/AppLayout.vue')
+  assert.match(layout, /caddyStopped\.value = res\.data\?\.status === 'stopped'/)
+  assert.match(layout, /v-if="caddyStopped"/)
+  assert.match(layout, /Caddy 服务未运行/)
+  assert.match(layout, /重启服务<\/el-button>|>重启服务</, '横幅必须带恢复入口')
+})
+
+test('日志占用条注释指向 utils/formatBytes 单源（不再称 api.ts）', () => {
+  const raw = source('src/components/LogStorageBar.vue')
+  assert.match(raw, /复用 utils\/formatBytes/)
+  assert.doesNotMatch(raw, /复用 api\.ts 的 formatBytes/)
+})
+
+test('基础设置时区：自由输入在保存前做 IANA 校验（不连坐整卡 400）', () => {
+  const page = code('src/views/settings/BasicSettings.vue')
+  assert.match(page, /new Intl\.DateTimeFormat\(undefined, \{ timeZone: tz \}\)/)
+  const save = section(page, 'const handleSave = async () => {', 'saving.value = true')
+  assert.match(save, /const tzError = timezoneError\(settings\.value\.timezone\)/)
+  assert.match(save, /settings\.value\.timezone = settings\.value\.timezone\.trim\(\)/)
+})
+
+test('MFA 自助缺口：激活响应缺 data 显性报错、动态码弹框提交中不可关', () => {
+  const wizard = code('src/components/MfaBindingWizard.vue')
+  assert.match(wizard, /if \(!res\.data\) \{/, '契约违约不得静默 return')
+  assert.match(wizard, /响应异常，请重试/)
+  const profile = code('src/components/ProfileDialog.vue')
+  assert.match(profile, /:close-on-press-escape="!mfaSubmitting"/)
+  assert.match(profile, /:show-close="!mfaSubmitting"/)
+})
+
+test('可访问名：CodeEditor 暴露 ariaLabel、帮助角标键盘可达', () => {
+  const editor = code('src/components/CodeEditor.vue')
+  assert.match(editor, /readonly ariaLabel\?: string/)
+  assert.match(editor, /:aria-label="ariaLabel \|\| undefined"/)
+  assert.match(code('src/views/security/SecurityBlockPages.vue'), /<CodeEditor[^>]*aria-label="拦截页面内容"/)
+  const help = code('src/components/common/FieldHelpIcon.vue')
+  assert.match(help, /tabindex="0"/)
+  assert.match(help, /role="button"/)
+  assert.match(help, /:aria-label="content \|\| '字段说明'"/)
+})
+
+test('IP 快捷弹层打开即清旧事件计数（行复用不串上一 IP）', () => {
+  const page = code('src/views/security/IPLocationAction.vue')
+  const show = section(page, 'const onPopoverShow', 'void loadEventCount()')
+  assert.match(show, /eventCount\.value = null/, '必须先清空再取数')
+})
+
+test('触发详情：策略 GET 的 catch 有会话序号守卫（与同函数其余 await 同口径）', () => {
+  const dialog = code('src/components/events/TriggerDetailDialog.vue')
+  const catchAt = dialog.indexOf('policyMissing.value = err instanceof Error')
+  assert.ok(catchAt > 0, '策略缺失判据缺失')
+  const windowStart = Math.max(0, catchAt - 240)
+  assert.match(
+    dialog.slice(windowStart, catchAt),
+    /if \(seq !== loadSeq\) return/,
+    '旧会话失败不得把新会话标成策略已删除/加载失败',
+  )
+})
+
+test('拦截页表单与后端同源前置门（名称/描述长度、内容非空与 64KB）', () => {
+  const text = code('src/views/security/SecurityBlockPages.vue')
+  assert.match(text, /v-model="form\.name"[^>]*maxlength="100"/)
+  assert.match(text, /v-model="form\.description"[^>]*maxlength="500"/)
+  assert.match(text, /const BLOCK_PAGE_CONTENT_MAX_BYTES = 64 << 10/)
+  assert.match(text, /if \(!form\.value\.content\.trim\(\)\)/)
+  assert.match(text, /new TextEncoder\(\)\.encode\(form\.value\.content\)\.byteLength/)
+  assert.match(text, /contentBytes > BLOCK_PAGE_CONTENT_MAX_BYTES/)
+  assert.doesNotMatch(text, /\.block-page-form \.content-form-item \.el-form-item__content/, '永不命中的 scoped 选择器已删除')
+})
+

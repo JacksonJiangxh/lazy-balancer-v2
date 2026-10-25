@@ -224,13 +224,18 @@ func threatTrafficSnapshot(adminURL string) (gin.H, bool) {
 	return data, ok
 }
 
-// invalidateThreatRollupDimAggregateCache 清空聚合缓存。请求路径刚完成同步固化
-// 后必须调用：固化会改写窗口内分钟行（最新分钟/重固窗口），而缓存键只含
-// sinceMinute/槽界/coverage——不清会让本次响应返回固化前的数据，直到 TTL 过期。
-func invalidateThreatRollupDimAggregateCache() {
+// invalidateThreatScreenRollupCaches 清空「读 rollup 分钟行」的两份缓存。请求
+// 路径刚完成同步固化后必须调用：固化会改写窗口内分钟行（最新分钟/重固窗口），
+// 而聚合缓存键只含 sinceMinute/槽界/coverage、top_targets 键只含 sinceMinute
+// ——任一未清都会让本次响应返回固化前的数据，直到 TTL 过期（同一屏总量/国家
+// 已重算而 Top3 仍旧，展示口径分叉）。
+func invalidateThreatScreenRollupCaches() {
 	threatRollupDimAggregateCacheMu.Lock()
 	threatRollupDimAggregateCache = map[threatRollupDimAggregateKey]threatRollupDimAggregateEntry{}
 	threatRollupDimAggregateCacheMu.Unlock()
+	topTargetsCacheMu.Lock()
+	topTargetsCache = map[topTargetsCacheKey]topTargetsCacheEntry{}
+	topTargetsCacheMu.Unlock()
 }
 
 // resetThreatScreenCachesForTest 测试缝：清空大屏进程内缓存（生产不调用）。

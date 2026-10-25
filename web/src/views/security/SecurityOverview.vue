@@ -102,7 +102,7 @@
                   <!-- 库文件缺失优先于更新状态（缺库降级口径，2026-09-24 裁定） -->
                   <!-- disable-transitions：异步数据到达时标签实例新建会重播 EP
                        zoom-in-center（先漂后归位，2026-09-25 用户反馈修复，Dashboard 判例同款） -->
-                  <el-tag v-if="overview.crs_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>缺失</el-tag>
+                  <el-tag v-if="overview.crs_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>未安装</el-tag>
                   <el-tag v-else-if="overview.update_status" :type="libraryStatusTagType(overview.update_status)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(overview.update_status) }}</el-tag>
                 </div>
               </div>
@@ -114,7 +114,7 @@
                   <div class="stat-box__value">{{ overview.ip2region_available === false || ip2regionVersion === 'unknown' ? '未安装' : ip2regionVersion === 'bundled' ? '内置版本' : ip2regionVersion }}</div>
                   <div class="stat-box__label">IP 地理库</div>
                   <el-tag v-if="ip2regionError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
-                  <el-tag v-else-if="overview.ip2region_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>缺失</el-tag>
+                  <el-tag v-else-if="overview.ip2region_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>未安装</el-tag>
                   <el-tag v-else-if="ip2regionVersion === 'unknown'" type="info" size="small" effect="plain" style="margin-top: 4px" disable-transitions>未安装</el-tag>
                   <el-tag v-else-if="ip2regionStatus" :type="libraryStatusTagType(ip2regionStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(ip2regionStatus) }}</el-tag>
                 </div>

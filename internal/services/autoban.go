@@ -275,7 +275,8 @@ func SetAutobanConfig(cfg AutobanConfig) error {
 	if !cfg.Enabled {
 		AutobanDisableFlush()
 	}
-	syncTaskLoop(AutobanTaskID, cfg.Enabled)
+	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）。
+	applyBusinessTaskLoop(AutobanTaskID, cfg.Enabled)
 	return nil
 }
 
@@ -707,6 +708,10 @@ func parseAutobanEntryTime(s string) time.Time {
 // 与 db 播种同为 name+system=1 口径）。可达形态：旧备份导入全表替换后 system
 // 名单种子不重播、旧版本可携带同名用户列表——仅 name 判定的播种会永久跳过
 // 内置行，而 autoban 全部消费方要求 system=1。同名用户列表不合并、不删除。
+//
+// 补建统一走 db.EnsureSystemIPList（启动播种/导入重播共用实现）：OR IGNORE
+// 幂等、描述按代码文案归一、同名用户列表留痕都在单源内完成——手写 INSERT
+// 曾与播种在 category 字面量/描述来源/幂等性三处漂移。
 func ensureAutobanPresetListID() (int64, error) {
 	if db.DB == nil {
 		return 0, errors.New("数据库未初始化")
@@ -719,16 +724,16 @@ func ensureAutobanPresetListID() (int64, error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
-		SELECT ?, ?, '自动封禁', '[]', 1, datetime('now'), datetime('now')
-		WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name=? AND system=1)`,
-		AutobanPresetListName, autobanPresetListDescription, AutobanPresetListName); err != nil {
-		return 0, fmt.Errorf("补建预置名单「%s」: %w", AutobanPresetListName, err)
+	created, cerr := db.EnsureSystemIPList(db.DB, AutobanPresetListName, autobanPresetListDescription, "自动封禁")
+	if cerr != nil {
+		return 0, fmt.Errorf("补建预置名单「%s」: %w", AutobanPresetListName, cerr)
 	}
 	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, AutobanPresetListName).Scan(&id); err != nil {
 		return 0, fmt.Errorf("预置名单「%s」补建后仍不可见: %w", AutobanPresetListName, err)
 	}
-	Logf("warn", "自动封禁预置名单缺失，已自动补建 system=1 行（若存在同名用户列表请重命名以消除歧义）")
+	if created {
+		Logf("warn", "自动封禁预置名单缺失，已自动补建 system=1 行（若存在同名用户列表请重命名以消除歧义）")
+	}
 	return id, nil
 }
 

@@ -2031,3 +2031,46 @@ func TestAPIDocs_mfaVerifyDocumentsConcurrent409(t *testing.T) {
 		t.Fatal("POST /auth/mfa/verify 未登记 409（并发验码形态）")
 	}
 }
+
+// 鉴权表对 API Key 写能力的承诺必须与只读 Key 写豁免清单同源
+// （services.IsReadOnlyWriteRoute）：非管理员用户创建的 Key 被强制
+// read_only=true，且 /users/me 与 /users/me/api-keys 不在豁免清单里——自助写
+// 只对登录会话放行。文档若把它们写成「Key 自助写除外」，按文档编排的脚本会
+// 100% 收 403，并掩盖「Key 恒只读」这一更简单的事实。
+func TestAPIDocs_readOnlyKeyClaimMatchesWriteWhitelist(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "docs", "api.zh-CN.md"))
+	if err != nil {
+		t.Fatalf("读 docs/api.zh-CN.md: %v", err)
+	}
+	var row string
+	for _, line := range strings.Split(string(source), "\n") {
+		if strings.HasPrefix(line, "| API Key |") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("docs/api.zh-CN.md 缺 API Key 鉴权行")
+	}
+
+	// 派生侧前提：自助写路径确实不在只读 Key 写豁免清单内。
+	for _, probe := range []struct{ method, path string }{
+		{http.MethodPatch, "/api/v1/users/me"},
+		{http.MethodPost, "/api/v1/users/me/api-keys"},
+	} {
+		if services.IsReadOnlyWriteRoute(probe.method, probe.path) {
+			t.Fatalf("前提变化：%s %s 已进只读 Key 写豁免清单——文档可恢复「Key 自助写」口径",
+				probe.method, probe.path)
+		}
+	}
+
+	// 豁免清单不含自助写路径 ⇒ 文档不得把它们写成 Key 的写例外。
+	if strings.Contains(row, "自助写除外") {
+		t.Errorf("API Key 行仍宣称「自助写除外」，但只读 Key 写豁免清单不含 /users/me 系列: %s", row)
+	}
+	for _, want := range []string{"恒为只读", "登录会话"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("API Key 行缺 %q（须说明 Key 无写例外、自助写走登录会话）: %s", want, row)
+		}
+	}
+}

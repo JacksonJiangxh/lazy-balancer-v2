@@ -1422,9 +1422,11 @@ func snapshotActiveUpdateStatus(status string) bool {
 
 // normalizeSnapshotPolicyRow 把快照策略行归一为「从端落库值」口径，单源供
 // apply 写侧与 security 节哈希输入共用：
-//   - anomaly_threshold<=0/nil→5（Create 侧默认，与主节点启动回填同口径）；
+//   - anomaly_threshold<=0/nil→db.DefaultAnomalyThreshold（Create 侧默认，与
+//     主节点启动回填同口径）；
 //   - rate_limit_burst<0→0（省略型规范值，负值仅带外可达）；
-//   - block_status_code 枚举外→403（默认拦截状态码，与启动归一/导入门同口径）。
+//   - block_status_code 枚举外→db.DefaultBlockStatusCode（默认拦截状态码，与
+//     启动归一/导入门同口径）。
 //     rate_limit_rps 有意不归一：无默认可归，镜像语义下主从渲染同报错
 //     （fail-visible，buildRateLimitHandler）；
 //   - geoip_crawler_exempt/engines 缺列补 schema 默认（旧主节点/手工快照），
@@ -1434,13 +1436,13 @@ func snapshotActiveUpdateStatus(status string) bool {
 //     否则同一行两侧字节不等。
 func normalizeSnapshotPolicyRow(p map[string]interface{}) {
 	if toFloat64(p["anomaly_threshold"]) <= 0 {
-		p["anomaly_threshold"] = int64(5)
+		p["anomaly_threshold"] = int64(db.DefaultAnomalyThreshold)
 	}
 	if toFloat64(p["rate_limit_burst"]) < 0 {
 		p["rate_limit_burst"] = int64(0)
 	}
 	if !ValidBlockStatusCode(int(toFloat64(p["block_status_code"]))) {
-		p["block_status_code"] = int64(403)
+		p["block_status_code"] = int64(db.DefaultBlockStatusCode)
 	}
 	if p["geoip_crawler_exempt"] == nil {
 		p["geoip_crawler_exempt"] = int64(0)
@@ -1703,6 +1705,9 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		normalized := normalizeJWTExpireMinutes(*settings.JWTExpireMinutes)
 		settings.JWTExpireMinutes = &normalized
 	}
+	// 安全事件保留/采样三列与主端装载侧共用同一归一：判据与 CaddyConfig
+	// 是否随包无关（旧主端可只带这三列），故在任何写入分支之前统一处理。
+	normalizeSnapshotSecurityRetentionSettings(&settings)
 	var baseClauses []string
 	var baseArgs []any
 	addBase := func(column string, value any) {
@@ -1918,31 +1923,19 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	// 自动封禁六项配置同口径入块（指针缺席=旧主端快照未
 	// 携带——跳过写入保留从端本地值，不清零；新主端恒携带全组，升主即生效）。
+	// 安全事件保留/采样三列已在上方经 normalizeSnapshotSecurityRetentionSettings
+	// 归一（与主端装载侧同一函数），此处只负责入块。
 	if settings.SecurityEventsRetentionDays != nil {
-		days := *settings.SecurityEventsRetentionDays
-		if days <= 0 || days > db.MaxSecurityEventsRetentionDays {
-			days = securityEventsRetentionDefaultDays
-		}
 		settingClauses = append(settingClauses, "security_events_retention_days=?")
-		settingArgs = append(settingArgs, days)
+		settingArgs = append(settingArgs, *settings.SecurityEventsRetentionDays)
 	}
 	if settings.SecurityEventsRowCap != nil {
-		rowCap := *settings.SecurityEventsRowCap
-		if rowCap <= 0 || rowCap > db.MaxSecurityEventsRowCap {
-			rowCap = securityEventsRetentionDefaultMax
-		}
 		settingClauses = append(settingClauses, "security_events_row_cap=?")
-		settingArgs = append(settingArgs, rowCap)
+		settingArgs = append(settingArgs, *settings.SecurityEventsRowCap)
 	}
 	if settings.ThreatTrafficSampleN != nil {
-		sample := *settings.ThreatTrafficSampleN
-		// 合法域=自适应默认或 0（关闭）；其余归一为默认（与装载侧
-		// cluster_snapshot.go 同常量，默认值单源）。
-		if sample != db.DefaultThreatTrafficSampleN && sample != 0 {
-			sample = db.DefaultThreatTrafficSampleN
-		}
 		settingClauses = append(settingClauses, "threat_traffic_sample_n=?")
-		settingArgs = append(settingArgs, sample)
+		settingArgs = append(settingArgs, *settings.ThreatTrafficSampleN)
 	}
 	// 大屏视觉模式：枚举白名单与写侧同源（models.IsValidThreatScreenMode）；
 	// 非法值归默认而非落脏值——渲染/读侧直读库值，脏枚举会让大屏回退分支

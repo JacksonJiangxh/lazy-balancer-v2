@@ -14,15 +14,16 @@ import {
   blockPageStageCanIntercept,
   buildStageModel,
   entryMatchesIp,
+  ensureSharedEntries,
   eventDetailRefIds,
   extractCrsRuleSnippet,
   formatAclModeDetail,
   hasIPACLControl,
   inferPolicyType,
+  invalidateSharedEntriesCache,
   isTrustExemptionCandidate,
   isWafDurationFamily,
   missingSharedEntryIds,
-  sharedEntriesCache,
   triggerStageFamily,
   trustHitMode,
   type SecurityStageBinding,
@@ -241,16 +242,16 @@ test('白名单零生效集：ACL 关闭时不得误报「将拒绝所有请求�
   assert.equal(formatAclModeDetail([], { ip_acl_enabled: true, ip_acl_mode: 'allow', ip_acl_list: '[]' }), '白名单模式 · 0 条（将拒绝所有请求）')
 })
 
-test('缺失名单条目判定单源：只报未缓存的正 id（静默失败的唯一可见信号）', () => {
-  const before = { ...sharedEntriesCache }
-  for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
+test('缺失名单条目判定单源：只报未缓存的正 id（静默失败的唯一可见信号）', async () => {
+  // 经生产写入口落地（writeSharedEntries 记录加载时刻）——直接写 sharedEntriesCache
+  // 没有加载时刻，按 TTL 契约本就该被判为陈旧，自写自断言会失去鉴别力。
+  invalidateSharedEntriesCache()
   try {
-    sharedEntriesCache[7] = ['1.1.1.1']
+    await ensureSharedEntries([7], async () => ['1.1.1.1'])
     assert.deepEqual(missingSharedEntryIds([7, 8, 8, 0, -3]), [8], '已缓存/非正 id 不得计入缺失')
     assert.deepEqual(missingSharedEntryIds([]), [])
   } finally {
-    for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
-    Object.assign(sharedEntriesCache, before)
+    invalidateSharedEntriesCache()
   }
 })
 

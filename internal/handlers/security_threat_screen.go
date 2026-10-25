@@ -64,11 +64,14 @@ func describeThreatRuleNameWithNames(key string, customNames map[int]string) str
 	switch n {
 	case 2:
 		return "IP 访问控制拦截（#2）"
-	case 3, 12:
+	case 3, 5, 12:
+		// id:5 是「绕过模式占位」的信任名单 DetectionOnly 规则（id:3 的同族
+		// 变体）——与 triggerTypeForRule/attackFamilyClassOf 的族标签同集合；
+		// 威胁情报库的历史段是 id:14，二者不得共用一个标签。
 		return "信任名单检测（#" + key + "）"
 	case 4:
 		return "IP 黑名单（#4）"
-	case 5, 14:
+	case 14:
 		return "威胁情报库（#" + key + "）"
 	case 7:
 		return "IP 白名单拒绝（#7）"
@@ -1756,12 +1759,13 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	needsSync := !threatRollupWarmerStarted.Load() || threatRollupStale() ||
 		(hours > 24 && !threatRollupCoverageReaches(hours))
 	if needsSync {
-		// 同步固化可能提交了部分批（错误路径同样会提交），聚合缓存必须失效：
-		// 否则本次响应仍返回固化前的窗口数据。
+		// 同步固化可能提交了部分批（错误路径同样会提交），读 rollup 分钟行的
+		// 两份缓存（维度聚合 + top_targets）都必须失效：否则本次响应仍返回
+		// 固化前的窗口数据。
 		if err := ensureThreatRollup(hours); err != nil {
 			trackErr(err)
 		}
-		invalidateThreatRollupDimAggregateCache()
+		invalidateThreatScreenRollupCaches()
 	}
 	// 宽窗口首轮只回填有界批数（threatRollupMaxBatchesPerCall），
 	// 最近成功固化不代表窗口头部已覆盖——必须披露部分聚合，避免把少计的
@@ -1795,7 +1799,9 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		if rawCoverageFrom != "" && rawCoverageFrom > windowStartMinute.Format("2006-01-02 15:04:05") {
 			rawCoverageLimited = true
 			if coverageFrom == "" {
-				coverageFrom = rawCoverageFrom[:16]
+				// 异形 event_time（带外写库/异形导入）可能短于 19 字符：
+				// 直接 [:16] 会 panic 整个处理器，统一走锚点 helper。
+				coverageFrom = threatMinuteAnchor(rawCoverageFrom)
 			}
 		}
 	}

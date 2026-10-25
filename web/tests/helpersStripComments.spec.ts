@@ -183,6 +183,8 @@ test('脚本存在性断言文件禁止裸 source()/repoSource() 回流', () => 
     'securityStagesPure.spec.ts',
     // 面板边界 marker 是 HTML 注释：先在 raw 上切片、再剥注释做代码断言。
     'panelUiWiring.spec.ts',
+    // 注释文案钉（断言对象是过时注释本身，剥注释后无法判定）。
+    'viewStateContracts.spec.ts',
   ])
   // 本文件自身含判据的合成样本字符串（非真实导入），排除自扫描。
   const offenders = specFiles.filter((name) => name !== 'helpersStripComments.spec.ts' && rawImport.test(readSpec(name)) && !allowedRaw.has(name))

@@ -12,6 +12,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,39 +22,98 @@ import (
 type middlewareRouteRegistration struct {
 	// handler 是注册末位处理器名（`h.X` 的 X）；无 h.X 的机器接口注册为空串。
 	handler string
-	// rateLimitKey/rateLimitPerMin 是注册处挂载的限流桶（loginRateLimit 与
-	// clusterRateLimit 两个中间件）；未挂限流时 rateLimitPerMin 为 0。
-	rateLimitKey       string
-	rateLimitPerMin    int
-	rateLimitMounted   bool
+	// rateLimitKey/rateLimitPerMin 是注册处挂载的限流桶（loginRateLimit、
+	// clusterRateLimit 与两个包装器 clusterRegisterRateLimit/
+	// clusterMachineRateLimit）；未挂限流时 rateLimitPerMin 为 0。
+	rateLimitKey     string
+	rateLimitPerMin  int
+	rateLimitMounted bool
+	// rateLimitIPPerMin 是同一注册上的第二档（按来源 IP）限额：集群机器接口
+	// 同时按凭证与 IP 计费；单档限流为 0。
+	rateLimitIPPerMin  int
 	rateLimitMessageCN string
+}
+
+// middlewareFuncDecl 取具名函数的声明——限额派生必须读包装器的实现体，
+// 测试里不复制常量。
+func middlewareFuncDecl(file *ast.File, name string) *ast.FuncDecl {
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == name && fn.Body != nil {
+			return fn
+		}
+	}
+	return nil
+}
+
+// clusterRateLimitCallLimit 从函数体内的 clusterRateLimit(scope, limit, msg)
+// 调用派生限额：直接挂载与包装器共用同一实参口径。
+func clusterRateLimitCallLimit(fn *ast.FuncDecl) int {
+	limit := 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if ident, ok := call.Fun.(*ast.Ident); !ok || ident.Name != "clusterRateLimit" || len(call.Args) < 2 {
+			return true
+		}
+		if lit, ok := call.Args[1].(*ast.BasicLit); ok && lit.Kind == token.INT {
+			if value, err := strconv.Atoi(lit.Value); err == nil {
+				limit = value
+			}
+		}
+		return true
+	})
+	return limit
+}
+
+// clusterMachineRateLimitLimits 从实现体的常量块派生双档限额（凭证/IP）。
+// 机器接口的限额是函数内常量，包装器实参里没有数字——只识别 callee 名或只读
+// 实参的扫描器会把这一族整体漏掉。
+func clusterMachineRateLimitLimits(fn *ast.FuncDecl) (credential, ip int) {
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		decl, ok := n.(*ast.GenDecl)
+		if !ok || decl.Tok != token.CONST {
+			return true
+		}
+		for _, spec := range decl.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range valueSpec.Names {
+				if i >= len(valueSpec.Values) {
+					continue
+				}
+				lit, ok := valueSpec.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.INT {
+					continue
+				}
+				value, err := strconv.Atoi(lit.Value)
+				if err != nil {
+					continue
+				}
+				switch name.Name {
+				case "credentialLimit":
+					credential = value
+				case "ipLimit":
+					ip = value
+				}
+			}
+		}
+		return true
+	})
+	return credential, ip
 }
 
 // loginRateLimitLimit 从 loginRateLimit 的实现体派生限额——文档对账的口径
 // 必须与实参同源，不能在测试里再写一个常量副本。
 func loginRateLimitLimit(file *ast.File) (int, bool) {
-	limit := 0
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "loginRateLimit" || fn.Body == nil {
-			continue
-		}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			if ident, ok := call.Fun.(*ast.Ident); !ok || ident.Name != "clusterRateLimit" || len(call.Args) < 2 {
-				return true
-			}
-			if lit, ok := call.Args[1].(*ast.BasicLit); ok && lit.Kind == token.INT {
-				if value, err := strconv.Atoi(lit.Value); err == nil {
-					limit = value
-				}
-			}
-			return true
-		})
+	fn := middlewareFuncDecl(file, "loginRateLimit")
+	if fn == nil {
+		return 0, false
 	}
+	limit := clusterRateLimitCallLimit(fn)
 	return limit, limit > 0
 }
 
@@ -64,6 +125,14 @@ func middlewareRouteRegistrations(t *testing.T, source []byte) map[string]middle
 		t.Fatalf("parse middleware.go: %v", err)
 	}
 	loginLimit, loginLimitKnown := loginRateLimitLimit(file)
+	registerLimit := 0
+	if fn := middlewareFuncDecl(file, "clusterRegisterRateLimit"); fn != nil {
+		registerLimit = clusterRateLimitCallLimit(fn)
+	}
+	machineCredentialLimit, machineIPLimit := 0, 0
+	if fn := middlewareFuncDecl(file, "clusterMachineRateLimit"); fn != nil {
+		machineCredentialLimit, machineIPLimit = clusterMachineRateLimitLimits(fn)
+	}
 	verbs := map[string]bool{"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true}
 	routes := map[string]middlewareRouteRegistration{}
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -113,6 +182,30 @@ func middlewareRouteRegistrations(t *testing.T, source []byte) map[string]middle
 				registration.rateLimitMounted = true
 				registration.rateLimitKey = "login"
 				registration.rateLimitPerMin = loginLimit
+			case "clusterRegisterRateLimit":
+				// 包装器：限额在实现体的 clusterRateLimit 实参里，callee 名本身
+				// 不携带数字——只识别两个基础中间件名的扫描器会整族漏检。
+				if registerLimit <= 0 {
+					continue
+				}
+				registration.rateLimitMounted = true
+				registration.rateLimitKey = "register"
+				registration.rateLimitPerMin = registerLimit
+			case "clusterMachineRateLimit":
+				// 双档限额（凭证 + IP）来自实现体常量块；第一实参是桶作用域。
+				if machineCredentialLimit <= 0 || machineIPLimit <= 0 {
+					continue
+				}
+				if len(middlewareCall.Args) > 0 {
+					if scopeLiteral, ok := middlewareCall.Args[0].(*ast.BasicLit); ok && scopeLiteral.Kind == token.STRING {
+						if scope, err := strconv.Unquote(scopeLiteral.Value); err == nil {
+							registration.rateLimitKey = scope
+						}
+					}
+				}
+				registration.rateLimitMounted = true
+				registration.rateLimitPerMin = machineCredentialLimit
+				registration.rateLimitIPPerMin = machineIPLimit
 			case "clusterRateLimit":
 				if len(middlewareCall.Args) < 2 {
 					continue
@@ -175,8 +268,23 @@ func TestMiddlewareRouteRegistrations_includesClosureAndMultiLineForms(t *testin
 		t.Errorf("GET /auth/setup registration=%+v, want handler GetSetupStatus", registration)
 	}
 
-	// 合成源码钉两种行级正则必然失明的形态（未来新增注册即此形态）。
+	// 合成源码钉两种行级正则必然失明的形态（未来新增注册即此形态），以及
+	// 包装器限额的派生路径：clusterRegisterRateLimit 的实参在实现体内、
+	// clusterMachineRateLimit 的限额在实现体常量块，callee 名都不带数字。
+	// 合成常量取 7/77（与生产的 30/300 不同），派生数只能来自实现体。
 	synthetic := []byte(`package middleware
+
+func clusterRegisterRateLimit() gin.HandlerFunc {
+	return clusterRateLimit("register", 7, "合成注册限流")
+}
+
+func clusterMachineRateLimit(scope string, source clusterCredentialSource) gin.HandlerFunc {
+	const (
+		credentialLimit = 7
+		ipLimit         = 77
+	)
+	return nil
+}
 
 func assemble(v1 *Group, h *Handlers) {
 	v1.POST(
@@ -188,6 +296,8 @@ func assemble(v1 *Group, h *Handlers) {
 		h.ClosureHandler(c)
 	})
 	v1.GET("/limited", clusterRateLimit("synthetic", 42, "合成限流"), h.LimitedHandler)
+	v1.POST("/register-limited", clusterRegisterRateLimit(), h.RegisterHandler)
+	v1.GET("/machine-limited", clusterMachineRateLimit("synthetic-machine", clusterCredentialFromToken), h.MachineHandler)
 }
 `)
 	syntheticRoutes := middlewareRouteRegistrations(t, synthetic)
@@ -201,17 +311,42 @@ func assemble(v1 *Group, h *Handlers) {
 	if !limited.rateLimitMounted || limited.rateLimitKey != "synthetic" || limited.rateLimitPerMin != 42 {
 		t.Errorf("限流挂载解析=%+v, want synthetic/42", limited)
 	}
+	register := syntheticRoutes["POST /register-limited"]
+	if !register.rateLimitMounted || register.rateLimitKey != "register" || register.rateLimitPerMin != 7 {
+		t.Errorf("clusterRegisterRateLimit 解析=%+v, want register/7（限额须来自实现体实参）", register)
+	}
+	machine := syntheticRoutes["GET /machine-limited"]
+	if !machine.rateLimitMounted || machine.rateLimitKey != "synthetic-machine" || machine.rateLimitPerMin != 7 || machine.rateLimitIPPerMin != 77 {
+		t.Errorf("clusterMachineRateLimit 解析=%+v, want synthetic-machine/7+77（双档限额须来自实现体常量）", machine)
+	}
 }
 
-// 公开端点限流是运维可见面：凡在 middleware.go 挂 loginRateLimit() /
-// clusterRateLimit(...) 的路由，OpenAPI 文档必须登记 429——漏登记时按规格
-// 生成的 SDK 会把限流当未知状态（登录页反复点击 SSO 即可触发）。
-func TestAPIDocRoutes_rateLimitedRoutesDocument429(t *testing.T) {
+// rateLimitNumbersIn 抓 429 描述里以「N/min」形态出现的限额数字。未写数字的
+// 条目保持自由文本：对账只要求登记 429，写了的数字则必须与注册实参全等
+// （限额调整后文档静默过期是同一族的漏检面）。
+var rateLimitNumberPattern = regexp.MustCompile(`(\d+)/min`)
+
+func rateLimitNumbersIn(text string) map[int]struct{} {
+	numbers := make(map[int]struct{}, 2)
+	for _, match := range rateLimitNumberPattern.FindAllStringSubmatch(text, -1) {
+		if value, err := strconv.Atoi(match[1]); err == nil {
+			numbers[value] = struct{}{}
+		}
+	}
+	return numbers
+}
+
+// 限流是运维可见面：凡在 middleware.go 挂限流（含两个包装器
+// clusterRegisterRateLimit / clusterMachineRateLimit）的路由，OpenAPI 文档
+// 必须登记 429——漏登记时按规格生成的 SDK/从节点客户端会把限流当未知状态
+// （30/min 凭证或 300/min IP 会被误判为集群凭证失效/网络异常）。文档写了
+// 数字的，数字必须与注册实参同源，限额漂移不得静默过期。
+func TestAPIDocs_rateLimitedRoutesDocument429AndNumbers(t *testing.T) {
 	documented := make(map[string]apiDocRoute, len(apiDocRoutes))
 	for _, route := range apiDocRoutes {
 		documented[route.Method+" "+route.Path] = route
 	}
-	limited, loginBucketRouted := 0, false
+	limited, loginBucketRouted, machineFamilyRouted := 0, false, false
 	for key, registration := range middlewareRouteRegistrations(t, middlewareSourceForTest(t)) {
 		if !registration.rateLimitMounted {
 			continue
@@ -220,20 +355,42 @@ func TestAPIDocRoutes_rateLimitedRoutesDocument429(t *testing.T) {
 		if registration.rateLimitKey == "login" {
 			loginBucketRouted = true
 		}
+		if registration.rateLimitIPPerMin > 0 {
+			machineFamilyRouted = true
+		}
 		route, ok := documented[key]
 		if !ok {
 			t.Errorf("%s 挂了限流桶 %s（%d/min）但文档无此路由", key, registration.rateLimitKey, registration.rateLimitPerMin)
 			continue
 		}
-		found := false
+		var texts []string
 		for _, routeError := range route.Errors {
 			if strings.HasPrefix(routeError, "429") {
-				found = true
-				break
+				texts = append(texts, routeError)
 			}
 		}
-		if !found {
+		if len(texts) == 0 {
 			t.Errorf("%s 挂限流桶 %s（%d/min，%s），文档 Errors=%v 缺 429", key, registration.rateLimitKey, registration.rateLimitPerMin, registration.rateLimitMessageCN, route.Errors)
+			continue
+		}
+		text := strings.Join(texts, "；")
+		numbers := rateLimitNumbersIn(text)
+		if len(numbers) == 0 {
+			continue
+		}
+		want := map[int]struct{}{registration.rateLimitPerMin: {}}
+		if registration.rateLimitIPPerMin > 0 {
+			want[registration.rateLimitIPPerMin] = struct{}{}
+		}
+		for number := range numbers {
+			if _, expected := want[number]; !expected {
+				t.Errorf("%s 文档 429 写了 %d/min，与注册实参 %v 不符: %s", key, number, sortedLimitKeys(want), text)
+			}
+		}
+		for number := range want {
+			if _, documented := numbers[number]; !documented {
+				t.Errorf("%s 文档 429 缺限额数字 %d/min（注册实参）: %s", key, number, text)
+			}
 		}
 	}
 	if limited == 0 {
@@ -241,5 +398,65 @@ func TestAPIDocRoutes_rateLimitedRoutesDocument429(t *testing.T) {
 	}
 	if !loginBucketRouted {
 		t.Fatal("未能从 middleware.go 的 loginRateLimit 派生限额（实现形态变化，扫描器需跟进）")
+	}
+	if !machineFamilyRouted {
+		t.Fatal("未能从 middleware.go 派生集群机器接口双档限流（包装器形态变化，扫描器需跟进）")
+	}
+}
+
+// sortedLimitKeys 把限额期望集转成稳定顺序（错误信息可读且不抖动）。
+func sortedLimitKeys(limits map[int]struct{}) []int {
+	keys := make([]int, 0, len(limits))
+	for limit := range limits {
+		keys = append(keys, limit)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// 集群机器端点的 429 必须带双档限额：该族由从节点周期调用（注册轮询/
+// 快照/规则库包/交付确认/健康上报），凭证 30/min 或 IP 300/min 超限时从节点
+// 侧只有「429」而没有数字，会把限流误判为集群凭证失效。
+func TestAPIDocsClusterMachineEndpointsRateLimitNumbers(t *testing.T) {
+	registrations := middlewareRouteRegistrations(t, middlewareSourceForTest(t))
+	documented := make(map[string]apiDocRoute, len(apiDocRoutes))
+	for _, route := range apiDocRoutes {
+		documented[route.Method+" "+route.Path] = route
+	}
+	machineRoutes := []string{
+		"GET /cluster/register/:id/status",
+		"POST /cluster/registration/confirm",
+		"GET /cluster/sync/snapshot",
+		"GET /cluster/sync/waf-files",
+		"POST /cluster/nodes/report",
+	}
+	seen := 0
+	for _, key := range machineRoutes {
+		registration, ok := registrations[key]
+		if !ok || !registration.rateLimitMounted || registration.rateLimitIPPerMin == 0 {
+			t.Fatalf("%s 未挂上集群机器限流（派生=%+v）——族清单需按真实装配更新", key, registration)
+		}
+		seen++
+		route, ok := documented[key]
+		if !ok {
+			t.Errorf("%s 文档无此路由", key)
+			continue
+		}
+		var text strings.Builder
+		for _, routeError := range route.Errors {
+			if strings.HasPrefix(routeError, "429") {
+				text.WriteString(routeError)
+			}
+		}
+		numbers := rateLimitNumbersIn(text.String())
+		for _, want := range []int{registration.rateLimitPerMin, registration.rateLimitIPPerMin} {
+			if _, ok := numbers[want]; !ok {
+				t.Errorf("%s 文档 429 缺 %d/min（凭证=%d、IP=%d）: %s",
+					key, want, registration.rateLimitPerMin, registration.rateLimitIPPerMin, text.String())
+			}
+		}
+	}
+	if seen != len(machineRoutes) {
+		t.Fatalf("机器端点派生 %d/%d", seen, len(machineRoutes))
 	}
 }

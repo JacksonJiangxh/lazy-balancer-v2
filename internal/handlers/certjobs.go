@@ -120,10 +120,12 @@ func (j *certJobListItem) scanFrom(scanner certJobScanner, now time.Time, expiry
 	); err != nil {
 		return err
 	}
-	if cooldown, retryable := certJobRetryCooldownAt(j.Status, j.CAAvailableAfter.NullTime, now); retryable {
-		// 向上取整（0=「现在即可重试」的语义见 services.CertJobRetryCooldownSeconds）：
-		// 剩余不足 1 秒时下发 1 而非 0，避免把仍在冷却中的任务引导成必然 429 的重试。
-		seconds := services.CertJobRetryCooldownSeconds(cooldown)
+	// 下发「此刻剩余秒」（0=现在即可重试；null=永久不可重试），已按 updated_at
+	// 扣减流逝部分——前端只需比较 >0，不得再按 updated_at 二次扣减。
+	if seconds, retryable := certJobRetryRemainingSeconds(j.Status,
+		j.UpdatedAt.NullTime,
+		sql.NullTime{Time: j.CreatedAt, Valid: !j.CreatedAt.IsZero()},
+		j.CAAvailableAfter.NullTime, now); retryable {
 		j.RetryCooldownSeconds = &seconds
 	}
 	j.Issuer = certificateIssuerCached(certPEM)
@@ -626,12 +628,13 @@ func certJobRetryCooldown(status string) (time.Duration, bool) {
 	return services.CertJobRetryCooldown(status)
 }
 
-// certJobRetryCooldownAt 返回「此刻该任务还剩多少冷却」：通用冷却之外并入
-// CA 限流退避窗口（waiting_ca ∧ ca_available_after 未到期，1–3h，远晚于
-// 通用冷却）。策略单源在 services.CertJobRetryCooldownAt——列表下发值、
-// 任务监控证书行与服务端门禁三处共用，不得各写一份。
-func certJobRetryCooldownAt(status string, caAvailableAfter sql.NullTime, now time.Time) (time.Duration, bool) {
-	return services.CertJobRetryCooldownAt(status, caAvailableAfter, now)
+// certJobRetryRemainingSeconds 是「此刻剩余冷却（秒）」的 handlers 侧入口：
+// 通用窗口按 updated_at（缺失回退 created_at）扣减，waiting_ca 并入 CA 限流
+// 退避窗口（1–3h，远晚于通用冷却）。策略单源在
+// services.CertJobRetryRemainingSeconds——列表下发值与任务监控证书行共用同一
+// 判据（0=现在可重试，null=永久不可重试），不得各写一份。
+func certJobRetryRemainingSeconds(status string, updatedAt, createdAt, caAvailableAfter sql.NullTime, now time.Time) (int64, bool) {
+	return services.CertJobRetryRemainingSeconds(status, updatedAt, createdAt, caAvailableAfter, now)
 }
 
 // certJobRetryBlocked 返回任务是否被重试门拦截，以及应返回的 HTTP 状态码。

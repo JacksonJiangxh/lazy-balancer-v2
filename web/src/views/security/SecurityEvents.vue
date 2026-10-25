@@ -194,7 +194,7 @@
         <el-table-column prop="event_time" label="时间" width="190" :formatter="(row: SecurityEvent) => formatDate(row.event_time)" />
         <el-table-column label="动作" width="80" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.action === 'blocked' ? 'danger' : 'warning'" size="small" effect="light">{{ row.action === 'blocked' ? '拦截' : '检测' }}</el-tag>
+            <el-tag :type="eventActionTone(row.action)" size="small" effect="light">{{ eventActionShort(row.action) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="规则" min-width="130">
@@ -335,8 +335,8 @@
           <el-descriptions-item label="触发规则">{{ [ctxEvent.rule_name, ctxEvent.rule_triggered ? `id:${ctxEvent.rule_triggered}` : ''].filter(Boolean).join(' · ') || '—' }}</el-descriptions-item>
           <el-descriptions-item label="所属策略">{{ ctxEvent.policy_name || '—' }}</el-descriptions-item>
           <el-descriptions-item label="动作">
-            <el-tag size="small" :type="ctxEvent.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
-              {{ ctxEvent.action === 'blocked' ? '已拦截' : ctxEvent.action === 'logged' ? '已记录' : ctxEvent.action || '—' }}
+            <el-tag size="small" :type="eventActionTone(ctxEvent.action)" effect="plain">
+              {{ eventActionFull(ctxEvent.action) }}
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="异常评分">{{ ctxEvent.anomaly_score > 0 ? ctxEvent.anomaly_score : '—' }}</el-descriptions-item>
@@ -411,6 +411,7 @@ import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
 import { isAutobanIneffective, suggestionBand, type SuggestionBand } from '@/utils/autobanStatus'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
+import { eventActionFull, eventActionShort, eventActionTone } from '@/utils/eventAction'
 import { ingestionWarningMessage, type IngestionHealth } from '@/utils/ingestionHealth'
 import type { APIResponse } from '@/types'
 
@@ -529,13 +530,13 @@ const fetchAutobanStatus = async (): Promise<void> => {
 // 配置弹框（七项=六项配置+口径变更提示）
 const autobanDialogVisible = ref(false)
 const autobanSaving = ref(false)
-const autobanForm = ref({ enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all' })
+const autobanForm = ref({ dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all' })
 const openAutobanConfig = (): void => {
   // 卡片主体/编辑/启用共用门：只读、从节点、状态加载中或加载失败均不打开
   // 配置弹框；表单从 autobanStatus 回填，错误态默认值保存会覆盖真实配置。
   if (!autobanWritable.value) return
   autobanForm.value = {
-    enabled: autobanStatus.value.enabled, dry_run: autobanStatus.value.dry_run,
+    dry_run: autobanStatus.value.dry_run,
     threshold: autobanStatus.value.threshold, window_minutes: autobanStatus.value.window_minutes,
     duration: autobanStatus.value.duration, scope: autobanStatus.value.scope,
   }

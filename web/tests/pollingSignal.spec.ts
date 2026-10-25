@@ -213,4 +213,12 @@ test('轮询页接线：取数函数接收本轮 signal，永久 signal 只留�
   assert.match(rules, /await fetchCertJobs\(task\.signal\)/)
   assert.match(rules, /const fetchHealthStatus = async \(roundSignal\?: AbortSignal\)/)
   assert.match(rules, /const fetchCertJobs = async \(roundSignal\?: AbortSignal\)/)
+
+  // 更新弹框（三库共用）：关闭弹框/终态 stopPolling 时在途状态+日志请求必须可取消
+  const libUpdate = code('src/composables/useLibUpdateDialog.ts')
+  assert.match(libUpdate, /usePollingTask\(async \(\{ signal \}\) => \{ await refreshStatus\(signal\) \}/,
+    '轮询回调必须消费本轮 signal')
+  assert.match(libUpdate, /const refreshStatus = async \(signal\?: AbortSignal\)/)
+  assert.match(libUpdate, /update\/status`, \{ silent: true, signal \}/)
+  assert.match(libUpdate, /update\/logs`, \{ silent: true, signal \}/)
 })

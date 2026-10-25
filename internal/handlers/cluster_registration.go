@@ -72,6 +72,13 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, registerRequestMaxBytes)
 	var req models.ClusterRegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// 与同 handler 其余失败面同源留痕（system 身份 + 来源地址）：绑定
+		// 失败此前零审计，畸形/探测请求在操作审计页不可回溯。详情不含请求体。
+		// 超限体积走既有 DoS 契约——拒绝但不写审计（否则大 body 泛洪可刷满
+		// 审计库，见 TestRegisterClusterNode_rejects_oversized_body）。
+		if !isRequestBodyTooLarge(err) {
+			services.RecordAuditLog("system", "注册失败", "集群节点", "注册请求格式错误", c.ClientIP())
+		}
 		clusterError(c, http.StatusBadRequest, "注册请求格式错误", err)
 		return
 	}
@@ -226,36 +233,51 @@ func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
+	// 失败留痕单源：与 clusterNodeAction 同构——审计中间件对 explicit 路由
+	// 无条件早退（含 4xx/5xx），本 handler 的每条失败面都必须自行补记，
+	// 否则坐标保存失败（前端旧缓存提交越界坐标、节点离线、DB 故障）在操作
+	// 审计页无痕，只剩 stdout。
+	auditFailure := func(nodeLabel, code, reason string) {
+		recordAudit(c, "更新", "集群节点", services.FormatAuditDetail(nodeLabel, reason, services.AuditResultPart(code)))
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
+		auditFailure("节点编号无效（"+registerAuditField(c.Param("id"))+"）", "invalid_request", "节点编号无效")
 		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
 		return
 	}
+	nodeLabel := fmt.Sprintf("节点 %d", id)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, registerRequestMaxBytes)
 	var req models.ClusterNodeSiteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		auditFailure(nodeLabel, "invalid_request", "站点坐标格式错误")
 		clusterError(c, http.StatusBadRequest, "站点坐标格式错误", err)
 		return
 	}
 	if req.ServerMapLat == nil || req.ServerMapLon == nil {
+		auditFailure(nodeLabel, "invalid_request", "必须同时提交站点纬度和经度")
 		clusterError(c, http.StatusBadRequest, "必须同时提交站点纬度和经度", nil)
 		return
 	}
 	if err := validateServerMapCoordinates(req.ServerMapLat, req.ServerMapLon); err != nil {
+		auditFailure(nodeLabel, "invalid_request", err.Error())
 		clusterError(c, http.StatusBadRequest, err.Error(), err)
 		return
 	}
 	if err := h.clusterService.UpdateNodeSiteCoordinates(c.Request.Context(), id, *req.ServerMapLat, *req.ServerMapLon); err != nil {
 		// 服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
+			auditFailure(nodeLabel, "blocked", "节点角色已降级")
 			clusterMasterForbidden(c, err)
 			return
 		}
-		status := http.StatusInternalServerError
 		if errors.Is(err, services.ErrNodeNotFound) {
-			status = http.StatusNotFound
+			auditFailure(nodeLabel, "failed", "节点不存在")
+			clusterError(c, http.StatusNotFound, "更新节点站点坐标失败", err)
+			return
 		}
-		clusterError(c, status, "更新节点站点坐标失败", err)
+		auditFailure(nodeLabel, "failed", err.Error())
+		clusterError(c, http.StatusInternalServerError, "更新节点站点坐标失败", err)
 		return
 	}
 	recordAudit(c, "更新", "集群节点", services.FormatAuditDetail(

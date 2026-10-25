@@ -64,7 +64,17 @@ test('MFA「支持的操作」清单覆盖 middleware 各写端点族', () => {
   for (const anchor of ['任务监控 运行', '服务控制', '节点站点坐标', '指纹钉', '自动封禁', '爬虫库', 'IP 名单', 'DNS 凭证连通性测试']) {
     assert.ok(flat.includes(anchor), `MFA 清单缺「${anchor}」——用户对这些写操作会被要求验码`)
   }
-  assert.match(page, /subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 自助端点除外）"/)
+  assert.match(page, /subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 验码、登出端点除外）"/)
+  // 副标题的豁免集必须与 DecideMFAStepUp 同源：step-up 只豁免 verify-step
+  // 与 logout，setup/activate/disable/recovery-codes 全部在覆盖面内（同弹框
+  // 清单也列了「启用/禁用/重新生成恢复码（自己的）」）。写成「MFA 自助端点
+  // 除外」会让用户以为关写保护后不必验码。
+  assert.doesNotMatch(page, /MFA 自助端点除外/, '副标题不得把 MFA 自助端点整体列为豁免')
+  assert.doesNotMatch(page, /与 MFA 自身端点/, '注释不得宣称 MFA 自身端点整体豁免')
+  const mfa = repoCode('internal/handlers/mfa.go')
+  const stepUp = section(mfa, 'if path == "/api/v1/auth/mfa/verify-step"', '\n\t}')
+  assert.ok(stepUp.includes('"/api/v1/auth/logout"'), 'DecideMFAStepUp 的豁免集已变化——副标题需同步')
+  assert.ok(!stepUp.includes('/api/v1/auth/mfa/disable'), 'DecideMFAStepUp 扩大豁免集——副标题与清单需同步')
   // 证书配置/CA 测试会真实写 DNS/EAB，不得再宣称「测试连接…不受影响」
   assert.doesNotMatch(page, /测试连接、预览、解析类操作不受影响/)
 })
@@ -94,6 +104,7 @@ test('MFA 清单反查：middleware 全部写路由族均有清单锚点', () =>
   const familyAnchors: ReadonlyArray<readonly [string, string]> = [
     ['/api/v1/users/me/api-keys', 'API 密钥'],
     ['/api/v1/users/me', '个人资料修改'],
+    ['/api/v1/auth/mfa/', '启用/禁用/重新生成恢复码'],
     ['/api/v1/users/:id/mfa/reset', '重置 MFA'],
     ['/api/v1/users', '用户增删改'],
     ['/api/v1/admin-tls', '管理 TLS'],
@@ -147,7 +158,7 @@ test('MFA 清单反查：middleware 全部写路由族均有清单锚点', () =>
   for (const route of routes) {
     if (exempt.has(route)) continue
     const path = route.slice(route.indexOf(' '))
-    if (path.startsWith(' /api/v1/auth/mfa/')) continue // MFA 自助端点（弹框 subtitle 明示除外）
+    if (path === ' /api/v1/auth/mfa/verify-step') continue // step-up 机制本体，弹框副标题明示除外
     const family = familyAnchors.find(([prefix]) => path.startsWith(` ${prefix}`))
     if (!family) {
       unmapped.push(route)

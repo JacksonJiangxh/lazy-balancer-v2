@@ -863,8 +863,9 @@ func copyWafFilePlain(src, dst string) error {
 	return os.WriteFile(dst, data, info.Mode().Perm())
 }
 
-// copyWafTree 递归复制目录树（普通文件与目录）。符号链接/特殊文件显式拒绝：
-// CRS 活树只应有普通文件，异常形态让快照失败而非静默丢文件。
+// copyWafTree 递归复制目录树（普通文件与目录）。符号链接按目标字节复制
+// （os.Stat 跟随，与 services.copyDir 同口径——CRS 树可能被部署成链接形态）；
+// 设备/管道等不可快照形态显式失败而非静默丢文件。
 func copyWafTree(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {

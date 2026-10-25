@@ -673,8 +673,12 @@ const threatAutoUpdate = ref(true)
 const threatSchedule = ref({ days: [1, 2, 3, 4, 5, 6, 7] as number[], time: '04:00' })
 
 const fetchThreatLib = async () => {
+  const seq = ++threatLibInfoSeq
   try {
-    const res = await request.get<APIResponse<{ sources: ThreatSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/threat-lib')
+    // 回刷由 60s 定时与操作后补拉触发：失败态已由健康标签/排程提示承载，
+    // 不再每次失败都弹全局 toast（后端抖动期每分钟四条）。
+    const res = await request.get<APIResponse<{ sources: ThreatSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/threat-lib', { silent: true })
+    if (seq !== threatLibInfoSeq) return
     if (res.data) {
       threatSources.value = res.data.sources
       threatAutoUpdate.value = res.data.auto_update !== false
@@ -683,6 +687,7 @@ const fetchThreatLib = async () => {
     threatLibError.value = false
     threatLibLoaded.value = true
   } catch {
+    if (seq !== threatLibInfoSeq) return
     // 只读拉取失败：不打断页面，但健康标签必须显性为「加载失败」
     threatLibError.value = true
     threatLibLoaded.value = true
@@ -706,8 +711,10 @@ const crawlerAutoUpdate = ref(true)
 const crawlerSchedule = ref({ days: [1, 2, 3, 4, 5, 6, 7] as number[], time: '04:00' })
 
 const fetchCrawlerLib = async () => {
+  const seq = ++crawlerLibInfoSeq
   try {
-    const res = await request.get<APIResponse<{ sources: CrawlerSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/crawler-lib')
+    const res = await request.get<APIResponse<{ sources: CrawlerSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/crawler-lib', { silent: true })
+    if (seq !== crawlerLibInfoSeq) return
     if (res.data) {
       crawlerSources.value = res.data.sources
       crawlerAutoUpdate.value = res.data.auto_update !== false
@@ -716,6 +723,7 @@ const fetchCrawlerLib = async () => {
     crawlerLibError.value = false
     crawlerLibLoaded.value = true
   } catch {
+    if (seq !== crawlerLibInfoSeq) return
     crawlerLibError.value = true
     crawlerLibLoaded.value = true
   }
@@ -969,6 +977,12 @@ const crsInfoLoaded = ref(false)
 const ip2regionInfoLoaded = ref(false)
 const threatLibLoaded = ref(false)
 const crawlerLibLoaded = ref(false)
+// 四库信息回刷的请求序号（按库各自一条）：60s 定时回刷与用户操作后的补拉会
+// 并发，响应乱序落地会把新版本/新排程覆盖回旧值。每库只允许最新一代写回。
+let crsInfoSeq = 0
+let ip2regionInfoSeq = 0
+let threatLibInfoSeq = 0
+let crawlerLibInfoSeq = 0
 // 库信息未落地/读取失败时排程未知：编辑器禁用并显性提示，
 // 不得用默认值（周一–周日 04:00）冒充库内排程被保存覆盖。
 const SCHEDULE_UNKNOWN_HINT = '排程未知：库信息读取失败，请关闭后重新加载'
@@ -1488,12 +1502,15 @@ function compileJSRegex(pattern: string): { re: RegExp | null; valid: boolean } 
 }
 
 const fetchCRS = async () => {
+  const seq = ++crsInfoSeq
   try {
-    const res = await request.get<APIResponse<typeof crsInfo.value>>('/security/crs')
+    const res = await request.get<APIResponse<typeof crsInfo.value>>('/security/crs', { silent: true })
+    if (seq !== crsInfoSeq) return
     if (res.data) crsInfo.value = res.data
     crsInfoError.value = false
     crsInfoLoaded.value = true
   } catch {
+    if (seq !== crsInfoSeq) return
     // 读取失败：标签/行状态显性化，不沿用默认值伪装正常
     crsInfoError.value = true
     crsInfoLoaded.value = true
@@ -1599,12 +1616,15 @@ const openRuleContent = async (row: CRSRuleFile) => {
   }
 }
 const fetchIP2RegionInfo = async () => {
+  const seq = ++ip2regionInfoSeq
   try {
-    const res = await request.get<APIResponse<typeof ip2regionInfo.value>>('/security/ip2region')
+    const res = await request.get<APIResponse<typeof ip2regionInfo.value>>('/security/ip2region', { silent: true })
+    if (seq !== ip2regionInfoSeq) return
     if (res.data) ip2regionInfo.value = res.data
     ip2regionInfoError.value = false
     ip2regionInfoLoaded.value = true
   } catch {
+    if (seq !== ip2regionInfoSeq) return
     ip2regionInfoError.value = true
     ip2regionInfoLoaded.value = true
   }

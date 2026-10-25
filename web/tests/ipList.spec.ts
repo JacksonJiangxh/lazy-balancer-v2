@@ -16,6 +16,7 @@ import { isValidCidr } from '../src/utils/ruleValidation.ts'
 import {
   ensureSharedEntries,
   invalidateSharedEntriesCache,
+  missingSharedEntryIds,
   parseIPList,
   sharedEntriesCache,
 } from '../src/utils/securityStages.ts'
@@ -224,6 +225,35 @@ test('D4 失败语义不变：失败不补取、不留缓存（下次调用重�
   await ensureSharedEntries([11], failing)
   assert.equal(calls, 2)
   invalidateSharedEntriesCache()
+})
+
+test('D5 缓存 TTL：超过 60s 按缺失重拉（外部变更不经本页写动作失效）', async () => {
+  invalidateSharedEntriesCache()
+  const realNow = Date.now
+  let now = realNow()
+  Date.now = () => now
+  try {
+    const calls: number[] = []
+    const loader = async (id: number): Promise<string[]> => {
+      calls.push(id)
+      return [`10.0.0.${id}`]
+    }
+    await ensureSharedEntries([5], loader)
+    assert.deepEqual(calls, [5])
+    // TTL 内不重拉
+    await ensureSharedEntries([5], loader)
+    assert.deepEqual(calls, [5], 'TTL 内已缓存 id 不得重复请求')
+    assert.deepEqual(missingSharedEntryIds([5]), [], 'TTL 内不算缺失')
+    // 超过 TTL：缺失上报 + ensure 重拉（另一标签页/管理员改名单的唯一收敛途径）
+    now += 61_000
+    assert.deepEqual(missingSharedEntryIds([5]), [5], '过期条目标记为缺失（调用方据此显性化加载失败）')
+    await ensureSharedEntries([5], loader)
+    assert.deepEqual(calls, [5, 5], '过期后必须重拉')
+    assert.deepEqual(sharedEntriesCache[5], ['10.0.0.5'])
+  } finally {
+    Date.now = realNow
+    invalidateSharedEntriesCache()
+  }
 })
 
 test('D2 代际守卫：失效前发起的在途 loader 落地不得回填缓存', async () => {

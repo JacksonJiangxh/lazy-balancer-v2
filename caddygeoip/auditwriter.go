@@ -1531,20 +1531,24 @@ func estimateAuditMessageBytes(m plugintypes.AuditLogMessage) int64 {
 	if isNilInterface(m) {
 		return 0
 	}
-	n := int64(len(m.Actionset())+len(m.Message())) + auditMessageOverhead
+	// 全部字符串段按 JSON 转义后字节计（jsonStringEscapedLen 与 json.Marshal
+	// 逐字节一致）：原始 len 会低估 <>&/控制字符（至多 6×），而本估算同时是
+	// 队列/单条字节预算的执法口径，低估即实际驻留可突破预算数倍。
+	n := int64(jsonStringEscapedLen(m.Actionset())+jsonStringEscapedLen(m.Message())) + auditMessageOverhead
 	// error_message 不在 plugintypes.AuditLogMessage 接口上，但内置 JSON
 	// formatter 直接序列化具体值（coraza 的 Message 带该导出字段）。
 	if em, ok := m.(interface{ ErrorMessage() string }); ok {
-		n += int64(len(em.ErrorMessage()))
+		n += int64(jsonStringEscapedLen(em.ErrorMessage()))
 	}
 	// 规则数据段（file/line/id/rev/msg/data/severity/ver/maturity/
 	// accuracy/tags/raw）同样进 JSON；Data() 可能是 typed-nil，取任何
 	// 访问器前必须走 isNilInterface。
 	if d := m.Data(); !isNilInterface(d) {
-		n += int64(len(d.File()) + len(d.Rev()) + len(d.Msg()) + len(d.Data()) +
-			len(d.Ver()) + len(d.Raw()))
+		n += int64(jsonStringEscapedLen(d.File()) + jsonStringEscapedLen(d.Rev()) +
+			jsonStringEscapedLen(d.Msg()) + jsonStringEscapedLen(d.Data()) +
+			jsonStringEscapedLen(d.Ver()) + jsonStringEscapedLen(d.Raw()))
 		for _, tag := range d.Tags() {
-			n += int64(len(tag)) + auditTagEntryOverhead
+			n += int64(jsonStringEscapedLen(tag)) + auditTagEntryOverhead
 		}
 	}
 	return n
@@ -1576,27 +1580,34 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 	}
 	n := int64(auditSnapshotFixedBytes)
 	t := &s.Transaction_
-	n += int64(len(t.Timestamp_) + len(t.ID_) + len(t.ClientIP_) + len(t.HostIP_) +
-		len(t.ServerID_) + len(t.HighestSeverity_))
+	// 全部字符串段按 JSON 转义后字节计（header 段已用同一口径）：估算即
+	// 队列/单条字节预算的执法口径，原始 len 会把 &&&… 类取值低估至多 6×。
+	n += int64(jsonStringEscapedLen(t.Timestamp_) + jsonStringEscapedLen(t.ID_) +
+		jsonStringEscapedLen(t.ClientIP_) + jsonStringEscapedLen(t.HostIP_) +
+		jsonStringEscapedLen(t.ServerID_) + jsonStringEscapedLen(t.HighestSeverity_))
 	if r := t.Request_; r != nil {
-		n += int64(len(r.Method_) + len(r.Protocol_) + len(r.URI_) + len(r.HTTPVersion_) + len(r.Body_))
+		n += int64(jsonStringEscapedLen(r.Method_) + jsonStringEscapedLen(r.Protocol_) +
+			jsonStringEscapedLen(r.URI_) + jsonStringEscapedLen(r.HTTPVersion_) +
+			jsonStringEscapedLen(r.Body_))
 		n += headerBytes(r.Headers_, r.HeadersBytes_)
 		for _, f := range r.Files_ {
 			n += auditFileEntryOverhead
 			if isNilInterface(f) {
 				continue
 			}
-			n += int64(len(f.Name()) + len(f.Mime()))
+			n += int64(jsonStringEscapedLen(f.Name()) + jsonStringEscapedLen(f.Mime()))
 		}
 	}
 	if q := t.Response_; q != nil {
-		n += int64(len(q.Protocol_) + len(q.Body_))
+		n += int64(jsonStringEscapedLen(q.Protocol_) + jsonStringEscapedLen(q.Body_))
 		n += headerBytes(q.Headers_, q.HeadersBytes_)
 	}
 	if pr := t.Producer_; pr != nil {
-		n += int64(len(pr.Connector_) + len(pr.Version_) + len(pr.Server_) + len(pr.RuleEngine_) + len(pr.Stopwatch_))
+		n += int64(jsonStringEscapedLen(pr.Connector_) + jsonStringEscapedLen(pr.Version_) +
+			jsonStringEscapedLen(pr.Server_) + jsonStringEscapedLen(pr.RuleEngine_) +
+			jsonStringEscapedLen(pr.Stopwatch_))
 		for _, rs := range pr.Rulesets_ {
-			n += int64(len(rs))
+			n += int64(jsonStringEscapedLen(rs))
 		}
 	}
 	for _, m := range s.Messages_ {

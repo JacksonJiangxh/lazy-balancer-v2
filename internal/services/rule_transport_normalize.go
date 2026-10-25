@@ -107,7 +107,7 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		rule.Domain = ""
 		rule.LogEnabled = false
 		rule.DnsFamily = "ipv4"
-		if rule.Strategy == "cookie" {
+		if rule.Strategy == "cookie" || rule.Strategy == "" {
 			rule.Strategy = "weighted_round_robin"
 		}
 		return

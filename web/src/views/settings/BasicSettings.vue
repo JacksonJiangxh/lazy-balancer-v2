@@ -456,13 +456,15 @@
     </el-dialog>
   </div>
 
-  <!-- （用户裁决）：写操作验证「支持的操作」清单——与后端 mfaStepUpGuard
+  <!-- 写操作验证「支持的操作」清单——与后端 mfaStepUpGuard
        实际覆盖面一致（admin/business 两组的 POST/PUT/PATCH/DELETE，排除
-       readOnlyWriteRoutes 的读语义 POST 与 MFA 自身端点；WS-05 起「测试」不再
-       一概豁免：证书配置/CA 提供商的 test 会真实写 DNS TXT / 申请 EAB）。 -->
+       readOnlyWriteRoutes 的读语义 POST，以及 step-up 机制本体 verify-step 与
+       登出（DecideMFAStepUp 仅豁免此二者，setup/activate/disable/恢复码照常
+       验码）；WS-05 起「测试」不再一概豁免：证书配置/CA 提供商的 test 会真实
+       写 DNS TXT / 申请 EAB）。 -->
   <el-dialog v-model="mfaScopeVisible" class="dialog-body-inset" width="min(640px, 94vw)">
     <template #header>
-      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 自助端点除外）" />
+      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 验码、登出端点除外）" />
     </template>
     <!-- 与 middleware.go 的 mfaStepUpGuard 挂载面（admin/business 两组级）
          及 readOnlyWriteRoutes 豁免清单同源。注意：证书配置/DNS 凭证/CA 提供商
@@ -1320,6 +1322,20 @@ const timezoneOptions = computed(() => {
   }
   return options
 })
+// 时区前置校验：allow-create 允许任意输入，一次拼写错误会让整卡保存被后端
+// （time.LoadLocation）400 拒绝，连带日志级别/保留策略/大屏坐标等无关项失败。
+// 运行时 Intl 与 Go 共用 IANA 库，本地即可定位到字段。
+const timezoneError = (value: string): string => {
+  const tz = value.trim()
+  if (!tz) return '时区不能为空'
+  try {
+    // 只借它做校验：构造即抛 RangeError 表示库中无此时区。
+    new Intl.DateTimeFormat(undefined, { timeZone: tz })
+    return ''
+  } catch {
+    return `无效的时区：${tz}`
+  }
+}
 // 父级 /config 加载完成前禁止保存：表单此刻仍是默认值。
 const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{
@@ -1647,6 +1663,12 @@ const handleSave = async () => {
     ElMessage.warning('请先在「配置证书」中选择并校验上传证书')
     return
   }
+  const tzError = timezoneError(settings.value.timezone)
+  if (tzError) {
+    ElMessage.warning(`${tzError}（请从列表选择，或输入 IANA 格式时区名，如 Asia/Shanghai）`)
+    return
+  }
+  settings.value.timezone = settings.value.timezone.trim()
   saving.value = true
   try {
     const payload = {

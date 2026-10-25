@@ -20,7 +20,7 @@ export interface AdminTlsCertInfo {
   days_left: number
 }
 
-export interface AdminTlsSelection {
+interface AdminTlsSelection {
   enabled: boolean
   mode: string
 }

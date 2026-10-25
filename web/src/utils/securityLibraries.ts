@@ -5,15 +5,19 @@
 // - summarizeLibrarySources：威胁情报库/爬虫地址库多源聚合（版本取最近、
 //   条目求和、状态=更新中>失败>成功>未更新）
 // - libraryHealthTag / librarySourceHealthTag：卡头健康标签
-// 状态词表：missing=文件缺失（danger）、not-installed=库未安装（info）、
+// 状态词表：missing=库文件/目录缺失（danger）、not-installed=库未安装（info）、
 // never=从未更新（info）、cancelled=已取消（info）、failed/running/checking/
 // downloading/installing/reloading/success/idle 与后端 update_status 同词。
+// 文件缺失与未安装的用户可见词统一「未安装」（版本列 2026-09-24 用户裁定的
+// 用词）：同一行/同一卡片的两个单元格不得用两个词描述同一事实；二者区别由
+// 色调承载（缺失=danger，未安装=info）。
 import { compareVersion } from './securityStages.ts'
+import { hasOwn } from './hasOwn.ts'
 
 type LibraryTagType = 'success' | 'warning' | 'danger' | 'info'
 
 const STATUS_LABELS: Record<string, string> = {
-  missing: '缺失',
+  missing: '未安装',
   'not-installed': '未安装',
   never: '未更新',
   failed: '更新失败',
@@ -31,9 +35,9 @@ const STATUS_LABELS: Record<string, string> = {
 }
 
 // 状态词表是普通对象：后端异常值（'constructor'/'toString' 等）直接下标会命中
-// 原型链上的函数，把函数当标签渲染。与 utils/logStatCap 同一具名守卫。
+// 原型链上的函数，把函数当标签渲染。与 utils/hasOwn 同一具名守卫。
 export const libraryStatusLabel = (status: string): string =>
-  Object.prototype.hasOwnProperty.call(STATUS_LABELS, status) ? STATUS_LABELS[status] : status ?? ''
+  hasOwn(STATUS_LABELS, status) ? STATUS_LABELS[status] : status ?? ''
 
 export const libraryStatusTagType = (status: string): LibraryTagType => {
   if (!status) return 'info'
@@ -67,7 +71,8 @@ interface LibrarySummary {
 
 /**
  * 多源规则库聚合（威胁情报库/爬虫地址库共用）：
- * - latestVersion = 各源 version 最大值（compareVersion，日期/semver 通用）；
+ * - latestVersion = 各源 version 最大值（compareVersion，日期/semver 通用；
+ *   等值取行序最后一行，API 为 id 序——后端 latestSourceVersion 同口径）；
  * - totalEntries = 各源 entry_count 之和；
  * - status = 任一更新中 > 任一失败 > 有版本=success > never（空源/无版本）。
  *   「从未更新」独立成 never，不折叠为 idle/「已最新」——原两页对空列表的
@@ -105,8 +110,9 @@ interface LibraryHealthTag {
 }
 
 /**
- * 单库（CRS/IP 地理库）健康标签：加载失败/文件缺失 → danger；库未安装
+ * 单库（CRS/IP 地理库）健康标签：加载失败/库文件缺失 → danger；库未安装
  * （版本未知/空）→ warning，不得再显示「正常」。
+ * 用词与其他库页面统一「未安装」（缺失=危险色，未安装=警告色，词同一）。
  * loaded=false（首次响应未落地）→ 「加载中」（初值 available:true
  * 不得冒充正常态）；缺省 true，既有调用方口径不变。
  */
@@ -116,7 +122,7 @@ export const libraryHealthTag = (
 ): LibraryHealthTag => {
   if (state.loaded === false) return { label: `${name} · 加载中`, type: 'info' }
   if (state.loadError) return { label: `${name} · 加载失败`, type: 'danger' }
-  if (state.available === false) return { label: `${name} · 缺失`, type: 'danger' }
+  if (state.available === false) return { label: `${name} · 未安装`, type: 'danger' }
   if (state.status === 'not-installed') return { label: `${name} · 未安装`, type: 'warning' }
   if (state.status === 'never') return { label: `${name} · 未更新`, type: 'warning' }
   // 持久 update_status 的失败/进行中/关闭态必须显性——该列可为

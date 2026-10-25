@@ -19,6 +19,7 @@ package services
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -401,7 +402,14 @@ func crsRuleIndexCacheKey(version string) string {
 	var maxMtime, totalSize int64
 	count := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
+		// CRS 发行契约=扁平 rules/ 目录（键只聚合顶层 .conf 的 stat）：子目录
+		// .conf 不进键，其增删改不会触发索引重建——检测到即 WARN（与
+		// buildCRSRuleIndex 同一守卫）。
+		if entry.IsDir() {
+			warnCRSSubdirRuleFiles(filepath.Join(CRSRuleIndexDir, entry.Name()))
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".conf") {
 			continue
 		}
 		info, err := entry.Info()
@@ -417,10 +425,40 @@ func crsRuleIndexCacheKey(version string) string {
 	return fmt.Sprintf("%s|%s|%d|%d|%d", version, CRSRuleIndexDir, count, maxMtime, totalSize)
 }
 
+// warnCRSSubdirRuleFiles 检测子目录内是否存在 .conf 规则文件：CRS 发行契约
+// 是扁平 rules/ 目录，索引/缓存键只扫顶层；rule_count 与完整性探针递归全树
+// ——子目录规则会让「组存在性 400」与计数口径分叉。返回是否命中（供守卫
+// 测试），命中时告警（节流，避免每次索引重建刷屏）。
+func warnCRSSubdirRuleFiles(dir string) bool {
+	found := false
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".conf") {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if !found {
+		return false
+	}
+	msg := fmt.Sprintf("CRS 规则目录含子目录 .conf（%s）：索引/选组只扫顶层，rule_count 与完整性探针递归全树——规则存在性判定可能与计数分叉（CRS 发行契约=扁平 rules/）", dir)
+	if auditFailureShouldLog(msg) {
+		Logf("warn", "%s", msg)
+	}
+	return true
+}
+
 // buildCRSRuleIndex 全量解析规则目录：文件名升序遍历（确定性），同 ID
 // 保留首见条目（keep first msg），最终按 id 升序输出。version 由调用方传入
 // ——键与产物必须同源（两次独立读取会在版本行/目录形态变化时把新代产物挂到
 // 旧键上，下一次调用再全量重建一次）。
+//
+// CRS 发行契约=扁平 rules/ 目录（仅扫顶层）：rule_count 与完整性探针按全树
+// 递归口径（子目录 .conf 计入），两者在子目录形态下会分叉——检测到子目录
+// .conf 时 WARN（契约被打破，选组存在性判定可能与计数不一致）。
 func buildCRSRuleIndex(version string) *CRSRuleIndex {
 	index := &CRSRuleIndex{Version: version, Rules: []CRSRuleIndexEntry{}, ids: map[string]struct{}{}}
 	entries, err := os.ReadDir(CRSRuleIndexDir)
@@ -428,7 +466,11 @@ func buildCRSRuleIndex(version string) *CRSRuleIndex {
 		return index
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
+		if entry.IsDir() {
+			warnCRSSubdirRuleFiles(filepath.Join(CRSRuleIndexDir, entry.Name()))
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".conf") {
 			continue
 		}
 		content, err := os.ReadFile(filepath.Join(CRSRuleIndexDir, entry.Name()))

@@ -33,16 +33,16 @@
           <span class="ip">{{ t.ip }}</span>
           <span class="dim">{{ t.attackType }} · {{ t.durationMs }}ms</span>
           <span v-if="(t.count ?? 1) > 1" class="agg">×{{ t.count }}</span>
-          <span class="sev" :class="t.action === 'blocked' ? 'sev-high' : 'sev-low'">{{ actionLabel(t.action) }}</span>
+          <span class="sev" :class="t.action === 'blocked' ? 'sev-high' : 'sev-low'">{{ eventActionFull(t.action) }}</span>
         </div>
       </transition-group>
 
       <div class="hint">
-        <span class="hint-desktop">拖动{{ isGlobeMode ? '旋转' : '平移' }} · 点击国家下钻 · 点击空白返回</span>
+        <span>拖动{{ isGlobeMode ? '旋转' : '平移' }} · 点击国家下钻 · 点击空白返回</span>
       </div>
 
       <transition name="fade">
-        <div v-if="showEmptyState" class="empty-state">近 {{ windowHours }} 小时无安全事件</div>
+        <div v-if="showEmptyState" class="empty-state">近 {{ bucketTerms.windowLabel }}无安全事件</div>
       </transition>
       <div class="error-stack" role="status" aria-live="polite">
         <div v-if="statsError" class="error-banner">大屏数据加载失败，正在重试…</div>
@@ -70,7 +70,7 @@
         <div v-if="collectorError" class="error-banner site-unset">大屏流量采集续租失败（Caddy 侧逐请求计数已中断），正在重试…</div>
         <div v-if="configLoadFailed" class="error-banner site-unset">
           大屏配置读取失败，暂用默认视图与未设置坐标
-          <button type="button" class="btn error-retry" @click="loadServerCentroid">重试</button>
+          <button type="button" class="btn error-retry" @click="retryConfigLoad">重试</button>
         </div>
         <div v-else-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
       </div>
@@ -93,7 +93,7 @@
             <div class="ev-top">
               <span>{{ formatFeedTime(event.event_time) }}</span>
               <span class="sev" :class="'sev-' + sevOf(event)">{{ sevLabel(event) }}</span>
-              <span class="act" :class="'act-' + event.action">{{ actionLabel(event.action) }}</span>
+              <span class="act" :class="'act-' + event.action">{{ eventActionShort(event.action) }}</span>
             </div>
             <div class="ev-main">
               <span class="ev-ip">{{ event.client_ip }}</span>
@@ -119,12 +119,12 @@
         </div>
         <div>
           <h1 class="glitch" data-text="安全威胁大屏">安全威胁大屏</h1>
-          <p>近 {{ windowHours }} 小时安全态势实时监控 <time class="mono">{{ clockText }}</time><span class="mono clock-date">{{ clockDate }}</span></p>
+          <p>近 {{ bucketTerms.windowLabel }}安全态势实时监控 <time>{{ clockText }}</time><span class="clock-date">{{ clockDate }}</span></p>
         </div>
       </div>
 
       <div class="kpis" role="group" aria-label="核心指标">
-        <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">{{ windowHours }}h 安全事件 · 拦截 {{ stats?.blocked_events ?? 0 }} / 检测 {{ loggedEvents }}</span></div>
+        <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">{{ bucketTerms.windowLabel }}安全事件 · 拦截 {{ stats?.blocked_events ?? 0 }} / 检测 {{ loggedEvents }}</span></div>
         <div class="kpi"><span class="kpi-value cool">{{ blockRateText }}</span><span class="kpi-label">拦截率 · 拦截 / 全部安全事件</span></div>
         <div class="kpi"><span class="kpi-value">{{ displayRecentRate }}</span><span class="kpi-label">拦截/分钟 · 近 5 分钟</span></div>
         <div class="kpi"><span class="kpi-value">{{ displayActive }}</span><span class="kpi-label">活跃攻击 IP · 近 10 分钟</span></div>
@@ -157,7 +157,7 @@
       </div>
       <div class="stats">
         <div class="stat-section overview-section">
-          <div class="stat-title"><span>窗口概览</span><em v-if="statsPending" class="ov-switch-hint" role="status">切换中…</em></div>
+          <div class="stat-title"><span>窗口概览</span><em v-if="statsPending" class="ov-switch-hint" role="status">切换中…</em><em v-else-if="staleFrameLabel" class="ov-switch-hint" role="status">{{ staleFrameLabel }}</em></div>
           <div class="overview-grid">
             <div class="ov-item"><span>事件总量</span><b>{{ stats?.total_events ?? 0 }}</b></div>
             <div class="ov-item"><span>拦截 / 检测</span><b>{{ stats?.blocked_events ?? 0 }} / {{ loggedEvents }}</b></div>
@@ -209,7 +209,7 @@
             <li v-for="item in topCountries" :key="item.name" class="rule" :title="item.name">
               <span class="rule-name">{{ item.name }}</span>
               <span class="cnt">{{ item.value }}</span>
-              <span class="rule-bar"><i :style="{ width: countryBarWidth(item.value), background: countryBarColor(item.value) }"></i></span>
+              <span class="rule-bar"><i :style="{ width: countryBarWidth(item.value), background: countryHeat(item.value) }"></i></span>
             </li>
           </ul>
           <div v-else class="empty">暂无归属地数据</div>
@@ -254,7 +254,7 @@
     <div class="charts-row">
       <div class="panel hud">
         <div class="panel-head">
-          <h2>{{ windowHours }}h 事件趋势 <span class="en">{{ windowHours > 24 ? 'DAILY' : 'HOURLY' }}</span></h2>
+          <h2>{{ bucketTerms.windowLabel }}事件趋势 <span class="en">{{ windowHours > 24 ? 'DAILY' : 'HOURLY' }}</span></h2>
           <span class="meta">合计 <b>{{ hourlyTotal }}</b></span>
         </div>
         <div class="chart-box">
@@ -304,6 +304,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
+import { eventActionFull, eventActionShort } from '@/utils/eventAction'
 import { trafficDelta, formatRecentRate, hourlyBucketLabel, bucketTerminology, type TrafficBaseline } from '@/utils/threatScreenMetrics'
 import { anomalySeverity, overlayDetectionGrade, zeroScoreSeverity, type AnomalySeverity } from '@/utils/severityScale'
 import { displayThreatScreenMode } from '@/utils/configValues'
@@ -437,8 +438,15 @@ const activeHourCount = computed(() => hourlyHist.value.filter((slot) => slot.va
 // 概览口径词随窗口派生（>24h 后端按日桶）——与趋势图 DAILY/HOURLY 同源
 const bucketTerms = computed(() => bucketTerminology(windowHours.value))
 // 已渲染的统计属于哪个窗口：切换窗口后旧帧保留但必须标注「切换中」，
-// 不得让上一窗口的数字冒充当前窗口。
-const statsPending = computed(() => stats.value !== null && stats.value.hours !== windowHours.value)
+// 不得让上一窗口的数字冒充当前窗口。失败时不再显示「切换中」（三态互斥）：
+// 轮询失败会保留旧帧直到新窗口成功，此时「切换中 + 加载失败」并存会让运维
+// 把旧窗口总量读成新窗口结论——改由 staleFrameLabel 明确标注旧帧窗口。
+const statsPending = computed(() => !statsError.value && stats.value !== null && stats.value.hours !== windowHours.value)
+const staleFrameLabel = computed(() => {
+  const hours = stats.value?.hours
+  if (hours === undefined || hours === windowHours.value) return ''
+  return `上次结果 · ${bucketTerminology(hours).windowLabel}`
+})
 const attackTypeShare = computed(() => stats.value?.attack_type_share ?? [])
 const displayRecentRateX10 = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
 const displayRecentRate = computed(() => formatRecentRate(displayRecentRateX10.value / 10))
@@ -455,12 +463,13 @@ const countryHeat = (count: number): string => {
   if (ratio > 0.33) return '#ff9f1c'
   return '#ffd166'
 }
-const countryBarColor = (count: number): string => countryHeat(count)
 const maxRuleCount = computed(() => topRules.value.reduce((m, item) => Math.max(m, item.value), 0))
 const ruleBarWidth = (count: number): string => `${maxRuleCount.value > 0 ? Math.max(5, (count / maxRuleCount.value) * 100) : 0}%`
 const ruleLabel = (name: string): string => (/^\d+$/.test(name) ? `规则 #${name}` : name)
 
-const SHARE_PALETTE = ['#ff4d4d', '#ff9f1c', '#ffd166']
+// 事件族切片与实时事件类型哈希共用的三主色（原 SHARE_PALETTE/TYPE_PALETTE 两
+// 份同值常量，单源后新增色只改一处）。
+const THREAT_PALETTE = ['#ff4d4d', '#ff9f1c', '#ffd166']
 /** 第 4 段（其余）单色：与三主色区分的中性灰蓝，不参与「切片色哈希」。 */
 const SHARE_REST_COLOR = '#6b7fa8'
 const shareTop = computed(() => attackTypeShare.value.slice(0, 3))
@@ -468,7 +477,7 @@ const shareRest = computed(() => Math.max(0, shareTotal.value - shareTop.value.r
 const shareTotal = computed(() => attackTypeShare.value.reduce((m, item) => m + item.value, 0))
 const shareSliceColor = (name: string): string => {
   const idx = shareTop.value.findIndex((x) => x.name === name)
-  return idx >= 0 ? SHARE_PALETTE[idx] ?? '#ffd166' : '#ffd166'
+  return idx >= 0 ? THREAT_PALETTE[idx] ?? '#ffd166' : '#ffd166'
 }
 const shareSegments = computed(() => {
   const top = shareTop.value
@@ -478,7 +487,7 @@ const shareSegments = computed(() => {
   let cursor = 0
   top.forEach((item, index) => {
     const pct = (item.value / total) * 100
-    segments.push({ color: SHARE_PALETTE[index] ?? '#ffd166', dash: `${pct} ${100 - pct}`, offset: 25 - cursor })
+    segments.push({ color: THREAT_PALETTE[index] ?? '#ffd166', dash: `${pct} ${100 - pct}`, offset: 25 - cursor })
     cursor += pct
   })
   const rest = 100 - cursor
@@ -509,14 +518,13 @@ const histAxis = computed((): string[] => {
 })
 
 const feedTypeColorCache = new Map<string, string>()
-const TYPE_PALETTE = ['#ff4d4d', '#ff9f1c', '#ffd166']
 const typeColorFor = (name: string): string => {
   if (!name) return '#56709f'
   const cached = feedTypeColorCache.get(name)
   if (cached) return cached
   let hash = 0
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0
-  const color = TYPE_PALETTE[Math.abs(hash) % TYPE_PALETTE.length]
+  const color = THREAT_PALETTE[Math.abs(hash) % THREAT_PALETTE.length]
   feedTypeColorCache.set(name, color)
   return color
 }
@@ -560,9 +568,6 @@ const toastTimers = new Map<number, number>()
  *  rule_triggered 二次猜解阶段（只识别 429/2/8/48x，其余一律 WAF），与后端
  *  trigger_type 映射（800xxx→地域拦截/12→信任/14→威胁情报/11→请求体…）
  *  左右自相矛盾。旧后端缺字段时回退 attack_type。 */
-function actionLabel(action: string): string {
-  return action === 'blocked' ? '已拦截' : action === 'logged' ? '仅检测' : action || '—'
-}
 function triggerLabel(ev: FeedEvent): string {
   return ev.trigger_type || ev.attack_type || '—'
 }
@@ -779,6 +784,14 @@ async function loadServerCentroid(): Promise<void> {
     // 配置读取失败：保持缺省（地图模式、本站未配置），但显性化为「读取失败」
     configLoadFailed.value = true
   }
+}
+
+// 配置重试：重读 /config 后必须联动引擎重装——地图/地球模式由配置决定，
+// 只改 screenMode 会让 HUD（地球标题/竖扫特效/操作提示）宣告地球而舞台仍是
+// 地图引擎。mountEngine 幂等（同模式直接返回），装载中则排队一次重装。
+async function retryConfigLoad(): Promise<void> {
+  await loadServerCentroid()
+  if (!disposed) await mountEngine()
 }
 
 // ============ 左侧实时列表：安全日志最新 50 条快照 ============
@@ -1308,7 +1321,6 @@ onBeforeUnmount(() => {
   color: #ffd166; font-variant-numeric: tabular-nums;
   text-shadow: 0 0 16px rgba(255, 159, 28, 0.55), 0 0 2px rgba(255, 209, 102, 0.9);
 }
-.kpi-value small { font-size: 16px; margin-left: 2px; }
 .kpi-value.cool { color: #8fe6ff; text-shadow: 0 0 16px rgba(58, 209, 255, 0.55); }
 .kpi-label { font-size: 11px; color: #8ea7d6; letter-spacing: 0.04em; white-space: nowrap; }
 

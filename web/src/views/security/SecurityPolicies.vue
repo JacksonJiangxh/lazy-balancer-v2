@@ -16,7 +16,7 @@
 
     <!-- 主数据失败与「确实没有策略」必须可区分——保留旧表 + 重试入口
          （同族页 SecurityRules/SecurityBlockPages 同款 error-banner 范式） -->
-    <el-alert v-if="policiesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner mb-5">
+    <el-alert v-if="policiesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
       <template #title>
         <div class="polling-error-title">
           <span>安全策略加载失败：列表为空/停留旧值不代表策略被清空</span>
@@ -26,7 +26,7 @@
     </el-alert>
 
     <!-- 辅助端点部分失败：计数/冲突告警会降级，必须可见点名（同族页 error-banner 范式） -->
-    <el-alert v-if="auxLoadFailures.length > 0" type="warning" :closable="false" show-icon class="polling-error-alert mb-5">
+    <el-alert v-if="auxLoadFailures.length > 0" type="warning" :closable="false" show-icon class="polling-error-alert">
       <template #title>
         <div class="polling-error-title">
           <span>部分辅助数据加载失败（{{ auxLoadFailures.join('、') }}）：策略计数与冲突告警可能不完整</span>
@@ -865,14 +865,15 @@
       <div class="rule-picker-list">
         <el-checkbox-group v-model="pickerSelected">
           <div v-for="rule in pickerPagedRules" :key="rule.caddy_id" class="rule-picker-item">
-            <el-checkbox :value="rule.caddy_id" :disabled="pickerMeta(rule.caddy_id).wouldExceed">
+            <el-checkbox :value="rule.caddy_id" :disabled="pickerMeta(rule.caddy_id).blockReason !== ''">
               <span class="rule-picker-name">{{ rule.name }}</span>
               <span class="rule-picker-meta">{{ rule.domain || '-' }}:{{ rule.listen_port }}</span>
             </el-checkbox>
-            <!-- v2.2.0：每条候选规则展示当前绑定链（policy_id ASC，1-based）与本策略落点；
-                 已达上限（MAX_POLICIES_PER_RULE）的规则禁用并说明原因。 -->
+            <!-- 每条候选规则展示当前绑定链（policy_id ASC，1-based）与本策略落点；
+                 后端必然拒绝的形态（绑定条数上限 / 阶段 2 限流唯一门）在选择阶段
+                 禁用并逐条说明原因——冲突在整批提交时会让本片全部失败。 -->
             <div class="rule-binding-preview">
-              <span v-if="pickerMeta(rule.caddy_id).wouldExceed" class="rule-binding-limit">已达 {{ MAX_POLICIES_PER_RULE }} 条绑定上限，无法继续绑定</span>
+              <span v-if="pickerMeta(rule.caddy_id).blockReason" class="rule-binding-limit">{{ pickerMeta(rule.caddy_id).blockReason }}</span>
               <template v-else>
                 <span
                   v-for="(entry, idx) in pickerMeta(rule.caddy_id).chain"
@@ -963,7 +964,7 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasOtherStage2Binding, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy, CrsRuleFileOption } from '@/utils/securityStages'
 import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { updaterName } from '@/utils/updaterName'
@@ -1075,6 +1076,13 @@ const policySearch = ref('')
 // 与后端兜底同形状） ──
 const activeTypeTab = ref<SecurityPolicyType>('stage1')
 const policyTypeOf = (row: PolicySummary): SecurityPolicyType => inferPolicyType(row)
+// 策略 id → 阶段类型（绑定选择器/提交门的 stage2 唯一性判据用）：与列表分组同一
+// 推断口径（inferPolicyType 优先 policy_type 列，缺省按内容推断）。
+const policyTypeById = computed<ReadonlyMap<number, SecurityPolicyType>>(() => {
+  const map = new Map<number, SecurityPolicyType>()
+  for (const p of policies.value) map.set(p.id, policyTypeOf(p))
+  return map
+})
 // 各类型条数（tab 标签 + 默认/回落 tab 选择共用一个计数源）
 const policyTypeCounts = computed<Record<SecurityPolicyType, number>>(() => {
   const counts: Record<SecurityPolicyType, number> = { stage0: 0, stage1: 0, stage2: 0, stage3: 0, mixed: 0 }
@@ -1148,6 +1156,8 @@ const isStage0ChainEntry = (entry: ChainEntry): boolean => {
   const policy = policies.value.find((p) => p.id === entry.policyId)
   return policy ? policyTypeOf(policy) === 'stage0' : false
 }
+// WAF 模式展示词单源：列表摘要与只读详情分段共用（两处曾各写一份同值表）。
+const WAF_MODE_TEXT: Record<string, string> = { blocking: '拦截', detection: '检测', custom_only: '仅自定义', off: '关闭' }
 const chainChipText = (entry: ChainEntry, index: number): string => {
   const name = entry.isSelf ? '本策略' : entry.name
   if (isStage0ChainEntry(entry)) return `${name} · 阶段 0·拦截判定前优先生效`
@@ -1163,14 +1173,13 @@ const policySummaryLine = (row: PolicySummary): string => {
     return row.has_rate_limit ? `${row.rate_limit_rps} 次/秒 · 突发 ${row.rate_limit_burst}` : '未启用'
   }
   if (type === 'stage3') {
-    const wafModeText: Record<string, string> = { blocking: '拦截', detection: '检测', custom_only: '仅自定义', off: '关闭' }
     const crsCount = Array.isArray(row.crs_rule_groups)
       ? row.crs_rule_groups.length
       : parseIPList(typeof row.crs_rule_groups === 'string' ? row.crs_rule_groups : undefined).length
     // WAF 全关=CRS 与自定义规则均不生效（共享 buildStage3Rows 同门）——不得把
     // 保留的自定义条数说成生效中。
     if (row.mode === 'off') return 'WAF 关闭'
-    const parts = [`WAF ${wafModeText[row.mode] ?? row.mode}`, `自定义 ${row.custom_rules_count} 条`]
+    const parts = [`WAF ${WAF_MODE_TEXT[row.mode] ?? row.mode}`, `自定义 ${row.custom_rules_count} 条`]
     if (row.mode === 'blocking' || row.mode === 'detection') parts.push(crsCount > 0 ? `CRS 组 ${crsCount}` : 'CRS 全部')
     return parts.join(' · ')
   }
@@ -1396,8 +1405,7 @@ const viewPolicySections = computed<ViewPolicySection[]>(() => {
   const crsGroupCount = parseIPList(d.crs_rule_groups).length
   const excludedCount = parseCrsExcludedRules(d.crs_excluded_rules).length
   const customCount = parseCustomRuleIds(d.custom_rules).length
-  const wafModeText: Record<string, string> = { blocking: '拦截', detection: '检测', custom_only: '仅自定义', off: '关闭' }
-  const stage3Rows: Array<{ label: string; value: string }> = [{ label: 'WAF 模式', value: wafModeText[d.mode] ?? d.mode }]
+  const stage3Rows: Array<{ label: string; value: string }> = [{ label: 'WAF 模式', value: WAF_MODE_TEXT[d.mode] ?? d.mode }]
   if (d.mode === 'blocking' || d.mode === 'detection') {
     stage3Rows.push({ label: '异常阈值', value: String(d.anomaly_threshold) })
     stage3Rows.push({ label: 'CRS 规则组', value: crsGroupCount === 0 ? '全部（默认）' : `${crsGroupCount} 组` })
@@ -2248,10 +2256,14 @@ const validateIpAclList = (): boolean => {
     ElMessage.error('白名单模式下 IP 列表不能为空，否则所有请求将被拒绝')
     return false
   }
-  const invalidEntry = ipACLList.value.find((entry) => !isValidCidr(entry))
-  if (invalidEntry) {
-    ElMessage.error(`IP/CIDR 条目格式不正确：${invalidEntry}`)
-    return false
+  // 校验只作用于生效字段（与渲染门同源）：关闭 IP 访问控制后内联名单按保留语义
+  // 继续回传但零发射，此时点名不可见条目会让用户既看不到也删不掉。
+  if (form.value.ip_acl_enabled) {
+    const invalidEntry = ipACLList.value.find((entry) => !isValidCidr(entry))
+    if (invalidEntry) {
+      ElMessage.error(`IP/CIDR 条目格式不正确：${invalidEntry}`)
+      return false
+    }
   }
   if (ipWhitelistEnabled.value) {
     const invalidTrustEntry = ipWhitelist.value.find((entry) => !isValidCidr(entry))
@@ -2313,9 +2325,9 @@ watch(pickerSearch, () => {
   pickerPage.value = 1
 })
 
-// 全选作用于当前搜索筛选出且可选择的全部规则（跨分页；已达绑定上限的规则
-// 不可选，不参与全选），selection 存于 pickerSelected 与分页无关
-const pickerSelectableRules = computed(() => pickerFilteredRules.value.filter((rule) => !pickerMeta(rule.caddy_id).wouldExceed))
+// 全选作用于当前搜索筛选出且可选择的全部规则（跨分页；已达绑定上限/限流冲突的
+// 规则不可选，不参与全选），selection 存于 pickerSelected 与分页无关
+const pickerSelectableRules = computed(() => pickerFilteredRules.value.filter((rule) => pickerMeta(rule.caddy_id).blockReason === ''))
 const pickerFilteredSelectedCount = computed(() => {
   const selected = new Set(pickerSelected.value)
   return pickerSelectableRules.value.reduce((count, rule) => count + (selected.has(rule.caddy_id) ? 1 : 0), 0)
@@ -2442,17 +2454,25 @@ const buildDisplayChain = (caddyId: string): ChainEntry[] => {
   return all
 }
 
-// 选择器单条规则元信息：绑定链、本策略落点（1-based）、是否因达绑定上限而不可选。
-// 本策略已在绑定中的规则重选不新增绑定，永不受上限限制。
-const pickerMeta = (caddyId: string): { chain: ChainEntry[]; selfPos: number; wouldExceed: boolean } => {
+// 选择器单条规则元信息：绑定链、本策略落点（1-based）、不可选原因（空串=可选）。
+// 判据与后端 bulk 校验同源（冲突整批 400，故必须在选择阶段就置灰）：
+// ①阶段 2（限流）策略 → 该规则已绑定其它限流策略（每规则仅一条，与
+// SecurityBindingEditor.pickerBlockReason 同源谓词）；②每规则绑定条数上限。
+// 本策略已在绑定中的规则重选不新增绑定，恒可选。
+const pickerMeta = (caddyId: string): { chain: ChainEntry[]; selfPos: number; blockReason: string } => {
   const existing = securityBindings.value[caddyId] || []
   const selfBound = editingId.value !== null && existing.some((b) => b.policy_id === editingId.value)
   const chain = buildDisplayChain(caddyId)
-  return {
-    chain,
-    selfPos: chain.findIndex((e) => e.isSelf) + 1,
-    wouldExceed: !selfBound && existing.length >= MAX_POLICIES_PER_RULE,
+  let blockReason = ''
+  if (!selfBound) {
+    if (editorPolicyType.value === 'stage2'
+      && hasOtherStage2Binding(existing, editingId.value, (id) => policyTypeById.value.get(id))) {
+      blockReason = '该规则已绑定其它限流策略（每规则仅一条），需先解绑'
+    } else if (existing.length >= MAX_POLICIES_PER_RULE) {
+      blockReason = `已达 ${MAX_POLICIES_PER_RULE} 条绑定上限，无法继续绑定`
+    }
   }
+  return { chain, selfPos: chain.findIndex((e) => e.isSelf) + 1, blockReason }
 }
 
 // 冲突检测视图：仅启用策略参与（禁用策略不生成配置）；
@@ -3240,6 +3260,21 @@ const handleSave = async () => {
       currentStep.value = WIZARD_STEP.BINDINGS
       return
     }
+    // 阶段 2 唯一门（与选择器置灰同一谓词）：每条规则仅一条限流策略，后端 bulk
+    // 对冲突整片 400——不在此拦截会先落库策略、再同步失败，重试永不成功。
+    const stage2Conflict = editorPolicyType.value === 'stage2'
+      ? added.filter((caddyId) => hasOtherStage2Binding(
+        securityBindings.value[caddyId] || [],
+        editingId.value,
+        (id) => policyTypeById.value.get(id),
+      ))
+      : []
+    if (stage2Conflict.length > 0) {
+      const names = stage2Conflict.map((id) => allRules.value.find((r) => r.caddy_id === id)?.name || id).join('、')
+      ElMessage.error(`以下规则已绑定其它限流策略（每规则仅一条），请先解绑后再关联：${names}`)
+      currentStep.value = WIZARD_STEP.BINDINGS
+      return
+    }
     // 名单保留语义（与 ip_acl_list 对齐）：关闭开关不清空已配置的名单，保存时
     // 始终回传当前名单内容，避免"关掉开关再打开"丢数据；ip_blacklist 本页不下发，
     // 后端指针语义自动保留原值。区域控制开关 = geoip_mode 三态：开启提交
@@ -3320,9 +3355,13 @@ const handleSave = async () => {
         }) as { message?: string })
       }
     } catch (error: unknown) {
-      // 失败的绑定请求已由全局拦截器 toast，这里仅记录并中止收尾
+      // 失败的绑定请求已由全局拦截器 toast，这里仅记录并中止收尾。
+      // 业务校验失败（400：绑定上限/限流唯一门/规则不存在等）是结构性拒绝——
+      // 原样重试必然再失败，不能承诺「可重试」；其余（网络/5xx）幂等重试安全。
       console.error('Failed to sync policy bindings:', error)
-     ElMessage.warning('策略已保存，但部分规则绑定同步失败；对话框保持打开，重新点击保存可重试绑定（幂等）')
+      ElMessage.warning(error instanceof ApiRequestError && error.status === 400
+        ? '策略已保存，但规则绑定被服务端拒绝：请按提示解绑冲突策略或调整关联规则后重试（原样重试不会成功）'
+        : '策略已保存，但部分规则绑定同步失败；对话框保持打开，重新点击保存可重试绑定（幂等）')
       return
     }
     // 历史（用户裁定 A：向导内延迟生效）：本次会话暂存的规则级阶段拦截页覆盖

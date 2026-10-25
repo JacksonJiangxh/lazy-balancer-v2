@@ -1466,8 +1466,13 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 	if req.ClientID != nil {
 		cfg.ClientID = strings.TrimSpace(*req.ClientID)
 	}
-	if req.ClientSecret != nil && *req.ClientSecret != "" {
-		cfg.ClientSecret = strings.TrimSpace(*req.ClientSecret)
+	if req.ClientSecret != nil {
+		// 先 trim 再判空：纯空白不是「未提供」——按原串判空会让 "   " 进入
+		// 赋值分支把已存密钥覆盖成空串，保存还返回成功。secret 无清除语义
+		//（仅 DELETE 可清），空白与空串同义=保持现值。
+		if secret := strings.TrimSpace(*req.ClientSecret); secret != "" {
+			cfg.ClientSecret = secret
+		}
 	}
 	if req.DisplayName != nil {
 		cfg.DisplayName = strings.TrimSpace(*req.DisplayName)

@@ -351,7 +351,7 @@ func ClientIPFromContext(ctx context.Context) string {
 const serverInstructions = `Lazy Balancer V2 负载均衡管理接口。认证：X-API-Key 头或 Authorization: Bearer lb_sk_...，Key 需开启 MCP 功能。
 
 权限范围：
-- 只读 Key（read_only）可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——导出含用户/密钥哈希、原始 Caddy 配置可能含内联私钥，二者与写操作同级隐藏）及 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）；其余写工具（POST/PUT/DELETE）需非只读 Key
+- 只读 Key（read_only）可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——导出含用户/密钥哈希、原始 Caddy 配置可能含内联私钥，二者与写操作同级隐藏）及 3 个读探测 POST 工具；其中 parse_certificate 对非管理员开放，validate_import/preview_config 需 Key 属主为管理员（属 admin 组路由，非管理员调用恒 403 且 tools/list 不展示）；其余写工具（POST/PUT/DELETE）需非只读 Key
 - 写操作需要管理员权限（API Key 所属用户角色为 admin），非管理员 Key 调用写工具返回 403；tools/list 已按「read_only 轴 + admin 轴」双轴过滤——admin 轴覆盖 admin 组路由与 business 组写路由（只读探测 POST 除外），未列出的工具不是不存在，而是当前 Key 不可见/不可调用
 - 从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点；所有写操作校验后即时生效（失败自动回滚），无需手动 reload
 - 配置 IP 白名单的 Key 还需来源 IP 命中白名单（白名单约束该 Key 的全部 REST 与 MCP 调用；MCP 内部转发不受白名单影响）

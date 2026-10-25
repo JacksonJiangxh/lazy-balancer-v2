@@ -133,7 +133,7 @@
                       </template>
                     </div>
                   </template>
-                  <div class="lock-summary-hint"><el-link type="primary" class="lock-flow-link" @click="openFlowFromLock(row)">查看完整处理流程 →</el-link></div>
+                  <div class="lock-summary-hint"><el-button link type="primary" @click="openFlowFromLock(row)">查看完整处理流程 →</el-button></div>
                 </div>
               </el-popover>
               <!-- TCP 灰色锁（2026-10-10 用户裁定）：无弹框，hover 提示不支持原因 -->
@@ -412,7 +412,7 @@
         <div v-show="currentStep === WIZARD_STEP.BASIC" class="step-content">
           <el-form :model="wizardForm" label-width="100px">
             <el-form-item label="规则名称" required>
-              <el-input v-model="wizardForm.name" placeholder="例如：我的网站负载均衡" />
+              <el-input v-model="wizardForm.name" placeholder="例如：我的网站负载均衡" maxlength="100" show-word-limit />
             </el-form-item>
             
             <!-- 原生表单行（2026-10-11 用户裁定：对齐统一走 el-form-item，弃自管标签行
@@ -565,19 +565,20 @@
                     placeholder="IP 或域名" 
                     size="small" 
                     class="upstream-input"
+                    :aria-label="`上游第 ${$index + 1} 行主机地址`"
                     :class="{ 'is-error': upstreamRowNeedsHost(row, $index) }"
                     @blur="upstreamTouched[$index] = true"
                   />
                 </template>
               </el-table-column>
               <el-table-column label="端口" width="96">
-                <template #default="{ row }">
-                  <el-input-number v-model="row.port" :min="1" :max="65535" size="small" controls-position="right" class="upstream-input-small" />
+                <template #default="{ row, $index }">
+                  <el-input-number v-model="row.port" :min="1" :max="65535" size="small" controls-position="right" class="upstream-input-small" :aria-label="`上游第 ${$index + 1} 行端口`" />
                 </template>
               </el-table-column>
               <el-table-column label="协议" width="88">
-                <template #default="{ row }">
-                  <el-select v-model="row.protocol" size="small" placeholder="协议">
+                <template #default="{ row, $index }">
+                  <el-select v-model="row.protocol" size="small" placeholder="协议" :aria-label="`上游第 ${$index + 1} 行协议`">
                     <template v-if="wizardForm.protocol === 'tcp'">
                       <el-option value="tcp" label="TCP" />
                       <el-option value="tls" label="TLS" />
@@ -593,13 +594,14 @@
                 <template #header>
                   回源域名<FieldHelpIcon content="该上游独立的回源 Host 头与 HTTPS SNI（主机名，不带端口；端口沿用左侧端口列配置）。留空=不覆盖（Host 跟随客户端请求或上游地址）" />
                 </template>
-                <template #default="{ row }">
+                <template #default="{ row, $index }">
                   <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" content="动态上游模式不支持回源域名（改写 Host 请经 API/MCP 设置规则级 host_header）">
                     <el-input
                       v-model="row.origin_domain"
                       placeholder="留空=不覆盖"
                       size="small"
                       class="upstream-input"
+                      :aria-label="`上游第 ${$index + 1} 行回源域名`"
                       :disabled="wizardForm.dynamic_dns"
                     />
                   </el-tooltip>
@@ -610,7 +612,7 @@
                   权重 %<FieldHelpIcon content="数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。" />
                 </template>
                 <template #default="{ row, $index }">
-                  <el-input-number v-model="row.weight" :min="1" :max="100" size="small" controls-position="right" class="upstream-input-small" :disabled="!row.enabled" @change="onWeightChange($index)" />
+                  <el-input-number v-model="row.weight" :min="1" :max="100" size="small" controls-position="right" class="upstream-input-small" :aria-label="`上游第 ${$index + 1} 行权重（%）`" :disabled="!row.enabled" @change="onWeightChange($index)" />
                 </template>
               </el-table-column>
               <el-table-column width="104">
@@ -619,20 +621,20 @@
                     ? '该上游并发连接数上限（HTTP 规则映射为 reverse_proxy 每上游并发请求数 max_requests；TCP 规则映射为 caddy-l4 max_connections），0 为不限制'
                     : '该上游同时处理的请求数达到上限后判定不可用并移出负载，0 为不限制——HTTP 反代无逐上游并发连接限制'" />
                 </template>
-                <template #default="{ row }">
+                <template #default="{ row, $index }">
                   <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" :content="`动态上游模式下${wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数'}不生效`">
-                    <el-input-number v-model="row.max_connections" :min="RULE_NUMERIC_LIMITS.maxConnectionsMin" size="small" controls-position="right" class="upstream-input-small" :disabled="wizardForm.dynamic_dns" />
+                    <el-input-number v-model="row.max_connections" :min="RULE_NUMERIC_LIMITS.maxConnectionsMin" size="small" controls-position="right" class="upstream-input-small" :aria-label="`上游第 ${$index + 1} 行${wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数'}`" :disabled="wizardForm.dynamic_dns" />
                   </el-tooltip>
                 </template>
               </el-table-column>
               <el-table-column label="启用" width="52" align="center">
                 <template #default="{ row, $index }">
-                  <el-switch v-model="row.enabled" size="small" @change="onWeightChange($index)" />
+                  <el-switch v-model="row.enabled" size="small" :aria-label="`上游第 ${$index + 1} 行启用`" @change="onWeightChange($index)" />
                 </template>
               </el-table-column>
               <el-table-column width="48" align="center">
                 <template #default="{ $index }">
-                  <el-button type="danger" link size="small" @click="removeUpstream($index)">
+                  <el-button type="danger" link size="small" :aria-label="`删除上游第 ${$index + 1} 行`" @click="removeUpstream($index)">
                     <el-icon><Delete /></el-icon>
                   </el-button>
                 </template>
@@ -673,7 +675,7 @@
 
             <el-divider content-position="left" class="compact-divider">负载策略</el-divider>
 
-            <div class="strategy-cards">
+            <div class="strategy-cards" role="radiogroup" aria-label="负载策略">
               <el-tooltip
                 v-for="card in strategyCardOptions"
                 :key="card.value"
@@ -684,7 +686,13 @@
                 <div
                   class="strategy-card"
                   :class="{ active: wizardForm.strategy === card.value, locked: ntlmOn && card.value !== 'cookie' }"
+                  role="radio"
+                  :aria-checked="wizardForm.strategy === card.value"
+                  :aria-disabled="ntlmOn && card.value !== 'cookie'"
+                  :tabindex="ntlmOn && card.value !== 'cookie' ? -1 : 0"
                   @click="selectStrategy(card.value)"
+                  @keydown.enter.prevent="selectStrategy(card.value)"
+                  @keydown.space.prevent="selectStrategy(card.value)"
                 >
                   <div class="strategy-card-head">
                     <span class="strategy-card-icon" aria-hidden="true">
@@ -704,8 +712,10 @@
 
             <el-divider content-position="left" class="compact-divider">健康检查</el-divider>
 
+            <!-- 三个健康阈值控件均不设上限：后端只校验 ≥1（handlers.go），
+                 带外合法值（API/MCP 写入 20）不得在编辑触碰控件时被静默夹到 10。 -->
             <el-form-item label="失败阈值">
-              <el-input-number v-model="wizardForm.health_check_unhealthy_threshold" :min="1" :max="10" controls-position="right" style="width: 120px;" />
+              <el-input-number v-model="wizardForm.health_check_unhealthy_threshold" :min="1" controls-position="right" style="width: 120px;" />
               <span class="form-tip-inline">次失败后标记为不健康（被动计数与主动探测共用）</span>
             </el-form-item>
 
@@ -747,7 +757,7 @@
                   <span class="form-tip-inline">探测请求的 Host 头；HTTPS 上游的探测不携带独立 SNI（回源域名仅作用于代理流量）</span>
                 </el-form-item>
                 <el-form-item label="恢复阈值">
-                  <el-input-number v-model="wizardForm.health_check_healthy_threshold" :min="1" :max="10" controls-position="right" style="width: 120px;" />
+                  <el-input-number v-model="wizardForm.health_check_healthy_threshold" :min="1" controls-position="right" style="width: 120px;" />
                   <span class="form-tip-inline">次连续探测成功后恢复为健康</span>
                 </el-form-item>
               </template>
@@ -771,7 +781,7 @@
                   <span class="form-tip-inline">留空或 0 表示按各上游自身端口探测</span>
                 </el-form-item>
                 <el-form-item label="恢复阈值">
-                  <el-input-number v-model="wizardForm.health_check_healthy_threshold" :min="1" :max="10" controls-position="right" style="width: 120px;" />
+                  <el-input-number v-model="wizardForm.health_check_healthy_threshold" :min="1" controls-position="right" style="width: 120px;" />
                   <span class="form-tip-inline">次连续探测成功后恢复为健康</span>
                 </el-form-item>
               </template>
@@ -886,7 +896,9 @@
             </el-form-item>
 
             <el-form-item label="Keepalive 超时">
-              <el-input-number v-model="wizardForm.upstream_keepalive_timeout" :min="0" :max="3600" controls-position="right" style="width: 120px;" :disabled="ntlmOn" />
+              <!-- 不设上限：后端只拒绝负值（rules.go），带外合法值（API/MCP 写入 7200）
+                   在编辑时不得被控件静默夹到 3600 —— 与 ProxyTimeoutFields 同口径。 -->
+              <el-input-number v-model="wizardForm.upstream_keepalive_timeout" :min="0" controls-position="right" style="width: 120px;" :disabled="ntlmOn" />
               <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn ? 'NTLM 模式锁定 300s（关闭后恢复全局继承）' : '秒，0 = 全局默认；与上游服务器长连接的空闲超时' }}</span>
             </el-form-item>
           </el-form>
@@ -2107,6 +2119,11 @@ async function retryTlsDetail(): Promise<void> {
     // 掩码私钥标记——已配置且回显空串时允许沿用原值
     wizardForm.tlsKeySet = resp.data.tls_key_set === true
     tlsDetailError.value = false
+    // 回填后复现正常加载路径的派生效果：certInfo 只由 textarea 的 blur 触发解析，
+    // 不回读会让 TLS 步的验证块与预览域名/有效期保持空（用户误判材料不可用）。
+    // validateCertificate 自带 certValidationSeq/会话序号守卫，换表单/关向导后
+    // 的迟到响应不会写回。
+    void validateCertificate()
     ElMessage.success('证书详情已重新加载')
   } catch (error: unknown) {
     if (!sessionAlive()) return
@@ -3127,6 +3144,14 @@ const submitWizard = async () => {
     return
   }
   if (wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled) {
+    // 提交门镜像步进门（nextStep 的 CUSTOM_ROUTES 分支同文案）：启用自定义路由
+    // 却没有路径规则时，载荷会落 custom_routes_enabled=1 + path_rules=[]，
+    // 预览却按空数组显示「禁用」——字段与文案相反的死配置。
+    if (wizardForm.path_rules.length === 0) {
+      ElMessage.warning('请至少添加一条路径规则')
+      saving.value = false
+      return
+    }
     const pathRuleError = validatePathRules(wizardForm.path_rules)
     if (pathRuleError) {
       ElMessage.warning(pathRuleError)
@@ -3979,7 +4004,7 @@ onUnmounted(() => {
 .rules-table :deep(.el-table .cell) { padding: 0 6px; }
 .search-input { width: 280px; }
 /* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
-.polling-error-alert { margin-bottom: 16px; }
+/* .polling-error-alert 已收敛 main.css（三处 scoped 逐字重复删除） */
 /* .polling-error-title/.polling-error-meta 已收敛 main.css*/
 /* .mode-row 自管标签行族已全量退役（2026-10-11 用户裁定：对齐统一走原生
  * el-form-item）——.mode-row-label/.mode-row-content/.required-mark 死 CSS 一并删除 */

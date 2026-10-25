@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -219,7 +220,7 @@ func captureApplicationLogs(t *testing.T) *bytes.Buffer {
 // logCleanupSummaryLine log-cleanup 任务单轮摘要行——对「摘要行口径 = 实际
 // 清理口径」直接钉测。
 func logCleanupSummaryLine(logFile string) string {
-	_, line := logCleanupRound(logFile)
+	_, line := logCleanupRound(context.Background(), logFile)
 	return line
 }
 

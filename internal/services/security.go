@@ -667,6 +667,14 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 		}
 		sb.WriteString(fmt.Sprintf("SecAction \"id:900,phase:1,nolog,pass,setvar:tx.inbound_anomaly_score_threshold=%d\"\n", p.AnomalyThreshold))
 		if len(groups) == 0 {
+			// 树交换探针二次采样（发射点）：生成入口的采样之后还要付库探测、
+			// 索引惰性构建与逐（规则×策略）渲染（百毫秒级以上），窗口可能在此
+			// 间开启。glob Include 的规则文件集在此刻读树——命中窗口即整份
+			// 配置拒绝（调用方重试），不发布「可编译但规则文件只到一半」的弱
+			// 安全链配置。
+			if crsTreeSwapInFlightNow() {
+				return "", errCRSTreeSwapInFlight
+			}
 			if p.WAFCheckResponse {
 				sb.WriteString("Include /app/waf/crs/rules/*.conf\n")
 			} else {
@@ -698,7 +706,9 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 			// 恒为空、属不可达的虚假防线）。序：901 先于被选组（phase:1 默认值），
 			// 949/959 在检测规则之后（插入序=执行序）。
 			emitInfraInclude("REQUEST-901-INITIALIZATION.conf")
-			emitCRSRuleGroupSelection(&sb, p, groups, chainIndex)
+			if err := emitCRSRuleGroupSelection(&sb, p, groups, chainIndex); err != nil {
+				return "", err
+			}
 			emitInfraInclude("REQUEST-949-BLOCKING-EVALUATION.conf")
 			if p.WAFCheckResponse {
 				emitInfraInclude("RESPONSE-959-BLOCKING-EVALUATION.conf")
@@ -2717,7 +2727,15 @@ func stripInfraCRSGroupCodes(groups []string) (kept, stripped []string) {
 // 文件内索引已知、未被选中的其余 ID 逐条 SecRuleRemoveById（ctl 不适用于配置期
 // 整组剔除，补删必须逐 ID，不能用区间以免误删同文件被选 ID）。陈旧 ID（索引
 // 不存在）跳过+warn。纯组号载荷的输出与既有实现逐行一致（等价回归锁定）。
-func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, groups []string, chainIndex func() *CRSRuleIndex) {
+//
+// 树交换探针二次采样（发射点）：本函数是选组路径下规则文件集的实际消费点
+// ——入口采样之后到此处可能已过百毫秒（库探测+索引构建+逐策略渲染），窗口
+// 若在此间开启，逐条 Include 会指向缺失/半拷贝的规则文件。命中即返回
+// errCRSTreeSwapInFlight，由调用方按「整份配置拒绝 + 重试」处理。
+func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, groups []string, chainIndex func() *CRSRuleIndex) error {
+	if crsTreeSwapInFlightNow() {
+		return errCRSTreeSwapInFlight
+	}
 	// 渲染侧同样按写入侧上限截断（防御深度）：带外/旧快照写入 1 万条组号时，
 	// 逐条 HasGroup（O(规则数)）与上万行 Include 会放大配置体积与生成耗时。
 	// 写入 API 已 400，此门只对绕过写侧的数据生效。
@@ -2768,7 +2786,7 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 		}
 	}
 	if len(idTargets) == 0 {
-		return
+		return nil
 	}
 	index := chainIndex()
 	selected := make(map[string]struct{}, len(idTargets))
@@ -2803,7 +2821,7 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 		sb.WriteString(fmt.Sprintf("Include /app/waf/crs/rules/%s\n", entry.File))
 	}
 	if len(parentFiles) == 0 {
-		return
+		return nil
 	}
 	idsByFile := index.RuleIDsByFile()
 	for _, file := range parentFiles {
@@ -2814,6 +2832,7 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 			sb.WriteString(fmt.Sprintf("SecRuleRemoveById %s\n", id))
 		}
 	}
+	return nil
 }
 
 // ValidateGeoIPCountries 校验 geoip_countries 载荷：必须是 JSON 数组且条目非空；

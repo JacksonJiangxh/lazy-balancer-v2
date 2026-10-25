@@ -141,6 +141,33 @@ test('另一标签页建立新会话：跟随令牌并重拉用户与节点模�
   assert.equal(store.nodeMode, 'master', '新会话必须重拉节点模式')
 })
 
+test('首屏 init：/users/me 与 /config 并行发出（不叠成两次 30s 超时）', async () => {
+  storage.set('token', 'tok-parallel')
+  const store = newStore()
+  const started: string[] = []
+  const deferred = new Map<string, () => void>()
+  const defaultGet = host.__authGet
+  host.__authGet = (url: string) => {
+    started.push(url)
+    const { promise, resolve } = Promise.withResolvers<unknown>()
+    deferred.set(url, () => resolve(url === '/users/me'
+      ? { data: { id: 8, username: 'bob', role: 'admin', is_enabled: true, display_name: 'Bob', mfa_enabled: false, auth_provider: 'local' } }
+      : { data: { is_master: true, timezone: 'Asia/Shanghai', cert_renewal_days: 30, mfa_write_guard: false } }))
+    return promise
+  }
+  try {
+    const pending = store.init()
+    // 两个请求均未落地：串行实现此刻只会发出 /users/me（首屏最坏 30s×2 的来源）
+    assert.deepEqual([...started].sort(), ['/config', '/users/me'], '首屏两个请求必须并行')
+    for (const resolve of deferred.values()) resolve()
+    await pending
+    assert.equal(store.user?.username, 'bob')
+    assert.equal(store.nodeMode, 'master')
+  } finally {
+    host.__authGet = defaultGet
+  }
+})
+
 test('非令牌键的 storage 变更不触碰会话（多标签页导航互不干扰）', () => {
   storage.set('token', 'tok-tab-d')
   const store = newStore()

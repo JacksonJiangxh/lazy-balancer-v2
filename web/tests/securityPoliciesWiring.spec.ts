@@ -98,3 +98,38 @@ test('保存收尾走批量端点，不回流逐规则 PUT（钉调用点而非�
   assert.match(tail, /request\.post</, '批量端点必须经 POST 提交')
   assert.doesNotMatch(tail, /request\.put\(/, '收尾不得逐规则 PUT')
 })
+
+test('限流唯一门：选择器与提交门共用同一谓词，业务 400 不再承诺可重试', () => {
+  const editor = code('src/components/SecurityBindingEditor.vue')
+  // 同源谓词：规则侧编辑器与策略向导都走 securityStages.hasOtherStage2Binding
+  assert.match(editor, /hasOtherStage2Binding\(current, props\.policyId/)
+  assert.match(page, /hasOtherStage2Binding,/)
+
+  const meta = section(page, 'const pickerMeta = (caddyId: string)', 'return { chain, selfPos:')
+  assert.match(meta, /editorPolicyType\.value === 'stage2'/, '仅阶段 2 策略触发限流唯一门')
+  assert.match(meta, /hasOtherStage2Binding\(existing, editingId\.value/)
+  assert.match(meta, /该规则已绑定其它限流策略（每规则仅一条），需先解绑/)
+
+  // 选择器渲染/全选集合必须按 blockReason 判据（原 wouldExceed 只剩条数上限）
+  assert.match(page, /:disabled="pickerMeta\(rule\.caddy_id\)\.blockReason !== ''"/)
+  assert.match(page, /v-if="pickerMeta\(rule\.caddy_id\)\.blockReason" class="rule-binding-limit"/)
+  assert.match(page, /pickerMeta\(rule\.caddy_id\)\.blockReason === ''/)
+  assert.doesNotMatch(page, /\.wouldExceed/, '按元信息单一原因判据收敛，不留双口径')
+
+  // 提交门镜像：阶段 2 新增绑定先本地拒绝，不让「策略已落库＋绑定 400」发生
+  const gate = section(page, "const stage2Conflict = editorPolicyType.value === 'stage2'", 'if (stage2Conflict.length > 0)')
+  assert.match(gate, /hasOtherStage2Binding\(/)
+  assert.match(page, /请先解绑后再关联/)
+
+  // 绑定同步失败分档：结构性 400 不承诺「重试」，其余（网络/5xx）保留幂等重试提示
+  assert.match(page, /error instanceof ApiRequestError && error\.status === 400/)
+  assert.match(page, /原样重试不会成功/)
+  assert.match(page, /重新点击保存可重试绑定（幂等）/)
+})
+
+test('IP ACL 名单校验只作用于启用态字段（关闭后隐藏的条目不得点名）', () => {
+  const validate = section(page, 'const validateIpAclList = (): boolean =>', 'const nextStep')
+  assert.match(validate, /if \(form\.value\.ip_acl_enabled\) \{\n\s*const invalidEntry = ipACLList\.value\.find/)
+  // 白名单空列表门仍按启用态（保留语义下关闭 ACL 不阻断保存）
+  assert.match(validate, /if \(form\.value\.ip_acl_enabled && form\.value\.ip_acl_mode === 'allow'/)
+})

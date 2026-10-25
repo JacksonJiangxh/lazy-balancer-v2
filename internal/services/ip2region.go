@@ -711,7 +711,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 		if prov == "" {
 			// 台湾城市误入省列：归入台湾省城市集（其省列值即城市名）。
 			rawProv := strings.TrimSpace(fields[1])
-			if geoipnames.TaiwanCities[rawProv] {
+			if geoipnames.IsTaiwanCity(rawProv) {
 				provinces["台湾省"] = true
 				set := cities["台湾省"]
 				if set == nil {

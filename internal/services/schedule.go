@@ -78,6 +78,16 @@ const (
 	noopSlotAssignSQL = `next_update=next_update`
 )
 
+// errScheduleSlotNotAdvanced 标记「状态列已落库，但本轮排程槽未推进」
+// （写路径严格读排程失败/库未初始化）。
+//
+// 成功路径必须把该结果按失败返回给任务引擎，不得以 success 收尾：引擎的
+// 「成功落定+槽仍到期」分支会把本槽记入 schedDoneSlot（同一槽只执行一次的
+// 水位），此后 tick 的「槽 > 已消费水位」门永久拒绝该槽——业务槽停在过去、
+// 也没有「下一次成功/失败落库」可以自愈，该族自动更新就此静默停摆。失败轮
+// 走引擎的退避重投（读恢复后的下一轮自然推进槽并清零退避/连续失败计数）。
+var errScheduleSlotNotAdvanced = errors.New("排程不可读，本轮排程槽未推进")
+
 // userCancelledRun 本轮是否由用户显式取消（任务监控「取消」/前端取消入口）。
 // 引擎在用户取消路径给运行 ctx 标记 ErrUserCancelled 取消原因；demote 中止/
 // 导入排空/进程停止走普通取消（context.Canceled）——三者保留「恢复后到期轮
@@ -158,7 +168,8 @@ func setVersionTableAutoUpdate(table, label, seed, taskID string, enabled bool) 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交 %s 自动更新事务: %w", label, err)
 	}
-	syncTaskLoop(taskID, enabled)
+	// 调度应用走与业务驱动整轮对齐共用的互斥（避免「库新/loop 旧」交错）。
+	applyBusinessTaskLoop(taskID, enabled)
 	return nil
 }
 
@@ -240,15 +251,23 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 	// 威胁/爬虫源表：逐启用行重排（行键不同——威胁按 id、爬虫按 name）。
 	// 威胁族带注册表名过滤（与读侧寻槽、首槽武装同源）：注册表外启用行的槽
 	// 不属于运行域，重排只会把被清理的惰性槽又写回去。
+	// 槽函数取严格形态（与版本表族同口径）：排程不可读时整表跳过——fail-soft
+	// 变体会把用户的「星期几 + HH:MM」写成默认 04:00 的未来槽（一次性越档
+	// 执行），读失败已由严格读单源留痕。
 	for _, st := range []struct {
 		table  string
 		keyCol string
-		slotFn func(time.Time) string
+		slotFn func(time.Time) (string, error)
 		names  []string
 	}{
-		{"security_threat_sources", "id", threatNextSlot, threatSourceRegistryNames()},
-		{"security_crawler_sources", "name", crawlerNextSlot, nil},
+		{"security_threat_sources", "id", threatNextSlotStrict, threatSourceRegistryNames()},
+		{"security_crawler_sources", "name", crawlerNextSlotStrict, nil},
 	} {
+		slot, slotErr := st.slotFn(now)
+		if slotErr != nil {
+			// 排程不可读：本表本轮不重排（旧槽保留，下一轮重排/保存排程自愈）。
+			continue
+		}
 		nameClause, nameArgs := sourceNameSetClause("name", st.names, false)
 		rows, err := database.Query(`SELECT `+st.keyCol+`, COALESCE(next_update,'') FROM `+st.table+`
 			WHERE update_enabled=1 AND COALESCE(next_update,'')<>''`+nameClause, nameArgs...)
@@ -267,10 +286,10 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 				Logf("warn", "时区变更重排：%s 行扫描失败（跳过该行）: %v", st.table, err)
 				continue
 			}
-			if slot := parseUTCSlot(nextUpdate); slot.IsZero() || !slot.After(now) {
+			if cur := parseUTCSlot(nextUpdate); cur.IsZero() || !cur.After(now) {
 				continue // 过期槽保留（补跑语义）
 			}
-			rearms = append(rearms, rearm{key: key, slot: st.slotFn(now)})
+			rearms = append(rearms, rearm{key: key, slot: slot})
 		}
 		if err := rows.Err(); err != nil {
 			Logf("warn", "时区变更重排：%s 迭代失败（部分行未重排）: %v", st.table, err)
@@ -516,14 +535,16 @@ func versionTableNextSlotStrict(table string, now time.Time) (string, error) {
 }
 
 // versionTableSlotSuccessAssign 版本表族成功落的 next_update 赋值片段与参数
-// （成功门 trigger 两次 + 槽值）。排程不可读时返回 no-op 片段与零参数：状态/
-// 版本列照常落库，预约保持旧值（读恢复后由下一次成功/失败落库路径自愈）。
-func versionTableSlotSuccessAssign(table, trigger string) (string, []any) {
+// （成功门 trigger 两次 + 槽值）。排程不可读时返回 no-op 片段与错误：状态/
+// 版本列照常落库，预约保持旧值，调用方必须把本轮按失败返回给任务引擎
+// （见 errScheduleSlotNotAdvanced——成功轮不推进槽却回 success 会被引擎消费
+// 本槽，该族自动更新从此静默停摆）。
+func versionTableSlotSuccessAssign(table, trigger string) (string, []any, error) {
 	slot, err := versionTableNextSlotStrict(table, time.Now().UTC())
 	if err != nil {
-		return noopSlotAssignSQL, nil
+		return noopSlotAssignSQL, nil, fmt.Errorf("%w: %v", errScheduleSlotNotAdvanced, err)
 	}
-	return versionTableSlotSuccessSQL, []any{trigger, trigger, slot}
+	return versionTableSlotSuccessSQL, []any{trigger, trigger, slot}, nil
 }
 
 // versionTableSlotAdvanceAssign 版本表族失败/取消落的赋值片段与参数
@@ -656,13 +677,14 @@ func crawlerNextSlotStrict(now time.Time) (string, error) {
 }
 
 // threatSlotSuccessAssign 威胁源族成功落的赋值片段与参数（成功门 trigger
-// 两次 + 槽值）；排程不可读时返回 no-op 片段与零参数。
-func threatSlotSuccessAssign(trigger string) (string, []any) {
+// 两次 + 槽值）；排程不可读时返回 no-op 片段与错误（原因/调用方契约同
+// versionTableSlotSuccessAssign）。
+func threatSlotSuccessAssign(trigger string) (string, []any, error) {
 	slot, err := threatNextSlotStrict(time.Now().UTC())
 	if err != nil {
-		return noopSlotAssignSQL, nil
+		return noopSlotAssignSQL, nil, fmt.Errorf("%w: %v", errScheduleSlotNotAdvanced, err)
 	}
-	return threatSlotSuccessSQL, []any{trigger, trigger, slot}
+	return threatSlotSuccessSQL, []any{trigger, trigger, slot}, nil
 }
 
 // threatSlotAdvanceAssign 威胁源族失败落（仅 auto 推进）。

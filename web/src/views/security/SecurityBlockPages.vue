@@ -90,10 +90,10 @@
       </template>
       <el-form :model="form" label-width="80px" label-position="right" class="block-page-form">
         <el-form-item label="名称" required>
-          <el-input v-model="form.name" placeholder="页面名称" :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" />
+          <el-input v-model="form.name" placeholder="页面名称" maxlength="100" show-word-limit :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" />
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="form.description" placeholder="页面描述" :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" />
+          <el-input v-model="form.description" placeholder="页面描述" maxlength="500" show-word-limit :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" />
         </el-form-item>
         <el-form-item label="内容类型">
           <el-select v-model="form.content_type" style="width: 320px" :disabled="isReadOnly || currentPage?.is_default || currentPage?.is_builtin">
@@ -104,7 +104,7 @@
         <el-form-item label="内容" class="content-form-item">
           <div class="block-content-editor" style="width: 100%">
             <SyntaxHighlight v-if="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" :content="form.content" language="markup" height="520px" />
-            <CodeEditor v-else v-model="form.content" language="markup" height="520px" placeholder="响应内容（HTML 类型支持内联 CSS）" />
+            <CodeEditor v-else v-model="form.content" language="markup" height="520px" aria-label="拦截页面内容" placeholder="响应内容（HTML 类型支持内联 CSS）" />
           </div>
           <div class="form-tip-line">
             {{ (currentPage?.is_default || currentPage?.is_builtin) ? '内置页面内容只读，仅可查看' : '拦截时返回给客户端的响应内容（HTML 类型支持内联 CSS）' }}
@@ -179,6 +179,9 @@ const contentSizes = computed(() => {
 })
 const form = ref({ name: '', description: '', content: '', content_type: 'text/html; charset=utf-8' })
 
+// 后端 validateBlockPagePayload 的内容上限（64<<10 字节），前端仅做同源前置门。
+const BLOCK_PAGE_CONTENT_MAX_BYTES = 64 << 10
+
 // 可选内容类型（与后端 models.BlockPageContentTypeWhitelist 白名单同口径）
 const CONTENT_TYPE_OPTIONS = [
   { value: 'text/html; charset=utf-8', label: 'HTML 页面（text/html）' },
@@ -238,6 +241,14 @@ const openDialog = (row?: BlockPage) => {
 }
 const handleSave = async () => {
   if (!form.value.name.trim()) { ElMessage.warning('请输入页面名称'); return }
+  // 与后端 validateBlockPagePayload 同源的前置门：内容非空 + ≤64KB（UTF-8 字节）。
+  // 此前只判名称，超限内容过确认后由后端 400 拒绝，错误文案不落到字段。
+  if (!form.value.content.trim()) { ElMessage.warning('请输入页面内容'); return }
+  const contentBytes = new TextEncoder().encode(form.value.content).byteLength
+  if (contentBytes > BLOCK_PAGE_CONTENT_MAX_BYTES) {
+    ElMessage.warning(`页面内容 ${formatBytes(contentBytes)} 超出 64KB 上限，请精简后保存`)
+    return
+  }
   saving.value = true
   try {
     const res = editingId.value
@@ -280,7 +291,6 @@ onMounted(fetchData)
 
 <style scoped>
 .block-content-editor { border: 1px solid #e4e7ed; border-radius: 6px; overflow: hidden; }
-.block-page-form .content-form-item .el-form-item__content { flex: 1; max-width: 100%; }
 
 /* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 

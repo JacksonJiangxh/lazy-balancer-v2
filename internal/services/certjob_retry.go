@@ -2,25 +2,26 @@ package services
 
 // 证书任务重试冷却的服务端单源策略（列表下发 / 服务端门禁 / 任务监控动态行
 // 三处共用）：
-//   - disabled：不可重试（永久条件，不是限流）；
+//   - disabled：不可重试（永久条件，不是限流），下发侧为 null（不可判定）；
 //   - issued / waiting_ca：无通用冷却，但 waiting_ca 还要并入 CA 限流退避窗口
 //     （ca_available_after，1–3h，远晚于通用冷却）；
-//   - queued 15 分钟、failed 5 分钟、其余执行态 2 分钟（服务端门禁按 updated_at
-//     起算是否到期）。
+//   - queued 15 分钟、failed 5 分钟、其余执行态 2 分钟（均自 updated_at 起算，
+//     与重试门同一基准）。
 //
-// 三处消费方必须共用本文件：前端以 retry_cooldown_seconds 为唯一判据，只下发
-// 通用冷却会让 waiting_ca 任务显示 0（「现在可重试」）而服务端按 CA 冷却回
-// 429，形成「可点重试却必被拒」的分叉。
+// 两个列表接口（/certificates/jobs 与 /system/tasks 的证书行动态行）统一下发
+// 「此刻剩余秒」：0 = 现在即可重试，>0 = 还需等待的秒数，null = 该状态永久不可
+// 重试。剩余值已按 updated_at 扣减已流逝部分（waiting_ca 取 CA 退避到期时刻），
+// 前端判据只需比较「>0」，不得再按 updated_at 二次扣减——曾出现下发剩余秒、
+// 前端又从 updated_at 起算时长，冷却过半即引导用户点击一次必然 429 的重试。
 
 import (
 	"database/sql"
 	"time"
 )
 
-// CertJobRetryCooldown 是重试冷却的通用策略源（按状态）。
-// 列表下发值与服务端门禁不直接共用本函数：列表还要并入 CA 限流退避
-// （见 CertJobRetryCooldownAt），服务端则先过本函数的通用冷却、再单独过
-// CertJobCAcooldownActive（force 可越过）。
+// CertJobRetryCooldown 是重试冷却的通用策略源（按状态），返回「完整窗口」。
+// 下发口径还要按 updated_at 扣减已流逝部分（见 CertJobRetryRemaining），服务端
+// 门禁则先过本窗口、再单独过 CertJobCAcooldownActive（force 可越过）。
 func CertJobRetryCooldown(status string) (time.Duration, bool) {
 	switch status {
 	case "disabled":
@@ -44,37 +45,50 @@ func CertJobCAcooldownActive(status string, caAvailableAfter sql.NullTime, now t
 	return status == "waiting_ca" && caAvailableAfter.Valid && now.Before(caAvailableAfter.Time)
 }
 
-// CertJobRetryCooldownAt 返回「此刻该任务还剩多少冷却」：通用冷却之外并入
-// CA 限流退避窗口。列表类下发（证书任务列表与任务监控证书行）必须走本函数
-// （或 CertJobRetryCooldownSecondsAt）——只下发通用冷却会让 waiting_ca 任务
-// 显示 0，而服务端按 CA 冷却回 429。
-func CertJobRetryCooldownAt(status string, caAvailableAfter sql.NullTime, now time.Time) (time.Duration, bool) {
-	cooldown, retryable := CertJobRetryCooldown(status)
+// CertJobRetryRemaining 返回「此刻还剩多少冷却」：通用窗口按 updated_at（缺失
+// 回退 created_at，两列都缺失按刚更新计满窗口，与重试门的 fail-closed 同口径）
+// 扣减已流逝时间；waiting_ca 在 CA 退避窗口内直接取 ca_available_after 的剩余。
+// ok=false 表示永久不可重试（下发侧应表达为 null，而不是「0=现在可重试」）。
+func CertJobRetryRemaining(status string, updatedAt, createdAt, caAvailableAfter sql.NullTime, now time.Time) (time.Duration, bool) {
+	window, retryable := CertJobRetryCooldown(status)
 	if !retryable {
-		return cooldown, false
+		return 0, false
 	}
 	if CertJobCAcooldownActive(status, caAvailableAfter, now) {
 		return caAvailableAfter.Time.Sub(now), true
 	}
-	return cooldown, true
+	if window <= 0 {
+		return 0, true
+	}
+	reference := updatedAt
+	if !reference.Valid {
+		reference = createdAt
+	}
+	if !reference.Valid {
+		return window, true
+	}
+	if remaining := reference.Time.Add(window).Sub(now); remaining > 0 {
+		return remaining, true
+	}
+	return 0, true
 }
 
-// CertJobRetryCooldownSeconds 把冷却时长规范化为下发口径（秒，向上取整）：
+// CertJobRetryCooldownSeconds 把剩余时长规范化为下发口径（秒，向上取整）：
 // 剩余不足 1 秒时下发 1 而非 0——0 在下发侧语义是「现在即可重试」，会把仍在
 // 冷却中的任务引导成一次必然 429 的重试。
-func CertJobRetryCooldownSeconds(cooldown time.Duration) int64 {
-	if cooldown <= 0 {
+func CertJobRetryCooldownSeconds(remaining time.Duration) int64 {
+	if remaining <= 0 {
 		return 0
 	}
-	return int64((cooldown + time.Second - 1) / time.Second)
+	return int64((remaining + time.Second - 1) / time.Second)
 }
 
-// CertJobRetryCooldownSecondsAt 是「此刻剩余冷却（秒）」的下发单源：
-// 不可重试/无剩余/CA 窗口缺失或已到期 → 0（0=无冷却，前端按此判定可点）。
-func CertJobRetryCooldownSecondsAt(status string, caAvailableAfter sql.NullTime, now time.Time) int64 {
-	cooldown, retryable := CertJobRetryCooldownAt(status, caAvailableAfter, now)
+// CertJobRetryRemainingSeconds 是「此刻剩余冷却（秒）」的下发单源：不可重试
+// （disabled）→ ok=false，消费方下发 null；其余按剩余时长取整（0=现在可重试）。
+func CertJobRetryRemainingSeconds(status string, updatedAt, createdAt, caAvailableAfter sql.NullTime, now time.Time) (int64, bool) {
+	remaining, retryable := CertJobRetryRemaining(status, updatedAt, createdAt, caAvailableAfter, now)
 	if !retryable {
-		return 0
+		return 0, false
 	}
-	return CertJobRetryCooldownSeconds(cooldown)
+	return CertJobRetryCooldownSeconds(remaining), true
 }

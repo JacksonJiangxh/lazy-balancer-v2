@@ -23,6 +23,15 @@ g.__gets = []
 
 registerModuleHooks({ '@/utils/api': STUB_API })
 const { useCountryNamesCn, countryLabel } = await import('../src/composables/useCountryNamesCn.ts')
+test('原型键不得把函数当译名（映射是普通对象）', () => {
+  const zh = { 美国: '美国(US)' }
+  for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
+    const label = countryLabel(zh, key)
+    assert.equal(typeof label, 'string', `${key} 译名必须是字符串（原型链函数不得外泄）`)
+    assert.equal(label, key, `${key} 未收录按原文回退`)
+  }
+})
+
 test('失败回退原名且不闩死：下一次调用重试并落地中文映射', async () => {
   g.__gets = []
   let mode: 'fail' | 'ok' = 'fail'

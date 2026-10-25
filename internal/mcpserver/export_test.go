@@ -47,6 +47,11 @@ func ReadOnlyProbeToolNamesForTest() []string {
 	return names
 }
 
+// ServerInstructionsForTest 暴露随 initialize 下发的运行时说明文本：外部测试
+// 包用它与路由派生集对账——同一权限契约的人读文档修正后，机器可读的两份文本
+// （instructions / playbook）也必须同步。
+func ServerInstructionsForTest() string { return serverInstructions }
+
 // DocEndpointForTest 是「仅 REST 可用的能力」表中的一条端点（方法 + 路径原文）。
 type DocEndpointForTest struct {
 	Method string

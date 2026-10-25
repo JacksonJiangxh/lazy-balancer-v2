@@ -944,3 +944,28 @@ func TestCrawlerIPRangeSnapshot_unavailableReasonsAreLogged(t *testing.T) {
 		t.Fatalf("冷启动缺失形态不得告警，实际 %d 条", got)
 	}
 }
+
+// 快照内容不可用（null/{}/全坏条目）不得把 ok 置真：判定侧对空集返回瞬态，
+// 若 ok=true 则 10 分钟缓存期内所有引擎验证恒瞬态，且诊断被成功路径的
+// clearCrawlerSnapshotLogs 抹掉（豁免整体静默失效）。
+func TestParsePayload_emptySnapshotIsUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"null", "null", false},
+		{"empty object", "{}", false},
+		{"engine with empty list", `{"360":[]}`, false},
+		{"all cidrs unparsable", `{"360":["not-a-cidr","1.2.3.4/99"]}`, false},
+		{"one usable prefix", `{"360":["203.0.113.0/24"]}`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &crawlerIPRangeSnapshot{filePath: "snapshot.json", prefixes: map[string][]netip.Prefix{}}
+			if got := s.parsePayload([]byte(c.raw)); got != c.want {
+				t.Fatalf("parsePayload(%s)=%v, want %v", c.raw, got, c.want)
+			}
+		})
+	}
+}

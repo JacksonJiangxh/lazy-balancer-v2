@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"testing"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 // security 节哈希口径必须与 apply 落库口径一致：主端 payload 的原始行经同一组
@@ -70,5 +72,79 @@ func TestSecuritySectionHash_matchesSlaveRebuildAfterApply(t *testing.T) {
 	}
 	if localAgain["security"] != local["security"] {
 		t.Fatalf("归一后哈希不稳定：%s != %s", localAgain["security"], local["security"])
+	}
+}
+
+// users 节里的安全事件保留/采样三列也必须「下发值 / 主端哈希输入 / 从端落库值」
+// 三面同源：写侧拒绝 0/越界（handlers/caddy.go），脏值只能带外直写，而启动
+// 回填 marker 置位后运行期不再改写——主端若按脏值算哈希，从端 apply 归一后
+// 主从哈希恒不等，每同步周期强制重放 users 节并重载 Caddy。
+func TestUsersSectionHash_matchesSlaveRebuildAfterApplyingOutOfRangeRetention(t *testing.T) {
+	cases := []struct {
+		name                  string
+		retentionDays, rowCap int
+		trafficSample         int
+	}{
+		{name: "zero-values", retentionDays: 0, rowCap: 0, trafficSample: 7},
+		{name: "above-limits", retentionDays: 999999, rowCap: db.MaxSecurityEventsRowCap + 1, trafficSample: -5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster, database := newClusterTestService(t)
+			ctx := context.Background()
+			if _, err := database.Exec(`UPDATE global_config SET security_events_retention_days=?, security_events_row_cap=?, threat_traffic_sample_n=? WHERE id=1`,
+				tc.retentionDays, tc.rowCap, tc.trafficSample); err != nil {
+				t.Fatal(err)
+			}
+
+			// When 主端构建快照（装载侧归一）
+			snapshot, _, err := cluster.Snapshot(ctx, 0, "", "cluster-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			masterHash := snapshot.SectionHashes["users"]
+			if masterHash == "" {
+				t.Fatal("users 节哈希缺失")
+			}
+			if got := *snapshot.BasicSettings.SecurityEventsRetentionDays; got != db.DefaultSecurityEventsRetentionDays {
+				t.Fatalf("下发保留天数=%d, want 归一为默认 %d（脏值不得进入快照与哈希）", got, db.DefaultSecurityEventsRetentionDays)
+			}
+			if got := *snapshot.BasicSettings.SecurityEventsRowCap; got != db.DefaultSecurityEventsRowCap {
+				t.Fatalf("下发行数上限=%d, want 归一为默认 %d", got, db.DefaultSecurityEventsRowCap)
+			}
+			if got := *snapshot.BasicSettings.ThreatTrafficSampleN; got != db.DefaultThreatTrafficSampleN {
+				t.Fatalf("下发采样口径=%d, want 归一为默认 %d", got, db.DefaultThreatTrafficSampleN)
+			}
+
+			// When 从端 apply（落库归一同源）
+			tx, err := database.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := updateSnapshotSettings(ctx, tx, snapshot); err != nil {
+				_ = tx.Rollback()
+				t.Fatalf("apply snapshot settings: %v", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Then 从端重建的 users 节哈希与主端相等，且库值已是默认
+			local, err := cluster.driftGuardSectionHashes(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if local["users"] != masterHash {
+				t.Fatalf("users 节哈希主从不一致：master=%s local=%s（保留/采样三列归一口径与哈希口径分裂）", masterHash, local["users"])
+			}
+			var days, rowCap, sample int
+			if err := database.QueryRow(`SELECT security_events_retention_days, security_events_row_cap, threat_traffic_sample_n FROM global_config WHERE id=1`).Scan(&days, &rowCap, &sample); err != nil {
+				t.Fatal(err)
+			}
+			if days != db.DefaultSecurityEventsRetentionDays || rowCap != db.DefaultSecurityEventsRowCap || sample != db.DefaultThreatTrafficSampleN {
+				t.Fatalf("落库值=(%d,%d,%d), want 默认(%d,%d,%d)", days, rowCap, sample,
+					db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap, db.DefaultThreatTrafficSampleN)
+			}
+		})
 	}
 }

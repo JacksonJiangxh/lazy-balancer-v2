@@ -44,7 +44,7 @@ var legacySecurityEnumBackfills = []string{
 	// 库值唯一真相（批 3）：从 `=429` 扩为枚举外全集（写侧白名单 0/400/401/
 	// 403/404/503，0=未设置跟随默认 403 为类型②省略型合法值）——旧备份/带外
 	// 脏值（如 418）随启动归一，渲染层不再消费枚举外状态码。
-	"UPDATE security_policies SET block_status_code=403 WHERE block_status_code IS NOT NULL AND block_status_code NOT IN (0,400,401,403,404,503)",
+	fmt.Sprintf("UPDATE security_policies SET block_status_code=%d WHERE block_status_code IS NOT NULL AND block_status_code NOT IN (0,400,401,%d,404,503)", db.DefaultBlockStatusCode, db.DefaultBlockStatusCode),
 	// rate_limit_rps 历史脏行（enabled=1 &
 	// rps<1，修复前 Update 缺陷可落库）绑定启用规则时整份配置生成失败
 	// （渲染层 fail-visible）。启动归一关停业务开关——rps 库值保持原样
@@ -66,15 +66,15 @@ func ValidBlockStatusCode(v int) bool {
 }
 
 // securityEnumRow 是归一前后对比所需的枚举列快照（含策略标识）。
-// rate_limit_enabled/rate_limit_rps 同为归一目标：rps 非法行会被关停
-// （保护面收窄），与 mode→off 同型，必须能逐策略留痕（只报总条数无法定位
-// 「哪条策略的限流被关」）。
+// rate_limit_enabled 为归一目标：rps 非法行会被关停（保护面收窄），与
+// mode→off 同型，必须能逐策略留痕（只报总条数无法定位「哪条策略的限流被关」）。
+// rate_limit_rps 自身不被任何回填语句改写（只作为关停判据），故不取快照列
+// ——同一事务内的前后比较恒相等，属不可达比较项。
 type securityEnumRow struct {
 	id                         int64
 	name                       string
 	ipACLMode, mode, geoIPMode string
 	rateLimitEnabled           int
-	rateLimitRPS               int
 }
 
 // securityEnumDirtyRows 选出枚举列非法或带首尾空白的策略行——谓词与
@@ -84,7 +84,7 @@ type securityEnumRow struct {
 // 「哪条策略、哪个字段、从什么值变成什么值」，故在变更前后各取一次快照。
 func securityEnumDirtyRows(ctx context.Context, tx *sql.Tx) ([]securityEnumRow, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(name,''), COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,''),
-			COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0)
+			COALESCE(rate_limit_enabled,0)
 		FROM security_policies
 		WHERE (ip_acl_mode IS NOT NULL AND ip_acl_mode<>TRIM(ip_acl_mode))
 		   OR (mode IS NOT NULL AND mode<>TRIM(mode))
@@ -100,7 +100,7 @@ func securityEnumDirtyRows(ctx context.Context, tx *sql.Tx) ([]securityEnumRow, 
 	var out []securityEnumRow
 	for rows.Next() {
 		var r securityEnumRow
-		if err := rows.Scan(&r.id, &r.name, &r.ipACLMode, &r.mode, &r.geoIPMode, &r.rateLimitEnabled, &r.rateLimitRPS); err != nil {
+		if err := rows.Scan(&r.id, &r.name, &r.ipACLMode, &r.mode, &r.geoIPMode, &r.rateLimitEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -121,10 +121,10 @@ func securityEnumNormalizedChanges(ctx context.Context, tx *sql.Tx, before []sec
 	var out []securityEnumChange
 	for _, b := range before {
 		var ipACLMode, mode, geoIPMode string
-		var rateLimitEnabled, rateLimitRPS int
+		var rateLimitEnabled int
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,''),
-				COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0) FROM security_policies WHERE id=?`, b.id).
-			Scan(&ipACLMode, &mode, &geoIPMode, &rateLimitEnabled, &rateLimitRPS); err != nil {
+				COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?`, b.id).
+			Scan(&ipACLMode, &mode, &geoIPMode, &rateLimitEnabled); err != nil {
 			if err == sql.ErrNoRows {
 				continue
 			}
@@ -137,7 +137,6 @@ func securityEnumNormalizedChanges(ctx context.Context, tx *sql.Tx, before []sec
 			{"mode", b.mode, mode},
 			{"geoip_mode", b.geoIPMode, geoIPMode},
 			{"rate_limit_enabled", strconv.Itoa(b.rateLimitEnabled), strconv.Itoa(rateLimitEnabled)},
-			{"rate_limit_rps", strconv.Itoa(b.rateLimitRPS), strconv.Itoa(rateLimitRPS)},
 		} {
 			if f.from == f.to {
 				continue

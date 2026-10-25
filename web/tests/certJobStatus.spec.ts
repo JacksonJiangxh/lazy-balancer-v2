@@ -9,21 +9,41 @@ import {
 } from '../src/utils/certJobStatus.ts'
 import { code, repoCode, section } from './_helpers.ts'
 
-const now = Date.parse('2026-10-19T00:00:00Z')
-const updatedAt = '2026-10-19T00:00:00Z'
-
-test('重试冷却时长由后端字段驱动，不再由状态常量驱动', () => {
-  assert.equal(certJobRetryReady(null, updatedAt, now), false, 'disabled=null 永不可重试')
-  assert.equal(certJobRetryReady(0, updatedAt, now), true, '零冷却立即可重试')
-  assert.equal(certJobRetryReady(900, updatedAt, now + 14*60*1000 + 59*1000), false)
-  assert.equal(certJobRetryReady(900, updatedAt, now + 15*60*1000), true)
-  assert.equal(certJobRetryReady(300, updatedAt, now + 4*60*1000), false)
-  assert.equal(certJobRetryReady(300, updatedAt, now + 5*60*1000), true)
+test('重试冷却由后端「此刻剩余秒」驱动，前端不做二次扣减', () => {
+  assert.equal(certJobRetryReady(null), false, 'null=永久不可重试')
+  assert.equal(certJobRetryReady(undefined), false, '缺字段=不可判定，不放行')
+  assert.equal(certJobRetryReady(0), true, '零冷却立即可重试')
+  assert.equal(certJobRetryReady(1), false, '剩余 1 秒仍在冷却')
+  assert.equal(certJobRetryReady(300), false, 'failed 冷却窗口内')
+  assert.equal(certJobRetryReady(900), false, 'queued 冷却窗口内')
 })
 
-test('缺失或畸形时间戳维持既有 fail-open 边界', () => {
-  assert.equal(certJobRetryReady(120, undefined, now), true)
-  assert.equal(certJobRetryReady(120, 'not-a-date', now), true)
+test('证书任务页与任务监控页共用同一冷却判据（不再各自按 updated_at 起算）', () => {
+  const util = code('src/utils/certJobStatus.ts')
+  assert.match(util, /return seconds <= 0/, '判据只能是剩余秒数 ≤0')
+  assert.doesNotMatch(util, /updatedAt/, '前端不得再按 updated_at 起算流逝')
+
+  const certJobs = code('src/views/settings/CertJobs.vue')
+  assert.match(certJobs, /certJobRetryReady\(row\.retry_cooldown_seconds\)/)
+
+  const monitor = code('src/views/settings/TaskMonitor.vue')
+  assert.match(monitor, /if \(certJobRetryReady\(seconds\)\) return ''/)
+})
+
+test('证书任务状态表查表防原型键：constructor 等不得把函数当标签/色调', () => {
+  const warn = console.warn
+  console.warn = () => {}
+  try {
+    for (const key of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+      const label = certJobStatusLabel(key as CertJobStatus)
+      assert.equal(typeof label, 'string', `${key} 标签必须是字符串（原型链函数不得外泄）`)
+      assert.equal(label, key, `${key} 未识别状态按原文回退`)
+      const tone = certJobStatusTone(key as CertJobStatus)
+      assert.equal(tone, 'info', `${key} 色调必须回落 info（不得落进 el-tag :type）`)
+    }
+  } finally {
+    console.warn = warn
+  }
 })
 
 // 证书任务状态 label/tone 全表覆盖后端 db.certJobStatuses（26 态，DB CHECK 单源）。

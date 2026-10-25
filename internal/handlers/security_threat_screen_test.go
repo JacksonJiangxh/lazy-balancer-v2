@@ -1411,8 +1411,50 @@ func TestGetSecurityThreatScreen_topTargetsLimitThree(t *testing.T) {
 	}
 }
 
-func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
+func TestGetSecurityThreatScreen_topTargetsInvalidatedAfterRollupSync(t *testing.T) {
 	// Given: 一条规则 + 1 条窗口内事件
+	setupSecurityPolicyTestDB(t)
+	installThreatClock(t, time.Now().UTC())
+	t.Cleanup(resetThreatScreenCachesForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "93.184.216.7", "lb_aaa", "blocked")
+
+	get := func() threatScreenPayload {
+		recorder := getRequest(t, router, "/security/overview/threat-screen")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var payload threatScreenPayload
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	// 首查（warmer 未启动 → 请求路径同步固化）：value=1。
+	first := get()
+	if len(first.Data.TopTargets) != 1 || first.Data.TopTargets[0].Value != 1 {
+		t.Fatalf("first top_targets=%+v, want 1 项 value=1", first.Data.TopTargets)
+	}
+
+	// 再落 2 条事件后第二查仍走同步固化：固化改写窗口内分钟行，top_targets
+	// 缓存必须随之失效——Top3 与同屏总量/国家必须同时反映新数据（此前只清
+	// 维度聚合缓存，同屏总量已 3 而 Top3 仍 1，展示口径分叉）。
+	seedThreatRuleEvent(t, utcStringAgo(30*time.Second), "93.184.216.7", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(20*time.Second), "93.184.216.7", "lb_aaa", "blocked")
+	second := get()
+	if len(second.Data.TopTargets) != 1 || second.Data.TopTargets[0].Value != 3 {
+		t.Fatalf("固化后 top_targets=%+v, want 1 项 value=3（缓存必须随固化失效）", second.Data.TopTargets)
+	}
+	if second.Data.TotalEvents < 3 {
+		t.Fatalf("同屏总量=%d, want >=3（与 Top3 同源）", second.Data.TotalEvents)
+	}
+}
+
+// 无同步固化（warmer 已启动且 rollup 新鲜）时，top_targets 仍按 TTL 命中
+// 缓存——大屏 30s 轮询不重复扫 rollup。
+func TestGetSecurityThreatScreen_topTargetsCachedWhenNoSync(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	installThreatClock(t, time.Now().UTC())
 	t.Cleanup(resetThreatScreenCachesForTest)
@@ -1435,20 +1477,24 @@ func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
 		return payload.Data.TopTargets[0].Value
 	}
 
-	// When/Then: 首查 value=1；缓存窗口（1min TTL）内再落 2 条事件后第二查
-	// 仍返回 1（进程内缓存命中——大屏 30s 轮询不再每轮扫原始表）
 	if got := get(); got != 1 {
 		t.Fatalf("first value=%d, want 1", got)
 	}
-	seedThreatRuleEvent(t, utcStringAgo(30*time.Second), "93.184.216.7", "lb_aaa", "blocked")
-	seedThreatRuleEvent(t, utcStringAgo(20*time.Second), "93.184.216.7", "lb_aaa", "blocked")
+
+	// 关闭请求路径同步固化（rollup 刚固化，不陈旧）：此后 TTL 内命中缓存。
+	threatRollupWarmerStarted.Store(true)
+	t.Cleanup(func() { threatRollupWarmerStarted.Store(false) })
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_target_rollup (minute, rule_caddy_id, count) VALUES (?, 'lb_aaa', 5)`,
+		time.Now().UTC().Add(time.Minute).Truncate(time.Minute).Format("2006-01-02 15:04")); err != nil {
+		t.Fatal(err)
+	}
 	if got := get(); got != 1 {
-		t.Fatalf("cached value=%d, want 1（TTL 内缓存命中）", got)
+		t.Fatalf("cached value=%d, want 1（TTL 内缓存命中，不得读到新 rollup 行）", got)
 	}
 	// reset 后重新查询生效
 	resetThreatScreenCachesForTest()
-	if got := get(); got != 3 {
-		t.Fatalf("after reset value=%d, want 3", got)
+	if got := get(); got != 6 {
+		t.Fatalf("after reset value=%d, want 6（原始行 + 新 rollup 行）", got)
 	}
 }
 

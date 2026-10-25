@@ -2181,24 +2181,37 @@ func engineLogTimeStr() string { return time.Now().In(engineLocPtr()).Format("20
 
 // ---- 日志 ----
 
-// taskLogConf 任务日志目录/尺寸配置与目录熔断状态（同一把读写锁——装配期
+// taskLogConf 任务日志目录/尺寸配置与日志熔断状态（同一把读写锁——装配期
 // 写一次、热路径逐行读）。此前为裸全局（taskLogDir/taskLogSizeBytesFn），
 // 测试在引擎存活期与任务写日志并发调用 SetLogDir/SetTaskLogSizeBytesFn
 // 存在数据竞争。
+//
+// 熔断分两级，粒度必须与故障粒度一致：
+//   - dirDown：目录级故障（MkdirAll 失败=父路径被文件占据/权限/只读挂载）。
+//     唯一会波及全部任务日志的形态，按全局熔断收口。
+//   - pathDown：单文件故障（rotate/open/write/close 失败=单文件权限/属主/
+//     单文件 IO 错误）。按路径熔断，只静默丢弃该文件的行——此前单文件连续
+//     失败会把 dirDown 置位，同一目录下其他健康任务日志一并被丢弃最长一个
+//     探测周期，且探针时刻仍是坏路径在写时窗口持续续期。
+//
+// 熔断窗口内任务日志静默丢弃（进入熔断时已留一次性 ERROR），每
+// taskLogDirProbeInterval 探测一次，恢复时补 INFO 并退出熔断。
+type taskLogPathCircuit struct {
+	down      bool
+	nextProbe time.Time
+	failures  int
+}
+
 var taskLogConf = struct {
 	sync.RWMutex
 	dir    string
 	sizeFn func() int64
-	// 目录熔断：目录不可创建/不可写时一次性 ERROR 并进入熔断，窗口内任务
-	// 日志静默丢弃——不再逐行「mkdir 失败 + open 失败」双 WARNING 刷运行
-	// 日志（高频族每秒数行会把排障信号淹没）；每 taskLogDirProbeInterval
-	// 探测一次，恢复时补 INFO 并退出熔断（首报/恢复同范式）。
-	// 「不可写」覆盖 mkdir 与实际写入链：MkdirAll 对「已存在但不可写」返回
-	// nil，只读挂载/权限被改/磁盘满/写失败只能在 rotate/open/write/close
-	// 暴露——连续 taskLogWriteFailureThreshold 次写失败按同一熔断态收口。
-	dirDown       bool
-	dirNextProbe  time.Time
-	writeFailures int
+	// dirDown：目录级不可用（无法创建）。恢复判定=真实写入链全通。
+	dirDown      bool
+	dirNextProbe time.Time
+	// pathCircuit：按任务日志路径的单文件熔断态（仅失败过的路径有条目，
+	// 写入成功即删除——键集合恒为「当前失败的文件」，天然有界）。
+	pathCircuit map[string]*taskLogPathCircuit
 }{}
 
 // taskLogDirProbeInterval 目录熔断恢复探测周期（测试可调；原子值避免测试
@@ -2220,7 +2233,7 @@ func SetLogDir(dir string) {
 	taskLogConf.dir = dir
 	taskLogConf.dirDown = false
 	taskLogConf.dirNextProbe = time.Time{}
-	taskLogConf.writeFailures = 0
+	taskLogConf.pathCircuit = nil
 	taskLogConf.Unlock()
 }
 
@@ -2290,15 +2303,25 @@ func appendTaskLogLine(path, line string) {
 	// 截断必须先于滚动判定——否则巨型单行会先
 	// 触发滚动、再把超限活动文件写出来，后续每行都反复触发滚动。
 	line = truncateTaskLogLine(line)
-	// 目录熔断前置判定（在 rotate/open 之前——熔断期二者必然失败，
-	// 逐行 WARNING 会淹没运行日志）。
+	// 熔断前置判定（在 rotate/open 之前——熔断期二者必然失败，
+	// 逐行 WARNING 会淹没运行日志）。目录级熔断（无法创建）对全部任务日志
+	// 成立；单文件熔断只对本次 path 成立——其他健康文件照常写入。
 	taskLogConf.RLock()
 	dir := taskLogConf.dir
-	down := taskLogConf.dirDown
-	nextProbe := taskLogConf.dirNextProbe
+	dirDown := taskLogConf.dirDown
+	dirProbeAt := taskLogConf.dirNextProbe
+	var pathDown bool
+	var pathProbeAt time.Time
+	if c := taskLogConf.pathCircuit[path]; c != nil {
+		pathDown, pathProbeAt = c.down, c.nextProbe
+	}
 	taskLogConf.RUnlock()
-	if down && time.Now().Before(nextProbe) {
-		return // 熔断窗口内静默丢弃（进入熔断时已留一次性 ERROR）
+	now := time.Now()
+	if dirDown && now.Before(dirProbeAt) {
+		return // 目录熔断窗口内静默丢弃（进入熔断时已留一次性 ERROR）
+	}
+	if pathDown && now.Before(pathProbeAt) {
+		return // 本文件熔断窗口内静默丢弃（其他任务日志不受影响）
 	}
 	if dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -2321,24 +2344,24 @@ func appendTaskLogLine(path, line string) {
 	writeOK := true
 	if _, err := rotateTaskLogBeforeWrite(path, int64(len(line)+1), 1, sizeLimit); err != nil {
 		writeOK = false
-		taskLogNoteWriteFailure(dir, "rotate", path, err)
+		taskLogNoteWriteFailure("rotate", path, err)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		writeOK = false
-		taskLogNoteWriteFailure(dir, "open", path, err)
+		taskLogNoteWriteFailure("open", path, err)
 		return
 	}
 	if _, err := fmt.Fprintln(f, line); err != nil {
 		writeOK = false
-		taskLogNoteWriteFailure(dir, "write", path, err)
+		taskLogNoteWriteFailure("write", path, err)
 	}
 	if err := f.Close(); err != nil {
 		writeOK = false
-		taskLogNoteWriteFailure(dir, "close", path, err)
+		taskLogNoteWriteFailure("close", path, err)
 	}
 	if writeOK {
-		taskLogNoteWriteSuccess(dir)
+		taskLogNoteWriteSuccess(path, dir)
 	}
 }
 
@@ -2349,7 +2372,6 @@ func taskLogEnterDirDownLocked(dir, what string, err error) {
 	newly := !taskLogConf.dirDown
 	taskLogConf.dirDown = true
 	taskLogConf.dirNextProbe = time.Now().Add(taskLogProbeInterval())
-	taskLogConf.writeFailures = 0
 	taskLogConf.Unlock()
 	if newly {
 		log.Printf("ERROR: taskengine: 任务日志目录不可用（%s，%s失败）——进入熔断（每 %s 探测恢复，熔断期任务日志静默丢弃）: %v",
@@ -2358,44 +2380,59 @@ func taskLogEnterDirDownLocked(dir, what string, err error) {
 }
 
 // taskLogNoteWriteFailure 记录一次写入链失败（rotate/open/write/close）。
-// 连续失败达到阈值即与「目录不可创建」同属熔断态（一次 ERROR + 停止逐行
-// WARNING）；已处于熔断态时只续期探测窗口，保持静默。阈值内的失败仍
-// WARNING 留痕（偶发抖动可见）。
-func taskLogNoteWriteFailure(dir, what, path string, err error) {
+// 熔断与故障粒度一致：这些错误都是**单文件**故障，只把本 path 置为熔断
+// （同一目录下其他任务日志不受影响）；连续失败达到阈值即一次 ERROR + 停止
+// 逐行 WARNING，已处于熔断态时只续期探测窗口。阈值内的失败仍 WARNING 留痕
+// （偶发抖动可见）。
+func taskLogNoteWriteFailure(what, path string, err error) {
 	taskLogConf.Lock()
-	taskLogConf.writeFailures++
-	trip := !taskLogConf.dirDown && taskLogConf.writeFailures >= taskLogWriteFailureThreshold
-	down := taskLogConf.dirDown
+	if taskLogConf.pathCircuit == nil {
+		taskLogConf.pathCircuit = map[string]*taskLogPathCircuit{}
+	}
+	c := taskLogConf.pathCircuit[path]
+	if c == nil {
+		c = &taskLogPathCircuit{}
+		taskLogConf.pathCircuit[path] = c
+	}
+	c.failures++
+	trip := !c.down && c.failures >= taskLogWriteFailureThreshold
 	if trip {
-		taskLogConf.dirDown = true
-		taskLogConf.writeFailures = 0
-		down = true
+		c.down = true
+		c.failures = 0
 	}
-	if down {
-		taskLogConf.dirNextProbe = time.Now().Add(taskLogProbeInterval())
+	if c.down {
+		c.nextProbe = time.Now().Add(taskLogProbeInterval())
 	}
+	down := c.down
 	taskLogConf.Unlock()
 	if !down {
 		log.Printf("WARNING: taskengine: %s task log %s failed: %v", what, path, err)
 		return
 	}
 	if trip {
-		log.Printf("ERROR: taskengine: 任务日志目录不可写（%s，连续 %d 次 %s 失败）——进入熔断（每 %s 探测恢复，熔断期任务日志静默丢弃）: %v",
-			dir, taskLogWriteFailureThreshold, what, taskLogProbeInterval(), err)
+		log.Printf("ERROR: taskengine: 任务日志文件不可写（%s，连续 %d 次 %s 失败）——进入熔断（每 %s 探测恢复，熔断期该文件日志静默丢弃）: %v",
+			path, taskLogWriteFailureThreshold, what, taskLogProbeInterval(), err)
 	}
 }
 
-// taskLogNoteWriteSuccess 一次完整写入成功=目录健康：清连续失败计数；若此前
-// 处于熔断态则退出并补一条 INFO（探测恢复的唯一判定点——mkdir 成功不等于
-// 可写，只有真实写入链全通才算恢复）。
-func taskLogNoteWriteSuccess(dir string) {
+// taskLogNoteWriteSuccess 一次完整写入成功=该文件与目录健康：清该路径的
+// 连续失败计数并退出其熔断（探测恢复的唯一判定点——mkdir 成功不等于可写，
+// 只有真实写入链全通才算恢复）；目录级熔断同样由真实写入成功解除。
+func taskLogNoteWriteSuccess(path, dir string) {
 	taskLogConf.Lock()
-	taskLogConf.writeFailures = 0
-	recovered := taskLogConf.dirDown
+	var recoveredPath, recoveredDir bool
+	if c := taskLogConf.pathCircuit[path]; c != nil {
+		recoveredPath = c.down
+		delete(taskLogConf.pathCircuit, path)
+	}
+	recoveredDir = taskLogConf.dirDown
 	taskLogConf.dirDown = false
 	taskLogConf.dirNextProbe = time.Time{}
 	taskLogConf.Unlock()
-	if recovered {
+	if recoveredPath {
+		log.Printf("INFO: taskengine: 任务日志文件恢复可写（%s），该文件日志恢复写入", path)
+	}
+	if recoveredDir {
 		log.Printf("INFO: taskengine: 任务日志目录恢复可写（%s），任务日志恢复写入", dir)
 	}
 }

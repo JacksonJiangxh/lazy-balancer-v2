@@ -19,7 +19,7 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 		want int
 	}{
 		{"provinceAliases", len(provinceAliases), 11},
-		{"TaiwanCities", len(TaiwanCities), 13},
+		{"taiwanCities", len(taiwanCities), 13},
 		{"cityPinyinFixes", len(cityPinyinFixes), 46},
 		{"autonomousPrefectures", len(autonomousPrefectures), 31},
 	}
@@ -51,8 +51,8 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	if got := provinceAliases["UEruemqi"]; got != "新疆维吾尔自治区" {
 		t.Errorf("provinceAliases[UEruemqi]=%q; want 新疆维吾尔自治区（乱码段回收）", got)
 	}
-	if !TaiwanCities["台中市"] {
-		t.Error("TaiwanCities must contain 台中市（误入省列的台湾城市）")
+	if !IsTaiwanCity("台中市") {
+		t.Error("IsTaiwanCity must contain 台中市（误入省列的台湾城市）")
 	}
 	if got := cityPinyinFixes["Wulumuqi"]; got != "乌鲁木齐市" {
 		t.Errorf("cityPinyinFixes[Wulumuqi]=%q; want 乌鲁木齐市", got)

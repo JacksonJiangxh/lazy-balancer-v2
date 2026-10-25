@@ -779,6 +779,68 @@ func TestEngine_TaskLogUnwritableDirCircuitBreaker(t *testing.T) {
 	}
 }
 
+// Given 同一任务日志目录下 a.log 不可写（单文件权限故障）、b.log 可写。
+// When a 连续写入触发该文件的熔断后继续写 b。
+// Then b 仍正常落盘、熔断只覆盖 a（旧形态：单文件连续失败置全局 dirDown，
+// 同目录其他健康任务日志一并静默丢弃最长一个探测周期）；a 恢复权限后补
+// INFO 并恢复写入。
+func TestEngine_TaskLogPathCircuitBreakerIsolatesOtherFiles(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 不受文件权限限制，无法构造不可写文件")
+	}
+	buf := captureEngineLog(t)
+	oldProbe := taskLogDirProbeInterval.Load()
+	taskLogDirProbeInterval.Store(int64(20 * time.Millisecond))
+	t.Cleanup(func() { taskLogDirProbeInterval.Store(oldProbe) })
+	SetTaskLogSizeBytesFn(func() int64 { return 1 << 20 })
+	t.Cleanup(func() { SetTaskLogSizeBytesFn(nil) })
+
+	dir := t.TempDir()
+	oldDir := LogDir()
+	SetLogDir(dir)
+	t.Cleanup(func() { SetLogDir(oldDir) })
+
+	badPath := TaskLogPath("t-fuse-dup")
+	if err := os.WriteFile(badPath, []byte("x\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badPath, 0o644) })
+	goodPath := TaskLogPath("t-fuse-healthy")
+
+	for range taskLogWriteFailureThreshold {
+		taskLogAppend("t-fuse-dup", "[start] 坏文件行")
+	}
+	if n := strings.Count(buf.String(), "任务日志文件不可写"); n != 1 {
+		t.Fatalf("单文件熔断 ERROR 行数=%d, want 1:\n%s", n, buf.String())
+	}
+
+	taskLogAppend("t-fuse-healthy", "[start] 健康文件行")
+	body, err := os.ReadFile(goodPath)
+	if err != nil {
+		t.Fatalf("健康任务日志必须照常落盘（单文件故障不得围堵同目录其他文件）: %v", err)
+	}
+	if !strings.Contains(string(body), "健康文件行") {
+		t.Fatalf("健康任务日志内容缺失: %q", body)
+	}
+
+	// 熔断窗口内坏文件静默丢弃（行未写入），窗口后的探测写恢复。
+	if err := os.Chmod(badPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	taskLogAppend("t-fuse-dup", "[done] 恢复行")
+	if n := strings.Count(buf.String(), "任务日志文件恢复可写"); n != 1 {
+		t.Fatalf("单文件恢复 INFO 行数=%d, want 1:\n%s", n, buf.String())
+	}
+	body, err = os.ReadFile(badPath)
+	if err != nil {
+		t.Fatalf("恢复后读写任务日志失败: %v", err)
+	}
+	if !strings.Contains(string(body), "恢复行") {
+		t.Fatalf("恢复后写入行缺失: %q", body)
+	}
+}
+
 // Given 日志尺寸阈值函数可能读库（缓存未命中，最坏占满 busy_timeout）。
 // When appendTaskLogLine 写入一行。
 // Then 阈值求值发生在「按路径日志锁」之外——持路径锁读库会串行阻塞全部

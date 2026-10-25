@@ -529,7 +529,11 @@ function lbConfirm() {
   lbDialog.resolve = null
 }
 
-const resetPassword = async (id: number) => {
+// 签名与调用点同口径：表格行整体传入，函数内统一取 row.id（模板插槽的 row 为
+// any，`vue-tsc` 拦不住「签名收 id、调用传行对象」的漂移——曾致请求路径变成
+// /users/[object Object]/reset-password）。
+const resetPassword = async (row: UserListItem) => {
+  const id = row.id
   if (isReadOnly.value || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
   operatingUserIds.value.add(id)
   const isSelf = id === authStore.user?.id
@@ -537,17 +541,16 @@ const resetPassword = async (id: number) => {
   // 非管理员整页只读，个人改密走个人资料弹框（需当前密码）。
   try {
     let newPassword = ''
-    const username = users.value.find((u) => u.id === id)?.username ?? ''
     const r = await lbOpen({
       title: '重置密码',
-      subtitle: `为「${username}」设置新密码`,
+      subtitle: `为「${row.username}」设置新密码`,
       message: '重置后该用户的全部登录会话将被吊销，账户锁定状态一并清除。',
       icon: 'key', tone: 'warning', mode: 'reset-pwd', confirmText: '确认重置',
     })
     if (!r.ok) return
     newPassword = r.newPwd ?? ''
     if (newPassword) {
-      await request.post(`/users/${id}/reset-password`, { new_password: newPassword })
+      await request.post(`/users/${row.id}/reset-password`, { new_password: newPassword })
       if (isSelf) {
         // 管理员重置本人密码:重置端点递增 pwd_ver 吊销自身会话——干净登出
         // (对齐 AppLayout.saveProfile / ),避免死 token 误报会话失效

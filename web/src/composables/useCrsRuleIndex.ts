@@ -24,7 +24,7 @@ const cleanCrsMsg = (msg: string): string => msg.replace(/[\r\n\t]+/g, ' ').repl
 /** 两行选项主行 label 的截断上限（超长 msg 截断 + …，全文经 title 悬浮展示） */
 const CRS_RULE_LABEL_MAX_CHARS = 48
 
-export interface CrsRuleLabelView {
+interface CrsRuleLabelView {
   /** 截断后的展示 label（≤48 字符，超出加 …） */
   label: string
   /** 不截断全文（title 悬浮用） */

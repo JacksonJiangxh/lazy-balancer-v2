@@ -864,27 +864,19 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	tx := session.tx
 	restoreImportNodeRole, err := suppressImportClusterVersionBumps(ctx, tx)
 	if err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("准备导入事务", err.Error()))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "准备导入事务失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "准备导入事务", err, http.StatusInternalServerError, "准备导入事务失败")
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_rules"); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧路径规则", err.Error()))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧路径规则失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "清理旧路径规则", err, http.StatusInternalServerError, "清理旧路径规则失败")
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM upstreams"); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧上游", err.Error()))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧上游失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "清理旧上游", err, http.StatusInternalServerError, "清理旧上游失败")
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM lb_rules"); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧规则", err.Error()))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧规则失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "清理旧规则", err, http.StatusInternalServerError, "清理旧规则失败")
 		return
 	}
 	// v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
@@ -893,9 +885,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	// 的 droppedTCPBindings 在 v1 恒为 0（表已空），因此 v1 路径不复用 v2 的
 	// 「已解除 N 条 TCP 绑定」文案。
 	if _, err := tx.ExecContext(ctx, "DELETE FROM security_policy_bindings"); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧策略绑定", err.Error()))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧策略绑定失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "清理旧策略绑定", err, http.StatusInternalServerError, "清理旧策略绑定失败")
 		return
 	}
 	userID := int(contextUserID(c))
@@ -907,9 +897,8 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	for _, r := range validRules {
 		caddyID, err := services.GenerateCaddyID()
 		if err != nil {
-			err = session.abort(err)
-			recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("生成规则编号", err.Error()))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则编号失败: " + importFailureAuditDetail(err)})
+			err = failImportAbort(c, session, "导入", "生成规则编号", err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则编号失败: " + err.Error()})
 			return
 		}
 		affectedRuleIDs = append(affectedRuleIDs, caddyID)
@@ -926,17 +915,13 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 			r.HostHeader, r.EnableTLS, tlsSource(r), r.TLSCert, r.TLSKey, r.Redirect,
 			r.Compress, r.Enabled, userID, userID, caddyID)
 		if err != nil {
-			err = session.abort(err)
-			recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s：%s", r.Name, importFailureAuditDetail(err)))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则失败，已回滚: " + importFailureAuditDetail(err)})
+			err = failImportTx(c, session, "导入", "规则 "+r.Name, err, http.StatusInternalServerError, "导入规则失败")
 			return
 		}
 		for _, u := range r.Upstreams {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections)
 				VALUES (?, ?, ?, ?, 0, ?, ?, 0)`, caddyID, u.Host, u.Port, u.Weight, u.Enabled, u.Protocol); err != nil {
-				err = session.abort(err)
-				recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s 上游：%s", r.Name, importFailureAuditDetail(err)))
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入上游失败，已回滚: " + importFailureAuditDetail(err)})
+				err = failImportTx(c, session, "导入", "规则 "+r.Name+" 上游", err, http.StatusInternalServerError, "导入上游失败")
 				return
 			}
 			upstreamCount++
@@ -958,15 +943,11 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	// 事实源）。其 droppedTCPBindings 在 v1 恒为 0（绑定表已在上方清空），
 	// 故 v1 不消费返回值、也不复用 v2 的告警文案。
 	if _, err := normalizeRuleRowsForTransport(ctx, tx); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则归一失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "", err, http.StatusInternalServerError, "导入规则归一失败")
 		return
 	}
 	if err := restoreImportNodeRole(); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "恢复导入前节点角色失败，已回滚: " + importFailureAuditDetail(err)})
+		err = failImportTx(c, session, "导入", "", err, http.StatusInternalServerError, "恢复导入前节点角色失败")
 		return
 	}
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {

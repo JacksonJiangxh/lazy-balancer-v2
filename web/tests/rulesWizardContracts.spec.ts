@@ -132,6 +132,15 @@ test('D 数值控件边界与后端写侧门逐值对表（改门即红）', () 
     assert.match(tag, /:max="RULE_NUMERIC_LIMITS\.tcpTryIntervalMax"/)
     assert.doesNotMatch(tag, /:max="10000"/, '重试间隔上界不得写死 10000')
   }
+
+  // 健康阈值与 upstream_keepalive_timeout：写侧只有下限（阈值 ≥1 / keepalive 拒负），
+  // 前端不得写死上限——API/MCP 写入的合法值（20 / 7200）一旦触碰控件会被
+  // el-input-number 静默夹到 10 / 3600 并随保存落库。
+  for (const field of ['health_check_unhealthy_threshold', 'health_check_healthy_threshold', 'upstream_keepalive_timeout']) {
+    const tags = wizardTags(field)
+    assert.ok(tags.length > 0, `缺 ${field} 控件`)
+    for (const tag of tags) assert.doesNotMatch(tag, /:max=/, `${field} 无后端上限`)
+  }
 })
 
 test('E CA 选择器选项包含当前值（已禁用回显不可新选）', () => {
@@ -147,4 +156,51 @@ test('E CA 选择器选项包含当前值（已禁用回显不可新选）', () 
 test('F 证书任务视图类型收敛共享定义（不再自带第二份字段清单）', () => {
   assert.match(page, /type CertJob = Pick<CertJobListItem,/)
   assert.doesNotMatch(page, /interface CertJob \{/, '字段清单不得回流视图')
+})
+
+test('G 自定义路由提交门镜像步进门（空清单不得落 custom_routes_enabled=1）', () => {
+  const body = section(page, 'const submitWizard = async', 'const data: UpdateRuleRequest')
+  const gate = section(body, "if (wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled) {", 'const pathRuleError = validatePathRules')
+  assert.match(gate, /wizardForm\.path_rules\.length === 0/, '空清单必须先于形状校验被拦下')
+  assert.match(gate, /请至少添加一条路径规则/, '与步进门同文案')
+  const next = section(page, 'const nextStep = ', 'const prevStep = ')
+  assert.match(next, /请至少添加一条路径规则/, '步进门仍在（两门同口径）')
+})
+
+test('H 规则名称与后端 100 字符门同源（不再过确认才 400）', () => {
+  const body = section(page, "v-model=\"wizardForm.name\"", '/>')
+  assert.match(body, /maxlength="100"/)
+  assert.match(body, /show-word-limit/)
+})
+
+test('I 负载策略卡与流程入口键盘可达', () => {
+  const cards = section(page, 'class="strategy-cards"', '</el-tooltip>')
+  assert.match(cards, /role="radiogroup"/, '同组语义')
+  assert.match(cards, /role="radio"/)
+  assert.match(cards, /:aria-checked="wizardForm\.strategy === card\.value"/)
+  assert.match(cards, /:aria-disabled="ntlmOn && card\.value !== 'cookie'"/)
+  assert.match(cards, /:tabindex="ntlmOn && card\.value !== 'cookie' \? -1 : 0"/, '锁定项移出 Tab 序，其余键盘可达')
+  assert.match(cards, /@keydown\.enter\.prevent="selectStrategy\(card\.value\)"/)
+  assert.match(cards, /@keydown\.space\.prevent="selectStrategy\(card\.value\)"/)
+  // 处理流程入口必须是真的可聚焦控件（el-link 无 href 渲染成不进 Tab 序的 <a>）
+  assert.match(page, /<el-button link type="primary" @click="openFlowFromLock\(row\)"/)
+  assert.doesNotMatch(page, /<el-link type="primary"[^>]*openFlowFromLock/)
+})
+
+test('J 上游行内控件与图标按钮带可访问名（含行序）', () => {
+  for (const label of ['主机地址', '端口', '协议', '回源域名', '权重（%）', '启用']) {
+    assert.match(page, new RegExp(`上游第 \\$\\{\\$index \\+ 1\\} 行${label}`), `缺 ${label} 的 aria-label`)
+  }
+  // 最大连接/请求数按协议换词，仍是逐行名称
+  assert.match(page, /上游第 \$\{\$index \+ 1\} 行\$\{wizardForm\.protocol === 'tcp' \? '最大连接' : '最大请求数'\}/)
+  // 图标记删除按钮 N 行同名 → 必须带行序
+  assert.match(page, /:aria-label="`删除上游第 \$\{\$index \+ 1\} 行`"/)
+})
+
+test('K TLS 证书详情重试成功后触发解析（验证块与预览不得留空）', () => {
+  const retry = section(page, 'async function retryTlsDetail', 'const resetCertInfo')
+  const assignKey = retry.indexOf('wizardForm.tlsKeySet = resp.data.tls_key_set === true')
+  const validate = retry.indexOf('void validateCertificate()')
+  assert.ok(assignKey > 0, '证书回填缺失')
+  assert.ok(validate > assignKey, '回填后必须触发解析（derive 效果与正常加载路径一致）')
 })

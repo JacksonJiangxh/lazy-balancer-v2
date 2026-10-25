@@ -312,7 +312,7 @@ func (r TaskLogHousekeepingResult) Summary() string {
 // 清理轮转（taskLogsHousekeeping）+ waf-audit 兜底。由任务引擎 log-cleanup
 // 族驱动（自此无独立启动器）。所有失败聚合进 RuntimeCleanupResult（Err()），
 // 由任务体决定 failed 终态与摘要措辞。
-func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
+func RuntimeLogCleanupOnce(ctx context.Context, logFile string) RuntimeCleanupResult {
 	result := RuntimeCleanupResult{}
 	// waf-audit 兜底不依赖保留期口径，先独立执行（失败也照常尝试其余清理）。
 	wafActions, wafErr := wafAuditHousekeeping()
@@ -322,7 +322,7 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	}
 	// 规则访问日志孤儿兜底同样不依赖保留期口径（按「规则是否还存活」判定），
 	// 先于保留期门执行——事件型删除失败后残留的规则日志不再永久占盘。
-	result.RuleLogs = PurgeOrphanRuleLogs()
+	result.RuleLogs = PurgeOrphanRuleLogs(ctx)
 	// 库未初始化不再整体跳过——保留期单源
 	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
 	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
@@ -379,7 +379,7 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 // 清理失败时不得称「完成」（失败轮谎报完成会把排障方向带偏，与
 // audit-retention 同口径）。logFile 为空（旋转写入器打开失败）时返回零值结果
 // 与显式「未启用」摘要。
-func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
+func logCleanupRound(ctx context.Context, logFile string) (RuntimeCleanupResult, string) {
 	// 旋转写入器打开失败（runtimeLogFile 为空，
 	// main.go 已有 error 留痕）时不得让 log-cleanup 静默零动作——任务监控恒绿
 	// 却没有任何留痕，排障时看不出「清理为什么没跑」。
@@ -396,7 +396,7 @@ func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
 		}
 		// 规则访问日志孤儿兜底只需要规则日志目录与存活规则清单（与运行日志
 		// 目录无关），运行日志 writer 打开失败时照常执行。
-		res.RuleLogs = PurgeOrphanRuleLogs()
+		res.RuleLogs = PurgeOrphanRuleLogs(ctx)
 		line := "日志清理未启用：运行日志文件未打开（应用日志副本清理与任务日志清理跳过）"
 		if len(res.WafAudit) > 0 {
 			line += "；waf-audit 兜底：" + strings.Join(res.WafAudit, "、")
@@ -409,7 +409,7 @@ func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
 		}
 		return res, line
 	}
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(ctx, logFile)
 	if err := res.Err(); err != nil {
 		return res, "日志清理未完成：" + logCleanupDetail(res) + "；错误：" + err.Error()
 	}

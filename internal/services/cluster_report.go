@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -118,13 +119,18 @@ func (s *SyncService) Report(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("编码节点上报: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/nodes/report", bytes.NewReader(payload))
+	// 小请求截止：上报是每同步周期必经的热路径，请求体仅数百字节；无截止时
+	// 对端「接受连接但永不响应」会让 run 循环停在首字节之前——不拉取、不上报、
+	// 不写 last_sync_error、零日志（只有主节点侧因缺上报判离线）。
+	callCtx, cancel := newClusterSmallRequestContext(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/nodes/report", bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("创建节点上报请求: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Cluster-Token", token)
-	resp, err := s.do(req)
+	resp, err := s.doSmall(req)
 	if err != nil {
 		// 审计节流：主节点持续宕机时上报每个同步周期都失败，同一错误只记录
 		// 一次；错误内容变化或上报恢复后再次失败时重记，避免按分钟刷审计日志。
@@ -208,7 +214,11 @@ func latestSourceVersion(ctx context.Context, database *sql.DB, table string) st
 	if database == nil {
 		return ""
 	}
-	rows, err := database.QueryContext(ctx, `SELECT COALESCE(version,'') FROM `+table)
+	// ORDER BY id + 「等值取后者」复刻前端 summarizeLibrarySources 的
+	// sort(compareVersion) + pop()：前端数据源同为本 API 的 id 序，稳定排序后
+	// 取末位即「最大值中行序最后一行」。否则同一库可能主节点 hover 显示
+	// 1.2.0、从节点列表显示 1.2（比较器已判等价，差异只剩形态）。
+	rows, err := database.QueryContext(ctx, `SELECT COALESCE(version,'') FROM `+table+` ORDER BY id`)
 	if err != nil {
 		Logf("warn", "读取 %s 版本失败（上报按未更新处理）: %v", table, err)
 		return ""
@@ -224,7 +234,7 @@ func latestSourceVersion(ctx context.Context, database *sql.DB, table string) st
 		if version == "" {
 			continue
 		}
-		if latest == "" || compareLibraryVersion(version, latest) > 0 {
+		if latest == "" || compareLibraryVersion(version, latest) >= 0 {
 			latest = version
 		}
 	}
@@ -232,9 +242,10 @@ func latestSourceVersion(ctx context.Context, database *sql.DB, table string) st
 }
 
 // compareLibraryVersion 复刻前端 utils/securityStages.compareVersion 的宽松
-// 语义：按 `.`/`-` 分段，两侧均可解析为数字时数值比较，否则字典序兜底；
-// 缺段按 0（"2026.09" < "2026.09.24"）。两端聚合口径必须一致，否则同一库在
-// 主节点列表与从节点本地显示不同版本。
+// 语义：按 `.`/`-` 分段，两侧均可解析为数值时按数值比较，否则按原段字符串序
+// 兜底；**缺段与空段按 0**（"1.2" 与 "1.2.0" 等价）——两端聚合口径必须一致，
+// 否则同一库在主节点列表与从节点本地显示不同版本。跨栈共享夹具
+// web/tests/fixtures/version-compare.tsv 由前后端测试同读，防止再次分叉。
 func compareLibraryVersion(a, b string) int {
 	pa, pb := splitLibraryVersion(a), splitLibraryVersion(b)
 	for i := 0; i < len(pa) || i < len(pb); i++ {
@@ -245,9 +256,9 @@ func compareLibraryVersion(a, b string) int {
 		if i < len(pb) {
 			sb = pb[i]
 		}
-		na, errA := strconv.Atoi(sa)
-		nb, errB := strconv.Atoi(sb)
-		if errA == nil && errB == nil {
+		na, aNumeric := libraryVersionSegmentNumber(sa)
+		nb, bNumeric := libraryVersionSegmentNumber(sb)
+		if aNumeric && bNumeric {
 			if na != nb {
 				if na < nb {
 					return -1
@@ -266,8 +277,28 @@ func compareLibraryVersion(a, b string) int {
 	return 0
 }
 
+// libraryVersionSegmentNumber 复刻 JS Number() 在本比较器可达输入上的语义：
+// 首尾空白忽略、空段（含缺段）按 0。Number 的十六进制/Infinity 形态不在
+// 版本号取值范围（日期/纯数字/semver），不模拟（声明边界）。
+func libraryVersionSegmentNumber(segment string) (float64, bool) {
+	trimmed := strings.TrimSpace(segment)
+	if trimmed == "" {
+		return 0, true
+	}
+	if n, err := strconv.Atoi(trimmed); err == nil {
+		return float64(n), true
+	}
+	if n, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsInf(n, 0) && !math.IsNaN(n) {
+		return n, true
+	}
+	return 0, false
+}
+
+// splitLibraryVersion 与前端一致：只剥前导 'v'，按 '.'/'-' 分段，不预裁剪
+// 整串空白（空白段由 libraryVersionSegmentNumber 的数值化容错吸收，非数字段
+// 的字符串兜底保持原样，与 JS 侧同形）。
 func splitLibraryVersion(version string) []string {
-	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	version = strings.TrimPrefix(version, "v")
 	if version == "" {
 		return nil
 	}

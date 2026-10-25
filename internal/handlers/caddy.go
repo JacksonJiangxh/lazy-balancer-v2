@@ -333,10 +333,6 @@ func stopCaddy(adminURL string) error {
 	return errors.New("停止后 Caddy Admin API 仍可达")
 }
 
-// ImportSecurityPolicyCustomOnlyModeSQL 供导入路径与测试共用的归一 SQL；
-// 唯一事实源在 db.SecurityPolicyCustomOnlyModeNormalizationSQL。
-const ImportSecurityPolicyCustomOnlyModeSQL = db.SecurityPolicyCustomOnlyModeNormalizationSQL
-
 func (h *Handlers) GetConfig(c *gin.Context) {
 	var cfg models.GlobalConfig
 	// 治理默认值列的读路径 SQL 字面量是默认值的第三次复制
@@ -1358,38 +1354,78 @@ func validateCaddyAdminSection(configData map[string]interface{}, adminURL strin
 		// 畸形 caddy_admin_url 由连接层报错；此处不把逃生口锁死。
 		return nil
 	}
-	listen := "localhost:2019" // Caddy 默认 admin 端点
-	raw, present := configData["admin"]
-	if present {
-		switch admin := raw.(type) {
-		case string:
-			if strings.EqualFold(strings.TrimSpace(admin), "off") {
-				return fmt.Errorf("%s", errCaddyAdminLockout)
-			}
-			listen = strings.TrimSpace(admin)
-		case map[string]interface{}:
-			if disabled, _ := admin["disabled"].(bool); disabled {
-				return fmt.Errorf("%s", errCaddyAdminLockout)
-			}
-			if raw2, ok := admin["listen"]; ok {
-				value, isString := raw2.(string)
-				if !isString {
-					return fmt.Errorf("admin.listen 必须是字符串地址")
-				}
-				if trimmed := strings.TrimSpace(value); trimmed != "" {
-					listen = trimmed
-				}
-			}
-		case nil:
-			// 显式 null 等同省略（Caddy 回落默认 admin 端点）。
-		default:
-			return fmt.Errorf("admin 段必须是监听地址字符串或对象")
-		}
+	listen, err := caddyAdminListenOf(configData)
+	if err != nil {
+		return err
 	}
 	if !caddyAdminListenReachable(listen, expectedHost, expectedPort) {
 		return fmt.Errorf("%s（当前 admin.listen=%s，面板配置为 %s:%s）", errCaddyAdminLockout, listen, expectedHost, expectedPort)
 	}
 	return nil
+}
+
+// caddyAdminListenOf 归一 admin 段的监听地址：省略/显式 null=Caddy 默认
+// localhost:2019；字符串或对象的 listen 即该地址；"off"/disabled 返回自锁
+// 错误。护栏与非回环暴露提示共用同一解析，三种形态的解释不得分叉。
+func caddyAdminListenOf(configData map[string]interface{}) (string, error) {
+	listen := "localhost:2019" // Caddy 默认 admin 端点
+	raw, present := configData["admin"]
+	if !present {
+		return listen, nil
+	}
+	switch admin := raw.(type) {
+	case string:
+		if strings.EqualFold(strings.TrimSpace(admin), "off") {
+			return "", fmt.Errorf("%s", errCaddyAdminLockout)
+		}
+		return strings.TrimSpace(admin), nil
+	case map[string]interface{}:
+		if disabled, _ := admin["disabled"].(bool); disabled {
+			return "", fmt.Errorf("%s", errCaddyAdminLockout)
+		}
+		if raw2, ok := admin["listen"]; ok {
+			value, isString := raw2.(string)
+			if !isString {
+				return "", fmt.Errorf("admin.listen 必须是字符串地址")
+			}
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				listen = trimmed
+			}
+		}
+		return listen, nil
+	case nil:
+		// 显式 null 等同省略（Caddy 回落默认 admin 端点）。
+		return listen, nil
+	default:
+		return "", fmt.Errorf("admin 段必须是监听地址字符串或对象")
+	}
+}
+
+// caddyAdminNonLoopbackWarning 返回 admin 监听落在非回环地址时的显式警告
+// （空串=无警告）。护栏只拦自锁、放行通配/自定义监听以保留逃生口——但
+// Caddy admin API 无鉴权（PUT /load 可全量改写配置），把监听暴露到非回环
+// 网段必须让管理员在保存成功时就看到后果。
+func caddyAdminNonLoopbackWarning(configData map[string]interface{}) string {
+	listen, err := caddyAdminListenOf(configData)
+	if err != nil {
+		return ""
+	}
+	host, _, splitErr := net.SplitHostPort(listen)
+	if splitErr != nil {
+		if strings.HasPrefix(listen, ":") {
+			host = ""
+		} else {
+			return ""
+		}
+	}
+	switch strings.ToLower(host) {
+	case "", "0.0.0.0", "::":
+		return fmt.Sprintf("admin 监听已改为非回环地址 %s（所有网段），Caddy admin API 无鉴权，可被对应网络访问", listen)
+	case "localhost", "127.0.0.1", "::1":
+		return ""
+	default:
+		return fmt.Sprintf("admin 监听已改为非回环地址 %s，Caddy admin API 无鉴权，可被该网段访问", listen)
+	}
 }
 
 // adminURLHostPort 解析 caddy_admin_url 的 host 与 port（缺端口按 scheme 默认）。
@@ -1584,7 +1620,15 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	// 2026-09-07 裁定：同 UpdateConfig——成功后清除既往失败标记。
 	h.recordCaddyApplyResult(nil)
 
-	recordAudit(c, "更新", "Caddy配置", "保存 Caddy 全局配置")
+	adminWarning := caddyAdminNonLoopbackWarning(configData)
+	if adminWarning != "" {
+		services.Logf("warn", "PutCaddyConfig: %s", adminWarning)
+	}
+	successDetail := "保存 Caddy 全局配置"
+	if adminWarning != "" {
+		successDetail += "；" + adminWarning
+	}
+	recordAudit(c, "更新", "Caddy配置", successDetail)
 	// 事务型路径重载审计（69d809b4 曾误删，2026-09-06 恢复）。
 	// 2026-09-25 审计真实性裁定：仅在真实 /load 发生时落笔——自定义配置与
 	// 运行配置同字节时短路零 provision，记「重载」即虚假事件。
@@ -1594,7 +1638,11 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	// （裁决：保留逃生口 + 明示后果）：自定义 Caddy 配置是
 	// 一次性逃生口，数据库生成器从不消费 caddy_config 列——任何后续规则/
 	// 配置变更或集群同步都会以权威生成配置覆盖它。保存成功即明示。
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置已保存（注意：自定义配置为一次性逃生口，任何后续规则/配置变更或集群同步都会以数据库生成的权威配置覆盖它）"})
+	successMessage := "配置已保存（注意：自定义配置为一次性逃生口，任何后续规则/配置变更或集群同步都会以数据库生成的权威配置覆盖它）"
+	if adminWarning != "" {
+		successMessage += "；" + adminWarning
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: successMessage})
 }
 
 func (h *Handlers) StartCaddy(c *gin.Context) {

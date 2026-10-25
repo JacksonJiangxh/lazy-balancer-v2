@@ -5,10 +5,13 @@ package services
 // 按「存活规则清单」求差兜底，与 metrics 孤儿清理同构。
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 // seedRuleLogFiles 在规则日志目录写入活动文件 + 三形态轮转副本。
@@ -44,7 +47,7 @@ func TestPurgeOrphanRuleLogs_deletesRemovedRuleKeepsLiveAndForeign(t *testing.T)
 		t.Fatal(err)
 	}
 
-	result := PurgeOrphanRuleLogs()
+	result := PurgeOrphanRuleLogs(context.Background())
 
 	if result.ScanError != "" {
 		t.Fatalf("ScanError=%q, want 空", result.ScanError)
@@ -79,7 +82,7 @@ func TestPurgeOrphanRuleLogs_survivesRuleListReadFailureWithoutDeleting(t *testi
 		t.Fatalf("注入清单读失败: %v", err)
 	}
 
-	result := PurgeOrphanRuleLogs()
+	result := PurgeOrphanRuleLogs(context.Background())
 
 	if result.ScanError == "" {
 		t.Fatal("存活规则清单读失败必须进 ScanError（不得静默当作无孤儿）")
@@ -112,7 +115,7 @@ func TestPurgeOrphanRuleLogs_removeFailureSurfaces(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
-	result := PurgeOrphanRuleLogs()
+	result := PurgeOrphanRuleLogs(context.Background())
 
 	if result.RemoveFailed == 0 {
 		t.Fatalf("删除失败未计数（Purged=%v）", result.Purged)
@@ -129,6 +132,76 @@ func TestPurgeOrphanRuleLogs_removeFailureSurfaces(t *testing.T) {
 	}
 	if summary := res.RuleLogs.Summary(); !containsAll(summary, "删除失败", "1 个") {
 		t.Fatalf("摘要未披露删除失败：%s", summary)
+	}
+}
+
+// 库未初始化时不得在 nil *sql.DB 上查询 panic（与 PurgeOrphanMetricsHistory
+// 同口径）；语义=不删除并把跳过原因写进错误面（静默零值会让「本轮清理全停」
+// 与「无事可做」同形，关停竞态/嵌入形态下排障无从区分）。
+func TestPurgeOrphanRuleLogs_nilDBSkipsWithoutDeleting(t *testing.T) {
+	oldDB, oldMetrics, oldAudit := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
+	db.DB, db.MetricsDB, db.AuditDB = nil, nil, nil
+	db.SetDB(nil)
+	t.Cleanup(func() {
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetrics, oldAudit
+		db.SetDB(oldCurrent)
+	})
+
+	dir := t.TempDir()
+	t.Cleanup(SetRuleLogDirForTest(dir))
+	names := seedRuleLogFiles(t, dir, "lb_nodb")
+
+	result := PurgeOrphanRuleLogs(context.Background())
+	if result.ScanError == "" {
+		t.Fatalf("nil 库必须把跳过原因写进 ScanError（清理不得静默跳过），实际 %+v", result)
+	}
+	if len(result.Purged) != 0 || result.RemoveFailed != 0 {
+		t.Fatalf("nil 库必须不删除任何文件，实际 %+v", result)
+	}
+	if err := result.purgedErr(); err == nil {
+		t.Fatal("nil 库跳过必须进错误面（任务终态可见）")
+	}
+	if err := (RuntimeCleanupResult{RuleLogs: result}).Err(); err == nil {
+		t.Fatal("RuntimeCleanupResult.Err() 必须携带 nil 库跳过原因")
+	}
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("nil 库时文件 %s 被误删: %v", name, err)
+		}
+	}
+}
+
+// 任务取消后不得继续删除：已处理条目保留计数，未处理条目计入 Remaining。
+func TestPurgeOrphanRuleLogs_honorsContextCancellation(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dir := t.TempDir()
+	t.Cleanup(SetRuleLogDirForTest(dir))
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled) VALUES ('lb_kept','kept','http',18095,1)`); err != nil {
+		t.Fatalf("seed live rule: %v", err)
+	}
+	first := seedRuleLogFiles(t, dir, "lb_orphan_a")
+	second := seedRuleLogFiles(t, dir, "lb_orphan_b")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ruleLogOrphanPurgeBeforeRemoveForTest = func() { cancel() }
+	t.Cleanup(func() { ruleLogOrphanPurgeBeforeRemoveForTest = nil })
+
+	result := PurgeOrphanRuleLogs(ctx)
+	if result.ScanError != "" {
+		t.Fatalf("取消不是扫描失败: %q", result.ScanError)
+	}
+	if len(result.Purged) != 0 {
+		t.Fatalf("已取消的清理不得删除任何规则，实际 %v", result.Purged)
+	}
+	if result.Remaining != 2 {
+		t.Fatalf("Remaining=%d, want 2（未处理条目交下轮）", result.Remaining)
+	}
+	for _, name := range append(append([]string{}, first...), second...) {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("取消后文件 %s 被误删: %v", name, err)
+		}
 	}
 }
 

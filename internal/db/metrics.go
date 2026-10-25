@@ -506,6 +506,13 @@ func initMetricsSchema(db *sql.DB) error {
 	-- ROWID 主键 (minute, rule_caddy_id) 的排序前缀完全等价（WHERE minute>=?
 	-- 与 GROUP BY minute 本就走主键扫描），删除以省写入/存储成本；存量库由
 	-- initMetricsSchema 的探测门一次性回收（fresh 库不创建、已回收库零 DDL）。
+	-- 消费面补全（删除论证不得只枚举前缀形态）：①时间窗扫描 WHERE minute>=?；
+	-- ②GROUP BY minute 的按分钟聚合；③威胁大屏 top_targets 的
+	-- GROUP BY rule_caddy_id（无 minute 上界——宽窗口下为主键全扫 + 临时 B 树
+	-- 分组）。①②与主键前缀等价，③不是前缀形态：取消索引后每个窗口 miss 付
+	-- 一次分组排序（数十万行量级，大屏 60s 缓存内每窗口一次）。按 rule_caddy_id
+	-- 建覆盖索引会重新引入被删除的写入成本，故维持现状（性能取舍，非正确性；
+	-- 若未来该查询成为瓶颈，改读主 rollup 的 rule 维度需先确认其口径等价）。
 
 	-- 指标库通用状态表：rollup 固化水位等持久元数据。
 	-- 键值单行形态，水位与分钟数据同事务提交——不再以数据行 MAX(minute)

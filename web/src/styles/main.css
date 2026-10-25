@@ -188,7 +188,7 @@ body {
 .error-banner .error-banner-meta { display: block; font-size: 12px; margin-top: 0; line-height: 1.5; }
 
 /* 轮询错误横幅行内件：Rules/CertJobs/ClusterSettings/AppLayout
-   四处模板共用；容器容器声明统一收敛到下方 .polling-error-alert（此前 7 处
+   四处模板共用；容器间距声明统一收敛到下方 .polling-error-alert（此前 7 处
    页面引用该类却全仓无定义，间距靠各自 mb-5/本地 scoped 分叉）。 */
 .polling-error-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
 .polling-error-meta { font-size: 12px; }
@@ -207,11 +207,10 @@ body {
    取大，仅调后者的 margin-top 压不过前者 12px 底距。 */
 .info-note-bar:has(+ .info-note-bar) { margin-bottom: 8px; }
 /* 弹框正文 20px 水平留白工具类（2026-09-25 用户裁定）：挂到 el-dialog class 即生效；
-   全局规则以兼容 append-to-body/teleport 弹框（scoped :deep 对子组件根不落 data-v 不可靠） */
-.dialog-body-inset .el-dialog__body { padding: 0 20px; }
-/* 弹框纵向滚动条占位：滚动条出现/消失不再改变内容宽度（否则宽表在
+   全局规则以兼容 append-to-body/teleport 弹框（scoped :deep 对子组件根不落 data-v 不可靠）。
+   纵向滚动条占位与之同声明合并：滚动条出现/消失不再改变内容宽度（否则宽表在
    滚动条出现的瞬间被挤出一条水平滚动条）。 */
-.dialog-body-inset .el-dialog__body { scrollbar-gutter: stable; }
+.dialog-body-inset .el-dialog__body { padding: 0 20px; scrollbar-gutter: stable; }
 
 /* V2 产品徽章（Login/AppLayout 共用，历史补充轮去双源） */
 .v2-badge {

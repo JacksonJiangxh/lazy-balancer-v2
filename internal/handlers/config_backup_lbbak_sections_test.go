@@ -62,6 +62,10 @@ func overrideTestWafPaths(t *testing.T) (crsDir, xdbPath string) {
 	}
 	xdbPath = filepath.Join(t.TempDir(), "ip2region.xdb")
 	t.Cleanup(services.OverrideWafLivePathsForTest(crsDir, xdbPath))
+	// 导入链会把备份里的真实 xdb 经 services.Reload 装进进程级 searcher：
+	// 用例结束必须复位，否则后续「无 xdb」形态的归属地断言在 -shuffle 下
+	// 读到上一个用例的库（顺序依赖假红）。复位先于路径还原（LIFO）。
+	t.Cleanup(services.ResetIP2RegionSearcherForTest)
 	return crsDir, xdbPath
 }
 

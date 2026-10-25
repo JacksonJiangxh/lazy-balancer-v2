@@ -396,7 +396,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// 「完成」（同族 audit-retention / security-events-retention /
 			// metrics-orphan-cleanup 均失败上抛）。此前恒 return nil —— daemon
 			// 停机时 waf-audit 兜底轮转失败、单文件删除失败全部只打应用日志。
-			res, line := logCleanupRound(logFile)
+			res, line := logCleanupRound(rc.Ctx, logFile)
 			if err := res.Err(); err != nil {
 				TaskLogfWarn("log-cleanup", "cleanup", "%s", line)
 				return err
@@ -745,6 +745,12 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
 				return fmt.Errorf("CRS 更新失败: %s", snap.Message)
 			}
+			// 状态行 success 但排程槽未推进（写路径严格读排程失败）：不得以
+			// success 收尾——引擎会把本槽记入消费水位，该族自动更新静默停摆。
+			// 按失败返回走退避重投，读恢复后的下一轮自然推进槽。
+			if serr := m.ScheduleSlotError(); serr != nil {
+				return serr
+			}
 			return nil
 		},
 	})
@@ -813,6 +819,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusFailed) {
 				return fmt.Errorf("IP2Region 更新失败: %s", snap.Message)
+			}
+			// 状态行 success 但排程槽未推进（写路径严格读排程失败）：按失败
+			// 返回让引擎退避重投同一槽（见 CRS 族同型说明）。
+			if serr := m.ScheduleSlotError(); serr != nil {
+				return serr
 			}
 			return nil
 		},
@@ -1075,6 +1086,21 @@ func IsBusinessDrivenTask(id string) bool {
 		}
 	}
 	return false
+}
+
+// applyBusinessTaskLoop 业务开关 setter 的调度应用入口：与
+// SyncBusinessTaskDrivers 共用 businessDriverSyncMu，串行化「单点应用」与
+// 「整轮对齐」。
+//
+// setter 提交 DB 后直接调 syncTaskLoop 会与整轮对齐交错：对齐先读旧态 →
+// setter 提交并应用新态 → 对齐再应用旧态，最终「库已新、loop 仍旧」且
+// businessDriverSyncPending=false（对齐全部读数成功），60s 对账不会纠正。
+// DB 写入保持在锁外（锁只保护「读实态并应用」这一段）：最后完成的一次应用
+// 即最后一次开关决定的语义。
+func applyBusinessTaskLoop(id string, enabled bool) {
+	businessDriverSyncMu.Lock()
+	defer businessDriverSyncMu.Unlock()
+	syncTaskLoop(id, enabled)
 }
 
 // syncTaskLoop 将业务开关直接映射为引擎调度开关：开启自动更新=StartLoop，

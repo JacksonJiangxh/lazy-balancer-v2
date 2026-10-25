@@ -102,3 +102,30 @@ func TestPutCaddyConfig_rejectsAdminLockoutBeforeApply(t *testing.T) {
 		t.Fatalf("loads=%d, want 0（护栏必须早于 apply）", loads)
 	}
 }
+
+// 逃生口护栏只拦自锁：通配/自定义 admin 监听放行（保留修配置的入口），但
+// Caddy admin API 无鉴权，保存成功时必须显式披露非回环暴露面。
+func TestCaddyAdminNonLoopbackWarning(t *testing.T) {
+	cases := []struct {
+		name     string
+		config   map[string]interface{}
+		wantWarn bool
+	}{
+		{"省略 admin 段回落默认回环", map[string]interface{}{}, false},
+		{"显式 null 回落默认回环", map[string]interface{}{"admin": nil}, false},
+		{"对象形态回环监听", map[string]interface{}{"admin": map[string]interface{}{"listen": "127.0.0.1:2019"}}, false},
+		{"字符串形态 localhost", map[string]interface{}{"admin": "localhost:2019"}, false},
+		{"通配 IPv4", map[string]interface{}{"admin": map[string]interface{}{"listen": "0.0.0.0:2019"}}, true},
+		{"通配省略主机", map[string]interface{}{"admin": map[string]interface{}{"listen": ":2019"}}, true},
+		{"指定网卡地址", map[string]interface{}{"admin": map[string]interface{}{"listen": "192.168.50.10:2019"}}, true},
+		{"disabled 由护栏拦截，不产生提示", map[string]interface{}{"admin": "off"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := caddyAdminNonLoopbackWarning(tc.config)
+			if (got != "") != tc.wantWarn {
+				t.Fatalf("warning=%q, wantWarn=%v", got, tc.wantWarn)
+			}
+		})
+	}
+}

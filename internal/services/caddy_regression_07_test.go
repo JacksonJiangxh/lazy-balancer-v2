@@ -26,14 +26,6 @@ func TestGenerateSingleRuleCaddyConfig_unsupportedProtocol_returnsError(t *testi
 	}
 }
 
-func TestGenerateRuleServerContext_unsupportedProtocol_returnsError(t *testing.T) {
-	config := GenerateRuleServerContext("lb_invalid_preview", 8080, "udp", "example.test")
-	genErr, isErr := config["error"].(error)
-	if !isErr || !strings.Contains(genErr.Error(), "unsupported protocol: udp") {
-		t.Fatalf("config=%v, want explicit unsupported protocol error", config)
-	}
-}
-
 func TestGenerateCaddyConfig_unsupportedProtocol_failsVisibleInsteadOfTCP(t *testing.T) {
 	for _, protocol := range []string{"https", "udp"} {
 		t.Run(protocol, func(t *testing.T) {

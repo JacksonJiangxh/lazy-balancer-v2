@@ -231,7 +231,9 @@ func TestEmitCRSRuleGroupSelection_capsEntries(t *testing.T) {
 		t.Fatalf("夹具无效：条目数 %d 未超过上限 %d", len(groups), CRSRuleGroupsMaxEntries)
 	}
 	policy := &models.SecurityPolicy{ID: 2, Name: "cap"}
-	emitCRSRuleGroupSelection(&sb, policy, groups, lazyCRSRuleIndex())
+	if err := emitCRSRuleGroupSelection(&sb, policy, groups, lazyCRSRuleIndex()); err != nil {
+		t.Fatalf("emitCRSRuleGroupSelection: %v", err)
+	}
 
 	out := sb.String()
 	includes := 0

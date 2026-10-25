@@ -17,7 +17,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
  *
  * 日志滚动容器 ref 归消费方所有（模板 ref 字符串绑定），对象传入以供滚底。
  */
-export interface UseLibUpdateDialogOptions<TInfo> {
+interface UseLibUpdateDialogOptions<TInfo> {
   readonly apiPrefix: string
   /** 日志滚动容器（模板 ref 绑定在消费方），每次日志拉取后自动滚到底部 */
   readonly logContainer: Ref<HTMLDivElement | null>
@@ -52,7 +52,9 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
   // 再起轮询——若 startPolling 走 resume()（start + 立即 run），同一轮 status+logs
   // 会被立刻重复请求一次（409=任务已在跑路径每次点击都翻倍）。start() 只挂 2s
   // 定时器，下一轮交给定时器；刚拉过的状态不重复拉。
-  const polling = usePollingTask(async () => { await refreshStatus() }, { interval: 2000 })
+  // 轮次 signal 必须透传：关闭弹框/终态 stopPolling 后，在途的两个请求
+  // （长任务下日志体不小）随 abort 取消，不再空跑完成。
+  const polling = usePollingTask(async ({ signal }) => { await refreshStatus(signal) }, { interval: 2000 })
   const startPolling = () => { polling.start() }
   const stopPolling = () => { polling.pause() }
 
@@ -61,12 +63,16 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
     if (options.logContainer.value) options.logContainer.value.scrollTop = options.logContainer.value.scrollHeight
   }
 
-  const refreshStatus = async () => {
+  /**
+   * 状态/日志双拉取。`signal` 由轮询轮次传入（关闭弹框/终态 → 在途请求取消）；
+   * onOpened/confirmUpdate 的显式调用不传，保持既有语义。
+   */
+  const refreshStatus = async (signal?: AbortSignal) => {
     if (!visible.value) return
     const seq = ++requestSeq
     const [statusResult, logsResult] = await Promise.allSettled([
-      request.get<APIResponse<TInfo>>(`${options.apiPrefix}/update/status`, { silent: true }),
-      request.get<APIResponse<{ content: string }>>(`${options.apiPrefix}/update/logs`, { silent: true }),
+      request.get<APIResponse<TInfo>>(`${options.apiPrefix}/update/status`, { silent: true, signal }),
+      request.get<APIResponse<{ content: string }>>(`${options.apiPrefix}/update/logs`, { silent: true, signal }),
     ])
     if (!visible.value || seq !== requestSeq) return
     if (statusResult.status === 'fulfilled') {

@@ -13,6 +13,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -100,6 +101,11 @@ func PurgeOrphanMetricsHistory(ctx context.Context) (int, error) {
 
 // liveRuleIDs 读取主库存活规则 caddy_id 集合。
 func liveRuleIDs(ctx context.Context) (map[string]bool, error) {
+	// nil 库守卫（两个消费方共用：孤儿规则日志兜底、孤儿指标清理）——
+	// 关停时 db.Close() 把 db.DB 置 nil，仍在跑的本轮不得 nil 解引用 panic。
+	if db.DB == nil {
+		return nil, errors.New("数据库未初始化")
+	}
 	rows, err := db.DB.QueryContext(ctx, `SELECT caddy_id FROM lb_rules`)
 	if err != nil {
 		return nil, err

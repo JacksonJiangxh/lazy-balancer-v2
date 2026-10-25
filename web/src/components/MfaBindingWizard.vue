@@ -125,7 +125,12 @@ const activate = async (): Promise<void> => {
   loading.value = true
   try {
     const res = await request.post<APIResponse<{ recovery_codes: string[] }>>('/auth/mfa/activate', { code: code.value }, { silent: true })
-    if (!res.data) return
+    if (!res.data) {
+      // 契约违约（200 无 data）：不得静默停在验证步——按钮已从 loading 复位，
+      // 无提示会让用户以为没点上而重复提交。
+      ElMessage.error('响应异常，请重试')
+      return
+    }
     recoveryCodes.value = res.data.recovery_codes
     step.value = 2
     mfaAwareSuccess('MFA 已启用')

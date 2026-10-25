@@ -139,6 +139,24 @@
         </div>
       </el-header>
 
+      <!-- Caddy 进程停摆全局横幅：/caddy/status 的 status 字段（running|stopped）——
+           只有仪表盘消费该字段时，停留在规则/设置/日志页完全看不到停摆
+           （apply_error 可能为空）。全节点全页面可见，带重启入口。 -->
+      <el-alert
+        v-if="caddyStopped"
+        type="error"
+        :closable="false"
+        show-icon
+        class="error-banner"
+      >
+        <template #title>
+          <div class="polling-error-title">
+            <span>Caddy 服务未运行：站点当前无法提供服务（面板操作不受影响）</span>
+            <el-button v-if="authStore.readOnlyReason === null" link type="danger" :loading="restarting" @click="handleRestartForDrift">重启服务</el-button>
+          </div>
+        </template>
+      </el-alert>
+
       <el-alert
         v-if="configDrift && authStore.nodeMode === 'master'"
         type="error"
@@ -284,6 +302,9 @@ const configDriftSince = ref('')
 const applyErrorBanner = ref('')
 const backgroundApplyErrorBanner = ref('')
 const applyErrorBannerKind = ref<'error' | 'warning'>('error')
+// Caddy 进程状态（running|stopped）：非仪表盘页面的停摆信号（Dashboard 另有一处
+// 消费）。查询失败时不改写旧值——保留最后一次已知状态，避免横幅闪烁。
+const caddyStopped = ref(false)
 const restarting = ref(false)
 let disposed = false
 
@@ -297,6 +318,7 @@ const fetchDriftStatus = async () => {
     configDriftSince.value = drifted ? (res.data?.config_drift_since || '') : ''
     const applyErr = res.data?.apply_error || ''
     const bgErr = res.data?.background_apply_error || ''
+    caddyStopped.value = res.data?.status === 'stopped'
     applyErrorBanner.value = applyErr || bgErr
     // 两者触发源不同且 apply_error 仅在下一次成功保存时清空：并存时后台失败
     // 必须单独成行，否则在 apply_error 清空前完全不可见（从节点同步重载失败即此类）。

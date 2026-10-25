@@ -41,8 +41,8 @@ const { info, error, unavailable } = useLogStorageStats({
   refreshKey: () => props.refreshKey,
 })
 
-// 复用 api.ts 的 formatBytes（站内字节格式化单一事实源，原私有
-// humanSize 与 Dashboard 精度不一致）
+// 复用 utils/formatBytes（站内字节格式化单一事实源，原私有 humanSize 与
+// Dashboard 精度不一致；该模块零 UI 依赖，不得改回 api.ts 上的旧位置）
 const humanSize = formatBytes
 
 const isEmpty = computed(() => {

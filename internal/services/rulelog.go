@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 // ruleLogDir 规则访问日志目录（写入端写死 /app/logs/rules）。包级 var 仅为
@@ -438,6 +440,11 @@ func (r RuleLogHousekeepingResult) purgedErr() error {
 	return errors.Join(errs...)
 }
 
+// ruleLogOrphanPurgeBeforeRemoveForTest 仅测试注入（nil=生产直通）：在算出
+// 孤儿清单、开始删除之前触发，用于确定性钉住任务取消时的提前退出语义
+// （删除不可逆，取消后不得继续）。
+var ruleLogOrphanPurgeBeforeRemoveForTest func()
+
 // PurgeOrphanRuleLogs 清理「规则已不存在」的规则访问日志（活动文件 + 移位/
 // 时间戳轮转副本）。规则日志此前只有三个事件型删除入口（删除规则 / 导入差集 /
 // 集群差集），任一路径失败即永久残留（单规则含副本上限约 6×caddy_log_size_mb），
@@ -445,9 +452,17 @@ func (r RuleLogHousekeepingResult) purgedErr() error {
 //
 // 判定域是 lb_rules.caddy_id：清单读取失败时一个文件都不删（否则会把存活规则
 // 的日志当孤儿清掉），按 ScanError 上抛。文件名还原失败的条目一律跳过——外来
-// 文件不属于本规则的日志族，不得误删。
-func PurgeOrphanRuleLogs() RuleLogHousekeepingResult {
+// 文件不属于本规则的日志族，不得误删。ctx 取消时提前返回，未处理条目计入
+// Remaining；库未初始化（启动早期）时直接返回零值（同 PurgeOrphanMetricsHistory）。
+func PurgeOrphanRuleLogs(ctx context.Context) RuleLogHousekeepingResult {
 	result := RuleLogHousekeepingResult{}
+	// 与 PurgeOrphanMetricsHistory 同口径：库未初始化（启动早期/关停竞态里仍
+	// 在跑的本轮/嵌入形态）时无可判定的存活规则——不删除，并把原因进错误面
+	// （静默零值会让「本轮清理全停」与「无事可做」同形）。
+	if db.DB == nil {
+		result.ScanError = "数据库未初始化，跳过孤儿规则日志清理（不删除）"
+		return result
+	}
 	entries, err := os.ReadDir(ruleLogDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -456,7 +471,7 @@ func PurgeOrphanRuleLogs() RuleLogHousekeepingResult {
 		result.ScanError = err.Error()
 		return result
 	}
-	liveIDs, err := liveRuleIDs(context.Background())
+	liveIDs, err := liveRuleIDs(ctx)
 	if err != nil {
 		result.ScanError = fmt.Sprintf("读取存活规则清单失败: %v", err)
 		return result
@@ -486,7 +501,17 @@ func PurgeOrphanRuleLogs() RuleLogHousekeepingResult {
 		result.Remaining = len(orphans) - limit
 		orphans = orphans[:limit]
 	}
-	for _, ruleID := range orphans {
+	if ruleLogOrphanPurgeBeforeRemoveForTest != nil {
+		ruleLogOrphanPurgeBeforeRemoveForTest()
+	}
+	for i, ruleID := range orphans {
+		// 任务取消/停机时及时退出：已删条目不可逆，未处理条目计入 Remaining
+		// 交下一轮（与 PurgeOrphanMetricsHistory 的 ctx 检查同口径）。
+		if err := ctx.Err(); err != nil {
+			result.Remaining += len(orphans) - i
+			Logf("warn", "规则日志孤儿清理被取消（本轮已清理 %d 个，剩余 %d 个待下轮）: %v", i, len(orphans)-i, err)
+			return result
+		}
 		if err := RemoveRuleLogFiles(ruleID); err != nil {
 			Logf("error", "规则日志孤儿清理失败（%s）: %v", ruleID, err)
 			result.RemoveFailed++

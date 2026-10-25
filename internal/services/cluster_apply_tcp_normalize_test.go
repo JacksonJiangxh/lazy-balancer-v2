@@ -82,3 +82,19 @@ func TestNormalizeRuleForTransport_tcpClearsCertMaterialWithoutEnableTLS(t *test
 		t.Fatalf("TCP 证书材料未清零: enable_tls=%v cert=%q key=%q", rule.EnableTLS, rule.TLSCert, rule.TLSKey)
 	}
 }
+
+// TCP 策略「空串」与 cookie 同一归一口径：手造/旧版本备份可带显式 ""（v2 导入
+// 只替换 nil，不补默认），同一 TCP 终态不得裂成 ” 与 weighted_round_robin
+// 两形态——导出/快照 canonical 才有稳定值。
+func TestNormalizeRuleForTransport_tcpEmptyStrategyFallsBackToDefault(t *testing.T) {
+	rule := models.LbRule{
+		CaddyID: "lb_tcpnorm_strategy", Name: "tcpnorm-strategy", Protocol: "tcp", ListenPort: 9002,
+		Strategy: "", Enabled: true,
+	}
+
+	normalizeRuleForTransport(&rule)
+
+	if rule.Strategy != "weighted_round_robin" {
+		t.Fatalf("TCP 空策略归一为 %q, want weighted_round_robin", rule.Strategy)
+	}
+}

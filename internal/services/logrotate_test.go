@@ -137,7 +137,7 @@ func TestTaskLogsHousekeeping_reportsDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 
 	if len(res.TaskLogs.Deleted) != 1 || res.TaskLogs.Deleted[0] != "stale.log" {
 		t.Fatalf("Deleted=%v, want [stale.log]", res.TaskLogs.Deleted)
@@ -191,7 +191,7 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 	if err := os.WriteFile(logPath, []byte(stream), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res := RuntimeLogCleanupOnce(filepath.Join(dir, "app.log"))
+	res := RuntimeLogCleanupOnce(context.Background(), filepath.Join(dir, "app.log"))
 
 	// audit.log 经完整安全链轮转为 .1、活文件截断归零，明细如实上报。
 	if st, err := os.Stat(logPath); err != nil || st.Size() != 0 {
@@ -347,7 +347,7 @@ func TestRuntimeLogCleanupOnce_reportsRetentionMonthsSingleSource(t *testing.T) 
 	writeStaleAppLogCopy(t, dir, "app.log.1")
 
 	// When
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 
 	// Then：保留月数=单源取值，且与实际删除口径一致（13 月前副本超 6 月保留期）
 	wantMonths, monthsErr := auditRetentionMonths()
@@ -377,7 +377,7 @@ func TestRuntimeLogCleanupOnce_outOfRangeRetentionFallsBackToDefault(t *testing.
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "app.log")
 
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 	if res.RetentionMonths != 3 {
 		t.Fatalf("RetentionMonths=%d, want 3（越界回退默认）", res.RetentionMonths)
 	}
@@ -402,7 +402,7 @@ func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
 	logFile := filepath.Join(dir, "app.log")
 	writeStaleAppLogCopy(t, dir, "app.log.1")
 
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 	if res.AppRemoved != 1 {
 		t.Fatalf("nil 库时 AppRemoved=%d, want 1（不得跳过应用日志副本清理）", res.AppRemoved)
 	}
@@ -414,6 +414,10 @@ func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
 // 运行日志文件未打开（runtimeLogFile 为空）时摘要行必须是显式
 // 「未启用」形态，而非静默零动作。
 func TestLogCleanupSummaryLine_disabledShape(t *testing.T) {
+	// 摘要行会带库派生段（孤儿规则日志扫描）：库未初始化时前缀变成
+	// 「日志清理未完成」——本用例只钉「未启用」形态，必须显式装配库，
+	// 不能依赖前序用例遗留的连接（-shuffle 下顺序一变即红）。
+	initServicesDB(t)
 	got := logCleanupSummaryLine("")
 	if !strings.HasPrefix(got, "日志清理未启用") {
 		t.Fatalf("logFile 为空时摘要=%q, want 「日志清理未启用…」", got)
@@ -504,7 +508,7 @@ func TestLogCleanupRound_wafFallbackRotationFailureIsReported(t *testing.T) {
 	auditLogCopyFile = func(string, string) error { return errors.New("injected copy failure") }
 
 	// When
-	res, line := logCleanupRound(filepath.Join(dir, "app.log"))
+	res, line := logCleanupRound(context.Background(), filepath.Join(dir, "app.log"))
 
 	// Then：失败进结果、Err 非空、摘要不得称完成
 	if res.WafAuditError == "" {
@@ -557,7 +561,7 @@ func TestLogCleanupRound_wafFallbackReportsRotationDelay(t *testing.T) {
 	}
 
 	// When
-	res, line := logCleanupRound(filepath.Join(dir, "app.log"))
+	res, line := logCleanupRound(context.Background(), filepath.Join(dir, "app.log"))
 
 	// Then：延迟必须进结果、Err 非空、摘要不得称完成
 	if res.WafAuditError == "" {
@@ -599,7 +603,7 @@ func TestRuntimeLogCleanupOnce_skipsRetentionDeletionWhenReadFails(t *testing.T)
 	swapBrokenDB(t)
 
 	// When
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 
 	// Then：一条都不删，失败原因可见
 	if res.RetentionError == "" {
@@ -620,7 +624,7 @@ func TestRuntimeLogCleanupOnce_skipsRetentionDeletionWhenReadFails(t *testing.T)
 	if err := res.Err(); err == nil {
 		t.Fatal("保留月数读取失败必须让本轮失败")
 	}
-	if _, line := logCleanupRound(logFile); !strings.Contains(line, "保留月数读取失败") {
+	if _, line := logCleanupRound(context.Background(), logFile); !strings.Contains(line, "保留月数读取失败") {
 		t.Fatalf("摘要行必须披露保留月数读取失败: %q", line)
 	}
 }
@@ -728,7 +732,7 @@ func TestLogCleanupRound_emptyLogFileStillRunsWafFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, line := logCleanupRound("")
+	res, line := logCleanupRound(context.Background(), "")
 
 	if !strings.HasPrefix(line, "日志清理未启用") {
 		t.Fatalf("logFile 为空时摘要=%q, want 「日志清理未启用…」", line)
@@ -768,7 +772,7 @@ func TestRuntimeLogCleanupOnce_countsAppMetadataFailures(t *testing.T) {
 	t.Cleanup(func() { appLogEntryInfo = oldInfo })
 
 	// When
-	res := RuntimeLogCleanupOnce(logFile)
+	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 
 	// Then：失败计数、错误面、摘要三处可见，且本轮未删除
 	if res.AppInfoFailed != 1 {

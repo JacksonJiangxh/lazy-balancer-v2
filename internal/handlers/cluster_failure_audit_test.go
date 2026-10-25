@@ -82,3 +82,129 @@ func TestClusterNodeAction_invalidIDLeavesAuditTrail(t *testing.T) {
 		t.Fatalf("非法编号失败面审计行数=%d, want 1", count)
 	}
 }
+
+// 站点坐标端点是 Explicit 路由：审计中间件对其失败面无条件早退，handler 必须
+// 逐条补记（与 clusterNodeAction 的 auditFailure 同构）。
+func TestUpdateClusterNodeSiteCoordinates_failureLeavesAuditTrail(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/nodes/999999/site", strings.NewReader(`{"server_map_lat":1.5,"server_map_lon":2.5}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "999999"}}
+
+	h.UpdateClusterNodeSiteCoordinates(ctx)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want 404", recorder.Code, recorder.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='集群节点' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("站点坐标失败面必须留痕（审计行缺失）: %v", err)
+	}
+	if !strings.Contains(detail, "节点 999999") || !strings.Contains(detail, "失败") {
+		t.Fatalf("审计详情必须点名节点并标明失败，got %q", detail)
+	}
+}
+
+func TestUpdateClusterNodeSiteCoordinates_invalidCoordinatesAudited(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/cluster/nodes/1/site", strings.NewReader(`{"server_map_lat":999,"server_map_lon":2.5}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	h.UpdateClusterNodeSiteCoordinates(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='更新' AND resource='集群节点' AND detail LIKE '%请求格式错误%'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("越界坐标失败面审计行数=%d, want 1", count)
+	}
+}
+
+// 登录票据端点的失败面此前零审计：MFA 未启用/step-up 缺失/节点离线/DB 故障
+// 在操作审计页不可回溯，只剩 stdout clusterError 日志。
+func TestGenerateClusterLoginTicket_mfaDisabledLeavesAuditTrail(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled) VALUES (1,'admin','x','admin',1,0)"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/cluster/nodes/1/login-ticket", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	ctx.Set("user_id", 1)
+
+	h.GenerateClusterLoginTicket(ctx)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403（未启用 MFA）", recorder.Code, recorder.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='生成失败' AND resource='登录票据' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("票据签发失败面必须留痕（审计行缺失）: %v", err)
+	}
+	if !strings.Contains(detail, "未启用 MFA") {
+		t.Fatalf("审计详情必须点明失败原因，got %q", detail)
+	}
+}
+
+// step-up 缺失（MFA 已启用但 10 分钟内未验证）此前同样零审计：428 属客户端
+// 可自愈分支，但仍需可追溯。
+func TestGenerateClusterLoginTicket_missingStepUpLeavesAuditTrail(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled) VALUES (1,'admin','x','admin',1,1)"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/cluster/nodes/1/login-ticket", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	ctx.Set("user_id", 1)
+	ctx.Set("auth_type", "jwt")
+	ctx.Set("auth_method", "password")
+
+	h.GenerateClusterLoginTicket(ctx)
+
+	if recorder.Code != http.StatusPreconditionRequired {
+		t.Fatalf("status=%d body=%s, want 428（step-up 未完成）", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='生成失败' AND resource='登录票据' AND detail LIKE '%step-up%'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("step-up 缺失失败面审计行数=%d, want 1", count)
+	}
+}
+
+// 注册端点的请求绑定失败此前零审计，与同 handler 其余失败面（无效令牌/非法名/
+// 缺地址/非法地址）不一致。
+func TestRegisterClusterNode_bindFailureLeavesAuditTrail(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/cluster/register", strings.NewReader(`{"name":`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Request.RemoteAddr = "10.0.0.9:5555"
+
+	h.RegisterClusterNode(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='注册失败' AND resource='集群节点' AND detail='注册请求格式错误'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("绑定失败审计行数=%d, want 1", count)
+	}
+}

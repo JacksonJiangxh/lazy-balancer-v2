@@ -17,9 +17,11 @@ import {
   summarizeLibrarySources,
 } from '../src/utils/securityLibraries.ts'
 
-test('状态词表：未安装/缺失/未更新不再伪装为已最新', () => {
+test('状态词表：缺失/未安装统一「未安装」、未更新不再伪装为已最新', () => {
   assert.equal(libraryStatusLabel('not-installed'), '未安装')
-  assert.equal(libraryStatusLabel('missing'), '缺失')
+  // 文件缺失与未安装的用户可见词同一（版本列 2026-09-24 裁定用词），
+  // 两者区别只由色调承载：缺失=danger、未安装=info。
+  assert.equal(libraryStatusLabel('missing'), '未安装')
   assert.equal(libraryStatusLabel('never'), '未更新')
   assert.notEqual(libraryStatusLabel('not-installed'), libraryStatusLabel('idle'))
   assert.equal(libraryStatusTagType('not-installed'), 'info')
@@ -95,7 +97,7 @@ test('单库健康标签：IP 地理库未安装 → 未安装警示（不再「
   )
   assert.deepEqual(
     libraryHealthTag('IP 地理库', { loadError: false, available: false, status: 'missing' }),
-    { label: 'IP 地理库 · 缺失', type: 'danger' },
+    { label: 'IP 地理库 · 未安装', type: 'danger' },
   )
   assert.deepEqual(
     libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: 'success' }),

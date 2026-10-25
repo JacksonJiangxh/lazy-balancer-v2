@@ -63,6 +63,8 @@
       append-to-body
       width="min(420px, 92vw)"
       :close-on-click-modal="false"
+      :close-on-press-escape="!mfaSubmitting"
+      :show-close="!mfaSubmitting"
       :title="mfaAction === 'reset' ? '重置 MFA' : '关闭 MFA'"
     >
       <div class="form-tip-line">{{ mfaAction === 'reset' ? '重置会立即换绑验证器，旧验证器与旧恢复代码全部失效。' : '关闭后登录不再需要动态验证码。' }}</div>

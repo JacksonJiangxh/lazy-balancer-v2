@@ -38,6 +38,13 @@ var (
 	}
 )
 
+// 建会话前两条 500 分支（读取现有规则/开启导入事务）在正常环境不可注入失败，
+// 经函数变量替换以钉测「失败必留痕」契约；生产恒为默认实现。
+var (
+	importRuleIDsForBegin = currentRuleIDs
+	importBeginTx         = func(ctx context.Context) (*sql.Tx, error) { return db.DB.BeginTx(ctx, nil) }
+)
+
 type importCoordinatorError struct {
 	phase         importPhase
 	err           error
@@ -252,6 +259,23 @@ func rejectWriteDuringImport(c *gin.Context, action string) bool {
 	return true
 }
 
+// failImportBegin 是「建会话前失败」的单一收尾：warn 运行日志 + 失败审计。
+// 与事务内的 failImportAbort（回滚→审计）对称——这些分支没有事务可回滚，
+// 但同属管理员高危操作被拒的复盘面：此前只有在途任务排空一条留痕，证书队列
+// 排空（409）与读规则/开事务（500）完全静默，形成第二套方言。
+// detail 是已带阶段与「未执行/未修改」结论的审计文案；审计动作按动作词取
+// 字面量（词汇门禁要求静态词条）。返回 cause 供调用方直接作为 begin 的
+// error 返回，响应文案与日志同源。
+func failImportBegin(action, detail string, cause error) error {
+	services.Logf("warn", "配置%s被拒绝：%s（%v）", action, detail, cause)
+	if action == "还原" {
+		services.RecordAuditLog("system", "还原失败", "配置备份", detail, "")
+	} else {
+		services.RecordAuditLog("system", "导入失败", "配置备份", detail, "")
+	}
+	return cause
+}
+
 // action 是本次会话的动作词（「导入」/「还原」）——排空失败等建会话前的审计
 // 也要带正确动作，不能一律记「导入失败」（自动备份还原路径同样走本函数）。
 func (h *Handlers) beginConfigImport(ctx context.Context, action string) (*configImportSession, error) {
@@ -296,15 +320,8 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		drained := engine.WaitInFlightRuns(drainCtx)
 		cancel()
 		if !drained {
-			services.Logf("warn", "配置导入：等待在途任务落定超时（%s），已中止导入", importInFlightDrainTimeout)
-			// 审计词条必须是字面量（词汇门禁校验）：按动作分支各写一次。
-			drainDetail := "在途任务未排空，导入未执行（配置未修改）"
-			if action == "还原" {
-				drainDetail = "在途任务未排空，还原未执行（配置未修改）"
-				services.RecordAuditLog("system", "还原失败", "配置备份", drainDetail, "")
-			} else {
-				services.RecordAuditLog("system", "导入失败", "配置备份", drainDetail, "")
-			}
+			drainDetail := fmt.Sprintf("在途任务未排空（等待上限 %s），%s未执行（配置未修改）", importInFlightDrainTimeout, action)
+			failImportBegin(action, drainDetail, errImportTaskDrainIncomplete)
 			// 与 close 同序：先恢复本代暂停，再允许下一代导入进入。
 			resumeEngine()
 			releaseSession()
@@ -327,6 +344,8 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		// 排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
 		// 不得继续导入。
 		if !recovery.manager.PauseAndDrain() {
+			certDetail := fmt.Sprintf("证书任务执行中，%s未执行（配置未修改）", action)
+			failImportBegin(action, certDetail, errCertQueueDrainIncomplete)
 			// 先解除 hold 再恢复队列/释放会话锁——否则第二个导入可在锁窗口
 			// 内看到「队列 inactive」并在第一个导入 Resume 后与之并发。
 			recovery.hold = false
@@ -358,20 +377,23 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 	}
 	h.caddyOpMu.Lock()
 	session := &configImportSession{h: h, ctx: ctx, recovery: recovery, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock, action: action}
-	ruleIDs, err := currentRuleIDs(ctx)
+	ruleIDs, err := importRuleIDsForBegin(ctx)
 	if err != nil {
 		// CA 已暂停：必须在释放会话锁之前恢复既有活动态——否则第二个导入可
 		// 在窗口内把「队列 inactive」当作稳定状态，随后与本导入的 Resume 并发。
 		err = finishImportFailure(nil, &session.recovery, fmt.Errorf("读取现有规则: %w", err))
+		failImportBegin(action, fmt.Sprintf("读取现有规则失败，%s未执行（数据库未修改）", action), err)
 		releaseBegin()
 		return nil, err
 	}
 	session.existingRuleIDs = ruleIDs
-	session.tx, err = db.DB.BeginTx(ctx, nil)
+	session.tx, err = importBeginTx(ctx)
 	if err != nil {
 		err = finishImportFailure(nil, &session.recovery, err)
+		wrapped := fmt.Errorf("开始导入事务: %w", err)
+		failImportBegin(action, fmt.Sprintf("开启导入事务失败，%s未执行（数据库未修改）", action), wrapped)
 		releaseBegin()
-		return nil, fmt.Errorf("开始导入事务: %w", err)
+		return nil, wrapped
 	}
 	return session, nil
 }

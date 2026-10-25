@@ -114,6 +114,10 @@ test('正常流光流起点：台湾/Taiwan 归一后与中国同点，两引擎
   assert.deepEqual(trafficOriginForCountry('中国'), COUNTRY_CENTROIDS['中国'])
   // 未知国家仍走兜底点（不是被归一成中国）
   assert.notDeepEqual(trafficOriginForCountry('不存在国'), COUNTRY_CENTROIDS['中国'])
+  // 质心表是普通对象：原型键不得取出函数（[0]/[1] 会变 NaN 坐标）
+  for (const key of ['constructor', 'toString', '__proto__']) {
+    assert.deepEqual(trafficOriginForCountry(key), [160, 15], `${key} 必须走兜底质心`)
+  }
   // 两引擎 setTraffic 都走共享 helper，禁止第三份查表实现
   for (const path of ['src/utils/threatScene.ts', 'src/utils/threatGlobe.ts']) {
     const text = code(path)

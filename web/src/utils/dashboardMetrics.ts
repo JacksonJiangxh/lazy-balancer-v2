@@ -1,11 +1,15 @@
+import { hasOwn } from './hasOwn.ts'
+
 export const buildRuleMetricsUnavailable = (
   rules: ReadonlyArray<{ caddy_id: string; enabled: boolean }>,
   metrics: Readonly<Record<string, unknown>> | null | undefined,
   metricsAvailable: boolean,
-): Record<string, boolean> => Object.fromEntries(rules.map((rule) => [
-  rule.caddy_id,
-  rule.enabled && (!metricsAvailable || metrics?.[rule.caddy_id] === undefined),
-]))
+): Record<string, boolean> => Object.fromEntries(rules.map((rule) => {
+  // 指标表是普通对象且 caddy_id 为外部字符串：原型键直接下标会把「无指标」
+  // 判成「有指标」，采集失败列退化为 0（缺失不得呈现为有值）。
+  const hasMetrics = metrics != null && hasOwn(metrics, rule.caddy_id) && metrics[rule.caddy_id] !== undefined
+  return [rule.caddy_id, rule.enabled && (!metricsAvailable || !hasMetrics)]
+}))
 
 // 问题：TCP 单规则指标按上游地址汇总——caddy-l4（v0.1.2）L4 指标
 //（caddy_layer4_proxy_connections_total/active_connections）仅携带 upstream

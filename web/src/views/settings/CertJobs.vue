@@ -236,7 +236,7 @@ const logLoading = logTail.loading
 const statusType = (status: CertJobStatus) => certJobStatusTone(status)
 
 const canRetry = (row: CertJob): boolean =>
-  certJobRetryReady(row.retry_cooldown_seconds, row.updated_at)
+  certJobRetryReady(row.retry_cooldown_seconds)
 
 const retryDisabledReason = (row: CertJob): string => {
   if (isReadOnly.value) return authStore.readOnlyMessage
@@ -460,7 +460,7 @@ onUnmounted(() => {
   color: #9ca3af;
 }
 .cert-jobs-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
-.polling-error-alert { margin-bottom: 16px; }
+/* .polling-error-alert 已收敛 main.css（三处 scoped 逐字重复删除） */
 /* .polling-error-title/.polling-error-meta 已收敛 main.css*/
 .cert-jobs-table :deep(.el-table__cell) {
   vertical-align: middle;

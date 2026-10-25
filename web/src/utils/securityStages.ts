@@ -984,7 +984,9 @@ export const inferPolicyType = (p: SecurityPolicyTypeInput): SecurityPolicyType 
 }
 
 // compareVersion 语义化版本比较：日期形态（2026.09.24）与
-// semver（v2.3.3）均可——逐段数值比较，非数值段字典序兜底。
+// semver（v2.3.3）均可——逐段数值比较，非数值段字典序兜底；缺段与空段按 0
+// （1.2 与 1.2.0 等价）——Go compareLibraryVersion 同口径，双方测试同读
+// web/tests/fixtures/version-compare.tsv（跨栈夹具，改语义两栈同时红）。
 // 注意：预发布段（如 -beta vs 空）按字典序判 beta > 正式版（semver 反直觉）——
 // 当前消费方只比较日期/纯数字形态，无预发布版本号，无实际影响（声明）。
 export const compareVersion = (a: string, b: string): number => {
@@ -1152,6 +1154,12 @@ export const entryMatchesIp = (entry: string, ip: string): boolean => {
 // invalidate 同时通知订阅者（已打开弹框的本地副本即时
 // 失效重拷——曾失效触不到本地 ref，开放窗口叠开 IP 处置后徽标滞留旧值）。
 export const sharedEntriesCache: Record<number, string[]> = {}
+// 条目年龄：缓存值由本页写入动作失效，但**外部**变更（另一标签页/另一管理员
+// 增删条目）不会触达本页——只靠写动作失效会让本页事件详情/「取消信任」计划
+// 长期陈旧。给每条名单记加载时刻，超过 TTL 即视为缺失并在下次 ensure 重拉。
+// 恢复可见时把已缓存条目标记为陈旧（见下方 visibilitychange 绑定）。
+const SHARED_ENTRIES_TTL_MS = 60_000
+const sharedEntriesLoadedAt = new Map<number, number>()
 // 缓存代际。invalidate 递增代际，在途 loader 落地时校验代际——
 // 写动作后旧请求的返回值不得回填缓存（否则后续 ensure 命中失效前的旧条目）。
 let entriesCacheGeneration = 0
@@ -1166,11 +1174,19 @@ export const subscribeSharedEntriesCache = (fn: EntriesCacheListener): (() => vo
 }
 const inflightEntries = new Map<number, { generation: number; promise: Promise<void> }>()
 
+/** 该 id 的缓存值是否仍在 TTL 内（无加载时刻=陈旧，按缺失重取）。 */
+const isSharedEntryFresh = (id: number): boolean => {
+  if (!(id in sharedEntriesCache)) return false
+  const loadedAt = sharedEntriesLoadedAt.get(id)
+  return loadedAt !== undefined && Date.now() - loadedAt < SHARED_ENTRIES_TTL_MS
+}
+
 /** 写入单名单条目并通知订阅者（加载完成/IP 处置后回写共用）。
  *  模块内私有——缓存写只允许经 loadSharedEntry / invalidate 路径，
  *  外泄第二写入口会绕开代际守卫（零外部消费即去 export）。 */
 function writeSharedEntries(id: number, values: string[]): void {
   sharedEntriesCache[id] = values
+  sharedEntriesLoadedAt.set(id, Date.now())
   notifyEntriesCache()
 }
 
@@ -1200,10 +1216,11 @@ async function loadSharedEntry(id: number, loader: (id: number) => Promise<strin
 /**
  * 缺失条目的名单 id：`ensureSharedEntries` 对单名单失败保持「未缓存」而不抛出
  * （下次调用可重试），调用方据此把加载失败显性化——否则条目缺失会退化成
- * 「未命中名单」的业务结论。非正 id 与已缓存 id 均不计入。
+ * 「未命中名单」的业务结论。非正 id、已缓存且在 TTL 内的 id 均不计入；
+ * 超过 TTL 的缓存按缺失处理（外部变更不经本页写入失效，必须按期重拉）。
  */
 export const missingSharedEntryIds = (ids: Iterable<number>): number[] =>
-  [...new Set(ids)].filter((id) => id > 0 && !(id in sharedEntriesCache))
+  [...new Set(ids)].filter((id) => id > 0 && !isSharedEntryFresh(id))
 
 /**
  * 按需补齐名单条目：只对「不在缓存」的 id 发请求，
@@ -1224,12 +1241,19 @@ export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: nu
   if (todo.length === 0) return
   const generation = entriesCacheGeneration
   await Promise.all(todo.map(async (id) => {
+    // 过期缓存先丢弃（不发通知）：失败后该 id 回到「未缓存」，调用方的失败
+    // 判定（missingSharedEntryIds）与既有的「失败不缓存」契约才能成立；
+    // 成功后 writeSharedEntries 立刻回填并通知。
+    if (id in sharedEntriesCache) {
+      delete sharedEntriesCache[id]
+      sharedEntriesLoadedAt.delete(id)
+    }
     const existing = inflightEntries.get(id)
     if (existing && existing.generation === generation) {
       await existing.promise
       // 等待期间发生写动作：复用的结果被代际守卫丢弃，本调用方不会自行重取，
       // 必须在此按新代际补取一次——否则「await 返回即已缓存」契约断裂。
-      if (!(id in sharedEntriesCache) && entriesCacheGeneration !== generation) {
+      if (!isSharedEntryFresh(id) && entriesCacheGeneration !== generation) {
         await loadSharedEntry(id, loader)
       }
       return
@@ -1241,8 +1265,26 @@ export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: nu
 export const invalidateSharedEntriesCache = (): void => {
   entriesCacheGeneration++
   for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
+  sharedEntriesLoadedAt.clear()
   cidrParseCache.clear()
   notifyEntriesCache()
+}
+
+/**
+ * 把已缓存条目标记为陈旧（保留值、不通知订阅者）：恢复可见时调用——期间他页
+ * /他人可能已增删条目，但正在展示的弹框不应突然变成「空名单」（那会把未命中
+ * 渲染成业务结论）。下次 `ensureSharedEntries` 按 TTL 判定重拉。
+ */
+const markSharedEntriesStale = (): void => {
+  sharedEntriesLoadedAt.clear()
+}
+
+// 跨标签页/外部变更的可见性入口：不可轮询，只能在「离开后回来」时感知。
+// 与 stores/auth 的 visible 补查同范式（单次绑定；node 单测无 document 时跳过）。
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) markSharedEntriesStale()
+  })
 }
 
 /**
@@ -1295,6 +1337,27 @@ export const SECURITY_BULK_LIMITS = { policyBindings: 100, ruleBlockPages: 500 }
 // SecurityBindingEditor（规则侧计数/选择器上限）与 SecurityPolicies（向导
 // 冲突检测注释/夹紧）共用，前两份本地常量各写一遍，后端调整时易漏改。
 export const MAX_POLICIES_PER_RULE = 8
+
+/** 绑定行的最小形状（策略类型由策略摘要推断，精简载荷缺摘要时回退限流标志）。 */
+export interface PolicyBindingRef {
+  policy_id: number
+  rate_limit_enabled?: boolean
+}
+
+/**
+ * 每条规则最多绑定一条限流策略——后端 bulk 端点对冲突整批 400（不是逐条跳过），
+ * 故所有选择/提交入口都必须在发送前用本谓词置灰或拦截。
+ * 返回该规则是否已绑定「本策略之外」的限流策略；`typeOf` 由调用方用
+ * inferPolicyType 建表（与后端 policy_type 列同口径），摘要缺失时回退绑定的
+ * rate_limit_enabled 标志。
+ */
+export const hasOtherStage2Binding = (
+  bindings: readonly PolicyBindingRef[],
+  selfPolicyId: number | null,
+  typeOf: (policyId: number) => SecurityPolicyType | undefined,
+): boolean => bindings.some((binding) =>
+  binding.policy_id !== selfPolicyId
+  && (typeOf(binding.policy_id) ?? (binding.rate_limit_enabled ? 'stage2' : 'stage3')) === 'stage2')
 
 /** 按单次上限切分待提交项（顺序保持；空数组→空切分）。 */
 export function chunkForBulk<T>(items: readonly T[], limit: number): T[][] {

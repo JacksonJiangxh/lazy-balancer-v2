@@ -153,8 +153,8 @@ type CertJobsSnapshot struct {
 // enqueue compensation.
 func SnapshotCertJobsForRule(ruleID string) (CertJobsSnapshot, error) {
 	snapshot := CertJobsSnapshot{ruleID: ruleID, preserved: make(map[int]struct{})}
-	rows, err := db.DB.Query(`SELECT id,rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,
-		renewal_attempts,ca_available_after,last_error_code,deployment_attempts,deployment_available_after,created_at,updated_at
+	rows, err := db.DB.Query(`SELECT id,rule_id,domain,status,message,expires_at,cert_pem,key_pem,COALESCE(ca_provider_id,0),
+		COALESCE(renewal_attempts,0),ca_available_after,last_error_code,COALESCE(deployment_attempts,0),deployment_available_after,created_at,updated_at
 		FROM cert_jobs WHERE rule_id=? ORDER BY id`, ruleID)
 	if err != nil {
 		return CertJobsSnapshot{}, fmt.Errorf("query certificate job snapshot: %w", err)
@@ -1382,7 +1382,7 @@ func (s *CertificateService) requeueWaitingCAJobs() (requeued, disabled int, err
 
 	// 与孤儿 sweep 同口径：规则删除/迁移/停用后的 waiting_ca 任务不得重排签发。
 	rows, err := db.DB.Query(`
-		SELECT j.id, j.rule_id, COALESCE(j.domain,''), j.ca_provider_id,
+		SELECT j.id, j.rule_id, COALESCE(j.domain,''), COALESCE(j.ca_provider_id,0),
 		       COALESCE(r.domain,''),
 		       CASE WHEN r.caddy_id IS NOT NULL AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' THEN 1 ELSE 0 END
 		FROM cert_jobs j
@@ -1454,8 +1454,11 @@ func (s *CertificateService) requeueWaitingCAJobs() (requeued, disabled int, err
 		requeued++
 		RecordAuditLog("system", "重新排队", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("ca_cooldown")), "")
 	}
+	// 单行读取失败只跳过该行（下方 summary 留痕）：升级为整轮失败会让 30s
+	// 补扫任务记 failed 终态，而同一轮其余可处置行本应照常重排——下一轮补扫
+	// 会重试被跳过的行。可空整型列已在查询侧 COALESCE，NULL 不再触发本分支。
 	if scanFailures > 0 {
-		err = fmt.Errorf("CA 冷却任务扫描有 %d 行读取失败（结果不可信）", scanFailures)
+		Logf("warn", "waiting_ca scan: %d 行读取失败已跳过，其余行照常处置", scanFailures)
 	}
 	return requeued, disabled, err
 }
@@ -1570,7 +1573,7 @@ func RequeueNonTerminalCertJobs() error {
 
 func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, issuedCertificate, time.Duration) error) error {
 	rows, err := db.DB.QueryContext(ctx, `
-		SELECT j.id, j.rule_id, j.domain, j.status, j.ca_provider_id, COALESCE(j.deployment_attempts,0), j.deployment_available_after,
+		SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0), j.deployment_available_after,
 		       COALESCE(r.domain,''), CASE WHEN r.caddy_id IS NOT NULL AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' THEN 1 ELSE 0 END,
 		       CASE WHEN `+CertJobMaterialPredicateSQL("j")+` THEN 1 ELSE 0 END
 		FROM cert_jobs j
@@ -2556,7 +2559,7 @@ func (s *CertificateService) CheckExpiration() ([]models.CertJob, int, error) {
 	// scanRenewalCandidates 会按 PEM 的真实 NotAfter 跳过仍在窗口外的证书；
 	// 临期或材料缺失的行则进入续期，不再因 NULL 永久失联。
 	rows, err := db.DB.Query(`
-		SELECT j.id, j.rule_id, j.domain, j.status, j.expires_at, j.ca_provider_id, COALESCE(j.renewal_attempts,0), j.ca_available_after, COALESCE(j.last_error_code,''),r.domain
+		SELECT j.id, j.rule_id, j.domain, j.status, j.expires_at, COALESCE(j.ca_provider_id,0), COALESCE(j.renewal_attempts,0), j.ca_available_after, COALESCE(j.last_error_code,''),r.domain
 		FROM cert_jobs j
 		JOIN lb_rules r ON r.caddy_id=j.rule_id
 		WHERE (
@@ -2594,7 +2597,7 @@ func (s *CertificateService) checkFailedFirstIssuance(maxAttempts int) ([]models
 	days := GetCertRenewalDays()
 
 	rows, err := db.DB.Query(`
-		SELECT j.id, j.rule_id, j.domain, j.status, j.expires_at, j.ca_provider_id, COALESCE(j.renewal_attempts,0), j.ca_available_after, COALESCE(j.last_error_code,''),r.domain
+		SELECT j.id, j.rule_id, j.domain, j.status, j.expires_at, COALESCE(j.ca_provider_id,0), COALESCE(j.renewal_attempts,0), j.ca_available_after, COALESCE(j.last_error_code,''),r.domain
 		FROM cert_jobs j
 		JOIN lb_rules r ON r.caddy_id=j.rule_id
 		WHERE j.status = 'failed'

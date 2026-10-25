@@ -231,13 +231,13 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				}
 				entries[id] = vals
 			} else {
-				// 自定义列表：读 DB entries JSON
-				var list []models.IPListEntry
-				if err := json.Unmarshal([]byte(raw), &list); err != nil {
+				// 自定义列表：读 DB entries JSON（解析判定与摘要单源）
+				list, perr := parseIPListEntriesStrict(raw)
+				if perr != nil {
 					// 畸形自定义名单必须进入 failedIDs：引用策略走严格跳过，
 					// 不得以缺内容的合并集静默收窄防护；不向全局 firstErr 上抛，
 					// 避免未引用该名单的渲染被无关脏行整体阻断。
-					Logf("error", "渲染: 自定义 IP 列表(id=%d) entries 解析失败（引用策略将跳过渲染）: %v", id, err)
+					Logf("error", "渲染: 自定义 IP 列表(id=%d) entries 解析失败（引用策略将跳过渲染）: %v", id, perr)
 					failed[id] = true
 					continue
 				}
@@ -282,6 +282,38 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 		return entries, failed, firstErr
 	}
 	return entries, failed, nil
+}
+
+// parseIPListEntriesStrict 解析自定义名单的 entries 列（渲染与摘要共用的
+// 「装载失败」判定单源）：只有 JSON 解析错误算失败——null 与 [] 同为合法
+// 空集（渲染按空集合继续发射，摘要必须同判，否则同一条名单在列表里显示
+// 「缺失」而实际按空集生效）。
+func parseIPListEntriesStrict(raw string) ([]models.IPListEntry, error) {
+	var list []models.IPListEntry
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// usableThreatTextEntries 剔除威胁名单文本里不可解析的行并留痕（与下载解析
+// 只收合法行的口径对齐）。文本分支此前把坏行原样交给聚合与 @ipListFast 投影：
+// 严格解析遇坏行整份失败（无缓存时 deny 方向按未命中=不拦；allow 否定算子
+// 则全拒），与下载/自愈路径「不可解析即丢弃」分叉。
+func usableThreatTextEntries(path string, vals []string) []string {
+	kept := make([]string, 0, len(vals))
+	dropped := 0
+	for _, v := range vals {
+		if _, err := wafiplist.ParseIPEntry(v); err != nil {
+			dropped++
+			continue
+		}
+		kept = append(kept, v)
+	}
+	if dropped > 0 {
+		Logf("warn", "威胁名单 %s 有 %d/%d 行不可解析，已从渲染集剔除（与下载解析同口径）", path, dropped, len(vals))
+	}
+	return kept
 }
 
 // threatTextParseRatio 文本可解析率（渲染侧口径）：与下载解析的
@@ -361,7 +393,7 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 			return nil, err
 		}
 		if threatTextParseRatioValue(vals) >= threatMinParseRatio {
-			return vals, nil
+			return usableThreatTextEntries(iplistPath, vals), nil
 		}
 		if fastErr == nil {
 			fastVals, fastReadErr := readFast()
@@ -398,7 +430,7 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 			}
 			if threatTextParseRatioValue(textVals) >= threatMinParseRatio {
 				Logf("warn", "威胁名单 %s 的 .fast 读取失败（回退 .iplist 文本）: %v", fastPath, err)
-				return textVals, nil
+				return usableThreatTextEntries(iplistPath, textVals), nil
 			}
 			parsed, total := threatTextParseRatio(textVals)
 			Logf("error", "威胁名单 %s 的 .fast 读取失败且文本可解析率 %d/%d 低于 50%%（引用策略将跳过渲染）: %v",
@@ -632,9 +664,9 @@ func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bo
 				presence[id] = len(vals) > 0
 				continue
 			}
-			var list []models.IPListEntry
-			if err := json.Unmarshal([]byte(raw), &list); err != nil || (list == nil && strings.TrimSpace(raw) != "[]") {
-				Logf("error", "摘要: 自定义 IP 列表(id=%d) entries 畸形（引用策略按装载失败处理）", id)
+			list, perr := parseIPListEntriesStrict(raw)
+			if perr != nil {
+				Logf("error", "摘要: 自定义 IP 列表(id=%d) entries 畸形（引用策略按装载失败处理）: %v", id, perr)
 				failed[id] = true
 				continue
 			}

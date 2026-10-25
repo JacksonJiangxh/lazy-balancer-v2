@@ -294,8 +294,10 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	// 崩溃窗口（文档级）：RemoveAll(rules) 与 moveTree 完成之间的进程崩溃会留下
 	// 缺失的 rules/ 与孤立的 rules.bak——刚安装的版本丢失，且 restoreBackup 只在
 	// 进程内错误路径执行、不会恢复。属小概率事件且可自愈：下次启动 SeedCRSRules
-	// 从 dist/快照重新播种（见 crsseed.go），影响面仅限 CRS 版本回退；孤立的
-	// .bak 也会在下次安装的 RemoveAll(rulesBak) 中被清理。不改行为，仅说明。
+	// 从 dist/快照重新播种（见 crsseed.go），影响面仅限 CRS 版本回退。
+	// 陈旧 .bak 不主动清理：它是崩溃现场的唯一恢复素材（见本函数前段），成功安装
+	// 时由 copyDirTransactional 的事务替换覆盖、成功路径末尾 os.RemoveAll(rulesBak)
+	// 删除；跨运行残留按崩溃现场保全。
 	// RemoveAll→overrides 写入的树交换段抽为 swapCRSTreeFromStaging，
 	// 在 wafFileMu 互斥段内执行（lbbak 导入 untarGzTo 交换同一棵树，交错产
 	// 混合/残缺 rules 树）；网络下载与 Caddy 重载在锁外。

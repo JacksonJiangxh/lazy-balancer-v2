@@ -37,6 +37,10 @@ test('弧线起点：中国精确到省，其他国家走质心，未知走兜�
   // [160, 15] = countryCentroids.FALLBACK_CENTROID（太平洋「海外」中心点）。
   assert.deepEqual(unknown, [160, 15])
   assert.deepEqual(arcOriginForLocation(''), [160, 15])
+  // 质心表是普通对象：原型键不得取出函数（后续 [0]/[1] 会变 undefined→NaN 弧线）
+  for (const key of ['constructor', 'toString', '__proto__']) {
+    assert.deepEqual(arcOriginForLocation(key), [160, 15], `${key} 必须走兜底质心`)
+  }
   assert.deepEqual(FALLBACK_CENTROID, [160, 15], '回退坐标变更需同步本用例（契约钉）')
 })
 

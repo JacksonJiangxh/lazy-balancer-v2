@@ -2,8 +2,10 @@ package handlers
 
 // 威胁大屏「活跃攻击源」计数缓存：近 10 分钟原始事件表按 client_ip 去重
 // （GROUP BY 全窗口扫描 + 逐行私网排除），大屏 30s 轮询下是重复的重查询。
-// 同窗口锚点（分钟）+ ≤10s TTL 复用结果；键含 since 锚点——窗口前移即新键，
-// 不会把旧窗口计数当当前窗口。失败不缓存（错误显式上抛由大屏整卡 500）。
+// 键取窗口起点的分钟锚点 + TTL 30s（与 30s 轮询同周期）：同一分钟内的重复
+// 请求复用结果，窗口跨分钟即换键。秒级入参在键上截到分钟——分钟内的窗口
+// 前移不换键（由 TTL 兜住陈旧上界）。失败不缓存（错误显式上抛由大屏整卡
+// 500）。
 
 import (
 	"database/sql"
@@ -13,9 +15,20 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// threatActiveSourcesCacheTTL 缓存有效期（≤10s：与活跃窗口的 10 分钟粒度相比
-// 陈旧上界可忽略；var 供测试缩短）。
-var threatActiveSourcesCacheTTL = 10 * time.Second
+// threatActiveSourcesCacheTTL 缓存有效期（30s，与安全总览/规则阶段统计缓存
+// 同族）：大屏 30s 轮询在同一窗口锚点内命中一次，热路径的 10 分钟窗口全扫
+// 不再每轮发生。var 供测试缩短/关闭。
+var threatActiveSourcesCacheTTL = 30 * time.Second
+
+// threatMinuteAnchor 把秒级/任意形态的窗口起点截到分钟锚点（缓存键口径）。
+// 小于 16 字符的异形值（带外写库/异形导入的 event_time）按原样返回，不得
+// 直接切片（[:16] 会 panic）。渲染侧与活跃源缓存共用本 helper。
+func threatMinuteAnchor(s string) string {
+	if len(s) > 16 {
+		return s[:16]
+	}
+	return s
+}
 
 type threatActiveSourcesKey struct {
 	metrics *sql.DB
@@ -42,10 +55,7 @@ func resetThreatActiveSourcesCacheForTest() {
 // threatActiveSourcesCount 返回窗口内非保留地址的去重源 IP 数（命中缓存时
 // 零查询）。activeSince 为窗口起点（UTC 墙钟串）。
 func threatActiveSourcesCount(metricsDB *sql.DB, activeSince string, now time.Time) (int, error) {
-	anchor := activeSince
-	if len(anchor) > 16 {
-		anchor = anchor[:16] // 分钟锚点（键与查询窗口同粒度语义）
-	}
+	anchor := threatMinuteAnchor(activeSince)
 	key := threatActiveSourcesKey{metrics: metricsDB, since: anchor}
 	if threatActiveSourcesCacheTTL > 0 {
 		threatActiveSourcesMu.Lock()

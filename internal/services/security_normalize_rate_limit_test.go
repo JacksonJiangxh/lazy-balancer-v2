@@ -8,8 +8,8 @@ import (
 )
 
 // 限流关停是保护面收窄，与 mode→off 同型：必须逐策略留痕（快照包含
-// rate_limit_enabled/rate_limit_rps 并产出变更记录），否则审计中心只剩一条
-// 「归一了 N 行」的计数，无法回答「哪条策略被关了限流」。
+// rate_limit_enabled；rate_limit_rps 只作关停判据、不被任何回填语句改写），
+// 否则审计中心只剩一条「归一了 N 行」的计数，无法回答「哪条策略被关了限流」。
 func TestSecurityEnumNormalizedChanges_reportsRateLimitShutdown(t *testing.T) {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
@@ -51,5 +51,12 @@ func TestSecurityEnumNormalizedChanges_reportsRateLimitShutdown(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("限流关停必须产出逐策略变更记录: %+v", changes)
+	}
+	// rps 列在同一事务内不被改写（只作关停判据）——「前快照==后回读」恒成立，
+	// 该比较项是不可达分支，不得出现在变更记录里。
+	for _, ch := range changes {
+		if ch.field == "rate_limit_rps" {
+			t.Fatalf("rate_limit_rps 不是归一目标，不得产出变更记录（不可达比较项）: %+v", changes)
+		}
 	}
 }

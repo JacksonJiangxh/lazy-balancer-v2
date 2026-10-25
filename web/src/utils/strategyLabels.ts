@@ -4,6 +4,8 @@
 // 死键 header 已删除（后端不接受该两形态）。
 // 映射对象收窄为模块内私有（外泄面只剩 getStrategyLabel 一个函数，
 // 消费方禁止绕过函数直读映射，防第二份映射/直改键值）
+import { hasOwn } from './hasOwn.ts'
+
 const strategyLabels: Record<string, string> = {
   weighted_round_robin: '轮询',
   least_conn: '最少连接',
@@ -13,7 +15,12 @@ const strategyLabels: Record<string, string> = {
   random: '随机',
 }
 
-export const getStrategyLabel = (strategy: string): string => strategyLabels[strategy] || strategy
+// 映射是普通对象且 strategy 可能来自导入/API（非向导白名单路径）：原型键直接
+// 下标会返回函数并绕过原词回退，规则列表/仪表盘会把函数源码当策略列渲染。
+export const getStrategyLabel = (strategy: string): string => {
+  const label = hasOwn(strategyLabels, strategy) ? strategyLabels[strategy] : undefined
+  return label || strategy
+}
 
 // ── 向导策略卡片与提交白名单单源 ──
 // 卡片可见集与 submitWizard 的 allowedStrategies 原各自维护：白名单放行了

@@ -10,6 +10,8 @@
 // 独立纯模块而非留在视图 SFC 内：上限/回落语义可由 node --test 直接求值，
 // 不依赖「函数文本里出现某常量」的源码钉。
 
+import { hasOwn } from './hasOwn.ts'
+
 export const MAX_LOG_STAT_KEYS = 500
 export const OTHER_LOG_STAT_KEY = '其他'
 
@@ -37,7 +39,7 @@ export const createLogStatBuckets = (): LogStatBuckets => ({
  */
 export const incrementCappedStat = (buckets: LogStatBuckets, bucket: LogStatBucket, key: string): void => {
   const map = buckets[bucket]
-  if (Object.prototype.hasOwnProperty.call(map, key)) {
+  if (hasOwn(map, key)) {
     map[key] += 1
     return
   }

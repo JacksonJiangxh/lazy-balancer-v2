@@ -196,6 +196,8 @@ const fetchLogs = async () => {
     const nextTotal = res.data?.total || 0
     const maxPage = Math.max(1, Math.ceil(nextTotal / targetPageSize))
     if (targetPage > maxPage) {
+      // 夹紧后显式重取：el-pagination 只在其内部写入页码时发 current-change
+      //（外部 v-model 赋值不触发），故不会产生同参数的第二条请求。
       page.value = maxPage
       void fetchLogs()
       return
@@ -231,7 +233,7 @@ onMounted(() => {
 .operator-email { font-size: 11.5px; color: var(--el-text-color-secondary); }
 
 .filter-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
-.polling-error-alert { margin-bottom: 16px; }
+/* .polling-error-alert 已收敛 main.css（三处 scoped 逐字重复删除） */
 .filter-actions { display: flex; gap: 0; margin-left: 8px; }
 .filter-actions .el-button + .el-button { margin-left: 8px; }
 

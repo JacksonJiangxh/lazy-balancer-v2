@@ -10,6 +10,8 @@
 //      →warning，含「成功/完成」→success（按此优先级，先命中先生效）。
 // 例外表与派生都未命中 → info + console.warn 一次（去重），词表漂移显性化。
 
+import { hasOwn } from './hasOwn.ts'
+
 type AuditActionTone = 'success' | 'danger' | 'warning' | 'info'
 
 // 精确命中优先于关键词派生。仅收录「派生结果不正确」或「不含任何关键词」的词。
@@ -108,8 +110,8 @@ const warnedUnknownActions = new Set<string>()
 export const actionTagType = (action: string): AuditActionTone => {
   // 例外表是普通对象：直接下标会把原型链上的键（'constructor'/'toString'/
   // '__proto__' 等后端词表异常值）当成命中，把函数当作色调返回。与
-  // utils/logStatCap 同一具名守卫（自有属性判定）。
-  const exception = Object.prototype.hasOwnProperty.call(ACTION_TONE_EXCEPTIONS, action)
+  // utils/logStatCap 同一具名守卫（utils/hasOwn 自有属性判定）。
+  const exception = hasOwn(ACTION_TONE_EXCEPTIONS, action)
     ? ACTION_TONE_EXCEPTIONS[action]
     : undefined
   if (exception) return exception

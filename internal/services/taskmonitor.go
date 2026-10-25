@@ -56,16 +56,21 @@ type TaskInfo struct {
 	LastRun               *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt             string       `json:"next_run_at,omitempty"`
 	// RetryCooldownSeconds 「运行/重试」按钮的剩余冷却秒数（无 omitempty：
-	// 0 是「现在即可重试」的语义，前端以本字段为唯一判据）。口径与证书任务
-	// 列表（/certificates/jobs 的 retry_cooldown_seconds）同源：
-	// services.CertJobRetryCooldownSecondsAt——证书行 waiting_ca 取 CA 退避
-	// 剩余秒、其余取任务退避（queued 15min/failed 5min/执行态 2min），缺失或
-	// 已到期为 0；非证书行恒 0（引擎族无证书重试冷却概念）。
-	RetryCooldownSeconds int64 `json:"retry_cooldown_seconds"`
-	Runs24h              int   `json:"runs_24h"`
-	Success24h           int   `json:"success_24h"`
-	Fail24h              int   `json:"fail_24h"`
+	// 0 是「现在即可重试」的语义，前端以本字段为唯一判据；null=该状态永久不可
+	// 重试，前端按 triggerable 呈现禁用态）。口径与证书任务列表
+	// （/certificates/jobs 的 retry_cooldown_seconds）同源：
+	// services.CertJobRetryRemainingSeconds——证书行下发「此刻剩余秒」（通用退避
+	// 按 updated_at 起算扣减，waiting_ca 取 CA 退避到期时刻），非证书行恒 0
+	// （引擎族无证书重试冷却概念）。
+	RetryCooldownSeconds *int64 `json:"retry_cooldown_seconds"`
+	Runs24h              int    `json:"runs_24h"`
+	Success24h           int    `json:"success_24h"`
+	Fail24h              int    `json:"fail_24h"`
 }
+
+// zeroRetryCooldown 是非证书任务行的统一下发值：引擎族没有证书重试冷却，
+// 0 = 「现在即可运行」。包级只读指针避免逐行分配。
+var zeroRetryCooldown = func() *int64 { seconds := int64(0); return &seconds }()
 
 // TaskRunInfo 最近一次运行。
 type TaskRunInfo struct {
@@ -188,14 +193,23 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 				Trigger: "queue", Result: status, Message: message},
 		}
 		ti.Runs24h, ti.Success24h, ti.Fail24h = runs24h, success, fail
-		// 「运行/重试」按钮的冷却：与证书任务列表同口径同源（0=无冷却）。
-		// waiting_ca 取 CA 退避剩余秒，其余取任务通用退避；ca_available_after
-		// 缺失/已到期自然得 0。双布局解析与槽解析单源。
-		var caWindow sql.NullTime
+		// 「运行/重试」按钮的冷却：与证书任务列表同口径同源——下发「此刻剩余
+		// 秒」（0=现在可重试；null=永久不可重试）。通用窗口按 updated_at 扣减
+		// （查询已 COALESCE 到 created_at），waiting_ca 取 CA 退避到期时刻。
+		// 双布局解析与槽解析单源。
+		var caWindow, updatedSlot, createdSlot sql.NullTime
 		if t := parseUTCSlot(caAvailableAfter); !t.IsZero() {
 			caWindow = sql.NullTime{Time: t, Valid: true}
 		}
-		ti.RetryCooldownSeconds = CertJobRetryCooldownSecondsAt(status, caWindow, time.Now())
+		if t := parseUTCSlot(updatedAt); !t.IsZero() {
+			updatedSlot = sql.NullTime{Time: t, Valid: true}
+		}
+		if t := parseUTCSlot(createdAt); !t.IsZero() {
+			createdSlot = sql.NullTime{Time: t, Valid: true}
+		}
+		if seconds, retryable := CertJobRetryRemainingSeconds(status, updatedSlot, createdSlot, caWindow, time.Now()); retryable {
+			ti.RetryCooldownSeconds = &seconds
+		}
 		ti.Status = TaskStatusIdle
 		switch status {
 		case "failed":
@@ -257,6 +271,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			LoopOn: m.LoopOn, BusinessDriven: IsBusinessDrivenTask(m.ID),
 			RoleApplicable:        m.RoleApplicable,
 			ScheduleStoppedReason: m.ScheduleStoppedReason,
+			// 引擎族没有证书重试冷却概念：恒 0（现在即可运行），不得留 null。
+			RetryCooldownSeconds: zeroRetryCooldown,
 		}
 		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
 		switch m.Kind {

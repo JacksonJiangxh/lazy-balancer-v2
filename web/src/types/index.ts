@@ -200,7 +200,7 @@ export type CertJobStatus =
   | 'waiting_ca'
   | 'disabled'
 
-export type CertJobCertificateStatus = 'expired' | 'expiring' | 'unknown' | 'valid'
+type CertJobCertificateStatus = 'expired' | 'expiring' | 'unknown' | 'valid'
 
 export interface CertJobListItem {
   id: number
@@ -222,6 +222,8 @@ export interface CertJobListItem {
   not_after?: string | null
   created_at?: string
   updated_at?: string | null
+  // 此刻剩余重试冷却（秒，向上取整）：0=现在即可重试，null=该状态永久不可重试。
+  // 后端已按 updated_at 起算扣减，前端只判 ≤0，不得再按 updated_at 二次扣减。
   retry_cooldown_seconds: number | null
 }
 

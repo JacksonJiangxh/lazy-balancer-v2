@@ -2351,6 +2351,13 @@ func TestEstimateAuditSnapshotBytes_isUpperBound(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		messagesCase.Messages_ = append(messagesCase.Messages_, mkMsg(64))
 	}
+	// HTML 安全字符在 JSON 里按 \u00XX 六字节转义：URI/body 用原始 len 估算
+	// 会低估至多 6×（攻击者构造 &&&… 即可让单条实际驻留突破预算）。
+	escapeHeavy := envelope()
+	escapeHeavy.Transaction_.Request_.URI_ = "/" + strings.Repeat("&", 4000)
+	escapeHeavy.Transaction_.Request_.Body_ = strings.Repeat("<>", 2000)
+	escapeHeavy.Transaction_.Response_.Body_ = strings.Repeat("&", 4000)
+	escapeHeavy.Messages_ = append(escapeHeavy.Messages_, mkMsg(0))
 
 	cases := []struct {
 		name string
@@ -2359,6 +2366,7 @@ func TestEstimateAuditSnapshotBytes_isUpperBound(t *testing.T) {
 		{"header 密集", &headerHeavy},
 		{"上传文件", &filesCase},
 		{"多 messages", &messagesCase},
+		{"HTML 转义密集", &escapeHeavy},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

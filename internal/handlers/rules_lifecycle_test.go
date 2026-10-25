@@ -613,7 +613,7 @@ func TestUpdateRule_auditsCertJobReadFailureAfterCommit(t *testing.T) {
 // 提交后失败审计 结构钉：五端点提交后失败分支的审计留痕数量下限（提交失败/入队
 // 失败路径无法在 handler 层注入 DB commit 故障，按源码分支计数）。
 // 注意：这是「最低数量」而非充分条件——新增/漏记分支可能不在计数覆盖面内，
-// 分支集合等价由 TestRulePostCommitFailureBranches_allAudited 承担。
+// 分支集合等价由 TestRuleWriteFailureBranches_allAudited 承担。
 func TestRuleFailurePathAudits_pinAllPostCommitBranches(t *testing.T) {
 	src, err := os.ReadFile("rules.go")
 	if err != nil {
@@ -639,43 +639,69 @@ func TestRuleFailurePathAudits_pinAllPostCommitBranches(t *testing.T) {
 }
 
 // 提交后失败审计 分支集合等价门（替代「数量下限」的充分性）：
-// 枚举五端点函数体内每个包含补偿调用（restoreACMEState / restoreEnabledState /
-// recoverCommittedViewAfterCommitFailure）的 if 块，断言块内存在留痕调用
-// ——直接 recordAudit，或经 fail* 闭包（闭包本体含 recordAudit）。
-// 任何新增补偿分支若无留痕立即变红，不依赖计数阈值。
-func TestRulePostCommitFailureBranches_allAudited(t *testing.T) {
+// 枚举五端点函数体内**每一个 5xx 响应**（writeInternalError / c.JSON 5xx），
+// 断言其执行路径上存在留痕调用——同一块内前序的直呼 recordAudit /
+// recordRuleWriteFailure，或经由 fail* 闭包（闭包本体含 recordAudit），或
+// 外层块的同一判据。此前只枚举「含补偿调用的 if 块」，补偿之前的失败
+// （读取/校验/证书文件清理…）全部落在覆盖面外。任何新增 5xx 分支若无留痕
+// 立即变红，不依赖计数阈值。
+func TestRuleWriteFailureBranches_allAudited(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "rules.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse rules.go: %v", err)
 	}
-	compensators := map[string]bool{
-		"restoreACMEState":                       true,
-		"restoreEnabledState":                    true,
-		"recoverCommittedViewAfterCommitFailure": true,
+	callName := func(call *ast.CallExpr) string {
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			return fun.Name
+		case *ast.SelectorExpr:
+			return fun.Sel.Name
+		}
+		return ""
 	}
-	calledNames := func(node ast.Node) []string {
-		var names []string
-		ast.Inspect(node, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
+	// 5xx 响应写点：统一写点与就地 c.JSON(500/502/…) 两种形态。
+	isServerErrorResponse := func(call *ast.CallExpr) bool {
+		switch callName(call) {
+		case "writeInternalError":
+			return true
+		case "JSON":
+			if len(call.Args) == 0 {
+				return false
 			}
-			switch fun := call.Fun.(type) {
-			case *ast.Ident:
-				names = append(names, fun.Name)
+			switch status := call.Args[0].(type) {
+			case *ast.BasicLit:
+				return status.Kind == token.INT && strings.HasPrefix(status.Value, "5")
 			case *ast.SelectorExpr:
-				names = append(names, fun.Sel.Name)
+				switch status.Sel.Name {
+				case "StatusInternalServerError", "StatusBadGateway", "StatusServiceUnavailable", "StatusGatewayTimeout":
+					return true
+				}
+			}
+		}
+		return false
+	}
+	// 仅收集本层语句内的 5xx（遇到嵌套块即止——嵌套块由下一层按同一判据评估，
+	// 避免外层「有审计」错误地赦免内层新增的无审计分支）。
+	directServerErrorCalls := func(stmt ast.Stmt) []*ast.CallExpr {
+		var calls []*ast.CallExpr
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if _, inner := n.(*ast.BlockStmt); inner {
+				return false
+			}
+			call, ok := n.(*ast.CallExpr)
+			if ok && isServerErrorResponse(call) {
+				calls = append(calls, call)
 			}
 			return true
 		})
-		return names
+		return calls
 	}
 	handlerFuncs := map[string]bool{
 		"CreateRule": true, "UpdateRule": true, "DeleteRule": true,
 		"DisableRule": true, "EnableRule": true,
 	}
-	audited := 0
+	checked := 0
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil || !handlerFuncs[fn.Name.Name] {
@@ -707,57 +733,66 @@ func TestRulePostCommitFailureBranches_allAudited(t *testing.T) {
 				return false
 			}
 			seen[name] = true
-			for _, called := range calledNames(body) {
+			var names []string
+			ast.Inspect(body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					names = append(names, callName(call))
+				}
+				return true
+			})
+			for _, called := range names {
 				if called == "recordAudit" || closureAudits(called, seen) {
 					return true
 				}
 			}
 			return false
 		}
-		// 闭包链上是否执行补偿（failEnable → failEnableWithStatus → restoreEnabledState
-		// / failUpdateWithStatus → restoreACMEState 等）。
-		var closureCompensates func(name string, seen map[string]bool) bool
-		closureCompensates = func(name string, seen map[string]bool) bool {
-			body, ok := closureBodies[name]
-			if !ok || seen[name] {
+		// 直呼留痕调用（非 if 分支内）：只有无条件执行才支配后续 5xx。
+		auditStatement := func(stmt ast.Stmt) bool {
+			expr, ok := stmt.(*ast.ExprStmt)
+			if !ok {
 				return false
 			}
-			seen[name] = true
-			for _, called := range calledNames(body) {
-				if compensators[called] || closureCompensates(called, seen) {
-					return true
-				}
+			call, ok := expr.X.(*ast.CallExpr)
+			if !ok {
+				return false
 			}
-			return false
+			name := callName(call)
+			return name == "recordAudit" || name == "recordRuleWriteFailure" || closureAudits(name, map[string]bool{})
 		}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			ifStmt, ok := n.(*ast.IfStmt)
-			if !ok || ifStmt.Body == nil {
-				return true
-			}
-			hasCompensation := false
-			for _, name := range calledNames(ifStmt.Body) {
-				if compensators[name] || (strings.HasPrefix(name, "fail") && closureCompensates(name, map[string]bool{})) {
-					hasCompensation = true
-					break
+		var walk func(block *ast.BlockStmt, auditPrefix []bool)
+		walk = func(block *ast.BlockStmt, auditPrefix []bool) {
+			audited := false
+			for _, stmt := range block.List {
+				covered := audited
+				for _, ancestorAudited := range auditPrefix {
+					covered = covered || ancestorAudited
 				}
-			}
-			if !hasCompensation {
-				return true
-			}
-			audited++
-			for _, name := range calledNames(ifStmt.Body) {
-				if name == "recordAudit" || closureAudits(name, map[string]bool{}) {
+				for _, call := range directServerErrorCalls(stmt) {
+					checked++
+					if !covered {
+						t.Errorf("%s: 5xx 响应缺少留痕（同块前序无审计，外层块的审计也不支配该分支）@ %s",
+							fn.Name.Name, fset.Position(call.Pos()))
+					}
+				}
+				if auditStatement(stmt) {
+					audited = true
+				}
+				// 进入嵌套块时携带「截至该语句之前的无条件审计」状态。
+				prefix := append(append([]bool{}, auditPrefix...), audited)
+				ast.Inspect(stmt, func(n ast.Node) bool {
+					if child, ok := n.(*ast.BlockStmt); ok {
+						walk(child, prefix)
+						return false
+					}
 					return true
-				}
+				})
 			}
-			t.Errorf("%s: 补偿分支缺少留痕（块内无 recordAudit，且 fail* 闭包链上也未落审计）@ %s",
-				fn.Name.Name, fset.Position(ifStmt.Pos()))
-			return true
-		})
+		}
+		walk(fn.Body, nil)
 	}
-	if audited == 0 {
-		t.Fatal("未枚举到任何补偿分支——AST 锚点漂移（分支集合等价门失效）")
+	if checked == 0 {
+		t.Fatal("未枚举到任何 5xx 响应——AST 锚点漂移（分支集合等价门失效）")
 	}
 }
 

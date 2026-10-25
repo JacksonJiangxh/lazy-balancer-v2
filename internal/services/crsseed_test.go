@@ -426,3 +426,12 @@ func TestReconcileCRSState_skipsSnapshotRebuildForBundledLive(t *testing.T) {
 		t.Fatalf("bundled live 不应重建快照: stat err=%v", err)
 	}
 }
+
+// restoreCRSFromSnapshot 仅供测试的加锁包装：生产路径统一走
+// ReconcileCRSState 持 wafFileMu 后调用 restoreCRSFromSnapshotInLock，
+// 生产代码不得再导出「自加锁」的第二套恢复入口。
+func restoreCRSFromSnapshot(liveDir, snapshotDir, version string) error {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	return restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version)
+}

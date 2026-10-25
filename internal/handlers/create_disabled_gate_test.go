@@ -114,3 +114,39 @@ func TestCreateRule_disabled_create_skips_conflict_gates(t *testing.T) {
 		}
 	})
 }
+
+// 「跟随默认」CA 提供商解析不到任何启用提供商（管理端删除/禁用全部 CA）
+// 是可修复的配置状态，必须是 400 + 可操作文案，而不是 500 服务器故障——
+// 后者会让用户以为服务损坏且刷新页面后无任何持久痕迹。
+func TestCreateRule_acmeDnsWithoutEnabledCAProviderIsBadRequest(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+
+	if _, err := db.DB.Exec(`UPDATE ca_providers SET enabled = 0`); err != nil {
+		t.Fatalf("disable ca providers: %v", err)
+	}
+	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('dns','dnspod','{"token":"x"}',1)`)
+	if err != nil {
+		t.Fatalf("seed certificate config: %v", err)
+	}
+	dnsConfigID, err := dnsResult.LastInsertId()
+	if err != nil {
+		t.Fatalf("certificate config id: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"name":"no-ca","protocol":"http","domain":"no-ca.example.test","listen_port":18443,"enabled":true,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（无可用 CA 提供商是可修复配置状态）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "没有可用的 CA 提供商") {
+		t.Fatalf("文案必须给出可操作指引: %s", response.Body.String())
+	}
+}

@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // replaceBusinessTaskDrivers 用可控驱动清单替换生产清单（测试结束恢复）。
@@ -97,6 +99,48 @@ func TestSyncBusinessTaskDrivers_pendingFollowsLastCompletedPass(t *testing.T) {
 	SyncBusinessTaskDrivers()
 	if businessDriverSyncPending.Load() {
 		t.Fatal("读恢复后的完整对齐必须清除重试标记")
+	}
+}
+
+// Given 业务驱动整轮对齐持有 businessDriverSyncMu（正在读实态）。
+// When 业务开关 setter 的应用段执行。
+// Then 必须等待互斥——否则交错后对齐会用旧态覆盖新态，留下「库已新、loop
+// 仍旧」且 pending=false（无重试纠正）的持久错态；释放互斥后 setter 立即生效。
+func TestBusinessTaskLoopSetterWaitsForDriverSync(t *testing.T) {
+	te := taskengine.NewEngine(taskengine.Options{TickInterval: time.Hour})
+	t.Cleanup(te.Stop)
+	te.Register(taskengine.Descriptor{ID: "threat", Family: "security", Name: "威胁情报库更新",
+		Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleAny,
+		NextSlotFn: func() time.Time { return time.Time{} },
+		Run:        func(taskengine.RunContext) error { return nil }})
+	previous := TaskEngine()
+	SetTaskEngineForTest(te)
+	t.Cleanup(func() { SetTaskEngineForTest(previous) })
+
+	businessDriverSyncMu.Lock()
+	applied := make(chan struct{})
+	go func() {
+		applyBusinessTaskLoop("threat", true)
+		close(applied)
+	}()
+	select {
+	case <-applied:
+		businessDriverSyncMu.Unlock()
+		t.Fatal("setter 的应用段未等待 businessDriverSyncMu：与整轮对齐交错会写回旧态")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if m, ok := te.Lookup("threat"); !ok || m.LoopOn {
+		businessDriverSyncMu.Unlock()
+		t.Fatalf("互斥持有期间调度开关不得被应用: ok=%v loopOn=%v", ok, m.LoopOn)
+	}
+	businessDriverSyncMu.Unlock()
+	select {
+	case <-applied:
+	case <-time.After(2 * time.Second):
+		t.Fatal("释放互斥后 setter 未完成调度应用")
+	}
+	if m, ok := te.Lookup("threat"); !ok || !m.LoopOn {
+		t.Fatalf("setter 的调度开关未生效: ok=%v loopOn=%v", ok, m.LoopOn)
 	}
 }
 

@@ -5,7 +5,7 @@
 //
 // 框架无关（不依赖 Vue）：node --test 下用假 document/window 驱动真实代码。
 
-export interface VisibilityIntervalSpec {
+interface VisibilityIntervalSpec {
   /** 每个周期执行的回调 */
   tick: () => void
   /** 周期毫秒 */
@@ -14,18 +14,18 @@ export interface VisibilityIntervalSpec {
   immediate?: boolean
 }
 
-export interface VisibilityDocumentHost {
+interface VisibilityDocumentHost {
   readonly hidden: boolean
   addEventListener: (type: 'visibilitychange', listener: () => void) => void
   removeEventListener: (type: 'visibilitychange', listener: () => void) => void
 }
 
-export interface VisibilityWindowHost {
+interface VisibilityWindowHost {
   setInterval: (handler: () => void, timeout: number) => number
   clearInterval: (id: number) => void
 }
 
-export interface VisibilityIntervalsOptions {
+interface VisibilityIntervalsOptions {
   intervals: readonly VisibilityIntervalSpec[]
   /** 转入隐藏（含挂载即隐藏）：全部间隔停止后调用——释放采集租约/暂停渲染 */
   onHidden?: () => void

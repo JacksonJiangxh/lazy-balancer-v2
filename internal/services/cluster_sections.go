@@ -544,10 +544,12 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 	// recordAppliedSectionHashes 不写该列,版本冻结在开关关闭前,每版本
 	// bump 至多刷一条告警审计)。
 	// 判定顺序「便宜门在前」：开关关闭 → 快照带引用 → 版本去重（一次点查）
-	// → 最后才 wafFilesRefVersionLabelsDiffer（只读两个小版本文件；不用
-	// wafFilesRefDiffers 的整树哈希，见该函数注释）。同版本重放（重载失败补偿重拉）本应被去重直接
-	// 跳过，若先算哈希会白付一次全树哈希并阻塞三库更新器与 lbbak 导入文件相位。
-	// 语义不变：三个条件仍同时成立才告警（AND）。
+	// → 最后才 wafFilesRefVersionLabelsDiffer（只读两个小版本文件 + 逐源
+	// .fast 哈希；不用 wafFilesRefDiffers 的整树哈希，见该函数注释）。同版本
+	// 重放（重载失败补偿重拉）本应被去重直接跳过，若先算哈希会白付一次全树
+	// 哈希并阻塞三库更新器与 lbbak 导入文件相位。
+	// 语义不变：三个条件仍同时成立才告警（AND）；判据覆盖 CRS/IP2Region/
+	// 威胁库三段——同步开关关闭时任一被引用面更新都要留信号。
 	if !sk.disabled["security"] || snapshot.WafFiles == nil {
 		return
 	}
@@ -562,12 +564,13 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 	if lastWarnVersion >= snapshot.Version {
 		return
 	}
-	// 轻量比对（版本标签）替代整树哈希：本告警只回答「主节点安全数据是否
-	// 已更新」，开关开启时的内容级漂移检测仍由 wafFilesDrifted 的哈希口径承担。
+	// 轻量比对（版本标签 + 威胁 .fast 哈希）替代整树哈希：本告警只回答
+	// 「主节点安全数据是否已更新」，开关开启时的内容级漂移检测仍由
+	// wafFilesDrifted 的哈希口径承担。
 	if !wafFilesRefVersionLabelsDiffer(snapshot.WafFiles) {
 		return
 	}
-	RecordAuditLog("system", "同步警告", "集群同步", "检测到主节点 CRS/IP2Region 文件已更新（同步开关关闭），本地文件保持不变", "")
+	RecordAuditLog("system", "同步警告", "集群同步", "检测到主节点 CRS/IP2Region/威胁库文件已更新（同步开关关闭），本地文件保持不变", "")
 	// 告警后只推进去重版本(哈希不动——security 关闭时哈希列不被
 	// 消费),保证每版本 bump 至多一条告警。
 	if dbh != nil {

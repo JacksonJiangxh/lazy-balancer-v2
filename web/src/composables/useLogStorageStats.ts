@@ -2,7 +2,7 @@ import { ref, watch } from 'vue'
 import { request } from '@/utils/api'
 
 /** GET /logs/stats 的单行统计（服务端按 key 收窄后返回的条目）。 */
-export interface LogStorageInfo {
+interface LogStorageInfo {
   key: string
   name: string
   size_bytes: number
@@ -20,7 +20,7 @@ export interface LogStorageInfo {
   config_source: string
 }
 
-export interface LogStorageTarget {
+interface LogStorageTarget {
   /** 日志行键（后端统计口径的唯一标识）。 */
   logKey: string
   /** 按站点收窄的服务标识（Caddy 统计行传实例 id）。 */

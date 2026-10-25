@@ -29,7 +29,7 @@ func canonicalProvince(trimmed string) (name string, taiwanCity, known bool) {
 	if canonical, ok := provinceAliases[trimmed]; ok {
 		return canonical, false, true
 	}
-	if TaiwanCities[trimmed] {
+	if taiwanCities[trimmed] {
 		return "", true, true
 	}
 	return trimmed, false, false

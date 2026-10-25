@@ -2,6 +2,7 @@
 // 杜绝热力阶梯与点内判定算法双实现漂移（此前靠人工复制保持一致）。
 import { CHINA_PROVINCES } from './chinaProvinces.ts'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from './countryCentroids.ts'
+import { hasOwn } from './hasOwn.ts'
 import { parseIpLocation } from './ipLocationParts.ts'
 
 type Rgb = [number, number, number]
@@ -235,7 +236,8 @@ export function arcOriginForLocation(ipLocation: string): Centroid {
     const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
     if (pv) return [pv.centroid[0], pv.centroid[1]]
   }
-  return COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID
+  const centroid = hasOwn(COUNTRY_CENTROIDS, country) ? COUNTRY_CENTROIDS[country] : undefined
+  return centroid ?? FALLBACK_CENTROID
 }
 
 /** 中国领土口径：世界边界数据中 Taiwan 为独立条目，但威胁大屏按中国的一部分
@@ -250,7 +252,9 @@ export function normalizeCountryName(name: string): string {
  *  `COUNTRY_CENTROIDS[key] ?? FALLBACK` 且未归一（「台湾」落太平洋兜底点，
  *  与热力「计数并入中国」口径不一致）。 */
 export function trafficOriginForCountry(name: string): Centroid {
-  return COUNTRY_CENTROIDS[normalizeCountryName(name)] ?? FALLBACK_CENTROID
+  const country = normalizeCountryName(name)
+  const centroid = hasOwn(COUNTRY_CENTROIDS, country) ? COUNTRY_CENTROIDS[country] : undefined
+  return centroid ?? FALLBACK_CENTROID
 }
 
 /**

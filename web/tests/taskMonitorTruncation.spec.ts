@@ -11,7 +11,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, repoCode } from './_helpers.ts'
+import { code, repoCode, section } from './_helpers.ts'
 
 /** Go 侧上限常量声明；缺失时硬失败（不得回退到字面量）。 */
 const certJobRowsLimit = (): number => {
@@ -59,6 +59,24 @@ test('证书行运行按钮按剩余冷却禁用并给出等待提示', () => {
   // /system/tasks 对证书行下发剩余冷却秒数（0=可运行）；前端不得只靠后端 429。
   assert.match(page, /retry_cooldown_seconds\?: number/, 'TaskInfo 必须声明冷却字段')
   assert.match(page, /const runCooldownReason = \(row: TaskInfo\): string =>/, '必须单源计算冷却提示')
-  assert.match(page, /Math\.ceil\(seconds \/ 60\)/, '提示需换算为分钟')
-  assert.match(page, /Boolean\(runCooldownReason\(row\)\)/, '运行按钮 must 在冷却期禁用')
+  const helper = section(page, 'const runCooldownReason = (row: TaskInfo): string =>', '\nconst onTrigger')
+  assert.match(helper, /Math\.ceil\(seconds \/ 60\)/, '提示需换算为分钟')
+  assert.match(
+    helper,
+    /冷却中，约 \$\{Math\.ceil\(seconds \/ 60\)\} 分钟后可运行/,
+    '冷却提示文案必须说明还要等待多久',
+  )
+
+  // 运行按钮块：禁用态必须真正接线到冷却原因。只要求符号在页面任意位置出现时，
+  // 把 helper 从 :disabled 挪到 tooltip / v-if 仍为绿——冷却期按钮可点。
+  const actions = section(page, 'label="操作"', '</el-table-column>')
+  const runButton = section(actions, '<el-button\n                  link type="primary"', '>运行</el-button>')
+  const disabled = /:disabled="([^"]*)"/.exec(runButton)?.[1]
+  assert.ok(disabled, `运行按钮缺 :disabled 绑定: ${runButton}`)
+  assert.match(disabled, /Boolean\(runCooldownReason\(row\)\)/, `运行按钮禁用未接线冷却原因（现为 "${disabled}"）`)
+  assert.match(disabled, /row\.status === 'running'/, '运行中仍应禁用')
+
+  // tooltip 必须把冷却原因呈现给用户（禁用按钮 hover 是唯一解释面）。
+  const tooltip = section(actions, 'v-if="row.triggerable"', '</el-tooltip>')
+  assert.match(tooltip, /:content="runCooldownReason\(row\)"/, '冷却原因必须进 tooltip content')
 })

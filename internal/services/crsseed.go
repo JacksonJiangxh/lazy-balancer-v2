@@ -182,11 +182,14 @@ func healCRSSnapshotFromLiveInLock(liveDir, snapshotDir, version string) {
 
 // writeCRSVersionMarker records the on-disk CRS version under the live dir so
 // startup reconciliation can tell the disk version from the DB record.
+// 与同包其它持久化同口径（tmp+fsync+rename）：该文件是 planCRSReconcile 的
+// 权威输入，裸 os.WriteFile 的崩溃窗口会留下 0 字节/半截 VERSION，让下一次
+// 启动的对账基于错误版本选方向（回退快照或改写 DB 版本行）。
 func writeCRSVersionMarker(liveDir, version string) {
 	if version == "" {
 		return
 	}
-	if err := os.WriteFile(filepath.Join(liveDir, crsVersionFile), []byte(version+"\n"), 0644); err != nil {
+	if err := writeFileAtomicSynced(filepath.Join(liveDir, crsVersionFile), []byte(version+"\n"), 0644); err != nil {
 		Logf("error", "crs seed: failed to write version marker: %v", err)
 	}
 }
@@ -274,20 +277,11 @@ func planCRSReconcile(liveV, snapV, dbV, bundledV string, snapshotRulesExist, pr
 	return crsReconcilePlan{action: crsReconcileCorrectDB, dbVersion: liveV}
 }
 
-// restoreCRSFromSnapshot copies the persisted snapshot tree back over the
-// live dir (rules + setup + user override files) and refreshes the marker.
+// restoreCRSFromSnapshotInLock 是调用方已持 wafFileMu 的快照恢复实现（唯一
+// 生产入口是 ReconcileCRSState 的锁内路径；自加锁包装已移除——它会让读者
+// 误以为存在可与锁内路径并行的第二套恢复语义）。
 // 装入前先对快照执行与 seed/备份恢复同一棵探针门——退化快照（部分
 // rules + 完整 VERSION）拒绝恢复，调用方记录错误并保留 live 现场。
-func restoreCRSFromSnapshot(liveDir, snapshotDir, version string) error {
-	// 本函数已不再是「仅启动」路径（runConfigLoad 闭包可经
-	// startup:config-load 的 manual/caddy-restart 触发运行期执行）——树交换
-	// 必须与导出/导入文件相位互斥。
-	wafFileMu.Lock()
-	defer wafFileMu.Unlock()
-	return restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version)
-}
-
-// restoreCRSFromSnapshotInLock 是调用方已持 wafFileMu 的快照恢复实现。
 func restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version string) error {
 	if !crsRulesTreeIntact(filepath.Join(snapshotDir, "rules")) {
 		return fmt.Errorf("快照 rules 树不完整（缺失 %s），拒绝恢复", crsRulesProbeFile)

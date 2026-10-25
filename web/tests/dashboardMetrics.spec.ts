@@ -26,6 +26,27 @@ test('成功响应缺失某规则才标失败，已有指标保持可用', () =>
   })
 })
 
+test('指标表原型键不得把「无指标」判成「有指标」', () => {
+  // caddy_id 来自外部字符串：直接下标会把 Object.prototype 上的函数当成指标值，
+  // 采集失败列退化为 0（缺失不得呈现为有值）。
+  const protoRules = [
+    { caddy_id: 'constructor', enabled: true },
+    { caddy_id: 'toString', enabled: true },
+    { caddy_id: '__proto__', enabled: true },
+  ]
+  assert.deepEqual(Object.entries(buildRuleMetricsUnavailable(protoRules, {}, true)), [
+    ['constructor', true],
+    ['toString', true],
+    ['__proto__', true],
+  ])
+  // 键存在且值为 0 属真实指标（可用），只有 undefined/缺键才算采集失败
+  assert.deepEqual(Object.entries(buildRuleMetricsUnavailable(protoRules, { constructor: 0 }, true)), [
+    ['constructor', false],
+    ['toString', true],
+    ['__proto__', true],
+  ])
+})
+
 test('TCP 行指标 title 明示上游地址口径，HTTP 行/禁用/采集失败不受影响', () => {
   // TCP 行：口径明示 + 值括注
   const tcpTitle = ruleMetricCellTitle({ disabled: false, unavailable: false, tcp: true, value: '1,234' })

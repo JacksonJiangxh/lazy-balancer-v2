@@ -36,12 +36,19 @@ var provinceAliases = map[string]string{
 	"新疆": "新疆维吾尔自治区", "台湾": "台湾省",
 }
 
-// TaiwanCities 台湾地区在 xdb 中误置于省列的城市——归入台湾省城市集。
-// 只读：禁止修改（全局单份）。
-var TaiwanCities = map[string]bool{
+// taiwanCities 台湾地区在 xdb 中误置于省列的城市——归入台湾省城市集。
+// 只读：禁止修改（全局单份）；外部只经 IsTaiwanCity 消费。
+var taiwanCities = map[string]bool{
 	"台北市": true, "新北市": true, "台中市": true, "台南市": true, "高雄市": true,
 	"基隆市": true, "新竹市": true, "嘉义市": true, "新竹县": true, "彰化县": true,
 	"桃园市": true, "云林县": true, "苗栗县": true,
+}
+
+// IsTaiwanCity 报告 name 是否为「误置于省列的台湾城市」。
+// 树侧（region.go）与发射侧（services/caddygeoip）共用本判据——表本身不
+// 导出，包外无从改写（选项树与发射变量的一致性是城市级规则命中的前提）。
+func IsTaiwanCity(name string) bool {
+	return taiwanCities[name]
 }
 
 // cityPinyinFixes xdb 部分段的城市列为拼音/英文形态（v3.17.0 生产库

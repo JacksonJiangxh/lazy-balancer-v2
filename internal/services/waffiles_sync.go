@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"net/http"
@@ -564,12 +565,17 @@ func rewriteVersionIfMissingOrStale(path, tag string) error {
 	return writeFileAtomicSynced(path, []byte(tag), 0644)
 }
 
-// wafFilesRefVersionLabelsDiffer 是「同步开关关闭」告警专用轻量比对：只读
-// 两个小版本文件（CRS 的 VERSION / ip2region 的 .version），不打包整棵规则树。
-// 该告警只回答「主节点安全数据是否已更新」，主端 ref 的版本标签正取自同一对
-// 文件——整树 tar.gz+sha256 对此没有增量信息，且持 WafFileLock 数十至数百毫秒
-// 会与三库更新器/导入文件相位争锁。开关开启时的内容级漂移检测仍走
+// wafFilesRefVersionLabelsDiffer 是「同步开关关闭」告警专用轻量比对：CRS 只读
+// VERSION、ip2region 只读 .version，威胁库逐源读取紧凑的 .fast 并比对哈希
+// （16B 头 + 5B/v4 的二进制布局，量级与三库源行相当），不打包整棵规则树。
+// 该告警只回答「主节点安全数据是否已更新」，主端 ref 的版本标签与威胁哈希正取
+// 自同一组文件——整树 tar.gz+sha256 对此没有增量信息，且持 WafFileLock 数十至
+// 数百毫秒会与三库更新器/导入文件相位争锁。开关开启时的内容级漂移检测仍走
 // wafFilesRefDiffers 的哈希口径。
+// 威胁段不可省：同步开关关闭时仅威胁库更新也必须产生「同步警告」审计——
+// 版本标签只覆盖 CRS/xdb，第三段被引用面（threat-*.iplist.fast）由
+// threatFastFilesDiffer 单源承担。stat/mtime 签名跨节点复制后必然不同
+// （从端文件由 bundle 重建），会把「内容一致」误报成更新，故用内容哈希。
 func wafFilesRefVersionLabelsDiffer(r *models.ClusterWafFilesRef) bool {
 	if r == nil {
 		return false
@@ -591,6 +597,27 @@ func wafFilesRefVersionLabelsDiffer(r *models.ClusterWafFilesRef) bool {
 			tag = sanitizeBundleVersion(strings.TrimSpace(string(content)))
 		}
 		if tag != r.IP2RegionTag {
+			return true
+		}
+	}
+	return threatFastFilesDiffer(r.ThreatSha256s)
+}
+
+// threatFastFilesDiffer 逐源比对 ref 声明的 .fast 哈希与本地磁盘：两处比对
+// （内容级 wafFilesRefDiffers 与「同步开关关闭」轻量告警）共用同一份判据——
+// 此前轻量路径整段漏掉威胁面，而注释仍宣称「内容级检测仍在」。
+// want 为空=主端未声明威胁面（旧主端/无威胁文件），不可判定，不判分叉。
+// 调用方必须持 WafFileLock。
+func threatFastFilesDiffer(want map[string]string) bool {
+	if len(want) == 0 {
+		return false
+	}
+	local := scanThreatFastFiles()
+	if len(local) != len(want) {
+		return true
+	}
+	for source, sum := range want {
+		if local[source] != sum {
 			return true
 		}
 	}
@@ -621,19 +648,8 @@ func wafFilesRefDiffers(r *models.ClusterWafFilesRef) bool {
 		}
 	}
 	// 威胁库 .fast 也属于引用面：同步开关关闭时仅威胁库更新也必须产生
-	// “同步警告”审计。
-	if len(r.ThreatSha256s) > 0 {
-		local := scanThreatFastFiles()
-		if len(local) != len(r.ThreatSha256s) {
-			return true
-		}
-		for name, sum := range r.ThreatSha256s {
-			if local[name] != sum {
-				return true
-			}
-		}
-	}
-	return false
+	// “同步警告”审计（判据单源于 threatFastFilesDiffer，与轻量告警共用）。
+	return threatFastFilesDiffer(r.ThreatSha256s)
 }
 
 // wafFilesRefMatchesBundle verifies fetched content against the reference
@@ -705,6 +721,10 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 		liveSum, liveErr := tarGzDirSum(crsLiveDir)
 		if liveErr != nil || liveSum != bundle.CRSSha256 {
 			if err := untarGzTo(bundle.CRSTarGz, crsLiveDir, bundle.CRSSha256); err != nil {
+				// 失败路径也可能已改写 live 树：入口 .sync-bak 自愈（树被回滚）
+				// 或替换段的失败恢复都会换掉规则文件，规则数缓存必须同步失效，
+				// 否则面板 rule_count 与实际树长期分叉到进程重启。
+				InvalidateCRSRuleCount()
 				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("crs", fmt.Errorf("写入同步 CRS 规则文件: %w", err))
 			}
 			// VERSION 随 tar 包以原始字节落盘：不得以 TrimSpace 后的
@@ -820,6 +840,39 @@ func skipWafSyncTransient(rel string) bool {
 		}
 	}
 	return strings.HasSuffix(rel, ".bak") || strings.HasSuffix(rel, ".old")
+}
+
+// removeTransientWafSyncPaths 删除 staging 树内的瞬态命名路径（与
+// skipWafSyncTransient 同一谓词）：解包已拒绝包内瞬态条目，本函数只处理上一轮
+// 清理失败残留——不剔除则它们会随整树落 live，既不受声明哈希约束、也不参与
+// 后续漂移判定。
+//
+// 遍历失败（只读/权限异常的预置残骸）按「无法判定」跳过：残留目录本身会让
+// 随后的整树哈希/复制失败（同步以错误收场），此处不得把错误提前改写成
+// 「清理瞬态残留」而掩盖真实失败形态。
+func removeTransientWafSyncPaths(root string) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if path == root {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		if !skipWafSyncTransient(filepath.ToSlash(rel)) {
+			return nil
+		}
+		if d.IsDir() {
+			if rmErr := os.RemoveAll(path); rmErr != nil {
+				return rmErr
+			}
+			return filepath.SkipDir
+		}
+		return os.Remove(path)
+	})
 }
 
 // tarGzDir deterministically archives dir (all contents, sorted, zeroed
@@ -944,12 +997,12 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	staging := destDir + ".sync-in"
 	backup := destDir + ".sync-bak"
 	// 清理动作的错误不得静默（旧实现裸调用丢弃错误，只读/权限异常下残骸会
-	// 累积）。此处只告警不放弃本轮：残留可能被本轮解包「合并」进 staging，
-	// 但生产唯一调用方（ApplyWafFileBundle）恒定传入声明哈希，污染后的
-	// staging 在落 live 之前的 tarGzDirSum 门即被拒绝并恢复旧树——真正需要
-	// 保持的是「残留可观测」，而不是以放弃一轮同步为代价。
+	// 累积）。此处只告警不放弃本轮：残留若与本轮解包合并，非瞬态内容会被
+	// 整树哈希门拒绝，瞬态命名残留在落 live 前由 removeTransientWafSyncPaths
+	// 剔除（解包本身已拒绝包内瞬态条目）——真正需要保持的是「残留可观测」，
+	// 而不是以放弃一轮同步为代价。
 	if err := os.RemoveAll(staging); err != nil {
-		Logf("warn", "waf sync: 清理同步暂存目录 %s 失败（残留可能与本轮解包合并，哈希门会拒绝落盘）: %v", staging, err)
+		Logf("warn", "waf sync: 清理同步暂存目录 %s 失败（瞬态残留落 live 前会被剔除，非瞬态残留触发哈希门拒绝）: %v", staging, err)
 	}
 	// 入口残留自愈：成功路径在末尾删除 .sync-bak，故备份在场即上一次 apply
 	// 没有走完（SIGKILL/掉电落在「备份→替换 live」窗口）。此时 live 可能缺失、
@@ -1024,6 +1077,13 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 		if filepath.IsAbs(rel) || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") || rel == ".." {
 			return fmt.Errorf("同步包含非法路径 %q", hdr.Name)
 		}
+		// 瞬态命名（点前缀任意段、*.bak/*.old）与打包侧同一谓词拒绝：打包/整树
+		// 哈希/漂移判定都跳过这些路径，若允许解包写入，它们会进入 live 树却
+		// 不参与声明哈希与漂移检测（完整性门覆盖集 ≠ 打包集）。coraza 的
+		// Include glob 会匹配点前缀 .conf，等于绕开哈希门注入规则。
+		if skipWafSyncTransient(rel) {
+			return fmt.Errorf("同步包含瞬态路径 %q（点前缀/.bak/.old 不参与规则树同步），已拒绝落盘", hdr.Name)
+		}
 		if rel == "" || strings.HasSuffix(rel, "/") {
 			continue
 		}
@@ -1070,6 +1130,13 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	}
 	// Verify the extracted staging tree before touching the live tree.
 	// 失败路径的 staging 清理由入口 defer 负责（清理失败只告警）。
+	// 先剔除瞬态残留：解包已拒绝包内瞬态条目，但上一轮 RemoveAll 失败留下的
+	// 点前缀/*.bak/*.old 文件会被整树搬到 live——它们不参与 tarGzDir/hash 口径
+	// （增量过滤），却在 live 里可被 Include glob 匹配。剔除后保证
+	// 「哈希覆盖集 == 打包集 == live 集」。
+	if err := removeTransientWafSyncPaths(staging); err != nil {
+		return fmt.Errorf("清理同步暂存目录的瞬态残留: %w", err)
+	}
 	if expectSum != "" {
 		sum, sumErr := tarGzDirSum(staging)
 		if sumErr != nil {

@@ -1764,6 +1764,9 @@ func newAuditRuleHandlers(t *testing.T, failedLoads int32) (*Handlers, *atomic.I
 func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T) {
 	// Given：同一条规则上并发执行 Update/Delete/Create，旧锁序（DB 事务→caddyOpMu
 	// 与 caddyOpMu→DB 并存）会 AB-BA 循环等待；统一锁序后全部请求必须在超时内完成。
+	// Create 在导入窗口内会 409 fast-fail——先归因，避免前序用例的异步导入
+	// 把本用例伪装成锁序/业务回归。
+	assertNoConfigImportWindowLeak(t)
 	handler, _, _ := newAuditRuleHandlers(t, 0)
 	seedAuditRule(t, "lb_lockorder", "lock", "lock.example.test", 8080, true, "manual", false)
 	seedAuditUpstream(t, "lb_lockorder")

@@ -241,3 +241,20 @@ func splitTCPDeadFieldsSQL(t *testing.T, sqlText string) (cols []string, where s
 func normalizeSQLWhitespace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
+
+// TCP 策略空串（手造/旧版本备份）与 cookie 同归一为 DDL 默认策略：同一 TCP
+// 终态不得出现 ”/weighted_round_robin 两形态；HTTP 规则不受影响。
+func TestTCPDeadFieldReset_normalizesEmptyStrategy(t *testing.T) {
+	for _, input := range []string{"cookie", ""} {
+		strategy := input
+		tcpDeadFieldReset("tcp", tcpDeadFields{Strategy: &strategy})
+		if strategy != "weighted_round_robin" {
+			t.Fatalf("TCP strategy=%q 归一为 %q, want weighted_round_robin", input, strategy)
+		}
+	}
+	strategy := ""
+	tcpDeadFieldReset("http", tcpDeadFields{Strategy: &strategy})
+	if strategy != "" {
+		t.Fatalf("HTTP strategy 不得被 TCP 归一改写，got %q", strategy)
+	}
+}

@@ -13,7 +13,7 @@
 
 | 范围 | 说明 |
 |---|---|
-| 只读 Key（read_only） | 可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希、后者原始 Caddy 配置可能含内联私钥，二者对只读 Key 恒 403，tools/list 亦隐藏）及 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）；其余写工具返回 403（test_certificate_config 证书配置测试会写 DNS TXT 记录、test_ca_provider 缺 EAB 时会写 CA 凭据，只读 Key 均不可用） |
+| 只读 Key（read_only） | 可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希、后者原始 Caddy 配置可能含内联私钥，二者对只读 Key 恒 403，tools/list 亦隐藏）及 3 个读探测 POST 工具；其中 parse_certificate 对非管理员开放，validate_import/preview_config 需 Key 属主为管理员（属 admin 组路由，非管理员调用恒 403 且 tools/list 不展示）；其余写工具返回 403（test_certificate_config 证书配置测试会写 DNS TXT 记录、test_ca_provider 缺 EAB 时会写 CA 凭据，只读 Key 均不可用） |
 | 写工具（POST/PUT/DELETE） | 需非只读 Key，且 Key 属主须为 admin 角色（非管理员 Key 的 tools/list 已隐藏全部恒 403 工具：admin 组路由 + business 组未豁免只读白名单的写路由）；从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点 |
 | IP 白名单 | 配了白名单的 Key，请求来源 IP 必须命中（约束该 Key 的全部 REST 与 MCP 调用；MCP 内部转发不受影响） |
 | 生效方式 | 写操作校验后即时生效，失败自动回滚，无需手动 reload |
