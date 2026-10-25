@@ -312,8 +312,10 @@ const MIN_ENVELOPES: Record<(typeof SCAN_DIRS)[number], number> = {
   // failRestoreFileAccess 单源（净 -8）；②V1 导入 6 处事务前 400 收敛为
   // failImportValidation 单源（净 -6）；③自动备份访问族（编号/文件名非法、
   // 行不存在、查询失败）收敛为 failAutoBackupAccess 单源（净 -2）。
-  // 叠加上其它调用点增补后实测 1306。
-  'internal/handlers': 1306,
+  // ④登录里 MFA 标记的独立查询并入 db.UserRowColumns 单源用户查询
+  // （fail-closed 500 保留在同一查询的错误分支，净 -1）。
+  // 叠加上其它调用点增补后实测 1305。
+  'internal/handlers': 1305,
   'internal/middleware': 43,
 }
 

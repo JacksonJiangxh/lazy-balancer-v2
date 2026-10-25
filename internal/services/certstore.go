@@ -31,14 +31,56 @@ var certWriteMu sync.RWMutex
 
 // certRuleFileLocks 按 ruleID 串行化同一规则的 cert/key 文件操作
 // （内容比对→tmp→rename 序列不得与同规则并发写交错产生撕裂组合）。
-// 键空间=规则数，无需回收（与 certJobLogWriteLocks 同口径）。
-var certRuleFileLocks sync.Map
+// 条目在最后一个持有者释放后回收（见 refCountedLockTable）——键空间是
+// 「当前在途操作数」而非历史规则总数。
+var certRuleFileLocks refCountedLockTable
+
+// refCountedLockTable 是按 key 引用计数的互斥锁表。与「sync.Map + LoadOrStore
+// 只增不删」的旧形态不同，最后一个持有者释放后条目即回收：规则可反复创建/删除
+// （caddy_id 随机生成），只增不删的表会按历史规则总数线性增长。refs 在 Lock
+// 前置自增（含阻塞等待者），只要有人持有或等待条目就不会被回收——不会出现同
+// key 两把不同锁的并发窗口。
+type refCountedLockTable struct {
+	mu    sync.Mutex
+	locks sync.Map // key -> *refCountedLock
+}
+
+type refCountedLock struct {
+	table *refCountedLockTable
+	key   string
+	mu    sync.Mutex
+	refs  int
+}
+
+// get 返回 key 对应的锁条目（不存在则注册；不改变引用计数）。
+func (t *refCountedLockTable) get(key string) *refCountedLock {
+	value, _ := t.locks.LoadOrStore(key, &refCountedLock{table: t, key: key})
+	return value.(*refCountedLock)
+}
+
+// Lock 先登记引用再阻塞：refs 覆盖「持有 + 等待」全体，回收判定因此安全。
+// 表锁只在计数读写期间持有，不与条目锁嵌套（无锁序反转）。
+func (l *refCountedLock) Lock() {
+	l.table.mu.Lock()
+	l.refs++
+	l.table.mu.Unlock()
+	l.mu.Lock()
+}
+
+func (l *refCountedLock) Unlock() {
+	l.mu.Unlock()
+	l.table.mu.Lock()
+	l.refs--
+	if l.refs == 0 {
+		l.table.locks.Delete(l.key)
+	}
+	l.table.mu.Unlock()
+}
 
 // lockCertRuleFile 返回单规则的 per-rule 文件锁。调用方必须先持
 // certWriteMu.RLock（锁序：certWriteMu → per-rule，单向不逆）。
-func lockCertRuleFile(ruleID string) *sync.Mutex {
-	lock, _ := certRuleFileLocks.LoadOrStore(ruleID, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+func lockCertRuleFile(ruleID string) *refCountedLock {
+	return certRuleFileLocks.get(ruleID)
 }
 
 // lockCertRuleFiles 按序取多条规则的 per-rule 锁（排序+去重防死锁/自锁），
@@ -54,7 +96,7 @@ func lockCertRuleFiles(ruleIDs []string) func() {
 		unique = append(unique, ruleID)
 	}
 	sort.Strings(unique)
-	locks := make([]*sync.Mutex, 0, len(unique))
+	locks := make([]*refCountedLock, 0, len(unique))
 	for _, ruleID := range unique {
 		lock := lockCertRuleFile(ruleID)
 		lock.Lock()
@@ -67,33 +109,15 @@ func lockCertRuleFiles(ruleIDs []string) func() {
 	}
 }
 
-var certificateDeployLocks sync.Map
-var certificateDeployLocksMu sync.Mutex
-
-type certificateDeployLock struct {
-	mu   sync.Mutex
-	refs int
-}
+var certificateDeployLocks refCountedLockTable
 
 // DeployLock serializes the complete deployment and rollback transaction for
-// one rule while allowing unrelated rules to deploy concurrently.
+// one rule while allowing unrelated rules to deploy concurrently. 条目随最后
+// 持有者释放回收（refCountedLockTable），与 certRuleFileLocks 同一实现。
 func DeployLock(ruleID string) func() {
-	certificateDeployLocksMu.Lock()
-	value, _ := certificateDeployLocks.LoadOrStore(ruleID, &certificateDeployLock{})
-	lock := value.(*certificateDeployLock)
-	lock.refs++
-	certificateDeployLocksMu.Unlock()
-
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
-		certificateDeployLocksMu.Lock()
-		lock.refs--
-		if lock.refs == 0 {
-			certificateDeployLocks.Delete(ruleID)
-		}
-		certificateDeployLocksMu.Unlock()
-	}
+	lock := certificateDeployLocks.get(ruleID)
+	lock.Lock()
+	return lock.Unlock
 }
 
 type CertFileSnapshot struct {

@@ -2567,3 +2567,194 @@ func TestAuditTimingSegmentConstants_wireContract(t *testing.T) {
 		t.Fatalf("分段键=%q/%q, want pre/end（审计行 pre_us/end_us 字段语义）", timingSegmentPre, timingSegmentEnd)
 	}
 }
+
+// auxProbeAuditLog/auxProbeTx/auxProbeReq 是只携带 uri/body/files 的最小 AuditLog 实现
+// （客户端可控非体段上限单测）：嵌入 nil 接口补足不可命名的 Args() 等方法，
+// 其余访问器走本地值。
+type auxProbeAuditLog struct{ tx auxProbeTx }
+
+func (l auxProbeAuditLog) Parts() types.AuditLogParts { return nil }
+func (l auxProbeAuditLog) Transaction() plugintypes.AuditLogTransaction {
+	return l.tx
+}
+func (l auxProbeAuditLog) Messages() []plugintypes.AuditLogMessage { return nil }
+
+type auxProbeTx struct {
+	plugintypes.AuditLogTransaction
+	req auxProbeReq
+}
+
+func (t auxProbeTx) Timestamp() string                                 { return "" }
+func (t auxProbeTx) UnixTimestamp() int64                              { return 0 }
+func (t auxProbeTx) ID() string                                        { return "tx-aux-probe" }
+func (t auxProbeTx) ClientIP() string                                  { return "" }
+func (t auxProbeTx) ClientPort() int                                   { return 0 }
+func (t auxProbeTx) HostIP() string                                    { return "" }
+func (t auxProbeTx) HostPort() int                                     { return 0 }
+func (t auxProbeTx) ServerID() string                                  { return "" }
+func (t auxProbeTx) HighestSeverity() string                           { return "" }
+func (t auxProbeTx) IsInterrupted() bool                               { return false }
+func (t auxProbeTx) Request() plugintypes.AuditLogTransactionRequest   { return t.req }
+func (t auxProbeTx) Response() plugintypes.AuditLogTransactionResponse { return nil }
+func (t auxProbeTx) Producer() plugintypes.AuditLogTransactionProducer { return nil }
+
+type auxProbeReq struct {
+	plugintypes.AuditLogTransactionRequest
+	uri   string
+	body  string
+	files []plugintypes.AuditLogTransactionRequestFiles
+}
+
+func (r auxProbeReq) Method() string               { return "POST" }
+func (r auxProbeReq) Protocol() string             { return "HTTP/1.1" }
+func (r auxProbeReq) URI() string                  { return r.uri }
+func (r auxProbeReq) HTTPVersion() string          { return "HTTP/1.1" }
+func (r auxProbeReq) Headers() map[string][]string { return nil }
+func (r auxProbeReq) Body() string                 { return r.body }
+func (r auxProbeReq) Files() []plugintypes.AuditLogTransactionRequestFiles {
+	return r.files
+}
+func (r auxProbeReq) Length() int32 { return 0 }
+
+// 客户端可控的「非体段」（uri 与 multipart files[].name/mime）必须与体/头同门
+// 封顶且入估算：否则单个 90KiB 全 `&` 文件名（≈540KiB 转义）+ 64KiB 全 `&`
+// 体（384KiB）+ 超长 URI 即可把本行推过 auditItemMaxBytes——被丢弃的恰是
+// 「触发 WAF 的这次请求」自身的安全事件（事件列表/大屏/自动封禁全缺）。
+// 钉：封顶后事件入队零丢弃、files_dropped 显性披露、估算不低于实际序列化。
+func TestSnapshotAuditLog_clientControlledAuxSegmentsStayUnderItemCap(t *testing.T) {
+	dense := strings.Repeat("&", 90*1024)
+	files := make([]plugintypes.AuditLogTransactionRequestFiles, 0, 200)
+	for range 200 {
+		files = append(files, auditSnapshotFile{Name_: dense, Size_: 1, Mime_: dense})
+	}
+	bigURI := "/probe?" + strings.Repeat("&", 60*1024)
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{
+		uri:   bigURI,
+		body:  strings.Repeat("&", auditBodyMaxBytes),
+		files: files,
+	}}})
+	req := snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+
+	// 上限必须真实截断（不是靠估算漏算通过）。门槛写成字面量：用例要在
+	// 未修复基线上也能编译，从而红在断言上（而不是红在符号缺失）。
+	//   uri 8KiB 转义字节 / files 64 条 / 单字段 1KiB 转义字节 /
+	//   条目内容总预算 24KiB 转义字节
+	const (
+		uriCapEscaped   = 8 * 1024
+		filesMaxEntries = 64
+		fieldCapEscaped = 1024
+		filesCapEscaped = 24 * 1024
+		truncatedSuffix = "\n...[TRUNCATED]"
+	)
+	if got := len(req.URI_); got >= len(bigURI) {
+		t.Fatalf("URI 未截断：保留 %d 字节（原始 %d）", got, len(bigURI))
+	}
+	if got := jsonStringEscapedLen(req.URI_); got > uriCapEscaped+len(truncatedSuffix) {
+		t.Fatalf("URI 转义字节 %d 越过 %d 上限", got, uriCapEscaped)
+	}
+	if got := len(req.Files_); got > filesMaxEntries {
+		t.Fatalf("files 保留 %d 条 > 上限 %d", got, filesMaxEntries)
+	}
+	// 截断披露必须出现在 wire 契约上（files_dropped，omitempty）。
+	type filesWire struct {
+		Files []struct {
+			Name string `json:"name"`
+			Mime string `json:"mime"`
+		} `json:"files"`
+		FilesDropped int `json:"files_dropped"`
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire filesWire
+	if err := json.Unmarshal(rawReq, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.FilesDropped == 0 {
+		t.Fatal("files 截断必须显性披露 files_dropped")
+	}
+	var fileEscaped int64
+	for _, f := range req.Files_ {
+		if jsonStringEscapedLen(f.Name()) > fieldCapEscaped+len(truncatedSuffix) ||
+			jsonStringEscapedLen(f.Mime()) > fieldCapEscaped+len(truncatedSuffix) {
+			t.Fatalf("文件名/MIME 转义字节越过单字段上限：name=%d mime=%d",
+				jsonStringEscapedLen(f.Name()), jsonStringEscapedLen(f.Mime()))
+		}
+		fileEscaped += int64(jsonStringEscapedLen(f.Name()) + jsonStringEscapedLen(f.Mime()))
+	}
+	if fileEscaped > filesCapEscaped {
+		t.Fatalf("files 条目内容转义字节 %d > 总预算 %d", fileEscaped, filesCapEscaped)
+	}
+
+	// 估算口径仍是实际序列化的上界，且整条落在单条上限内。
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := estimateAuditSnapshotBytes(snap)
+	if size < int64(len(serialized)) {
+		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", size, len(serialized))
+	}
+	if size > auditItemMaxBytes {
+		t.Fatalf("估算 %d > 单条上限 %d（被构造的这次请求自身事件仍会被整行丢弃）", size, auditItemMaxBytes)
+	}
+
+	// 入队路径：本行必须留在事件里（dropped==0）。
+	p := &auditPipeline{
+		target: filepath.Join(t.TempDir(), "audit.log"),
+		queue:  make(chan lbAuditItem, 2),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"aux-dense"}`)}})
+	if dropped := p.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped=%d, want 0（客户端构造的超长文件名/URI 不得挤掉自身事件）", dropped)
+	}
+	if length := len(p.queue); length != 1 {
+		t.Fatalf("queue length=%d, want 1", length)
+	}
+}
+
+// 未超限形态必须原样保留（封顶只在越限时生效，不改写正常 uri/文件名）。
+func TestSnapshotAuditLog_auxSegmentsPassThroughWhenUnderCap(t *testing.T) {
+	files := []plugintypes.AuditLogTransactionRequestFiles{
+		auditSnapshotFile{Name_: "report.pdf", Size_: 1024, Mime_: "application/pdf"},
+	}
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{
+		uri: "/upload?x=1", files: files,
+	}}})
+	req := snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		URI   string `json:"uri"`
+		Files []struct {
+			Name string `json:"name"`
+			Mime string `json:"mime"`
+		} `json:"files"`
+		FilesDropped int `json:"files_dropped"`
+	}
+	if err := json.Unmarshal(rawReq, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.URI != "/upload?x=1" {
+		t.Fatalf("URI 被改写：%q", wire.URI)
+	}
+	if len(wire.Files) != 1 || wire.FilesDropped != 0 {
+		t.Fatalf("files=%d dropped=%d, want 1/0", len(wire.Files), wire.FilesDropped)
+	}
+	if wire.Files[0].Name != "report.pdf" || wire.Files[0].Mime != "application/pdf" {
+		t.Fatalf("文件条目被改写：%#v", wire.Files[0])
+	}
+}

@@ -419,3 +419,19 @@ func TestCertJobLogFileName_reversibleForDottedIDs(t *testing.T) {
 		}
 	}
 }
+
+// 日志写锁条目在最后一个持有者释放后回收：规则可反复创建/删除，只增不删的
+// 锁表会按历史规则总数无界增长（旧实现注释以「规则量级」为由不回收）。
+func TestLockCertJobLog_reclaimsEntryAfterRelease(t *testing.T) {
+	const ruleID = "lb_reclaim_log_lock"
+	component := certJobLogFileComponent(ruleID)
+	lock := lockCertJobLog(ruleID)
+	lock.Lock()
+	if _, exists := certJobLogWriteLocks.locks.Load(component); !exists {
+		t.Fatal("在途持锁时日志写锁条目必须存在")
+	}
+	lock.Unlock()
+	if _, exists := certJobLogWriteLocks.locks.Load(component); exists {
+		t.Fatal("日志写锁条目未回收（键空间随历史规则无界增长）")
+	}
+}

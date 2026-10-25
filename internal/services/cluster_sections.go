@@ -211,11 +211,15 @@ func sanitizeUsersForHash(users []models.ClusterUser) []models.ClusterUser {
 		out[i] = u
 		out[i].LastLogin = models.JSONNullTime{}
 		out[i].MFALastTimestep = 0
-		// is_setup_admin 是由 (role,is_enabled) 确定性派生的保护标记：apply 侧
-		// 落库后会按「最低 id 的启用管理员」在本地归一（旧主端载荷不含该字段
-		// 时同样如此）。派生值不进哈希——进哈希会让「主端未携带标记」形态在
-		// 从端每轮重建出与载荷不同的哈希，触发永久重放/重载（waf ref 同型
-		// 乒乓）。
+		// is_setup_admin **不随快照同步**：本函数产出的 users 节既是节哈希输入，
+		// 也是 v3 信封化后唯一实际下发的 canonical 载荷——此处清零意味着从端
+		// 收到的恒为「无标记」形态。标记由接收端本地归一：apply 落库后立即
+		// 按「最低 id 的启用管理员」重建（insertSnapshotUsersAndKeys →
+		// db.EnsureSetupAdminFlag）。主端标记若带外落在非最低 id 的管理员上，
+		// 不会在对端复现，这是刻意的本地归一语义，不是载荷丢失。
+		// 清零的第二个理由与 last_login 同源：标记进哈希会让「主端未携带标记」
+		// 的形态在从端每轮重建出与载荷不同的哈希，触发永久重放/重载
+		// （waf ref 同型乒乓）。
 		out[i].IsSetupAdmin = false
 	}
 	return out

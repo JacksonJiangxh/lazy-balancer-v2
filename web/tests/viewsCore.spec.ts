@@ -451,4 +451,8 @@ test('用户页：初始化管理员不可删除/禁用（标记由列表响应�
   assert.match(users, /isReadOnly \|\| row\.is_setup_admin \|\| switchingIds\.has\(row\.id\)/, '状态开关须对初始化管理员禁用')
   assert.match(users, /系统初始化管理员不可删除/, '删除按钮须给出不可删除原因')
   assert.match(users, /isReadOnly \|\| row\.is_setup_admin \|\| row\.id === authStore\.user\?\.id/, '删除按钮须对初始化管理员禁用')
+  // 第三个保护面：编辑弹框的角色下拉（后端 protected 恒 400「不可降级」）
+  assert.match(users, /const roleLocked = computed\(\(\) => editingSelf\.value \|\| editingUser\.value\?\.is_setup_admin === true\)/)
+  assert.match(users, /<el-select v-model="form\.role" style="width: 100%" :disabled="roleLocked">/)
+  assert.match(users, /系统初始化管理员不可降级/)
 })

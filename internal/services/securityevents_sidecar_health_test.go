@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -140,11 +141,12 @@ func TestWriterStatsHealth_writeFailureMarkerBecomesUnavailable(t *testing.T) {
 	}
 }
 
-// 侧车计数文件跨容器重启存活：早于本进程启动的 written_at 属于上一代进程，
-// 必须整份忽略并复位基线。否则只要历史上出现过一次丢弃，重启后首个 tick
-// 就把旧累计值当「本进程新失败」——degraded 15 分钟 + data_loss + 一条
-// 「审计日志写侧失败」任务日志的误报；且新进程无失败时侧车永不重写，误报
-// 长期存在。
+// 侧车计数文件跨容器重启存活：早于本进程启动的 written_at 属于上一代面板
+// 进程的累计读数，必须只记为**基线**（不得归零、也不得计入本代），本代只
+// 累计其后的新增。否则只要历史上出现过一次丢弃，重启后首个 tick 就把旧累计
+// 值当「本进程新失败」——degraded 15 分钟 + data_loss + 一条「审计日志写侧
+// 失败」任务日志的误报；归零比整份忽略更糟：面板单独重启（Caddy 保持运行、
+// 计数器保留旧值）时，插件下一次任意写入都会把历史失败全量算进本代。
 func TestWriterStatsHealth_staleGenerationIgnored(t *testing.T) {
 	dir := t.TempDir()
 	oldPath := auditLogPath
@@ -191,8 +193,9 @@ func TestWriterStatsHealth_staleGenerationIgnored(t *testing.T) {
 			status.WriterDegraded, status.WriterDropped, status.WriterIOErrors)
 	}
 
-	// 本代际侧车（written_at 晚于进程启动）照常累计增量。
-	fresh := `{"dropped":7,"io_errors":3,"written_at":"` +
+	// 本代际侧车（written_at 晚于进程启动）只累计**相对旧代读数的新增**：
+	// 旧代已作为基线（dropped=7/io=3），故同一计数再读一次是 0 增量。
+	fresh := `{"dropped":8,"io_errors":3,"format_errors":0,"written_at":"` +
 		time.Now().UTC().Add(time.Second).Format(time.RFC3339) + `"}`
 	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(fresh), 0o644); err != nil {
 		t.Fatal(err)
@@ -201,8 +204,8 @@ func TestWriterStatsHealth_staleGenerationIgnored(t *testing.T) {
 	securityEventsWriterHealth.mu.Lock()
 	dropped, ioErrors = securityEventsWriterHealth.droppedTotal, securityEventsWriterHealth.ioTotal
 	securityEventsWriterHealth.mu.Unlock()
-	if dropped != 7 || ioErrors != 3 {
-		t.Fatalf("本代际侧车必须累计：dropped=%d io=%d, want 7/3", dropped, ioErrors)
+	if dropped != 1 || ioErrors != 0 {
+		t.Fatalf("本代际只累计旧代读数之后的新增：dropped=%d io=%d, want 1/0", dropped, ioErrors)
 	}
 
 	// 缺失 written_at 的旧版本产物退回基线差量口径（兼容形态，不得静默忽略）。
@@ -214,8 +217,8 @@ func TestWriterStatsHealth_staleGenerationIgnored(t *testing.T) {
 	securityEventsWriterHealth.mu.Lock()
 	dropped = securityEventsWriterHealth.droppedTotal
 	securityEventsWriterHealth.mu.Unlock()
-	if dropped != 9 {
-		t.Fatalf("无 written_at 的旧产物应按差量累计到 9，got %d", dropped)
+	if dropped != 2 {
+		t.Fatalf("无 written_at 的旧产物应按差量累计到 2（8→9 的新增），got %d", dropped)
 	}
 }
 
@@ -262,5 +265,72 @@ func TestWriterStatsHealth_oldWrittenAtInCurrentGenerationIsNotStale(t *testing.
 	if status.WriterDegraded || status.WriterStatsUnavailable || !status.Healthy {
 		t.Fatalf("陈旧但属本代际的 written_at 不得判停更/降级: degraded=%v unavailable=%v healthy=%v",
 			status.WriterDegraded, status.WriterStatsUnavailable, status.Healthy)
+	}
+}
+
+// 面板进程单独重启（监督器只重启 app，Caddy 保持运行）时插件计数器保留旧
+// 累计值：旧代侧车读数必须记为基线，本代窗口只计入**真新增**。归零的话，
+// 插件下一次任意写入（哪怕只新增 1 次失败）把历史失败全量算进本代 →
+// 误报 degraded（15 分钟）+ 永久 data_loss + 一条任务日志业务行。
+func TestWriterStatsHealth_panelOnlyRestartCountsOnlyNewFailures(t *testing.T) {
+	isolationForWriterHealth(t)
+
+	// 旧代侧车：written_at 早于本进程启动，累计 7 次丢弃 / 3 次 IO 错误。
+	// 该读数是「插件仍在运行、计数器未归零」的形态。
+	oldGen := `{"dropped":7,"io_errors":3,"format_errors":0,"written_at":"` +
+		securityEventsProcessStart.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(oldGen), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsObserveAuditWriterStats()
+	if status := SecurityEventsIngestionHealthSnapshot(); status.WriterDropped != 0 || status.WriterDegraded {
+		t.Fatalf("旧代读数只作基线：dropped=%d degraded=%v, want 0/false",
+			status.WriterDropped, status.WriterDegraded)
+	}
+
+	// 本代插件新增 1 次丢弃后重写侧车（累计 8/3）。
+	fresh := `{"dropped":8,"io_errors":3,"format_errors":0,"written_at":"` +
+		time.Now().UTC().Add(time.Second).Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(fresh), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsObserveAuditWriterStats()
+
+	securityEventsWriterHealth.mu.Lock()
+	dropped, windowFailures := securityEventsWriterHealth.droppedTotal, securityEventsWriterHealth.windowFailures
+	securityEventsWriterHealth.mu.Unlock()
+	if dropped != 1 || windowFailures != 1 {
+		t.Fatalf("本代只计真新增：dropped=%d windowFailures=%d, want 1/1（历史 7 次不得计入）",
+			dropped, windowFailures)
+	}
+	if status := SecurityEventsIngestionHealthSnapshot(); status.WriterDegraded {
+		t.Fatal("单次新增失败不得触发 degraded（历史失败被误计为窗口内新增）")
+	}
+}
+
+// 插件进程（Caddy）重启后计数器从 0 起：增量口径必须自动复位基线，不得
+// 把「计数变小」当新增。
+func TestWriterStatsHealth_pluginCounterResetRestartsBaseline(t *testing.T) {
+	isolationForWriterHealth(t)
+	observeDropped := func(dropped uint64) uint64 {
+		t.Helper()
+		payload := fmt.Sprintf(`{"dropped":%d,"io_errors":0,"format_errors":0,"written_at":%q}`,
+			dropped, time.Now().UTC().Add(time.Second).Format(time.RFC3339))
+		if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(payload), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		securityEventsObserveAuditWriterStats()
+		return SecurityEventsIngestionHealthSnapshot().WriterDropped
+	}
+	if got := observeDropped(5); got != 5 {
+		t.Fatalf("首次读数应累计 5，got %d", got)
+	}
+	// 插件重启：计数归 0（新增 0，不是负数）→ 不新增。
+	if got := observeDropped(0); got != 5 {
+		t.Fatalf("计数器归 0 不得计入新增，got %d", got)
+	}
+	// 重启后新增 2 次 → 累计 7。
+	if got := observeDropped(2); got != 7 {
+		t.Fatalf("重启后新增应累计到 7，got %d", got)
 	}
 }

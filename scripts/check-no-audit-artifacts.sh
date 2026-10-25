@@ -116,6 +116,21 @@ if [[ "$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort)" != "$(printf '%s\n' "$
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 通道 0：依赖/构建缓存不得「被跟踪」。
+# skip_re 把 node_modules 从内容扫描面摘掉（按源码形态设计的扫描器不该读转译
+# 副本），但被跟踪本身就是仓卫生缺陷：一次 `git add -A` 就会把 vitest 的
+# .vite/.vitest-cache 转译缓存连同其中的失败记录一起发布，且与 tests 源随时
+# 分叉。故此处单列一条反向断言——.gitignore 只负责「不被暂存」，本通道负责
+# 「已在索引里的也拦下」。
+# ---------------------------------------------------------------------------
+tracked_cache_re='(^|/)node_modules/|(^|/)\.(?:vite|vitest-cache)/'
+if tracked_cache="$(printf '%s\n' "$controlled" | grep -E "$tracked_cache_re" || true)"; [[ -n "$tracked_cache" ]]; then
+  echo "ERROR: 依赖/构建缓存目录不得入库（git rm -r --cached 撤销，并确认 .gitignore 覆盖）：" >&2
+  echo "$tracked_cache" >&2
+  exit 1
+fi
+
 # —— 通道 1：路径 ——
 bad_paths="$(printf '%s\n' "$controlled" | grep -v -E "$skip_re" | grep -E "$path_regex" || true)"
 if [[ -n "$bad_paths" ]]; then

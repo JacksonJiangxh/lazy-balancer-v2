@@ -433,8 +433,8 @@ test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
   const basic = code('src/views/settings/BasicSettings.vue')
   const checks: Array<[string, string, RegExp]> = [
     ['const saveAutoBackupSettings = async', '\nconst ', /if \(isReadOnly\.value \|\| !autoBackupSectionsValid\.value/],
-    ['const restoreAutoBackup = async', '\nconst ', /if \(backupDisabled\.value\) return/],
-    ['const deleteAutoBackup = async', '\nconst ', /if \(backupDisabled\.value\) return/],
+    ['const restoreAutoBackup = async', '\nconst ', /if \(backupDisabled\.value \|\| autoBackupActionBusy\.value\) return/],
+    ['const deleteAutoBackup = async', '\nconst ', /if \(backupDisabled\.value \|\| autoBackupActionBusy\.value\) return/],
     ['const confirmImport = async', '\nconst ', /if \(isReadOnly\.value\) return/],
   ]
   for (const [start, end, pattern] of checks) {

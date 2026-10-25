@@ -1797,6 +1797,14 @@ func docDataArray(t *testing.T, key string) map[string]any {
 func TestAPIDocs_decisionKeyExamplesMatchImplementation(t *testing.T) {
 	assertStructKeysDocumented(t, "GET /users", mapKeysOf(docDataArray(t, "GET /users")), models.UserResponse{})
 
+	// 同一响应模型的全部产出端点共用一份示例（userResponseExample 单源）：
+	// 只对列表做对账会让新增字段只进 1/4 示例，其余端点示例停留在旧形状，
+	// 按 /users/me 示例生成的 SDK 会缺 is_setup_admin/mfa_enabled/auth_provider，
+	// 按 PUT /users/:id 示例会以为响应无 body。
+	for _, key := range []string{"GET /users/me", "PATCH /users/me", "PUT /users/:id"} {
+		assertStructKeysDocumented(t, key, mapKeysOf(docResponseExample(t, key)), models.UserResponse{})
+	}
+
 	node := docDataArray(t, "GET /cluster/nodes")
 	assertStructKeysDocumented(t, "GET /cluster/nodes", mapKeysOf(node), models.ClusterNodeView{})
 	health, ok := node["health"].(map[string]any)
@@ -1817,6 +1825,72 @@ func TestAPIDocs_decisionKeyExamplesMatchImplementation(t *testing.T) {
 	assertStructKeysDocumented(t, "GET /security/crs", mapKeysOf(docResponseExample(t, "GET /security/crs")), models.CRSInfo{})
 	assertStructKeysDocumented(t, "GET /security/ip2region", mapKeysOf(docResponseExample(t, "GET /security/ip2region")), models.IP2RegionInfo{})
 	assertStructKeysDocumented(t, "GET /system/info", mapKeysOf(docResponseExample(t, "GET /system/info")), models.SystemInfo{})
+}
+
+// 初始化管理员的三个保护类 400 是消费者必然遇到的可行动拒绝原因（降级/禁用/
+// 删除），必须逐条登记——通用 invalid_request 掩盖后，SDK 会把 400 当实现缺陷
+// 重试。文案与 handlers 的实现字面量对账（实现改词而文档未跟即红）。
+func TestAPIDocs_setupAdminProtectionRejectionsDocumented(t *testing.T) {
+	source, err := os.ReadFile("users.go")
+	if err != nil {
+		t.Fatalf("读 users.go: %v", err)
+	}
+	for _, want := range []struct {
+		route    string
+		message  string
+		keywords []string
+	}{
+		{"PUT /users/:id", "初始管理员不可降级", []string{"不可降级"}},
+		{"PUT /users/:id/status", "初始管理员不可禁用", []string{"不可禁用"}},
+		{"DELETE /users/:id", "初始管理员不可删除", []string{"不可删除"}},
+	} {
+		if !strings.Contains(string(source), want.message) {
+			t.Errorf("users.go 未出现保护文案 %q（实现与文档对账的单源已漂移）", want.message)
+		}
+		route := routesEntry(t, want.route)
+		entry, ok := "", false
+		for _, candidate := range route.Errors {
+			if strings.HasPrefix(candidate, "400 ") && strings.Contains(candidate, "setup_admin_protected") {
+				entry, ok = candidate, true
+				break
+			}
+		}
+		if !ok {
+			t.Errorf("%s 未登记 400 setup_admin_protected（实现返回 %q）errors=%v", want.route, want.message, route.Errors)
+			continue
+		}
+		for _, keyword := range want.keywords {
+			if !strings.Contains(entry, keyword) && !strings.Contains(route.Description, keyword) {
+				t.Errorf("%s 的 400 setup_admin_protected 未说明「%s」（errors=%q description=%q）", want.route, keyword, entry, route.Description)
+			}
+		}
+	}
+}
+
+// 带分页查询的 GET 端点必须把 page/page_size 登记进 OpenAPI query 参数：
+// 描述里写了分页而 contracts 未登记时，生成的 openapi.yaml 对该端点零
+// parameters，SDK 只能拿到首页且无续页形参（/certificates 即此形态）。
+func TestAPIDocContracts_paginatedGetRoutesDeclareQueryParameters(t *testing.T) {
+	checked := 0
+	for _, route := range apiDocRoutes {
+		if route.Method != http.MethodGet || !strings.Contains(route.Description, "page_size") {
+			continue
+		}
+		checked++
+		names := map[string]bool{}
+		for _, parameter := range apiDocContractFor(route).queryParameters {
+			names[parameter.name] = true
+		}
+		for _, want := range []string{"page", "page_size"} {
+			if !names[want] {
+				t.Errorf("%s %s 描述声明分页但 OpenAPI 未登记 query 参数 %s（contracts 缺 %q 条目）",
+					route.Method, route.Path, want, route.Method+" "+route.Path)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("未扫到任何声明 page_size 的 GET 端点——派生基线失效，扫描口径需跟进")
+	}
 }
 
 // summary/tags 必须可原样还原：裸拼自由文本会在含 ": "/"#" 等字符时破坏

@@ -106,8 +106,10 @@ func TestNewProviderFromCredentials_authModeOverridesStrayMode(t *testing.T) {
 	if !ok {
 		t.Fatalf("provider=%T, want *dnspod.Provider（auth_mode 优先）", provider)
 	}
-	if dnspodProvider.LoginToken() != "123,abc" {
-		t.Fatalf("login token=%q, want 123,abc（UI 字段为凭据真相）", dnspodProvider.LoginToken())
+	// 凭据相等以账户摘要（String()，由完整凭据派生）判定：包外不再暴露凭据
+	// 访问器，避免把凭据读取面扩到任何同包/跨包代码。
+	if dnspodProvider.String() != dnspod.New("123,abc").String() {
+		t.Fatalf("provider=%s, want 凭据 123,abc（UI 字段为凭据真相）", dnspodProvider.String())
 	}
 }
 
@@ -122,8 +124,8 @@ func TestNewProviderFromCredentials_uiFieldsOverrideStaleAPIToken(t *testing.T) 
 	if !ok {
 		t.Fatalf("provider=%T, want *dnspod.Provider", provider)
 	}
-	if dnspodProvider.LoginToken() != "123,abc" {
-		t.Fatalf("login token=%q, want 123,abc（app_id/app_token 优先）", dnspodProvider.LoginToken())
+	if dnspodProvider.String() != dnspod.New("123,abc").String() {
+		t.Fatalf("provider=%s, want 凭据 123,abc（app_id/app_token 优先）", dnspodProvider.String())
 	}
 }
 

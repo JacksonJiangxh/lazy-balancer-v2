@@ -294,8 +294,8 @@ var configBackupProtectedConfigKeys = map[string]bool{
 	// db.go:2285/2346 启动迁移 Scan int）——同口径纳入保护。
 	"threat_traffic_sample_unified_migrated": true,
 	"security_events_retention_migrated":     true,
-	// global_config.dns_credentials 为遗留列（读路径不回显、写路径已移除、
-	// 存量由启动迁移置空）：导出剔除 + 导入跳过，避免旧备份把不可见凭证
+	// global_config.dns_credentials 为退役列（读路径不回显、写路径已移除、
+	// 列由启动迁移删除）：导出剔除 + 导入跳过，避免旧备份把不可见凭证
 	// 写回并被后续备份继续外带。
 	"dns_credentials": true,
 }

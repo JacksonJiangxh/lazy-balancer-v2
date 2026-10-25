@@ -24,6 +24,7 @@
 <script setup lang="ts">
 import TakeoverBadge from '@/components/common/TakeoverBadge.vue'
 import type { ProxyTimeoutConfig } from '@/types'
+import { PROXY_TIMEOUT_FIELDS } from '@/utils/proxyTimeouts.ts'
 
 withDefaults(defineProps<{
   readonly value: ProxyTimeoutConfig
@@ -43,27 +44,10 @@ const emit = defineEmits<{
   (event: 'update', field: keyof ProxyTimeoutConfig, value: number): void
 }>()
 
-type TimeoutField = {
-  readonly key: keyof ProxyTimeoutConfig
-  readonly label: string
-  readonly min: number
-  readonly desc: string
-  readonly suggest?: number
-}
+type TimeoutField = (typeof PROXY_TIMEOUT_FIELDS)[number]
 
-// 上限口径：后端 rule_features.go 仅校验「不能为负」与 flush_interval >= -1，无上限——
-// 长连接/流式（SSE/LLM 长响应、WebSocket 代理）合法需要 >24h。前端不设 max，
-// 避免把控件夹回 86400 造成带外/导入的更大值被静默改值。
-
-const fields: readonly TimeoutField[] = [
-  { key: 'proxy_dial_timeout', label: '连接超时', min: 0, desc: '建立到上游 TCP 连接', suggest: 10 },
-  { key: 'proxy_response_header_timeout', label: '响应头超时', min: 0, desc: '等待上游响应头返回', suggest: 30 },
-  { key: 'proxy_read_timeout', label: '读超时', min: 0, desc: '两次读上游数据的间隔；流式需大于静默期', suggest: 60 },
-  { key: 'proxy_write_timeout', label: '写超时', min: 0, desc: '两次写客户端的间隔；流式需大于静默期', suggest: 60 },
-  { key: 'proxy_stream_timeout', label: '流式超时', min: 0, desc: '整个流式会话总时长；用于 SSE/LLM' },
-  { key: 'proxy_flush_interval', label: '刷新间隔', min: -1, desc: '默认仅 SSE 无缓冲；-1=所有响应无缓冲；>0=每 N 秒一次' },
-  { key: 'proxy_stream_close_delay', label: '流关闭延迟', min: 0, desc: '>0=reload 时延迟 N 秒关旧 WebSocket/SSE' },
-]
+// 字段定义（标签/下限/说明/建议值）与向导预览摘要同源，见 utils/proxyTimeouts.ts。
+const fields: readonly TimeoutField[] = PROXY_TIMEOUT_FIELDS
 
 const update = (field: keyof ProxyTimeoutConfig, value: number | undefined): void => {
   emit('update', field, value ?? 0)

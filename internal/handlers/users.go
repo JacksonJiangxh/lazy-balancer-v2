@@ -18,7 +18,7 @@ import (
 )
 
 func (h *Handlers) ListUsers(c *gin.Context) {
-	rows, err := db.DB.Query("SELECT id, username, role, display_name, is_enabled, created_at, last_login, COALESCE(mfa_enabled,0), COALESCE(auth_provider,'local'), COALESCE(is_setup_admin,0) FROM users ORDER BY id")
+	rows, err := db.DB.Query("SELECT " + db.UserRowColumns("") + " FROM users ORDER BY id")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
@@ -27,18 +27,15 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 
 	var users = make([]models.UserResponse, 0) // F-SYSR-1：空表出口归一 []，与 scanAPIKeys 同形（null 会使前端判空分裂）
 	for rows.Next() {
-		var u models.User
-		var mfaEnabled, setupAdmin int
-		var authProvider string
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.DisplayName, &u.IsEnabled, &u.CreatedAt, &u.LastLogin, &mfaEnabled, &authProvider, &setupAdmin); err != nil {
+		var meta db.UserRowMeta
+		u, err := db.ScanUserRow(rows, &meta)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 			return
 		}
-		// mfa_enabled 由构造器单源填充，删除手工补字段。
-		u.IsSetupAdmin = setupAdmin == 1
-		response := models.NewUserResponse(u, mfaEnabled == 1)
-		response.AuthProvider = authProvider
-		users = append(users, response)
+		// mfa_enabled/is_setup_admin/auth_provider 均由单源扫描载入，
+		// 构造器单点复制（删除手工补字段）。
+		users = append(users, models.NewUserResponse(u, meta.MFAEnabled))
 	}
 	if err := rows.Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
@@ -307,8 +304,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 			return
 		}
 	}
-	var user models.User
-	var authProvider string
+	var meta db.UserRowMeta
 	// 改密成功后在提交前吊销在册 MFA 挑战。
 	if passwordHash != "" {
 		if err := revokeMFAChallenges(tx, id); err != nil {
@@ -316,15 +312,14 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 			return
 		}
 	}
-	// 响应必须回填 mfa_enabled（与 GET /users 同口径）——此前
-	// NewUserResponse 无该字段，PUT 响应恒为 false，API 消费者/脚本误判。
-	var mfaEnabled int
-	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id,username,role,display_name,is_enabled,created_at,last_login,COALESCE(auth_provider,'local'),COALESCE(mfa_enabled,0) FROM users WHERE id=?`, id).
-		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider, &mfaEnabled); err != nil {
+	// 响应必须回填与 GET /users 同口径（单源列清单：mfa_enabled 与
+	// is_setup_admin 一并载入）——此前该端点响应恒 mfa_enabled=false，
+	// is_setup_admin 同样恒 false，API 消费者/脚本误判。
+	user, err := db.ScanUserRow(tx.QueryRowContext(c.Request.Context(), `SELECT `+db.UserRowColumns("")+` FROM users WHERE id=?`, id), &meta)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户失败"})
 		return
 	}
-	user.AuthProvider = authProvider
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户失败"})
 		return
@@ -336,7 +331,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新", "用户", services.FormatAuditDetail(services.AuditUserPart(id, user.Username), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	response := models.NewUserResponse(user, mfaEnabled == 1)
+	response := models.NewUserResponse(user, meta.MFAEnabled)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户更新成功", Data: response})
 }
 

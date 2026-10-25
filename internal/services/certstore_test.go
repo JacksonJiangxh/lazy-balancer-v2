@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -90,20 +89,20 @@ func TestRemoveCertFiles_returns_both_delete_errors(t *testing.T) {
 
 func TestDeployLock_removes_entry_after_last_release(t *testing.T) {
 	// Given
-	certificateDeployLocks = sync.Map{}
+	certificateDeployLocks = refCountedLockTable{}
 
 	// When
 	unlock := DeployLock("lb_refcount")
 	unlock()
 
 	// Then
-	if _, exists := certificateDeployLocks.Load("lb_refcount"); exists {
+	if _, exists := certificateDeployLocks.locks.Load("lb_refcount"); exists {
 		t.Fatal("deployment lock entry remained after its last holder released it")
 	}
 }
 
 func TestDeployLock_serializes_waiters_and_keeps_entry_until_final_release(t *testing.T) {
-	certificateDeployLocks = sync.Map{}
+	certificateDeployLocks = refCountedLockTable{}
 	acquired := make(chan int)
 	release := make(chan struct{})
 	done := make(chan int)
@@ -121,11 +120,11 @@ func TestDeployLock_serializes_waiters_and_keeps_entry_until_final_release(t *te
 	// 测试超时（CI 挂起）；类型断言带 ok 避免私有字段形态变更直接 panic。
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		certificateDeployLocksMu.Lock()
-		value, exists := certificateDeployLocks.Load("lb_serial")
-		lock, ok := value.(*certificateDeployLock)
+		certificateDeployLocks.mu.Lock()
+		value, exists := certificateDeployLocks.locks.Load("lb_serial")
+		lock, ok := value.(*refCountedLock)
 		registered := exists && ok && lock.refs == 3
-		certificateDeployLocksMu.Unlock()
+		certificateDeployLocks.mu.Unlock()
 		if registered {
 			break
 		}
@@ -139,7 +138,7 @@ func TestDeployLock_serializes_waiters_and_keeps_entry_until_final_release(t *te
 		t.Fatalf("released worker=%d, want first holder %d", released, first)
 	}
 	second := <-acquired
-	if _, exists := certificateDeployLocks.Load("lb_serial"); !exists {
+	if _, exists := certificateDeployLocks.locks.Load("lb_serial"); !exists {
 		t.Fatal("deployment lock entry was deleted while a waiter held it")
 	}
 	release <- struct{}{}
@@ -147,13 +146,72 @@ func TestDeployLock_serializes_waiters_and_keeps_entry_until_final_release(t *te
 		t.Fatalf("released worker=%d, want second holder %d", released, second)
 	}
 	<-acquired
-	if _, exists := certificateDeployLocks.Load("lb_serial"); !exists {
+	if _, exists := certificateDeployLocks.locks.Load("lb_serial"); !exists {
 		t.Fatal("deployment lock entry was deleted before the final release")
 	}
 	release <- struct{}{}
 	<-done
-	if _, exists := certificateDeployLocks.Load("lb_serial"); exists {
+	if _, exists := certificateDeployLocks.locks.Load("lb_serial"); exists {
 		t.Fatal("deployment lock entry remained after final release")
+	}
+}
+
+// 规则文件锁/部署锁/日志写锁共用 refCountedLockTable：条目必须在最后一个
+// 持有者释放后回收（规则可反复创建/删除，只增不删的表会按历史规则总数无界
+// 增长），且等待者在场时不得回收（否则同 key 会出现两把锁，per-rule 串行化
+// 失效）。
+func TestRefCountedLockTable_reclaimsOnlyAfterLastHolder(t *testing.T) {
+	var table refCountedLockTable
+	first := table.get("lb_refcounted")
+	first.Lock()
+	if _, exists := table.locks.Load("lb_refcounted"); !exists {
+		t.Fatal("在途持锁时条目必须存在")
+	}
+
+	secondAcquired := make(chan *refCountedLock, 1)
+	go func() {
+		second := table.get("lb_refcounted")
+		second.Lock()
+		secondAcquired <- second
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		table.mu.Lock()
+		refs := first.refs
+		table.mu.Unlock()
+		if refs == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待者未登记引用（refs=%d, want 2）", refs)
+		}
+		runtime.Gosched()
+	}
+
+	first.Unlock()
+	if _, exists := table.locks.Load("lb_refcounted"); !exists {
+		t.Fatal("等待者仍在阻塞，条目不得回收（否则同 key 会出现两把不同锁）")
+	}
+	second := <-secondAcquired
+	if second != first {
+		t.Fatal("等待者拿到了另一把锁：per-rule 串行化失效")
+	}
+	second.Unlock()
+	if _, exists := table.locks.Load("lb_refcounted"); exists {
+		t.Fatal("最后一个持有者释放后条目未回收（键空间随历史规则无界增长）")
+	}
+}
+
+func TestLockCertRuleFile_reclaimsEntryAfterRelease(t *testing.T) {
+	const ruleID = "lb_reclaim_rule_file"
+	lock := lockCertRuleFile(ruleID)
+	lock.Lock()
+	if _, exists := certRuleFileLocks.locks.Load(ruleID); !exists {
+		t.Fatal("在途持锁时规则文件锁条目必须存在")
+	}
+	lock.Unlock()
+	if _, exists := certRuleFileLocks.locks.Load(ruleID); exists {
+		t.Fatal("规则文件锁条目未回收（键空间随历史规则无界增长）")
 	}
 }
 

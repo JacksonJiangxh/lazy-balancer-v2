@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
+
+	"lazy-balancer-v2/internal/dnsname"
 )
 
 // ResolveZone returns the DNS zone (registered domain) that a provider API call
@@ -21,8 +23,13 @@ import (
 // sub.example.com, not example.com) is invisible to the PSL and still resolves
 // to example.com. Supporting delegated zones needs an explicit zone setting
 // rather than guessing from the test input.
+//
+// DNS 名大小写不敏感：ResolveZone 必须先归一小写（dnsname.NormalizeName，与
+// ownership/challenge_claims 同源）——PSL 查询与 provider 侧 Domain.List 的规范
+// 形态都是小写，保留输入大小写会让混合大小写域名落进「last two labels」兜底
+// （`API.Example.Co.UK` → `Co.UK`），并在 provider 侧精确比较时失配。
 func ResolveZone(domain string) (string, error) {
-	trimmed := strings.TrimSuffix(strings.TrimSpace(domain), ".")
+	trimmed := dnsname.NormalizeName(domain)
 	if trimmed == "" {
 		return "", fmt.Errorf("dns zone: domain is empty")
 	}

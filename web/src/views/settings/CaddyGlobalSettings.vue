@@ -168,11 +168,16 @@
             v-model="settings.access_log_format"
             type="textarea"
             :rows="8"
+            maxlength="16384"
+            show-word-limit
             :disabled="isReadOnly"
             placeholder="每行一个字段映射，格式: caddy字段路径 -> 自定义名称，或 caddy字段路径 -> delete"
           />
           <el-button text type="primary" size="small" :disabled="isReadOnly" @click="settings.access_log_format = DEFAULT_ACCESS_LOG_FORMAT">还原默认格式</el-button>
           <div class="form-tip-line format-tip">
+            <!-- 上限与后端写侧门同源（internal/handlers/caddy.go：16KiB / 200 行，
+                 按 UTF-8 字节计）——超限保存会被拒绝，先在此告知而不是让用户试错 -->
+            <div>最多 200 行、16 KiB（后端按 UTF-8 字节计）；超限保存会被拒绝。</div>
             每行一条规则：字段重命名 <code>request&gt;remote_ip -&gt; src</code> 或删除字段 <code>request&gt;headers -&gt; delete</code>。
             无论格式如何，<code>request&gt;headers&gt;X-API-Key</code> 恒被删除（面板 API Key 不落日志）。
             可用字段：<code>request&gt;remote_ip</code> <code>request&gt;client_ip</code> <code>request&gt;method</code> <code>request&gt;host</code> <code>request&gt;uri</code> <code>request&gt;proto</code> <code>request&gt;headers&gt;User-Agent</code> <code>status</code> <code>size</code> <code>duration</code> <code>bytes_read</code> <code>user_id</code> <code>ts</code> <code>resp_headers</code> <code>request&gt;tls</code>。

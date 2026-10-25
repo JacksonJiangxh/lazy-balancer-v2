@@ -28,7 +28,8 @@ const (
 	// S1 陈旧标记：标记落在非「启用管理员」行（账号被降级/禁用后残留）。
 	setupAdminStalePredicate = `COALESCE(is_setup_admin,0)=1 AND NOT (role='admin' AND is_enabled=1)`
 	// S2 多标记并存：仅多标记时收敛到最低 id（单标记哪怕落在非最低 id 也是
-	// 载荷/主端的显式事实，归一不得迁移）。
+	// 配置备份载荷里的显式事实，归一不得迁移。集群快照不在此列：其 canonical
+	// 载荷下发前已清零标记，从端恒由下方 S3 重建）。
 	setupAdminMultiPredicate = `COALESCE(is_setup_admin,0)=1 AND role='admin' AND is_enabled=1
 	  AND id <> ` + setupAdminLowestEnabledAdmin + `
 	  AND (SELECT COUNT(*) FROM users WHERE COALESCE(is_setup_admin,0)=1 AND role='admin' AND is_enabled=1) > 1`
@@ -40,9 +41,9 @@ const (
 
 // EnsureSetupAdminFlag 归一 break-glass 管理入口标记：
 //   - 标记只允许落在「启用的管理员」行上，非管理员/禁用行的陈旧标记先清除；
-//   - 多条启用管理员同时带标记（导入的备份、集群快照或带外改库的形态）收敛为
+//   - 多条启用管理员同时带标记（导入的配置备份或带外改库的形态）收敛为
 //     单条：只有最低 id 的启用管理员保留标记，其余清零。**仅在多标记时生效**——
-//     单标记（哪怕落在非最低 id）是载荷/主端的显式事实，归一不得迁移；
+//     单标记（哪怕落在非最低 id）是配置备份载荷的显式事实，归一不得迁移；
 //   - 若没有任何启用管理员带标记（旧库补列、旧备份/旧快照还原、表重建，
 //     或标记行被带外改写），把最低 id 的启用管理员补标为入口。
 //
@@ -53,10 +54,12 @@ func EnsureSetupAdminFlag(ctx context.Context, ex setupAdminExecer) error {
 		return err
 	}
 	// 仅在**多标记并存**时收敛（先清非最低 id 的启用管理员标记，再交给下方补标）
-	// ——单标记不迁移：集群快照/备份载荷显式把标记落在非最低 id 的管理员上时，
-	// 该标记是主端事实，清零会违背「标记随载荷落库」的语义（随后补标又落到最低
-	// id，等于篡改载荷）。多标记形态下两条相邻语句都不命中（补标分支要求「没有
-	// 任何启用管理员带标记」），才会永久滞留、被 handlers 判为不可删/禁/降级。
+	// ——单标记不迁移：配置备份载荷显式把标记落在非最低 id 的管理员上时，该标记
+	// 是备份里的显式事实，清零会违背「标记随载荷落库」的语义（随后补标又落到最低
+	// id，等于篡改载荷）。集群快照不走这条：其 canonical 载荷在下发前已清零标记
+	// （sanitizeUsersForHash），从端恒命中下方 S3 补标。
+	// 多标记形态下两条相邻语句都不命中（补标分支要求「没有任何启用管理员带标记」），
+	// 才会永久滞留、被 handlers 判为不可删/禁/降级。
 	// 该 SQLite 子查询自引用 users 表在 UPDATE 中合法（同库既有迁移同款形态）。
 	if _, err := ex.ExecContext(ctx, `UPDATE users SET is_setup_admin=0 WHERE `+setupAdminMultiPredicate); err != nil {
 		return err

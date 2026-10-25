@@ -2965,7 +2965,8 @@ func securityEventsIngestionTaskState() securityEventsIngestionTaskHealthState {
 //     一条任务日志业务行（仅状态变化，低频）。
 //   - written_at 判据边界（已裁定，勿按「停更」重报）：写侧只在计数变化时
 //     重写侧车（无失败＝不写盘），故 written_at 陈旧是正常形态而非故障信号；
-//     读侧只用它做代际判定（早于本进程启动的整份忽略并复位基线），不得据其
+//     读侧只用它做代际判定（早于本进程启动的读数是上一代面板的累计值，
+//     记为基线而非归零——插件计数只在插件进程重启时从 0 起），不得据其
 //     年龄判「写侧停摆/侧车停更」——按年龄降级会在无失败期间长期误报。写侧
 //     drain 真停摆没有独立存活信号可观测（要判必须先在生产侧落固定心跳）。
 const (
@@ -3114,16 +3115,20 @@ func securityEventsObserveAuditWriterStats() {
 		securityEventsWriterHealth.mu.Unlock()
 		return
 	}
-	// 代际判定：读取成功但书写时刻早于本进程启动 = 上一代进程的累计值。
-	// 整份忽略并复位基线——本轮既不累计 delta，也不误报失败；下一轮读到
-	// 本代进程写过的新计数时按 baseline=0 正常累计（计数本身也是从 0 起的）。
-	// written_at 缺失/不可解析（更早版本的插件产物）时退回基线差量逻辑。
+	// 代际判定：读取成功但书写时刻早于本进程启动 = 上一代进程（面板）的累计
+	// 读数。**不得把基线归零**：插件计数器只有在**插件进程（Caddy）自身重启**
+	// 时才是从 0 起的；面板进程单独重启（监督器只重启 app、Caddy 保持运行）时
+	// 插件计数器保留旧累计值。归零后插件下一次任意写入（哪怕只新增 1 次失败）
+	// 都会让 delta=累计值-0 把历史失败全量算进本代窗口 → 误报 degraded（15
+	// 分钟）+ 永久 data_loss + 一条任务日志业务行，误导排障与升级验收。
+	// 旧代读数作为基线：本代只累计其后的新增；插件进程真重启时计数归 0 会走
+	// delta 的「current<baseline」分支自动复位基线。
 	if written, perr := time.Parse(time.RFC3339, payload.WrittenAt); perr == nil {
 		if written.Before(securityEventsProcessStart) {
 			securityEventsWriterHealth.mu.Lock()
-			securityEventsWriterHealth.baselineDropped = 0
-			securityEventsWriterHealth.baselineIO = 0
-			securityEventsWriterHealth.baselineFormat = 0
+			securityEventsWriterHealth.baselineDropped = payload.Dropped
+			securityEventsWriterHealth.baselineIO = payload.IOErrors
+			securityEventsWriterHealth.baselineFormat = payload.FormatErrors
 			securityEventsWriterHealth.sidecarReadFailures = 0
 			securityEventsWriterHealth.mu.Unlock()
 			return

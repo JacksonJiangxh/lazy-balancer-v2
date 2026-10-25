@@ -23,6 +23,10 @@ ui/
 # final 阶段的 COPY web/dist 层失效（构建缓存按内容摘要判定）——这是发版必然
 # 开销，不是本文件能消除的。注意 web/dist 必须留在上下文内——Docker 的排除
 # 模式按上下文根相对匹配，下方 dist/ 只匹配根目录 dist，不会波及 web/dist。
+# 仓根 node_modules（在仓库根跑 vitest/node 脚本时生成的 .vite/.vitest-cache
+# 转译缓存）——Docker 的排除模式按上下文根锚定，本条只匹根级目录，web/ 内的
+# 依赖目录仍是下方显式一条。
+node_modules/
 web/node_modules/
 web/src/
 web/tests/

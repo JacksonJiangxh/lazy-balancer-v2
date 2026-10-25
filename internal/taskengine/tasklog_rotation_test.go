@@ -121,7 +121,7 @@ func TestTaskLogPathLockTreatsRotatedCopiesAsActivePath(t *testing.T) {
 	dir := t.TempDir()
 	active := filepath.Join(dir, "task.log")
 	activeLock := lockTaskLogPath(active)
-	for _, copyPath := range []string{active + ".1", active + ".5", active + ".2.gz"} {
+	for _, copyPath := range []string{active + ".1", active + ".5", active + ".2.gz", active + ".1.zst"} {
 		if lockTaskLogPath(copyPath) != activeLock {
 			t.Fatalf("%s 未归一到活动路径锁（写入侧轮转与保留期删除将持不同互斥量）", copyPath)
 		}

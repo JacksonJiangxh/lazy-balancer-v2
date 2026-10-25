@@ -75,6 +75,7 @@ func assertLastGoodIsCommittedView(t *testing.T, lkgPath string) {
 }
 
 func TestUpdateConfig_applyFailurePinsLastKnownGoodToCommittedView(t *testing.T) {
+	preserveApplicationLogLevel(t, "")
 	handler, lkgPath := newFailingLoadHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

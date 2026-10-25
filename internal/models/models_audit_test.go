@@ -200,3 +200,18 @@ func TestBlockPageContentTypeWhitelistIsClosed(t *testing.T) {
 		t.Fatalf("白名单副本被改写后仍污染了 ValidBlockPageContentType")
 	}
 }
+
+// 集群快照的全局设置区不得携带 global_config 的退役列 dns_credentials：
+// 该列读/写/备份三面均已收口（唯一凭证来源是 certificate_configs），快照若
+// 继续携带，从节点每次 apply 都会对无写入方的列写一次空串，并把退役列拖进
+// 集群版本触发器的 OF 清单（该列被删除时启动就绪门硬失败）。
+func TestClusterBasicSettings_hasNoRetiredGlobalDNSCredentialsField(t *testing.T) {
+	typ := reflect.TypeOf(ClusterBasicSettings{})
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Name == "DNSCredentials" || strings.Contains(field.Tag.Get("json"), "dns_credentials") {
+			t.Fatalf("ClusterBasicSettings 仍携带退役列 %s（json=%q）——全局 DNS 凭证已退役，凭证唯一来源是 certificate_configs",
+				field.Name, field.Tag.Get("json"))
+		}
+	}
+}

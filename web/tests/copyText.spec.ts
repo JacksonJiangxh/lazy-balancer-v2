@@ -139,10 +139,13 @@ test('ProxyTimeoutFields：字段集与 ProxyTimeoutConfig 同集同序，undefi
   const typeKeys = [...block.matchAll(/^\s+(proxy_\w+):/gm)].map((m) => m[1])
   assert.ok(typeKeys.length >= 7, `ProxyTimeoutConfig 键解析失败（${typeKeys.length}）`)
 
-  const component = code('src/components/rules/ProxyTimeoutFields.vue')
-  const fieldKeys = [...component.matchAll(/\{ key: '(proxy_\w+)'/g)].map((m) => m[1])
+  // 字段表单源在 utils/proxyTimeouts（控件与向导预览共用），不再散在 SFC 里
+  const fieldsSource = code('src/utils/proxyTimeouts.ts')
+  const fieldKeys = [...fieldsSource.matchAll(/\{ key: '(proxy_\w+)'/g)].map((m) => m[1])
   assert.deepEqual(fieldKeys, typeKeys, '字段集/顺序必须与类型单源一致（漏字段即静默不可编辑）')
 
+  const component = code('src/components/rules/ProxyTimeoutFields.vue')
+  assert.match(component, /import \{ PROXY_TIMEOUT_FIELDS \} from '@\/utils\/proxyTimeouts\.ts'/, '控件必须读字段单源')
   const update = member(component, 'const update = ')
   assert.match(update, /emit\('update', field, value \?\? 0\)/, 'undefined 归一到 0（后端不接受 null）')
 })

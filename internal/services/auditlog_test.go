@@ -1,11 +1,15 @@
 package services
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"strings"
 	"testing"
 	"time"
+
+	sqlitedriver "github.com/glebarez/go-sqlite"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -176,7 +180,7 @@ func TestCleanupAuditLogs_fallsBackToDefaultOnMissingConfigRow(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
 	// When
-	n, err := CleanupAuditLogs()
+	n, err := CleanupAuditLogs(t.Context())
 	if err != nil {
 		t.Fatalf("CleanupAuditLogs() error=%v, want nil（默认 3 月回退后应正常清理）", err)
 	}
@@ -235,7 +239,7 @@ func TestCleanupAuditLogs_deletesInBatches(t *testing.T) {
 	auditCleanupBatchSize = 3
 	t.Cleanup(func() { auditCleanupBatchSize = oldBatch })
 
-	n, err := CleanupAuditLogs()
+	n, err := CleanupAuditLogs(t.Context())
 	if err != nil {
 		t.Fatalf("CleanupAuditLogs() error=%v, want nil", err)
 	}
@@ -297,7 +301,7 @@ func TestCleanupAuditLogs_reportsPartialCountOnMidwayFailure(t *testing.T) {
 	t.Cleanup(func() { auditCleanupBatchSize = oldBatch })
 
 	// When
-	n, err := CleanupAuditLogs()
+	n, err := CleanupAuditLogs(t.Context())
 
 	// Then：错误上抛且返回真实部分计数（不是 0）
 	if err == nil {
@@ -343,7 +347,7 @@ func TestCleanupAuditLogs_skipsDeletionWhenRetentionReadFails(t *testing.T) {
 	swapBrokenDB(t)
 
 	// When
-	n, err := CleanupAuditLogs()
+	n, err := CleanupAuditLogs(t.Context())
 
 	// Then：本轮不删除任何行，失败上抛（任务面落 failed）
 	if err == nil {
@@ -358,5 +362,129 @@ func TestCleanupAuditLogs_skipsDeletionWhenRetentionReadFails(t *testing.T) {
 	}
 	if rows != 1 {
 		t.Fatalf("审计证据行数=%d, want 1（不得删除）", rows)
+	}
+}
+
+// newAuditCleanupFixture 建独立主库（保留 3 月）与审计库，种 oldRows 条过期
+// 审计行，批尺寸收窄为 batch。返回审计库句柄；清理时恢复全局句柄与批尺寸。
+func newAuditCleanupFixture(t *testing.T, oldRows, batch int) *sql.DB {
+	t.Helper()
+	oldDB, oldAuditDB := db.DB, db.AuditDB
+	mainDB, err := sql.Open("sqlite", t.TempDir()+"/main.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBatch := auditCleanupBatchSize
+	db.DB, db.AuditDB = mainDB, auditDB
+	auditCleanupBatchSize = batch
+	t.Cleanup(func() {
+		auditCleanupBatchSize = oldBatch
+		db.DB, db.AuditDB = oldDB, oldAuditDB
+		_ = mainDB.Close()
+		_ = auditDB.Close()
+	})
+	if _, err := mainDB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY CHECK (id = 1), audit_retention_months INTEGER DEFAULT 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mainDB.Exec(`INSERT INTO global_config (id, audit_retention_months) VALUES (1, 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(100), action VARCHAR(50) NOT NULL, resource VARCHAR(100),
+		detail TEXT, ip_address VARCHAR(45), created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if oldRows > 0 {
+		if _, err := auditDB.Exec(`INSERT INTO audit_log (username, action, resource, created_at)
+			WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ?)
+			SELECT 'u', '登录', '认证', '2020-01-01 00:00:00' FROM seq`, oldRows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return auditDB
+}
+
+// wrapAuditDBWithDeleteCounter 用同一 audit 库文件挂 DELETE 计数包装句柄
+// （与指标孤儿清理同一条注入缝：afterExec 在批与批之间注入关停置 nil / ctx
+// 取消，而不是语句执行之前）。
+func wrapAuditDBWithDeleteCounter(t *testing.T) (*deleteCountingProbe, func()) {
+	t.Helper()
+	var seq int
+	var name, file string
+	if err := db.AuditDB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		t.Fatalf("read audit db path: %v", err)
+	}
+	if file == "" {
+		t.Fatal("audit 测试库不是文件库，无法附加计数句柄")
+	}
+	previous := db.AuditDB
+	probe := &deleteCountingProbe{match: "audit_log"}
+	wrapped := sql.OpenDB(deleteCountingConnector{
+		dsn:   file + "?_pragma=busy_timeout(30000)",
+		inner: &sqlitedriver.Driver{},
+		probe: probe,
+	})
+	db.AuditDB = wrapped
+	return probe, func() {
+		_ = wrapped.Close()
+		db.AuditDB = previous
+	}
+}
+
+// Given 过期审计行跨多条 DELETE 批，第一批执行完成后审计库句柄被关停置 nil
+// （关停排空超时后 db.Close 执行，在途清理轮仍在下一批）。
+// When 执行保留清理。
+// Then 返回可见错误而非 nil 解引用 panic；已删除批次不可逆，计数如实。
+func TestCleanupAuditLogs_auditDBClosedMidRunDoesNotPanic(t *testing.T) {
+	newAuditCleanupFixture(t, 7, 3)
+	counter, restore := wrapAuditDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+	counter.afterExec = func(n int) {
+		if n == 1 {
+			db.AuditDB = nil // 关停尾部 db.Close() 的等价形态
+		}
+	}
+
+	n, err := CleanupAuditLogs(t.Context())
+
+	if err == nil {
+		t.Fatal("审计库关停后必须返回错误（任务落 failed），不得静默成功")
+	}
+	if n != 3 {
+		t.Fatalf("CleanupAuditLogs()=%d, want 3（已删除批次必须计入真实部分计数）", n)
+	}
+}
+
+// Given 过期审计行跨多条 DELETE 批，第一批执行完成后 ctx 被取消（任务取消/
+// 关停）。
+// When 执行保留清理。
+// Then 返回 context.Canceled + 已删除批次真实计数——批间复检让关停能中断本轮，
+// 且不得把部分删除报成清理完成。
+func TestCleanupAuditLogs_cancelBetweenBatchesReturnsContextError(t *testing.T) {
+	newAuditCleanupFixture(t, 7, 3)
+	counter, restore := wrapAuditDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	counter.afterExec = func(n int) {
+		if n == 1 {
+			cancel()
+		}
+	}
+
+	n, err := CleanupAuditLogs(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled, got %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("CleanupAuditLogs()=%d, want 3（已删除批次必须计入真实部分计数）", n)
 	}
 }

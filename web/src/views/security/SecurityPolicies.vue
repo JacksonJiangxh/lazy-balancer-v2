@@ -54,17 +54,27 @@
         </el-table-column>
         <el-table-column label="关联规则" width="100" align="center">
           <template #default="{ row }">
-            <!-- 关联规则 drill-down 必须键盘可达：hover-only tooltip 内的 div 既
-                 开不了也点不到。reference 可聚焦 + focus 触发；内容行用具名 button
-                 （Tab 进 popper 后可回车跳到该规则）。 -->
-            <el-tooltip v-if="policyBoundRules(row.id).length > 0" placement="top" popper-class="policy-rules-popper" :popper-options="popperViewportSafe" :trigger="['hover', 'focus']">
-              <template #content>
-                <button v-for="rule in policyBoundRules(row.id)" :key="rule.caddy_id" type="button" class="policy-rule-row" @click="openRuleInNewTab(rule.caddy_id)">
-                  {{ rule.name }} ({{ rule.caddy_id }})
-                </button>
+            <!-- 关联规则 drill-down 必须键盘可达：hover-only tooltip 里的 div 既开不了
+                 也点不到，而 role="button" 的 span 没有任何激活行为=假按钮。改用
+                 el-dropdown（click 触发 + 菜单内 roving focus + Esc 关闭）：reference 是
+                 真按钮，Enter/Space 打开后焦点进入菜单，可逐条跳到规则。 -->
+            <el-dropdown
+              v-if="policyBoundRules(row.id).length > 0"
+              trigger="click"
+              placement="bottom-start"
+              popper-class="policy-rules-popper"
+              :popper-options="popperViewportSafe"
+              @command="openRuleInNewTab"
+            >
+              <button type="button" class="policy-rule-count" :aria-label="`关联规则 ${row.rule_count} 条，查看并跳转规则`">{{ row.rule_count }}</button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-for="rule in policyBoundRules(row.id)" :key="rule.caddy_id" :command="rule.caddy_id">
+                    {{ rule.name }} ({{ rule.caddy_id }})
+                  </el-dropdown-item>
+                </el-dropdown-menu>
               </template>
-              <span class="policy-rule-count" tabindex="0" role="button" :aria-label="`关联规则 ${row.rule_count} 条，查看并跳转列表`">{{ row.rule_count }}</span>
-            </el-tooltip>
+            </el-dropdown>
             <template v-else>{{ row.rule_count }}</template>
           </template>
         </el-table-column>
@@ -195,7 +205,7 @@
         <DialogHeader :icon="Lock" :title="editingId ? (isReadOnly ? '查看策略' : '编辑策略') : '新建策略'"
           :subtitle="EDITOR_SUBTITLES[editorPolicyType]" tone="primary" />
       </template>
-      <el-steps :active="visualStepIndex" finish-status="success" align-center class="wizard-steps" :class="{ 'is-clickable': stepsClickable }">
+      <el-steps :active="visualStepIndex" finish-status="success" align-center class="wizard-steps" :class="{ 'is-clickable': stepsClickable && !saving }">
         <el-step
           v-for="step in visibleSteps"
           :key="step"
@@ -208,7 +218,7 @@
       <div class="wizard-content">
         <!-- Step 0: 基础信息 -->
         <div v-show="currentStep === WIZARD_STEP.BASIC" class="step-content">
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <!-- 策略类型：新建时选择（决定步骤条与表单裁剪）；编辑时固定展示。
                  与 el-form-item label 完全同构（用户裁定）；radio 不用 el-radio-group
                  包组——组容器 DIV 会被 EP 注册为表单输入 id 触发 Firefox label-for 告警，
@@ -248,7 +258,7 @@
               <span v-else class="stage-projection-empty">将应用于 {{ boundRules.length }} 条已关联规则</span>
             </div>
           </div>
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="信任 IP">
               <div class="acl-inline-row">
                 <el-select v-model="ipWhitelist" multiple filterable allow-create default-first-option placeholder="输入 IP/CIDR 后回车" class="acl-inline-select" />
@@ -289,7 +299,7 @@
               <span v-else class="stage-projection-empty">将应用于 {{ boundRules.length }} 条已关联规则</span>
             </div>
           </div>
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <!-- 原生表单行（2026-10-11 用户裁定：对齐统一走 el-form-item；Firefox
                  label-for 控制台告警为 EP 上游已知形态，非用户可见） -->
             <el-form-item label="WAF 模式">
@@ -538,7 +548,7 @@
             </div>
           </div>
           <el-divider content-position="left" class="acl-divider">访问控制</el-divider>
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="启用">
               <el-switch v-model="form.ip_acl_enabled" />
             </el-form-item>
@@ -578,7 +588,7 @@
             </template>
           </el-form>
           <el-divider content-position="left" class="acl-divider">区域控制</el-divider>
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="启用">
               <!-- 开关即生效状态：关闭提交 geoip_mode='off'（后端零发射），名单
                    保留不清单（重开即复用）；从 off 重开时控制模式回落 deny。 -->
@@ -644,7 +654,7 @@
               <span class="stage-projection-empty">{{ boundRules.length > 0 ? `将应用于 ${boundRules.length} 条已关联规则` : '尚未关联规则' }}</span>
             </div>
           </div>
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="启用">
               <el-switch v-model="form.rate_limit_enabled" />
             </el-form-item>
@@ -662,7 +672,7 @@
 
         <!-- Step 4: 关联规则 -->
         <div v-show="currentStep === WIZARD_STEP.BINDINGS" class="step-content">
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="已关联">
               <div class="rule-bind-field">
                 <div class="rule-picker-trigger" role="button" tabindex="0" :class="{ 'is-locked': isReadOnly }" @click="!isReadOnly && openRulePicker()" @keydown.enter.prevent="!isReadOnly && openRulePicker()" @keydown.space.prevent="!isReadOnly && openRulePicker()">
@@ -752,7 +762,7 @@
               <span v-else class="stage-projection-empty">将应用于 {{ boundRules.length }} 条已关联规则</span>
             </div>
           </div>
-          <el-form :model="form" label-width="100px" :disabled="isReadOnly">
+          <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="拦截页面">
               <el-select v-model="form.block_page_id" placeholder="选择拦截页面" style="width: 100%">
                 <el-option :value="0" :label="editorPolicyType === 'stage2' ? '不使用自定义页面（429 空响应体）' : '不使用自定义页面（Caddy 默认 403）'" />
@@ -840,10 +850,10 @@
 
       <template #footer>
         <div class="wizard-footer">
-          <el-button v-if="hasPreviousStep" @click="prevStep">
+          <el-button v-if="hasPreviousStep" :disabled="saving" @click="prevStep">
             <el-icon><ArrowLeft /></el-icon>上一步
           </el-button>
-          <el-button v-if="hasNextStep" type="primary" @click="nextStep">
+          <el-button v-if="hasNextStep" type="primary" :disabled="saving" @click="nextStep">
             下一步<el-icon><ArrowRight /></el-icon>
           </el-button>
           <el-button v-if="currentStep === WIZARD_STEP.PREVIEW" type="primary" :disabled="isReadOnly" :loading="saving" @click="handleSave">
@@ -1064,6 +1074,9 @@ const crsExcludedRows = ref<CrsExcludedRow[]>([])
 
 const loading = ref(false)
 const saving = ref(false)
+// 保存中冻结表单与步骤导航：payload 跨多个 await 组装，在途时的编辑会让
+// 「是否生效」取决于编辑落在哪个 await 之后，成功提示也不披露被丢弃的字段。
+const formFrozen = computed(() => isReadOnly.value || saving.value)
 const policies = ref<PolicySummary[]>([])
 // 主列表拉取失败必须可辨识（否则「加载失败」与「确实没有策略」同形，
 // 用户会误以为策略被清空）。失败保留旧数据，仅置错误态供横幅+重试。
@@ -2251,7 +2264,7 @@ const moveToAdjacentWizardStep = (direction: -1 | 1): void => {
 }
 
 const jumpToStep = (step: WizardStep): void => {
-  if (!stepsClickable.value) return
+  if (!stepsClickable.value || saving.value) return
   currentStep.value = step
 }
 
@@ -3829,23 +3842,18 @@ onMounted(async () => {
 
 /* 兜底：关联规则多时 popper 可超视口——flip 回退之外由内部滚动承接*/
 .policy-rules-popper { max-height: 60vh; overflow-y: auto; }
-.policy-rules-popper .policy-rule-row {
-  display: block;
-  width: 100%;
-  padding: 4px 8px;
+.policy-rules-popper .el-dropdown-menu { padding: 4px 0; }
+.policy-rules-popper .el-dropdown-menu__item { font-size: 12px; line-height: 1.6; }
+/* reference 是真按钮（原为无激活行为的 span）：清掉 UA 按钮外观，保留文本外观
+   与焦点环；键盘激活交给 el-dropdown 的 click 触发 */
+.policy-rule-count {
+  padding: 0 2px;
   border: 0;
   background: transparent;
   color: inherit;
   font: inherit;
-  font-size: 12px;
-  line-height: 1.6;
-  text-align: left;
-  border-radius: 4px;
   cursor: pointer;
-  transition: background-color 0.2s ease;
 }
-.policy-rules-popper .policy-rule-row:hover { background-color: rgba(255, 255, 255, 0.12); }
-.policy-rules-popper .policy-rule-row:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 1px; }
 .policy-rule-count:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; border-radius: 2px; }
 
 /* el-cascader 懒加载面板（teleported 到 body）：菜单放宽，给两行规则叶与组 label 留足宽度 */

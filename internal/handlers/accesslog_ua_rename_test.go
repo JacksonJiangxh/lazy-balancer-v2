@@ -6,6 +6,7 @@ package handlers
 // 回归：合法改名（remote_ip→src）与无关改名放行。
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,5 +158,85 @@ func TestUpdateConfig_accessLogFormatIgnoredWhenJSONDisabled(t *testing.T) {
 	}
 	if storedJSON != "0" || storedFormat != "" {
 		t.Fatalf("落库終态 json=%s format=%q, want 0/空", storedJSON, storedFormat)
+	}
+}
+
+// access_log_format 是管理员可写的自由多行 DSL（每行 `路径 -> 动作`）：无规模
+// 门时超长格式可落库，并按「格式行数 × 启用日志规则数」放大 /load 载荷、LKG/
+// 集群快照与变更计划。写侧与规则文本长度门同口径 400 点名（不静默截断）：
+// 行数上限 200、总字节上限 16KiB。
+func TestUpdateConfig_accessLogFormatSizeLimit(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/config", h.UpdateConfig)
+	router.POST("/config/preview", h.PreviewConfigUpdate)
+	send := func(method, path, format string) *httptest.ResponseRecorder {
+		payload, err := json.Marshal(map[string]any{"source": "caddy", "access_log_format": format})
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		request := httptest.NewRequest(method, path, strings.NewReader(string(payload)))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		return recorder
+	}
+	preview := func(format string) *httptest.ResponseRecorder {
+		return send(http.MethodPost, "/config/preview", format)
+	}
+	// 存量为 JSON 输出开启（默认值），避免跨字段门抢先 400 掩盖规模门。
+	if _, err := db.DB.Exec(`UPDATE global_config SET access_log_json=1 WHERE id=1`); err != nil {
+		t.Fatalf("seed access_log_json: %v", err)
+	}
+
+	// 行数边界：199 行普通映射 + 归一自动补的脱敏行 = 落库 200 行放行；
+	// 200 行普通映射归一后 201 行即 400（门认落库值，否则回读再保存会被自己
+	// 的门拒绝）；201 行原始串在归一前就超限。
+	const line = "request>host -> h"
+	joinLines := func(n int) string {
+		lines := make([]string, n)
+		for i := range lines {
+			lines[i] = line
+		}
+		return strings.Join(lines, "\n")
+	}
+	if res := preview(joinLines(199)); res.Code != http.StatusOK {
+		t.Fatalf("199 行（归一后 200 行）status=%d body=%s, want 200（上限内不得拦截）", res.Code, res.Body.String())
+	}
+	atCap := joinLines(200)
+	if res := preview(atCap); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("200 行（归一后 201 行）preview status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	if res := send(http.MethodPut, "/config", atCap); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("200 行（归一后 201 行）save status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	over := joinLines(201)
+	if res := preview(over); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("201 行 preview status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	if res := send(http.MethodPut, "/config", over); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("201 行 save status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+
+	// 字节边界：恰好 16KiB（已含规范脱敏行=归一幂等，落库值等于输入）放行，
+	// 超 1 字节 400。
+	const maxBytes = 16 * 1024
+	prefix := "request>host -> "
+	exact := prefix + strings.Repeat("a", maxBytes-1-len(accessLogRedactionLine)-len(prefix)) + "\n" + accessLogRedactionLine
+	if len(exact) != maxBytes {
+		t.Fatalf("夹具长度=%d, want %d", len(exact), maxBytes)
+	}
+	if normalized := normalizeAccessLogRedaction(exact); normalized != exact {
+		t.Fatalf("夹具必须是归一幂等形态（长度 %d→%d）", len(exact), len(normalized))
+	}
+	if res := preview(exact); res.Code != http.StatusOK {
+		t.Fatalf("恰好 16KiB status=%d body=%s, want 200", res.Code, res.Body.String())
+	}
+	if res := preview(exact + "c"); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "字节") {
+		t.Fatalf("16KiB+1 preview status=%d body=%s, want 400 含「字节」", res.Code, res.Body.String())
+	}
+	if res := send(http.MethodPut, "/config", exact+"c"); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "字节") {
+		t.Fatalf("16KiB+1 save status=%d body=%s, want 400 含「字节」", res.Code, res.Body.String())
 	}
 }

@@ -90,6 +90,25 @@ var (
 	// DeploymentCleanupJobStatusSQL 同上，供补扫 cleanup 分支的 SQL IN 复用
 	// （该分支刻意不覆盖 downloaded——否则 downloaded 行会绕过窗口与沉降判据）。
 	DeploymentCleanupJobStatusSQL = "'" + strings.Join(deploymentCleanupJobStatuses, "','") + "'"
+	// deploymentPersistenceJobStatuses = 部署生命周期 + downloading：
+	// downloading 是唯一「ACME 证书字节已到手、但 downloaded 进度行未落库」的
+	// active 形态（issuer 的 stage 序列为 …finalized→waiting_order_valid→
+	// order_valid→downloading→downloaded），一次瞬时 DB 写失败就让行停在这里。
+	// 若部署链只用部署生命周期求值，失败回写首查 0 行提前返回：刚签发的材料
+	// 只存在内存、任务滞留 active 且无周期通道（补扫只收 downloaded/cleanup_*，
+	// 启动恢复只收非终态）。
+	// 其余 active 签发态刻意不在集合内：它们发生在证书字节到手之前，走到部署
+	// 失败回写的材料必然来自更早的尝试（并发 requeue/取消后的陈旧回调），把行
+	// 写回 downloaded 会越权改写正在进行的签发（见
+	// doesNotDowngradeOutsideDeployableLifecycle 契约）。queued/waiting_ca 同理
+	// 由队列/CA 退避链维护。
+	deploymentPersistenceJobStatuses = func() []string {
+		statuses := make([]string, 0, len(deploymentLifecycleJobStatuses)+1)
+		statuses = append(statuses, deploymentLifecycleJobStatuses...)
+		statuses = append(statuses, "downloading")
+		sort.Strings(statuses)
+		return statuses
+	}()
 )
 
 type jobTransitionExecutor interface {

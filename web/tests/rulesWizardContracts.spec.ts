@@ -11,6 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { code, repoCode, section } from './_helpers.ts'
 import { RULE_NUMERIC_LIMITS } from '../src/utils/ruleValidation.ts'
+import { proxyTimeoutSummary } from '../src/utils/proxyTimeouts.ts'
 
 const page = code('src/views/Rules.vue')
 
@@ -33,7 +34,7 @@ test('A 向导不再自带第二份策略字面量，卡片与白名单均由共
   assert.doesNotMatch(page, /\{ value: 'least_conn', title:/, '卡片文案不得回流到视图')
 })
 
-test('B 提交路径镜像步进 host 门（跳步保存不得静默剔除空 host 行）', () => {
+test('B 提交路径镜像步进完整性门（跳步保存不得静默剔除空 host/port 行）', () => {
   const body = section(page, 'const submitWizard = async', 'const data: UpdateRuleRequest')
   assert.match(
     body,
@@ -42,13 +43,18 @@ test('B 提交路径镜像步进 host 门（跳步保存不得静默剔除空 ho
   )
   assert.match(
     body,
-    /if \(wizardForm\.upstreams\.some\(\(u, i\) => upstreamRowNeedsHost\(u, i\)\)\) \{\s*ElMessage\.warning\('请填写所有已启用上游服务器的主机地址'\)/,
-    '缺 host 门时空 host 行会被载荷过滤静默剔除，保存「成功」但规则少了上游',
+    /if \(wizardForm\.upstreams\.some\(\(u, i\) => upstreamRowInvalid\(u, i\)\)\) \{\s*ElMessage\.warning\(upstreamFieldWarning\.value \|\| '请填写所有已启用上游服务器的主机地址与端口'\)/,
+    '缺 host/port 门时空行会被载荷过滤静默剔除，保存「成功」但规则少了上游',
   )
-  // 载荷侧静默剔除仍在（host+port 身份过滤），但门必须在其之前拦截
-  const gateAt = body.indexOf('upstreamRowNeedsHost(u, i)')
+  // 谓词两腿：host 与 port 缺一即无效（端口清空曾不报错也不进载荷）
+  const predicates = section(page, 'const upstreamRowMissingHost', 'const upstreamFieldWarning')
+  assert.match(predicates, /!u\.host && u\.enabled !== false && upstreamTouched\.value\[i\]/, 'host 腿缺失')
+  assert.match(predicates, /!\(Number\(u\.port\) > 0\) && u\.enabled !== false && upstreamTouched\.value\[i\]/, 'port 腿缺失')
+  assert.match(predicates, /upstreamRowMissingHost\(u, i\) \|\| upstreamRowMissingPort\(u, i\)/, '完整门须两腿并集')
+  // 载荷侧过滤仍在（host+port 身份过滤），但门必须在其之前拦截
+  const gateAt = body.indexOf('upstreamRowInvalid(u, i)')
   const filterAt = body.indexOf('filter(u => u.host && u.port)')
-  assert.ok(gateAt >= 0 && filterAt > gateAt, 'host 门必须先于载荷过滤')
+  assert.ok(gateAt >= 0 && filterAt > gateAt, '完整性门必须先于载荷过滤')
 })
 
 test('C 三个辅助端点失败有错误态 + 横幅重试（不再仅 console）', () => {
@@ -203,4 +209,47 @@ test('K TLS 证书详情重试成功后触发解析（验证块与预览不得�
   const validate = retry.indexOf('void validateCertificate()')
   assert.ok(assignKey > 0, '证书回填缺失')
   assert.ok(validate > assignKey, '回填后必须触发解析（derive 效果与正常加载路径一致）')
+})
+
+test('L 预览覆盖高级步全部可编辑项（请求体/Keepalive/代理超时/强制 HTTP1）', () => {
+  const preview = section(page, 'title="配置预览"', '</el-descriptions>')
+  assert.match(preview, /label="请求体大小"/, '请求体大小 0=全局默认的特殊语义必须可核')
+  assert.match(preview, /label="Keepalive 超时"/)
+  assert.match(preview, /label="代理超时"/)
+  assert.match(preview, /label="强制 HTTP\/1\.1"/)
+  // 代理超时七项不另造第二份清单：摘要取自字段单源
+  assert.match(preview, /\{\{ proxyTimeoutSummary\(wizardForm\) \}\}/)
+
+  // 摘要行为：0 继承全局、-1 立即透传、>0 秒值
+  const base = {
+    proxy_dial_timeout: 10,
+    proxy_response_header_timeout: 0,
+    proxy_read_timeout: 60,
+    proxy_write_timeout: 0,
+    proxy_stream_timeout: 0,
+    proxy_flush_interval: -1,
+    proxy_stream_close_delay: 5,
+  }
+  const summary = proxyTimeoutSummary(base)
+  for (const clause of ['连接超时 10s', '响应头超时 全局', '读超时 60s', '流式超时 全局', '刷新间隔 立即透传', '流关闭延迟 5s']) {
+    assert.ok(summary.includes(clause), `摘要缺 ${clause}：${summary}`)
+  }
+  // 七项全列（任一缺席都与「核对面」承诺矛盾）
+  assert.equal(summary.split(' / ').length, 7)
+})
+
+test('M 「从文件读取」写入后重算证书校验（不得停留在上一份材料结论）', () => {
+  const paste = section(page, 'const pasteFromFile = ', 'const openWizard = ')
+  const certAssign = paste.indexOf('wizardForm.tls_cert = content')
+  const keyAssign = paste.indexOf('wizardForm.tls_key = content')
+  const revalidate = paste.indexOf('void validateCertificate()')
+  assert.ok(certAssign > 0 && keyAssign > 0, '两路写入缺失')
+  assert.ok(revalidate > keyAssign, '赋值之后必须重算（validateCertificate 自带会话/序号守卫）')
+})
+
+test('N 统计单飞锁在重试入口移交所有权（重试后不得永久冻结）', () => {
+  const start = section(page, 'const startLogStats = async', 'const onRuleLogTabChange')
+  const reset = start.indexOf('logStatsInFlight.value = false')
+  const seq = start.indexOf('const requestSeq = ++ruleLogRequestSeq')
+  assert.ok(reset > 0 && seq > reset, '重试先清锁再取新 seq（旧在途请求的 finally 因 seq 失配不会释放）')
 })

@@ -677,7 +677,7 @@ func TestConfigBackup_export_preserves_sensitive_columns(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (name, dns_credentials) VALUES ('dnspod', '{"secret_id":"dns-cred","secret_key":"k"}')`); err != nil {
 		t.Fatalf("seed certificate config: %v", err)
 	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET dns_credentials='dns-secret', admin_tls_cert='admin-cert', admin_tls_key='admin-key' WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_cert='admin-cert', admin_tls_key='admin-key' WHERE id=1`); err != nil {
 		t.Fatalf("seed global config: %v", err)
 	}
 	router := gin.New()
@@ -706,9 +706,9 @@ func TestConfigBackup_export_preserves_sensitive_columns(t *testing.T) {
 	if seededCA == nil {
 		t.Fatal("seeded ca_providers row not found in export")
 	}
-	// global_config.dns_credentials 是遗留列：读路径不回显、写路径已移除、
-	// 存量由启动迁移置空——导出必须剔除（旧备份导入时同样跳过），否则
-	// 不可见凭证会随每次备份外带。
+	// global_config.dns_credentials 是退役列（启动迁移删除该列）：读路径不回显、
+	// 写路径已移除——导出必须不含该键（旧备份导入时同样跳过），否则不可见凭证
+	// 会随每次备份外带。
 	if _, present := backup.Config["dns_credentials"]; present {
 		t.Fatal("export 携带遗留 global_config.dns_credentials（应剔除）")
 	}
@@ -856,6 +856,7 @@ func TestImportConfigBackup_ignoresDeadMetricsRetentionDaysKey(t *testing.T) {
 		{name: "invalid form ignored", value: "bogus"},
 	} {
 		t.Run(item.name, func(t *testing.T) {
+			preserveApplicationLogLevel(t, "")
 			// Given
 			h := newBackupTestHandlers(t)
 			completeTables := make(map[string][]map[string]any, len(configBackupTables))

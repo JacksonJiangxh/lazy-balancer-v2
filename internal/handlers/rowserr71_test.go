@@ -79,6 +79,7 @@ func (rowsErrZeroRows) Next([]driver.Value) error { return io.EOF }
 // captureLog 捕获标准库日志输出（services.Logf 的 warn/error 落点）。
 func captureLog(t *testing.T) *strings.Builder {
 	t.Helper()
+	preserveApplicationLogLevel(t, "info")
 	var buf strings.Builder
 	old := log.Writer()
 	log.SetOutput(&buf)

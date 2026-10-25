@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -579,5 +580,20 @@ func TestEncodeKeyPEM_unknownTypeFailsLoudly(t *testing.T) {
 	ecPEM, err := EncodeKeyPEM(ecKey)
 	if err != nil || !strings.Contains(ecPEM, "EC PRIVATE KEY") {
 		t.Fatalf("EncodeKeyPEM(ecdsa)=(%q,%v), want EC PEM", ecPEM, err)
+	}
+}
+
+// 账户密钥落盘必须持久（fsync + 父目录同步）：落盘失败不得当作注册成功——
+// 非持久写在掉电/硬杀窗口会留下不存在或截断的密钥（下次注册生成新账户，
+// 或 fail-closed 到人工删除），而调用方会以为账户已可复用。
+func TestLoadOrCreateAccountKey_failsWhenDurableWriteFails(t *testing.T) {
+	original := accountKeyWrite
+	accountKeyWrite = func(string, []byte, os.FileMode) error { return errors.New("simulated fsync failure") }
+	t.Cleanup(func() { accountKeyWrite = original })
+
+	_, err := loadOrCreateAccountKey(t.TempDir(), "https://acme.example/directory", "admin@example.com", "", nil)
+
+	if err == nil || !strings.Contains(err.Error(), "写入 ACME 账户密钥") {
+		t.Fatalf("error=%v, want 落盘持久化失败上抛", err)
 	}
 }

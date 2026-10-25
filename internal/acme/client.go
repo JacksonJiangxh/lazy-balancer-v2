@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/internal/atomicfile"
 	"lazy-balancer-v2/internal/models"
 
 	"golang.org/x/crypto/acme"
@@ -173,6 +174,11 @@ type accountKeyMetadata struct {
 	EABKeyDigest string `json:"eab_key_digest,omitempty"`
 }
 
+// accountKeyWrite 是账户密钥/元数据落盘的测试缝（默认持久化原子写：
+// fsync + 父目录同步）。用于覆盖「落盘持久化失败」的失败路径——默认实现
+// 见 internal/atomicfile.WriteAtomic。
+var accountKeyWrite = atomicfile.WriteAtomic
+
 func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey []byte) (*ecdsa.PrivateKey, error) {
 	// dataDir 为空时密钥路径退化为 CWD 相对路径（曾使 handlers 测试
 	// 在仓库内堆积数千个账户私钥），入口直接拒绝，对齐 dnsprovider/factory.go
@@ -224,13 +230,12 @@ func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey 
 	if err != nil {
 		return nil, err
 	}
-	tmp := keyPath + ".tmp"
-	if err := os.WriteFile(tmp, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0600); err != nil {
+	// 账户密钥必须持久化落盘（fsync + 父目录同步，与仓内其他簿记文件同一
+	// 契约）：掉电/硬杀落在写入窗口时，非持久写会留下「不存在」或截断的密钥
+	// ——前者导致下次注册生成新账户（CA 账户 churn），后者 fail-closed 直到
+	// 人工删除文件。落盘失败不得当作成功注册（密钥未持久 = 账户无法复用）。
+	if err := accountKeyWrite(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0600); err != nil {
 		return nil, fmt.Errorf("写入 ACME 账户密钥: %w", err)
-	}
-	if err := os.Rename(tmp, keyPath); err != nil {
-		_ = os.Remove(tmp)
-		return nil, fmt.Errorf("部署 ACME 账户密钥: %w", err)
 	}
 	// 与既有密钥路径同口径——密钥已
 	// 落盘即可用，元数据仅是卫生清理的输入，写失败只记 warn。
@@ -264,13 +269,8 @@ func writeAccountKeyMetadata(keyPath, directoryURL, email, eabKID, eabKeyDigest 
 		return fmt.Errorf("编码 ACME 账户密钥元数据: %w", err)
 	}
 	metadataPath := keyPath + ".json"
-	tmp := metadataPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := accountKeyWrite(metadataPath, data, 0600); err != nil {
 		return fmt.Errorf("写入 ACME 账户密钥元数据: %w", err)
-	}
-	if err := os.Rename(tmp, metadataPath); err != nil {
-		removeErr := os.Remove(tmp)
-		return fmt.Errorf("部署 ACME 账户密钥元数据: %w", errors.Join(err, removeErr))
 	}
 	return nil
 }

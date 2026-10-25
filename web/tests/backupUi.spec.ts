@@ -54,7 +54,7 @@ test('还原文案按备份分类，失败行不显示下载', () => {
   assert.match(restore, /autoBackupScopeText\(row\)/)
   assert.match(restore, /覆盖该备份包含的分类/)
   assert.doesNotMatch(restore, /覆盖当前全部配置/)
-  assert.match(page, /<el-button v-if="row\.status === 'success'" link type="primary" size="small" @click="downloadAutoBackup\(row\)">下载<\/el-button>/)
+  assert.match(page, /<el-button v-if="row\.status === 'success'" link type="primary" size="small" :disabled="autoBackupActionBusy" @click="downloadAutoBackup\(row\)">下载<\/el-button>/)
 })
 
 test('下次备份只消费调度器返回值并标明补跑', () => {

@@ -428,10 +428,10 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		// 与运行时/节点状态阈值同界，存量脏数据不得原样展示。
 		cfg.SyncInterval = 86400
 	}
-	// （2026-09-05 证书域审计裁定）：global_config.dns_credentials 为遗留字段
-	// （签发链唯一凭证来源是 certificate_configs.dns_credentials，前端零消费，
-	// v1/v2 导入走 DB 直读不受影响），GET /config 不再返回其值，恒为空串。
-	// UpdateConfig 写路径与集群快照同步保留不动（v1 导入兼容）。
+	// （2026-09-05 证书域审计裁定，2026-10-26 列退役）：global_config.dns_credentials
+	// 为退役列（签发链唯一凭证来源是 certificate_configs.dns_credentials，前端
+	// 零消费），GET /config 不再返回该键；写路径同步收口，集群快照亦不再携带，
+	// 存量列由启动迁移删除。
 
 	cfg.HasGitHubToken = cfg.GitHubToken != ""
 	// 自定义 Caddy 配置可能内联私钥或敏感 header；与规则 tls_key 同口径，
@@ -485,6 +485,11 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	}
 
 	if req.AccessLogFormat != nil {
+		// 规模门先于语义门：字节/行数检查不解析 DSL，超大串先按规模 400，
+		// 避免对整串做逐行解析。
+		if err := validateAccessLogFormatSize(*req.AccessLogFormat); err != nil {
+			return err
+		}
 		if err := validateAccessLogFormat(*req.AccessLogFormat); err != nil {
 			return err
 		}
@@ -493,6 +498,11 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		// 猜测渲染层偷偷追加了什么。空格式保持为空（=「不裁剪原生字段」，
 		// 渲染层仍注入脱敏行）。
 		*req.AccessLogFormat = normalizeAccessLogRedaction(*req.AccessLogFormat)
+		// 归一可能多出一行脱敏规则，门必须同时认落库值——否则「上限内输入
+		// + 脱敏行」落库即超限，回读再保存会被自己的门 400。
+		if err := validateAccessLogFormatSize(*req.AccessLogFormat); err != nil {
+			return fmt.Errorf("%v（保存时会自动补一行脱敏规则，落库值按此计数）", err)
+		}
 	}
 
 	// 补上限与 UI:max=10240(CaddyGlobalSettings.vue)对齐——
@@ -685,7 +695,7 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		return
 	}
 	if err := validateUpdateConfigRequest(&req); err != nil {
-		writeUpdateConfigValidationFailure(c, err)
+		writeUpdateConfigValidationFailure(c, err, false)
 		return
 	}
 	old, err := loadConfigSnapshot()
@@ -769,10 +779,22 @@ func writeConfigValidationFailure(c *gin.Context, err error, auditFailure bool) 
 // 入参校验错误：受信代理校验内含 DB 读取（读存量网段/引用展开），其失败是
 // 服务端故障——必须 500 + 固定文案并留痕，不得回 400 让管理员误判载荷非法，
 // 也不得把 SQL/驱动文本透给客户端。其余纯载荷错误保持 400 全部展示。
-func writeUpdateConfigValidationFailure(c *gin.Context, err error) {
+// auditFailure 与 writeConfigValidationFailure 同签名同口径：由调用方的审计
+// 策略决定——保存端点（PUT /config）是 Explicit，中间件不为失败兜底，5xx 必须
+// 在此留痕；预览端点（AuditPolicySkip）必须传 false，否则会给不落库的查询
+// 产生虚假留痕。4xx 不审计是既定政策。
+func writeUpdateConfigValidationFailure(c *gin.Context, err error, auditFailure bool) {
 	var readErr *trustedProxyReadError
 	if errors.As(err, &readErr) {
-		writeInternalError(c, http.StatusInternalServerError, errTrustedProxyRead.Error(), readErr.Unwrap())
+		cause := readErr.Unwrap()
+		if cause == nil {
+			cause = readErr
+		}
+		if auditFailure {
+			recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(
+				"读取受信代理配置失败", cause.Error(), services.AuditResultPart("failure")))
+		}
+		writeInternalError(c, http.StatusInternalServerError, errTrustedProxyRead.Error(), cause)
 		return
 	}
 	c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -798,7 +820,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 	if err := validateUpdateConfigRequest(&req); err != nil {
-		writeUpdateConfigValidationFailure(c, err)
+		writeUpdateConfigValidationFailure(c, err, true)
 		return
 	}
 
@@ -861,9 +883,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	// 可空列（acme_email/access_log_format/default_ca_provider_id）需支持
 	// 清空：传空值即置 NULL（COALESCE 无法区分“未传”与“清空”）。其余列保留 COALESCE 语义
 	// —— 未传(nil) 保持原值。CASE WHEN ? IS NULL 用于区分 nil 与空字符串。
-	// global_config.dns_credentials 为遗留列（签发链唯一凭证来源是
-	// certificate_configs）：读路径早已不回显，这里同步收口写分支——不可见的
-	// 凭证不再可被写入，存量值由启动迁移置空。
+	// global_config.dns_credentials 为退役列（签发链唯一凭证来源是
+	// certificate_configs）：读路径早已不回显，写分支亦已收口——不可见的凭证
+	// 不再可被写入；存量列由启动迁移删除。
 	res, err := tx.Exec(`
 			UPDATE global_config SET
 				dns_provider = COALESCE(?, dns_provider),
@@ -1770,6 +1792,33 @@ func normalizeAccessLogRedaction(format string) string {
 		out = append(out, line)
 	}
 	return strings.Join(append(out, accessLogRedactionLine), "\n")
+}
+
+// access_log_format 规模上限：该列是管理员可写的自由多行 DSL，落库后进入每次
+// 渲染（同一 encoder map 在每个启用日志的 rule logger 下重复序列化）、/load
+// 载荷、LKG/集群快照与变更计划——上限族（规则 name/description、受信网段总量、
+// IP 名单条数）对该字段逐条成立，唯独它此前无规模门。按 bytes + 物理行数计
+// （DSL 以行分隔，行数与字节数决定放大倍数），口径为落库值（写侧归一后恒含
+// 一行 X-API-Key 脱敏规则）。
+const (
+	maxAccessLogFormatBytes = 16 * 1024
+	maxAccessLogFormatLines = 200
+)
+
+// validateAccessLogFormatSize 是 access_log_format 规模门的单一事实源
+// （保存/预览共用 validateUpdateConfigRequest）。空白格式=不裁剪原生字段，
+// 不计规模。超限 400 点名（fail-visible，不做静默截断）。
+func validateAccessLogFormatSize(format string) error {
+	if strings.TrimSpace(format) == "" {
+		return nil
+	}
+	if n := len(format); n > maxAccessLogFormatBytes {
+		return fmt.Errorf("访问日志格式过长（最多 %d 字节，当前 %d 字节）", maxAccessLogFormatBytes, n)
+	}
+	if n := strings.Count(strings.TrimRight(format, "\n"), "\n") + 1; n > maxAccessLogFormatLines {
+		return fmt.Errorf("访问日志格式行数过多（最多 %d 行，当前 %d 行）", maxAccessLogFormatLines, n)
+	}
+	return nil
 }
 
 // validateAccessLogFormat enforces the fields the log stats feature relies

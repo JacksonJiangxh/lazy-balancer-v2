@@ -21,3 +21,26 @@ export function canSaveIpList(detailLoading: boolean, detailFailed: boolean): bo
 export function needsEmptyListConfirm(editingId: number | null, entries: number): boolean {
   return editingId !== null && entries === 0
 }
+
+/**
+ * 全量 PUT 之前的新鲜度差集：服务端当前存在、但本次载荷已不含的条目值。
+ *
+ * 自动封禁名单由任务持续 merge 写入（攻击者达阈值即追加条目），而弹框详情只在
+ * 打开时取一次、保存是整表替换——期间新增的封禁条目会被一并删掉（提前解封），
+ * 界面无任何提示。按值（去空白、大小写不敏感）比对，重复值只报一次。
+ */
+export function entriesMissingFromPayload(
+  serverEntries: readonly string[],
+  payloadValues: readonly string[],
+): string[] {
+  const keep = new Set(payloadValues.map((value) => value.trim().toLowerCase()))
+  const reported = new Set<string>()
+  const missing: string[] = []
+  for (const raw of serverEntries) {
+    const key = raw.trim().toLowerCase()
+    if (!key || keep.has(key) || reported.has(key)) continue
+    reported.add(key)
+    missing.push(raw.trim())
+  }
+  return missing
+}

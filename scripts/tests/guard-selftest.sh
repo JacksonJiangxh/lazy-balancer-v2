@@ -97,6 +97,22 @@ mkdir_in() { mkdir -p "$tmp_root/$(dirname "$1")"; }
 # 命中面
 # ===========================================================================
 
+# 0) 依赖/构建缓存被跟踪：.gitignore 只挡「未跟踪」，已在索引里的一律由通道 0
+#    拦下（根 node_modules 的 vitest 转译缓存曾随一次全量暂存入库）。
+reset_fixture
+mkdir_in node_modules/.vitest-cache/_metadata.json
+printf '{"web/tests/apiErrorContract.spec.ts":{"failed":true}}\n' >"$tmp_root/node_modules/.vitest-cache/_metadata.json"
+mkdir_in node_modules/.vite/vitest/CACHEDIR.TAG
+: >"$tmp_root/node_modules/.vite/vitest/CACHEDIR.TAG"
+git -C "$tmp_root" add -f node_modules
+assert_bad "tracked node_modules cache" "不得入库"
+
+# 0b) 同一目录仅存在于工作区（未跟踪）时不构成缺陷——忽略规则生效即不误报。
+reset_fixture
+mkdir_in node_modules/.vitest-cache/_metadata.json
+printf '{"failed":true}\n' >"$tmp_root/node_modules/.vitest-cache/_metadata.json"
+assert_good "untracked node_modules cache is ignored"
+
 # 1) 未跟踪文件同样入扫描面（不 git add，直接写）
 reset_fixture
 mkdir_in internal/handlers/untracked_behavior_test.go

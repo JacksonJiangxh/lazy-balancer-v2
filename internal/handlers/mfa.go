@@ -68,13 +68,13 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
-	var userID int
-	var passwordVersion, challengeVersion int64
-	var user models.User
-	err := db.DB.QueryRow(`SELECT u.id, u.password_version, ch.password_version, u.username, u.role, u.display_name, u.is_enabled, u.created_at, u.last_login, COALESCE(u.auth_provider,'local')
+	var meta db.UserRowMeta
+	var challengeVersion int64
+	// 用户列清单单源（含 is_setup_admin 与 mfa_enabled），挑战表只追加
+	// password_version 供版本绑定比对。
+	user, err := db.ScanUserRow(db.DB.QueryRow(`SELECT `+db.UserRowColumns("u")+`, ch.password_version
 		FROM mfa_challenges ch JOIN users u ON u.id = ch.user_id
-		WHERE ch.token=? AND ch.expires_at > datetime('now')`, req.MFAToken).
-		Scan(&userID, &passwordVersion, &challengeVersion, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &user.AuthProvider)
+		WHERE ch.token=? AND ch.expires_at > datetime('now')`, req.MFAToken), &meta, &challengeVersion)
 	if err != nil {
 		// DB 故障与无效挑战分判——基础设施错误 500，
 		// 不再伪装成 401（挑战无效不泄露具体原因的口径仅适用于 ErrNoRows）。
@@ -93,7 +93,10 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		rejectMFAChallengeLogin(c)
 		return
 	}
-	user.ID = userID
+	// 后续服务调用与响应构造共用单源扫描结果（user.ID 由查询载入，
+	// passwordVersion 取自同一次扫描）。
+	userID := user.ID
+	passwordVersion := meta.PasswordVersion
 
 	// 挑战绑定签发时的密码版本——签发后密码被改（自助/管理员重置），
 	// 旧挑战即使持有有效第二因子也不得换取携带新 pwd_ver 的 JWT；顺带删除。
@@ -534,16 +537,16 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 		return
 	}
 	// 重签 JWT：保留原身份声明，仅刷新 mfa_ts（与 respondLogin 同构；node_mode 重读）
-	var user models.User
-	var passwordVersion int64
+	var meta db.UserRowMeta
 	// 重读用户的 DB 错误不得并入 401「用户不可用」
 	// ——基础设施故障 500；行缺失/禁用保持 401（JWT 仍有效但账号已不可用）。
-	// 重读列必须含 auth_provider（COALESCE 与登录路径同
-	// 口径）——漏列会让所有 step-up 响应的 auth_provider 变成 ""，且存量
-	// OIDC 行（mfa_enabled=1）在 verify-step 成功后丢掉 auth_method=oidc 声明
-	// （middleware 的 MFA 门短路与集群票据直通依赖该声明）。
-	if err := db.DB.QueryRow(`SELECT id, username, role, display_name, is_enabled, created_at, last_login, password_version, COALESCE(auth_provider,'local') FROM users WHERE id=?`, userID).
-		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &user.AuthProvider); err != nil {
+	// 列清单来自单源（auth_provider 与登录路径同口径）——漏列会让所有
+	// step-up 响应的 auth_provider 变成 ""，且存量 OIDC 行（mfa_enabled=1）在
+	// verify-step 成功后丢掉 auth_method=oidc 声明（middleware 的 MFA 门短路与
+	// 集群票据直通依赖该声明）；is_setup_admin 同列清单载入，避免本路径响应
+	// 与其他用户读取端点口径分裂。
+	user, err := db.ScanUserRow(db.DB.QueryRow(`SELECT `+db.UserRowColumns("")+` FROM users WHERE id=?`, userID), &meta)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户信息失败"})
 		return
 	}
@@ -551,7 +554,7 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不可用"})
 		return
 	}
-	h.respondLoginWithMFA(c, user, passwordVersion, time.Now().Unix(), false)
+	h.respondLoginWithMFA(c, user, meta.PasswordVersion, time.Now().Unix(), false)
 }
 
 // —— 写操作 step-up 判定（路由守卫与 handler 内联副本的单源）——

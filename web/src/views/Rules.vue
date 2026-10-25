@@ -586,14 +586,14 @@
                     size="small" 
                     class="upstream-input"
                     :aria-label="`上游第 ${$index + 1} 行主机地址`"
-                    :class="{ 'is-error': upstreamRowNeedsHost(row, $index) }"
+                    :class="{ 'is-error': upstreamRowInvalid(row, $index) }"
                     @blur="upstreamTouched[$index] = true"
                   />
                 </template>
               </el-table-column>
               <el-table-column label="端口" width="96">
                 <template #default="{ row, $index }">
-                  <el-input-number v-model="row.port" :min="1" :max="65535" size="small" controls-position="right" class="upstream-input-small" :aria-label="`上游第 ${$index + 1} 行端口`" />
+                  <el-input-number v-model="row.port" :min="1" :max="65535" size="small" controls-position="right" class="upstream-input-small" :class="{ 'is-error': upstreamRowMissingPort(row, $index) }" :aria-label="`上游第 ${$index + 1} 行端口`" @blur="upstreamTouched[$index] = true" />
                 </template>
               </el-table-column>
               <el-table-column label="协议" width="88">
@@ -660,8 +660,8 @@
                 </template>
               </el-table-column>
             </el-table>
-            <div v-if="upstreamHostWarning" class="form-tip-line">
-              <span class="port-warning">{{ upstreamHostWarning }}</span>
+            <div v-if="upstreamFieldWarning" class="form-tip-line">
+              <span class="port-warning">{{ upstreamFieldWarning }}</span>
             </div>
 
             <template v-if="wizardForm.protocol === 'http'">
@@ -962,6 +962,21 @@
                  漏项会让误配置只能保存后从单规则配置查看器发现 -->
             <el-descriptions-item label="访问日志" v-if="wizardForm.protocol === 'http'">
               {{ wizardForm.log_enabled ? '开启' : '关闭' }}
+            </el-descriptions-item>
+            <!-- 高级步其余可编辑项同为「配置核对面」成员：口径取自单规则配置
+                 查看器与代理超时字段单源（utils/proxyTimeouts.ts），预览不另造
+                 第二份文案——漏项会让误配置只能保存后才发现。 -->
+            <el-descriptions-item label="请求体大小">
+              {{ (wizardForm.request_body_max_size_mb || 0) > 0 ? `${wizardForm.request_body_max_size_mb}MB` : '全局默认' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="Keepalive 超时">
+              {{ (wizardForm.upstream_keepalive_timeout || 0) > 0 ? `${wizardForm.upstream_keepalive_timeout}s` : '全局默认' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="代理超时" v-if="wizardForm.protocol === 'http'">
+              {{ proxyTimeoutSummary(wizardForm) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="强制 HTTP/1.1" v-if="wizardForm.protocol === 'http'">
+              {{ wizardForm.upstream_force_http1 ? '开启' : '关闭' }}
             </el-descriptions-item>
             <el-descriptions-item label="PROXY 协议 v2" v-if="wizardForm.protocol === 'tcp'">
               {{ wizardForm.tcp_proxy_protocol ? '启用' : '禁用' }}
@@ -1316,6 +1331,7 @@ import type {
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import PathRulesEditor from '@/components/rules/PathRulesEditor.vue'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
+import { proxyTimeoutSummary } from '@/utils/proxyTimeouts'
 import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
@@ -1897,14 +1913,32 @@ let ruleLogRequestSeq = 0
 const ruleLogHtml = computed(() => ansiToHtml(ruleLogContent.value || '暂无日志'))
 const ruleConfig = ref<RuleConfigView | null>(null)
 
-// 结构性简化（D 域 2(e)）：host 门谓词单源化——红框/常驻警告/步进门/提交门
-// 四腿共用同一谓词（提交门先全量置 touched 再判定，与步进门口径一致）；
-// 载荷过滤（host+port 身份）概念不同、不参与。
-const upstreamRowNeedsHost = (u: UpstreamInput, i: number): boolean =>
+// 结构性简化（D 域 2(e)）：上游启用行的完整性门谓词单源化——红框、常驻警告、
+// 步进门、提交门四腿共用同一谓词（提交门先全量置 touched 再判定，与步进门口径
+// 一致）。host 与 port 缺一即无效：载荷过滤按 host+port 身份剔除行，端口被
+// el-input-number 清空的行不会报错也不会进载荷——保存「成功」但规则少了上游。
+const upstreamRowMissingHost = (u: UpstreamInput, i: number): boolean =>
   !u.host && u.enabled !== false && upstreamTouched.value[i]
 
-const upstreamHostWarning = computed(() =>
-  wizardForm.upstreams.some((u, i) => upstreamRowNeedsHost(u, i)) ? '主机地址为必填项，请填写完整' : '')
+const upstreamRowMissingPort = (u: UpstreamInput, i: number): boolean =>
+  !(Number(u.port) > 0) && u.enabled !== false && upstreamTouched.value[i]
+
+const upstreamRowInvalid = (u: UpstreamInput, i: number): boolean =>
+  upstreamRowMissingHost(u, i) || upstreamRowMissingPort(u, i)
+
+// 逐行点名缺哪一列（全局 toast 只能给一句话，字段级定位靠这里）
+const upstreamFieldWarning = computed(() => {
+  const missingHost: number[] = []
+  const missingPort: number[] = []
+  wizardForm.upstreams.forEach((u, i) => {
+    if (upstreamRowMissingHost(u, i)) missingHost.push(i + 1)
+    else if (upstreamRowMissingPort(u, i)) missingPort.push(i + 1)
+  })
+  const parts: string[] = []
+  if (missingHost.length) parts.push(`第 ${missingHost.join('、')} 行主机地址`)
+  if (missingPort.length) parts.push(`第 ${missingPort.join('、')} 行端口`)
+  return parts.length ? `${parts.join('，')}为必填项，请填写完整` : ''
+})
 
 // 混合回源域名 + 主动健康检查警告谓词（2026-10-10 用户裁定）：HTTP 规则 +
 // 主动检查开启 + 未设统一健康检查域名 + 任一启用上游配置了回源域名。
@@ -2128,11 +2162,14 @@ async function retryTlsDetail(): Promise<void> {
   // 回填会把旧规则的证书材料写进新规则（manual 私钥校验还会被 tlsKeySet 放行）。
   const sessionSeq = ++tlsDetailSeq
   const openSeq = wizardOpenSeq
+  // 目标规则取 tlsDetailRuleId（失败时由 markTlsDetailFailed 记下源规则 id）——
+  // 复制流程有意清空 editingRule（新建语义），用编辑态判定会让复制态的重试恒被
+  // 丢弃：回填与提示都在守卫之后，tlsDetailError 永不清除 → TLS 步/保存永久卡死。
   const sessionAlive = (): boolean =>
     sessionSeq === tlsDetailSeq &&
     openSeq === wizardOpenSeq &&
     wizardVisible.value &&
-    editingRule.value?.caddy_id === caddyId
+    tlsDetailRuleId.value === caddyId
   tlsDetailLoading.value = true
   try {
     const resp = await request.get<APIResponse<Rule>>(`/rules/${encodeURIComponent(caddyId)}`)
@@ -2704,6 +2741,11 @@ const pasteFromFile = (type: 'cert' | 'key'): void => {
         wizardForm.tls_key = content
       }
       ElMessage.success('已从文件读取内容')
+      // 写入后必须重算校验：原实现只由 textarea @blur 触发（点击按钮本身会让
+      // textarea 失焦、以旧内容校验一次），新内容不回填结论会让校验块与预览
+      // 停留在上一份证书的域名/到期日。validateCertificate 自带
+      // certValidationSeq/会话守卫并先 resetCertInfo，换表单后的迟到响应不会写回。
+      void validateCertificate()
     }
     reader.onerror = () => {
       ElMessage.error('读取文件失败，请重试或手动粘贴')
@@ -3068,11 +3110,11 @@ const nextStep = (): void => {
   }
   if (currentStep.value === WIZARD_STEP.UPSTREAMS) {
     upstreamTouched.value = wizardForm.upstreams.map(() => true)
-    // host 门与提交口径对齐（只检查启用行；此处 touched 已全置 true，
-    // 故与红框/警告共用同一谓词）。提交侧 validUpstreams 按 host+port 过滤空行，
-    // 启用性由下方「至少一个启用上游」检查兜底。
-    if (wizardForm.upstreams.some((u, i) => upstreamRowNeedsHost(u, i))) {
-      ElMessage.warning('请填写所有已启用上游服务器的主机地址')
+    // 完整性门与提交口径对齐（只检查启用行；此处 touched 已全置 true，
+    // 故与红框/警告共用同一谓词）：host 与 port 缺一不放过——提交侧按
+    // host+port 过滤身份，端口清空行会被静默剔除。
+    if (wizardForm.upstreams.some((u, i) => upstreamRowInvalid(u, i))) {
+      ElMessage.warning(upstreamFieldWarning.value || '请填写所有已启用上游服务器的主机地址与端口')
       return
     }
     const validUpstreams = wizardForm.upstreams.filter(u => u.host && u.port)
@@ -3176,13 +3218,13 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  // 启用上游 host 必填门（与步进门同谓词镜像——编辑态可点步标题跳步绕过
-  // nextStep 的 UPSTREAMS 分支；缺此门时空 host 行被载荷过滤静默剔除，
-  // 保存「成功」但规则少了上游）。touched 全置与步进门口径对齐，
+  // 启用上游完整性门（host+port；与步进门同谓词镜像——编辑态可点步标题跳步
+  // 绕过 nextStep 的 UPSTREAMS 分支；缺此门时空 host/port 行被载荷过滤静默
+  // 剔除，保存「成功」但规则少了上游）。touched 全置与步进门口径对齐，
   // 同时让红框标出待补行。
   upstreamTouched.value = wizardForm.upstreams.map(() => true)
-  if (wizardForm.upstreams.some((u, i) => upstreamRowNeedsHost(u, i))) {
-    ElMessage.warning('请填写所有已启用上游服务器的主机地址')
+  if (wizardForm.upstreams.some((u, i) => upstreamRowInvalid(u, i))) {
+    ElMessage.warning(upstreamFieldWarning.value || '请填写所有已启用上游服务器的主机地址与端口')
     saving.value = false
     return
   }
@@ -3845,6 +3887,11 @@ const startLogStats = async () => {
   if (disposed) return
   const targetId = ruleLogCaddyId.value
   if (!targetId) return
+  // 单飞锁随本轮请求所有权移交：错误态「重试」会自增 ruleLogRequestSeq，
+  // 若此刻恰有流请求在途，其 finally 因 seq 失配跳过释放——不在此清锁则锁
+  // 永久为 true，统计轮询此后每 tick 早退（面板静默冻结、无 loading/错误）。
+  // 在途的旧请求同理因 seq/maps 失配不会写回。
+  logStatsInFlight.value = false
   const requestSeq = ++ruleLogRequestSeq
   // 统计起始时间走 formatDate（配置时区口径），与页面其他时间戳一致，
   // 不再用浏览器本地时区的 toLocaleString（started_at 为直接渲染的预格式化文本）
@@ -4285,6 +4332,10 @@ onUnmounted(() => {
 
 .upstream-input { width: 100%; }
 .upstream-input.is-error :deep(.el-input__wrapper) {
+  box-shadow: 0 0 0 1px #f56c6c inset;
+}
+/* 端口列（数字输入框窄列）同红框：host 与 port 缺一都算该行无效 */
+.upstream-input-small.is-error :deep(.el-input__wrapper) {
   box-shadow: 0 0 0 1px #f56c6c inset;
 }
 .upstream-input-small { width: 100%; }

@@ -1,3 +1,5 @@
+import { hasOwn } from './hasOwn.ts'
+
 /**
  * 导入/还原预览摘要的中文标签单源。
  *
@@ -38,5 +40,8 @@ const IMPORT_SUMMARY_LABELS: Readonly<Record<string, string>> = {
   tls_rules: '其中 TLS 规则',
 }
 
-/** 摘要键的中文标签；未知键回退原键（fail-visible：新表未登记时立刻可见）。 */
-export const importSummaryLabel = (key: string): string => IMPORT_SUMMARY_LABELS[key] || key
+/** 摘要键的中文标签；未知键回退原键（fail-visible：新表未登记时立刻可见）。
+ *  键来自后端 summary 的任意字符串，必须先过 hasOwn——裸下标会把原型链上的
+ *  constructor/toString 当命中（truthy，绕过回退）。 */
+export const importSummaryLabel = (key: string): string =>
+  hasOwn(IMPORT_SUMMARY_LABELS, key) ? IMPORT_SUMMARY_LABELS[key] : key

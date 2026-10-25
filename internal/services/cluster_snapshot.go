@@ -644,13 +644,15 @@ func normalizeSnapshotSecurityRetentionSettings(settings *models.ClusterBasicSet
 func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store snapshotStore, snapshot *models.ClusterSnapshot) error {
 	// 证书到期/续签天数/重试次数三列兜底统一绑定 db.Default*（消费点族单源，
 	// 读侧禁字面量回流；其余既有批 1+2 口径见各 COALESCE 注释）。
+	// global_config.dns_credentials 已退役（列由启动迁移删除，凭证唯一来源是
+	// certificate_configs.dns_credentials 并随 ACME 节同步）——不在本清单内。
 	var caddyConfig string
 	var brandingJSON string
 	err := store.QueryRowContext(ctx, `SELECT COALESCE(cluster_version,0), COALESCE(caddy_config,'{}'), COALESCE(branding_json,''),
 		COALESCE(log_level,'info'),
 		COALESCE(task_log_size_mb,10), COALESCE(audit_log_size_mb,10), COALESCE(runtime_log_size_mb,100), COALESCE(audit_retention_months,3), COALESCE(jwt_expire_minutes,20), COALESCE(timezone,?),
 		COALESCE(acme_email,''), COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,?), COALESCE(cert_renewal_attempts,?),
-		COALESCE(default_ca_provider_id,0), COALESCE(dns_provider,''), COALESCE(dns_credentials,''), COALESCE(sync_interval,60),
+		COALESCE(default_ca_provider_id,0), COALESCE(dns_provider,''), COALESCE(sync_interval,60),
 		COALESCE(admin_tls_enabled,0), COALESCE(admin_tls_mode,'selfsigned'), COALESCE(admin_tls_cert,''), COALESCE(admin_tls_key,''),
 		COALESCE(mfa_write_guard,0), COALESCE(mfa_lockout_enabled,0), COALESCE(github_proxy_url,'https://v4.gh-proxy.org/'),
 		COALESCE(oidc_config,'')
@@ -658,7 +660,7 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 		&snapshot.BasicSettings.LogLevel,
 		&snapshot.BasicSettings.TaskLogSizeMB, &snapshot.BasicSettings.AuditLogSizeMB, &snapshot.BasicSettings.RuntimeLogSizeMB, &snapshot.BasicSettings.AuditRetentionMonths, &snapshot.BasicSettings.JWTExpireMinutes, &snapshot.BasicSettings.Timezone,
 		&snapshot.BasicSettings.ACMEEmail, &snapshot.BasicSettings.CertExpiryDays, &snapshot.BasicSettings.CertRenewalDays, &snapshot.BasicSettings.CertRenewalAttempts,
-		&snapshot.BasicSettings.DefaultCAProviderID, &snapshot.BasicSettings.DNSProvider, &snapshot.BasicSettings.DNSCredentials, &snapshot.BasicSettings.SyncInterval,
+		&snapshot.BasicSettings.DefaultCAProviderID, &snapshot.BasicSettings.DNSProvider, &snapshot.BasicSettings.SyncInterval,
 		&snapshot.BasicSettings.AdminTLSEnabled, &snapshot.BasicSettings.AdminTLSMode, &snapshot.BasicSettings.AdminTLSCert, &snapshot.BasicSettings.AdminTLSKey,
 		&snapshot.BasicSettings.MFAWriteGuard, &snapshot.BasicSettings.MFALockoutEnabled, &snapshot.BasicSettings.GitHubProxyURL, &snapshot.BasicSettings.OIDCConfig)
 	if err != nil {
@@ -1109,7 +1111,11 @@ func (s *ClusterService) dumpTableAsJSON(ctx context.Context, store snapshotStor
 
 func (s *ClusterService) snapshotACME(ctx context.Context, store snapshotStore) (*models.ClusterACMEState, error) {
 	state := &models.ClusterACMEState{CAProviders: make([]models.CAProvider, 0), CertificateConfigs: make([]models.CertificateConfig, 0)}
-	rows, err := store.QueryContext(ctx, `SELECT id,name,provider,directory_url,COALESCE(credentials,''),COALESCE(max_concurrent,`+strconv.Itoa(db.DefaultCAProviderMaxConcurrent)+`),COALESCE(min_interval_ms,`+strconv.Itoa(db.DefaultCAProviderMinIntervalMS)+`),COALESCE(enabled,1),created_at,updated_at FROM ca_providers ORDER BY id`)
+	// ca_providers.enabled 的 NULL 语义与本地读侧同源（services/caproviders.go 的
+	// COALESCE(enabled,0)，fail-closed）：所有取用门都是 `WHERE enabled=1`，NULL 本就
+	// 不命中；导出成「启用」会让从节点把主节点读成禁用的同一行落成启用，主从切换后
+	// 该提供商「自己启用」，与主节点此前的失败归因相反。
+	rows, err := store.QueryContext(ctx, `SELECT id,name,provider,directory_url,COALESCE(credentials,''),COALESCE(max_concurrent,`+strconv.Itoa(db.DefaultCAProviderMaxConcurrent)+`),COALESCE(min_interval_ms,`+strconv.Itoa(db.DefaultCAProviderMinIntervalMS)+`),COALESCE(enabled,0),created_at,updated_at FROM ca_providers ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 CA 提供商: %w", err)
 	}
@@ -1131,6 +1137,9 @@ func (s *ClusterService) snapshotACME(ctx context.Context, store snapshotStore) 
 		return nil, fmt.Errorf("关闭 CA 提供商结果: %w", err)
 	}
 
+	// certificate_configs.enabled 与 ca_providers 刻意不同：本表的 NULL 语义是
+	// 「启用」（与 handlers/certificates.go 的读取列表、certissuer.go 的绑定门
+	// COALESCE(enabled,1) 同源），导出必须保持同一口径，否则主从读值分叉。
 	rows, err = store.QueryContext(ctx, `SELECT id,name,COALESCE(dns_provider,'dnspod'),COALESCE(dns_credentials,''),COALESCE(enabled,1),created_at,updated_at FROM certificate_configs ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照证书配置: %w", err)

@@ -187,12 +187,14 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
-	var user models.User
+	// 用户行列清单来自 db.UserRowColumns 单源（含 mfa_enabled/is_setup_admin
+	// ——登录响应与其余用户读取端点同口径）；password_hash/login_locked_until
+	// 仅为本路径需要的追加列。
+	var meta db.UserRowMeta
 	var passwordHash string
-	var passwordVersion int64
 	var loginLockedUntil sql.NullString
-	err := db.DB.QueryRow("SELECT id, username, password_hash, role, display_name, is_enabled, created_at, last_login, password_version, login_locked_until, COALESCE(auth_provider,'local') FROM users WHERE username = ?",
-		req.Username).Scan(&user.ID, &user.Username, &passwordHash, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &loginLockedUntil, &user.AuthProvider)
+	user, err := db.ScanUserRow(db.DB.QueryRow("SELECT "+db.UserRowColumns("")+", password_hash, login_locked_until FROM users WHERE username = ?", req.Username),
+		&meta, &passwordHash, &loginLockedUntil)
 
 	if err == sql.ErrNoRows {
 		// 对不存在的用户名也执行一次注定失败的 bcrypt 比较（结果刻意
@@ -246,15 +248,10 @@ func (h *Handlers) Login(c *gin.Context) {
 
 	// v2.1.8 MFA 两步登录：密码通过且用户已启用 MFA → 签发 5 分钟单次挑战，
 	// 不发 JWT；前端携 mfa_token 调 /auth/mfa/verify。
-	// MFA 是主认证控制（非纵深层），判定 DB 错误必须 fail-closed——
-	// 此前 err != nil 落穿 respondLogin 直接发 JWT，构成二因子静默绕过。
-	var mfaEnabled bool
-	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", user.ID).Scan(&mfaEnabled); err != nil {
-		services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
-		return
-	}
-	if mfaEnabled {
+	// MFA 是主认证控制（非纵深层），is_enabled 读取已并入本次用户查询：读库
+	// 失败在上面统一 500（fail-closed）——此前 mfa_enabled 单独查询失败落穿
+	// respondLogin 直接发 JWT，构成二因子静默绕过。
+	if meta.MFAEnabled {
 		// 密码正确但账户启用 MFA 时不在密码步清零计数——完整登录以 MFA 验证
 		// 成功为准（否则「输对密码→连错 4 次验证码→重登清零」可无限绕过锁定）；
 		// 未启用 MFA 则密码即完整登录，清零计数。
@@ -277,7 +274,7 @@ func (h *Handlers) Login(c *gin.Context) {
 		services.Logf("warn", "登录成功清零登录失败计数与锁定失败: user_id=%d: %v", user.ID, err)
 	}
 
-	h.respondLogin(c, user, passwordVersion)
+	h.respondLogin(c, user, meta.PasswordVersion)
 }
 
 func (h *Handlers) respondLogin(c *gin.Context, user models.User, passwordVersion int64) {
@@ -452,13 +449,8 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 	// 复用 contextUserID。
 	userIDInt := int(contextUserID(c))
 
-	var user models.User
-	var mfaEnabled int
-	var authProvider string
-	err := db.DB.QueryRow(`
-		SELECT id, username, role, display_name, is_enabled, created_at, last_login, COALESCE(mfa_enabled,0), COALESCE(auth_provider,'local')
-		FROM users WHERE id = ?
-	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &mfaEnabled, &authProvider)
+	var meta db.UserRowMeta
+	user, err := db.ScanUserRow(db.DB.QueryRow(`SELECT `+db.UserRowColumns("")+` FROM users WHERE id = ?`, userIDInt), &meta)
 
 	if err != nil {
 		// 基础设施故障与用户不存在不可混同：鉴权层之后、本查询之前用户被
@@ -472,9 +464,10 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 		return
 	}
 
-	response := models.NewUserResponse(user, mfaEnabled == 1)
-	// v2.3.0:OIDC 来源标记——前端据此隐藏本地显示名/密码编辑(数据源自 IdP)
-	response.AuthProvider = authProvider
+	// AuthProvider/IsSetupAdmin 均由单源查询载入，构造器单点复制（不再
+	// 手工补字段——历史上正因手工补漏项，OIDC 来源与 break-glass 标记
+	// 在同一端点上先后缺失）。
+	response := models.NewUserResponse(user, meta.MFAEnabled)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: response})
 }
 
@@ -691,16 +684,11 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		}
 	}
 
-	var user models.User
-	var authProvider string
-	// 响应回填 mfa_enabled（与 GET /users/me、登录响应
-	// 同口径）——此前 PATCH /users/me 恒返回 false，MFA 已启用用户被误导。
-	var mfaEnabled int
-	err = tx.QueryRowContext(c.Request.Context(), `
-		SELECT id, username, role, display_name, is_enabled, created_at, last_login, COALESCE(auth_provider,'local'), COALESCE(mfa_enabled,0)
-		FROM users WHERE id = ?
-	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider, &mfaEnabled)
-	user.AuthProvider = authProvider
+	var meta db.UserRowMeta
+	// 响应回填与 GET /users/me、登录响应同口径（单源列清单：mfa_enabled 与
+	// is_setup_admin 一并载入）——此前 PATCH /users/me 恒返回 mfa_enabled=false，
+	// is_setup_admin 同样恒 false，MFA 已启用用户/break-glass 判定被误导。
+	user, err := db.ScanUserRow(tx.QueryRowContext(c.Request.Context(), `SELECT `+db.UserRowColumns("")+` FROM users WHERE id = ?`, userIDInt), &meta)
 
 	if err != nil {
 		// 鉴权层与本事务之间用户被并发删除：ErrNoRows=401（与 jwtAuth 同
@@ -723,7 +711,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新信息", "用户", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	response := models.NewUserResponse(user, mfaEnabled == 1)
+	response := models.NewUserResponse(user, meta.MFAEnabled)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: response})
 }
 

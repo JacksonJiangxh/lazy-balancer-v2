@@ -217,6 +217,13 @@
           <el-form-item v-if="adminTlsForm.inspecting" label=" ">
             <el-text type="info" size="small">解析中…</el-text>
           </el-form-item>
+          <!-- 失败原因必须常驻弹框内（toast 一闪而过；「确定」变灰需可解释） -->
+          <div v-if="adminTlsForm.inspectError && !adminTlsForm.inspecting" class="info-note-bar">
+            <el-text type="danger" size="small" class="info-note-desc">{{ adminTlsForm.inspectError }}</el-text>
+          </div>
+          <div v-else-if="adminTlsMissingPairHint && !adminTlsForm.inspecting" class="info-note-bar">
+            <span class="info-note-desc">{{ adminTlsMissingPairHint }}</span>
+          </div>
           <template v-if="adminTlsForm.certInfo">
             <el-form-item label="证书信息">
               <div class="tls-cert-info">
@@ -436,9 +443,9 @@
           </el-table-column>
           <el-table-column label="操作" width="150" align="right">
             <template #default="{ row }">
-              <el-button v-if="row.status === 'success'" link type="primary" size="small" @click="downloadAutoBackup(row)">下载</el-button>
-              <el-button v-if="row.status === 'success'" link type="warning" size="small" @click="restoreAutoBackup(row)">还原</el-button>
-              <el-button link type="danger" size="small" @click="deleteAutoBackup(row)">删除</el-button>
+              <el-button v-if="row.status === 'success'" link type="primary" size="small" :disabled="autoBackupActionBusy" @click="downloadAutoBackup(row)">下载</el-button>
+              <el-button v-if="row.status === 'success'" link type="warning" size="small" :loading="restoringBackupId === row.id" :disabled="autoBackupActionBusy || backupDisabled" @click="restoreAutoBackup(row)">还原</el-button>
+              <el-button link type="danger" size="small" :loading="deletingBackupId === row.id" :disabled="autoBackupActionBusy || backupDisabled" @click="deleteAutoBackup(row)">删除</el-button>
             </template>
           </el-table-column>
           <template #empty><el-empty description="暂无备份" :image-size="70" /></template>
@@ -684,6 +691,11 @@ const autoBackupSavedSections = ref<string[]>([])
 const autoBackupLastRun = ref<string | null>(null)
 const autoBackupNextRunAt = ref<string | null>(null)
 const autoBackupCatchUpDue = ref(false)
+// 行级在途门（占位先于确认框，同 TaskMonitor/ClusterSettings 范式）：双击或
+// 连点不同行不得叠出两个确认框、并发提交两次整库覆盖/删除。
+const restoringBackupId = ref<number | null>(null)
+const deletingBackupId = ref<number | null>(null)
+const autoBackupActionBusy = computed(() => restoringBackupId.value !== null || deletingBackupId.value !== null)
 
 const autoBackupLastRunLabel = computed(() => (autoBackupLastRun.value ? formatDate(autoBackupLastRun.value) : '—'))
 const autoBackupNextRunLabel = computed<string | null>(() => {
@@ -861,70 +873,80 @@ const downloadAutoBackup = async (row: AutoBackupRow): Promise<void> => {
 }
 
 const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
-  // 写动作函数级守卫（还原会覆盖配置，仅主节点管理员可执行）
-  if (backupDisabled.value) return
-  const scope = autoBackupScopeText(row)
+  // 写动作函数级守卫（还原会覆盖配置，仅主节点管理员可执行）+ 行动作在途门
+  if (backupDisabled.value || autoBackupActionBusy.value) return
+  restoringBackupId.value = row.id
   try {
-    await ElMessageBox.confirm(
-      `将使用备份「${row.filename}」覆盖该备份包含的分类：${scope}；未包含的分类保持现状。此操作不可撤销。确认还原？`,
-      '还原配置',
-      { type: 'warning', confirmButtonText: '确认还原', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  try {
-    // 还原走导入 core(config_backup.go importConfigBackupCore),响应同样携带
-    // data.warnings 与 data.disabled_conflicts——与导入弹框同口径展示：冲突
-    // 自动禁用的规则若无提示，业务流量会在「还原成功」后静默切走。
-    const res = await request.post<{ message?: string; data?: { warnings?: string[]; disabled_conflicts?: DisabledRuleConflict[] } }>(`/auto-backup/${row.id}/restore`, undefined, { timeout: 0 })
-    autoBackupVisible.value = false
-    const warnings = res.data?.warnings ?? []
-    const disabledConflicts = res.data?.disabled_conflicts ?? []
-    const resultLines = [
-      res.message || '配置还原成功',
-      ...warnings,
-      ...(disabledConflicts.length > 0 ? [`冲突置为禁用：${disabledConflicts.length} 条`] : []),
-      ...disabledConflicts.map((conflict) => formatImportConflict(conflict, true)),
-    ]
-    await ElMessageBox.alert(
-      h('div', resultLines.map((line) => h('div', line))),
-      '还原完成',
-      {
-        confirmButtonText: '刷新页面',
-        type: warnings.length > 0 || disabledConflicts.length > 0 ? 'warning' : 'success',
-        showClose: false,
-        closeOnClickModal: false,
-        closeOnPressEscape: false,
-      },
-    )
-    window.location.reload()
-  } catch (error: unknown) {
-    // 全局拦截器已弹 message toast；失败响应携带的文件面判决（回退失败=文件与
-    // 版本记录可能分裂 / 提交结果不确定=需人工核对）必须展示——回滚只覆盖库侧，
-    // 回退失败或提交不确定时执行面可能已与库分叉，不得按「已回滚即无需动作」处理。
-    await showImportFailure(error, '配置还原失败', '还原失败')
+    const scope = autoBackupScopeText(row)
+    try {
+      await ElMessageBox.confirm(
+        `将使用备份「${row.filename}」覆盖该备份包含的分类：${scope}；未包含的分类保持现状。此操作不可撤销。确认还原？`,
+        '还原配置',
+        { type: 'warning', confirmButtonText: '确认还原', cancelButtonText: '取消' },
+      )
+    } catch {
+      return
+    }
+    try {
+      // 还原走导入 core(config_backup.go importConfigBackupCore),响应同样携带
+      // data.warnings 与 data.disabled_conflicts——与导入弹框同口径展示：冲突
+      // 自动禁用的规则若无提示，业务流量会在「还原成功」后静默切走。
+      const res = await request.post<{ message?: string; data?: { warnings?: string[]; disabled_conflicts?: DisabledRuleConflict[] } }>(`/auto-backup/${row.id}/restore`, undefined, { timeout: 0 })
+      autoBackupVisible.value = false
+      const warnings = res.data?.warnings ?? []
+      const disabledConflicts = res.data?.disabled_conflicts ?? []
+      const resultLines = [
+        res.message || '配置还原成功',
+        ...warnings,
+        ...(disabledConflicts.length > 0 ? [`冲突置为禁用：${disabledConflicts.length} 条`] : []),
+        ...disabledConflicts.map((conflict) => formatImportConflict(conflict, true)),
+      ]
+      await ElMessageBox.alert(
+        h('div', resultLines.map((line) => h('div', line))),
+        '还原完成',
+        {
+          confirmButtonText: '刷新页面',
+          type: warnings.length > 0 || disabledConflicts.length > 0 ? 'warning' : 'success',
+          showClose: false,
+          closeOnClickModal: false,
+          closeOnPressEscape: false,
+        },
+      )
+      window.location.reload()
+    } catch (error: unknown) {
+      // 全局拦截器已弹 message toast；失败响应携带的文件面判决（回退失败=文件与
+      // 版本记录可能分裂 / 提交结果不确定=需人工核对）必须展示——回滚只覆盖库侧，
+      // 回退失败或提交不确定时执行面可能已与库分叉，不得按「已回滚即无需动作」处理。
+      await showImportFailure(error, '配置还原失败', '还原失败')
+    }
+  } finally {
+    restoringBackupId.value = null
   }
 }
 
 const deleteAutoBackup = async (row: AutoBackupRow): Promise<void> => {
-  // 写动作函数级守卫
-  if (backupDisabled.value) return
+  // 写动作函数级守卫 + 行动作在途门（双击不得叠两个确认框/两次 DELETE）
+  if (backupDisabled.value || autoBackupActionBusy.value) return
+  deletingBackupId.value = row.id
   try {
-    await ElMessageBox.confirm(`确认删除备份「${row.filename}」？删除后不可恢复。`, '删除备份', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-    })
-  } catch {
-    return
-  }
-  try {
+    try {
+      await ElMessageBox.confirm(`确认删除备份「${row.filename}」？删除后不可恢复。`, '删除备份', {
+        type: 'warning',
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+      })
+    } catch {
+      return
+    }
     await request.delete(`/auto-backup/${row.id}`)
     mfaAwareSuccess('备份已删除')
-    await fetchAutoBackup()
+    // quiet=true：删除只影响列表——非 quiet 会用服务端值整体覆盖上方表单，
+    // 把用户未保存的频率/时间/保留份数/范围静默回退（同保存与立即备份轮询口径）。
+    await fetchAutoBackup(true)
   } catch {
     // 全局拦截器已提示
+  } finally {
+    deletingBackupId.value = null
   }
 }
 
@@ -1274,6 +1296,9 @@ interface AdminTlsForm {
   keyFile: File | null
   certInfo: AdminTlsCertInfo | null
   inspecting: boolean
+  // /admin-tls/inspect 失败原因：弹框内必须可见（原实现只靠瞬态 toast，
+  // 弹框只剩文件名 + 灰掉的「确定」，解析中/解析失败/配对缺失无法区分）
+  inspectError: string
 }
 
 const mfaScopeVisible = ref(false)
@@ -1436,7 +1461,7 @@ const trafficSampleN = computed<number>({
 })
 // 证书弹框表单（文件选择/校验）是临时态：随弹框关闭销毁，不随分页切换保留；
 // 已确认的暂存材料（stagedAdminTlsCert）在设置草稿里存活。
-const adminTlsForm = ref<AdminTlsForm>({ mode: 'selfsigned', certFile: null, keyFile: null, certInfo: null, inspecting: false })
+const adminTlsForm = ref<AdminTlsForm>({ mode: 'selfsigned', certFile: null, keyFile: null, certInfo: null, inspecting: false, inspectError: '' })
 const adminTlsDialogVisible = ref(false)
 // 隐藏文件选择器代理（弹框 destroy-on-close，input 置于弹框外）
 const tlsCertFileInput = ref<HTMLInputElement | null>(null)
@@ -1457,6 +1482,15 @@ const adminTlsStoredCertState = computed(() => ({
   certError: adminTlsCertError.value,
 }))
 const adminTlsReuseSaved = computed(() => adminTlsReusesSavedCert(adminTlsStoredCertState.value, adminTlsForm.value))
+// 只选了一半材料时给出可见原因：inspecting 只在两个文件齐备时启动，缺一个时
+// 弹框原本只有文件名 + 灰掉的「确定」，用户无法区分「还没选全」与「解析失败」。
+const adminTlsMissingPairHint = computed(() => {
+  if (adminTlsForm.value.mode !== 'upload') return ''
+  const hasCert = adminTlsForm.value.certFile !== null
+  const hasKey = adminTlsForm.value.keyFile !== null
+  if (hasCert === hasKey) return ''
+  return hasCert ? '已选择证书文件，还需选择私钥文件才能解析证书' : '已选择私钥文件，还需选择证书文件才能解析证书'
+})
 const adminTlsConfirmBlocked = computed(() => adminTlsConfirmDisabled(adminTlsStoredCertState.value, adminTlsForm.value))
 const adminTlsDirty = computed(() => {
   if (adminTls.value.enabled !== adminTlsSaved.value.enabled) return true
@@ -1510,13 +1544,14 @@ const openAdminTlsDialog = () => {
     keyFile: stagedAdminTlsCert.value?.keyFile ?? null,
     certInfo: stagedAdminTlsCert.value?.certInfo ?? null,
     inspecting: false,
+    inspectError: '',
   }
   adminTlsDialogVisible.value = true
 }
 
 const onAdminTlsDialogClose = () => {
   tlsInspectSeq++
-  adminTlsForm.value = { mode: 'selfsigned', certFile: null, keyFile: null, certInfo: null, inspecting: false }
+  adminTlsForm.value = { mode: 'selfsigned', certFile: null, keyFile: null, certInfo: null, inspecting: false, inspectError: '' }
   // 由开关触发的弹窗若未点「确定」就关闭，开关回退到已保存状态
   if (tlsDialogFromToggle) {
     tlsDialogFromToggle = false
@@ -1565,6 +1600,7 @@ const onTlsFile = async (e: Event, kind: 'cert' | 'key') => {
   if (kind === 'cert') adminTlsForm.value.certFile = file
   else adminTlsForm.value.keyFile = file
   adminTlsForm.value.certInfo = null
+  adminTlsForm.value.inspectError = ''
   if (adminTlsForm.value.certFile && adminTlsForm.value.keyFile) {
     const seq = ++tlsInspectSeq
     adminTlsForm.value.inspecting = true
@@ -1575,10 +1611,15 @@ const onTlsFile = async (e: Event, kind: 'cert' | 'key') => {
       const res = await request.post<{ data?: AdminTlsCertInfo }>('/admin-tls/inspect', fd)
       if (seq === tlsInspectSeq) {
         adminTlsForm.value.certInfo = res.data ?? null
+        // 解析成功但无证书信息：同样要给出可见原因，避免「确定」无声变灰
+        adminTlsForm.value.inspectError = adminTlsForm.value.certInfo ? '' : '未能从所选文件解析出证书信息，请确认文件内容完整'
       }
     } catch {
       if (seq === tlsInspectSeq) {
         adminTlsForm.value.certInfo = null
+        // 具体原因（不匹配/损坏）由后端 message 经全局拦截器 toast 呈现；此处给出
+        // 弹框内常驻解释 +「重新选择」动作，用户不必依赖一闪而过的 toast 试错。
+        adminTlsForm.value.inspectError = '证书解析失败：证书与私钥可能不匹配，或文件已损坏／不是 PEM 格式；请重新选择两个文件'
       }
     } finally {
       if (seq === tlsInspectSeq) {

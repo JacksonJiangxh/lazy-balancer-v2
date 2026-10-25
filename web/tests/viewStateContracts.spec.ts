@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, member, section, source } from './_helpers.ts'
+import { code, member, repoCode, section, source } from './_helpers.ts'
 import { bucketTerminology } from '../src/utils/threatScreenMetrics.ts'
 
 test('规则向导切 TCP 清空动态上游与 DNS 字段（隐藏控件不得留下恒拒残留）', () => {
@@ -18,15 +18,20 @@ test('规则向导切 TCP 清空动态上游与 DNS 字段（隐藏控件不得�
   assert.match(branch, /wizardForm\.dns_server = ''/)
 })
 
-test('证书详情重试按会话序号丢弃过期响应', () => {
+test('证书详情重试按会话序号丢弃过期响应（编辑与复制态同口径）', () => {
   const rules = code('src/views/Rules.vue')
   assert.match(rules, /let tlsDetailSeq = 0/)
   const retry = section(rules, 'async function retryTlsDetail', 'const resetCertInfo')
   assert.match(retry, /const sessionSeq = \+\+tlsDetailSeq/)
-  assert.match(retry, /editingRule\.value\?\.caddy_id === caddyId/, '换表单后旧响应不得回填')
+  assert.match(retry, /tlsDetailRuleId\.value === caddyId/, '目标规则判据不得依赖 editingRule（复制态恒为 null）')
+  assert.doesNotMatch(retry, /editingRule\.value\?\.caddy_id/, '复制态 editingRule 为空：用它判会话会把重试回填全部丢弃')
   assert.match(retry, /if \(!sessionAlive\(\)\) return/)
   const reset = section(rules, 'const resetWizard = ', 'const beforeWizardClose')
   assert.match(reset, /tlsDetailSeq\+\+/, '关闭向导必须作废在途重试会话')
+  // 复制入口在请求前清空 editingRule 并记录失败目标 id——两者必须同时成立
+  const copy = section(rules, 'const openCopyWizard = async', 'const viewConfig')
+  assert.match(copy, /editingRule\.value = null/)
+  assert.match(copy, /markTlsDetailFailed\(rule\.caddy_id\)/)
 })
 
 test('规则库排程在库信息未落地/读取失败时禁用并提示', () => {
@@ -320,3 +325,61 @@ test('拦截页表单与后端同源前置门（名称/描述长度、内容非�
   assert.doesNotMatch(text, /\.block-page-form \.content-form-item \.el-form-item__content/, '永不命中的 scoped 选择器已删除')
 })
 
+
+test('处理流程弹框把「证书详情加载失败」与「无可展示证书」分开（含重试）', () => {
+  const dialog = code('src/components/RuleFlowDialog.vue')
+  assert.match(dialog, /const certFailed = ref\(false\)/)
+  const load = section(dialog, 'const loadCertInfo = ', 'const retryCertInfo')
+  assert.match(load, /\.catch\(\(\) => \{/, '失败分支必须存在')
+  assert.match(load, /certFailed\.value = true/, '失败不得落成「规则禁用或证书未就绪」')
+  const template = section(dialog, 'v-if="target.enableTls && !isTcp"', '</template>')
+  assert.match(template, /v-else-if="certFailed"/, '失败态须先于 certInfo 空态渲染')
+  assert.match(template, /证书信息加载失败/)
+  assert.match(template, /@click="retryCertInfo">重试/, '失败必须可重试')
+  // 打开弹框重置失败位（上一会话的失败不得污染新会话）
+  assert.match(section(dialog, 'const onDialogOpen = ', 'const loadCertInfo'), /certFailed\.value = false/)
+})
+
+test('大屏切窗期间标题/KPI/趋势用「已渲染帧」口径（不得用当前窗口词标注旧帧）', () => {
+  const screen = code('src/views/security/ThreatScreen.vue')
+  assert.match(screen, /const frameWindowHours = computed\(\(\) => stats\.value\?\.hours \?\? windowHours\.value\)/)
+  assert.match(screen, /const frameTerms = computed\(\(\) => bucketTerminology\(frameWindowHours\.value\)\)/)
+  assert.match(screen, /const frameBucketLabel = computed\(\(\) => frameWindowHours\.value > 24 \? 'DAILY' : 'HOURLY'\)/)
+  assert.match(screen, /近 \{\{ frameTerms\.windowLabel \}\}安全态势实时监控/, '副标题须用帧口径')
+  assert.match(screen, /\{\{ frameTerms\.windowLabel \}\}安全事件 · 拦截/, 'KPI 标签须用帧口径')
+  assert.match(screen, /\{\{ frameTerms\.windowLabel \}\}事件趋势 <span class="en">\{\{ frameBucketLabel \}\}/, '趋势标题与桶词须同源')
+  assert.match(screen, /\{\{ frameTerms\.peakLabel \}\}/)
+  assert.match(screen, /\{\{ frameTerms\.countLabel \}\}/)
+  // 陈旧帧仍需明说「上次结果 · 24h」
+  assert.match(screen, /<em v-if="staleFrameLabel" class="ov-switch-hint" role="status">\{\{ staleFrameLabel \}\}<\/em>/)
+})
+
+test('策略向导保存中冻结表单与步骤导航（payload 组装窗口内的编辑不得被静默丢弃）', () => {
+  const policies = code('src/views/security/SecurityPolicies.vue')
+  assert.match(policies, /const formFrozen = computed\(\(\) => isReadOnly\.value \|\| saving\.value\)/)
+  const forms = [...policies.matchAll(/<el-form :model="form" label-width="100px" :disabled="([^"]+)">/g)].map((m) => m[1])
+  assert.ok(forms.length >= 5, `向导表单解析失败（${forms.length}）`)
+  assert.deepEqual([...new Set(forms)], ['formFrozen'], '所有步骤表单必须同门（漏一处即可在途编辑）')
+  assert.match(policies, /:class="\{ 'is-clickable': stepsClickable && !saving \}"/)
+  assert.match(policies, /const jumpToStep = \(step: WizardStep\): void => \{\s*if \(!stepsClickable\.value \|\| saving\.value\) return/)
+  assert.match(policies, /<el-button v-if="hasPreviousStep" :disabled="saving" @click="prevStep">/)
+  assert.match(policies, /<el-button v-if="hasNextStep" type="primary" :disabled="saving" @click="nextStep">/)
+})
+
+test('用户编辑弹框对初始化管理员禁用角色下拉并给出原因', () => {
+  const users = code('src/views/Users.vue')
+  assert.match(users, /const roleLocked = computed\(\(\) => editingSelf\.value \|\| editingUser\.value\?\.is_setup_admin === true\)/)
+  assert.match(users, /<el-select v-model="form\.role" style="width: 100%" :disabled="roleLocked">/)
+  assert.match(users, /系统初始化管理员不可降级/, '必须给出字段级原因（否则只有全局 400 toast）')
+  assert.match(users, /role: roleLocked\.value \? undefined : form\.value\.role/, '锁定态不得把所选角色发给后端')
+})
+
+test('Keys 页 MCP 权限说明与后端能力矩阵同口径', () => {
+  const keys = code('src/views/Keys.vue')
+  assert.match(keys, /export_config 与 get_caddy_config 除外/, '只读 Key 的 GET 排除项必须披露')
+  assert.match(keys, /validate_import 与 preview_config 要求 Key 属主为管理员/, '探测 POST 的属主角色轴必须披露')
+  assert.match(keys, /需非只读 Key 且 Key 属主为管理员/, '写工具的属主角色轴必须披露')
+  assert.match(keys, /lazy-balancer:\/\/docs\/ops-playbook/, '指向后端单源手册')
+  // 与后端可见性单源对表：两个隐藏 GET 工具名不得漂移
+  assert.match(repoCode('internal/mcpserver/tool_visibility.go'), /"export_config":\s*\{\},\s*"get_caddy_config":\s*\{\},/)
+})

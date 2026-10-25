@@ -549,3 +549,68 @@ func TestUpgradeDedupedEvent_preservesAttributionWhenNewAttributionEmpty(t *test
 		t.Fatalf("非空归因必须覆盖: rule=%q policy=%d ruleName=%q policyName=%q", ruleID, policyID, ruleName, policyName)
 	}
 }
+
+// Given 去重表里同时存在窗口内、恰在窗口边界、窗口外三类条目。
+// When 触发清扫。
+// Then 只丢窗口外条目（边界键仍可用于归并），清扫计数归零——丢弃边界键会
+// 让仍在窗口内的同一请求重新入库成第二条事件。
+func TestSecurityEventsRequestDeduper_sweepDropsOnlyOutOfWindowEntries(t *testing.T) {
+	const nowSec = int64(7_000_000)
+	d := &securityEventsRequestDeduper{
+		entries: map[uint64]securityEventsDedupeEntry{
+			1: {atSec: nowSec},
+			2: {atSec: nowSec - securityEventsDedupeWindowSec},
+			3: {atSec: nowSec - securityEventsDedupeWindowSec - 1},
+		},
+		maxSec:     nowSec,
+		sinceSweep: 3,
+	}
+
+	d.sweep()
+
+	if d.sinceSweep != 0 {
+		t.Fatalf("sinceSweep=%d, want 0（清扫后必须重新计插入间隔，否则每轮 record 都全表扫）", d.sinceSweep)
+	}
+	if len(d.entries) != 2 {
+		t.Fatalf("清扫后条目数=%d, want 2（只丢窗口外）: %+v", len(d.entries), d.entries)
+	}
+	if _, ok := d.entries[3]; ok {
+		t.Fatal("窗口外条目必须被丢弃（否则长跑进程的去重表无界增长）")
+	}
+	if _, ok := d.entries[2]; !ok {
+		t.Fatal("恰在窗口边界的条目必须保留（丢掉会让窗口内的同一请求重复入库）")
+	}
+	if _, ok := d.lookup(1, nowSec); !ok {
+		t.Fatal("窗口内条目清扫后仍须可归并")
+	}
+}
+
+// Given 去重表已积压陈旧条目，插入计数差一次达到清扫间隔。
+// When 再登记一条新键。
+// Then record 内部触发清扫（陈旧条目消失、新键可查），计数归零——
+// 清扫必须由插入摊销驱动，不能只在显式调用点发生。
+func TestSecurityEventsRequestDeduper_recordTriggersSweepAtInterval(t *testing.T) {
+	const nowSec = int64(7_000_000)
+	d := &securityEventsRequestDeduper{
+		entries: map[uint64]securityEventsDedupeEntry{
+			9: {atSec: nowSec - securityEventsDedupeWindowSec - 5},
+		},
+		maxSec:     nowSec - 1,
+		sinceSweep: securityEventsDedupeSweepEvery - 1,
+	}
+
+	d.record(10, securityEventsDedupeEntry{atSec: nowSec})
+
+	if d.sinceSweep != 0 {
+		t.Fatalf("sinceSweep=%d, want 0（达到插入间隔必须触发清扫）", d.sinceSweep)
+	}
+	if _, ok := d.entries[9]; ok {
+		t.Fatalf("陈旧条目未被清扫: %+v", d.entries)
+	}
+	if _, ok := d.lookup(10, nowSec); !ok {
+		t.Fatalf("新登记的键必须可归并: %+v", d.entries)
+	}
+	if _, ok := d.lookup(9, nowSec); ok {
+		t.Fatal("已清扫的陈旧键不得再命中窗口")
+	}
+}

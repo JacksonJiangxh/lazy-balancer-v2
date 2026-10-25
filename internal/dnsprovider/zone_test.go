@@ -22,6 +22,12 @@ func TestResolveZone_table(t *testing.T) {
 		// 解析；委派区需显式配置。
 		{name: "delegated subdomain stays PSL", input: "api.sub.example.com", want: "example.com"},
 		{name: "single label fallback", input: "localhost", want: "localhost"},
+		// DNS 名大小写不敏感：zone 归一必须小写，否则 provider 侧
+		// Domain.List 返回的规范形态（小写）无法命中，混合大小写输入会把
+		// 「域名合法但大小写不同」误导成「域名不在账户」。
+		{name: "mixed case", input: "WWW.Example.COM", want: "example.com"},
+		{name: "mixed case with trailing dot", input: "API.Example.Co.UK.", want: "example.co.uk"},
+		{name: "mixed case single label", input: "LocalHost", want: "localhost"},
 		{name: "unknown tld fallback", input: "host.example.internal", want: "example.internal"},
 		{name: "empty", input: "", wantErr: true},
 		{name: "dot only", input: ".", wantErr: true},

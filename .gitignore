@@ -27,8 +27,10 @@ test-ui/
 # 镜像构建期**不**产出 ui/。
 ui/
 
-# Node modules (installed during docker build)
-web/node_modules/
+# Node modules（含 web/ 与仓根两种安装位置；不带前导斜杠的规则匹配任意层级）。
+# 仓根的 node_modules 由在仓库根直接跑 vitest/node 侧脚本产生（.vite/.vitest-cache
+# 转译缓存），属构建产物，不入库也不进 Docker 构建上下文。
+node_modules/
 
 # Editor and IDE
 .idea/

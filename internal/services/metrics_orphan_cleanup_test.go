@@ -214,10 +214,17 @@ type deleteCountingProbe struct {
 	// afterExec 在第 n 条 DELETE 执行完成后回调（关停窗口注入点：句柄置
 	// nil / ctx 取消发生在批与批之间，而不是语句执行之前）。
 	afterExec func(n int)
+	// match 是计入的目标表名（空=metrics_history）：同一条注入缝供指标孤儿
+	// 清理与审计保留清理两族共用（两族都是「每批重读句柄 + 批间复检 ctx」）。
+	match string
 }
 
 func (p *deleteCountingProbe) record(query string) int {
-	if !strings.Contains(strings.ToLower(query), "delete from metrics_history") {
+	table := p.match
+	if table == "" {
+		table = "metrics_history"
+	}
+	if !strings.Contains(strings.ToLower(query), "delete from "+table) {
 		return 0
 	}
 	p.mu.Lock()

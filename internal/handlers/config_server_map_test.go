@@ -55,6 +55,7 @@ func readServerMapCoords(t *testing.T, router *gin.Engine) (float64, float64) {
 }
 
 func TestPutConfig_serverMapCoordsPersistAndOmissionKeepsValue(t *testing.T) {
+	preserveApplicationLogLevel(t, "")
 	// Given: 全新配置（0,0=未设置 → 前端回退地图视觉中心）
 	router := newServerMapConfigRouter(t)
 	if lat, lon := readServerMapCoords(t, router); lat != 0 || lon != 0 {

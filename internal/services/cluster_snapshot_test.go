@@ -645,3 +645,58 @@ func TestClusterService_Snapshot_rejectsDemotionCommittedDuringBuild(t *testing.
 		t.Fatalf("构建期降级仍下发了完整快照: err=%v, want ErrNotMasterNode(403 语义)", err)
 	}
 }
+
+// ca_providers.enabled 带外 NULL（列可空，正常写路径恒写 0/1）的读语义必须
+// 主从一致：本地读侧 fail-closed（COALESCE(enabled,0)，与所有 WHERE enabled=1
+// 取用门一致），集群快照导出必须同值——导出「启用」会让从节点把同一行落成
+// 启用，主从切换后该提供商「自己启用」，与主节点此前的失败归因相反。
+func TestClusterSnapshot_caProviderEnabledNullMatchesLocalRead(t *testing.T) {
+	service, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES (41,'null-enabled','letsencrypt',?,'{}',1,2000,NULL),(42,'explicit-enabled','letsencrypt',?,'{}',1,2000,1)`,
+		LetsEncryptDirectoryURL, LetsEncryptDirectoryURL); err != nil {
+		t.Fatalf("seed CA providers: %v", err)
+	}
+
+	// 主节点本地读口径：NULL 行按禁用。
+	masterRead, err := NewCAProviderService().GetCAProvider(41)
+	if err != nil {
+		t.Fatalf("master read CA provider: %v", err)
+	}
+	if masterRead.Enabled {
+		t.Fatal("本地读口径：enabled IS NULL 必须读成禁用（fail-closed）")
+	}
+
+	// 快照导出必须同口径。
+	state, err := service.snapshotACME(context.Background(), database)
+	if err != nil {
+		t.Fatalf("snapshot ACME: %v", err)
+	}
+	exported := make(map[int]models.CAProvider, len(state.CAProviders))
+	for _, provider := range state.CAProviders {
+		exported[provider.ID] = provider
+	}
+	if exported[41].Enabled {
+		t.Fatal("快照导出把 enabled IS NULL 导成启用：从节点会自行启用主节点读成禁用的提供商")
+	}
+	if !exported[42].Enabled {
+		t.Fatal("显式启用行必须导出启用")
+	}
+
+	// 从节点落库：同一快照经 apply 事务层写入另一实例，读值必须仍为禁用。
+	slaveDB := setupIsolatedDB(t)
+	snapshot := models.ClusterSnapshot{SchemaVersion: CurrentSnapshotSchema, ACME: state}
+	if err := replaceSnapshotDB(context.Background(), slaveDB, snapshot); err != nil {
+		t.Fatalf("apply ACME section: %v", err)
+	}
+	slaveRead, err := NewCAProviderService().GetCAProvider(41)
+	if err != nil {
+		t.Fatalf("slave read CA provider: %v", err)
+	}
+	if slaveRead.Enabled != masterRead.Enabled {
+		t.Fatalf("主从读值分叉：master=%v slave=%v（同一行 enabled IS NULL）", masterRead.Enabled, slaveRead.Enabled)
+	}
+	if slaveRead.Enabled {
+		t.Fatal("从节点读成启用：快照导出与本地读口径分叉")
+	}
+}

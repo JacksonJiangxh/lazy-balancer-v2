@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -189,12 +190,11 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 	if claims.ExpiresAt <= now.UTC().Unix() {
 		return claims, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketExpired)
 	}
-	var user models.User
-	var passwordVersion int64
-	var authProvider string
-	err = tx.QueryRowContext(ctx, `SELECT id,username,role,display_name,is_enabled,created_at,last_login,password_version,COALESCE(auth_provider,'local') FROM users WHERE id=?`, claims.UserID).
-		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &authProvider)
-	user.AuthProvider = authProvider
+	var meta db.UserRowMeta
+	// 用户列清单单源（含 is_setup_admin）——票据登录是与密码登录并列的
+	// UserResponse 产出路径，漏列会让从节点会话把 break-glass 管理员显示成
+	// 普通管理员。
+	user, err := db.ScanUserRow(tx.QueryRowContext(ctx, `SELECT `+db.UserRowColumns("")+` FROM users WHERE id=?`, claims.UserID), &meta)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && (!user.IsEnabled || user.Username != claims.Username) {
 		return claims, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketUserUnavailable)
 	}
@@ -211,5 +211,5 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 	if err := tx.Commit(); err != nil {
 		return claims, models.User{}, 0, fmt.Errorf("提交登录票据消费: %w", err)
 	}
-	return claims, user, passwordVersion, nil
+	return claims, user, meta.PasswordVersion, nil
 }

@@ -256,3 +256,13 @@ test('未知摘要键回退原键（fail-visible，不静默吞成空串）', ()
   assert.equal(importSummaryLabel('security_new_table'), 'security_new_table')
   assert.equal(importSummaryLabel('security_policies'), '安全策略')
 })
+
+test('摘要键查表防原型键：constructor/toString 不得把原型函数当标签', () => {
+  // 键来自后端 summary 的任意字符串；裸下标会把 Object.prototype 上的函数
+  // 当成命中（truthy，绕过 `||` 回退），预览 chip 会渲染出函数源码。
+  for (const key of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    const label = importSummaryLabel(key)
+    assert.equal(typeof label, 'string', `${key} 标签必须是字符串（原型链函数不得外泄）`)
+    assert.equal(label, key, `${key} 必须按原文回退`)
+  }
+})

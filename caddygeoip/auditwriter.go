@@ -80,6 +80,35 @@ const auditWriterName = "lbfile"
 // 6× 最坏比推导，保证 64KiB 转义密集体不会被整行丢弃。
 const auditBodyMaxBytes = 64 * 1024
 
+// auditTruncatedMarker 是快照文本段（体/URI/文件名/MIME）超限截断的显式标记
+// （与落库侧 services.securityEventsTruncatedMarker 同形态）：落盘值自带标记，
+// 展示与导出可直接观测「该字段被裁剪」，不静默截断。二进制体不带标记，只带
+// BodyTruncated_ 标记位。
+const auditTruncatedMarker = "\n...[TRUNCATED]"
+
+// 客户端可控的「非体段」上限（与 auditBodyMaxBytes/auditHeadersMaxBytes 同族）：
+// transaction.request.uri 与 files[].name/mime 同样进快照 JSON、同样按 JSON
+// 转义口径计入单条/队列字节预算。不设限时单个 multipart 请求即可把快照推过
+// auditItemMaxBytes——被丢弃的恰是「触发 WAF 的这次请求」自身的安全事件
+// （事件列表/大屏/自动封禁喂入全缺），客户端可控字符分布即决定自身事件是否
+// 留库（与体段同一失效面）。
+//
+// 上限取 **转义后字节** 口径（估算/执法与落盘 JSON 同口径；原始字节上限在
+// `&`/`<`/`>` 密集输入上会放大 6×）：
+//   - URI：8KiB，与落库侧 services.securityEventsURICap(8192) 同量级——摄取侧
+//     无需二次裁剪；
+//   - 单个文件名 / 单条 MIME：各 1KiB 转义字节（多部分文件名/类型实践中远小于
+//     此；90KiB 全 `&` 的文件名正是漏封段）；
+//   - files[] 条数：64 条；条目内容总预算 24KiB 转义字节——「条数 × 单条上限」
+//     相加（64×2KiB）本身仍是 128KiB 量级，必须有总预算才能保证与体/头/
+//     messages 相加后仍落在 auditItemMaxBytes 之内。
+const (
+	auditURIMaxEscapedBytes   = 8 * 1024
+	auditFilesMaxEntries      = 64
+	auditFileFieldMaxEscaped  = 1024
+	auditFilesMaxEscapedBytes = 24 * 1024
+)
+
 func init() {
 	// 计时注册表清扫参数默认值（atomic 存储，见下方 var 块说明）。
 	auditTimingEntryTTLNs.Store(int64(30 * time.Second))
@@ -110,8 +139,10 @@ var (
 	// （320KiB），整条安全事件被丢弃（客户端可控的字符分布即可让自身事件
 	// 不留库）。
 	// 上界 = 6×请求体 + 6×响应体 + 请求头 + 响应头（后两者已在快照侧按转义
-	// 字节截断到各 64KiB）+ messages（转义字节 32KiB）+ 96KiB 余量（事务
-	// 字符串/文件条目/messages 固定开销）。取 1MiB。
+	// 字节截断到各 64KiB）+ messages（转义字节 32KiB）+ URI（转义字节 8KiB，
+	// 见 auditURIMaxEscapedBytes）+ files[]（转义字节 24KiB + 单条余量，见
+	// auditFilesMaxEscapedBytes）+ 48KiB 余量（事务/producer 字符串、条目固定
+	// 开销、messages 评估族溢出）。取 1MiB。
 	auditItemMaxBytes = int64(1024 * 1024)
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
 	// 兜底（低流量下 bufio 滞留行不超周期）。
@@ -701,8 +732,12 @@ type auditSnapshotRequest struct {
 	Body_          string                                        `json:"body"`
 	BodyTruncated_ bool                                          `json:"body_truncated,omitempty"`
 	Files_         []plugintypes.AuditLogTransactionRequestFiles `json:"files"`
-	ArgsStub       struct{}                                      `json:"args"`
-	Length_        int32                                         `json:"length"`
+	// FilesDropped_ 是被条数/字节预算上限省略的 files[] 条目数（omitempty）：
+	// 文件明细只服务取证展示，不能因其挤掉整条安全事件——超出时截断并把丢弃
+	// 条数显性记入本键（与 messages_dropped 同一披露姿态）。
+	FilesDropped_ int      `json:"files_dropped,omitempty"`
+	ArgsStub      struct{} `json:"args"`
+	Length_       int32    `json:"length"`
 }
 
 func (r *auditSnapshotRequest) Method() string {
@@ -893,9 +928,41 @@ func snapshotAuditBody(body string) (string, bool) {
 	}
 	prefix := strings.Clone(body[:cut])
 	if utf8.ValidString(prefix) {
-		return prefix + "\n...[TRUNCATED]", true
+		return prefix + auditTruncatedMarker, true
 	}
 	return prefix, true
+}
+
+// snapshotClipEscaped 按 **JSON 转义后字节** 预算截断文本（估算/执法与落盘
+// JSON 同口径，见 jsonStringEscapedLen）：逐字符累加转义长度，超限处停在
+// UTF-8 边界，克隆前缀并追加 auditTruncatedMarker。原始字节上限在 `&`/`<`/`>`
+// 密集输入上会放大 6×，正是本函数存在的理由。
+//
+// 只对超限文本扫描到上限（未超限走一次全串计数，返回值复用原 string，
+// 零分配）；超限前缀必须 Clone，否则快照继续持有原始大 string 的 backing
+// array，内存上限失真。
+func snapshotClipEscaped(s string, maxEscapedBytes int) (string, bool) {
+	if maxEscapedBytes <= 0 || s == "" {
+		return s, false
+	}
+	used := 0
+	cut := 0
+	for cut < len(s) {
+		_, size := utf8.DecodeRuneInString(s[cut:])
+		if size <= 0 {
+			break
+		}
+		esc := jsonStringEscapedLen(s[cut : cut+size])
+		if used+esc > maxEscapedBytes {
+			break
+		}
+		used += esc
+		cut += size
+	}
+	if cut >= len(s) {
+		return s, false
+	}
+	return strings.Clone(s[:cut]) + auditTruncatedMarker, true
 }
 
 // auditHeadersMaxBytes 快照 headers（请求/响应）序列化字节硬上限（与 part
@@ -1117,10 +1184,16 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 	}
 	if req := tx.Request(); !isNilInterface(req) {
 		body, bodyTruncated := snapshotAuditBody(req.Body())
+		// URI 与 files[] 是客户端可控的非体段，必须与体/头同门封顶（见
+		// auditURIMaxEscapedBytes）：否则单个超长 URI/文件名即可把本行推过
+		// auditItemMaxBytes，让「触发 WAF 的这次请求」自身的安全事件被整行丢弃。
+		// 内容预算留出标记字节 → 截断后整字段转义字节 ≤ 上限，摄取侧
+		// （services.securityEventsURICap 同值）不再二次裁剪（避免双标记）。
+		uri, _ := snapshotClipEscaped(req.URI(), auditURIMaxEscapedBytes-len(auditTruncatedMarker))
 		r := &auditSnapshotRequest{
 			Method_:        req.Method(),
 			Protocol_:      req.Protocol(),
-			URI_:           req.URI(),
+			URI_:           uri,
 			HTTPVersion_:   req.HTTPVersion(),
 			Body_:          body,
 			BodyTruncated_: bodyTruncated,
@@ -1130,8 +1203,28 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		if hs := req.Headers(); hs != nil {
 			r.Headers_, r.HeadersBytes_ = snapshotAuditHeaders(hs)
 		}
-		for _, f := range req.Files() {
-			r.Files_ = append(r.Files_, auditSnapshotFile{Name_: f.Name(), Size_: f.Size(), Mime_: f.Mime()})
+		files := req.Files()
+		fileBudget := int64(auditFilesMaxEscapedBytes)
+		for i, f := range files {
+			if i >= auditFilesMaxEntries {
+				r.FilesDropped_ = len(files) - i
+				break
+			}
+			if isNilInterface(f) {
+				continue
+			}
+			name, _ := snapshotClipEscaped(f.Name(), auditFileFieldMaxEscaped)
+			mime, _ := snapshotClipEscaped(f.Mime(), auditFileFieldMaxEscaped)
+			cost := int64(jsonStringEscapedLen(name)+jsonStringEscapedLen(mime)) + auditFileEntryOverhead
+			if cost > fileBudget {
+				// 条目内容总预算：条数上限之外的第二道门（64×2KiB 相加仍是
+				// 128KiB 量级，必须另有总预算才保证与体/头/messages 相加后
+				// 不越过单条上限）。
+				r.FilesDropped_ = len(files) - i
+				break
+			}
+			fileBudget -= cost
+			r.Files_ = append(r.Files_, auditSnapshotFile{Name_: name, Size_: f.Size(), Mime_: mime})
 		}
 		r.AuditLogTransactionRequest = frozenArgsRequest(req)
 		t.Request_ = r
@@ -1519,6 +1612,9 @@ const (
 	auditTagEntryOverhead = 16
 	// 每个上传文件条目：`{"name":"…","size":N,"mime":"…"},` + 结构体驻留。
 	auditFileEntryOverhead = 96
+	// auditFilesDroppedOverhead 是文件条目截断披露键（`"files_dropped":N,`）
+	// 的固定估算（丢弃数按 6 位上限预留）。
+	auditFilesDroppedOverhead = 32
 	// 每条 message：键名/数字字段/tags 语法 + slice 元素与 RuleMatch 驻留；
 	// 内容串（actionset/message/error_message/data 各字段）另按 len 计入。
 	auditMessageOverhead = 512
@@ -1606,6 +1702,11 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 			jsonStringEscapedLen(r.URI_) + jsonStringEscapedLen(r.HTTPVersion_) +
 			jsonStringEscapedLen(r.Body_))
 		n += headerBytes(r.Headers_, r.HeadersBytes_)
+		// files_dropped 是文件条目截断的披露键（`"files_dropped":N,`）：估算
+		// 必须计入，否则截断披露本身会把实际序列化体积推过估算口径。
+		if r.FilesDropped_ > 0 {
+			n += auditFilesDroppedOverhead
+		}
 		for _, f := range r.Files_ {
 			n += auditFileEntryOverhead
 			if isNilInterface(f) {

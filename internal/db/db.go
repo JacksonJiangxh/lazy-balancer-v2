@@ -576,7 +576,6 @@ func createTables() error {
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		caddy_config TEXT DEFAULT '{}',
 		dns_provider VARCHAR(50) DEFAULT 'dnspod',
-		dns_credentials TEXT,
 		acme_email VARCHAR(255),
 		log_level VARCHAR(10) DEFAULT 'info',
 		is_master BOOLEAN DEFAULT TRUE,
@@ -1713,10 +1712,6 @@ func runMigrations() error {
 	if err := migrateLegacyDNSCredentials(); err != nil {
 		return err
 	}
-	// 全局配置同族遗留列：读/写路径均已收口后清空存量值（见函数注释）。
-	if err := migrateLegacyGlobalDNSCredentials(); err != nil {
-		return err
-	}
 
 	// Drop legacy columns from lb_rules if they still exist (no longer used).
 	legacyLbColumns := []string{"tls_auto_cert", "tls_email"}
@@ -1918,6 +1913,9 @@ func runMigrations() error {
 	//   写点与读点均已移除（核实全仓零写零读），存量库启动时删除。
 	// - lb_rules.ip_acl_mode / ip_acl_list 为规则级 IP 访问控制的遗留列，规则级 IP ACL 早已
 	//   迁入 security_policies（策略级 ip_acl_* 仍在使用），这两列不再被读取或写入。
+	// - global_config.dns_credentials：全局 DNS 凭证退役列——读路径不回显、写路径已移除、
+	//   备份三面排除、集群快照模型/装载/apply 与版本触发器 OF 清单均已摘除，签发链唯一
+	//   凭证来源是 certificate_configs.dns_credentials。存量值随列一并删除（比置空更彻底）。
 	deadColumnDrops := []struct{ table, column string }{
 		{"task_runs", "stage"},              // 零写入方死列
 		{"task_runs", "entry_count"},        // 零写入方死列
@@ -1926,6 +1924,7 @@ func runMigrations() error {
 		{"security_custom_rules", "status_code"},
 		{"global_config", "admin_tls_acme_rule_id"},
 		{"global_config", "admin_tls_port"},
+		{"global_config", "dns_credentials"}, // 全局 DNS 凭证退役列（凭证源=certificate_configs）
 		{"lb_rules", "ip_acl_mode"},
 		{"lb_rules", "ip_acl_list"},
 	}
@@ -4364,35 +4363,6 @@ func migrateLegacyDNSCredentials() error {
 		return nil
 	}); err != nil {
 		return err
-	}
-	return nil
-}
-
-// migrateLegacyGlobalDNSCredentials 清除 global_config.dns_credentials 的存量值。
-// 该列是遗留字段：签发链唯一凭证来源是 certificate_configs，读取面早已不回显、
-// UpdateConfig 的写分支已移除，仅剩「库中不可见但随备份外带」的残余面。
-// 每次启动幂等执行（有值才写），顺带覆盖「旧备份导入把该列写回」的路径。
-func migrateLegacyGlobalDNSCredentials() error {
-	// 逐列探测（只读，不取写锁）：遗留/精简夹具可能没有 global_config
-	// 或没有该列（表不存在时 pragma_table_info 返回空集）——无条件 UPDATE
-	// 会让这类库在迁移期硬失败。
-	var hasColumn bool
-	if err := DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info('global_config') WHERE name='dns_credentials')`).Scan(&hasColumn); err != nil {
-		return fmt.Errorf("failed to check legacy global_config.dns_credentials column: %w", err)
-	}
-	if !hasColumn {
-		return nil
-	}
-	res, err := execMigrationWriteIfNeeded(updateWhere("global_config", "dns_credentials = NULL",
-		"dns_credentials IS NOT NULL AND dns_credentials <> ''"))
-	if err != nil {
-		return fmt.Errorf("failed to clear legacy global_config.dns_credentials: %w", err)
-	}
-	if res == nil {
-		return nil
-	}
-	if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected > 0 {
-		log.Printf("Cleared legacy global_config.dns_credentials (%d row(s))", affected)
 	}
 	return nil
 }

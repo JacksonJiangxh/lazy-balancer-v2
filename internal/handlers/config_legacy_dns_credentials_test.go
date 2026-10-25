@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,17 +11,15 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// global_config.dns_credentials 是遗留列：读路径不回显、写路径已移除，
-// 请求体携带该键不得落库，也不得在变更清单/预览面声称「DNS凭证」被修改。
+// global_config.dns_credentials 是退役列（启动迁移删除列、读写两面收口、
+// 备份三面排除）：请求体携带该键不得落库，也不得在变更清单/预览面声称
+// 「DNS凭证」被修改——否则旧客户端仍以为可以写全局 DNS 凭证。
 func TestUpdateConfig_ignoresLegacyGlobalDNSCredentials(t *testing.T) {
-	// Given：库里预置一个旧版本残留值（升级用户形态）。
+	// Given
 	handler := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/config", handler.UpdateConfig)
-	if _, err := db.DB.Exec(`UPDATE global_config SET dns_credentials='legacy-id,legacy-token' WHERE id=1`); err != nil {
-		t.Fatalf("seed legacy credentials: %v", err)
-	}
 
 	// When
 	req := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"source":"acme","dns_credentials":"new-id,new-token"}`))
@@ -34,14 +31,15 @@ func TestUpdateConfig_ignoresLegacyGlobalDNSCredentials(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
-	var stored sql.NullString
-	if err := db.DB.QueryRow(`SELECT dns_credentials FROM global_config WHERE id=1`).Scan(&stored); err != nil {
-		t.Fatalf("read stored credentials: %v", err)
+	// Then 2：列已随退役删除——请求体值无处落库，且列不存在。
+	var columnCount int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('global_config') WHERE name='dns_credentials'`).Scan(&columnCount); err != nil {
+		t.Fatalf("query global_config schema: %v", err)
 	}
-	if stored.String == "new-id,new-token" {
-		t.Fatal("遗留列 dns_credentials 仍被写入（请求体值已落库）")
+	if columnCount != 0 {
+		t.Fatal("global_config.dns_credentials 列仍存在（退役列必须由启动迁移删除）")
 	}
-	// Then 2：变更清单不得把该键算作「DNS凭证」变更。
+	// Then 3：变更清单不得把该键算作「DNS凭证」变更。
 	var body struct {
 		Message string `json:"message"`
 		Data    struct {

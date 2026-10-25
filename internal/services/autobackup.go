@@ -238,7 +238,9 @@ func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 		if parsed, perr := time.Parse(time.RFC3339, lastRun.String); perr == nil {
 			row.lastRun = &parsed
 		} else {
-			// 非法形态按「未跑过」处理——下一个到期槽立即补跑，不静默停摆
+			// 非法形态按「未跑过」处理——下一个到期槽立即补跑，不静默停摆。
+			// 写侧 advanceAutoBackupWatermark 的推进条件必须同判据（非法值可被
+			// 覆盖），否则水位线永不推进、每个 tick 重跑一次全量备份。
 			Logf("warn", "自动备份：auto_backup_last_run 形态非法 %q（按未运行处理）", lastRun.String)
 		}
 	}
@@ -360,7 +362,11 @@ func advanceAutoBackupWatermark(startedAt time.Time) error {
 		return nil
 	}
 	formatted := slot.Format(time.RFC3339)
-	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1 AND (auto_backup_last_run IS NULL OR auto_backup_last_run='' OR datetime(auto_backup_last_run) < datetime(?))`, formatted, formatted); err != nil {
+	// 「是否已跑过」的判据与读侧 loadAutoBackupSettings 同源：NULL/空串/非法形态
+	// 一律按「从未跑过」处理，允许被本槽覆盖。datetime(非法值) 为 NULL，若只写
+	// `datetime(last_run) < datetime(?)`，带外非法值会让条件恒不成立、Exec 仍成功
+	// ⇒ 水位线永不推进，调度器每个 tick 判到期并重跑一次完整备份。
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1 AND (auto_backup_last_run IS NULL OR auto_backup_last_run='' OR datetime(auto_backup_last_run) IS NULL OR datetime(auto_backup_last_run) < datetime(?))`, formatted, formatted); err != nil {
 		Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
 		return fmt.Errorf("更新自动备份水位线（槽 %s）失败: %w", formatted, err)
 	}

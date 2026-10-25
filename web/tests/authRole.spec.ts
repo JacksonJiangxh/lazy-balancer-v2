@@ -65,6 +65,16 @@ test('隐藏页不得自续 /users/me 重试定时器（与 /config 同范式：
   assert.match(authSrc, /const clearUserRetryTimer = \(\): void => \{\s*userRetryDeferred = false/, '清表须复位待补查标记')
 })
 
+test('两处用户归一化必须搬运 is_setup_admin（缺一即让 store 与列表页判断分叉）', () => {
+  // 后端全部用户响应路径（登录/MFA/me/PATCH me/PUT/:id/票据登录）都真实下发
+  // is_setup_admin；store 逐字段重建 user.value 时漏搬会让消费方恒读 undefined。
+  const fetchBody = member(authSrc, 'async function fetchUser')
+  const fetchSuccess = fetchBody.slice(fetchBody.indexOf('if (res.data) {'))
+  assert.match(fetchSuccess, /is_setup_admin: res\.data\.is_setup_admin \?\? false/, 'GET /users/me 归一化必须带上 is_setup_admin')
+  const applyBody = member(authSrc, 'function applyAuthResponse')
+  assert.match(applyBody, /is_setup_admin: res\.user\.is_setup_admin \?\? false/, '登录/票据响应归一化必须带上 is_setup_admin')
+})
+
 test('mfa_write_guard 随 /config 投影单源：Users 页不再单独整取 GET /config', () => {
   // 结构边界：花括号配对取函数体（不再用远处的 interface 声明作终点——那样
   // fetchConfig 之后新增的函数会落进切片，让断言被相邻函数满足）。

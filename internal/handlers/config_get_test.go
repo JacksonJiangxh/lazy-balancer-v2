@@ -15,14 +15,15 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// （2026-09-05 证书域审计裁定）：global_config.dns_credentials 为遗留字段
-// （签发链唯一凭证来源是 certificate_configs.dns_credentials，前端零消费），
-// GET /config 不再返回其值——管理员与非管理员视角均须为空。
-func TestGetConfig_omits_legacy_global_dns_credentials(t *testing.T) {
-	// Given：遗留字段中存有真实凭证
+// （2026-09-05 证书域审计裁定，2026-10-26 列退役）：global_config.dns_credentials
+// 为退役列（签发链唯一凭证来源是 certificate_configs.dns_credentials，前端
+// 零消费），列由启动迁移删除——GET /config 响应既不带值，也不再带键；
+// 管理员与非管理员视角同形。
+func TestGetConfig_omits_retiredGlobalDNSCredentials(t *testing.T) {
+	// Given：对照字段有真实值，证明响应装配链路正常
 	h := newBackupTestHandlers(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET dns_credentials='legacy-id,legacy-token', acme_email='ops@example.com' WHERE id=1`); err != nil {
-		t.Fatalf("seed legacy dns credentials: %v", err)
+	if _, err := db.DB.Exec(`UPDATE global_config SET acme_email='ops@example.com' WHERE id=1`); err != nil {
+		t.Fatalf("seed acme email: %v", err)
 	}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -37,25 +38,22 @@ func TestGetConfig_omits_legacy_global_dns_credentials(t *testing.T) {
 			response := httptest.NewRecorder()
 			target.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/config", nil))
 
-			// Then
+			// Then：退役键彻底消失（字段退役后「值为空串」的旧契约升级为
+			// 「键不存在」——消费者不得再依据该键存在与否做判定）。
 			if response.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
-			if strings.Contains(response.Body.String(), "legacy-id") || strings.Contains(response.Body.String(), "legacy-token") {
-				t.Fatalf("response leaks legacy dns credentials: %s", response.Body.String())
+			if strings.Contains(response.Body.String(), "dns_credentials") {
+				t.Fatalf("response 仍携带退役键 dns_credentials: %s", response.Body.String())
 			}
 			var body struct {
 				Data struct {
-					DNSCredentials string `json:"dns_credentials"`
-					DNSProvider    string `json:"dns_provider"`
-					ACMEEmail      string `json:"acme_email"`
+					DNSProvider string `json:"dns_provider"`
+					ACMEEmail   string `json:"acme_email"`
 				} `json:"data"`
 			}
 			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 				t.Fatalf("decode config response: %v", err)
-			}
-			if body.Data.DNSCredentials != "" {
-				t.Fatalf("dns_credentials=%q, want empty (field no longer served)", body.Data.DNSCredentials)
 			}
 			if body.Data.ACMEEmail != "ops@example.com" {
 				t.Fatalf("acme_email=%q, want unaffected field intact", body.Data.ACMEEmail)

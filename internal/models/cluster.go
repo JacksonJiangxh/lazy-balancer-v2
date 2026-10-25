@@ -376,7 +376,6 @@ type ClusterBasicSettings struct {
 	CertRenewalAttempts        *int    `json:"cert_renewal_attempts,omitempty"`
 	DefaultCAProviderID        *int    `json:"default_ca_provider_id,omitempty"`
 	DNSProvider                *string `json:"dns_provider,omitempty"`
-	DNSCredentials             *string `json:"dns_credentials,omitempty"`
 	SyncInterval               *int    `json:"sync_interval,omitempty"`
 	CaddyLogLevel              *string `json:"caddy_log_level,omitempty"`
 	CaddyLogSizeMB             *int    `json:"caddy_log_size_mb,omitempty"`
@@ -470,9 +469,12 @@ type ClusterUser struct {
 	AuthProvider string `json:"auth_provider,omitempty"`
 	OIDCSubject  string `json:"oidc_subject,omitempty"`
 	OIDCIssuer   string `json:"oidc_issuer,omitempty"`
-	// IsSetupAdmin 标记 break-glass 管理入口：随快照同步，从节点对目标账号
-	// 的不可删/禁/降级保护与主节点一致。旧主端载荷缺该字段时为 false，
-	// 从节点按「最低 id 的启用管理员」本地重建（db.EnsureSetupAdminFlag）。
+	// IsSetupAdmin 标记 break-glass 管理入口：**不随快照同步**——users 节在
+	// canonical 载荷里由 sanitizeUsersForHash 清零，本字段的下发值恒为 false
+	// （JSON 形状保留以兼容旧协议解析）。从节点落库后按「最低 id 的启用管理员」
+	// 本地归一（db.EnsureSetupAdminFlag），故保护对象由各节点按本地用户表现算：
+	// 主端标记若带外落在非最低 id 的管理员上，从节点会保护另一行。备份导出/
+	// 还原走独立载荷，标记在其中如实落库。
 	IsSetupAdmin bool `json:"is_setup_admin,omitempty"`
 
 	// pending 密钥不跨节点（绑定向导是节点本地交互；半途切换面板属可重做流程）。

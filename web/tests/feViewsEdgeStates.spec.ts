@@ -20,7 +20,12 @@ const recordingConfirmer = (outcome: 'confirm' | 'cancel') => {
   return { calls, confirmer }
 }
 
-test('一次性凭据守卫：确认后才关闭，取消则弹框保持打开', () => {
+// 确认框走 Promise 回调：done() 在 .then 的微任务里执行，断言前必须先让出
+// 一拍（await Promise.resolve()）。只断言「确认框被调用」会让「确认后永不
+// 关闭」的实现照样全绿——主契约是「点我已保存 → 弹框关闭」，必须钉 done
+// 的调用次数。
+
+test('一次性凭据守卫：确认后才关闭，取消则弹框保持打开', async () => {
   {
     const { calls, confirmer } = recordingConfirmer('confirm')
     let done = 0
@@ -28,6 +33,10 @@ test('一次性凭据守卫：确认后才关闭，取消则弹框保持打开',
     close(() => { done += 1 })
     assert.equal(calls.length, 1)
     assert.deepEqual(calls[0].options, { type: 'warning', confirmButtonText: '我已保存', cancelButtonText: '继续查看' })
+    await Promise.resolve()
+    assert.equal(done, 1, '用户确认已保存后必须关闭弹框（确认分支不得吞掉 done）')
+    await Promise.resolve()
+    assert.equal(done, 1, 'done 只能调用一次（重复关闭会二次触发 @closed 清理）')
   }
   {
     const { calls, confirmer } = recordingConfirmer('cancel')
@@ -35,6 +44,7 @@ test('一次性凭据守卫：确认后才关闭，取消则弹框保持打开',
     const close = createOneTimeSecretCloseGuard({ message: '仅此一次', title: '保存' }, confirmer)
     close(() => { done += 1 })
     assert.equal(calls.length, 1)
+    await Promise.resolve()
     assert.equal(done, 0, '取消关闭确认时不得关闭弹框（秘密仍在屏上）')
   }
 })
@@ -55,6 +65,19 @@ test('一次性凭据守卫：blocked 静默拒绝、skip 直接关闭（均不�
     close(() => { done += 1 })
     assert.equal(calls.length, 0, '无秘密可丢时不得弹确认框')
     assert.equal(done, 1)
+  }
+  {
+    // 提交在途且此刻无待保存秘密：拒绝必须优先——关闭动作落在提交中途会留下
+    // 半提交状态；「跳过」只表达无需确认，不表达允许关闭。
+    const { calls, confirmer } = recordingConfirmer('confirm')
+    let done = 0
+    const close = createOneTimeSecretCloseGuard(
+      { message: 'm', title: 't', blocked: () => true, skip: () => true },
+      confirmer,
+    )
+    close(() => { done += 1 })
+    assert.equal(calls.length, 0, 'blocked 与 skip 同时成立时不得弹确认框')
+    assert.equal(done, 0, 'blocked 必须优先于 skip（提交在途不得关闭）')
   }
 })
 
@@ -182,10 +205,15 @@ test('CRS 源码折叠暴露展开态与焦点环', () => {
 
 test('关联规则 drill-down 与触发明细 tooltip 键盘可达', () => {
   const policies = code('src/views/security/SecurityPolicies.vue')
-  assert.match(policies, /:trigger="\['hover', 'focus'\]"/)
-  assert.match(policies, /<button v-for="rule in policyBoundRules\(row\.id\)"[^>]*class="policy-rule-row"/, 'popper 内容必须是具名按钮')
-  assert.match(policies, /class="policy-rule-count" tabindex="0" role="button" :aria-label="`关联规则/)
-  assert.match(policies, /\.policy-rule-row:focus-visible/)
+  // 真按钮做 reference：原 role="button" 的 span 无任何激活行为（假按钮），
+  // hover-only tooltip 的内容也从进不了焦点序。el-dropdown 的 click 触发 +
+  // 菜单 roving focus + Esc 关闭给出可用键盘路径。
+  assert.match(policies, /<el-dropdown\s+v-if="policyBoundRules\(row\.id\)\.length > 0"\s+trigger="click"/)
+  assert.match(policies, /<button type="button" class="policy-rule-count" :aria-label="`关联规则/, 'reference 必须是真按钮')
+  assert.match(policies, /<el-dropdown-item v-for="rule in policyBoundRules\(row\.id\)"/, '菜单项须逐条具名')
+  assert.match(policies, /@command="openRuleInNewTab"/, '菜单命令必须接到跳转动作')
+  assert.match(policies, /\.policy-rule-count:focus-visible/)
+  assert.doesNotMatch(policies, /role="button" tabindex="0" :aria-label="`关联规则/, '不得回流无激活行为的假按钮')
 
   const events = code('src/views/security/SecurityEvents.vue')
   assert.match(events, /:content="row\.rule_msg" placement="top" :show-after="200" :trigger="\['hover', 'focus'\]"/)

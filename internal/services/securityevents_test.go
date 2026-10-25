@@ -3683,19 +3683,26 @@ func TestSecurityEventsAttribution_Stage0PassthroughTrustDoesNotOwnLoggedIPEvent
 	}
 }
 
-// resetSecurityEventsPollState 重置摄取单轮状态（测试隔离——pollState 为
-// 进程级单例，跨用例复用会带着上一用例的 tailer/offset 污染）。
+// resetSecurityEventsPollState 重置摄取单轮状态与采集健康位（测试隔离）。
+//
+// 两者都是进程级单例：pollState 残留 tailer/offset 会让下一用例从错误位置
+// 续读；健康位更隐蔽——任何驱动一次 poll 的用例（含 logCleanupRound 的
+// waf-audit 兜底）都会把本轮注入的失败写进快照，后续用例读快照时把上一条
+// 用例的注入错误当成本轮事实（AutobanFeedHealth 据此报「采集降级」，失败
+// 文案指错方向）。用例只调本函数即可，复位由这里成对登记。
 func resetSecurityEventsPollState(t *testing.T) {
 	t.Helper()
 	securityEventsPollState.Lock()
 	securityEventsPollState.tailer = nil
 	securityEventsPollState.inited = false
 	securityEventsPollState.Unlock()
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
 	t.Cleanup(func() {
 		securityEventsPollState.Lock()
 		securityEventsPollState.tailer = nil
 		securityEventsPollState.inited = false
 		securityEventsPollState.Unlock()
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
 	})
 }
 

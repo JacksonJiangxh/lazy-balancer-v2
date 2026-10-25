@@ -12,15 +12,37 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"lazy-balancer-v2/internal/services"
 )
 
 func captureHandlerLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
+	preserveApplicationLogLevel(t, "info")
 	buffer := &bytes.Buffer{}
 	oldWriter := log.Writer()
 	log.SetOutput(buffer)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 	return buffer
+}
+
+// preserveApplicationLogLevel 记录进程级应用日志级别并在用例结束时复位；
+// force 非空时先切到该级别。
+//
+// 级别是进程级阈值（services.ConfigureLogLevel），而 PUT /config、
+// 配置备份导入、配置写中间件都会经 services.ApplyLogLevel 把它改成载荷里的
+// log_level——这些用例只改库不复位，阈值就泄漏给后续用例：断言「本用例是否
+// 留痕」的 info 级用例会拿到空日志，失败文案却指向「实现没留痕」。捕获型用例
+// 必须先固定级别；写 log_level 的用例必须快照复位。
+func preserveApplicationLogLevel(t *testing.T, force string) {
+	t.Helper()
+	previous := services.CurrentLogLevel()
+	if force != "" {
+		if err := services.ConfigureLogLevel(force); err != nil {
+			t.Fatalf("设置应用日志级别 %q 失败: %v", force, err)
+		}
+	}
+	t.Cleanup(func() { _ = services.ConfigureLogLevel(previous) })
 }
 
 func countLogOccurrences(logs *bytes.Buffer, fragment string) int {

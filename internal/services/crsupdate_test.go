@@ -765,3 +765,19 @@ func TestCRSUpdateRun_runningResetDeferRegisteredBeforeAudit(t *testing.T) {
 		t.Fatal("running 复位 defer 必须注册在审计 defer 之前（LIFO 后执行）——否则审计读到下一轮状态")
 	}
 }
+
+// Given 版本行存在且指向已安装的上游版本；另一形态是行里的 version 为空。
+// When 取日志口径的当前 CRS 版本（启动载入摘要行消费）。
+// Then 返回行内版本；空版本回落镜像捆绑版本——日志摘要与安装判定必须同源，
+// 否则载入摘要宣称的版本与引擎实际加载的 CRS 目录不一致。
+func TestCurrentCRSVersionForLog_matchesVersionRow(t *testing.T) {
+	initServicesDB(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	if got := CurrentCRSVersionForLog(); got != "v4.14.0" {
+		t.Fatalf("CurrentCRSVersionForLog()=%q, want v4.14.0（须与版本行同源）", got)
+	}
+	seedCRSVersionRow(t, "", false)
+	if got := CurrentCRSVersionForLog(); got != CRSBundledVersion {
+		t.Fatalf("空版本 CurrentCRSVersionForLog()=%q, want bundled %q", got, CRSBundledVersion)
+	}
+}

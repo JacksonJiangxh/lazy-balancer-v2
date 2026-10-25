@@ -914,8 +914,9 @@ func insertSnapshotUsersAndKeys(ctx context.Context, tx *sql.Tx, snapshot models
 			return fmt.Errorf("写入快照用户 %s: %w", user.Username, err)
 		}
 	}
-	// 保护目标兜底：旧主端载荷不含 is_setup_admin（全 false）或标记行不是启用
-	// 管理员时，按「最低 id 的启用管理员」在从节点重建，保证本地保护面可用。
+	// 保护目标本地归一：canonical 载荷（v3 唯一下发形态）里的 is_setup_admin
+	// 已被 sanitizeUsersForHash 清零，故本处恒按「最低 id 的启用管理员」在从节点
+	// 重建，保证本地保护面可用（旧协议/手工载荷即便携带标记，也以本地用户表为准）。
 	if err := db.EnsureSetupAdminFlag(ctx, tx); err != nil {
 		return fmt.Errorf("归一 setup 管理员标记: %w", err)
 	}
@@ -1781,9 +1782,6 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	if settings.DNSProvider != nil {
 		addBase("dns_provider", *settings.DNSProvider)
-	}
-	if settings.DNSCredentials != nil {
-		addBase("dns_credentials", *settings.DNSCredentials)
 	}
 	if settings.SyncInterval != nil {
 		addBase("sync_interval", normalizeSyncInterval(*settings.SyncInterval))

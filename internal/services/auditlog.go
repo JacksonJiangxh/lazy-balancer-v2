@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -228,24 +229,36 @@ func auditRetentionMonths() (int, error) {
 // 审计写入（单条巨型 DELETE 在百万行库上持锁数秒）。var 供测试缩批。
 var auditCleanupBatchSize = 5000
 
+// errAuditDBUnavailable 审计库未初始化或已关闭（关停期 db.Close() 置 nil）。
+// 循环每批重读句柄并在 nil 时返回该错误：入口只判一次不足以防 nil 解引用
+// panic——关停排空是**有界放弃**的，db.Close() 紧随其后把 AuditDB 置 nil，
+// 大批积压的清理轮会在下一批撞上 nil *sql.DB。返回可见错误让任务落 failed
+// 且摘要保留真实部分计数（已删批次不可逆）。
+var errAuditDBUnavailable = errors.New("审计数据库未初始化")
+
 // CleanupAuditLogs 按保留月数清理审计日志，返回删除条数（SPEC §6.5 摘要行数据源）。
 // 失败必须上抛：audit-retention 任务体据此落 failed 终态，且失败轮不得写
 // 「清理完成」（此前失败静默返回 0——任务监控全绿、摘要谎报完成）。
-// 分批删除：每批至多 auditCleanupBatchSize 行循环至删净，批间释放写锁。
-func CleanupAuditLogs() (int, error) {
+// 分批删除：每批至多 auditCleanupBatchSize 行循环至删净，批间释放写锁并
+// 复检 ctx（删除按批幂等，中途取消语义无损——关停/取消可中断本轮，不让
+// 日志清理轮拖过关停预算）。
+func CleanupAuditLogs(ctx context.Context) (int, error) {
 	retentionMonths, monthsErr := auditRetentionMonths()
 	if monthsErr != nil {
 		// 保留期口径未知时一条都不删：按更短默认删除是不可逆的证据损失。
 		return 0, monthsErr
 	}
 	cutoff := time.Now().UTC().AddDate(0, -retentionMonths, 0).Format("2006-01-02 15:04:05")
-	if db.AuditDB == nil {
-		Logf("warn", "audit log cleanup skipped: audit database is not initialized")
-		return 0, fmt.Errorf("审计数据库未初始化")
-	}
 	total := 0
 	for {
-		res, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < ? LIMIT ?)", cutoff, auditCleanupBatchSize)
+		// 每批重读句柄（与指标孤儿清理同源）：nil 时返回可见错误，已删批次
+		// 不可逆但计数如实。
+		auditDB := db.AuditDB
+		if auditDB == nil {
+			Logf("warn", "audit log cleanup skipped: audit database is not initialized")
+			return total, errAuditDBUnavailable
+		}
+		res, err := auditDB.ExecContext(ctx, "DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < ? LIMIT ?)", cutoff, auditCleanupBatchSize)
 		if err != nil {
 			Logf("warn", "audit log cleanup failed: %v", err)
 			// 已删除批次不可逆——失败路径必须返回真实部分计数，摘要才能如实
@@ -257,6 +270,11 @@ func CleanupAuditLogs() (int, error) {
 			return total, fmt.Errorf("读取审计日志删除条数失败: %w", err)
 		}
 		total += int(n)
+		// 批间复检 ctx：末批清空后同样以取消态收尾——否则任务取消/关停被
+		// 当作清理完成（success），与「本轮只删掉了部分行」的事实不符。
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
 		if int(n) < auditCleanupBatchSize {
 			break
 		}

@@ -250,6 +250,22 @@ var (
 
 var errThreatRollupRestart = errors.New("threat rollup restart after concurrent rewind")
 
+// threatRollupRewindApplyInLock 是回退落库的单点调用入口（调用方已持
+// threatRollupMu）：真实失败来自 DB 写锁/BUSY/磁盘满，构造代价高，测试经此
+// 缝注入失败形态验证「失败必须回填 + 有界重试」。
+var threatRollupRewindApplyInLock = threatRollupRewindToInLock
+
+var (
+	// threatRollupRewindApplyAttempts 是一次 ensure 轮内对回退队列的最大应用
+	// 尝试次数：应用失败时队列已回填，若不像旧实现那样「失败也报已处理」，
+	// ensure 就不会立即 continue；但仍需少量重试消化瞬时锁冲突，超过即把
+	// 失败交回调用方（warmer 的 60s 节拍/请求路径既有告警）。
+	threatRollupRewindApplyAttempts = 2
+	// threatRollupRewindApplyBackoff 是重试前的线性退避基数（第 n 次重试等待
+	// n×该值）；用 var 供测试置零。
+	threatRollupRewindApplyBackoff = 50 * time.Millisecond
+)
+
 // threatScreenNow 时钟缝（可控时间轴验证「上一分钟在完整后
 // 至少终固一次」——迟到写入必须被下一次固化覆盖）。
 var threatScreenNow = func() time.Time { return time.Now().UTC() }
@@ -401,18 +417,21 @@ func takeThreatRollupReclassifyPending() []time.Time {
 	return out
 }
 
-func applyPendingThreatRollupRewindInLock() {
+// applyPendingThreatRollupRewindInLock 消费并应用待处理回退队列（调用方持锁）。
+// 返回值：attempted=队列确有可消费项；succeeded=应用全部成功（无可消费项时
+// 视为成功）。失败时已消费条目**已回填**，由下一次 TryLock 成功者重试。
+func applyPendingThreatRollupRewindInLock() (attempted, succeeded bool) {
 	ts := threatRollupRewindPending.Swap(0)
 	reclassifyMinutes := takeThreatRollupReclassifyPending()
 	if ts == 0 && len(reclassifyMinutes) == 0 {
-		return
+		return false, true
 	}
 	var minute time.Time
 	if ts != 0 {
 		minute = time.Unix(ts, 0).UTC()
 	}
-	if threatRollupRewindToInLock(minute, reclassifyMinutes) {
-		return
+	if threatRollupRewindApplyInLock(minute, reclassifyMinutes) {
+		return true, true
 	}
 	// 失败回填：队列已被消费（Swap/整表置空），而改判是 UPDATE（事件 id 不变），
 	// 增量重固按 id>高水位永远扫不到——不回填则该分钟的 blocked/logged 口径
@@ -422,6 +441,7 @@ func applyPendingThreatRollupRewindInLock() {
 		queueThreatRollupRewind(minute)
 	}
 	queueThreatRollupReclassify(reclassifyMinutes)
+	return true, false
 }
 
 // ThreatRollupRewindTo 摄取提交后回退 rollup 覆盖水位。
@@ -454,19 +474,36 @@ func ThreatRollupRewindTo(minute time.Time, reclassifyMinutes []time.Time) {
 	}
 	defer threatRollupMu.Unlock()
 	applyPendingThreatRollupRewindInLock()
-	threatRollupRewindToInLock(minute, reclassifyMinutes)
+	if threatRollupRewindApplyInLock(minute, reclassifyMinutes) {
+		return
+	}
+	// 直通路径同样必须消费回退返回值（与队列路径同实现）：失败即回填——水位
+	// 不回退、原地改判分钟不进全量重算，该分钟口径会陈旧到下一次代际全量
+	// 重固（改判是 UPDATE，id 不变，增量重固永远扫不到）。回填幂等，由下一次
+	// drain/TryLock 成功者重试。
+	if !minute.IsZero() {
+		queueThreatRollupRewind(minute)
+	}
+	queueThreatRollupReclassify(reclassifyMinutes)
 }
 
-func drainThreatRollupRewindPending() bool {
+// drainThreatRollupRewindPending 由 ensure 在批次间隙调用：尝试一次性应用待
+// 处理回退队列。返回值：
+//   - attempted=false：无可消费项，或抢不到锁（留待下一次 ensure/下一轮节拍）；
+//   - succeeded=true：可消费项全部应用成功（或本来就没有）。
+//
+// 应用失败时队列已由 applyPending 回填，调用方**不得**把它当作「已处理一轮」
+// ——否则 ensure 会立刻重新固化并重试，形成无退避、无上限的紧凑循环（DB 写
+// 锁/BUSY/磁盘满时每轮一次事务 + 一条 warn，warmer 协程被粘住）。
+func drainThreatRollupRewindPending() (attempted, succeeded bool) {
 	if threatRollupRewindPending.Load() == 0 && !hasPendingThreatRollupReclassify() {
-		return false
+		return false, true
 	}
 	if !threatRollupMu.TryLock() {
-		return false
+		return false, false
 	}
 	defer threatRollupMu.Unlock()
-	applyPendingThreatRollupRewindInLock()
-	return true
+	return applyPendingThreatRollupRewindInLock()
 }
 
 func hasPendingThreatRollupReclassify() bool {
@@ -567,6 +604,7 @@ func threatRollupRewindToInLock(minute time.Time, reclassifyMinutes []time.Time)
 func ensureThreatRollup(hours int) error {
 	threatRollupEnsureMu.Lock()
 	defer threatRollupEnsureMu.Unlock()
+	rewindAttempts := 0
 	for {
 		err := ensureThreatRollupWithYields(hours)
 		if errors.Is(err, errThreatRollupRestart) {
@@ -575,10 +613,24 @@ func ensureThreatRollup(hours int) error {
 		if err != nil {
 			return err
 		}
-		if drainThreatRollupRewindPending() {
+		attempted, succeeded := drainThreatRollupRewindPending()
+		if !attempted {
+			return nil
+		}
+		if succeeded {
 			continue
 		}
-		return nil
+		// 回退应用失败（队列已回填）：只有成功才 continue——旧实现在这里
+		// 无条件继续，DB 写锁/BUSY/磁盘满时形成无退避、无上限的紧凑重试循环
+		// （每轮一次事务 + 一条 warn，warmer 协程被粘住）。有限次重试消化
+		// 瞬时冲突，仍失败则把队列留给下一轮节拍（warmer 60s / 请求路径）。
+		rewindAttempts++
+		if rewindAttempts >= threatRollupRewindApplyAttempts {
+			return fmt.Errorf("threat rollup rewind: %d 次尝试后仍失败，队列已回填，留待下一轮", rewindAttempts)
+		}
+		if threatRollupRewindApplyBackoff > 0 {
+			time.Sleep(time.Duration(rewindAttempts) * threatRollupRewindApplyBackoff)
+		}
 	}
 }
 

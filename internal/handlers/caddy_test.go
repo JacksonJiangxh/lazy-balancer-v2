@@ -545,6 +545,7 @@ func TestReloadCaddy_records_failure_audit_with_error_detail(t *testing.T) {
 // 裁定 2026-09-07：撤 UpdateConfig 的 pre-tx /load 探针（与 ④'「探针已撤除」
 // 对齐；SQL 失败分支不再有已交换的运行配置需回弹= 根因消解）。
 func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
+	preserveApplicationLogLevel(t, "")
 	newBackupTestHandlers(t)
 	var loads atomic.Int32
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

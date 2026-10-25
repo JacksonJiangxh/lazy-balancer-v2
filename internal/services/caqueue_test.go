@@ -2367,3 +2367,51 @@ func TestFailJob_materialBearingDeploymentJobStaysDeployable(t *testing.T) {
 		t.Fatalf("queued job status=%q, want failed（重签失败不得被降级为部署重试）", status)
 	}
 }
+
+// Given 规则删除补偿的重试次数（含 0/负数这类「未尝试」形态）。
+// When 计算下一次补偿延迟。
+// Then 从 1 分钟指数翻倍并在 10 分钟封顶——不封顶会让第 6 次起延迟到 32/64
+// 分钟，补偿队列在规则已删除后的等待期远超人工介入窗口；attempt<=1 恒为
+// 1 分钟。
+func TestRuleDeletionCompensationBackoff_exponentialWithTenMinuteCap(t *testing.T) {
+	for _, tc := range []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: -3, want: time.Minute},
+		{attempt: 0, want: time.Minute},
+		{attempt: 1, want: time.Minute},
+		{attempt: 2, want: 2 * time.Minute},
+		{attempt: 3, want: 4 * time.Minute},
+		{attempt: 4, want: 8 * time.Minute},
+		{attempt: 5, want: 10 * time.Minute},
+		{attempt: 6, want: 10 * time.Minute},
+		{attempt: 99, want: 10 * time.Minute},
+	} {
+		if got := ruleDeletionCompensationBackoff(tc.attempt); got != tc.want {
+			t.Fatalf("attempt=%d backoff=%s, want %s", tc.attempt, got, tc.want)
+		}
+	}
+}
+
+// Given 续签失败的原始消息与尝试上限；另一形态是消息里已含上限标记。
+// When 追加终态说明。
+// Then 首次追加「已达到最大重试次数 N」并保留原消息；已含标记时逐字返回
+// （幂等——重复追加会把同一句话叠成两段，且第二次的 N 会覆盖首次数值）。
+func TestMaxRenewalAttemptsMessage_appendsLimitOnceAndIsIdempotent(t *testing.T) {
+	const base = "ACME 签发失败：连接超时"
+	want := base + "（已达到最大重试次数 5，停止自动重试，可手动重试）"
+	got := maxRenewalAttemptsMessage(base, 5)
+	if got != want {
+		t.Fatalf("message=%q, want %q", got, want)
+	}
+	if again := maxRenewalAttemptsMessage(got, 5); again != got {
+		t.Fatalf("已含上限标记时二次调用=%q, want 原样 %q", again, got)
+	}
+	if again := maxRenewalAttemptsMessage(got, 9); again != got {
+		t.Fatalf("已含上限标记时改用另一上限=%q, want 原样 %q（不得覆盖首次数值）", again, got)
+	}
+	if empty := maxRenewalAttemptsMessage("", 3); !strings.Contains(empty, "已达到最大重试次数 3") {
+		t.Fatalf("空消息也必须带上限说明: %q", empty)
+	}
+}

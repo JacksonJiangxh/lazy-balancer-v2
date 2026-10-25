@@ -49,7 +49,10 @@
               <el-input v-else :model-value="form.display_name" disabled />
             </el-form-item>
             <el-form-item label="角色">
-              <el-select v-model="form.role" style="width: 100%" :disabled="editingSelf">
+              <!-- 初始化管理员（break-glass 入口）后端不可降级：编辑弹框直接禁用
+                   角色控件并在下方给出原因——否则提交必 400，且只有全局 toast 无
+                   字段定位，与同页「不可删除/禁用」的显式禁用口径不一致 -->
+              <el-select v-model="form.role" style="width: 100%" :disabled="roleLocked">
                 <el-option label="管理员" value="admin">
                   <el-tag type="danger" size="small">管理员</el-tag>
                 </el-option>
@@ -57,6 +60,8 @@
                   <el-tag type="info" size="small">普通用户</el-tag>
                 </el-option>
               </el-select>
+              <div v-if="editingUser?.is_setup_admin && !editingSelf" class="form-tip-line">系统初始化管理员不可降级</div>
+              <div v-else-if="editingSelf" class="form-tip-line">不能修改自己的角色</div>
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -309,6 +314,9 @@ const openCreateForm = () => {
 const editingIsOIDC = computed(() => editingUser.value?.auth_provider === 'oidc')
 const editingSelf = computed(() => editingUser.value !== null && editingUser.value.id === authStore.user?.id)
 const editingUser = ref<UserListItem | null>(null)
+// 角色不可改：编辑自己（会把自己降级/失权）与初始化管理员（后端 protected 恒 400）
+// 两条同因不同源的锁合流——模板与提交载荷共用本判据。
+const roleLocked = computed(() => editingSelf.value || editingUser.value?.is_setup_admin === true)
 const switchingIds = ref(new Set<number>())
 let usersRequestSeq = 0
 const form = ref({
@@ -380,7 +388,7 @@ const handleSubmit = async () => {
       const oidcTarget = editingUser.value.auth_provider === 'oidc'
       await request.put(`/users/${editingUser.value.id}`, {
         username: oidcTarget ? undefined : form.value.username,
-        role: editingSelf.value ? undefined : form.value.role,
+        role: roleLocked.value ? undefined : form.value.role,
         display_name: oidcTarget ? undefined : form.value.display_name,
         password: oidcTarget ? undefined : (form.value.password || undefined),
       })

@@ -77,6 +77,10 @@
             </div>
             <template v-if="target.enableTls && !isTcp">
               <div v-if="certLoading" class="flow-cert-loading"><el-skeleton :rows="2" animated /></div>
+              <div v-else-if="certFailed" class="flow-detail-line">
+                证书信息加载失败
+                <el-button link type="warning" size="small" @click="retryCertInfo">重试</el-button>
+              </div>
               <template v-else-if="certInfo">
                 <div class="flow-cert-title">TLS 证书</div>
                 <div class="flow-kv-grid">
@@ -440,6 +444,9 @@ interface FlowCertInfo {
 const stats = ref<StageStats | null>(null)
 const statsSettled = ref(false)
 const certInfo = ref<FlowCertInfo | null>(null)
+// cert-info 拉取失败位：失败与「后端无可展示证书」必须区分——原实现两者共用
+// certInfo=null，弹框会把一次 5xx/超时读成「规则禁用或证书未就绪」的业务结论。
+const certFailed = ref(false)
 const certLoading = ref(false)
 let statsSeq = 0
 // 证书拉取用独立序列计数器：与 statsSeq 共用时，TLS 规则的 cert-info 请求
@@ -750,6 +757,7 @@ const onDialogOpen = (): void => {
   stats.value = null
   statsSettled.value = false
   certInfo.value = null
+  certFailed.value = false
   certLoading.value = false
   // 明细缓存随弹框会话重置（规则绑定/策略内容可能已在页间变更）；序号自增使
   // 上一会话在途明细续体失配（修复 A→B 快速切换后 B 明细被 A 续体占死/残留）
@@ -779,15 +787,33 @@ const onDialogOpen = (): void => {
   } else {
     statsSettled.value = true
   }
-  // TLS 启用时拉取证书信息（接入卡富化）
+  // TLS 启用时拉取证书信息（接入卡富化）；失败与「无可展示证书」区分开
   if (props.target?.enableTls && !isTcp.value) {
-    const seq = ++certSeq
-    certLoading.value = true
-    request.get<APIResponse<FlowCertInfo>>(`/rules/${encodeURIComponent(caddyId)}/cert-info`, { silent: true })
-      .then((res) => { if (seq === certSeq) certInfo.value = res.data ?? null })
-      .catch(() => { if (seq === certSeq) certInfo.value = null })
-      .finally(() => { if (seq === certSeq) certLoading.value = false })
+    loadCertInfo(caddyId)
   }
+}
+
+// 证书信息加载：失败置 certFailed（面板给「加载失败 + 重试」），成功但无数据
+// 才落到「规则禁用或证书未就绪」。certSeq 守卫丢弃过期响应（同 cert-info 独立
+// 计数器理由见上方注释）。
+const loadCertInfo = (caddyId: string): void => {
+  const seq = ++certSeq
+  certLoading.value = true
+  certFailed.value = false
+  request.get<APIResponse<FlowCertInfo>>(`/rules/${encodeURIComponent(caddyId)}/cert-info`, { silent: true })
+    .then((res) => { if (seq === certSeq) certInfo.value = res.data ?? null })
+    .catch(() => {
+      if (seq !== certSeq) return
+      certInfo.value = null
+      certFailed.value = true
+    })
+    .finally(() => { if (seq === certSeq) certLoading.value = false })
+}
+
+const retryCertInfo = (): void => {
+  const caddyId = props.target?.caddyId
+  if (!caddyId || certLoading.value) return
+  loadCertInfo(caddyId)
 }
 </script>
 

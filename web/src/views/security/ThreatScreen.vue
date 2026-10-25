@@ -119,12 +119,12 @@
         </div>
         <div>
           <h1 class="glitch" data-text="安全威胁大屏">安全威胁大屏</h1>
-          <p>近 {{ bucketTerms.windowLabel }}安全态势实时监控 <time>{{ clockText }}</time><span class="clock-date">{{ clockDate }}</span></p>
+          <p>近 {{ frameTerms.windowLabel }}安全态势实时监控 <time>{{ clockText }}</time><span class="clock-date">{{ clockDate }}</span><em v-if="staleFrameLabel" class="ov-switch-hint" role="status">{{ staleFrameLabel }}</em></p>
         </div>
       </div>
 
       <div class="kpis" role="group" aria-label="核心指标">
-        <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">{{ bucketTerms.windowLabel }}安全事件 · 拦截 {{ stats?.blocked_events ?? 0 }} / 检测 {{ loggedEvents }}</span></div>
+        <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">{{ frameTerms.windowLabel }}安全事件 · 拦截 {{ stats?.blocked_events ?? 0 }} / 检测 {{ loggedEvents }}</span></div>
         <div class="kpi"><span class="kpi-value cool">{{ blockRateText }}</span><span class="kpi-label">拦截率 · 拦截 / 全部安全事件</span></div>
         <div class="kpi"><span class="kpi-value">{{ displayRecentRate }}</span><span class="kpi-label">拦截/分钟 · 近 5 分钟</span></div>
         <div class="kpi"><span class="kpi-value">{{ displayActive }}</span><span class="kpi-label">活跃攻击 IP · 近 10 分钟</span></div>
@@ -162,11 +162,11 @@
             <div class="ov-item"><span>事件总量</span><b>{{ stats?.total_events ?? 0 }}</b></div>
             <div class="ov-item"><span>拦截 / 检测</span><b>{{ stats?.blocked_events ?? 0 }} / {{ loggedEvents }}</b></div>
             <div class="ov-item">
-              <span>{{ bucketTerms.peakLabel }}</span>
+              <span>{{ frameTerms.peakLabel }}</span>
               <b>{{ peakSlot.value > 0 ? peakSlot.name : '—' }}</b>
               <em v-if="peakSlot.value > 0">{{ peakSlot.value }} 次</em>
             </div>
-            <div class="ov-item"><span>{{ bucketTerms.countLabel }}</span><b>{{ activeHourCount }}/{{ hourlyHist.length }}</b></div>
+            <div class="ov-item"><span>{{ frameTerms.countLabel }}</span><b>{{ activeHourCount }}/{{ hourlyHist.length }}</b></div>
           </div>
         </div>
 
@@ -254,7 +254,7 @@
     <div class="charts-row">
       <div class="panel hud">
         <div class="panel-head">
-          <h2>{{ bucketTerms.windowLabel }}事件趋势 <span class="en">{{ windowHours > 24 ? 'DAILY' : 'HOURLY' }}</span></h2>
+          <h2>{{ frameTerms.windowLabel }}事件趋势 <span class="en">{{ frameBucketLabel }}</span></h2>
           <span class="meta">合计 <b>{{ hourlyTotal }}</b></span>
         </div>
         <div class="chart-box">
@@ -437,6 +437,11 @@ const peakSlot = computed(() => hourlyHist.value.reduce(
 const activeHourCount = computed(() => hourlyHist.value.filter((slot) => slot.value > 0).length)
 // 概览口径词随窗口派生（>24h 后端按日桶）——与趋势图 DAILY/HOURLY 同源
 const bucketTerms = computed(() => bucketTerminology(windowHours.value))
+// 已渲染帧的口径：标题/副标题/KPI/趋势必须描述「画出的那帧」（stats.hours），
+// 切窗在途或请求持续失败时旧帧保留，用当前窗口词标注旧数字等于谎报口径。
+const frameWindowHours = computed(() => stats.value?.hours ?? windowHours.value)
+const frameTerms = computed(() => bucketTerminology(frameWindowHours.value))
+const frameBucketLabel = computed(() => frameWindowHours.value > 24 ? 'DAILY' : 'HOURLY')
 // 已渲染的统计属于哪个窗口：切换窗口后旧帧保留但必须标注「切换中」，
 // 不得让上一窗口的数字冒充当前窗口。失败时不再显示「切换中」（三态互斥）：
 // 轮询失败会保留旧帧直到新窗口成功，此时「切换中 + 加载失败」并存会让运维

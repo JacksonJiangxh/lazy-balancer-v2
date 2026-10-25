@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/internal/dnsname"
 	"lazy-balancer-v2/internal/dnsprovider/internal/retry"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
@@ -49,8 +50,9 @@ type ownedRecord struct {
 
 // Provider implements dnsprovider.Provider for DNSPod (dnsapi.cn).
 type Provider struct {
-	// loginToken 凭据保持私有——导出字段任何一次 %+v/JSON 序列化即泄密；
-	// 读取走 LoginToken() 访问器，日志形态走 String() 脱敏。
+	// loginToken 凭据保持私有——导出字段任何一次 %+v/JSON 序列化即泄密。
+	// 生产读取全部是包内直读（构造 API 请求、缓存键派生）；本包不提供凭据
+	// 访问器，日志/序列化形态走 String()（只暴露账户摘要）。
 	loginToken string
 	client     *http.Client
 	mu         sync.Mutex
@@ -61,9 +63,6 @@ type Provider struct {
 	// 命中新账户下的无关记录。
 	account string
 }
-
-// LoginToken 返回凭据原文（仅构造 API 请求/缓存键派生使用；禁止打印）。
-func (p *Provider) LoginToken() string { return p.loginToken }
 
 // String 脱敏形态：只暴露账户摘要，任何日志/序列化路径不得回显凭据。
 func (p *Provider) String() string { return "dnspod.Provider{account:" + p.account + "}" }
@@ -536,6 +535,10 @@ func (p *Provider) domainIDCacheKey(zone string) string {
 }
 
 func (p *Provider) getDomainID(ctx context.Context, zone string) (string, error) {
+	// DNS 名大小写不敏感（与 ResolveZone/dnsname 单源同口径）：Domain.List 返回
+	// 服务端规范形态（小写），输入侧归一后才能真正命中；缓存键随之归一，同一
+	// zone 的不同书写形态不再各存一份 domain_id。
+	zone = dnsname.NormalizeName(zone)
 	cacheKey := p.domainIDCacheKey(zone)
 	domainIDCacheMu.Lock()
 	cached, ok := domainIDCache[cacheKey]
@@ -565,7 +568,9 @@ func (p *Provider) getDomainID(ctx context.Context, zone string) (string, error)
 			return "", fmt.Errorf("Domain.List failed: %s", p.sanitizeMessage(result.Status.Message))
 		}
 		for _, d := range result.Domains {
-			if d.Name == zone {
+			// 两侧归一后再比较：服务端规范形态当前是小写，但依赖该实现细节会让
+			// 「返回形态变化」静默变成「域名不在账户」的错误结论。
+			if dnsname.NormalizeName(d.Name) == zone {
 				id := d.ID.String()
 				domainIDCacheMu.Lock()
 				domainIDCache[cacheKey] = id

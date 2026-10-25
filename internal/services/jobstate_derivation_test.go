@@ -89,5 +89,60 @@ func TestDeploymentLifecycleStatusLiteralOnlyInDerivation(t *testing.T) {
 		if match := literalSet.FindString(string(data)); match != "" {
 			t.Errorf("%s 重新写死了部署生命周期状态集字面量 %s，必须复用 DeploymentLifecycleJobStatusSQL/DeploymentCleanupJobStatusSQL", path, match)
 		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if countDeploymentLifecycleGoLiterals(line) < 2 {
+				continue
+			}
+			t.Errorf("%s 重新写死了部署生命周期状态集（Go 字面量）: %s，必须复用 deploymentLifecycleJobStatuses/JobLifecycle", path, strings.TrimSpace(line))
+		}
+	}
+}
+
+// countDeploymentLifecycleGoLiterals 统计一行里作为 Go 字符串字面量出现的部署
+// 生命周期状态个数：`[]string{"downloaded", "cleanup_dns"}` 与
+// `status == "downloaded" || status == "cleanup_dns"` 都是第二份集合的形态。
+// SQL 片段用单引号包裹，不计入；单状态比较（1 个）是合法用法。
+func countDeploymentLifecycleGoLiterals(line string) int {
+	count := 0
+	for _, status := range []string{"downloaded", "cleanup_dns", "cleanup_warning"} {
+		if strings.Contains(line, `"`+status+`"`) {
+			count++
+		}
+	}
+	return count
+}
+
+// 部署链回写源态集 = 部署生命周期 + downloading（唯一「证书字节已到手、
+// downloaded 进度行未落库」的 active 形态）。终态（issued/failed/disabled）在
+// 集合外——那是并发胜者已提交的状态，陈旧部署回调不得把成功结果拉回部署生命
+// 周期；其余 active 签发态（creating_order/validating…）也在集合外——它们发生在
+// 证书字节到手之前，到达部署失败回写的材料只能是陈旧回调的，写回 downloaded 会
+// 越权改写正在进行的签发（doesNotDowngradeOutsideDeployableLifecycle 契约）；
+// queued/waiting_ca 由队列/CA 退避链维护。
+func TestDeploymentPersistenceStatusSetDerivedFromLifecycleMap(t *testing.T) {
+	want := append([]string{}, deploymentLifecycleJobStatuses...)
+	want = append(want, "downloading")
+	sort.Strings(want)
+	if strings.Join(deploymentPersistenceJobStatuses, ",") != strings.Join(want, ",") {
+		t.Fatalf("deploymentPersistenceJobStatuses=%v, want %v（部署生命周期 + downloading）",
+			deploymentPersistenceJobStatuses, want)
+	}
+	contains := func(status string) bool {
+		for _, got := range deploymentPersistenceJobStatuses {
+			if got == status {
+				return true
+			}
+		}
+		return false
+	}
+	for _, status := range []string{"downloaded", "cleanup_dns", "cleanup_warning", "downloading"} {
+		if !contains(status) {
+			t.Fatalf("集合缺 %q（部署链必须能从该状态收敛材料）: %v", status, deploymentPersistenceJobStatuses)
+		}
+	}
+	for _, status := range []string{"issued", "failed", "disabled", "queued", "waiting_ca", "creating_order", "validating", "finalized"} {
+		if contains(status) {
+			t.Fatalf("集合不得含 %q（终态=并发胜者/在途签发=不得越权改写）: %v", status, deploymentPersistenceJobStatuses)
+		}
 	}
 }

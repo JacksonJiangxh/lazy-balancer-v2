@@ -191,7 +191,7 @@ func TestReadAdminConfigBody_rejectsOversize(t *testing.T) {
 func TestCertJobLogLockKeyMatchesHousekeepingKey(t *testing.T) {
 	ruleID := "lb.dot.rule"
 	component := certJobLogFileComponent(ruleID)
-	t.Cleanup(func() { certJobLogWriteLocks.Delete(component) })
+	t.Cleanup(func() { certJobLogWriteLocks.locks.Delete(component) })
 
 	writeLock := lockCertJobLog(ruleID)
 	parsed, ok := certJobLogRuleIDFromName("certjob-" + component + ".log.1")

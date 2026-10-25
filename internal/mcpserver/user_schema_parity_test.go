@@ -86,3 +86,39 @@ func TestUserToolSchemasMatchPasswordAndUsernamePolicy(t *testing.T) {
 		}
 	}
 }
+
+// 初始化管理员的保护面在 MCP 侧同样必须可发现：Agent 能读到的只有工具
+// description 与 usage 文本，缺提示会让它反复重试同一必败操作（终态 400）。
+// 保护文案从 handlers 的实现字面量派生，两侧漂移即红。
+func TestUserToolsDocumentSetupAdminProtection(t *testing.T) {
+	source := readHandlerSource(t, "users.go")
+	for _, tc := range []struct {
+		tool  string
+		guard string // handlers 实现里的 400 文案
+		verb  string // MCP 侧必须点名的保护动作
+	}{
+		{"update_user", "初始管理员不可降级", "降级"},
+		{"delete_user", "初始管理员不可删除", "删除"},
+	} {
+		if !strings.Contains(source, tc.guard) {
+			t.Errorf("handlers/users.go 未出现保护文案 %q（派生单源已漂移）", tc.guard)
+		}
+		var spec toolSpec
+		found := false
+		for _, candidate := range tools {
+			if candidate.name == tc.tool {
+				spec, found = candidate, true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("工具 %s 未注册", tc.tool)
+		}
+		usage := toolUsage[tc.tool]
+		for label, text := range map[string]string{"description": spec.description, "usage": usage} {
+			if !strings.Contains(text, "初始化管理员") || !strings.Contains(text, tc.verb) {
+				t.Errorf("%s 的 %s=%q 未提示「初始化管理员不可%s」（对应 400 %q）", tc.tool, label, text, tc.verb, tc.guard)
+			}
+		}
+	}
+}

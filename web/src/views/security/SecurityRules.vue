@@ -276,8 +276,14 @@
               </el-select>
               <div class="pattern-col">
                 <div class="pattern-input-row">
-                  <el-input v-model="cond.pattern" :placeholder="patternPlaceholder(cond)" size="small" :class="{ 'is-error': cond.operator === 'regex' && !isValidRegex(cond.pattern) }" />
+                  <el-input v-model="cond.pattern" :placeholder="patternPlaceholder(cond)" size="small" :class="{ 'is-error': (cond.operator === 'regex' && !isValidRegex(cond.pattern)) || patternOverLimit(cond.pattern) }" />
                   <el-icon v-if="cond.operator === 'regex' && !isValidRegex(cond.pattern)" class="regex-error-icon"><WarningFilled /></el-icon>
+                  <el-icon v-else-if="patternOverLimit(cond.pattern)" class="regex-error-icon"><WarningFilled /></el-icon>
+                </div>
+                <!-- 与后端写侧门同口径：4KiB 按 UTF-8 字节计（中文字符 3 字节），
+                     按字符数看不出超限，故给出实时字节数 -->
+                <div v-if="patternOverLimit(cond.pattern)" class="form-tip-line port-warning">
+                  匹配内容不能超过 {{ CUSTOM_RULE_MAX_PATTERN_BYTES }} 字节（当前 {{ patternByteLength(cond.pattern) }} 字节）
                 </div>
                 <div v-if="cond.target === 'user_agent'" class="preset-section">
                   <button type="button" class="preset-header" :aria-expanded="!uaCollapsed[idx]" @click="uaCollapsed[idx] = !uaCollapsed[idx]">
@@ -310,9 +316,13 @@
               </div>
               <el-button link type="danger" size="small" :disabled="isReadOnly" @click="removeCondition(idx)">删除</el-button>
             </div>
-            <el-button v-if="!isReadOnly" size="small" type="primary" plain class="add-condition-btn" @click="ruleForm.conditions.push({ target: 'uri', operator: 'contains', pattern: '' })">
-              + 添加条件
-            </el-button>
+            <div class="add-condition-row">
+              <el-button v-if="!isReadOnly" size="small" type="primary" plain class="add-condition-btn" :disabled="!canAddCondition(ruleForm.conditions.length)" @click="ruleForm.conditions.push({ target: 'uri', operator: 'contains', pattern: '' })">
+                + 添加条件
+              </el-button>
+              <!-- 条件数上限与后端 customRuleMaxConditions 同源：超出只能提交后吃 400 -->
+              <span class="form-tip-inline">{{ ruleForm.conditions.length }}/{{ CUSTOM_RULE_MAX_CONDITIONS }}</span>
+            </div>
           </div>
         </el-form-item>
         <!-- 原生表单行（2026-10-11 用户裁定：对齐统一走 el-form-item；Firefox
@@ -351,7 +361,7 @@
           subtitle="可复用 IP/CIDR 集合，供安全策略引用（黑白名单 / 信任名单）" />
       </template>
       <div v-if="ipListDetailFailed" class="info-note-bar">
-        <span class="info-note-desc">名单条目加载失败：为避免以空条目覆盖原列表，保存已禁用。</span>
+        <span class="info-note-desc">名单条目加载失败：为避免以空条目覆盖原列表，保存与条目增删/导入已禁用；请先重新加载。</span>
         <el-button size="small" type="primary" plain @click="reloadIpListDetail">重新加载</el-button>
       </div>
       <el-form :model="ipListForm" label-width="80px" label-position="right" v-loading="loadingIpListDetail">
@@ -418,11 +428,11 @@
               />
             </div>
             <div class="entries-toolbar">
-              <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain @click="addIpListEntry">
+              <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed" @click="addIpListEntry">
                 + 添加条目
               </el-button>
               <div class="entries-toolbar-right">
-                <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain @click="triggerImportEntries">导入</el-button>
+                <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed" @click="triggerImportEntries">导入</el-button>
                 <el-button size="small" type="primary" plain @click="exportIpListEntries">导出</el-button>
               </div>
             </div>
@@ -655,7 +665,8 @@ import { request, mfaAwareSuccess } from '@/utils/api'
 import { formatBytes } from '@/utils/formatBytes'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
-import { IP_LIST_MAX_ENTRIES, canSaveIpList, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
+import { IP_LIST_MAX_ENTRIES, canSaveIpList, entriesMissingFromPayload, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
+import { CUSTOM_RULE_MAX_CONDITIONS, CUSTOM_RULE_MAX_PATTERN_BYTES, canAddCondition, patternByteLength, patternOverLimit } from '@/utils/customRuleLimits'
 import { formatIpListEntryLine, ipListRemarkMaxLength, parseIpListEntryLine } from '@/utils/ipListCsv'
 import { popperViewportSafe } from '@/utils/popper'
 import { useAuthStore } from '@/stores/auth'
@@ -1176,6 +1187,17 @@ const openIpListDialog = async (row?: IPListRow) => {
 const reloadIpListDetail = async (): Promise<void> => {
   const id = ipListDetailRowId.value
   if (id == null) return
+  // 重试会用服务端条目整表替换：已有未保存条目（含加载成功后又失败、用户继续
+  // 补录的形态）必须先确认，不得静默丢弃。
+  if (ipListForm.value.entries.length > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `重新加载将用服务端条目覆盖当前 ${ipListForm.value.entries.length} 条（含未保存的新增/编辑），确定继续？`,
+        '重新加载确认',
+        { type: 'warning', confirmButtonText: '重新加载', cancelButtonText: '取消' },
+      )
+    } catch { return }
+  }
   const requestSeq = ++ipListDetailSeq
   loadingIpListDetail.value = true
   try {
@@ -1185,12 +1207,44 @@ const reloadIpListDetail = async (): Promise<void> => {
     ipListForm.value.entries = (res.data?.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
     ipListDetailFailed.value = false
     ipListEntryPage.value = 1
+    ElMessage.success('已加载最新条目')
   } catch {
     if (requestSeq !== ipListDetailSeq) return
     ipListDetailFailed.value = true
     ElMessage.error('加载列表条目失败，请稍后重试')
   } finally {
     if (requestSeq === ipListDetailSeq) loadingIpListDetail.value = false
+  }
+}
+
+/**
+ * 内置名单保存前的「期间新增条目」核对（返回是否可以继续保存）。
+ * 重取详情失败时同样要求确认——无法核对就不能假装安全，用户可选择取消后重开弹框。
+ */
+const confirmAutobanFreshness = async (id: number, payloadValues: string[]): Promise<boolean> => {
+  try {
+    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
+    const missing = entriesMissingFromPayload((res.data?.entries || []).map((e) => e.value), payloadValues)
+    if (missing.length === 0) return true
+    const preview = missing.slice(0, 5).join('、') + (missing.length > 5 ? ' 等' : '')
+    await ElMessageBox.confirm(
+      `打开弹框后名单新增了 ${missing.length} 条（${preview}），保存为整表替换，会将这些新条目一并移除（即刻解封）。确定继续？`,
+      '封禁条目已变化',
+      { type: 'warning', confirmButtonText: '仍要保存', cancelButtonText: '取消' },
+    )
+    return true
+  } catch (error: unknown) {
+    if (error === 'cancel' || error === 'close') return false
+    try {
+      await ElMessageBox.confirm(
+        '无法核对打开弹框后是否有任务新增封禁条目；保存仍会整表替换该名单。确定继续？',
+        '无法核对最新条目',
+        { type: 'warning', confirmButtonText: '仍要保存', cancelButtonText: '取消' },
+      )
+      return true
+    } catch {
+      return false
+    }
   }
 }
 
@@ -1225,6 +1279,12 @@ const saveIpList = async () => {
     try {
       await ElMessageBox.confirm(`将清空列表「${name}」的全部条目（保存后不可恢复），确定继续？`, '清空确认', { type: 'warning', confirmButtonText: '清空并保存' })
     } catch { return }
+  }
+  // 内置自动封禁名单由任务持续 merge 写入，而本弹框详情只在打开时取一次、保存
+  // 是全量替换：打开期间新封禁的 IP 会被无声解封。保存前重取详情做差，点名移除项。
+  if (editingIpListPreset.value && editingIpListId.value) {
+    const proceed = await confirmAutobanFreshness(editingIpListId.value, entries.map((e) => e.value))
+    if (!proceed) return
   }
   const action = editingIpListId.value ? '保存' : '创建'
   const expiredNote = expiredEntryCount > 0 ? `，其中 ${expiredEntryCount} 条已到期（保存后自动移除）` : ''
@@ -1758,8 +1818,17 @@ const saveCustomRule = async () => {
   if (isReadOnly.value || savingRule.value) return
   if (!ruleForm.value.name.trim()) { ElMessage.warning('请输入规则名称'); return }
   if (!ruleForm.value.conditions.length) { ElMessage.warning('至少需要一个匹配条件'); return }
+  // 上限与后端写侧门同源（条件数/pattern 字节）：不前置拦截只能等 400，且无字段定位。
+  if (ruleForm.value.conditions.length > CUSTOM_RULE_MAX_CONDITIONS) {
+    ElMessage.error(`自定义规则最多支持 ${CUSTOM_RULE_MAX_CONDITIONS} 个匹配条件（当前 ${ruleForm.value.conditions.length} 个）`)
+    return
+  }
   for (const cond of ruleForm.value.conditions) {
     if (!cond.pattern.trim()) { ElMessage.error('每个条件必须填写匹配值'); return }
+    if (patternOverLimit(cond.pattern)) {
+      ElMessage.error(`匹配内容不能超过 ${CUSTOM_RULE_MAX_PATTERN_BYTES} 字节（当前「${cond.pattern.slice(0, 20)}…」${patternByteLength(cond.pattern)} 字节）`)
+      return
+    }
     if (cond.pattern.endsWith('\\')) {
       ElMessage.error(cond.operator === 'regex'
         ? '正则匹配内容不能以反斜杠结尾，可用 `\\$` 结尾锚定或末尾追加 `(?:)` 空组表达尾部反斜杠'
@@ -1855,6 +1924,7 @@ onUnmounted(() => {
 :deep(.dh-icon.lib-icon--ip) { background: #f0fdfa; color: #0d9488; }
 :deep(.dh-icon.lib-icon--threat) { background: #fff1f2; color: #e11d48; }
 :deep(.dh-icon.lib-icon--crawler) { background: #fff7ed; color: #ea580c; }
+.add-condition-row { display: flex; align-items: center; gap: 8px; }
 .add-condition-btn { margin-top: 4px; }
 .pattern-col { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px; }
 .pattern-input-row { display: flex; align-items: center; gap: 6px; }

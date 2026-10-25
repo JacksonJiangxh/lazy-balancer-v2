@@ -166,9 +166,9 @@
             <div class="mcp-guide-subtitle">自签证书（可选配置）</div>
             <div class="mcp-guide-text">如客户端报证书错误，在启动环境加 <code>NODE_TLS_REJECT_UNAUTHORIZED=0</code>，或将面板证书加入系统信任。</div>
             <div class="mcp-guide-subtitle">常见错误</div>
-            <div class="mcp-guide-text">401：密钥无效或缺失 / JWT 无效；403：MCP 未开启 / 只读 Key 调用写工具 / 来源 IP 不在白名单；参数错误：校验在 REST 侧执行，以 IsError + 具体 message 文本返回（协议层不做 input_schema 校验，无 -32602）——读 message 修正后重试。</div>
+            <div class="mcp-guide-text">401：密钥无效或缺失 / JWT 无效；403：MCP 未开启 / 只读 Key 调用写工具或 export_config、get_caddy_config / 非管理员属主调用 validate_import、preview_config / 来源 IP 不在白名单；参数错误：校验在 REST 侧执行，以 IsError + 具体 message 文本返回（协议层不做 input_schema 校验，无 -32602）——读 message 修正后重试。</div>
             <div class="mcp-guide-subtitle">权限范围（scope）</div>
-            <div class="mcp-guide-text">只读 Key 可调用 GET 查询类工具及 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config；证书配置测试与 CA 提供商测试会写入真实 DNS 记录/凭据，属写语义，只读 Key 不可用）；其余写工具（POST/PUT/DELETE）需非只读 Key 且仅在主节点可用（从节点一律 403——集群端点 promote_cluster / pull_sync / set_cluster_mode / forget_cluster_pins 除外，在从节点本身可用）。写操作校验后即时生效，失败自动回滚，无需手动 reload。</div>
+            <div class="mcp-guide-text">只读 Key 可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希，后者原始 Caddy 配置可能含内联私钥，对只读 Key 恒 403 且 tools/list 不展示）及 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config）；其中 parse_certificate 对非管理员开放，validate_import 与 preview_config 要求 Key 属主为管理员（非管理员调用恒 403 且 tools/list 不展示）。证书配置测试与 CA 提供商测试会写入真实 DNS 记录/凭据，属写语义，只读 Key 不可用。其余写工具（POST/PUT/DELETE）需非只读 Key 且 Key 属主为管理员，仅在主节点可用（从节点一律 403——集群端点 promote_cluster / pull_sync / set_cluster_mode / forget_cluster_pins 除外，在从节点本身可用）。写操作校验后即时生效，失败自动回滚，无需手动 reload。完整口径以 <code>lazy-balancer://docs/ops-playbook</code> 资源为准。</div>
             <div class="mcp-guide-subtitle">常用流程</div>
             <pre class="mcp-guide-pre">新建 HTTP 代理：create_rule（protocol=http + domain + listen_port + upstreams）
   → 需要免费证书再 issue_certificate 传 caddy_id

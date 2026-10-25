@@ -254,17 +254,25 @@ func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() 
 // 用于覆盖「状态回写本身失败」的形态。
 var deploymentFailureWriteback = transitionJob
 
+// deploymentPersistenceWriteback 是部署前置「材料落库 + 状态转 downloaded」写入的
+// 测试缝（默认 transitionJob），用于覆盖 CAS 冲突的两类归因：并发胜者已提交终态
+// （材料陈旧、保持 raw）与自身进度写丢失（行仍非终态、必须落材料并登记重试）。
+var deploymentPersistenceWriteback = transitionJob
+
 // deploymentFailureFromStatuses 返回部署失败回写允许的源状态集合：常规部署链为
-// deploymentLifecycleJobStatuses；快速重部署链额外允许 issued——该链先以
-// issued→downloaded 的进度写进入部署生命周期，若这次进度写本身因瞬时 DB 故障
-// 未落库，失败回写若仍拒绝 issued 就只剩 WARN，行会停在 issued 而磁盘是旧材料
-// （文件对账只补缺失文件、不比对内容），只有重启/升主才能收敛。
+// deploymentPersistenceJobStatuses（部署生命周期 + downloading）——后者覆盖
+// 「downloaded 进度写因瞬时 DB 故障未落库、行仍停在 downloading」的形态，否则
+// 首查 0 行提前返回会让刚签发的材料只存在内存、任务滞留 active 且无周期通道；
+// 快速重部署链额外允许 issued——该链先以 issued→downloaded 的进度写进入部署生命
+// 周期，若这次进度写本身因瞬时 DB 故障未落库，失败回写若仍拒绝 issued 就只剩
+// WARN，行会停在 issued 而磁盘是旧材料（文件对账只补缺失文件、不比对内容），
+// 只有重启/升主才能收敛。
 func deploymentFailureFromStatuses(includeIssued bool) []string {
 	if !includeIssued {
-		return deploymentLifecycleJobStatuses
+		return deploymentPersistenceJobStatuses
 	}
-	statuses := make([]string, 0, len(deploymentLifecycleJobStatuses)+1)
-	statuses = append(statuses, deploymentLifecycleJobStatuses...)
+	statuses := make([]string, 0, len(deploymentPersistenceJobStatuses)+1)
+	statuses = append(statuses, deploymentPersistenceJobStatuses...)
 	statuses = append(statuses, "issued")
 	return statuses
 }
@@ -291,7 +299,7 @@ func advanceCertificateDeploymentWindow(jobID, attempt int, message, availableAf
 }
 
 func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, message string, err error) error {
-	return s.deploymentFailedFrom(jobID, material, message, err, deploymentLifecycleJobStatuses)
+	return s.deploymentFailedFrom(jobID, material, message, err, deploymentFailureFromStatuses(false))
 }
 
 func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate, message string, err error, from []string) error {
@@ -303,6 +311,12 @@ func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate,
 		args = append(args, status)
 	}
 	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ("+placeholders+")", args...).Scan(&previousAttempt); queryErr != nil {
+		// 0 行=行已不存在，或状态不在可回写集合（终态 issued/failed/disabled 由
+		// 并发胜者推进；queued/waiting_ca 由队列/CA 退避链维护）：本回调材料已无
+		// 归属，保持 raw 返回。留一个显式磁盘日志行——此前该分支静默返回，
+		// certjob-*.log 里完全看不到「部署失败但无处回写」的痕迹。
+		WriteCertJobLog(jobID, "ERROR", "deployment_failed_no_row",
+			fmt.Sprintf("部署失败但任务不在可回写状态（材料未落库，状态由其他链路维护/行已不存在）: %v", err))
 		return &certificateDeploymentError{err: errors.Join(err, queryErr)}
 	}
 	if material.deploymentAttempt > previousAttempt {
@@ -806,7 +820,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 		return s.deploymentFailed(jobID, material, "证书部署确认失败: "+err.Error(), fmt.Errorf("confirm certificate deployment: %w", err))
 	}
 
-	err := transitionJob(db.DB, jobID, []string{"downloaded", "cleanup_dns", "cleanup_warning"}, "downloaded", map[string]any{
+	err := deploymentPersistenceWriteback(db.DB, jobID, deploymentLifecycleJobStatuses, "downloaded", map[string]any{
 		"cert_pem":                   material.certPEM,
 		"key_pem":                    material.keyPEM,
 		"expires_at":                 canonicalDatetimeValue(material.notAfter),
@@ -815,10 +829,18 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 		"deployment_available_after": nil,
 	})
 	if err != nil {
-		// 并发胜者(ErrJobTransitionConflict)保持 raw——对方已推进,
-		// 本回调材料陈旧;其余(瞬时 DB)走 deploymentFailed,材料随失败落库。
+		// CAS 冲突不等于「并发胜者已推进」：先重读行状态再定性。只有终态
+		// （issued/failed/disabled，并发部署回调/取消已提交）才保持 raw——本回调
+		// 材料已陈旧；行仍在非终态时冲突来自「自身进度写丢失/并发 requeue」，
+		// 此时 ACME 材料只在内存，raw 返回会被队列按 CA 签发失败打成终态并永久
+		// 丢弃材料 → 改走 deploymentFailed 落材料 + 退避重试。其余（瞬时 DB）
+		// 同口径走 deploymentFailed。
 		if errors.Is(err, ErrJobTransitionConflict) {
-			return fmt.Errorf("persist downloaded certificate: %w", err)
+			status, statusErr := readCertJobStatus(jobID)
+			if statusErr == nil && JobIsTerminal(status) {
+				return fmt.Errorf("persist downloaded certificate: %w", err)
+			}
+			return s.deploymentFailed(jobID, material, "证书部署落库冲突: "+err.Error(), fmt.Errorf("persist downloaded certificate: %w", err))
 		}
 		return s.deploymentFailed(jobID, material, "证书部署落库失败: "+err.Error(), fmt.Errorf("persist downloaded certificate: %w", err))
 	}
@@ -859,7 +881,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 		return s.deploymentFailed(jobID, material, "开启证书事务失败: "+err.Error(), fmt.Errorf("begin certificate transaction: %w", err))
 	}
 	defer func() { _ = tx.Rollback() }()
-	err = transitionJob(tx, jobID, []string{"downloaded", "cleanup_dns", "cleanup_warning"}, "issued", map[string]any{
+	err = transitionJob(tx, jobID, deploymentLifecycleJobStatuses, "issued", map[string]any{
 		"message":                    "签发成功",
 		"renewal_attempts":           0,
 		"ca_available_after":         nil,
@@ -968,6 +990,16 @@ func deploymentCommittedByConcurrentWinner(jobID int, material issuedCertificate
 	return err == nil && bytes.Equal(deployed, []byte(material.certPEM))
 }
 
+// readCertJobStatus 重读任务当前状态，用于区分「并发胜者已推进到终态」与
+// 「自身进度写丢失、行仍在非终态」——两者的正确处置相反（前者保持 raw 让材料
+// 陈旧回调退出，后者必须落材料并登记重试）。读失败按瞬时 DB 故障上抛，调用方
+// 走材料保留路径。
+func readCertJobStatus(jobID int) (string, error) {
+	var status string
+	err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status)
+	return status, err
+}
+
 // confirmCertificateDeployment 校验任务与规则的当前状态仍允许落盘这份签发
 // 材料。刻意不过滤 r.enable_tls/r.tls_source：与扫描/物化路径
 // （certificates.go 的 rescan/renew 查询、certstore.go 的启动物化）统一附加
@@ -996,12 +1028,15 @@ func confirmCertificateDeployment(ctx context.Context, jobID int, material issue
 	if canonicalJobDomains != canonicalRuleDomains {
 		return fmt.Errorf("certificate job %d domains no longer match rule", jobID)
 	}
-	deployable := status == "downloaded" || status == "cleanup_dns" || status == "cleanup_warning"
+	// 可部署源态由 jobLifecycleByStatus 派生（JobLifecycle）：新增/重命名部署
+	// 生命周期状态时这里自动跟随，不再维护第三份状态字面量集合。快速重部署链
+	// 额外允许 issued（任务已签发、材料在库，只重写磁盘文件）。
+	deployable := JobLifecycle(status) == JobLifecycleDownloaded
 	if allowIssued {
-		deployable = status == "issued" || status == "downloaded"
+		deployable = JobLifecycle(status) == JobLifecycleIssued || deployable
 	}
 	if !deployable {
-		return fmt.Errorf("certificate job %d is no longer deployable", jobID)
+		return fmt.Errorf("certificate job %d is no longer deployable (status=%s)", jobID, status)
 	}
 	return nil
 }

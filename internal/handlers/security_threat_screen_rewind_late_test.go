@@ -10,6 +10,7 @@ package handlers
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -260,4 +261,120 @@ func TestThreatRollupRewind_failureRefillsConsumedQueue(t *testing.T) {
 	// 清理：回填的全局队列不得泄漏到其他用例。
 	threatRollupRewindPending.Store(0)
 	_ = takeThreatRollupReclassifyPending()
+}
+
+// 直通路径（ThreatRollupRewindTo 抢到锁后直接应用入参）同样必须消费回退
+// 返回值：失败即回填。否则水位不回退、原地改判分钟不进全量重算——改判是
+// UPDATE（事件 id 不变），增量重固按 id>高水位永远扫不到，该分钟 blocked/
+// logged 口径陈旧到下一次代际全量重固（大屏与事件列表同窗口口径分裂）。
+func TestThreatRollupRewindTo_directPathRefillsOnFailure(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	// 取近期分钟：窗口外会被 threatRollupRewindMinute 钳到展示下界，断言
+	// 目标应取钳制后的同一值（此处取窗口内，避开钳制）。
+	m := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Minute)
+	seedThreatRewindWatermark(t, m.Format(threatRewindMinuteLayout))
+	// 注入失败形态：metrics_state 不可读 → 回退早退 false（与队列路径用例
+	// 同一注入方式，不依赖测试缝）。
+	if _, err := db.MetricsDB.Exec(`DROP TABLE metrics_state`); err != nil {
+		t.Fatal(err)
+	}
+	threatRollupRewindPending.Store(0)
+	_ = takeThreatRollupReclassifyPending()
+	t.Cleanup(func() {
+		threatRollupRewindPending.Store(0)
+		_ = takeThreatRollupReclassifyPending()
+	})
+
+	ThreatRollupRewindTo(m, []time.Time{m})
+
+	if got := threatRollupRewindPending.Load(); got != m.Unix() {
+		t.Fatalf("直通路径失败后回退队列=%d, want %d（本批重固不得丢弃）", got, m.Unix())
+	}
+	if !hasPendingThreatRollupReclassify() {
+		t.Fatal("直通路径失败后原地改判分钟必须回填（否则该分钟永不转全量重算）")
+	}
+}
+
+// drain 必须区分「无可消费项/抢不到锁」与「应用成功」：应用失败时队列已被
+// applyPending 回填，旧实现却无条件报告「已处理」，ensure 立即 continue 形成
+// 无退避、无上限的紧凑重试循环（DB 写锁/BUSY/磁盘满时每轮一次事务 + 一条
+// warn，warmer 协程被粘住）。
+func TestDrainThreatRollupRewindPending_reportsFailure(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	m := time.Date(2026, 10, 18, 13, 30, 0, 0, time.UTC)
+	seedThreatRewindWatermark(t, m.Format(threatRewindMinuteLayout))
+	if _, err := db.MetricsDB.Exec(`DROP TABLE metrics_state`); err != nil {
+		t.Fatal(err)
+	}
+	threatRollupRewindPending.Store(0)
+	_ = takeThreatRollupReclassifyPending()
+	t.Cleanup(func() {
+		threatRollupRewindPending.Store(0)
+		_ = takeThreatRollupReclassifyPending()
+	})
+	queueThreatRollupRewind(m)
+
+	attempted, succeeded := drainThreatRollupRewindPending()
+	if !attempted {
+		t.Fatal("队列有可消费项时 attempt 必须为真")
+	}
+	if succeeded {
+		t.Fatal("应用失败不得报告成功（ensure 会据此紧凑重试）")
+	}
+	if got := threatRollupRewindPending.Load(); got != m.Unix() {
+		t.Fatalf("失败后回退队列=%d, want %d（必须回填重试）", got, m.Unix())
+	}
+
+	// 无待处理项时：attempted=false 且不视为失败。
+	threatRollupRewindPending.Store(0)
+	if attempted, succeeded := drainThreatRollupRewindPending(); attempted || !succeeded {
+		t.Fatalf("空队列: attempted=%v succeeded=%v, want false/true", attempted, succeeded)
+	}
+}
+
+// 回退持续失败时 ensure 必须有界返回：旧实现 drain 恒报成功 → ensure 紧凑
+// 重试永不返回（warmer 协程被粘在循环里，每轮一次事务 + 一条 warn）。
+// 用测试缝让 ensure 自身成功、回退持续失败（真实形态是 DB 写锁/BUSY/磁盘满）：
+// 缝在第 8 次调用前一律失败、之后成功——旧实现会一路重试到「成功」并返回
+// nil，新实现在有界次数内放弃并返回错误。
+func TestEnsureThreatRollup_boundedRetriesWhenRewindKeepsFailing(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	oldApply := threatRollupRewindApplyInLock
+	oldAttempts := threatRollupRewindApplyAttempts
+	oldBackoff := threatRollupRewindApplyBackoff
+	t.Cleanup(func() {
+		threatRollupRewindApplyInLock = oldApply
+		threatRollupRewindApplyAttempts = oldAttempts
+		threatRollupRewindApplyBackoff = oldBackoff
+		threatRollupRewindPending.Store(0)
+		_ = takeThreatRollupReclassifyPending()
+	})
+	threatRollupRewindApplyAttempts = 2
+	threatRollupRewindApplyBackoff = 0
+	var calls, successes atomic.Int64
+	threatRollupRewindApplyInLock = func(time.Time, []time.Time) bool {
+		if calls.Add(1) <= 8 {
+			return false
+		}
+		successes.Add(1)
+		return true
+	}
+	threatRollupRewindPending.Store(0)
+	_ = takeThreatRollupReclassifyPending()
+	queueThreatRollupRewind(time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Minute))
+
+	err := ensureThreatRollup(1)
+	if err == nil {
+		t.Fatal("回退持续失败时 ensure 必须返回错误（留待下一轮节拍），不得重试到成功")
+	}
+	if got := successes.Load(); got != 0 {
+		t.Fatalf("有界重试内不得触达「成功」形态（重试次数无上限）: successes=%d", got)
+	}
+	// 每轮 ensure 最多两处应用（批次间隙合并 + drain），上限 2×attempts。
+	if got := calls.Load(); got > int64(2*threatRollupRewindApplyAttempts) {
+		t.Fatalf("回退应用次数=%d > %d（重试无上限）", got, 2*threatRollupRewindApplyAttempts)
+	}
+	if got := threatRollupRewindPending.Load(); got == 0 {
+		t.Fatal("失败后队列必须保持回填（下一轮节拍重试）")
+	}
 }

@@ -71,11 +71,16 @@ type rotationCopyName struct {
 }
 
 // classifyRotationCopyName 仅按文件名形态解析轮转副本（与目录内容无关）。
-// 先剥 .gz 与同秒碰撞后缀再按族判定：双重后缀副本（<base>.<ts>.gz /
-// <stem>-<ts>-size.log.gz）必须归到剥掉时间戳后的基名——否则会派生出一个
-// 「副本名本身当基名」的非规范条目，按固定基名取值的消费方取不到。
+// 先剥压缩后缀（.gz/.zst）与同秒碰撞后缀再按族判定：双重后缀副本
+// （<base>.<ts>.gz / <stem>-<ts>-size.log.gz）必须归到剥掉时间戳后的基名——
+// 否则会派生出一个「副本名本身当基名」的非规范条目，按固定基名取值的消费方
+// 取不到。
+//
+// 压缩后缀剥离与写侧锁键归一（taskengine.taskLogActivePath）共用
+// taskengine.StripRotationCompressionSuffix：两侧各持一份曾让 .zst 副本在
+// 分类器里归族、在锁键里却不归一（保留期删除因此取到副本名自己的锁）。
 func classifyRotationCopyName(name string) rotationCopyName {
-	core, gzipped := stripRotationCompressionSuffix(name)
+	core, gzipped := taskengine.StripRotationCompressionSuffix(name)
 	originalCore := core
 	collision := false
 	if stripped, ok := stripRotationCollisionSuffix(core); ok {
@@ -135,17 +140,6 @@ func classifyRotationCopyName(name string) rotationCopyName {
 // 侧白名单同源，避免两侧各写一份上游命名知识后漂移。
 var timberjackRotationReasonSuffix = regexp.MustCompile(
 	`-(?:` + services.CaddyLogRotationReasonPattern() + `)(?:_\d+)?\.log$`)
-
-// stripRotationCompressionSuffix 剥掉轮转副本的压缩后缀（.gz / .zst）并报告
-// 是否压缩——只认 .gz 会让 zstd 副本分类落空（与删除侧白名单同族）。
-func stripRotationCompressionSuffix(name string) (core string, compressed bool) {
-	for _, suffix := range []string{".gz", ".zst"} {
-		if strings.HasSuffix(name, suffix) {
-			return strings.TrimSuffix(name, suffix), true
-		}
-	}
-	return name, false
-}
 
 // isRotationTimestampTail 判定轮转副本名里时间戳段的开头形状（其后可带
 // 尺寸/碰撞余段）：紧凑 YYYYMMDD[T|-]HHMMSS（timberjack 与运行日志族）

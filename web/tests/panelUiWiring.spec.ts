@@ -266,7 +266,8 @@ test('阶段页覆盖写入按 skipped 归集后再回写（不谎报已覆盖�
 test('名单详情 GET 静默，避免与全局拦截器双 toast', () => {
   const text = code('src/views/security/SecurityRules.vue')
   const silentGets = text.match(/security\/ip-lists\/\$\{[^}]+\}`, \{ silent: true \}\)/g) ?? []
-  assert.equal(silentGets.length, 2, `详情与重试两处请求都应 silent，实际 ${silentGets.length}`)
+  // 详情、失败重试、内置名单保存前的新鲜度核对——三处都走 silent + 本地文案
+  assert.equal(silentGets.length, 3, `详情/重试/新鲜度核对三处请求都应 silent，实际 ${silentGets.length}`)
   // 本地提示保留（带「已禁用保存」动作信息）
   assert.match(text, /加载列表条目失败，已禁用保存；请重新加载/)
 })

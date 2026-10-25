@@ -6,7 +6,14 @@ export interface CurrentUser {
   display_name: string | null
   mfa_enabled?: boolean
   auth_provider?: string
-  // 初始化创建的首个管理员（break-glass 入口）：不可删除/禁用，前端禁用操作。
+  // 初始化创建的首个管理员（break-glass 入口）。后端三条强保护：不可删除、
+  // 不可禁用、不可降级（role 恒为 admin）；保护判定读库失败时 fail-closed 500
+  // （无法判定保护目标则不放行），前端操作会被 400/500 拒绝。
+  // 响应面：所有用户响应路径（密码登录 / MFA 登录与 step-up / GET·PATCH
+  // /users/me / PUT /users/:id / 从节点票据登录）均由 db.UserRowColumns 单源
+  // 列清单真实下发（非仅 GET /users 列表）——不要按端点分叉解读。字段无
+  // omitempty，类型保留可选只为容忍历史形态响应（缺省按 false 归一化，
+  // 即非保护目标；后端仍二次拦截）。
   is_setup_admin?: boolean
 }
 

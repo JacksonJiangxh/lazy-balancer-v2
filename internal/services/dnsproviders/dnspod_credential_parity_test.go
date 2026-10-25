@@ -73,16 +73,19 @@ func TestDNSPodCredentialInference_parityWithFactory(t *testing.T) {
 			if err != nil {
 				t.Fatalf("construct provider from canonical: %v", err)
 			}
+			// 凭据相等以账户摘要（String()，由完整凭据派生）判定：provider 包
+			// 不再暴露凭据访问器；摘要相等即两侧推导出的凭据一致（tencent 侧
+			// 摘要覆盖 secretID+secretKey 对）。
 			switch rawProvider := rawProvider.(type) {
 			case *dnspod.Provider:
 				builtDNSPod, ok := builtProvider.(*dnspod.Provider)
-				if !ok || builtDNSPod.LoginToken() != rawProvider.LoginToken() {
-					t.Fatalf("dnspod token mismatch: raw=%q canonical=%T", rawProvider.LoginToken(), builtProvider)
+				if !ok || builtDNSPod.String() != rawProvider.String() {
+					t.Fatalf("dnspod credential mismatch: raw=%s canonical=%T", rawProvider.String(), builtProvider)
 				}
 			case *tencent.Provider:
 				builtTencent, ok := builtProvider.(*tencent.Provider)
-				if !ok || builtTencent.SecretID() != rawProvider.SecretID() {
-					t.Fatalf("tencent secret mismatch: raw=%q canonical=%T", rawProvider.SecretID(), builtProvider)
+				if !ok || builtTencent.String() != rawProvider.String() {
+					t.Fatalf("tencent credential mismatch: raw=%s canonical=%T", rawProvider.String(), builtProvider)
 				}
 			default:
 				t.Fatalf("unexpected provider type %T", rawProvider)

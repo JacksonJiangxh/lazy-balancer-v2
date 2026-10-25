@@ -156,6 +156,7 @@ export const useAuthStore = defineStore('auth', () => {
           display_name: res.data.display_name,
           mfa_enabled: res.data.mfa_enabled ?? false,
           auth_provider: res.data.auth_provider ?? 'local',
+          is_setup_admin: res.data.is_setup_admin ?? false,
         }
       } else {
         // 200 但 data 为空——user 仍为 null（unknown 只读窗口）且原先此处
@@ -313,6 +314,7 @@ interface LoginResult {
         mfa_enabled: res.user.mfa_enabled ?? false,
         // 票据登录响应携带的来源标记——缺失按本地,避免从节点 UI 误判
         auth_provider: res.user.auth_provider ?? 'local',
+        is_setup_admin: res.user.is_setup_admin ?? false,
       }
     }
   }

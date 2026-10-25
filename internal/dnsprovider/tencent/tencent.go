@@ -40,7 +40,9 @@ type ownedRecord struct {
 // Provider implements dnsprovider.Provider for Tencent Cloud DNSPod.
 type Provider struct {
 	// secretID/secretKey 凭据保持私有（与 dnspod.Provider 同口径）——
-	// 导出字段任何一次 %+v/JSON 序列化即泄密；日志形态走 String() 脱敏。
+	// 导出字段任何一次 %+v/JSON 序列化即泄密。生产读取全部是包内直读
+	// （构造 SDK 凭证）；本包不提供凭据访问器，日志/序列化形态走 String()
+	// （只暴露账户摘要）。
 	secretID  string
 	secretKey string
 	client    *dnspod.Client
@@ -52,12 +54,6 @@ type Provider struct {
 	// 命中新账户下的无关记录。
 	account string
 }
-
-// SecretID 返回凭据 SecretID（仅构造 SDK 凭证使用；禁止打印）。
-func (p *Provider) SecretID() string { return p.secretID }
-
-// SecretKey 返回凭据 SecretKey（仅构造 SDK 凭证使用；禁止打印）。
-func (p *Provider) SecretKey() string { return p.secretKey }
 
 // String 脱敏形态：只暴露账户摘要，任何日志/序列化路径不得回显凭据。
 func (p *Provider) String() string { return "tencent.Provider{account:" + p.account + "}" }

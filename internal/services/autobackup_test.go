@@ -672,3 +672,47 @@ func TestNextAutoBackupSlot_invalidScheduleParamsLeaveTrace(t *testing.T) {
 		t.Fatalf("恢复日志次数=%d, want 1: %s", count, logs.String())
 	}
 }
+
+// 带外写入的非法水位线（非 RFC3339）：读侧按「从未跑过」立即补跑，推进 SQL
+// 必须同判据——`datetime(非法值)` 为 NULL 时条件恒不成立、Exec 却成功，
+// 水位线永不推进 ⇒ 每个 tick 重跑一次完整备份（写 task_runs 行 + 备份文件）。
+func TestAutoBackupScheduled_advancesOutOfBandInvalidWatermark(t *testing.T) {
+	setupAutoBackupTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00', auto_backup_last_run='legacy-not-a-timestamp'
+		WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	setAutoBackupTestExecutor(t, &calls, nil)
+
+	// When
+	if err := runAutoBackupScheduled(context.Background(), 0); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Then 1：非法值被真实槽覆盖（读侧判据「非法=未跑过」在写侧同样成立）。
+	if len(calls) != 1 {
+		t.Fatalf("calls=%v, want 单次执行", calls)
+	}
+	var lastRun string
+	if err := db.DB.QueryRow(`SELECT auto_backup_last_run FROM global_config WHERE id=1`).Scan(&lastRun); err != nil {
+		t.Fatalf("read last_run: %v", err)
+	}
+	got, perr := time.Parse(time.RFC3339, lastRun)
+	if perr != nil {
+		t.Fatalf("last_run=%q 仍为非法形态：非法水位线必须按「未跑过」被覆盖", lastRun)
+	}
+
+	// Then 2：覆盖后下一槽在未来——不再每 tick 判到期重跑全量备份。
+	now := time.Now()
+	slot, ok := nextAutoBackupSlot(now)
+	if !ok {
+		t.Fatal("ok=false, want 未来槽（水位线已推进）")
+	}
+	if !slot.After(now) {
+		t.Fatalf("slot=%v 不晚于 now=%v：水位线未推进，调度器会每 tick 重跑全量备份", slot, now)
+	}
+	if slot.Before(got) {
+		t.Fatalf("slot=%v 早于已写水位线 %v", slot, got)
+	}
+}

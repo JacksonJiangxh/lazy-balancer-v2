@@ -432,3 +432,36 @@ func TestSecurityEventsRuleIsCRSFamily_boundaries(t *testing.T) {
 		}
 	}
 }
+
+// Given 策略载荷（可能是大段 JSON 或中文规则名）与截断上限。
+// When 生成日志摘要片段。
+// Then 按 rune 截断且带省略号——按字节截断会把中文字符切成半字（日志出现
+// 非法 UTF-8）；limit<=0 表示「不记录载荷」必须返回空串而非原样透出。
+func TestClipForLog_runeSafeTruncation(t *testing.T) {
+	payload := `{"crs_excluded_rules":"949110,959100"}`
+	if got := clipForLog(payload, 0); got != "" {
+		t.Fatalf("limit=0 时=%q, want 空串（负数/零表示不记录载荷）", got)
+	}
+	if got := clipForLog(payload, -1); got != "" {
+		t.Fatalf("limit=-1 时=%q, want 空串", got)
+	}
+	if got := clipForLog(payload, len([]rune(payload))); got != payload {
+		t.Fatalf("恰在上限时=%q, want 原样（不得多打省略号）", got)
+	}
+	cut := clipForLog(payload, 4)
+	if cut != `{"cr…` {
+		t.Fatalf("ASCII 截断=%q, want %q", cut, `{"cr…`)
+	}
+
+	zh := "策略排除规则载荷超长"
+	zhCut := clipForLog(zh, 3)
+	if runes := []rune(zhCut); len(runes) != 4 || runes[3] != '…' {
+		t.Fatalf("中文截断=%q（rune 数=%d）, want 前 3 个 rune + 省略号", zhCut, len(runes))
+	}
+	if !strings.HasPrefix(zhCut, "策略排") {
+		t.Fatalf("中文截断=%q, want 以「策略排」开头（不得切坏多字节字符）", zhCut)
+	}
+	if got := clipForLog(zh, len([]rune(zh))+5); got != zh {
+		t.Fatalf("上限大于长度时=%q, want 原样 %q", got, zh)
+	}
+}

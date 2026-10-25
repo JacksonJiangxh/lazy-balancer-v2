@@ -246,6 +246,92 @@ func TestPreviewConfigUpdate_trustedProxyReadFailureReturns500(t *testing.T) {
 	}
 }
 
+// Given 受信代理校验内的 DB 读取故障（引用列表展开失败）。
+// When 保存全局配置（PUT /config，Explicit 审计策略，中间件不为失败兜底）。
+// Then 500 + 固定文案且操作审计恰留一条（含相位与底层错误）；同一映射被
+// 预览路由（AuditPolicySkip）使用时不产生虚假留痕。
+func TestUpdateConfig_trustedProxyReadFailureIsAudited(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/config", h.UpdateConfig)
+	router.POST("/config/preview", h.PreviewConfigUpdate)
+
+	origDB := db.DB
+	broken := sql.OpenDB(rowsErrStubConnector{
+		match: func(q string) bool { return strings.Contains(q, "FROM global_config WHERE id=1") },
+		cols:  1,
+	})
+	t.Cleanup(func() { _ = broken.Close() })
+	db.DB = broken
+	t.Cleanup(func() { db.DB = origDB })
+
+	send := func(method, path string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path,
+			strings.NewReader(`{"source":"caddy","trusted_proxy_ranges":"[\"203.0.113.0/24\"]"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		return recorder
+	}
+	const resource = "全局配置"
+	before := auditCountFor(t, "更新失败", resource)
+
+	preview := send(http.MethodPost, "/config/preview")
+	if preview.Code != http.StatusInternalServerError {
+		t.Fatalf("preview status=%d body=%s, want 500", preview.Code, preview.Body.String())
+	}
+	if got := auditCountFor(t, "更新失败", resource) - before; got != 0 {
+		t.Fatalf("预览路径失败留痕=%d 条, want 0（AuditPolicySkip 不落库不审计）", got)
+	}
+
+	save := send(http.MethodPut, "/config")
+	if save.Code != http.StatusInternalServerError {
+		t.Fatalf("save status=%d body=%s, want 500（DB 故障不得映射成载荷非法）", save.Code, save.Body.String())
+	}
+	raw := save.Body.String()
+	if !strings.Contains(raw, "读取受信代理配置失败") {
+		t.Fatalf("body=%s, want 固定文案「读取受信代理配置失败」", raw)
+	}
+	for _, leak := range []string{"注入的迭代失败", "sql:", "SQL"} {
+		if strings.Contains(raw, leak) {
+			t.Fatalf("body=%s 透出了底层错误文本 %q", raw, leak)
+		}
+	}
+
+	if got := auditCountFor(t, "更新失败", resource) - before; got != 1 {
+		t.Fatalf("保存路径失败留痕=%d 条, want 1（Explicit 路由 5xx 必须留痕）", got)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log
+		WHERE action='更新失败' AND resource=? ORDER BY id DESC LIMIT 1`, resource).Scan(&detail); err != nil {
+		t.Fatalf("读取失败审计: %v", err)
+	}
+	for _, want := range []string{"读取受信代理配置失败", "注入的迭代失败"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("审计 detail=%q, want 含 %q（相位 + 底层错误可追溯）", detail, want)
+		}
+	}
+
+	// 回归形状：DB 恢复正常后，同一保存端点的纯载荷错误仍是 400 且不审计
+	// （4xx 不入审计是既定政策，auditFailure=true 不得把它带进来）。
+	db.DB = origDB
+	if _, err := db.DB.Exec(`UPDATE global_config SET access_log_json=1 WHERE id=1`); err != nil {
+		t.Fatalf("seed access_log_json: %v", err)
+	}
+	bad := httptest.NewRequest(http.MethodPut, "/config",
+		strings.NewReader(`{"source":"caddy","access_log_format":"not-a-mapping"}`))
+	bad.Header.Set("Content-Type", "application/json")
+	badRecorder := httptest.NewRecorder()
+	router.ServeHTTP(badRecorder, bad)
+	if badRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（纯载荷错误保持 400）", badRecorder.Code, badRecorder.Body.String())
+	}
+	if got := auditCountFor(t, "更新失败", resource) - before; got != 1 {
+		t.Fatalf("载荷 400 后失败留痕=%d 条, want 仍为 1（4xx 不审计）", got)
+	}
+}
+
 // Given 备份导入链中的受信代理门需要读库，而 DB 读取故障。
 // When 导入 v2 备份。
 // Then 500 + 固定文案（此前一律「备份校验失败」400 并透出 SQL 文本）。

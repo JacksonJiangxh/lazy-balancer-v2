@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -103,18 +102,17 @@ type CertJobFileLogger struct {
 // 裁定）：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog*），实例级
 // 锁防不了跨实例并发轮转的 check-then-rename 交错——两个实例同时越过大小阈值
 // 时，后者的 os.Rename(path, path+".1") 会覆盖前者刚轮转出的 .1，丢一整代
-// 历史。键空间以 ruleID 为界（规则量级），无需回收。
+// 历史。条目随最后持有者释放回收（refCountedLockTable）：规则可反复创建/删除，
+// 只增不删的表会按历史规则总数无界增长。
 //
 // 键口径 = certJobLogFileComponent(ruleID)：housekeeping
 // 从文件名反解 ruleID，只能拿到已编码的主体；若写侧用原始值取锁，写与清理会持
 // 不同互斥量，轮转/删除交错可覆盖 .1 代或删除未过期代。旧实现用剔除非法字符的
 // 主体（sanitizePathComponent），不可逆致 `lb.dot` 与 `lbdot` 共文件共锁。
-var certJobLogWriteLocks sync.Map // file component -> *sync.Mutex
+var certJobLogWriteLocks refCountedLockTable // file component -> entry
 
-func lockCertJobLog(ruleID string) *sync.Mutex {
-	key := certJobLogFileComponent(ruleID)
-	lock, _ := certJobLogWriteLocks.LoadOrStore(key, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+func lockCertJobLog(ruleID string) *refCountedLock {
+	return certJobLogWriteLocks.get(certJobLogFileComponent(ruleID))
 }
 
 // NewCertJobFileLogger creates a logger bound to a specific rule.
@@ -210,8 +208,9 @@ func RemoveCertJobLogFiles(ruleID string) error {
 	// （如 `lb.dot` → certjob-lbdot.log）与新文件名不同，此处不顺手删除——
 	// 旧名与「剔除后同名的另一条规则」（lbdot）无法区分，误删会清掉他人日志。
 	// 历史文件由保留期清理（taskLogsHousekeeping 可解析旧名）自然淘汰。
-	lockCertJobLog(ruleID).Lock()
-	defer lockCertJobLog(ruleID).Unlock()
+	lock := lockCertJobLog(ruleID)
+	lock.Lock()
+	defer lock.Unlock()
 	path := CertJobLogPath(ruleID)
 	// 仓内轮转只做 rename（rotateTaskLogFile 不压缩），但 logstats 读侧承认
 	// 外部 logrotate 留下的整文件 gzip 归档形态（<base>.gz）；删除规则时

@@ -282,6 +282,41 @@ func TestProvider_getDomainID_paginates_large_accounts(t *testing.T) {
 	}
 }
 
+func TestProvider_getDomainID_normalizesZoneCase(t *testing.T) {
+	// DNS 名大小写不敏感：Domain.List 返回服务端规范形态（小写），混合大小写
+	// 的 zone 输入必须命中同一域名，且缓存键随之归一——同一 zone 的不同书写
+	// 形态不得各存一份 domain_id，也不得把「大小写不同」报成「域名不在账户」。
+	domainIDCacheMu.Lock()
+	domainIDCache = map[string]string{}
+	domainIDCacheMu.Unlock()
+	transport := &paginatedTransport{domains: []string{"example.com"}, pageSize: 10}
+	provider := New("id,token")
+	provider.client.Transport = transport
+
+	// When：混合大小写 + 尾点
+	domainID, err := provider.getDomainID(t.Context(), "Example.COM.")
+	if err != nil {
+		t.Fatalf("get domain id with mixed case: %v", err)
+	}
+	if domainID != "1" {
+		t.Fatalf("domainID=%q, want 1", domainID)
+	}
+
+	// Then：小写形态直接命中同一缓存键（不再发请求）
+	transport.mu.Lock()
+	requestsBefore := len(transport.requests)
+	transport.mu.Unlock()
+	if _, err := provider.getDomainID(t.Context(), "example.com"); err != nil {
+		t.Fatalf("get domain id after normalization: %v", err)
+	}
+	transport.mu.Lock()
+	requestsAfter := len(transport.requests)
+	transport.mu.Unlock()
+	if requestsAfter != requestsBefore {
+		t.Fatalf("requests=%d→%d, want 同一 zone 的不同大小写复用同一缓存键", requestsBefore, requestsAfter)
+	}
+}
+
 func TestProvider_getDomainID_not_found_after_all_pages(t *testing.T) {
 	// Given: the zone is not in the account at all
 	domains := []string{"a.example.com", "b.example.com"}
