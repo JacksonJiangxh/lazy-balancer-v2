@@ -121,13 +121,13 @@
         <el-table-column label="状态" width="80" align="center">
           <template #default="{ row }">
             <!-- 只读态全部渲染但禁用，tooltip 显示原因（与规则页同构） -->
-            <el-tooltip :disabled="!isReadOnly" :content="readOnlyMessage">
+            <el-tooltip :disabled="!isReadOnly && !row.is_setup_admin" :content="row.is_setup_admin ? '系统初始化管理员不可禁用' : readOnlyMessage">
               <div>
                 <el-switch
                   v-model="row.is_enabled"
                   :aria-label="`用户 ${row.username} 的启用状态`"
                   :loading="switchingIds.has(row.id)"
-                  :disabled="isReadOnly || switchingIds.has(row.id) || submittingUserId === row.id || row.id === authStore.user?.id"
+                  :disabled="isReadOnly || row.is_setup_admin || switchingIds.has(row.id) || submittingUserId === row.id || row.id === authStore.user?.id"
                   @change="(val: boolean) => handleToggleStatus(row.id, val)"
                 />
               </div>
@@ -179,9 +179,9 @@
                 </el-button>
               </div>
             </el-tooltip>
-            <el-tooltip :disabled="!isReadOnly && row.id !== authStore.user?.id" :content="row.id === authStore.user?.id ? '不能删除当前登录账户' : readOnlyMessage">
+            <el-tooltip :disabled="!isReadOnly && row.id !== authStore.user?.id && !row.is_setup_admin" :content="row.is_setup_admin ? '系统初始化管理员不可删除' : (row.id === authStore.user?.id ? '不能删除当前登录账户' : readOnlyMessage)">
               <div>
-                <el-button type="danger" link size="small" :disabled="isReadOnly || row.id === authStore.user?.id || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="deleteUser(row)">
+                <el-button type="danger" link size="small" :disabled="isReadOnly || row.is_setup_admin || row.id === authStore.user?.id || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="deleteUser(row)">
                   删除
                 </el-button>
               </div>

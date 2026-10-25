@@ -440,3 +440,15 @@ test('.vue 导入守卫覆盖单行/跨行/副作用/动态四形态（元测试
   assert.equal(vueImportOffender("import { section } from './_helpers.ts'"), false)
   assert.equal(vueImportOffender(sample("const doc = 'src/views/Rules<vue>'")), false)
 })
+
+test('用户页：初始化管理员不可删除/禁用（标记由列表响应透出）', () => {
+  const users = code('src/views/Users.vue')
+  const types = code('src/types/index.ts')
+  // 列表响应必须携带标记，否则前端无法区分「保护行」与普通管理员。
+  assert.match(types, /is_setup_admin\?: boolean/, 'UserListItem 必须声明 is_setup_admin')
+  // 启停与删除两处：内容提示 + 禁用条件都要覆盖初始化管理员。
+  assert.match(users, /系统初始化管理员不可禁用/, '状态开关须给出不可禁用原因')
+  assert.match(users, /isReadOnly \|\| row\.is_setup_admin \|\| switchingIds\.has\(row\.id\)/, '状态开关须对初始化管理员禁用')
+  assert.match(users, /系统初始化管理员不可删除/, '删除按钮须给出不可删除原因')
+  assert.match(users, /isReadOnly \|\| row\.is_setup_admin \|\| row\.id === authStore\.user\?\.id/, '删除按钮须对初始化管理员禁用')
+})

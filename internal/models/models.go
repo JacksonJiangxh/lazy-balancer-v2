@@ -22,6 +22,9 @@ type User struct {
 	LastLogin    sql.NullTime   `json:"last_login"`
 	// v2.3.0:认证来源(local/oidc)——票据登录跨节点透传、响应透出供前端区分
 	AuthProvider string `json:"auth_provider"`
+	// IsSetupAdmin 标记初始化创建的首个管理员（break-glass 入口）：不可删除/
+	// 禁用/降级，前端据此禁用对应操作。
+	IsSetupAdmin bool `json:"is_setup_admin"`
 }
 
 type UserResponse struct {
@@ -32,6 +35,7 @@ type UserResponse struct {
 	IsEnabled    bool       `json:"is_enabled"`
 	MFAEnabled   bool       `json:"mfa_enabled"`
 	AuthProvider string     `json:"auth_provider"`
+	IsSetupAdmin bool       `json:"is_setup_admin"`
 	CreatedAt    time.Time  `json:"created_at"`
 	LastLogin    *time.Time `json:"last_login"`
 }
@@ -50,6 +54,7 @@ func NewUserResponse(user User, mfaEnabled bool) UserResponse {
 		MFAEnabled:   mfaEnabled,
 		CreatedAt:    user.CreatedAt,
 		AuthProvider: user.AuthProvider,
+		IsSetupAdmin: user.IsSetupAdmin,
 	}
 	if user.DisplayName.Valid {
 		response.DisplayName = &user.DisplayName.String

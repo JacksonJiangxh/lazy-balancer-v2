@@ -6,6 +6,8 @@ export interface CurrentUser {
   display_name: string | null
   mfa_enabled?: boolean
   auth_provider?: string
+  // 初始化创建的首个管理员（break-glass 入口）：不可删除/禁用，前端禁用操作。
+  is_setup_admin?: boolean
 }
 
 export interface UserListItem extends CurrentUser {

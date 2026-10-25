@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -457,6 +458,48 @@ func TestListUsers_emptyTableReturnsEmptyArray(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"data":[]`) {
 		t.Fatalf("空表 data 须为 []: %s", response.Body.String())
+	}
+}
+
+// ListUsers 必须透出 is_setup_admin：前端据此禁用「删除/禁用」两个操作，
+// 后端保护（DeleteUser/UpdateUser status 分支）已存在，缺标记会让按钮可点后
+// 报 400，属可见契约断裂。
+func TestListUsers_exposesSetupAdminFlag(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin", "admin", true)
+	seedUserAuditTest(t, 7, "other", "user", true)
+	if _, err := db.DB.Exec(`UPDATE users SET is_setup_admin=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE users SET is_setup_admin=0 WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.GET("/users", h.ListUsers)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/users", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []struct {
+			ID           int  `json:"id"`
+			IsSetupAdmin bool `json:"is_setup_admin"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	flags := map[int]bool{}
+	for _, u := range resp.Data {
+		flags[u.ID] = u.IsSetupAdmin
+	}
+	if !flags[1] {
+		t.Fatalf("初始化管理员 is_setup_admin 应为 true: %+v", flags)
+	}
+	if flags[7] {
+		t.Fatalf("普通用户 is_setup_admin 应为 false: %+v", flags)
 	}
 }
 
