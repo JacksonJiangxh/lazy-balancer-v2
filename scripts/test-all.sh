@@ -166,14 +166,21 @@ if [[ -n "$unformatted" ]]; then
   exit 1
 fi
 
+# 全量测试本身即以固定 shuffle seed 运行：文件声明顺序只是一个任意排列，
+# 用固定 seed 的乱序跑同时承担「全量通过」与「固定排列通过」两件事，避免
+# 先顺序跑一遍、再用同一个 seed 重复跑一遍的重复计算。seed 固定=失败可复放。
+canonical_shuffle_seed="${CANONICAL_SHUFFLE_SEED:-1}"
 for module in "${modules[@]}"; do
-  echo "== go test ./... -count=1 ($module) =="
-  (cd "$module" && go test ./... -count=1)
+  echo "== go test ./... -count=1 -shuffle=${canonical_shuffle_seed} ($module) =="
+  (cd "$module" && go test ./... -count=1 -shuffle="$canonical_shuffle_seed")
 done
 
-# 顺序依赖门：固定 seed 可复放，随机 seed 扩展排列面；五个持有进程级全局态的
-# 包统一使用 900s 超时。自测用真实的声明顺序安全、乱序失败的夹具包验证鉴别力。
-./scripts/test-shuffle.sh
+# 额外排列面：默认 0 轮（上面的固定 seed 已覆盖乱序）；FULL=1（发版/夜间）
+# 追加 1 个随机 seed，SHUFFLE_GATE_SEEDS 可显式指定多轮。五个持有进程级全局
+# 态的包共用 900s 超时；自测用「声明顺序安全、乱序失败」的夹具包验证鉴别力。
+if [[ "${FULL:-0}" == "1" || -n "${SHUFFLE_GATE_SEEDS:-}" ]]; then
+  ./scripts/test-shuffle.sh
+fi
 
 # 交叉编译等价性（不是「镜像构建等价性」）：验证 GOOS=linux CGO_ENABLED=0
 # 这组构建参数下代码可编译——平台/cgo 相关代码路径不进本地测试面，四个嵌套

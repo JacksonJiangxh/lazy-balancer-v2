@@ -12,15 +12,13 @@ x-common-ulimits: &common-ulimits
     soft: 1048576
     hard: 1048576
 x-common-healthcheck: &common-healthcheck
-  # 探针须模式无关：面板 HTTPS 可开关（开启时明文 HTTP 得 302），admin_tls 关闭时
-  # 又只有明文可用；镜像内无 curl（仅构建期临时安装后 apk del），busybox wget
-  # 的 --no-check-certificate 经实证可完成自签 TLS 探测。
-  # 顺序与镜像 HEALTHCHECK 一致：HTTPS 先行（HTTPS 常态下一击命中，明文模式下
-  # 仅多一次握手失败即回落）；两处顺序必须同向，否则「镜像直跑」与 compose 跑的
-  # 首探行为不同，排障时无法对照。
+  # 与镜像 HEALTHCHECK 同一实现：二进制自带子命令（exec 形式，零 shell）。
+  # 旧 CMD-SHELL 形态每 30s 派生 sh + HTTP 客户端子进程，在 PID 1 不回收孤儿
+  # 的容器里会持续累积僵尸并打满 cgroup pids 配额（生产实证）。
+  # 语义：HTTPS 先行 → 明文回落，只认第一跳 200、不跟随跳转。
   # 端口同镜像：容器内面板口恒为 8000（entrypoint 不传 -config，数据库/文件里的
   # port 只对裸机自定义启动生效）；改探针端口须与 Dockerfile HEALTHCHECK 同步。
-  test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health"]
+  test: ["CMD", "/usr/local/bin/lazy-balancer", "--healthcheck"]
   interval: 30s
   timeout: 5s
   retries: 3

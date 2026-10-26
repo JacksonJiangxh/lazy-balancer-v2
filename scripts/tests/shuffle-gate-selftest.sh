@@ -111,4 +111,19 @@ if [[ "$random_runs" -ne 2 || "$gate_output" == *"seeds: 1)"* ]]; then
   exit 1
 fi
 
-echo "shuffle gate selftest: order-leak RED, fixed-seed replay, timeout, random seed and wiring ok"
+# 默认（无显式 seed）只补一个随机轮：固定 seed 的全量已在 test-all 主循环跑过，
+# 这里再来一遍即重复计算。
+run_gate "" "" ./clean
+if [[ $gate_rc -ne 0 ]]; then
+  echo "FAIL [default single random round] clean fixture failed" >&2
+  echo "$gate_output" >&2
+  exit 1
+fi
+default_runs="$(printf '%s\n' "$gate_output" | grep -c '^-- -shuffle=')"
+if [[ "$default_runs" -ne 1 ]]; then
+  echo "FAIL [default single random round] expected exactly 1 run, got ${default_runs}" >&2
+  echo "$gate_output" >&2
+  exit 1
+fi
+
+echo "shuffle gate selftest: order-leak RED, fixed-seed replay, timeout, random seed, default single round and wiring ok"

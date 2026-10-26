@@ -25,6 +25,16 @@ func TestMain(m *testing.M) {
 	IPListDataDir = dir
 	wafiplist.AllowedPathPrefix = dir + string(filepath.Separator)
 	code := m.Run()
+	// 全局 Caddy 写锁泄漏会让后续所有配置写/重载永久阻塞；用例收尾后必须
+	// 处于可获取状态（TryLock 成功即证明上一持有者已释放）。
+	if code == 0 {
+		if !CaddyOpLock.TryLock() {
+			log.Print("全局态泄漏：CaddyOpLock 仍被占用（用例写侧缺少 Unlock）")
+			code = 1
+		} else {
+			CaddyOpLock.Unlock()
+		}
+	}
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }

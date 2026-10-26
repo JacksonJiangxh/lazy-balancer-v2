@@ -165,7 +165,7 @@ FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c
 # 分支最新仍为 r3。这里只对 musl/musl-utils 两个包指定 edge 仓库并精确钉版，
 # 基础系统（busybox/apk/openssl/zlib）仍来自 3.24.3；实测仅这两个包升级，
 # apk 正常运行。edge 若移除 r6，构建在此显性失败（不会静默用回 r3）。
-RUN apk add --no-cache ca-certificates sqlite tzdata openssl=3.5.9-r0 zlib=1.3.2-r1 && \
+RUN apk add --no-cache ca-certificates sqlite tzdata tini openssl=3.5.9-r0 zlib=1.3.2-r1 && \
     apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/main \
       musl=1.2.6-r6 musl-utils=1.2.6-r6 && \
     apk list -I | grep -Eq '^musl-1\.2\.6-r6 ' && \
@@ -271,15 +271,18 @@ COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # 443/udp = HTTP/3（QUIC）——Caddy 默认启用，EXPOSE 需一并声明。
-# 探针顺序 HTTPS 先行，与 docker-compose.yml 的共享锚点同序：面板 HTTPS 开启
-# 是常态，明文先行会先吃一次 302 再失败；反向在明文模式下只多一次握手失败即
-# 回落，成本对称而常态更快收敛。镜像内无 curl（构建期临时安装后 apk del），
-# busybox wget 的 --no-check-certificate 经实证可完成自签 TLS 探测。
-# 探针端口固定 8000：容器内 entrypoint 不透传 -config，config.go 的 port 只对
-# 裸机自定义启动生效；若未来支持容器内改端口，探针须改为读环境变量。
+# 探针使用二进制自带子命令（exec 形式，零 shell）：不派生 sh/客户端子进程。
+# 旧形态在 PID 1 不回收孤儿的容器里每 30s 泄漏子进程（生产实证：十余小时
+# 堆到 2252 个僵尸 ssl_client，打满 cgroup pids 配额，容器内连 cat 都无法 fork）。
+# 语义不变：HTTPS 先行（管理 TLS 是常态）→ 失败回落明文；只认第一跳 200、
+# 不跟随跳转（避免把登录页 200 误判为健康）。探针端口固定 8000（容器内
+# entrypoint 不透传 -config，config.go 的 port 只对裸机自定义启动生效）；
+# 两段尝试各 2s，合计小于 --timeout=5s。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health || exit 1
+  CMD ["/usr/local/bin/lazy-balancer", "--healthcheck"]
 
 EXPOSE 80 443 443/udp 8000
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+# tini 作为 PID 1：回收任何被遗弃的子进程（健康检查/运维 exec/入口脚本），
+# 不再依赖部署方记得加 --init。信号由 tini 转发给入口脚本与面板进程。
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]

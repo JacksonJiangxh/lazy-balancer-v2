@@ -48,6 +48,11 @@ func (e *startupError) Unwrap() error { return e.err }
 func startupFailed(err error) error { return &startupError{err: err} }
 
 func main() {
+	// 健康检查模式必须在 flag 解析与服务装配之前分流：该路径不读配置、
+	// 不初始化数据库、不启动任何监听。
+	if healthcheckRequested(os.Args) {
+		os.Exit(runHealthcheck())
+	}
 	if err := run(); err != nil {
 		var startupFailure *startupError
 		if errors.As(err, &startupFailure) {

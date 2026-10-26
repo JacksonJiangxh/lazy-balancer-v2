@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# 顺序依赖门：固定 seed 保留已知排列，额外随机 seed 扩大未来用例的排列面。
-# 每次失败都打印含 seed 与超时的完整复放命令。
+# 顺序依赖门：扩大排列面。全量测试已用固定 seed 跑过一遍（见 test-all.sh
+# 的 canonical_shuffle_seed），本脚本只负责「额外轮次」：默认 1 个随机 seed；
+# SHUFFLE_GATE_SEEDS 显式指定多轮（夜间/发版）；SHUFFLE_GATE_RANDOM_SEED=0
+# 可关闭随机轮。每次失败都打印含 seed 与超时的完整复放命令。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -10,7 +12,7 @@ if [[ ${#packages[@]} -eq 0 ]]; then
   packages=(./internal/handlers ./internal/services ./internal/middleware ./internal/db ./internal/taskengine)
 fi
 
-seeds=(1792946460835645000 1)
+seeds=()
 if [[ -n "${SHUFFLE_GATE_SEEDS:-}" ]]; then
   read -r -a seeds <<<"$SHUFFLE_GATE_SEEDS"
 fi

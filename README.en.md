@@ -45,6 +45,8 @@ docker run -d --name lazy-balancer \
 ```
 
 > Image tags: `latest` points at the most recent **stable** release (no channel suffix); pre-release tags carry a `-beta` suffix (e.g. `:v2.3.8-beta`). Pin that exact tag when you need a pre-release or a reproducible install.
+>
+> **Container init**: current images ship an init process (reaps abandoned health-check children) and use the binary's built-in health check, so `--init` is no longer needed. If you pin `v2.3.8` or older, add `--init`; for high-connection deployments also consider `--pids-limit=4096` (PID cgroup, threads included).
 
 Mounts: `/app/data` database, config and IP geolocation data (required — the IP2Region xdb lives at `/app/data/ip2region.xdb` and persists with the data volume), `/app/certs` certificates and private keys (required), `/app/backup` auto-backup output directory (required — without it, backup files are lost when the container is recreated), `/app/logs` logs (recommended), `/app/waf` WAF/CRS rule sets (recommended).
 
