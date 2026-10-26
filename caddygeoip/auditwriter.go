@@ -87,14 +87,18 @@ const auditBodyMaxBytes = 64 * 1024
 const auditTruncatedMarker = "\n...[TRUNCATED]"
 
 // 客户端可控的「非体段」上限（与 auditBodyMaxBytes/auditHeadersMaxBytes 同族）：
-// transaction.request.uri 与 files[].name/mime 同样进快照 JSON、同样按 JSON
-// 转义口径计入单条/队列字节预算。不设限时单个 multipart 请求即可把快照推过
-// auditItemMaxBytes——被丢弃的恰是「触发 WAF 的这次请求」自身的安全事件
-// （事件列表/大屏/自动封禁喂入全缺），客户端可控字符分布即决定自身事件是否
-// 留库（与体段同一失效面）。
+// transaction.request.method、transaction.server_id、transaction.request.uri 与
+// files[].name/mime 同样进快照 JSON、同样按 JSON 转义口径计入单条/队列字节
+// 预算。不设限时任一项即可把快照推过 auditItemMaxBytes——被丢弃的恰是「触发
+// WAF 的这次请求」自身的安全事件（事件列表/大屏/自动封禁喂入全缺），客户端
+// 可控字符分布即决定自身事件是否留库（与体段同一失效面）。
 //
 // 上限取 **转义后字节** 口径（估算/执法与落盘 JSON 同口径；原始字节上限在
 // `&`/`<`/`>` 密集输入上会放大 6×）：
+//   - method：64B 转义字节——标准方法名（含 WebDAV/扩展方法）远短于此；越限
+//     视为构造请求，保留前缀与截断标记作证据；
+//   - server_id：256B 转义字节——Caddy 服务端名称/ID 由配置生成，实践中远短于
+//     此；同样保留前缀与标记；
 //   - URI：8KiB，与落库侧 services.securityEventsURICap(8192) 同量级——摄取侧
 //     无需二次裁剪；
 //   - 单个文件名 / 单条 MIME：各 1KiB 转义字节（多部分文件名/类型实践中远小于
@@ -102,11 +106,17 @@ const auditTruncatedMarker = "\n...[TRUNCATED]"
 //   - files[] 条数：64 条；条目内容总预算 24KiB 转义字节——「条数 × 单条上限」
 //     相加（64×2KiB）本身仍是 128KiB 量级，必须有总预算才能保证与体/头/
 //     messages 相加后仍落在 auditItemMaxBytes 之内。
+//
+// 上述各段的「上限之和 + 48KiB 余量 ≤ auditItemMaxBytes」由
+// TestAuditItemMaxBytes_coversAllClientControlledSegments 复算钉住：新增客户端
+// 可控段必须同步声明上限，否则同族缺陷会以新字段形式回归。
 const (
-	auditURIMaxEscapedBytes   = 8 * 1024
-	auditFilesMaxEntries      = 64
-	auditFileFieldMaxEscaped  = 1024
-	auditFilesMaxEscapedBytes = 24 * 1024
+	auditMethodMaxEscapedBytes   = 64
+	auditServerIDMaxEscapedBytes = 256
+	auditURIMaxEscapedBytes      = 8 * 1024
+	auditFilesMaxEntries         = 64
+	auditFileFieldMaxEscaped     = 1024
+	auditFilesMaxEscapedBytes    = 24 * 1024
 )
 
 func init() {
@@ -139,10 +149,14 @@ var (
 	// （320KiB），整条安全事件被丢弃（客户端可控的字符分布即可让自身事件
 	// 不留库）。
 	// 上界 = 6×请求体 + 6×响应体 + 请求头 + 响应头（后两者已在快照侧按转义
-	// 字节截断到各 64KiB）+ messages（转义字节 32KiB）+ URI（转义字节 8KiB，
-	// 见 auditURIMaxEscapedBytes）+ files[]（转义字节 24KiB + 单条余量，见
-	// auditFilesMaxEscapedBytes）+ 48KiB 余量（事务/producer 字符串、条目固定
-	// 开销、messages 评估族溢出）。取 1MiB。
+	// 字节截断到各 64KiB）+ messages（转义字节 32KiB）+ method（转义字节 64B，
+	// 见 auditMethodMaxEscapedBytes）+ server_id（转义字节 256B，见
+	// auditServerIDMaxEscapedBytes）+ URI（转义字节 8KiB，见
+	// auditURIMaxEscapedBytes）+ files[]（转义字节 24KiB + 单条余量，见
+	// auditFilesMaxEscapedBytes）+ 48KiB 余量（时间戳/事务 ID/协议/地址等
+	// 插件与栈侧字符串、producer 字符串、条目固定开销、messages 评估族溢出）。
+	// 客户端可控段全部有显式上限，余量不再替它们兜底——越限按上限截断留标记，
+	// 不整行丢弃。取 1MiB。
 	auditItemMaxBytes = int64(1024 * 1024)
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
 	// 兜底（低流量下 bufio 滞留行不超周期）。
@@ -1170,6 +1184,10 @@ func auditMessageIsEvaluation(m plugintypes.AuditLogMessage) bool {
 }
 
 func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTransaction {
+	// server_id 与请求侧客户端可控段同门封顶（见 auditServerIDMaxEscapedBytes）：
+	// 超长取值同样进 JSON 转义口径的单条/队列预算，不封顶即可让本行撞
+	// auditItemMaxBytes 整行丢弃。
+	serverID, _ := snapshotClipEscaped(tx.ServerID(), auditServerIDMaxEscapedBytes-len(auditTruncatedMarker))
 	t := &auditSnapshotTransaction{
 		Timestamp_:       tx.Timestamp(),
 		UnixTimestamp_:   tx.UnixTimestamp(),
@@ -1178,7 +1196,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		ClientPort_:      tx.ClientPort(),
 		HostIP_:          tx.HostIP(),
 		HostPort_:        tx.HostPort(),
-		ServerID_:        tx.ServerID(),
+		ServerID_:        serverID,
 		HighestSeverity_: tx.HighestSeverity(),
 		IsInterrupted_:   tx.IsInterrupted(),
 	}
@@ -1190,8 +1208,12 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		// 内容预算留出标记字节 → 截断后整字段转义字节 ≤ 上限，摄取侧
 		// （services.securityEventsURICap 同值）不再二次裁剪（避免双标记）。
 		uri, _ := snapshotClipEscaped(req.URI(), auditURIMaxEscapedBytes-len(auditTruncatedMarker))
+		// method 同属客户端可控的事务字符串：超长伪造方法名（请求行由客户端
+		// 决定）不封顶时会与体/头/URI 叠加把本行推过 auditItemMaxBytes。按
+		// auditMethodMaxEscapedBytes 封顶并留截断标记，保留前缀作为取证线索。
+		method, _ := snapshotClipEscaped(req.Method(), auditMethodMaxEscapedBytes-len(auditTruncatedMarker))
 		r := &auditSnapshotRequest{
-			Method_:        req.Method(),
+			Method_:        method,
 			Protocol_:      req.Protocol(),
 			URI_:           uri,
 			HTTPVersion_:   req.HTTPVersion(),
@@ -1694,10 +1716,13 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 	t := &s.Transaction_
 	// 全部字符串段按 JSON 转义后字节计（header 段已用同一口径）：估算即
 	// 队列/单条字节预算的执法口径，原始 len 会把 &&&… 类取值低估至多 6×。
+	// ServerID_ 已按 auditServerIDMaxEscapedBytes 封顶，此处按封顶后的实际值
+	// 计入——封顶与计费同源，估算不会因原始超长取值把整行判成超限。
 	n += int64(jsonStringEscapedLen(t.Timestamp_) + jsonStringEscapedLen(t.ID_) +
 		jsonStringEscapedLen(t.ClientIP_) + jsonStringEscapedLen(t.HostIP_) +
 		jsonStringEscapedLen(t.ServerID_) + jsonStringEscapedLen(t.HighestSeverity_))
 	if r := t.Request_; r != nil {
+		// Method_ 同样已按 auditMethodMaxEscapedBytes 封顶（见 snapshotTransaction）。
 		n += int64(jsonStringEscapedLen(r.Method_) + jsonStringEscapedLen(r.Protocol_) +
 			jsonStringEscapedLen(r.URI_) + jsonStringEscapedLen(r.HTTPVersion_) +
 			jsonStringEscapedLen(r.Body_))

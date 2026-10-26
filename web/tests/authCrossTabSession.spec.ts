@@ -180,3 +180,134 @@ test('非令牌键的 storage 变更不触碰会话（多标签页导航互不�
   assert.equal(store.intentionalLogout, false)
   assert.equal(timers.size, 0)
 })
+
+// ── 迟到响应：账号切换后旧 /users/me 不得回写新会话身份 ──
+// 无论响应成败，await 之后都必须按发起时的会话身份（令牌 + 代际）比对；
+// 否则旧账号的 200 会把 user 重建为上一位用户，readOnlyReason 随之按旧角色
+// 渲染写控件（后端仍按新令牌鉴权，故仅 UI 误导，但会持续到刷新）。
+
+const aliceMe = { data: { id: 7, username: 'alice', role: 'admin', is_enabled: true, display_name: 'Alice', mfa_enabled: false, auth_provider: 'local' } }
+const bobMe = { data: { id: 9, username: 'bob', role: 'operator', is_enabled: true, display_name: 'Bob', mfa_enabled: false, auth_provider: 'local' } }
+const masterConfig = { data: { is_master: true, timezone: 'Asia/Shanghai', cert_renewal_days: 30, mfa_write_guard: false } }
+
+// 手动放行的请求队列：按发出顺序记录 { url, resolve, reject }，由用例决定落地时机。
+interface PendingGet { readonly url: string; readonly resolve: (value: unknown) => void; readonly reject: (reason: unknown) => void }
+const deferGets = (): { queue: PendingGet[]; restore: () => void } => {
+  const queue: PendingGet[] = []
+  const original = host.__authGet
+  host.__authGet = (url: string) => {
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>()
+    queue.push({ url, resolve, reject })
+    return promise
+  }
+  return { queue, restore: () => { host.__authGet = original } }
+}
+
+// storage 监听器在每个 store 实例的 setup 内注册（本 spec 逐用例 newStore），
+// 故一次 dispatch 会被历史用例的 store 一并收到并各自发请求。本实例总是最后
+// 注册的监听者，它的「/users/me + /config」必是队尾那一对。
+const ownNewSessionGets = (queue: PendingGet[], from: number): PendingGet[] => {
+  const tail = queue.slice(-2)
+  assert.ok(queue.length - from >= 2)
+  assert.deepEqual(tail.map((g) => g.url), ['/users/me', '/config'], '新会话必须重拉身份与节点模式')
+  return tail
+}
+
+test('账号切换：旧 /users/me 的迟到成功响应不得覆盖新会话身份', async () => {
+  storage.set('token', 'tok-acc-a')
+  const store = newStore()
+  const { queue, restore } = deferGets()
+  try {
+    const firstInit = store.init()
+    // 旧 /users/me 保持未落地（正是本用例要构造的迟到响应），init 的等待由用例末尾兜住
+    void firstInit.catch(() => {})
+    await flush()
+    assert.deepEqual(queue.map((g) => g.url), ['/users/me', '/config'], '首屏两请求均未落地')
+    // 旧会话的 /config 先落地（节点模式与身份无关），在途门随之释放
+    queue[1].resolve(masterConfig)
+    await flush()
+
+    // 另一标签页登录 B：本页跟随新令牌并以新代际重拉
+    const beforeSwitch = queue.length
+    storage.set('token', 'tok-acc-b')
+    dispatchStorage('token')
+    await flush()
+    const fresh = ownNewSessionGets(queue, beforeSwitch)
+    fresh[0].resolve(bobMe)
+    fresh[1].resolve(masterConfig)
+    await flush()
+    assert.equal(store.user?.username, 'bob')
+
+    // 旧账号 A（管理员）的响应此刻才到：必须整条丢弃
+    queue[0].resolve(aliceMe)
+    await flush()
+    assert.equal(store.user?.username, 'bob', '旧账号迟到响应不得覆盖新会话身份')
+    assert.equal(store.user?.role, 'operator', '角色不得回退到旧账号的管理员权限')
+  } finally {
+    restore()
+  }
+})
+
+test('账号切换：旧 /users/me 的迟到失败不得排重试链或清空已知用户', async () => {
+  storage.set('token', 'tok-acc-c')
+  const store = newStore()
+  const { queue, restore } = deferGets()
+  try {
+    const firstInit = store.init()
+    void firstInit.catch(() => {})
+    await flush()
+    queue[1].resolve(masterConfig)
+    await flush()
+
+    const beforeSwitch = queue.length
+    storage.set('token', 'tok-acc-d')
+    dispatchStorage('token')
+    await flush()
+    const fresh = ownNewSessionGets(queue, beforeSwitch)
+    fresh[0].resolve(bobMe)
+    fresh[1].resolve(masterConfig)
+    await flush()
+    const timersBefore = timers.size
+    assert.equal(store.user?.username, 'bob')
+
+    // 旧会话的请求以瞬时失败落地：既不得清空 B 的用户，也不得为 B 排重试链
+    queue[0].reject(new Error('network down'))
+    await flush()
+    assert.equal(store.user?.username, 'bob', '迟到失败不得改动新会话身份')
+    assert.equal(timers.size, timersBefore, '迟到失败不得排入重试定时器')
+  } finally {
+    restore()
+  }
+})
+
+test('OIDC 换令牌：清空上一账号的用户与节点模式，迟到响应不得复活旧身份', async () => {
+  storage.set('token', 'tok-oidc-prev')
+  const store = newStore()
+  const { queue, restore } = deferGets()
+  try {
+    const firstInit = store.init()
+    await flush()
+    queue[0].resolve(aliceMe)
+    queue[1].resolve(masterConfig)
+    await firstInit
+    assert.equal(store.user?.username, 'alice')
+    assert.equal(store.nodeMode, 'master')
+
+    // 上一账号的补拉仍在途
+    const lateFetch = store.fetchUser()
+    await flush()
+    const late = queue[2]
+    assert.equal(late.url, '/users/me')
+
+    store.applyOIDCToken('tok-oidc-new')
+    assert.equal(store.token, 'tok-oidc-new')
+    assert.equal(store.user, null, '换令牌即换身份：旧用户不得继续渲染')
+    assert.equal(store.nodeMode, null, '节点模式须由 init 重拉（不得沿用旧值）')
+
+    late.resolve(aliceMe)
+    await lateFetch
+    assert.equal(store.user, null, '旧身份的迟到响应不得复活已清空的用户')
+  } finally {
+    restore()
+  }
+})

@@ -126,7 +126,7 @@ var tools = []toolSpec{
 	{"retry_cert_job", "重试指定证书签发任务", http.MethodPost, "/certificates/jobs/{id}/retry", []string{"id"}, nil, idSchema("id", "证书任务 ID", "integer")},
 	{"delete_cert_job", "删除指定证书签发任务", http.MethodDelete, "/certificates/jobs/{id}", []string{"id"}, nil, idSchema("id", "证书任务 ID", "integer")},
 	{"issue_certificate", "触发 ACME 证书签发", http.MethodPost, "/certificates/issue", nil, nil, issueCertificateSchema},
-	{"list_certificates", "列出证书任务清单（每规则每域名最新签发任务：状态/到期时间）", http.MethodGet, "/certificates", nil, []string{"page", "page_size"}, listCertificatesSchema},
+	{"list_certificates", "列出证书任务清单（每规则每域名最新签发任务：状态/到期时间）", http.MethodGet, "/certificates", nil, []string{"rule_id", "page", "page_size"}, listCertificatesSchema},
 	{"get_config", "读取全局配置", http.MethodGet, "/config", nil, nil, emptySchema},
 	{"update_config", "更新全局配置并应用 Caddy", http.MethodPut, "/config", nil, nil, updateConfigSchema},
 	{"reload_caddy", "从数据库重新生成并加载 Caddy 配置", http.MethodPost, "/config/reload", nil, nil, emptySchema},
@@ -235,7 +235,7 @@ var tools = []toolSpec{
 	{"parse_certificate", "解析上传的证书内容", http.MethodPost, "/certificates/parse", nil, nil, parseCertificateSchema},
 	{"create_user", "创建用户", http.MethodPost, "/users", nil, nil, createUserSchema},
 	{"update_user", "更新指定用户（初始化管理员不可降级为普通用户——is_setup_admin=true 的行返回 400）", http.MethodPut, "/users/{id}", []string{"id"}, nil, updateUserSchema},
-	{"toggle_user_status", "启用/禁用指定用户", http.MethodPut, "/users/{id}/status", []string{"id"}, nil, toggleUserStatusSchema},
+	{"toggle_user_status", "启用/禁用指定用户（初始化管理员不可禁用——is_setup_admin=true 的行返回 400）", http.MethodPut, "/users/{id}/status", []string{"id"}, nil, toggleUserStatusSchema},
 	{"reset_user_password", "重置指定用户密码", http.MethodPost, "/users/{id}/reset-password", []string{"id"}, nil, idSchema("id", "用户 ID", "integer")},
 	{"delete_user", "删除指定用户（初始化管理员不可删除——is_setup_admin=true 的行返回 400）", http.MethodDelete, "/users/{id}", []string{"id"}, nil, idSchema("id", "用户 ID", "integer")},
 	{"reset_user_mfa", "重置用户 MFA（仅管理员；操作者已启用 MFA 时须提交本人 6 位动态验证码，未启用传空串——MCP/API Key 路径不走 428 step-up，直接在本接口验码）", http.MethodPost, "/users/{id}/mfa/reset", []string{"id"}, nil, `{"type":"object","required":["id","code"],"properties":{"id":{"type":"integer","description":"用户 ID"},"code":{"type":"string","description":"操作者自己的 6 位 MFA 动态验证码；操作者未启用 MFA 时传空串"}},"additionalProperties":false}`},
@@ -351,7 +351,7 @@ func ClientIPFromContext(ctx context.Context) string {
 const serverInstructions = `Lazy Balancer V2 负载均衡管理接口。认证：X-API-Key 头或 Authorization: Bearer lb_sk_...，Key 需开启 MCP 功能。
 
 权限范围：
-- 只读 Key（read_only）可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——导出含用户/密钥哈希、原始 Caddy 配置可能含内联私钥，二者与写操作同级隐藏）及 3 个读探测 POST 工具；其中 parse_certificate 对非管理员开放，validate_import/preview_config 需 Key 属主为管理员（属 admin 组路由，非管理员调用恒 403 且 tools/list 不展示）；其余写工具（POST/PUT/DELETE）需非只读 Key
+- 只读 Key（read_only）可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——导出含用户/密钥哈希、原始 Caddy 配置可能含内联私钥，二者与写操作同级隐藏）及 3 个读探测 POST 工具；其中 parse_certificate 对非管理员开放，validate_import/preview_config 需 Key 属主为管理员（属 admin 组路由，非管理员调用恒 403 且 tools/list 不展示）；其余写工具（POST/PUT/PATCH/DELETE）需非只读 Key
 - 写操作需要管理员权限（API Key 所属用户角色为 admin），非管理员 Key 调用写工具返回 403；tools/list 已按「read_only 轴 + admin 轴」双轴过滤——admin 轴覆盖 admin 组路由与 business 组写路由（只读探测 POST 除外），未列出的工具不是不存在，而是当前 Key 不可见/不可调用
 - 从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点；所有写操作校验后即时生效（失败自动回滚），无需手动 reload
 - 配置 IP 白名单的 Key 还需来源 IP 命中白名单（白名单约束该 Key 的全部 REST 与 MCP 调用；MCP 内部转发不受白名单影响）
@@ -407,8 +407,10 @@ const listCertJobsSchema = `{"type":"object","properties":{"rule_id":{"type":"st
 // list_certificates 与 REST ListCertificates 的分页钳位同值（page/page_size
 // 上限均 maxCertJobPage=1000，默认 1/1000）：此前 schema 为 emptySchema，
 // 端点在获得 LIMIT/OFFSET 后 Agent 在 >1000 行部署上只能拿到前 1000 行，
-// 响应 total 可见却无续页参数可跟随。
-const listCertificatesSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":1000,"default":1,"description":"页码；与 REST 同口径，page_size 默认 1000（等价原全量返回）"},"page_size":{"type":"integer","minimum":1,"maximum":1000,"default":1000,"description":"每页条数；响应 data.total 为匹配总数，超过本页条数时按 page 续取"}},"additionalProperties":false}`
+// 响应 total 可见却无续页参数可跟随。rule_id 与 REST 的可选过滤同口径
+// （精确匹配规则 Caddy ID）——转发层只按 queryArgs 构造查询串，漏登记会让
+// Agent 的过滤意图被静默丢弃、退化为全局首页。
+const listCertificatesSchema = `{"type":"object","properties":{"rule_id":{"type":"string","description":"按规则 Caddy ID 精确过滤（缺省=全部规则）"},"page":{"type":"integer","minimum":1,"maximum":1000,"default":1,"description":"页码；与 REST 同口径，page_size 默认 1000（等价原全量返回）"},"page_size":{"type":"integer","minimum":1,"maximum":1000,"default":1000,"description":"每页条数；响应 data.total 为匹配总数，超过本页条数时按 page 续取"}},"additionalProperties":false}`
 const securityEventsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":1000,"default":1,"description":"页码；REST 侧超过 1000 会静默钳位（深 OFFSET 保护），更深历史请用筛选条件"},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"action":{"type":"string"},"ip":{"type":"string"},"rule_caddy_id":{"type":"string"},"rule_name":{"type":"string","description":"按负载规则名称过滤（子串）"},"policy_name":{"type":"string","description":"按安全策略名称过滤（子串）"},"rule_triggered":{"type":"string","description":"按触发规则过滤（类别：IP 访问控制/地域拦截/WAF 规则（CRS）含全部 6 位规则 ID/自定义规则；也可输细标签（评分拦截/协议异常/协议攻击）或 CRS 规则 ID/消息关键词）"},"rule_triggered_exclude":{"type":"string","description":"按触发规则反向过滤（同 rule_triggered 的类别/细标签/ID，整体取反——筛掉该类型看其余）"},"uri":{"type":"string","description":"按请求 URI 过滤（子串）"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
 const caddyLogsSchema = `{"type":"object","properties":{"type":{"type":"string","enum":["runtime","server","proxy","tls"]}},"additionalProperties":false}`
 const metricsHistorySchema = `{"type":"object","properties":{"rule_id":{"type":"string","description":"可选规则 ID（Caddy ID），省略时返回全局聚合趋势"},"interval":{"type":"string","description":"时间范围（如 1h、24h、7d），默认 1h"}},"additionalProperties":false}`

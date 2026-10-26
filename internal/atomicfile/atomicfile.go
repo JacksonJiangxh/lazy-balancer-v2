@@ -15,33 +15,50 @@ import (
 	"path/filepath"
 )
 
+// 失败注入面：本原语的契约是「任一失败都清理临时文件并返回错误」，但这些
+// 分支在真实磁盘上无法可靠触发（权限位/写入/fsync/close/rename 需要盘满、
+// 只读挂载或权限异常）。把系统调用收在包级变量上，测试即可逐条注入失败，
+// 断言「错误上抛 + 目录零残留」；默认值就是标准库实现，无行为差异。
+var (
+	createTemp = os.CreateTemp
+	removePath = os.Remove
+	renamePath = os.Rename
+	openPath   = os.Open
+
+	fileChmod = (*os.File).Chmod
+	fileWrite = (*os.File).Write
+	fileSync  = (*os.File).Sync
+	fileClose = (*os.File).Close
+	dirSync   = (*os.File).Sync
+)
+
 // WriteAtomic 原子且持久地写入 path（覆盖既有内容）。mode 为最终文件权限
 // （显式 chmod，不受进程 umask 影响）。目录必须已存在。
 func WriteAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	tmp, err := createTemp(dir, "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	fail := func(cause error) error {
-		return errors.Join(cause, tmp.Close(), os.Remove(tmpName))
+		return errors.Join(cause, fileClose(tmp), removePath(tmpName))
 	}
-	if err := tmp.Chmod(mode); err != nil {
+	if err := fileChmod(tmp, mode); err != nil {
 		return fail(err)
 	}
-	if _, err := tmp.Write(data); err != nil {
+	if _, err := fileWrite(tmp, data); err != nil {
 		return fail(err)
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := fileSync(tmp); err != nil {
 		return fail(err)
 	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
+	if err := fileClose(tmp); err != nil {
+		_ = removePath(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
+	if err := renamePath(tmpName, path); err != nil {
+		_ = removePath(tmpName)
 		return err
 	}
 	return SyncParent(path)
@@ -50,12 +67,12 @@ func WriteAtomic(path string, data []byte, mode os.FileMode) error {
 // SyncParent 对 path 所在目录做 fsync：rename 只改目录项，目录本身的持久化
 // 需要单独同步，否则掉电后新文件名可能不存在。
 func SyncParent(path string) error {
-	dir, err := os.Open(filepath.Dir(path))
+	dir, err := openPath(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	if err := dir.Sync(); err != nil {
-		return errors.Join(err, dir.Close())
+	if err := dirSync(dir); err != nil {
+		return errors.Join(err, fileClose(dir))
 	}
-	return dir.Close()
+	return fileClose(dir)
 }

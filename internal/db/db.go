@@ -2159,15 +2159,35 @@ func migrateSecurityPolicyCustomOnlyMode() error {
 	if done {
 		return nil
 	}
-	res, err := DB.Exec(SecurityPolicyCustomOnlyModeNormalizationSQL)
-	if err != nil {
-		return fmt.Errorf("failed to migrate off-mode policies with custom rules: %w", err)
+	// 归一与一次性门同事务：门写失败不得留下「已改写但未置位」的半态
+	// （旧实现两条语句各自提交，门失败后下次启动重跑虽幂等，但库内已改而
+	// 无留痕）。审计在提交后按事务内实际变更计数写一行——零变更不写。
+	var changed int64
+	if err := withWriteTx("WAF mode custom_only normalization", func(tx *sql.Tx) error {
+		res, err := tx.Exec(SecurityPolicyCustomOnlyModeNormalizationSQL)
+		if err != nil {
+			return fmt.Errorf("failed to migrate off-mode policies with custom rules: %w", err)
+		}
+		changed, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to read migrated WAF policy count: %w", err)
+		}
+		if _, err := tx.Exec("UPDATE global_config SET waf_mode4_migrated=1 WHERE id=1"); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	if n, err := res.RowsAffected(); err == nil && n > 0 {
-		log.Printf("WAF 模式四态化迁移：%d 个 mode=off 且挂启用自定义规则的策略已迁移为 custom_only（行为不变）", n)
+	if changed == 0 {
+		return nil
 	}
-	_, err = DB.Exec("UPDATE global_config SET waf_mode4_migrated=1 WHERE id=1")
-	return err
+	// 用户策略数据被改写须留痕（与 TCP 死字段/跨模式 TLS 残留等姊妹迁移同
+	// 口径：聚合一行 + 实际变更计数）。
+	detail := fmt.Sprintf("存量 WAF 策略 mode=off 且挂启用自定义规则已迁移为 custom_only：%d 条（行为不变；一次性门已置位，迁移后主动保存的 off 不再被改写）", changed)
+	log.Print(detail)
+	recordSystemAudit("启动迁移", "安全策略", detail)
+	return nil
 }
 
 // normalizeCertJobsCAAvailableAfter 将 cert_jobs.ca_available_after 规范化为
@@ -4947,7 +4967,11 @@ func migrateTCPRuleSecurityPolicyBindings() error {
 		return err
 	}
 	if removed > 0 {
-		log.Printf("迁移：已清理 %d 条 TCP 规则安全策略绑定", removed)
+		// 用户策略绑定被删除须留痕（与 TCP 死字段/跨模式 TLS 残留等姊妹迁移
+		// 同口径：聚合一行 + 事务内实际变更计数）。
+		detail := fmt.Sprintf("存量 TCP 规则安全策略绑定已清理：%d 条（TCP 渲染链零消费策略绑定；删除后同事务推进 cluster_version 让从端收敛）", removed)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "安全策略", detail)
 	}
 	return nil
 }

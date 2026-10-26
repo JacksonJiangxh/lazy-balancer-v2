@@ -1,6 +1,6 @@
 <template>
   <!-- v2.3.0 OIDC 认证集成:受控弹框(入口在用户列表卡头) -->
-  <el-dialog :model-value="modelValue" width="min(720px, 92vw)" :close-on-click-modal="false"
+  <el-dialog :model-value="modelValue" width="min(720px, 92vw)" :close-on-click-modal="false" :close-on-press-escape="!saving" :show-close="!saving"
     destroy-on-close append-to-body class="oidc-dialog" @update:model-value="emit('update:modelValue', $event)">
     <template #header>
       <DialogHeader :icon="Connection" title="登录认证（OIDC）"
@@ -14,8 +14,9 @@
       :title="`OIDC 已启用（${displayName || 'OIDC'}）——登录页默认展示认证服务入口，本地账号可折叠进入。`" />
 
     <!-- 只读（从节点/非管理员）时整表单禁用：footer 按钮禁用是双保险而非唯一面，
-         与 FreeCertificates/BasicSettings 的整表单 :disabled 口径一致 -->
-    <el-form :disabled="isReadOnly">
+         与 FreeCertificates/BasicSettings 的整表单 :disabled 口径一致。
+         保存中同样冻结（formFrozen）：保存成功会关弹框，在途编辑静默丢失。 -->
+    <el-form :disabled="formFrozen">
     <!-- ① 服务地址 -->
     <div class="oidc-step">
       <div class="oidc-step-badge">1</div>
@@ -163,6 +164,8 @@ const probe = reactive<{ ok: boolean; checked: boolean; key?: string; error?: st
 const lastTest = ref<{ ok: boolean; providerName?: string; error?: string; credentialsChecked?: boolean } | null>(null)
 const testing = ref(false)
 const saving = ref(false)
+// 保存中冻结整表单（与设置卡同口径）：保存成功即关弹框，在途编辑无处落账。
+const formFrozen = computed(() => isReadOnly.value || saving.value)
 
 const CALLBACK_PATH = '/api/v1/auth/oidc/callback'
 const callbackUrl = computed(() => `${window.location.origin}${CALLBACK_PATH}`)

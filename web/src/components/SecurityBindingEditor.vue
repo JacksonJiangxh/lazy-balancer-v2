@@ -36,6 +36,7 @@
           :model-value="section.single ? (section.selection.value[0] ?? null) : section.selection.value"
           :multiple="!section.single"
           :clearable="section.single"
+          :disabled="saving"
           :placeholder="section.single ? '选择策略（单选，换选=替换）' : '选择策略（可多选）'"
           style="width: 100%"
           @update:model-value="section.single ? (section.selection.value = $event == null ? [] : [Number($event)]) : (section.selection.value = $event)"
@@ -64,12 +65,12 @@
 
     <!-- 策略侧：规则选择器（复用 rule picker 交互；每行显示当前绑定集合与阶段页覆盖徽标） -->
     <template v-else>
-      <el-input v-model="pickerSearch" placeholder="搜索规则名 / 域名 / 规则 ID" clearable :prefix-icon="Search" class="picker-search" />
+      <el-input v-model="pickerSearch" placeholder="搜索规则名 / 域名 / 规则 ID" clearable :prefix-icon="Search" class="picker-search" :disabled="saving" />
       <div class="picker-header">
         <el-checkbox
           :model-value="pickerAllChecked"
           :indeterminate="pickerIndeterminate"
-          :disabled="pickerSelectableRules.length === 0"
+          :disabled="pickerSelectableRules.length === 0 || saving"
           @change="toggleSelectAll"
         >全选</el-checkbox>
         <span class="picker-header-meta">筛选 {{ pickerFilteredRules.length }} 条</span>
@@ -79,7 +80,7 @@
           <div class="picker-rule-main">
             <el-checkbox
               :model-value="pickerSelected.includes(rule.caddy_id)"
-              :disabled="pickerWouldExceed(rule)"
+              :disabled="saving || pickerWouldExceed(rule)"
               @change="toggleRule(rule.caddy_id, $event)"
             >
               <span class="picker-rule-name">{{ rule.name }}</span>
@@ -119,6 +120,7 @@
         :total="pickerFilteredRules.length"
         layout="prev, pager, next"
         small
+        :disabled="saving"
         class="picker-pagination"
       />
     </template>
@@ -313,6 +315,7 @@ const pickerIndeterminate = computed(() => {
 })
 
 const toggleRule = (caddyId: string, checked: string | number | boolean): void => {
+  if (saving.value) return // 保存中冻结选择：在途改动不进本次载荷，关窗即丢失
   if (checked === true) {
     if (!pickerSelected.value.includes(caddyId)) pickerSelected.value = [...pickerSelected.value, caddyId]
     return
@@ -321,6 +324,7 @@ const toggleRule = (caddyId: string, checked: string | number | boolean): void =
 }
 
 const toggleSelectAll = (checked: string | number | boolean): void => {
+  if (saving.value) return
   const selectableIds = pickerSelectableRules.value.map((rule) => rule.caddy_id)
   if (checked === true) {
     pickerSelected.value = [...new Set([...pickerSelected.value, ...selectableIds])]

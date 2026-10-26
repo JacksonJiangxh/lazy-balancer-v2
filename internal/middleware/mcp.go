@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/tls"
 	"net/http"
 	"time"
 
@@ -23,12 +24,28 @@ func mcpAccessGuard() gin.HandlerFunc {
 	}
 }
 
-// loopbackAPIClient 是 MCP 工具内部转发专用的本机回环客户端。转发 base URL
-// 恒为明文 http://127.0.0.1:<port>/api/v1（见 SetupRouter），因此不需要 TLS
-// 配置——此前挂了 InsecureSkipVerify 的死配置（分支不可达），读者会误判
-// 「回环转发存在 TLS 面且已显式豁免」；若未来改 HTTPS，跳过校验必须显式
-// 注释「自签回环」并配钉测，不得作为默认继承。
+// LoopbackAPIClient 是 MCP 工具内部转发专用的本机回环客户端。转发 base URL
+// 恒为明文 http://127.0.0.1:<port>/api/v1（见 SetupRouter）；面板启用 HTTPS
+// 后该明文请求由 TLS 嗅探层回 302（cmd/server/http_redirect_mux.go），
+// mcpserver 侧按原方法/原请求体重放到 https 回环地址。同一次升级换来的
+// 证书可能是管理员选定的自签形态（selfsigned），因此这条专用链路必须信任
+// 面板自身证书：InsecureSkipVerify 只允许存在于本客户端，不得扩散到任何
+// 通用客户端。
+//
+// 凭证不出回环由两处共同保证：base URL 在这里固定为回环地址，重放目标另由
+// mcpserver.isLoopbackHTTPURL 限制为 localhost/回环 IP。
 // 重定向在 mcpserver 侧统一关闭（redirectlessClient），此处不重复配置。
-func loopbackAPIClient() *http.Client {
-	return &http.Client{Timeout: 60 * time.Second}
+func LoopbackAPIClient() *http.Client {
+	return &http.Client{Timeout: 60 * time.Second, Transport: loopbackAPITransport()}
+}
+
+// loopbackAPITransport 只服务回环内部转发：显式跳过自签证书校验（面板
+// selfsigned 形态），其余传输参数与默认传输保持同口径。
+func loopbackAPITransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true,
+	}
+	return transport
 }

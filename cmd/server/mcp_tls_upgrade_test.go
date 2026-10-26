@@ -3,6 +3,8 @@ package main
 // 真实 TLS 升级链联测：明文 tools/call → 真实
 // newHTTPRedirectMux 302（此前所有测试只 mock 301，给了假绿）→ MCP 内部
 // 转发按原方法/原请求体重放 https。重放集合缺 302 时本测试拿到 {} 错误。
+// 生产回环客户端（middleware.LoopbackAPIClient）必须信任面板自签证书，
+// 否则该重放会以 x509 不受信任失败——测试只用生产客户端，不自注入旁路。
 
 import (
 	"crypto/ecdsa"
@@ -22,10 +24,11 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/mcpserver"
+	"lazy-balancer-v2/internal/middleware"
 )
 
-// selfSignedTestCert 生成测试用自签证书（回环客户端 InsecureSkipVerify，
-// SAN 不参与校验，仅完成 TLS 握手）。
+// selfSignedTestCert 生成测试用自签证书：生产回环客户端显式豁免回环自签
+// 证书校验，因此该证书不被任何公共根信任，正是面板 selfsigned 形态。
 func selfSignedTestCert(t *testing.T) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -79,17 +82,10 @@ func TestMCPForwardFollowsRealMux302PreservingMethodAndBody(t *testing.T) {
 		_ = mux.Close()
 	})
 
-	// 与 middleware loopbackAPIClient 同形态：自签跳过校验、不自动跟随重定向。
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	handler := mcpserver.NewForTest(fmt.Sprintf("http://%s/api/v1", listener.Addr().String()), client)
+	// 必须锚定生产回环客户端（middleware.LoopbackAPIClient，由 SetupRouter
+	// 注入 MCP 转发链）——用测试自注入的「跳过校验」客户端只能证明重放逻辑，
+	// 不能证明生产 TLS 行为（曾因此让自签 HTTPS 下的回环重放缺陷假绿）。
+	handler := mcpserver.NewForTest(fmt.Sprintf("http://%s/api/v1", listener.Addr().String()), middleware.LoopbackAPIClient())
 
 	// When：经 MCP 信封调用 POST 工具——转发层先以 http 明文命中嗅探层 302。
 	envelope := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_certificate","arguments":` + wantBody + `}}`

@@ -109,8 +109,8 @@
                     role="button"
                     tabindex="0"
                     :aria-label="`查看「${row.name}」的安全处理流程`"
-                    @keydown.enter.prevent="openFlowFromLock(row)"
-                    @keydown.space.prevent="openFlowFromLock(row)"
+                    @keydown.enter.prevent="activateOnce($event, () => openFlowFromLock(row))"
+                    @keydown.space.prevent="activateOnce($event, () => openFlowFromLock(row))"
                   ><Lock /></el-icon>
                 </template>
                 <div class="lock-summary">
@@ -430,7 +430,7 @@
       <div class="wizard-content">
         <!-- Step 0: 基本配置 -->
         <div v-show="currentStep === WIZARD_STEP.BASIC" class="step-content">
-          <el-form :model="wizardForm" label-width="100px">
+          <el-form :model="wizardForm" label-width="100px" :disabled="saving">
             <el-form-item label="规则名称" required>
               <el-input v-model="wizardForm.name" placeholder="例如：我的网站负载均衡" maxlength="100" show-word-limit />
             </el-form-item>
@@ -485,7 +485,7 @@
             <span class="info-note-desc">证书详情加载失败：手动 TLS 配置可能不完整，已阻止进入下一步与保存。</span>
             <el-button size="small" type="primary" plain :loading="tlsDetailLoading" @click="retryTlsDetail">重新加载</el-button>
           </div>
-          <el-form :model="wizardForm" label-width="100px" v-if="wizardForm.enable_tls && wizardForm.protocol === 'http'">
+          <el-form :model="wizardForm" label-width="100px" v-if="wizardForm.enable_tls && wizardForm.protocol === 'http'" :disabled="saving">
             <el-form-item label="证书来源">
               <el-radio-group v-model="wizardForm.tls_source" :disabled="isCurrentRuleLocked" aria-label="证书来源">
                 <el-radio value="manual">手动上传</el-radio>
@@ -568,7 +568,7 @@
 
         <!-- Step 2: 上游服务器 -->
         <div v-show="currentStep === WIZARD_STEP.UPSTREAMS" class="step-content">
-          <el-form :model="wizardForm" label-width="100px">
+          <el-form :model="wizardForm" label-width="100px" :disabled="saving">
             <div class="upstream-header">
               <span class="section-title">上游服务器列表</span>
               <el-button size="small" type="primary" @click="addUpstream" :disabled="wizardForm.upstreams.length >= MAX_UPSTREAM_ROWS || (wizardForm.dynamic_dns && wizardForm.upstreams.length >= 1)">
@@ -705,14 +705,16 @@
               >
                 <div
                   class="strategy-card"
-                  :class="{ active: wizardForm.strategy === card.value, locked: ntlmOn && card.value !== 'cookie' }"
+                  :class="{ active: wizardForm.strategy === card.value, locked: strategyLocked(card.value) }"
                   role="radio"
                   :aria-checked="wizardForm.strategy === card.value"
-                  :aria-disabled="ntlmOn && card.value !== 'cookie'"
-                  :tabindex="ntlmOn && card.value !== 'cookie' ? -1 : 0"
+                  :aria-disabled="strategyLocked(card.value)"
+                  :tabindex="strategyTabindex(card.value)"
+                  :ref="(el: unknown) => setStrategyCardRef(card.value, el)"
                   @click="selectStrategy(card.value)"
-                  @keydown.enter.prevent="selectStrategy(card.value)"
-                  @keydown.space.prevent="selectStrategy(card.value)"
+                  @keydown="onStrategyKeydown($event)"
+                  @keydown.enter.prevent="activateOnce($event, () => selectStrategy(card.value))"
+                  @keydown.space.prevent="activateOnce($event, () => selectStrategy(card.value))"
                 >
                   <div class="strategy-card-head">
                     <span class="strategy-card-icon" aria-hidden="true">
@@ -816,7 +818,7 @@
 
         <!-- Step 4: 高级选项 -->
         <div v-show="currentStep === WIZARD_STEP.ADVANCED" class="step-content">
-          <el-form :model="wizardForm" label-width="130px">
+          <el-form :model="wizardForm" label-width="130px" :disabled="saving">
             <template v-if="wizardForm.protocol === 'http'">
               <el-divider content-position="left" class="compact-divider">DNS 服务器</el-divider>
 
@@ -939,17 +941,11 @@
             <el-descriptions-item label="NTLM 兼容" v-if="wizardForm.protocol === 'http' && ntlmOn">
               开启（Cookie 会话保持 · 禁用重试 · 立即透传 · Keepalive 300s · 强制 HTTP/1.1 · 主动健康检查关闭）
             </el-descriptions-item>
-            <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'http'">
-              <template v-if="wizardForm.enable_active_health_check">
-                {{ wizardForm.health_check_path || '/' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s){{ wizardForm.health_check_host ? `，Host: ${wizardForm.health_check_host}` : '' }}
-              </template>
-              <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 恢复窗口 {{ wizardForm.health_check_interval * 3 }}s)</template>
-            </el-descriptions-item>
-            <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'tcp'">
-              <template v-if="wizardForm.enable_active_health_check">
-                TCP 主动探测端口 {{ wizardForm.tcp_health_check_port || '默认' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s)
-              </template>
-              <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 恢复窗口 {{ wizardForm.health_check_interval * 3 }}s)</template>
+            <!-- 健康检查行取自 utils/healthCheckSummary 单源：主动分支曾只打印
+                 path/interval/timeout（HTTP）或探测端口（TCP），失败/恢复阈值只在
+                 被动分支出现——预览自称配置核对面，改过的阈值必须同处可见。 -->
+            <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
+              {{ healthCheckSummary(wizardForm) }}
             </el-descriptions-item>
             <el-descriptions-item label="连接重试" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
               <template v-if="(wizardForm.tcp_try_duration || 0) > 0">
@@ -1045,10 +1041,10 @@
 
       <template #footer>
         <div class="wizard-footer">
-          <el-button v-if="hasPreviousStep" @click="prevStep">
+          <el-button v-if="hasPreviousStep" :disabled="saving" @click="prevStep">
             <el-icon><ArrowLeft /></el-icon>上一步
           </el-button>
-          <el-button v-if="hasNextStep" type="primary" @click="nextStep">
+          <el-button v-if="hasNextStep" type="primary" :disabled="saving" @click="nextStep">
             下一步<el-icon><ArrowRight /></el-icon>
           </el-button>
           <el-button v-if="currentStep === WIZARD_STEP.PREVIEW" type="primary" :loading="saving" :disabled="tlsDetailError && wizardForm.tls_source === 'manual'" :title="tlsDetailError && wizardForm.tls_source === 'manual' ? '证书详情加载失败：请先在 TLS 步骤重新加载' : ''" @click="submitWizard">
@@ -1091,16 +1087,14 @@
           <el-descriptions-item label="压缩" v-if="ruleConfig.protocol === 'http'">
             {{ ruleConfig.enable_compress ? (Array.isArray(ruleConfig.compress_types) ? ruleConfig.compress_types[0] : (ruleConfig.compress_types || 'gzip')) : '禁用' }}
           </el-descriptions-item>
-          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && ruleConfig.enable_active_health_check">
-            {{ ruleConfig.health_check_path || '/' }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s){{ ruleConfig.health_check_host ? `，Host: ${ruleConfig.health_check_host}` : '' }}
+          <!-- 与向导预览同一份摘要单源（utils/healthCheckSummary）：主动行同样点名
+               失败/恢复阈值，被动行只在未启用主动探测时补位。 -->
+          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.enable_active_health_check">
+            {{ activeHealthCheckSummary(ruleConfig) }}
           </el-descriptions-item>
-          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && !ruleConfig.enable_active_health_check">未启用</el-descriptions-item>
-          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'tcp' && ruleConfig.enable_active_health_check">
-            TCP 探测端口 {{ ruleConfig.tcp_health_check_port || '默认' }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s)
-          </el-descriptions-item>
-          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'tcp' && !ruleConfig.enable_active_health_check">未启用</el-descriptions-item>
-          <el-descriptions-item label="被动健康检查" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
-            失败 {{ ruleConfig.health_check_unhealthy_threshold || 3 }} 次视为不健康, 恢复窗口 {{ (ruleConfig.health_check_interval || 10) * 3 }}s
+          <el-descriptions-item label="主动健康检查" v-else>未启用</el-descriptions-item>
+          <el-descriptions-item label="被动健康检查" v-if="!ruleConfig.enable_active_health_check">
+            {{ passiveHealthCheckSummary(ruleConfig) }}
           </el-descriptions-item>
           <el-descriptions-item label="连接重试" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
             <template v-if="ruleConfig.tcp_try_duration > 0">
@@ -1332,6 +1326,9 @@ import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import PathRulesEditor from '@/components/rules/PathRulesEditor.vue'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
 import { proxyTimeoutSummary } from '@/utils/proxyTimeouts'
+import { activeHealthCheckSummary, healthCheckSummary, passiveHealthCheckSummary } from '@/utils/healthCheckSummary'
+import { activateOnce } from '@/utils/keyboardActivate'
+import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
 import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
@@ -1431,6 +1428,7 @@ interface RuleConfigView {
   health_check_path: string
   health_check_interval: number
   health_check_timeout: number
+  health_check_healthy_threshold: number
   health_check_unhealthy_threshold: number
   enable_active_health_check: boolean
   tcp_health_check_port: number
@@ -2416,7 +2414,8 @@ const hasNextStep = computed(() => visualStepIndex.value < visibleWizardSteps.va
 // 步骤可点击快跳(镜像 SecurityPolicies.vue 向导先例,同口径):仅编辑态开放——
 // 新建/复制时基本配置步骤的协议/TLS/自定义路由选择决定可见步骤集,且表单尚未水合,
 // 跳过前置步骤会绕过步进校验。快跳本身不执行校验(与策略向导一致:步进校验只作用于上一页/下一页按钮)。
-const stepsClickable = computed(() => editingRule.value !== null)
+// 保存中一律不可跳步：请求在途时改到的字段不进本次载荷，成功关窗即静默丢弃。
+const stepsClickable = computed(() => editingRule.value !== null && !saving.value)
 
 const jumpToStep = (step: WizardStep): void => {
   if (!stepsClickable.value) return
@@ -2680,6 +2679,7 @@ const buildRuleConfigView = (
   health_check_path: rule.health_check_path || '',
   health_check_interval: rule.health_check_interval || 10,
   health_check_timeout: rule.health_check_timeout || 2,
+  health_check_healthy_threshold: rule.health_check_healthy_threshold || 2,
   health_check_unhealthy_threshold: rule.health_check_unhealthy_threshold || 3,
   enable_active_health_check: rule.enable_active_health_check === true,
   tcp_health_check_port: rule.tcp_health_check_port || 0,
@@ -2995,8 +2995,31 @@ const STRATEGY_ICONS: Record<string, typeof Connection> = {
 }
 const strategyIcon = (strategy: string) => STRATEGY_ICONS[strategy] ?? RefreshRight
 
+// 策略卡片是自定义单选组（role=radiogroup + role=radio）：整组只留一个 tab stop
+// （roving tabindex），方向键在可选项间移动并切换——与原生 radio 组/APG 一致，
+// 不再要求逐张 Tab 且方向键无效。
+const strategyLocked = (value: string): boolean => ntlmOn.value && value !== 'cookie'
+
+const strategyCardRefs = new Map<string, HTMLElement>()
+const setStrategyCardRef = (value: string, el: unknown): void => {
+  if (el instanceof HTMLElement) strategyCardRefs.set(value, el)
+  else strategyCardRefs.delete(value)
+}
+
+const strategyTabindex = (value: string): number =>
+  rovingTabindex(strategyCardOptions.value.map((card) => card.value), wizardForm.strategy, strategyLocked, value)
+
+const onStrategyKeydown = (event: KeyboardEvent): void => {
+  if (event.repeat) return
+  const next = nextRadioValue(strategyCardOptions.value.map((card) => card.value), wizardForm.strategy, strategyLocked, event.key)
+  if (next === null) return
+  event.preventDefault()
+  selectStrategy(next)
+  strategyCardRefs.get(next)?.focus()
+}
+
 const selectStrategy = (strategy: string): void => {
-  if (ntlmOn.value) return // NTLM 接管：策略锁定 cookie，其余卡片置灰不可选
+  if (ntlmOn.value || saving.value) return // NTLM 接管：策略锁定 cookie，其余卡片置灰不可选；保存中冻结选择
   wizardForm.strategy = strategy
 }
 
@@ -3045,6 +3068,8 @@ const proxyTimeoutFieldOverrides = computed(() => ntlmOn.value
   : undefined)
 
 const moveToAdjacentWizardStep = (direction: -1 | 1): void => {
+  // 保存中冻结步骤前进/后退：请求在途时的编辑不会进入本次载荷
+  if (saving.value) return
   const currentIndex = visibleWizardSteps.value.indexOf(currentStep.value)
   const targetStep = visibleWizardSteps.value[currentIndex + direction]
   if (targetStep !== undefined) currentStep.value = targetStep

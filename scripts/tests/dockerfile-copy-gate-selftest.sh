@@ -4,7 +4,8 @@
 # 关键边界：xcaddy-builder 阶段也 COPY wafiplist/、geoipnames/。删掉 backend 阶段
 # 的同名 COPY 时门禁必须红——按整份 Dockerfile 汇总 COPY 源的实现会在这里给假绿
 # （前一阶段满足了断言）。此外覆盖：go.sum 缺失、阶段别名缺失、`COPY . .`、
-# 多行续写形态。
+# 多行续写形态、未跟踪顶层 Go 目录（缺清单必红 / 补清单即绿 / 被 .gitignore
+# 排除的不入面）。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -173,6 +174,34 @@ fixture_with_shared_stage_copies
 grep -v '^COPY cmd/ ./cmd/$' "$tmp_root/Dockerfile" >"$tmp_root/Dockerfile.tmp"
 mv "$tmp_root/Dockerfile.tmp" "$tmp_root/Dockerfile"
 assert_fail "backend cmd COPY missing" "cmd"
+
+# 9) 未跟踪的新顶层 Go 目录同样入面：还没 git add 就要红。只扫受控文件时，
+#    「新目录 + 漏 COPY」会先绿、提交后才红，而真正的漏 COPY 只在镜像构建期
+#    报缺包。
+reset_fixture
+fixture_with_shared_stage_copies
+mkdir -p "$tmp_root/newplugin"
+printf 'package newplugin\n' >"$tmp_root/newplugin/plugin.go"
+assert_fail "untracked top-level Go dir missing from manifest" "newplugin"
+
+# 10) 同一未跟踪目录补进清单后必须绿——形态要求是「清单同步」，不是永远红。
+reset_fixture
+fixture_with_shared_stage_copies
+mkdir -p "$tmp_root/newplugin"
+printf 'package newplugin\n' >"$tmp_root/newplugin/plugin.go"
+awk '{ print } /^COPY config\/ \.\/config\/$/ { print "COPY newplugin/ ./newplugin/" }' \
+  "$tmp_root/Dockerfile" >"$tmp_root/Dockerfile.tmp"
+mv "$tmp_root/Dockerfile.tmp" "$tmp_root/Dockerfile"
+assert_pass "untracked top-level Go dir present in manifest"
+
+# 11) 被 .gitignore 排除的 Go 目录不入面（--exclude-standard）：本地/生成目录
+#     不得逼着往清单里加 COPY，否则门禁与 .gitignore 互相打架。
+reset_fixture
+fixture_with_shared_stage_copies
+mkdir -p "$tmp_root/ignoredplugin"
+printf 'package ignoredplugin\n' >"$tmp_root/ignoredplugin/plugin.go"
+printf 'ignoredplugin/\n' >"$tmp_root/.gitignore"
+assert_pass "gitignored Go dir is out of scope"
 
 echo "copy-gate selftest: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

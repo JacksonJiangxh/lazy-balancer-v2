@@ -175,8 +175,8 @@ func stripRotationCollisionSuffix(s string) (string, bool) {
 }
 
 // dirBytes 返回 path 的活跃文件大小与轮转副本合计。唯一实现与聚合行共用
-// 「目录枚举 + 分类器归属」口径（移位 .N[.gz]、运行日志时间戳、timberjack、
-// 同秒碰撞后缀、整文件 .gz 全族），两套口径结构上不可能再分叉。
+// 「目录枚举 + 分类器归属」口径（移位 .N[.gz/.zst]、运行日志时间戳、timberjack、
+// 同秒碰撞后缀、整文件压缩归档全族），两套口径结构上不可能再分叉。
 func dirBytes(path string) (int64, int64, int) {
 	return dirBytesWithEntries(path, nil)
 }
@@ -293,12 +293,13 @@ func logStatsFileSize(path string) (int64, bool) {
 
 // aggregateDirStats 单次目录枚举归并匹配文件的活跃/轮转体量与归档份数
 // （替代「逐目录项 dirBytes → 其内部再 ReadDir」的 O(N²) 形态；
-// 聚合累加 RotatedCount，且.gz 归档不再冒充活跃）。
+// 聚合累加 RotatedCount，且压缩归档不再冒充活跃）。
 // 返回 基名 → 归并结果。分类口径与 dirBytes 一致：
-//   - base（匹配、非轮转副本、非 .gz）计入 Active；
+//   - base（匹配、非轮转副本、非压缩归档）计入 Active；
 //     .1..9 移位副本、运行日志族 base.、timberjack
-//     <stem>-<ts>-size.log[.gz] 副本计入所属 base 的 Rotated/RotCount；
-//   - 不归属任何匹配 base 的 .gz 按归档计入 Rotated（压缩归档不是活跃文件）。
+//     <stem>-<ts>-size.log[.gz/.zst] 副本计入所属 base 的 Rotated/RotCount；
+//   - 不归属任何匹配 base 的压缩归档（.gz/.zst）按归档计入 Rotated
+//     （压缩归档不是活跃文件）。
 func aggregateDirStats(dir string, match func(name string) bool) map[string]dirStats {
 	return aggregateDirStatsWithEntries(dir, nil, match)
 }
@@ -370,7 +371,7 @@ func aggregateDirStatsWithEntries(dir string, entries []os.DirEntry, match func(
 			out[base] = st
 			continue
 		}
-		if strings.HasSuffix(name, ".gz") {
+		if _, compressed := taskengine.StripRotationCompressionSuffix(name); compressed {
 			st := out[name]
 			st.Rotated += info.Size()
 			st.RotCount++
@@ -389,11 +390,11 @@ func isRotationCopyShape(name string) bool {
 // rotationCopyBaseOf 把轮转副本归到所属 base（四族语法取自
 // classifyRotationCopyName 单源；成员判定以目录实际基名集合为准）。
 func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[string]string) (string, bool) {
-	// 整文件 gzip 归档 <base>.gz 优先按字面基名归并（<base>.gz 与
-	// <base>.1.gz 同时存在时前者语义是 base 的整文件归档）。此前只对齐了
-	// 运行日志族与 timberjack 族，整文件归档落入通用 .gz 独立键（消费侧按
-	// 固定基名取值 → 该文件字节从聚合行消失）。
-	if base := strings.TrimSuffix(name, ".gz"); base != name {
+	// 整文件压缩归档 <base>.gz/<base>.zst 优先按字面基名归并（<base>.gz 与
+	// <base>.1.gz 同时存在时前者语义是 base 的整文件归档）。压缩后缀剥离走
+	// taskengine.StripRotationCompressionSuffix 单源；此前只认 .gz，.zst 归档
+	// 落入通用独立键（消费侧按固定基名取值 → 该文件字节从聚合行消失）。
+	if base, compressed := taskengine.StripRotationCompressionSuffix(name); compressed {
 		if _, ok := bases[base]; ok {
 			return base, true
 		}
@@ -580,18 +581,24 @@ func requestedLogKeys(c *gin.Context) map[string]bool {
 var caddyLogFamilyBases = []string{"caddy.log", "caddy-tls.log", "caddy-server.log", "caddy-proxy.log"}
 
 // caddyLogFamilyMatch 匹配 caddy 四份日志及其轮转副本（移位/时间戳/timberjack
-// 形态）——聚合一次目录枚举即可归并四文件与总行。
+// 形态）——聚合一次目录枚举即可归并四文件与总行。基名/移位/整文件归档走直接
+// 前缀判定，其余副本交给 classifyRotationCopyName 单源：压缩后缀（.gz/.zst）、
+// reason 家族与同毫秒碰撞后缀都不在此另写一份——各持一份曾让 family matcher
+// 只认 .gz 与无碰撞形态，同一响应内聚合行与 dirBytes 分叉（.zst 归档整份
+// 消失、-size_1 副本漏计）。
 func caddyLogFamilyMatch(name string) bool {
 	for _, base := range caddyLogFamilyBases {
 		if name == base || strings.HasPrefix(name, base+".") {
 			return true
 		}
 	}
-	if strings.HasSuffix(strings.TrimSuffix(name, ".gz"), "-size.log") {
-		for _, base := range caddyLogFamilyBases {
-			if strings.HasPrefix(name, strings.TrimSuffix(base, ".log")+"-") {
-				return true
-			}
+	shape := classifyRotationCopyName(name)
+	if shape.kind == rotationCopyNone || shape.base == "" {
+		return false
+	}
+	for _, base := range caddyLogFamilyBases {
+		if shape.base == base {
+			return true
 		}
 	}
 	return false
@@ -942,7 +949,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"logs": infos}})
 }
 
-// isCertJobLogName 证书任务日志文件名（含 .N 移位副本与 .gz 压缩归档）。
+// isCertJobLogName 证书任务日志文件名（含 .N 移位副本与 .gz/.zst 压缩归档）。
 func isCertJobLogName(name string) bool {
 	if !strings.HasPrefix(name, "certjob-") {
 		return false
@@ -950,16 +957,16 @@ func isCertJobLogName(name string) bool {
 	return isTaskLogFamilyName(name)
 }
 
-// isRuleAccessLogName 规则访问日志文件名（含 .N 移位副本与 .gz 压缩归档）。
+// isRuleAccessLogName 规则访问日志文件名（含 .N 移位副本与 .gz/.zst 压缩归档）。
 func isRuleAccessLogName(name string) bool {
 	return isTaskLogFamilyName(name)
 }
 
-// isTaskLogFamilyName 任务日志文件名族：活跃文件 base.log[.gz] 与全部轮转
-// 副本形态（移位 .N[.gz]、时间戳、同秒碰撞后缀、timberjack）——副本形态
-// 判定走分类器单源，避免两处语法各自演化（.N.gz 曾在此漏判而聚合少计）。
+// isTaskLogFamilyName 任务日志文件名族：活跃文件 base.log[.gz/.zst] 与全部轮转
+// 副本形态（移位 .N[.gz/.zst]、时间戳、同秒碰撞后缀、timberjack）——压缩后缀
+// 剥离与副本形态判定走单源（.N.gz 曾在此漏判而聚合少计）。
 func isTaskLogFamilyName(name string) bool {
-	if strings.HasSuffix(strings.TrimSuffix(name, ".gz"), ".log") {
+	if core, _ := taskengine.StripRotationCompressionSuffix(name); strings.HasSuffix(core, ".log") {
 		return true
 	}
 	return isRotationCopyShape(name)

@@ -154,7 +154,9 @@ test('DNS 凭证测试按掩码回传分流（***→库中原值 :id/test）', (
 
 test('管理 TLS 读取失败显性化，开关禁用至加载成功', () => {
   const text = code('src/views/settings/BasicSettings.vue')
-  assert.match(text, /:disabled="isReadOnly \|\| !adminTlsLoaded"/)
+  // 冻结门（只读 ∪ 保存中）必须与加载门并联——只读门不得让「保存中」漏出去
+  assert.match(text, /:disabled="formFrozen \|\| !adminTlsLoaded"/)
+  assert.match(text, /const formFrozen = computed\(\(\) => isReadOnly\.value \|\| saving\.value\)/)
 })
 
 test('Caddy 全局配置卡接入 configLoaded 双重门控', () => {

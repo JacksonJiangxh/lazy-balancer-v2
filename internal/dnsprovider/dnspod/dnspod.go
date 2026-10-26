@@ -99,9 +99,11 @@ func New(loginToken string) *Provider {
 // Present for the same name adds another record, and cleanup removes records by
 // ownership record ID / value.
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
-	zone = strings.TrimSuffix(zone, ".")
-	subDomain := strings.TrimSuffix(tokenFQDN, ".")
-	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	// zone 与 tokenFQDN 都按 dnsname 单源归一后再派生相对子域：DNS 名大小写
+	// 不敏感，保存前探针的 FQDN 可能保留输入原样（`Example.COM`），大小写敏感
+	// 的后缀比较会把整个 FQDN 当成 sub_domain 写进 API（TXT 落到错误名字）。
+	zone = dnsname.NormalizeName(zone)
+	subDomain := dnsname.RelativeTo(tokenFQDN, zone)
 
 	domainID, err := p.getDomainID(ctx, zone)
 	if err != nil {
@@ -179,9 +181,8 @@ func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value stri
 // 兜底表键含 domain_id，计数按 "|"+subDomain 后缀跨键聚合（避免为计数引入
 // getDomainID 网络解析；跨 zone 同名子域的少量多计只会让预算偏大，方向安全）。
 func (p *Provider) CountCleanupRecords(zone, tokenFQDN, value string) int {
-	zone = strings.TrimSuffix(zone, ".")
-	subDomain := strings.TrimSuffix(tokenFQDN, ".")
-	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	zone = dnsname.NormalizeName(zone)
+	subDomain := dnsname.RelativeTo(tokenFQDN, zone)
 	p.mu.Lock()
 	fallback := 0
 	for key, entries := range p.owned {
@@ -213,9 +214,8 @@ func (p *Provider) CountCleanupRecords(zone, tokenFQDN, value string) int {
 // 收益低于耦合成本）。任一侧修改删除/自愈/兜底排空逻辑时，MUST 同步另一侧
 // 并保持语义一致（domain-id 自愈、ownership 条目留存、兜底排空）。
 func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, byValue bool) error {
-	zone = strings.TrimSuffix(zone, ".")
-	subDomain := strings.TrimSuffix(tokenFQDN, ".")
-	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	zone = dnsname.NormalizeName(zone)
+	subDomain := dnsname.RelativeTo(tokenFQDN, zone)
 
 	domainID, err := p.getDomainID(ctx, zone)
 	if err != nil {

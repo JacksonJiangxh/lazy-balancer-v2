@@ -45,7 +45,9 @@ func TestListAPIKeys_survivesNullBooleanColumns(t *testing.T) {
 			continue
 		}
 		found = true
-		// 缺省与鉴权侧同口径：is_enabled 视为启用，其余为关闭。
+		// 列表显示与鉴权判定有意不同：列表把 NULL 按启用展示（缺省即启用），
+		// 鉴权侧对 NULL fail-closed（401）。不得为「统一口径」而放行脏行——
+		// 两侧语义由 apikey_enabled_null_test.go 分别钉住。
 		if !key.IsEnabled || key.MCPEnabled || key.ReadOnly {
 			t.Fatalf("key=%+v, want is_enabled=true/mcp=false/read_only=false", key)
 		}

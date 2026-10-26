@@ -170,6 +170,28 @@ for module in "${modules[@]}"; do
   (cd "$module" && go test ./... -count=1)
 done
 
+# 顺序依赖门（-shuffle 固定 seed）：单包内用例共享进程内全局态（包级缓存、
+# 测试用 seam、ingestion 健康位等），默认的声明顺序让「写侧在清理前」恰好成立，
+# 换个排列就红——这类泄漏只能靠打乱顺序暴露，而人工偶发跑一次 -shuffle 不算门禁。
+# 固定 seed 而非随机：失败必须可复放，报告里直接给出同一条命令。
+# 两个 seed 取不同排列（单 seed 可能恰好把污染方排在受害方之后而全绿）；
+# 两个并发密集包合跑一条命令，go test 自身按包并行，门禁时长不翻倍。
+shuffle_seeds=(1792946460835645000 1)
+echo "== go test -shuffle (fixed seeds: ${shuffle_seeds[*]}) =="
+for seed in "${shuffle_seeds[@]}"; do
+  echo "-- -shuffle=${seed} ./internal/handlers ./internal/services"
+  set +e
+  go test -count=1 -shuffle="${seed}" ./internal/handlers ./internal/services
+  shuffle_rc=$?
+  set -e
+  if [[ ${shuffle_rc} -ne 0 ]]; then
+    echo "顺序依赖门失败（rc=${shuffle_rc}）：固定 seed 可复放——" >&2
+    echo "  go test -count=1 -shuffle=${seed} ./internal/handlers ./internal/services" >&2
+    echo "先查共享全局态（包级缓存/测试 seam/健康位）的写侧与清理侧配对，勿改 seed 绕过。" >&2
+    exit 1
+  fi
+done
+
 # 交叉编译等价性（不是「镜像构建等价性」）：验证 GOOS=linux CGO_ENABLED=0
 # 这组构建参数下代码可编译——平台/cgo 相关代码路径不进本地测试面，四个嵌套
 # 模块由 xcaddy 在镜像内以同一组参数编译插件，其 linux-only 编译错误（构建

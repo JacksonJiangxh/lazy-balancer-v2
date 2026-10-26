@@ -191,7 +191,9 @@ func TestReadAdminConfigBody_rejectsOversize(t *testing.T) {
 func TestCertJobLogLockKeyMatchesHousekeepingKey(t *testing.T) {
 	ruleID := "lb.dot.rule"
 	component := certJobLogFileComponent(ruleID)
-	t.Cleanup(func() { certJobLogWriteLocks.locks.Delete(component) })
+	// 本用例只比较键口径，acquire 登记的两份引用不在此释放——直接按 key 删除
+	// 会绕过引用协议（表内删除不等于引用归零），因此整表重置还原。
+	t.Cleanup(func() { certJobLogWriteLocks = refCountedLockTable{} })
 
 	writeLock := lockCertJobLog(ruleID)
 	parsed, ok := certJobLogRuleIDFromName("certjob-" + component + ".log.1")

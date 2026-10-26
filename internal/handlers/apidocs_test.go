@@ -2,11 +2,14 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2187,5 +2190,164 @@ func TestAPIDocs_readOnlyKeyClaimMatchesWriteWhitelist(t *testing.T) {
 	// 只读语义 POST 不等于只读 Key 可写：管理写操作仍必须写明 403。
 	if !strings.Contains(row, "管理写操作一律 403") {
 		t.Errorf("API Key 行须明确管理写操作仍为 403（只读语义 POST 是唯一写方法例外）: %s", row)
+	}
+}
+
+// 证书任务列表与详情是同一投影（certJobListItem）：两处各自手写示例会让
+// not_after/days_remaining/certificate_status/retry_cooldown_seconds 等
+// 必下发字段只在其中一侧可见——按列表示例生成 SDK 会漏掉冷却三态，
+// 按详情示例会漏掉到期与颁发者。
+func TestAPIDocs_certJobExamplesMatchImplementation(t *testing.T) {
+	route := routesEntry(t, "GET /certificates/jobs")
+	var listEnvelope struct {
+		List []map[string]any `json:"list"`
+	}
+	if err := json.Unmarshal([]byte(route.Response), &listEnvelope); err != nil {
+		t.Fatalf("GET /certificates/jobs 示例必须是 data 对象 JSON: %v", err)
+	}
+	if len(listEnvelope.List) == 0 {
+		t.Fatal("GET /certificates/jobs 示例缺 list 元素")
+	}
+	assertStructKeysDocumented(t, "GET /certificates/jobs list[0]", mapKeysOf(listEnvelope.List[0]), certJobListItem{})
+	assertStructKeysDocumented(t, "GET /certificates/jobs/:id", mapKeysOf(docResponseExample(t, "GET /certificates/jobs/:id")), certJobListItem{})
+
+	// 冷却三态是消费契约（0/正数/null），两个端点的描述都必须说明，
+	// 否则调用方只能从 429 反推可重试性。
+	for _, key := range []string{"GET /certificates/jobs", "GET /certificates/jobs/:id"} {
+		description := routesEntry(t, key).Description
+		if !strings.Contains(description, "retry_cooldown_seconds") || !strings.Contains(description, "null=永久不可重试") {
+			t.Errorf("%s 描述未说明 retry_cooldown_seconds 三态: %q", key, description)
+		}
+	}
+}
+
+// GET /certificates 的响应恒返回服务端实际生效的 page/page_size（被钳位时
+// 调用方据此得知真实页位置）——示例缺这两个键会让生成的 SDK 无法续页。
+// 直接调用真实 handler 取 data 顶层键集，与文档示例双向对账。
+func TestAPIDocs_certificateListExampleMatchesImplementation(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	router := gin.New()
+	router.GET("/certificates", h.ListCertificates)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/certificates", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var impl struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &impl); err != nil {
+		t.Fatalf("parse implementation response: %v", err)
+	}
+	assertKeySetsEqual(t, "GET /certificates", mapKeysOf(docResponseExample(t, "GET /certificates")), mapKeysOf(impl.Data))
+}
+
+// 四个登录族响应的 user 是完整 models.UserResponse（同 userResponseExample
+// 单源）——写成占位 {} 会让按示例建模的客户端发现不到 mfa_enabled/
+// auth_provider/is_setup_admin 等决策字段。
+func TestAPIDocs_loginFamilyUserExampleMatchesImplementation(t *testing.T) {
+	for _, key := range []string{"POST /auth/login", "POST /auth/ticket-login", "POST /auth/mfa/verify", "POST /auth/mfa/verify-step"} {
+		example := docResponseExample(t, key)
+		user, ok := example["user"].(map[string]any)
+		if !ok || len(user) == 0 {
+			t.Errorf("%s 示例 user 必须是完整对象（占位 {} 会隐藏决策字段）: %v", key, example["user"])
+			continue
+		}
+		assertStructKeysDocumented(t, key+" user", mapKeysOf(user), models.UserResponse{})
+	}
+}
+
+// API Key 管理列表与自助列表实际返回同一完整投影
+// （APIKeyWithUserResponse）——两处示例各自缺不同字段会让 SDK 模型二选一
+// 地丢字段。
+func TestAPIDocs_apiKeyExamplesMatchImplementation(t *testing.T) {
+	for _, key := range []string{"GET /api-keys", "GET /users/me/api-keys"} {
+		assertStructKeysDocumented(t, key, mapKeysOf(docDataArray(t, key)), models.APIKeyWithUserResponse{})
+	}
+}
+
+// 证书任务页码上限的文档必须与 handler 实参同值：契约表与路由描述曾按
+// 1000000 写，而实现是 maxCertJobPage=1000——按文档构参的 SDK 深翻页会
+// 拿到被钳制后的另一页却不自知。上限从 ListCertJobs 的
+// parsePaginationParam 实参派生，改实现而不改文档即红。
+func TestAPIDocContract_certJobsPageLimitMatchesHandlerCap(t *testing.T) {
+	source, err := os.ReadFile("certjobs.go")
+	if err != nil {
+		t.Fatalf("read certjobs.go: %v", err)
+	}
+	body := string(source)
+	match := regexp.MustCompile(`parsePaginationParam\(c, "page", [^,]+, ([A-Za-z0-9_]+)\)`).FindStringSubmatch(body)
+	if match == nil {
+		t.Fatal("ListCertJobs 未找到 page 分页上限实参（解析基线失效）")
+	}
+	want, err := resolvePaginationCap(body, match[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, parameter := range apiDocContractFor(apiDocRoute{Method: http.MethodGet, Path: "/certificates/jobs"}).queryParameters {
+		if parameter.name != "page" {
+			continue
+		}
+		// 不能只用 strings.Contains("1-1000")：「1-1000000」是它的超串，文档
+		// 写回 1000000 也会命中。必须取出区间右端整数字再比数值。
+		rangeMatch := regexp.MustCompile(`1-([0-9]+)`).FindStringSubmatch(parameter.description)
+		if rangeMatch == nil {
+			t.Fatalf("GET /certificates/jobs 的 page 契约描述=%q 未声明 1-<上限> 区间", parameter.description)
+		}
+		if got, err := strconv.Atoi(rangeMatch[1]); err != nil || got != want {
+			t.Errorf("GET /certificates/jobs 的 page 契约上限=%q, want %d（handler 实参）", rangeMatch[1], want)
+		}
+	}
+	description := routesEntry(t, "GET /certificates/jobs").Description
+	capMatch := regexp.MustCompile(`page≤([0-9]+)`).FindStringSubmatch(description)
+	if capMatch == nil {
+		t.Fatalf("GET /certificates/jobs 描述=%q 未声明 page≤<上限>", description)
+	}
+	if got, err := strconv.Atoi(capMatch[1]); err != nil || got != want {
+		t.Errorf("GET /certificates/jobs 描述上限=%q, want %d（handler 实参）", capMatch[1], want)
+	}
+}
+
+// resolvePaginationCap 把分页上限实参解析成数值：字面量直接取值，命名常量
+// 从同一文件的 const 声明解析（值域同源，避免文档侧另抄一份数字）。
+func resolvePaginationCap(source, raw string) (int, error) {
+	cleaned := strings.ReplaceAll(raw, "_", "")
+	if value, err := strconv.Atoi(cleaned); err == nil {
+		return value, nil
+	}
+	decl := regexp.MustCompile(`(?m)^const ` + regexp.QuoteMeta(raw) + ` = ([0-9_]+)$`).FindStringSubmatch(source)
+	if decl == nil {
+		return 0, fmt.Errorf("无法在 certjobs.go 解析常量 %s 的值", raw)
+	}
+	value, err := strconv.Atoi(strings.ReplaceAll(decl[1], "_", ""))
+	if err != nil {
+		return 0, fmt.Errorf("常量 %s 的值 %q 非法: %w", raw, decl[1], err)
+	}
+	return value, nil
+}
+
+// redeployed 同名不同类型（定向=boolean、批量=integer 计数）是既有运行时
+// 契约，文档必须分别说明：只写布尔会让按 {"all":true} 批量调用的一方按
+// boolean 建模而反序列化失败。两处运行时字面量从 certificates.go 派生，
+// 文档或实现任一侧漂移即红。
+func TestAPIDocs_issueCertificateRedeployedDualTypeDocumented(t *testing.T) {
+	source, err := os.ReadFile("certificates.go")
+	if err != nil {
+		t.Fatalf("read certificates.go: %v", err)
+	}
+	body := string(source)
+	if !strings.Contains(body, `"redeployed": true`) {
+		t.Error("certificates.go 未出现定向形态的布尔字面量 \"redeployed\": true（派生基线已漂移）")
+	}
+	if !strings.Contains(body, `"redeployed":         redeployed`) {
+		t.Error("certificates.go 未出现批量形态的整数计数器 \"redeployed\": redeployed（派生基线已漂移）")
+	}
+	description := routesEntry(t, "POST /certificates/issue").Description
+	if !strings.Contains(description, "布尔") || !strings.Contains(description, "整数") {
+		t.Errorf("POST /certificates/issue 描述未分别说明 redeployed 的布尔与整数形态: %q", description)
+	}
+	if !strings.Contains(description, `"redeployed":true`) || !strings.Contains(description, `"redeployed":0`) {
+		t.Errorf("POST /certificates/issue 描述未给出两种响应示例: %q", description)
 	}
 }

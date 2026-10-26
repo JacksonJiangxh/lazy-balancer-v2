@@ -227,7 +227,7 @@ func logCleanupSummaryLine(logFile string) string {
 // taskLogsHousekeeping 任务日志清理（保留月数自行读取）——测试/独立调用
 // 入口；生产链走 RuntimeLogCleanupOnce（复用已读取口径，避免一轮两次查库）。
 func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
-	months, monthsErr := auditRetentionMonths()
+	months, monthsErr := auditRetentionMonths(context.Background())
 	return taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
 }
 

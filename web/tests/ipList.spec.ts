@@ -300,3 +300,20 @@ test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨�
   assert.doesNotMatch(rules, /length\s*>\s*2000\b/, '条目数比较不得写死 2000')
   assert.doesNotMatch(rules, /:max="\s*2000\s*"/, '控件上限不得写死 2000')
 })
+
+// 引号字段闭合后只允许「空白 + 单个逗号 + 空白」；残留一律按非法行拒绝。
+// 旧实现把首字段残留整体并入备注、备注字段残留静默丢弃——导入结果与源文件
+// 不一致却无任何提示。
+test('C11 引号字段闭合后的残留被拒绝（合法/首字段残留/备注残留三形态）', () => {
+  // 合法形态：闭合引号后仅有空白或「逗号 + 空白」
+  assert.deepEqual(parseIpListEntryLine('"10.0.0.4",备注', isValidCidr), { value: '10.0.0.4', remark: '备注' })
+  assert.deepEqual(parseIpListEntryLine('"10.0.0.4" , 备注', isValidCidr), { value: '10.0.0.4', remark: '备注' })
+  assert.deepEqual(parseIpListEntryLine('"10.0.0.4"', isValidCidr), { value: '10.0.0.4', remark: '' })
+  assert.deepEqual(parseIpListEntryLine('"10.0.0.4",', isValidCidr), { value: '10.0.0.4', remark: '' })
+  // 首字段残留（曾被当成备注的一部分）
+  assert.equal(parseIpListEntryLine('"10.0.0.4"junk,备注', isValidCidr), null)
+  // 备注字段残留（曾被静默丢弃）
+  assert.equal(parseIpListEntryLine('"10.0.0.4","备注"junk', isValidCidr), null)
+  // 第三列：无对应语义，同样拒绝而非并进备注
+  assert.equal(parseIpListEntryLine('"10.0.0.4","备注","多余"', isValidCidr), null)
+})

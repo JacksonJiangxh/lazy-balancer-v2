@@ -550,6 +550,13 @@ func TestApplySnapshotBranding_auditsOnlyWhenContentChanges(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// db.Close() 会把原子句柄 SetDB(nil)——只还原三个包级变量会让
+		// db.GetDB() 与 db.DB 分叉，后续用例（尤其 -shuffle 顺序）读到
+		// 已关闭/临时目录已删的库。恢复协议必须成对执行并自证。
+		db.SetDB(oldDB)
+		if got := db.GetDB(); got != oldDB {
+			t.Errorf("清理后 db.GetDB()=%p, want 原句柄 %p（原子句柄未随包级变量一同恢复）", got, oldDB)
+		}
 	})
 	defer SetDefaultLandingBody(DefaultLandingText)
 

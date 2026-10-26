@@ -111,7 +111,7 @@
         <el-table-column v-if="!isReadOnly" label="操作" width="168" fixed="right">
           <template #default="{ row }">
             <el-button size="small" link type="primary" @click="openDialog(row)">{{ policyTypeOf(row) === 'mixed' ? '查看' : '编辑' }}</el-button>
-            <el-button v-if="policyTypeOf(row) !== 'mixed'" size="small" link type="primary" @click="openBindRulesDialog(row)">绑定规则</el-button>
+            <el-button v-if="policyTypeOf(row) !== 'mixed'" size="small" link type="primary" :disabled="securityBindingsLoading || securityBindingsFailed || bindRulesOpening" :title="securityBindingsLoading ? '规则绑定数据加载中' : securityBindingsFailed ? '规则绑定数据加载失败，请先重新加载' : ''" @click="openBindRulesDialog(row)">绑定规则</el-button>
             <el-button v-if="policyTypeOf(row) === 'mixed'" size="small" link type="warning" @click="openMigrateDialog(row)">更新迁移</el-button>
             <el-button size="small" link type="danger" @click="handleDelete(row)">删除</el-button>
           </template>
@@ -675,7 +675,7 @@
           <el-form :model="form" label-width="100px" :disabled="formFrozen">
             <el-form-item label="已关联">
               <div class="rule-bind-field">
-                <div class="rule-picker-trigger" role="button" tabindex="0" :class="{ 'is-locked': isReadOnly }" @click="!isReadOnly && openRulePicker()" @keydown.enter.prevent="!isReadOnly && openRulePicker()" @keydown.space.prevent="!isReadOnly && openRulePicker()">
+                <div class="rule-picker-trigger" role="button" tabindex="0" :class="{ 'is-locked': isReadOnly }" @click="!isReadOnly && openRulePicker()" @keydown.enter.prevent="activateOnce($event, () => !isReadOnly && openRulePicker())" @keydown.space.prevent="activateOnce($event, () => !isReadOnly && openRulePicker())">
                   <span :class="{ 'rule-picker-placeholder': boundRules.length === 0 }">{{ boundRules.length > 0 ? `已选 ${boundRules.length} 条` : '选择要关联的负载均衡规则' }}</span>
                   <el-icon class="rule-picker-arrow"><ArrowDown /></el-icon>
                 </div>
@@ -984,6 +984,7 @@ import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { updaterName } from '@/utils/updaterName'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
 import { buildPolicyPayload, crawlerExemptionNeedsEngines, trustEnabledForPolicyType } from '@/utils/policyPayload'
+import { activateOnce } from '@/utils/keyboardActivate'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; geoip_crawler_exempt?: boolean; geoip_crawler_engines?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
 // 规则行携带阶段拦截页覆盖 4 字段（关联规则行内编辑与生效投影同源）
@@ -1522,9 +1523,41 @@ const applyStageOverrideSuccess = (caddyId: string, edit: StageOverrideEdit): vo
 // ── 行级「绑定规则」（不经编辑器；与规则页「安全」弹框共享 SecurityBindingEditor） ──
 const bindRulesVisible = ref(false)
 const bindRulesPolicy = ref<PolicySummary | null>(null)
-const openBindRulesDialog = (row: PolicySummary): void => {
-  bindRulesPolicy.value = row
-  bindRulesVisible.value = true
+// 数据就绪门（与 Rules.vue 的 securityBindingsLoading/Error 同源）：编辑器语义是
+// 「整集替换/全量重置」，以加载中/失败时的旧快照或空快照打开，会按错误的 delta
+// 提交——界面提示更新成功，实际未被看到的既有绑定仍保留。
+const securityBindingsLoading = ref(true)
+const securityBindingsFailed = ref(false)
+const bindRulesOpening = ref(false)
+
+const refreshBindingsSnapshot = async (): Promise<boolean> => {
+  securityBindingsLoading.value = true
+  try {
+    const res = await request.get<APIResponse<Record<string, BindingInfo[]>>>('/security/bindings')
+    securityBindings.value = res.data || {}
+    securityBindingsFailed.value = false
+    return true
+  } catch {
+    securityBindingsFailed.value = true
+    return false
+  } finally { securityBindingsLoading.value = false }
+}
+
+const openBindRulesDialog = async (row: PolicySummary): Promise<void> => {
+  if (securityBindingsLoading.value || securityBindingsFailed.value || bindRulesOpening.value) {
+    ElMessage.warning(securityBindingsLoading.value ? '规则绑定数据加载中，请稍后再试' : '规则绑定数据加载失败，请先点击上方「重新加载」')
+    return
+  }
+  bindRulesOpening.value = true
+  try {
+    // 打开前重取一次快照（保存是全量替换，旧快照的 delta 不等于当前真实绑定集）
+    if (!(await refreshBindingsSnapshot())) {
+      ElMessage.error('规则绑定数据刷新失败，已取消打开；请稍后重试')
+      return
+    }
+    bindRulesPolicy.value = row
+    bindRulesVisible.value = true
+  } finally { bindRulesOpening.value = false }
 }
 const onBindRulesSaved = (): void => { void fetchData() }
 const allRules = ref<Rule[]>([])
@@ -1773,6 +1806,8 @@ const allCustomRules = ref<Array<{ id: number; name: string; action?: string; en
 // 「列表加载失败」与「策略确已删除」，否则瞬时失败会被误报为「已被删除」。
 const fetchData = async (): Promise<boolean> => {
   loading.value = true
+  // 行级「绑定规则」的就绪门：主数据/辅助数据都在本次 allSettled 里，门随整体结束释放
+  securityBindingsLoading.value = true
   try {
     // allSettled 替代 all——策略主数据失败才整体报错，
     // 辅助数据（规则/CRS 选项/拦截页/绑定/用户）部分失败保留已有数据，
@@ -1806,8 +1841,8 @@ const fetchData = async (): Promise<boolean> => {
     else failures.push('拦截页面')
     if (crRes.status === 'fulfilled') allCustomRules.value = crRes.value.data || []
     else failures.push('自定义规则')
-    if (bindRes.status === 'fulfilled') securityBindings.value = bindRes.value.data || {}
-    else failures.push('规则绑定')
+    if (bindRes.status === 'fulfilled') { securityBindings.value = bindRes.value.data || {}; securityBindingsFailed.value = false }
+    else { failures.push('规则绑定'); securityBindingsFailed.value = true }
     if (userRes.status === 'fulfilled') users.value = userRes.value.data || []
     else failures.push('用户列表')
     if (ipListRes.status === 'fulfilled') ipLists.value = ipListRes.value.data || []
@@ -1819,7 +1854,10 @@ const fetchData = async (): Promise<boolean> => {
     console.error('Failed to load policies data:', error)
     policiesLoadError.value = true
     return false
-  } finally { loading.value = false }
+  } finally {
+    loading.value = false
+    securityBindingsLoading.value = false
+  }
 }
 
 // JSON 数组文本解析走 utils/securityStages（单源）：文本 JSON.parse 后委托

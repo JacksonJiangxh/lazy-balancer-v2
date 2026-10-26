@@ -49,7 +49,7 @@ curl -s http://localhost:8000/api/v1/mcp \
 
 完整工具列表通过 `tools/list` 方法获取。
 
-证书工具的两条资源上限（与 REST 同口径）：`list_certificates` 支持 `page`/`page_size`（默认 1/1000，上限均 1000，响应 `data.total` 为匹配总数，超过 1000 行时按 `page` 续取）；`issue_certificate` 的 `{"all":true}` 批量全量重签单次最多匹配 500 个 ACME 规则，超出返回 400，请分批执行或改用 `caddy_id` 定向签发。
+证书工具的两条资源上限（与 REST 同口径）：`list_certificates` 支持 `rule_id`（规则 Caddy ID，精确过滤）与 `page`/`page_size`（默认 1/1000，上限均 1000，响应 `data.total` 为匹配总数，超过 1000 行时按 `page` 续取）；`issue_certificate` 的 `{"all":true}` 批量全量重签单次最多匹配 500 个 ACME 规则，超出返回 400，请分批执行或改用 `caddy_id` 定向签发。
 
 ## 操作手册
 

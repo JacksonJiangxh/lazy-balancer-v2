@@ -459,7 +459,7 @@ test('安全规则预设项可键盘操作（折叠头 button + 标签/模板键
   const text = code('src/views/security/SecurityRules.vue')
   assert.match(text, /<button type="button" class="preset-header" :aria-expanded="!uaCollapsed\[idx\]"/)
   assert.match(text, /<button type="button" class="preset-header" :aria-expanded="!regexCollapsed\[idx\]"/)
-  assert.match(text, /class="preset-tag" role="button" tabindex="0" @click="cond\.pattern = t\.value" @keydown\.enter\.prevent="cond\.pattern = t\.value" @keydown\.space\.prevent="cond\.pattern = t\.value"/)
+  assert.match(text, /class="preset-tag" role="button" tabindex="0" @click="cond\.pattern = t\.value" @keydown\.enter\.prevent="activateOnce\(\$event, \(\) => \{ cond\.pattern = t\.value \}\)" @keydown\.space\.prevent="activateOnce\(\$event, \(\) => \{ cond\.pattern = t\.value \}\)"/, '快捷标签长按不得按重复率反复写入')
   assert.match(text, /<el-button v-for="p in REGEX_PRESETS"[\s\S]{0,120}class="regex-preset-link"/)
   assert.match(text, /\.preset-header:focus-visible,[\s\S]{0,200}outline: 2px solid #409eff/)
 })

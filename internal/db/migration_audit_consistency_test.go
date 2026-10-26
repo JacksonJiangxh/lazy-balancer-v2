@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 )
@@ -135,5 +136,196 @@ func TestMigrateDropMergedSyncSwitchColumns_recordsDiscardedLegacyBookkeeping(t 
 		if !strings.Contains(entries[0].detail, fragment) {
 			t.Fatalf("audit detail=%q, want 含 %q", entries[0].detail, fragment)
 		}
+	}
+}
+
+// seedWAFModeMigrationDB 建表并播种 global_config 行（一次性门列由迁移自身
+// 补列）+ 四条覆盖迁移判据两面的策略行。
+func seedWAFModeMigrationDB(t *testing.T) *sql.DB {
+	t.Helper()
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT OR IGNORE INTO global_config (id, caddy_config, cluster_version) VALUES (1,'{}',0)`); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_policies (name, mode, custom_rules) VALUES
+		('off-启用-a','off','[{"id":1,"enabled":true,"action":"block","score":5}]'),
+		('off-启用-b','off','[{"id":2,"enabled":true,"action":"block","score":5}]'),
+		('off-仅禁用','off','[{"id":3,"enabled":false,"action":"block","score":5}]'),
+		('blocking-启用','blocking','[{"id":4,"enabled":true,"action":"block","score":5}]')`); err != nil {
+		t.Fatalf("seed security policies: %v", err)
+	}
+	return database
+}
+
+func securityPolicyMode(t *testing.T, database *sql.DB, name string) string {
+	t.Helper()
+	var mode string
+	if err := database.QueryRow(`SELECT mode FROM security_policies WHERE name=?`, name).Scan(&mode); err != nil {
+		t.Fatalf("read mode of %s: %v", name, err)
+	}
+	return mode
+}
+
+// WAF 模式四态化迁移改写用户策略必须进操作审计：提交后按事务内实际变更
+// 计数写一行聚合（存量 N 条不再写 N 条）；一次性门置位后重跑零新增。
+func TestMigrateSecurityPolicyCustomOnlyMode_aggregatesAudit(t *testing.T) {
+	seedWAFModeMigrationDB(t)
+	drainSystemAuditBuffer()
+
+	if err := migrateSecurityPolicyCustomOnlyMode(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1（聚合一行）: %+v", len(entries), entries)
+	}
+	if entries[0].action != "启动迁移" || entries[0].resource != "安全策略" {
+		t.Fatalf("audit action/resource=(%q,%q), want (启动迁移,安全策略)", entries[0].action, entries[0].resource)
+	}
+	if !strings.Contains(entries[0].detail, "2") || !strings.Contains(entries[0].detail, "custom_only") {
+		t.Fatalf("audit detail=%q, want 含实际变更计数 2 与目标模式", entries[0].detail)
+	}
+
+	// 一次性门已置位：重跑零变更、零新增审计。
+	if err := migrateSecurityPolicyCustomOnlyMode(); err != nil {
+		t.Fatalf("repeat migrate: %v", err)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("重复启动不得重复留痕: %+v", entries)
+	}
+}
+
+// 零实际变更不写审计（探测/无命中行时不得造留痕）。
+func TestMigrateSecurityPolicyCustomOnlyMode_skipsAuditWhenNothingChanged(t *testing.T) {
+	database := seedWAFModeMigrationDB(t)
+	// 只留不满足迁移判据的行：off 仅挂禁用规则、blocking 挂启用规则。
+	if _, err := database.Exec(`DELETE FROM security_policies WHERE name LIKE 'off-启用-%'`); err != nil {
+		t.Fatalf("trim policies: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	if err := migrateSecurityPolicyCustomOnlyMode(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("零变更不得写审计: %+v", entries)
+	}
+	if mode := securityPolicyMode(t, database, "off-仅禁用"); mode != "off" {
+		t.Fatalf("off-仅禁用 mode=%q, want off", mode)
+	}
+	if mode := securityPolicyMode(t, database, "blocking-启用"); mode != "blocking" {
+		t.Fatalf("blocking-启用 mode=%q, want blocking", mode)
+	}
+}
+
+// 一次性门写失败必须整体回滚：数据保持原状且不得留下「已审计但未落库」的
+// 假留痕；故障解除后重试成功只留一条。
+func TestMigrateSecurityPolicyCustomOnlyMode_rollbackLeavesNoAudit(t *testing.T) {
+	database := seedWAFModeMigrationDB(t)
+	if _, err := database.Exec(`CREATE TRIGGER block_waf_mode_marker BEFORE UPDATE OF waf_mode4_migrated ON global_config
+		BEGIN SELECT RAISE(ABORT, 'marker blocked'); END;`); err != nil {
+		t.Fatalf("create blocking trigger: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	if err := migrateSecurityPolicyCustomOnlyMode(); err == nil {
+		t.Fatal("门写失败必须向上返回错误")
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("回滚后不得留痕: %+v", entries)
+	}
+	if mode := securityPolicyMode(t, database, "off-启用-a"); mode != "off" {
+		t.Fatalf("回滚后 mode=%q, want off（归一与一次性门同事务）", mode)
+	}
+
+	if _, err := database.Exec(`DROP TRIGGER block_waf_mode_marker`); err != nil {
+		t.Fatalf("drop blocking trigger: %v", err)
+	}
+	if err := migrateSecurityPolicyCustomOnlyMode(); err != nil {
+		t.Fatalf("retry migrate: %v", err)
+	}
+	if mode := securityPolicyMode(t, database, "off-启用-a"); mode != "custom_only" {
+		t.Fatalf("retry mode=%q, want custom_only", mode)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 1 || !strings.Contains(entries[0].detail, "2") {
+		t.Fatalf("重试成功应恰留一条聚合审计: %+v", entries)
+	}
+}
+
+// seedTCPBindingMigrationDB 播种两条 TCP 规则绑定 + 一条 HTTP 绑定（HTTP 与
+// 无对应规则的历史行必须保留）。
+func seedTCPBindingMigrationDB(t *testing.T) *sql.DB {
+	t.Helper()
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config,cluster_version) VALUES (1,'{}',0);
+		INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,compress_types) VALUES
+		('lb_audit_http','http-rule','http',8080,'gzip'),
+		('lb_audit_tcp_a','tcp-a','tcp',9001,''),
+		('lb_audit_tcp_b','tcp-b','tcp',9002,'');
+		INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES
+		('lb_audit_http',7),('lb_audit_tcp_a',7),('lb_audit_tcp_b',7);`); err != nil {
+		t.Fatalf("seed bindings: %v", err)
+	}
+	return database
+}
+
+// TCP 绑定清理删除用户策略绑定必须进操作审计（聚合一行 + 实际变更计数），
+// 重复启动零新增。
+func TestMigrateTCPRuleSecurityPolicyBindings_aggregatesAudit(t *testing.T) {
+	seedTCPBindingMigrationDB(t)
+	drainSystemAuditBuffer()
+
+	if err := migrateTCPRuleSecurityPolicyBindings(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1（聚合一行）: %+v", len(entries), entries)
+	}
+	if entries[0].action != "启动迁移" || entries[0].resource != "安全策略" {
+		t.Fatalf("audit action/resource=(%q,%q), want (启动迁移,安全策略)", entries[0].action, entries[0].resource)
+	}
+	if !strings.Contains(entries[0].detail, "2") {
+		t.Fatalf("audit detail=%q, want 含实际变更计数 2", entries[0].detail)
+	}
+
+	if err := migrateTCPRuleSecurityPolicyBindings(); err != nil {
+		t.Fatalf("repeat migrate: %v", err)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("无待清理行时不得重复留痕: %+v", entries)
+	}
+}
+
+// 无 TCP 绑定（只有 HTTP/历史行）时零写、零版本扰动、零审计。
+func TestMigrateTCPRuleSecurityPolicyBindings_skipsAuditWhenNothingChanged(t *testing.T) {
+	database := seedTCPBindingMigrationDB(t)
+	if _, err := database.Exec(`DELETE FROM security_policy_bindings WHERE rule_caddy_id LIKE 'lb_audit_tcp_%'`); err != nil {
+		t.Fatalf("trim tcp bindings: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	if err := migrateTCPRuleSecurityPolicyBindings(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("零变更不得写审计: %+v", entries)
+	}
+	var version int
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 0 {
+		t.Fatalf("cluster_version=%d, want 0（无变更不得 bump）", version)
 	}
 }

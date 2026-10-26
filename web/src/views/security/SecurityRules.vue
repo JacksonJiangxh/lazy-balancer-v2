@@ -249,7 +249,7 @@
         <DialogHeader :icon="Filter" :title="editingRuleId ? (isReadOnly ? '查看自定义规则' : '编辑自定义规则') : '新建自定义规则'"
           subtitle="按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件为 AND 关系" tone="danger" />
       </template>
-      <el-form :model="ruleForm" label-width="80px" label-position="right" :disabled="isReadOnly">
+      <el-form :model="ruleForm" label-width="80px" label-position="right" :disabled="isReadOnly || savingRule">
         <!-- 值与后端写侧门同源（internal/handlers/security.go：名称 ≤100 rune、
              描述 ≤500 rune）——超长只能等 400 的旧形态没有字段级定位 -->
         <el-form-item label="名称" required>
@@ -293,7 +293,7 @@
                     <div v-for="g in UA_PRESET_GROUPS" :key="g.label" class="preset-group">
                       <span class="preset-group-label">{{ g.label }}</span>
                       <div class="preset-group-tags">
-                        <el-tag v-for="t in g.values" :key="t.value" size="small" effect="plain" class="preset-tag" role="button" tabindex="0" @click="cond.pattern = t.value" @keydown.enter.prevent="cond.pattern = t.value" @keydown.space.prevent="cond.pattern = t.value">{{ t.label }}</el-tag>
+                        <el-tag v-for="t in g.values" :key="t.value" size="small" effect="plain" class="preset-tag" role="button" tabindex="0" @click="cond.pattern = t.value" @keydown.enter.prevent="activateOnce($event, () => { cond.pattern = t.value })" @keydown.space.prevent="activateOnce($event, () => { cond.pattern = t.value })">{{ t.label }}</el-tag>
                       </div>
                     </div>
                     <div class="preset-hint">标签写入真实 UA 片段（contains 精确匹配，区分大小写）</div>
@@ -314,10 +314,10 @@
                   </div>
                 </div>
               </div>
-              <el-button link type="danger" size="small" :disabled="isReadOnly" @click="removeCondition(idx)">删除</el-button>
+              <el-button link type="danger" size="small" :disabled="isReadOnly || savingRule" @click="removeCondition(idx)">删除</el-button>
             </div>
             <div class="add-condition-row">
-              <el-button v-if="!isReadOnly" size="small" type="primary" plain class="add-condition-btn" :disabled="!canAddCondition(ruleForm.conditions.length)" @click="ruleForm.conditions.push({ target: 'uri', operator: 'contains', pattern: '' })">
+              <el-button v-if="!isReadOnly" size="small" type="primary" plain class="add-condition-btn" :disabled="!canAddCondition(ruleForm.conditions.length) || savingRule" @click="ruleForm.conditions.push({ target: 'uri', operator: 'contains', pattern: '' })">
                 + 添加条件
               </el-button>
               <!-- 条件数上限与后端 customRuleMaxConditions 同源：超出只能提交后吃 400 -->
@@ -364,21 +364,21 @@
         <span class="info-note-desc">名单条目加载失败：为避免以空条目覆盖原列表，保存与条目增删/导入已禁用；请先重新加载。</span>
         <el-button size="small" type="primary" plain @click="reloadIpListDetail">重新加载</el-button>
       </div>
-      <el-form :model="ipListForm" label-width="80px" label-position="right" v-loading="loadingIpListDetail">
+      <el-form :model="ipListForm" label-width="80px" label-position="right" v-loading="loadingIpListDetail" :disabled="savingIpList">
         <!-- 自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
              前端直接禁用灰态——禁止修改的字段不可输入，而非提交后报 400 -->
         <div v-if="editingIpListPreset" class="form-tip-line">内置名单字段不可修改，仅条目可编辑（手动封禁 / 删除条目）</div>
         <el-form-item label="名称" required>
-          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset" />
+          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset || savingIpList" />
         </el-form-item>
         <el-form-item label="分类">
-          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%" :disabled="ipListDialogReadOnly || editingIpListPreset">
+          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%" :disabled="ipListDialogReadOnly || editingIpListPreset || savingIpList">
             <el-option v-for="c in IP_LIST_CATEGORIES" :key="c" :label="c" :value="c" />
           </el-select>
           <div class="form-tip-line">预设分类可直接选择，也可自定义（≤32 字符）</div>
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset" />
+          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset || savingIpList" />
         </el-form-item>
         <el-form-item label="条目" required>
           <div class="entries-block">
@@ -414,7 +414,7 @@
               </template>
               <el-table-column v-if="!ipListDialogReadOnly" label="" width="60" align="center">
                 <template #default="{ $index }">
-                  <el-button link type="danger" size="small" @click="removeIpListEntry(ipListEntryPageStart + $index)">删除</el-button>
+                  <el-button link type="danger" size="small" :disabled="savingIpList" @click="removeIpListEntry(ipListEntryPageStart + $index)">删除</el-button>
                 </template>
               </el-table-column>
             </el-table>
@@ -428,11 +428,11 @@
               />
             </div>
             <div class="entries-toolbar">
-              <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed" @click="addIpListEntry">
+              <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed || savingIpList" @click="addIpListEntry">
                 + 添加条目
               </el-button>
               <div class="entries-toolbar-right">
-                <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed" @click="triggerImportEntries">导入</el-button>
+                <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed || savingIpList" @click="triggerImportEntries">导入</el-button>
                 <el-button size="small" type="primary" plain @click="exportIpListEntries">导出</el-button>
               </div>
             </div>
@@ -665,10 +665,11 @@ import { request, mfaAwareSuccess } from '@/utils/api'
 import { formatBytes } from '@/utils/formatBytes'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
-import { IP_LIST_MAX_ENTRIES, canSaveIpList, entriesMissingFromPayload, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
+import { IP_LIST_MAX_ENTRIES, canSaveIpList, mergeConcurrentBanEntries, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
 import { CUSTOM_RULE_MAX_CONDITIONS, CUSTOM_RULE_MAX_PATTERN_BYTES, canAddCondition, patternByteLength, patternOverLimit } from '@/utils/customRuleLimits'
 import { formatIpListEntryLine, ipListRemarkMaxLength, parseIpListEntryLine } from '@/utils/ipListCsv'
 import { popperViewportSafe } from '@/utils/popper'
+import { activateOnce } from '@/utils/keyboardActivate'
 import { useAuthStore } from '@/stores/auth'
 
 import { useClampedPagination } from '@/composables/useClampedPagination'
@@ -1077,6 +1078,9 @@ const editingIpListPreset = ref(false)
 const ipListDialogReadOnly = computed(() => isReadOnly.value || (editingIpListSystem.value && !editingIpListPreset.value))
 const editingIpListId = ref<number | null>(null)
 const savingIpList = ref(false)
+// 打开弹框时服务端已有的条目值快照：保存前的最终复核据此区分「任务并发新增」
+// 与「用户在弹框里主动删除」——前者必须保留（否则提前解封），后者按用户意图移除。
+const ipListOpenSnapshot = ref<string[]>([])
 const ipListForm = ref<{ name: string; description: string; category: string; entries: IPListEntry[] }>({ name: '', description: '', category: '', entries: [] })
 
 const ipListsError = ref(false)
@@ -1154,6 +1158,7 @@ const openIpListDialog = async (row?: IPListRow) => {
     ipListDetailFailed.value = false
     ipListDetailRowId.value = null
     ipListForm.value = { name: '', description: '', category: '', entries: [{ value: '', remark: '' }] }
+    ipListOpenSnapshot.value = []
     ipListDialogVisible.value = true
     return
   }
@@ -1172,6 +1177,7 @@ const openIpListDialog = async (row?: IPListRow) => {
       // 自动封禁名单条目保留 created_at/expires_at（保存随全量写回，
       // 任务 merge 的到期语义与弹框到期列依赖这两字段）
       ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
+      ipListOpenSnapshot.value = ipListForm.value.entries.map((e) => e.value)
     }
   } catch {
     if (requestSeq !== ipListDetailSeq) return
@@ -1205,6 +1211,7 @@ const reloadIpListDetail = async (): Promise<void> => {
     const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
     if (requestSeq !== ipListDetailSeq) return
     ipListForm.value.entries = (res.data?.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
+    ipListOpenSnapshot.value = ipListForm.value.entries.map((e) => e.value)
     ipListDetailFailed.value = false
     ipListEntryPage.value = 1
     ElMessage.success('已加载最新条目')
@@ -1218,34 +1225,29 @@ const reloadIpListDetail = async (): Promise<void> => {
 }
 
 /**
- * 内置名单保存前的「期间新增条目」核对（返回是否可以继续保存）。
- * 重取详情失败时同样要求确认——无法核对就不能假装安全，用户可选择取消后重开弹框。
+ * 内置名单保存前的最终复核（保存流程里最后一个异步步骤，紧邻 PUT）：
+ * 重取详情，把「打开弹框后由任务新增、本次载荷又没有」的封禁条目原样并入载荷。
+ *
+ * 旧实现的差集发生在最后一次确认框之前——用户在该确认框停留期间新封禁的 IP 仍会
+ * 被整表替换掉（提前解封），故差集必须落到确认之后。无法核对时中止保存
+ * （fail-closed：不能拿未知状态做全表覆盖）。打开快照里的条目不计入「并发新增」，
+ * 用户主动删除的封禁仍可移除。
  */
-const confirmAutobanFreshness = async (id: number, payloadValues: string[]): Promise<boolean> => {
+const mergeFreshAutobanEntries = async (id: number, entries: IPListEntry[]): Promise<IPListEntry[] | null> => {
+  let serverEntries: IPListEntry[] = []
   try {
     const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
-    const missing = entriesMissingFromPayload((res.data?.entries || []).map((e) => e.value), payloadValues)
-    if (missing.length === 0) return true
-    const preview = missing.slice(0, 5).join('、') + (missing.length > 5 ? ' 等' : '')
-    await ElMessageBox.confirm(
-      `打开弹框后名单新增了 ${missing.length} 条（${preview}），保存为整表替换，会将这些新条目一并移除（即刻解封）。确定继续？`,
-      '封禁条目已变化',
-      { type: 'warning', confirmButtonText: '仍要保存', cancelButtonText: '取消' },
-    )
-    return true
-  } catch (error: unknown) {
-    if (error === 'cancel' || error === 'close') return false
-    try {
-      await ElMessageBox.confirm(
-        '无法核对打开弹框后是否有任务新增封禁条目；保存仍会整表替换该名单。确定继续？',
-        '无法核对最新条目',
-        { type: 'warning', confirmButtonText: '仍要保存', cancelButtonText: '取消' },
-      )
-      return true
-    } catch {
-      return false
-    }
+    serverEntries = res.data?.entries || []
+  } catch {
+    ElMessage.error('无法核对最新封禁条目，已中止保存（避免解封刚封禁的 IP）；请稍后重试')
+    return null
   }
+  const merged = mergeConcurrentBanEntries(serverEntries, entries, ipListOpenSnapshot.value)
+  if (merged.preserved.length > 0) {
+    const preview = merged.preserved.slice(0, 5).join('、') + (merged.preserved.length > 5 ? ' 等' : '')
+    ElMessage.warning(`保存期间新增的 ${merged.preserved.length} 条封禁条目已保留（${preview}），不会随本次保存移除`)
+  }
+  return merged.entries
 }
 
 const saveIpList = async () => {
@@ -1280,21 +1282,23 @@ const saveIpList = async () => {
       await ElMessageBox.confirm(`将清空列表「${name}」的全部条目（保存后不可恢复），确定继续？`, '清空确认', { type: 'warning', confirmButtonText: '清空并保存' })
     } catch { return }
   }
-  // 内置自动封禁名单由任务持续 merge 写入，而本弹框详情只在打开时取一次、保存
-  // 是全量替换：打开期间新封禁的 IP 会被无声解封。保存前重取详情做差，点名移除项。
-  if (editingIpListPreset.value && editingIpListId.value) {
-    const proceed = await confirmAutobanFreshness(editingIpListId.value, entries.map((e) => e.value))
-    if (!proceed) return
-  }
   const action = editingIpListId.value ? '保存' : '创建'
   const expiredNote = expiredEntryCount > 0 ? `，其中 ${expiredEntryCount} 条已到期（保存后自动移除）` : ''
   try {
     await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目${expiredNote}）？`, '确认', { type: 'warning' })
   } catch { return }
+  // 并发新增核对必须落在最后一次确认之后（此前它在确认之前完成，确认框停留期间
+  // 任务新写入的封禁条目仍会被整表替换掉）。此处到 PUT 之间无任何用户交互。
+  let payloadEntries: IPListEntry[] = entries
+  if (editingIpListPreset.value && editingIpListId.value) {
+    const merged = await mergeFreshAutobanEntries(editingIpListId.value, entries)
+    if (merged === null) return
+    payloadEntries = merged
+  }
   savingIpList.value = true
   try {
     // entries 与其余名单字段同口径：JSON 数组文本（后端 CreateIPListRequest.Entries 为 string）
-    const body = { name, description: ipListForm.value.description.trim(), category: ipListForm.value.category.trim(), entries: JSON.stringify(entries) }
+    const body = { name, description: ipListForm.value.description.trim(), category: ipListForm.value.category.trim(), entries: JSON.stringify(payloadEntries) }
     const res = editingIpListId.value
       ? await request.put(`/security/ip-lists/${editingIpListId.value}`, body)
       : await request.post('/security/ip-lists', body)

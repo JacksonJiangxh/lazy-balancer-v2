@@ -154,3 +154,86 @@ func TestAggregateDirStats_wholeFileGzipArchiveJoinsBase(t *testing.T) {
 		t.Fatalf("dirBytes=(%d,%d,%d) aggregate=(%d,%d,%d)——两套分类器分叉", active, rotated, count, stats.Active, stats.Rotated, stats.RotCount)
 	}
 }
+
+// timberjack zstd 归档（<stem>-<ts>-<reason>.log.zst）与整文件 .zst 必须和
+// .gz 同族进入聚合统计：压缩后缀集合单源（.gz/.zst），family matcher 不得
+// 只认 .gz——否则同一文件在命名分类里归族、在聚合行里整份消失（页面少算
+// 归档体量）。活动基名在与缺席两种形态都要一致。
+func TestAggregateDirStats_zstdCopiesCountIntoBase(t *testing.T) {
+	cases := []struct {
+		name        string
+		base        string
+		files       map[string]int
+		wantActive  int64
+		wantRotated int64
+		wantCount   int
+	}{
+		{
+			name: "有活跃基名",
+			base: "caddy.log",
+			files: map[string]int{
+				"caddy.log":                               100,
+				"caddy.log.zst":                           15,
+				"caddy-20260921-120000-64-size.log.zst":   40,
+				"caddy-20260921-120100-64-size_1.log.zst": 20,
+				"caddy-20260921-120200-64-size.log.gz":    10,
+			},
+			wantActive:  100,
+			wantRotated: 85,
+			wantCount:   4,
+		},
+		{
+			name: "仅剩归档（基名缺席）",
+			base: "caddy-tls.log",
+			files: map[string]int{
+				"caddy-tls-20260921-120000-64-size.log.zst": 30,
+			},
+			wantActive:  0,
+			wantRotated: 30,
+			wantCount:   1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, size := range tc.files {
+				if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// 非 caddy 族的同名形态不得被 matcher 收进来（匹配面仍是四份日志）。
+			if err := os.WriteFile(filepath.Join(dir, "other-20260921-120000-64-size.log.zst"), make([]byte, 5), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			for name := range tc.files {
+				if !caddyLogFamilyMatch(name) {
+					t.Fatalf("caddyLogFamilyMatch(%q)=false——压缩归档必须与 .gz 同族", name)
+				}
+			}
+			if caddyLogFamilyMatch("other-20260921-120000-64-size.log.zst") {
+				t.Fatal("非 caddy 族文件被 caddy matcher 收录")
+			}
+
+			stats := aggregateDirStats(dir, caddyLogFamilyMatch)
+			entry := stats[tc.base]
+			if entry.Active != tc.wantActive || entry.Rotated != tc.wantRotated || entry.RotCount != tc.wantCount {
+				t.Fatalf("aggregate[%s]=(%d,%d,%d), want (%d,%d,%d)",
+					tc.base, entry.Active, entry.Rotated, entry.RotCount, tc.wantActive, tc.wantRotated, tc.wantCount)
+			}
+			// 归档不得落成以副本名/派生名为基名的独立键（消费侧按固定基名取值）。
+			for key := range stats {
+				if key != tc.base {
+					t.Fatalf("聚合出现非规范基名条目 %q（压缩归档必须并入 %s）", key, tc.base)
+				}
+			}
+
+			// 与单文件 dirBytes 口径一致（同一响应内两行不得分叉）。
+			active, rotated, count := dirBytes(filepath.Join(dir, tc.base))
+			if active != entry.Active || rotated != entry.Rotated || count != entry.RotCount {
+				t.Fatalf("dirBytes=(%d,%d,%d) vs aggregate=(%d,%d,%d)——两套口径分叉",
+					active, rotated, count, entry.Active, entry.Rotated, entry.RotCount)
+			}
+		})
+	}
+}

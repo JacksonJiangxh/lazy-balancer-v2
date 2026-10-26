@@ -2997,10 +2997,13 @@ func securityEventsAuditWriterStatsFailurePath() string {
 // 不可用」——磁盘满/目录只读正是侧车要覆盖的故障形态，双向失效不得静默。
 // securityEventsProcessStart 是本进程（面板服务）启动时刻，用于判定侧车
 // 计数的代际：计数文件跨容器重启存活，written_at 早于本时刻说明写它的是
-// 上一代进程——那批累计值与本进程无关，整份忽略并复位基线。否则重启后
-// 首个 tick 会把历史失败当成本进程新失败（degraded 15 分钟 + data_loss +
-// 一条「审计日志写侧失败」任务日志的误报），且新进程无失败时侧车永不重写，
-// 误报长期存在。var 供测试注入。
+// 上一代进程——那批累计读数**只记为基线**（baselineDropped/IO/Format），不
+// 计入本代失败窗口；基线不得归零：插件计数器只在插件进程（Caddy）自身重启时
+// 才从 0 起，面板单独重启时插件仍持旧累计值，归零会把历史失败全量算成本代
+// 新增。插件真重启时计数回落，delta 的 `current<baseline` 分支再自动复位
+// 基线。否则重启后首个 tick 会把历史失败当成本进程新失败（degraded 15 分钟
+// + data_loss + 一条「审计日志写侧失败」任务日志的误报），且新进程无失败时
+// 侧车永不重写，误报长期存在。var 供测试注入。
 var securityEventsProcessStart = time.Now()
 
 // securityEventsMessagesDropped 是写侧单行 messages 截断量的进程级累计：

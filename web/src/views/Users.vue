@@ -463,20 +463,22 @@ const deleteUser = async (row: UserListItem) => {
 
 const handleToggleStatus = async (id: number, isEnabled: boolean) => {
   if (isReadOnly.value || switchingIds.value.has(id) || submittingUserId.value === id || operatingUserIds.value.has(id)) return
-  if (!isEnabled) {
-    // 禁用与删除同为破坏性操作，与 deleteUser/toggleRule 保持同款二次确认。
-    try {
-      await ElMessageBox.confirm('确定要禁用这个用户吗？禁用后该用户将无法登录。', '警告', { type: 'warning' })
-    } catch {
-      // 取消确认时回滚乐观开关——el-switch 已先行翻转 row.is_enabled，
-      // 不回滚则 UI 显示「已禁用」而服务端仍启用，直到下次 fetchUsers 才自愈。
-      const row = users.value.find(u => u.id === id)
-      if (row) row.is_enabled = !isEnabled
-      return
-    }
-  }
+  // 占位先于确认（同 TaskMonitor 范式）：确认框悬挂期也属「操作在途」，
+  // 没有门时连点会叠出第二个确认框并重复写状态。
   switchingIds.value.add(id)
   try {
+    if (!isEnabled) {
+      // 禁用与删除同为破坏性操作，与 deleteUser/toggleRule 保持同款二次确认。
+      try {
+        await ElMessageBox.confirm('确定要禁用这个用户吗？禁用后该用户将无法登录。', '警告', { type: 'warning' })
+      } catch {
+        // 取消确认时回滚乐观开关——el-switch 已先行翻转 row.is_enabled，
+        // 不回滚则 UI 显示「已禁用」而服务端仍启用，直到下次 fetchUsers 才自愈。
+        const row = users.value.find(u => u.id === id)
+        if (row) row.is_enabled = !isEnabled
+        return
+      }
+    }
     await request.put(`/users/${id}/status`, { is_enabled: isEnabled })
     mfaAwareSuccess(isEnabled ? '已启用用户' : '已禁用用户')
     fetchUsers()

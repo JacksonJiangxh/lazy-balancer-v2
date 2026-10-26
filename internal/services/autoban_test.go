@@ -1961,6 +1961,13 @@ func TestAutobanMerge_expiredEntryNotRebannedSameRound(t *testing.T) {
 // 调度关闭 = 用户显式停止 / 自愈预算用尽后的共同终态形状）。。
 func installFeedHealthTestEngine(t *testing.T) *taskengine.Engine {
 	t.Helper()
+	// 摄取健康位是包级全局（securityEventsIngestionHealth）：其他用例用
+	// securityEventsRecordPollResult 注入过失败后会留下 Observed && !Healthy，
+	// 而本组用例断言的是「调度是否停止」这一维。不先摆到确定的未观测基线，
+	// 断言就会被上一个用例的顺序决定（-shuffle 换排列即假红）。
+	prevHealth := SecurityEventsIngestionHealthSnapshot()
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	t.Cleanup(func() { SecurityEventsSetIngestionHealthForTest(prevHealth) })
 	te := taskengine.NewEngine(taskengine.Options{StartPaused: true})
 	t.Cleanup(te.Stop)
 	if err := te.Register(taskengine.Descriptor{

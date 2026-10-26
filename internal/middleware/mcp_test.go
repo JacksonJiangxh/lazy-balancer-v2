@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -463,5 +465,35 @@ func TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("lb_rules 行数=%d, want 0（从节点写入必须被拦截且不落库）", count)
+	}
+}
+
+// 自签回环豁免只属于 MCP 内部转发专用客户端：通用默认传输一旦被改成跳过
+// 校验，面板全部出站请求（集群同步、CA/DNS 调用）都会静默失去证书校验。
+// 每次装配返回独立 transport，避免调用方改 CheckRedirect 等字段互相污染。
+func TestLoopbackAPIClient_TLSExemptionIsScoped(t *testing.T) {
+	client := LoopbackAPIClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("LoopbackAPIClient().Transport=%T, want *http.Transport", client.Transport)
+	}
+	if transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("回环专用客户端必须显式豁免自签证书校验（面板 selfsigned 形态下 TLS 重放依赖它）")
+	}
+	if transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("回环 TLS MinVersion=%x, want TLS1.2", transport.TLSClientConfig.MinVersion)
+	}
+	if client.Timeout != 60*time.Second {
+		t.Fatalf("回环客户端 Timeout=%s, want 60s（长操作单次等待上限）", client.Timeout)
+	}
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.DefaultTransport=%T, want *http.Transport", http.DefaultTransport)
+	}
+	if defaultTransport.TLSClientConfig != nil && defaultTransport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("默认传输被改成跳过证书校验——豁免不得扩散到通用客户端")
+	}
+	if LoopbackAPIClient().Transport == client.Transport {
+		t.Fatal("每次装配必须返回独立 transport（客户端副本改字段不得污染共享实例）")
 	}
 }

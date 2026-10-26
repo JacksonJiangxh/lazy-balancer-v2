@@ -88,15 +88,15 @@
         <DialogHeader :icon="Document" :title="dialogTitle" tone="warning"
           subtitle="命中拦截规则时返回给客户端的响应页面，支持自定义内容类型" />
       </template>
-      <el-form :model="form" label-width="80px" label-position="right" class="block-page-form">
+      <el-form :model="form" label-width="80px" label-position="right" class="block-page-form" :disabled="saving">
         <el-form-item label="名称" required>
-          <el-input v-model="form.name" placeholder="页面名称" maxlength="100" show-word-limit :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" />
+          <el-input v-model="form.name" placeholder="页面名称" maxlength="100" show-word-limit :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin || saving" />
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="form.description" placeholder="页面描述" maxlength="500" show-word-limit :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" />
+          <el-input v-model="form.description" placeholder="页面描述" maxlength="500" show-word-limit :readonly="isReadOnly || currentPage?.is_default || currentPage?.is_builtin || saving" />
         </el-form-item>
         <el-form-item label="内容类型">
-          <el-select v-model="form.content_type" style="width: 320px" :disabled="isReadOnly || currentPage?.is_default || currentPage?.is_builtin">
+          <el-select v-model="form.content_type" style="width: 320px" :disabled="isReadOnly || currentPage?.is_default || currentPage?.is_builtin || saving">
             <el-option v-for="opt in CONTENT_TYPE_OPTIONS" :key="opt.value" :value="opt.value" :label="opt.label" />
           </el-select>
           <span class="form-tip-inline">拦截响应的 Content-Type（均 UTF-8 编码）</span>
@@ -104,7 +104,7 @@
         <el-form-item label="内容" class="content-form-item">
           <div class="block-content-editor" style="width: 100%">
             <SyntaxHighlight v-if="isReadOnly || currentPage?.is_default || currentPage?.is_builtin" :content="form.content" language="markup" height="520px" />
-            <CodeEditor v-else v-model="form.content" language="markup" height="520px" aria-label="拦截页面内容" placeholder="响应内容（HTML 类型支持内联 CSS）" />
+            <CodeEditor v-else v-model="form.content" language="markup" height="520px" aria-label="拦截页面内容" placeholder="响应内容（HTML 类型支持内联 CSS）" :readonly="saving" />
           </div>
           <div class="form-tip-line">
             {{ (currentPage?.is_default || currentPage?.is_builtin) ? '内置页面内容只读，仅可查看' : '拦截时返回给客户端的响应内容（HTML 类型支持内联 CSS）' }}

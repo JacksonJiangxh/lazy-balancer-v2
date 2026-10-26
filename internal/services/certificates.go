@@ -1412,12 +1412,12 @@ func (s *CertificateService) requeueWaitingCAJobs() (requeued, disabled int, err
 		ruleBound    bool
 	}
 	var jobs []waitingJob
-	scanFailures := 0
+	var scanErrors []error
 	for rows.Next() {
 		var job waitingJob
 		if err := rows.Scan(&job.id, &job.ruleID, &job.domain, &job.caProviderID, &job.ruleDomain, &job.ruleBound); err != nil {
 			Logf("error", "waiting_ca scan: scan row failed: %v", err)
-			scanFailures++
+			scanErrors = append(scanErrors, fmt.Errorf("读取 CA 冷却任务行: %w", err))
 			continue
 		}
 		jobs = append(jobs, job)
@@ -1432,6 +1432,17 @@ func (s *CertificateService) requeueWaitingCAJobs() (requeued, disabled int, err
 		Logf("error", "waiting_ca scan: close rows failed: %v", err)
 		return 0, 0, fmt.Errorf("关闭 CA 冷却任务结果集: %w", err)
 	}
+	// 读失败不得被记为成功轮：可读行照常处置（部分成果保留），失败行数与原因在
+	// 返回时并入错误——与 rescanDroppedDeploymentRetries 同口径（部分成功 +
+	// 错误上抛，而不是在两者之间二选一）。否则带外畸形行被静默跳过后，30s 补扫
+	// 仍报成功，任务监控看不到「本次扫描不完整」。
+	defer func() {
+		if len(scanErrors) == 0 {
+			return
+		}
+		Logf("warn", "waiting_ca scan: %d 行读取失败已跳过，其余行照常处置", len(scanErrors))
+		err = errors.Join(err, fmt.Errorf("CA 冷却任务扫描有 %d 行读取失败（结果不完整）: %w", len(scanErrors), errors.Join(scanErrors...)))
+	}()
 
 	for _, job := range jobs {
 		if !certJobRuleApplicable(job.ruleBound, job.ruleDomain, job.domain) {
@@ -1462,12 +1473,7 @@ func (s *CertificateService) requeueWaitingCAJobs() (requeued, disabled int, err
 		requeued++
 		RecordAuditLog("system", "重新排队", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("ca_cooldown")), "")
 	}
-	// 单行读取失败只跳过该行（下方 summary 留痕）：升级为整轮失败会让 30s
-	// 补扫任务记 failed 终态，而同一轮其余可处置行本应照常重排——下一轮补扫
-	// 会重试被跳过的行。可空整型列已在查询侧 COALESCE，NULL 不再触发本分支。
-	if scanFailures > 0 {
-		Logf("warn", "waiting_ca scan: %d 行读取失败已跳过，其余行照常处置", scanFailures)
-	}
+	// 单行读取失败的聚合见扫描阶段末尾的 defer（扫描失败不得记为成功轮）。
 	return requeued, disabled, err
 }
 

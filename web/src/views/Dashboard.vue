@@ -1086,6 +1086,10 @@ const fetchRuleHealth = async (currentRules: Rule[], version: number, roundSigna
 
 const controlCaddy = async (action: 'start' | 'stop' | 'restart') => {
   if (authStore.readOnlyReason !== null) return
+  // 占位先于确认（同 TaskMonitor/ClusterSettings 范式）：确认框悬挂期同样没有门，
+  // 双击或「重启→停止」连点会叠加两次写请求，最终服务状态取决于返回顺序。
+  if (caddyLoading.value) return
+  caddyLoading.value = true
   
   const actionText = { start: '启动', stop: '停止', restart: '重启' }[action]
   const actionDesc = {
@@ -1102,7 +1106,6 @@ const controlCaddy = async (action: 'start' | 'stop' | 'restart') => {
     })
     if (disposed) return
     
-    caddyLoading.value = true
     await request.post(`/caddy/${action}`, undefined, { signal: dashboardPolling.signal })
     if (disposed) return
     

@@ -162,7 +162,7 @@ func TestDeployLock_serializes_waiters_and_keeps_entry_until_final_release(t *te
 // 失效）。
 func TestRefCountedLockTable_reclaimsOnlyAfterLastHolder(t *testing.T) {
 	var table refCountedLockTable
-	first := table.get("lb_refcounted")
+	first := table.acquire("lb_refcounted")
 	first.Lock()
 	if _, exists := table.locks.Load("lb_refcounted"); !exists {
 		t.Fatal("在途持锁时条目必须存在")
@@ -170,7 +170,7 @@ func TestRefCountedLockTable_reclaimsOnlyAfterLastHolder(t *testing.T) {
 
 	secondAcquired := make(chan *refCountedLock, 1)
 	go func() {
-		second := table.get("lb_refcounted")
+		second := table.acquire("lb_refcounted")
 		second.Lock()
 		secondAcquired <- second
 	}()
@@ -198,6 +198,68 @@ func TestRefCountedLockTable_reclaimsOnlyAfterLastHolder(t *testing.T) {
 	}
 	second.Unlock()
 	if _, exists := table.locks.Load("lb_refcounted"); exists {
+		t.Fatal("最后一个持有者释放后条目未回收（键空间随历史规则无界增长）")
+	}
+}
+
+// 「查找/创建条目」与「引用登记」必须同属一个表级临界区：分开执行时，最后
+// 一个持有者可在两步之间把条目从表里删除，迟到的获取者于是抱着已成孤儿的旧锁
+// 加锁，而第三者已建出另一把新锁——同 key 同时被两把锁「保护」，per-rule
+// 互斥失效（证书/私钥可交错写，部署快照可覆盖已提交的部署）。
+func TestRefCountedLockTable_acquireNeverHandsOutStaleEntry(t *testing.T) {
+	var table refCountedLockTable
+	const key = "lb_stale_acquire"
+
+	// Given：第一持有者持锁，第二获取者在此之前完成「取条目」。
+	holder := table.acquire(key)
+	holder.Lock()
+	stale := table.acquire(key)
+	if stale != holder {
+		t.Fatal("acquire 返回了与表内条目不同的锁")
+	}
+
+	// When：第一持有者释放（旧实现此时 refs 归零 → 条目被回收），第三获取者
+	// 随后取锁。
+	holder.Unlock()
+	fresh := table.acquire(key)
+
+	// Then：已返回给调用方的条目不得被回收——第三获取者必须命中同一条目，
+	// 否则同 key 存在两把并存的锁。
+	if fresh != stale {
+		t.Fatal("获取与引用登记非原子：同 key 出现两把并存的锁（per-rule 互斥失效）")
+	}
+	table.mu.Lock()
+	_, exists := table.locks.Load(key)
+	refs := stale.refs
+	table.mu.Unlock()
+	if !exists {
+		t.Fatal("登记过引用的条目被回收")
+	}
+	if refs != 2 {
+		t.Fatalf("两次 acquire 后 refs=%d, want 2", refs)
+	}
+
+	// 且两把「同一把」锁必须真实互斥：一方持锁期间另一方不得进入临界区。
+	stale.Lock()
+	acquired := make(chan struct{})
+	go func() {
+		fresh.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("同 key 的两次获取同时进入临界区")
+	case <-time.After(100 * time.Millisecond):
+	}
+	stale.Unlock()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("互斥释放后等待者未取得锁")
+	}
+	fresh.Unlock()
+
+	if _, exists := table.locks.Load(key); exists {
 		t.Fatal("最后一个持有者释放后条目未回收（键空间随历史规则无界增长）")
 	}
 }

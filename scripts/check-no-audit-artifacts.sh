@@ -124,8 +124,19 @@ fi
 # 分叉。故此处单列一条反向断言——.gitignore 只负责「不被暂存」，本通道负责
 # 「已在索引里的也拦下」。
 # ---------------------------------------------------------------------------
-tracked_cache_re='(^|/)node_modules/|(^|/)\.(?:vite|vitest-cache)/'
-if tracked_cache="$(printf '%s\n' "$controlled" | grep -E "$tracked_cache_re" || true)"; [[ -n "$tracked_cache" ]]; then
+# 正则必须是 GNU/BSD 通用的 ERE：非捕获组 `(?:…)` 属 PCRE，GNU grep -E 会以
+# rc=2 报「repetition-operator operand invalid」。故 rc 必须与「无命中」区分开：
+# 只有 0（有命中）/1（无命中）是正常结果，>1 一律 fail-closed——用 `|| true`
+# 兜住会把正则错误吞成空结果，通道永远假绿且自检无法变红。
+tracked_cache_re='(^|/)node_modules/|(^|/)[.](vite|vitest-cache)/'
+tracked_cache_rc=0
+tracked_cache="$(printf '%s\n' "$controlled" | grep -E "$tracked_cache_re")" || tracked_cache_rc=$?
+if [[ $tracked_cache_rc -gt 1 ]]; then
+  echo "ERROR: 依赖/构建缓存通道的正则无法执行（grep rc=${tracked_cache_rc}）：${tracked_cache_re}" >&2
+  echo "门禁 fail-closed——正则错误不等于无命中，请改成通用 ERE。" >&2
+  exit 1
+fi
+if [[ -n "$tracked_cache" ]]; then
   echo "ERROR: 依赖/构建缓存目录不得入库（git rm -r --cached 撤销，并确认 .gitignore 覆盖）：" >&2
   echo "$tracked_cache" >&2
   exit 1

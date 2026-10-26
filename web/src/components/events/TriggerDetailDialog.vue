@@ -104,7 +104,7 @@
               : '当前 CRS 索引加载失败，无法展示规则详情' }}</span>
           </div>
           <template v-if="crsEntry">
-            <div class="crs-snippet-toggle" role="button" tabindex="0" :aria-expanded="crsSnippetExpanded" aria-label="展开或收起规则源码" @click="toggleCrsSnippet" @keydown.enter.prevent="toggleCrsSnippet" @keydown.space.prevent="toggleCrsSnippet">
+            <div class="crs-snippet-toggle" role="button" tabindex="0" :aria-expanded="crsSnippetExpanded" aria-label="展开或收起规则源码" @click="toggleCrsSnippet" @keydown.enter.prevent="activateOnce($event, toggleCrsSnippet)" @keydown.space.prevent="activateOnce($event, toggleCrsSnippet)">
               <el-icon class="crs-snippet-toggle-icon" :class="{ 'is-expanded': crsSnippetExpanded }"><ArrowRight /></el-icon>
               <span>{{ crsSnippetExpanded ? '收起规则源码' : '展开规则源码' }}</span>
               <span class="crs-snippet-toggle-file">{{ crsEntry.file }} · id:{{ row?.rule_triggered }} 所在行 ±10 行</span>
@@ -164,6 +164,7 @@ import { formatDate } from '@/utils/date'
 import { eventActionFull, eventActionTone } from '@/utils/eventAction'
 import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, missingSharedEntryIds, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet, wafModeLabel } from '@/utils/securityStages'
 import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
+import { activateOnce } from '@/utils/keyboardActivate'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
 

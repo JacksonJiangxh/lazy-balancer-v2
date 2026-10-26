@@ -11,6 +11,7 @@
 package retryafter
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -25,6 +26,14 @@ func Parse(header string, now time.Time) time.Duration {
 	if seconds, err := strconv.Atoi(header); err == nil {
 		if seconds <= 0 {
 			return 0
+		}
+		// 乘法前钳制：time.Duration 是 int64 纳秒，超出安全秒数的值会让
+		// `seconds * time.Second` 绕回——18446744074 得到约 290ms、
+		// 9223372037 得到负值，消费方（CA 冷却 3h 上限、DNS MaxBackoff）收到的
+		// 退避会比上游要求的短几个数量级，异常限流下的重试反而更频繁。超界饱和
+		// 为最大时长，由消费方既有的上限继续收敛。
+		if int64(seconds) > math.MaxInt64/int64(time.Second) {
+			return time.Duration(math.MaxInt64)
 		}
 		return time.Duration(seconds) * time.Second
 	}

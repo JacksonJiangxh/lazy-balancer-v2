@@ -691,7 +691,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	// API routes
 	v1 := r.Group("/api/v1")
 	{
-		mcpHandler := mcpserver.NewWithInternalAuth(fmt.Sprintf("http://127.0.0.1:%d/api/v1", cfg.Port), loopbackAPIClient(), internalMCPAuthSecret)
+		mcpHandler := mcpserver.NewWithInternalAuth(fmt.Sprintf("http://127.0.0.1:%d/api/v1", cfg.Port), LoopbackAPIClient(), internalMCPAuthSecret)
 		v1.POST("/mcp", apiKeyAuth(db.DB), mcpAccessGuard(), func(c *gin.Context) {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 			body, err := io.ReadAll(c.Request.Body)

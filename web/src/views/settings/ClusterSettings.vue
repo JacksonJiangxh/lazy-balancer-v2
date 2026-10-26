@@ -126,10 +126,12 @@
           :class="{ 'is-active': serviceControlAction === item.value, [`is-${item.tone}`]: true }"
           role="radio"
           :aria-checked="serviceControlAction === item.value"
-          tabindex="0"
-          @click="serviceControlAction = item.value"
-          @keydown.enter.prevent="serviceControlAction = item.value"
-          @keydown.space.prevent="serviceControlAction = item.value"
+          :tabindex="serviceControlTabindex(item.value)"
+          :ref="(el: unknown) => setServiceCardRef(item.value, el)"
+          @click="selectServiceAction(item.value)"
+          @keydown="onServiceCardKeydown($event)"
+          @keydown.enter.prevent="activateOnce($event, () => selectServiceAction(item.value))"
+          @keydown.space.prevent="activateOnce($event, () => selectServiceAction(item.value))"
         >
           <div class="service-control-card-icon">
             <el-icon :size="22"><component :is="item.icon" /></el-icon>
@@ -202,6 +204,8 @@ import ClusterSlavePanel from './cluster/ClusterSlavePanel.vue'
 import ClusterStatusCard from './cluster/ClusterStatusCard.vue'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
+import { activateOnce } from '@/utils/keyboardActivate'
+import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
 
 interface ActionResponse {
   readonly code: number
@@ -267,6 +271,29 @@ const serviceControlOptions = [
 const serviceControlWarnings: Record<string, string> = {
   stop_caddy: '停止后该节点的负载均衡服务将不可用，请及时启动',
   restart_app: '重启应用将短暂中断该节点的全部服务（约数秒）',
+}
+
+// 服务控制卡片是自定义单选组（role=radiogroup + role=radio）：整组只有一个
+// tab stop（roving tabindex），方向键移动并切换——原生 radio 组/APG 语义，
+// 不再要求四张卡片逐个 Tab 且方向键无效。
+const serviceCardRefs = new Map<string, HTMLElement>()
+const setServiceCardRef = (value: string, el: unknown): void => {
+  if (el instanceof HTMLElement) serviceCardRefs.set(value, el)
+  else serviceCardRefs.delete(value)
+}
+const serviceControlTabindex = (value: string): number =>
+  rovingTabindex(serviceControlOptions.map((item) => item.value), serviceControlAction.value, () => false, value)
+const selectServiceAction = (value: string): void => {
+  if (serviceControlLoading.value) return // 指令在途时冻结选择，避免与已下发动作错位
+  serviceControlAction.value = value
+}
+const onServiceCardKeydown = (event: KeyboardEvent): void => {
+  if (event.repeat) return
+  const next = nextRadioValue(serviceControlOptions.map((item) => item.value), serviceControlAction.value, () => false, event.key)
+  if (next === null) return
+  event.preventDefault()
+  selectServiceAction(next)
+  serviceCardRefs.get(next)?.focus()
 }
 
 const openServiceControlDialog = (node: ClusterNode): void => {

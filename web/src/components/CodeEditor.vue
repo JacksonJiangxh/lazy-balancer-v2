@@ -6,6 +6,7 @@
       :value="modelValue"
       :placeholder="placeholder"
       :aria-label="ariaLabel || undefined"
+      :readonly="readonly || undefined"
       spellcheck="false"
       @input="onInput"
       @scroll="onScroll"
@@ -26,7 +27,9 @@ const props = withDefaults(defineProps<{
   /** 可访问名：placeholder 不是合法替代（读屏不读占位符为名称），
    *  每个消费方必须提供业务语义名。 */
   readonly ariaLabel?: string
-}>(), { placeholder: '', height: '520px', ariaLabel: '' })
+  /** 只读：请求在途等场景冻结内容编辑（textarea 只读，不再产生 update 事件）。 */
+  readonly readonly?: boolean
+}>(), { placeholder: '', height: '520px', ariaLabel: '', readonly: false })
 
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 

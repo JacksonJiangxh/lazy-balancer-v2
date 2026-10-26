@@ -11,7 +11,8 @@
 #     连写形态、审计产物文件名（含 audit_96/audit-round-96/round-96 等分隔符
 #     型轮次命名）、.gitignore 双向校验（含重复模式行）、轮次引用的
 #     各书写形态（裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、
-#     跨行拆字含续行注释前缀）；
+#     跨行拆字含续行注释前缀）、依赖/构建缓存通道（node_modules 内外两种缓存
+#     目录、正则在各 grep 实现下可执行、非法正则必须 fail-closed）；
 #   • 误报面：npm 生成物（package-lock.json 内容面豁免）、百分位、版本串、
 #     十六进制摘要/哈希算法名、协议与产品 token、
 #     容量边界常量、合法测试函数名、中文“轮播/轮询”、循环轮次表述（心跳/共识/
@@ -112,6 +113,117 @@ reset_fixture
 mkdir_in node_modules/.vitest-cache/_metadata.json
 printf '{"failed":true}\n' >"$tmp_root/node_modules/.vitest-cache/_metadata.json"
 assert_good "untracked node_modules cache is ignored"
+
+# 0c) 缓存目录本身（不在 node_modules 下）同样不得入库——通道正则的第二分支
+#     （.vite/.vitest-cache）必须独立生效，只测 node_modules 形态会漏掉整支。
+reset_fixture
+mkdir_in web/.vitest-cache/_metadata.json
+printf '{"failed":true}\n' >"$tmp_root/web/.vitest-cache/_metadata.json"
+git -C "$tmp_root" add -f web/.vitest-cache
+assert_bad "tracked .vitest-cache outside node_modules" "不得入库"
+
+# 0c2) `.vite/` 分支必须单独可见：0) 的 .vite 样例带 node_modules 前缀，只靠第一
+#      分支就能命中，第二分支里的 .vite 项整支失效也看不出来。故造一条完全不含
+#      node_modules 的仓根 .vite 缓存。
+reset_fixture
+mkdir_in .vite/vitest/CACHEDIR.TAG
+: >"$tmp_root/.vite/vitest/CACHEDIR.TAG"
+git -C "$tmp_root" add -f .vite
+assert_bad "tracked .vite outside node_modules" "不得入库"
+
+# 0d) 缓存通道的正则形态必须在每一种 grep 实现下都可执行：命中样例返回 0、
+#     未命中样例返回 1，绝不出现 2（正则错误）。PCRE 的 (?:…) 在 GNU grep -E
+#     下会被当成无关字符吞掉，其中的 `.vite/` 分支静默失效（macOS 基线只有
+#     BSD grep，看不到这个形态），任何实现报错时配合 `|| true` 又会被当成
+#     「无命中」，通道永远假绿。故此处先拒 PCRE 形态，再逐个实现实跑命中/未
+#     命中样例，最后用 awk 的 POSIX ERE 引擎做严格模拟（它对非 ERE 语法直接
+#     报 illegal primary 并 rc=2，正好复现「整支失效」）。
+cache_re="$(sed -n "s/^tracked_cache_re='\(.*\)'$/\1/p" "$guard")"
+if [[ -z "$cache_re" ]]; then
+  echo "FAIL [cache regex form] 无法从守卫源码取出 tracked_cache_re" >&2
+  fail=$((fail + 1))
+elif [[ "$cache_re" == *'(?:'* ]]; then
+  echo "FAIL [cache regex form] 正则是 PCRE 形态（含 (?:…)，GNU grep -E 会静默丢分支）：$cache_re" >&2
+  fail=$((fail + 1))
+else
+  # 三个命中样例各自锚定一条分支：第一分支（node_modules）、第二分支的
+  # .vitest-cache 项、第二分支的 .vite 项（不带 node_modules 前缀，只有整支
+  # 有效才可能命中）。少任何一个，对应分支失效都看不出来。
+  cache_hit_samples=(
+    'node_modules/.vite/vitest/CACHEDIR.TAG'
+    'web/.vitest-cache/_metadata.json'
+    '.vite/vitest/CACHEDIR.TAG'
+  )
+  cache_miss_sample='internal/handlers/rules.go'
+  cache_impls=()
+  for cand in "$(type -P grep || true)" /usr/bin/grep /bin/grep \
+              "$(command -v ggrep || true)" /opt/homebrew/bin/ggrep /usr/local/bin/ggrep \
+              /opt/homebrew/bin/grep /usr/local/bin/grep; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    # 同一个二进制经多条候选路径命中时只测一次，计数才反映真实实现数。
+    dup=0
+    for seen in ${cache_impls[@]+"${cache_impls[@]}"}; do
+      if [[ "$seen" == "$cand" ]]; then
+        dup=1
+        break
+      fi
+    done
+    if [[ $dup -eq 1 ]]; then
+      continue
+    fi
+    cache_impls+=("$cand")
+  done
+  cache_form_bad=0
+  for impl in "${cache_impls[@]}"; do
+    for sample in "${cache_hit_samples[@]}"; do
+      set +e
+      printf '%s\n' "$sample" | "$impl" -E "$cache_re" >/dev/null 2>&1
+      rc_hit=$?
+      set -e
+      if [[ ${rc_hit} -ne 0 ]]; then
+        echo "FAIL [cache regex form] $impl 未命中应命中样例（rc=${rc_hit}，期望 0）：$sample" >&2
+        cache_form_bad=1
+      fi
+    done
+    set +e
+    printf '%s\n' "$cache_miss_sample" | "$impl" -E "$cache_re" >/dev/null 2>&1
+    rc_miss=$?
+    set -e
+    if [[ ${rc_miss} -ne 1 ]]; then
+      echo "FAIL [cache regex form] $impl 未命中样例返回 rc=${rc_miss}（期望 1，2 表示正则错误）：$cache_re" >&2
+      cache_form_bad=1
+    fi
+  done
+  # POSIX ERE 严格模拟：走 awk 的 ERE 引擎而不是独立实现，绕开「同一实现自证
+  # 自身」的自洽陷阱。ENVIRON 传值避免 -v 的反斜杠转义改写正则。
+  for sample in "${cache_hit_samples[@]}"; do
+    if ! printf '%s\n' "$sample" | CACHE_RE="$cache_re" awk \
+        'BEGIN { re = ENVIRON["CACHE_RE"] } $0 ~ re { hit = 1 } END { exit(hit ? 0 : 1) }' >/dev/null 2>&1; then
+      echo "FAIL [cache regex form] POSIX ERE 严格模拟（awk）未命中应命中样例：$sample" >&2
+      cache_form_bad=1
+    fi
+  done
+  if ! printf '%s\n' "$cache_miss_sample" | CACHE_RE="$cache_re" awk \
+      'BEGIN { re = ENVIRON["CACHE_RE"] } $0 ~ re { hit = 1 } END { exit(hit ? 1 : 0) }' >/dev/null 2>&1; then
+    echo "FAIL [cache regex form] POSIX ERE 严格模拟（awk）命中未命中样例或无法执行：$cache_re" >&2
+    cache_form_bad=1
+  fi
+  if [[ $cache_form_bad -eq 0 ]]; then
+    echo "ok   [cache regex form] ${#cache_impls[@]} 种 grep 实现 + POSIX ERE 严格模拟下分支齐全：$cache_re"
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+  fi
+fi
+
+# 0e) 正则不可执行时必须硬失败——把夹具副本换成任何 grep 都拒绝的形态（括号
+#     不配对），守卫必须红且把原因说成 fail-closed；吞错实现会在此给假绿。
+reset_fixture
+bad_cache_line="tracked_cache_re='(^|/)node_modules/|('"
+awk -v line="$bad_cache_line" '/^tracked_cache_re=/ { print line; next } { print }' \
+  "$tmp_root/scripts/check-no-audit-artifacts.sh" >"$tmp_root/scripts/guard.tmp"
+mv "$tmp_root/scripts/guard.tmp" "$tmp_root/scripts/check-no-audit-artifacts.sh"
+assert_bad "invalid cache regex fails closed" "fail-closed"
 
 # 1) 未跟踪文件同样入扫描面（不 git add，直接写）
 reset_fixture

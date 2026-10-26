@@ -33,8 +33,8 @@
             :tabindex="autobanWritable ? 0 : -1"
             :aria-disabled="!autobanWritable"
             @click="openAutobanConfig"
-            @keydown.enter.prevent="openAutobanConfig"
-            @keydown.space.prevent="openAutobanConfig"
+            @keydown.enter.prevent="activateOnce($event, openAutobanConfig)"
+            @keydown.space.prevent="activateOnce($event, openAutobanConfig)"
           >
             <div class="autoban-title">
               <el-icon class="title-icon"><Lock /></el-icon>
@@ -274,14 +274,14 @@
     <TriggerDetailDialog v-model="triggerDetailVisible" :row="triggerDetailRow" />
 
     <!-- 自动封禁配置弹框：六项配置+口径/窗口变更重置提示-->
-    <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
+    <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset" :close-on-click-modal="false" :close-on-press-escape="!autobanSaving" :show-close="!autobanSaving">
       <template #header>
         <!-- 喂入门只排除「已验证爬虫豁免」事件，ACL/GeoIP/威胁情报事件
              同样计数——文案不得自缩为「WAF 事件」，否则用户按「只有 WAF 命中才
              计数」校准阈值会过早封禁 -->
         <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="安全事件（IP 访问控制/地域/WAF/威胁情报，已验证爬虫豁免除外）固定窗口计数达到阈值即写入「自动封禁名单」（调度开启时到期自动解封）" />
       </template>
-      <el-form :model="autobanForm" label-width="96px" label-position="right">
+      <el-form :model="autobanForm" label-width="96px" label-position="right" :disabled="autobanSaving">
         <el-form-item label="观察模式">
           <el-switch v-model="autobanForm.dry_run" />
           <div class="form-tip-line">开启时仅记录达阈值建议、不写入名单（推荐先观察校准阈值）</div>
@@ -308,7 +308,7 @@
       </el-form>
       <div class="info-note-bar"><span class="info-note-desc">修改统计窗口或口径会立即重置计数器（旧计数与新口径不可混算）</span></div>
       <template #footer>
-        <el-button @click="autobanDialogVisible = false">取消</el-button>
+        <el-button :disabled="autobanSaving" @click="autobanDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="autobanSaving" :disabled="!autobanWritable" @click="saveAutobanConfig">保存</el-button>
       </template>
     </el-dialog>
@@ -410,6 +410,7 @@ import { TRIGGERED_CATEGORIES, serializeTriggeredFilter, CRAWLER_FAMILY_LABEL } 
 import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
 import { isAutobanIneffective, suggestionBand, type SuggestionBand } from '@/utils/autobanStatus'
+import { activateOnce } from '@/utils/keyboardActivate'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
 import { eventActionFull, eventActionShort, eventActionTone } from '@/utils/eventAction'

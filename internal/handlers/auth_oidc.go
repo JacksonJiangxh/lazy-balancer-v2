@@ -943,6 +943,18 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
+// oidcDisplayName 派生 OIDC 用户的显示名，重复登录刷新与 JIT 首登共用。
+// 统一「trim → rune 截断（列宽 50 的单位是字符不是字节）→ 空值回退
+// fallback」：IdP 是显示名的唯一来源（UI 明示「由认证服务管理」），claims
+// 里的纯空白不得落库；IdP 侧删除显示名后回退本地用户名，避免既有用户长期
+// 停留在首次开户的陈旧快照上。
+func oidcDisplayName(claimName, fallback string) string {
+	if name := truncateRunes(strings.TrimSpace(claimName), 50); name != "" {
+		return name
+	}
+	return truncateRunes(strings.TrimSpace(fallback), 50)
+}
+
 // oidcIdentity 是 (issuer,subject) 命中的 OIDC 身份行。
 type oidcIdentity struct {
 	id              int
@@ -1257,10 +1269,9 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		// 链接，本轮保留本地值（报告裁定：单独策略）。
 		// 刷新失败不阻断登录（与 touchLastLogin 同口径）：显示名是派生展示
 		// 属性、非授权前提，瞬时写失败（WAL 长占/锁）不应把用户挡在认证之外，
-		// 下次登录自愈。
-		if name := truncateRunes(strings.TrimSpace(claims.Name), 50); name != "" {
-			refreshOIDCDisplayName(ident.id, ident.username, name)
-		}
+		// 下次登录自愈。写侧 SQL 自带「值有变才写」判据，claims 空白回退
+		// 用户名同样只在值确实变化时落库。
+		refreshOIDCDisplayName(ident.id, ident.username, oidcDisplayName(claims.Name, ident.username))
 	case errors.Is(err, sql.ErrNoRows):
 		// JIT 开户:默认普通角色;用户名取 preferred_username→email 本地部分→sub,
 		// 冲突时后缀去重(不绑定本地账号,同名共存)。TrimSpace 先于空值兜底
@@ -1279,10 +1290,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		// 截断按 rune 计数——byte 截断会把中文/emoji 切成无效 UTF-8
 		// 落库(前端展示乱码);列宽 VARCHAR(50) 的语义单位是字符不是字节。
 		base = truncateRunes(base, 50)
-		displayName := truncateRunes(claims.Name, 50)
-		if displayName == "" {
-			displayName = base
-		}
+		displayName := oidcDisplayName(claims.Name, base)
 		// 不同 subject 同名并发首登仍会撞 username 唯一约束——
 		// 唯一冲突后重算候选名有限重试（含 同 subject 并发回退）。
 		var created bool

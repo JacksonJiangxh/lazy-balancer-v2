@@ -627,20 +627,21 @@ const toggleKey = async (key: APIKey) => {
   if (nodeWriteBlocked.value || togglePendingId.value !== null || deletingIds.value.has(key.id)) return
   const isEnabled = !key.is_enabled
 
-  if (!isEnabled) {
-    try {
-      await ElMessageBox.confirm(`确定要禁用 API 密钥“${key.name}”吗？禁用后该密钥将无法访问接口。`, '禁用确认', {
-        type: 'warning',
-        confirmButtonText: '确认禁用',
-        cancelButtonText: '取消',
-      })
-    } catch {
-      return
-    }
-  }
-
+  // 占位先于确认（同 TaskMonitor/ClusterSettings 范式）：确认框悬挂期也是「操作在途」，
+  // 此时没有门，连点会叠出第二个确认框并重复写。
   togglePendingId.value = key.id
   try {
+    if (!isEnabled) {
+      try {
+        await ElMessageBox.confirm(`确定要禁用 API 密钥“${key.name}”吗？禁用后该密钥将无法访问接口。`, '禁用确认', {
+          type: 'warning',
+          confirmButtonText: '确认禁用',
+          cancelButtonText: '取消',
+        })
+      } catch {
+        return
+      }
+    }
     const payload: UpdateAPIKeyInput = { is_enabled: isEnabled }
     await request.patch(`/users/me/api-keys/${key.id}`, payload)
     mfaAwareSuccess(isEnabled ? '密钥已启用' : '密钥已禁用')

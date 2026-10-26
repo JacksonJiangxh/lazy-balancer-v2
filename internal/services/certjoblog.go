@@ -112,7 +112,7 @@ type CertJobFileLogger struct {
 var certJobLogWriteLocks refCountedLockTable // file component -> entry
 
 func lockCertJobLog(ruleID string) *refCountedLock {
-	return certJobLogWriteLocks.get(certJobLogFileComponent(ruleID))
+	return certJobLogWriteLocks.acquire(certJobLogFileComponent(ruleID))
 }
 
 // NewCertJobFileLogger creates a logger bound to a specific rule.

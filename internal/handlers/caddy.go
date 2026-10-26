@@ -1798,20 +1798,20 @@ func normalizeAccessLogRedaction(format string) string {
 // 渲染（同一 encoder map 在每个启用日志的 rule logger 下重复序列化）、/load
 // 载荷、LKG/集群快照与变更计划——上限族（规则 name/description、受信网段总量、
 // IP 名单条数）对该字段逐条成立，唯独它此前无规模门。按 bytes + 物理行数计
-// （DSL 以行分隔，行数与字节数决定放大倍数），口径为落库值（写侧归一后恒含
-// 一行 X-API-Key 脱敏规则）。
+// （DSL 以行分隔，行数与字节数决定放大倍数），口径为落库值：非空白 DSL 写侧
+// 归一后恒含一行 X-API-Key 脱敏规则（故门在归一时前后各过一次）；空白串原样
+// 落库，同按原始长度计数。
 const (
 	maxAccessLogFormatBytes = 16 * 1024
 	maxAccessLogFormatLines = 200
 )
 
 // validateAccessLogFormatSize 是 access_log_format 规模门的单一事实源
-// （保存/预览共用 validateUpdateConfigRequest）。空白格式=不裁剪原生字段，
-// 不计规模。超限 400 点名（fail-visible，不做静默截断）。
+// （保存/预览/备份导入共用）。空白格式=「不裁剪原生字段」的语义，但空白串
+// 仍是可落库自由串（DB、GET /config、备份、集群快照都会带上原值），故同样
+// 受字节/行数上限约束——规模检查先于任何空白短路，否则纯空格超限串可绕过
+// 上限落库。超限 400 点名（fail-visible，不做静默截断）。
 func validateAccessLogFormatSize(format string) error {
-	if strings.TrimSpace(format) == "" {
-		return nil
-	}
 	if n := len(format); n > maxAccessLogFormatBytes {
 		return fmt.Errorf("访问日志格式过长（最多 %d 字节，当前 %d 字节）", maxAccessLogFormatBytes, n)
 	}

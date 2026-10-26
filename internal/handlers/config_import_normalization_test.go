@@ -7,8 +7,78 @@ package handlers
 
 import (
 	"context"
+	"net/http"
+	"strings"
 	"testing"
+
+	"lazy-balancer-v2/internal/db"
 )
+
+// upstream_keepalive_timeout 归一的双通道可见性：预览输出同一条说明、导入
+// 成功审计同样留痕（此前归一在运行期设置门内静默发生，预览「可导入无提示」、
+// 审计只记来源与计数）；合法值两处都不得出现说明。
+func TestImportConfigBackup_keepaliveClampPreviewAndAuditChannels(t *testing.T) {
+	t.Run("负值归一说明双通道可见", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"upstream_keepalive_timeout": -5})
+
+		preview := postImportShared(t, h.ValidateConfigImport, "/config/import/validate", backup)
+		if preview.Code != http.StatusOK {
+			t.Fatalf("validate status=%d body=%s", preview.Code, preview.Body.String())
+		}
+		if body := preview.Body.String(); !strings.Contains(body, `"valid":true`) || !strings.Contains(body, "upstream_keepalive_timeout") {
+			t.Fatalf("预览必须可导入且给出归一说明: body=%s", body)
+		}
+
+		imported := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
+		if imported.Code != http.StatusOK {
+			t.Fatalf("import status=%d body=%s", imported.Code, imported.Body.String())
+		}
+		var stored int
+		if err := db.DB.QueryRow("SELECT upstream_keepalive_timeout FROM global_config WHERE id=1").Scan(&stored); err != nil {
+			t.Fatalf("read keepalive: %v", err)
+		}
+		if stored != 0 {
+			t.Fatalf("keepalive=%d, want 0（负值归零落库）", stored)
+		}
+		var detail string
+		if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='导入' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+			t.Fatalf("read import audit: %v", err)
+		}
+		if !strings.Contains(detail, "upstream_keepalive_timeout") {
+			t.Fatalf("导入审计缺归一留痕: %q", detail)
+		}
+	})
+
+	t.Run("合法值不产生说明", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"upstream_keepalive_timeout": 60})
+
+		preview := postImportShared(t, h.ValidateConfigImport, "/config/import/validate", backup)
+		if body := preview.Body.String(); !strings.Contains(body, `"valid":true`) || strings.Contains(body, "upstream_keepalive_timeout") {
+			t.Fatalf("合法值不得出现归一说明: body=%s", body)
+		}
+		if imported := postImportShared(t, h.ImportConfigBackup, "/config/import", backup); imported.Code != http.StatusOK {
+			t.Fatalf("import status=%d body=%s", imported.Code, imported.Body.String())
+		}
+		var stored int
+		if err := db.DB.QueryRow("SELECT upstream_keepalive_timeout FROM global_config WHERE id=1").Scan(&stored); err != nil {
+			t.Fatalf("read keepalive: %v", err)
+		}
+		if stored != 60 {
+			t.Fatalf("keepalive=%d, want 60", stored)
+		}
+		var detail string
+		if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='导入' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+			t.Fatalf("read import audit: %v", err)
+		}
+		if strings.Contains(detail, "upstream_keepalive_timeout") {
+			t.Fatalf("合法值导入审计不得出现归一留痕: %q", detail)
+		}
+	})
+}
 
 // 越界/非法形态的全局配置键在链内归一并产生带值回显的说明；预览与导入
 // 消费同一结果（前者 warnings，后者审计），因此本用例只钉链内唯一归一点。

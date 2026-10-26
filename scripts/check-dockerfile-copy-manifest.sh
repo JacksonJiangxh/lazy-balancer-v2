@@ -10,7 +10,10 @@
 # 断言：
 #   1) 存在 backend 阶段且块内至少一条 COPY（解析退化不许以空清单通过）；
 #   2) go.mod / go.sum 在清单内（go build 必需；复制目录只带内容，模块文件必须显式）；
-#   3) git 跟踪的全部顶层 Go 目录在清单内（新增顶层目录必须同步清单）。
+#   3) 顶层 Go 目录在清单内（新增顶层目录必须同步清单）。目录派生用
+#      `git ls-files --cached --others --exclude-standard`——受控 + 未跟踪同扫，
+#      与同仓 shell/gofmt 门同口径：新目录还没 git add 时就能红，而不是等到
+#      提交后才红、真正漏 COPY 只在镜像构建期报缺包。
 #
 # 用法：bash scripts/check-dockerfile-copy-manifest.sh [--self-test] [Dockerfile]
 set -euo pipefail
@@ -111,7 +114,7 @@ for required in go.mod go.sum; do
   }
 done
 
-top_go_dirs="$(git ls-files '*.go' | awk -F/ 'NF>1{print $1}' | LC_ALL=C sort -u)"
+top_go_dirs="$(git ls-files --cached --others --exclude-standard '*.go' | awk -F/ 'NF>1{print $1}' | LC_ALL=C sort -u)"
 missing_dirs=""
 while IFS= read -r dir; do
   [[ -z "$dir" ]] && continue

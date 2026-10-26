@@ -2351,7 +2351,9 @@ func backupUniqueNumericKey(value string) (string, bool) {
 // backupUniqueKeyValue 生成唯一性比对键：任一列 NULL/缺列即返回 false
 // （SQLite 唯一索引对含 NULL 的行不作约束）；未知形态交给类型门，不猜。
 // 整数形字符串与整数/整数值浮点统一编入数值域（"5" 与 5 在库中同值）；
-// 布尔独立域（JSON true/false 与整数 1/0 的语义不同，交给类型门判断）。
+// 布尔同样编入数值域（true/false 落库为 INTEGER 1/0——normalizeBackupBooleanValue
+// 与 SQLite 亲和性都归一到该形态；分成独立 "b:" 域会把 true 与 1 判成不重复，
+// 键冲突漏到事务内以 UNIQUE 约束 500 回滚，而预检的声明目标正是 400）。
 func backupUniqueKeyValue(row map[string]any, columns []string) (string, bool) {
 	parts := make([]string, len(columns))
 	for index, column := range columns {
@@ -2368,9 +2370,9 @@ func backupUniqueKeyValue(row map[string]any, columns []string) (string, bool) {
 			parts[index] = "s:" + typed
 		case bool:
 			if typed {
-				parts[index] = "b:1"
+				parts[index] = "n:1"
 			} else {
-				parts[index] = "b:0"
+				parts[index] = "n:0"
 			}
 		case float64:
 			if typed == math.Trunc(typed) && typed >= math.MinInt64 && typed <= math.MaxInt64 {
@@ -3962,27 +3964,31 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 	// access_log_format 导入侧此前零校验——手造
 	// 备份可落库「删除 request>remote_ip/uri/headers」的格式，日志统计与 UA
 	// 统计静默失效（保存侧 caddy.go UpdateConfig 有 validateAccessLogFormat
-	// 门）。与保存侧同门：校验 + 归一强制携带 X-API-Key 脱敏行（渲染层另有
-	// 恒等不变量兜底，导入落库值即所见）。
+	// 门）。与保存侧同门同序：规模门 → 语义门 → 归一强制携带 X-API-Key 脱敏行
+	// → 落库值再过一次规模门（归一可能多出脱敏行；渲染层另有恒等不变量兜底，
+	// 导入落库值即所见）。
 	if raw, exists := config["access_log_format"]; exists && raw != nil {
 		format, ok := raw.(string)
 		if !ok {
 			return fmt.Errorf("备份的 access_log_format 必须为字符串")
 		}
+		if err := validateAccessLogFormatSize(format); err != nil {
+			return fmt.Errorf("备份的 access_log_format 无效: %w", err)
+		}
 		if err := validateAccessLogFormat(format); err != nil {
 			return fmt.Errorf("备份的 access_log_format 无效: %w", err)
 		}
-		config["access_log_format"] = normalizeAccessLogRedaction(format)
-	}
-	// 上游 keepalive 导入侧缺非负门——写侧（caddy.go
-	// UpdateConfig / rules.go 创建更新）明确拒绝负值，负值落库后基础设置保存
-	// 恒 400、规则行编辑被同门卡死（同 TestImportConfigBackup_clamps_* 记录的
-	// 锁死族）。导入侧按写侧口径归零并留痕（钳制而非整包拒绝，保持导入可用）。
-	if raw, exists := config["upstream_keepalive_timeout"]; exists && raw != nil {
-		if value, ok := backupInteger(raw); !ok || value < 0 {
-			config["upstream_keepalive_timeout"] = int64(0)
+		normalized := normalizeAccessLogRedaction(format)
+		if err := validateAccessLogFormatSize(normalized); err != nil {
+			return fmt.Errorf("备份的 access_log_format 无效: %w（导入时会自动补一行脱敏规则，落库值按此计数）", err)
 		}
+		config["access_log_format"] = normalized
 	}
+	// 上游 keepalive 为「0=继承」省略型列（写侧 caddy.go UpdateConfig /
+	// rules.go 创建更新明确拒绝负值——负值落库后基础设置保存恒 400、规则行
+	// 编辑被同门卡死）。负值/非整数归 0 的钳制与留痕由全局配置数值归一
+	// （backupConfigClampRules 的 upstream_keepalive_timeout 行）单点负责，
+	// 预览 warning 与导入成功审计同源；本门不再二次静默改写。
 	// 全局配置区其余写侧门也必须前移到导入——
 	// github_proxy_url 写侧白名单（services.ValidateGitHubProxyURL），
 	// oidc_config 写侧「损坏即拒绝改写」（auth_oidc.go loadOIDCConfig）。
@@ -4914,6 +4920,11 @@ var backupConfigClampRules = []backupConfigClampRule{
 	{Key: "http_read_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPReadTimeout, ResetOnLow: true},
 	{Key: "http_write_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPWriteTimeout, ResetOnLow: true},
 	{Key: "http_idle_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPIdleTimeout, ResetOnLow: true},
+	// upstream_keepalive_timeout 同为「0=继承」省略型列（写侧拒绝负值、无上界）：
+	// 负值按越界钳到 0、非整数按非法形态归 0，两条说明与其余键同源进
+	// ConfigClampNotes（预览 warning 与导入成功审计双通道）。此前该键在运行期
+	// 设置门内静默归零——预览「可导入无提示」而落库值已变。
+	{Key: "upstream_keepalive_timeout", Lo: 0, Hi: 0, Def: 0},
 }
 
 // clampBackupConfigInts 按 backupConfigClampRules 就地钳制全局配置区，返回

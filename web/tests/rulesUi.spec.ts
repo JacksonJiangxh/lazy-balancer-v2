@@ -58,33 +58,39 @@ test('健康检查超时只属于主动探测（HTTP/TCP 均隐藏在被动模�
 })
 
 test('被动健康检查预览不再宣称超时语义', () => {
+  // 预览健康检查行改由 utils/healthCheckSummary 单源生成（阈值与预览同处可见）
   const wizardPreview = sectionFrom(
     /<el-descriptions-item[^>]*label="健康检查"[^>]*>/,
     '<el-descriptions-item label="连接重试"',
     '向导预览健康检查描述项',
   )
-  const passiveLines = wizardPreview.match(/被动检查 \([^\n]*/g) ?? []
-  assert.ok(passiveLines.length >= 2, 'missing passive preview lines')
-  for (const line of passiveLines) {
-    assert.doesNotMatch(line, /超时/, `passive preview must not claim timeout: ${line}`)
-    assert.match(line, /恢复窗口/)
-  }
-  const passiveConfigLine = section(page, '<el-descriptions-item label="被动健康检查"', '</el-descriptions-item>')
-  assert.doesNotMatch(passiveConfigLine, /超时/)
-  assert.match(passiveConfigLine, /恢复窗口/)
+  assert.match(wizardPreview, /\{\{ healthCheckSummary\(wizardForm\) \}\}/, '预览必须走健康摘要单源')
+  const helper = code('src/utils/healthCheckSummary.ts')
+  const passive = section(helper, 'export function passiveHealthCheckSummary', 'export function healthCheckSummary')
+  assert.doesNotMatch(passive, /超时/, '被动摘要不得宣称超时语义')
+  assert.match(passive, /恢复窗口/)
+  const configViewer = section(page, '<el-descriptions-item label="被动健康检查"', '</el-descriptions-item>')
+  assert.doesNotMatch(configViewer, /超时/)
+  assert.match(configViewer, /passiveHealthCheckSummary\(ruleConfig\)/)
 })
 
 test('配置预览的主动健康检查判据是 enable_active_health_check', () => {
+  // 查看器的主动行以 enable_active_health_check 判定（不是「path 非空」这类推断），
+  // 且主动/被动互斥——主动开启时不再重复打印被动行。
   const preview = sectionFrom(
     /<el-descriptions-item[^>]*label="主动健康检查"[^>]*>/,
-    '被动健康检查',
+    '<el-descriptions-item label="连接重试"',
     '配置预览主动健康检查描述项',
   )
-  assert.match(preview, /ruleConfig\.enable_active_health_check/)
-  assert.doesNotMatch(preview, /v-if="ruleConfig\.protocol === 'http' && ruleConfig\.health_check_path"/)
-  assert.doesNotMatch(preview, /!ruleConfig\.health_check_path/)
-  assert.match(preview, /ruleConfig\.health_check_path \|\| '\/'/)
-  assert.match(preview, /!ruleConfig\.enable_active_health_check/)
+  assert.match(preview, /v-if="ruleConfig\.enable_active_health_check"/)
+  assert.match(preview, /activeHealthCheckSummary\(ruleConfig\)/)
+  assert.match(preview, /<el-descriptions-item label="主动健康检查" v-else>未启用<\/el-descriptions-item>/)
+  assert.match(preview, /v-if="!ruleConfig\.enable_active_health_check"/)
+  assert.doesNotMatch(preview, /health_check_path \|\| '\/'/, '口径不得在模板里再写一份')
+  // 失败/恢复阈值都在主动摘要里（预览曾只给 path/interval/timeout）
+  const active = section(code('src/utils/healthCheckSummary.ts'), 'export function activeHealthCheckSummary', 'export function passiveHealthCheckSummary')
+  assert.match(active, /health_check_unhealthy_threshold/)
+  assert.match(active, /health_check_healthy_threshold/)
 })
 
 test('开启 TCP 主动检查不再自动写首上游端口（0=按各上游自身端口）', () => {

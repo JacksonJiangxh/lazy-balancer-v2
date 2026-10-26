@@ -324,6 +324,56 @@ func TestImportAccessLogFormatGate(t *testing.T) {
 			t.Fatalf("preview valid=true, want false（删除受保护字段）")
 		}
 	})
+	t.Run("超限规模被拒绝且零落库", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		if _, err := db.DB.Exec(`UPDATE global_config SET access_log_format='request>host -> h' WHERE id=1`); err != nil {
+			t.Fatalf("seed access_log_format: %v", err)
+		}
+		readStored := func() string {
+			var stored string
+			if err := db.DB.QueryRow(`SELECT COALESCE(access_log_format,'') FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+				t.Fatalf("read access_log_format: %v", err)
+			}
+			return stored
+		}
+		importFormat := func(format string) *httptest.ResponseRecorder {
+			return importBackupShared(h, t, legacyBackupJSON(t, nil, map[string]any{"access_log_format": format}, nil))
+		}
+		joinLines := func(n int) string {
+			lines := make([]string, n)
+			for i := range lines {
+				lines[i] = "request>host -> h"
+			}
+			return strings.Join(lines, "\n")
+		}
+		// 201 行原始串在归一前即超限；200 行归一自动补脱敏行→201 行，按落库
+		// 值口径同样拒绝（否则导入校验给绿、导入后保存反被写侧门 400）。
+		if rec := importFormat(joinLines(201)); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "200 行") {
+			t.Fatalf("201 行导入 status=%d body=%s, want 400 含「200 行」", rec.Code, rec.Body.String())
+		}
+		if rec := importFormat(joinLines(200)); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "200 行") {
+			t.Fatalf("200 行（归一后 201 行）导入 status=%d body=%s, want 400 含「200 行」", rec.Code, rec.Body.String())
+		}
+		// 字节域：纯空白串同受规模门约束（空白语义不豁免上限）。
+		overSpaces := strings.Repeat(" ", maxAccessLogFormatBytes+1)
+		if rec := importFormat(overSpaces); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "字节") {
+			t.Fatalf("16KiB+1 纯空格导入 status=%d body=%s, want 400 含「字节」", rec.Code, rec.Body.String())
+		}
+		// 预览与导入同门。
+		if resp := validateResponseShared(t, h, legacyBackupJSON(t, nil, map[string]any{"access_log_format": joinLines(201)}, nil)); resp.Valid {
+			t.Fatalf("preview valid=true, want false（201 行超限）")
+		}
+		if stored := readStored(); stored != "request>host -> h" {
+			t.Fatalf("超限导入后落库=%q, want 原值（零部分写入）", stored)
+		}
+		// 上限内：199 行归一后 200 行、16KiB 纯空格均放行。
+		if rec := importFormat(joinLines(199)); rec.Code != http.StatusOK {
+			t.Fatalf("199 行（归一后 200 行）导入 status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		if rec := importFormat(strings.Repeat(" ", maxAccessLogFormatBytes)); rec.Code != http.StatusOK {
+			t.Fatalf("16KiB 纯空格导入 status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 // 导入侧 weight<1 拒绝

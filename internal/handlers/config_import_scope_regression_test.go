@@ -267,6 +267,35 @@ func TestImportRejectsDuplicateUniqueKeys(t *testing.T) {
 			wantIn: []string{"users", "主键 id"},
 		},
 		{
+			// 布尔与整数在恢复侧同一落库形态（INTEGER 1/0）：唯一键预检必须
+			// 同域判重，否则冲突漏成事务内 500。
+			name:     "users 主键 true 与 1 同域重复",
+			sections: []string{"users"},
+			tables: map[string][]map[string]any{"users": {
+				{"id": true, "username": "bool-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1},
+				{"id": 1, "username": "int-admin", "password_hash": "hash", "role": "user", "is_enabled": 1},
+			}},
+			wantIn: []string{"users", "主键 id"},
+		},
+		{
+			name:     "users 主键 false 与 0 同域重复",
+			sections: []string{"users"},
+			tables: map[string][]map[string]any{"users": {
+				{"id": false, "username": "false-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1},
+				{"id": 0, "username": "zero-admin", "password_hash": "hash", "role": "user", "is_enabled": 1},
+			}},
+			wantIn: []string{"users", "主键 id"},
+		},
+		{
+			name:     "users 主键 true 与整数形字符串 1 同域重复",
+			sections: []string{"users"},
+			tables: map[string][]map[string]any{"users": {
+				{"id": true, "username": "bool-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1},
+				{"id": "1", "username": "text-admin", "password_hash": "hash", "role": "user", "is_enabled": 1},
+			}},
+			wantIn: []string{"users", "主键 id"},
+		},
+		{
 			name:     "system 名单同名重复",
 			sections: []string{"security"},
 			tables: map[string][]map[string]any{"security_ip_lists": {
@@ -295,6 +324,33 @@ func TestImportRejectsDuplicateUniqueKeys(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// 唯一键预检的布尔同域归一不得产生假阳性：true/false 在库中是 1/0 两个不同
+// 值，只有与同一数值（1/0 或整数形字符串）重复才拒绝。
+func TestImportUniqueKeyPrecheck_booleanSharesNumericDomainWithoutFalsePositive(t *testing.T) {
+	newBackupTestHandlers(t)
+	row := func(id any, username string) map[string]any {
+		return map[string]any{"id": id, "username": username, "password_hash": "hash", "role": "user", "is_enabled": 1}
+	}
+	distinct := map[string][]map[string]any{"users": {row(true, "bool-true"), row(false, "bool-false"), row(int64(2), "int-two")}}
+	if err := validateBackupUniqueKeys(distinct); err != nil {
+		t.Fatalf("true/false/2 三行不得判为重复: %v", err)
+	}
+	for _, tt := range []struct {
+		name        string
+		left, right any
+	}{
+		{"true 与 1", true, int64(1)},
+		{"false 与 0", false, int64(0)},
+		{"true 与整数形字符串 1", true, "1"},
+	} {
+		tables := map[string][]map[string]any{"users": {row(tt.left, "left"), row(tt.right, "right")}}
+		err := validateBackupUniqueKeys(tables)
+		if err == nil || !strings.Contains(err.Error(), "主键 id") {
+			t.Fatalf("%s: err=%v, want 点名 users 主键 id 的重复", tt.name, err)
+		}
 	}
 }
 

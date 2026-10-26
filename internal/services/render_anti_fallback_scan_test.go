@@ -13,6 +13,9 @@ package services
 // 命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
 // switch/case 零值守卫与非 map 非空复合字面量默认值，并为每形态配夹具（
 // TestFallbackScan_detectsEquivalentGuardShapes）——语义等价写法不得绕过机制。
+// switch 面同时覆盖 tagged 形态（`switch x { case 0: x = 5 }` 用 Tag 与 case
+// 值构造等值比较后复用同一判定），数值字面量按 go/constant 的数值比对 0/1
+// （0x0 / 00 / 0_0 / 0b0 / 0e0 与 0 同值，源码文本比较会漏掉这些写法）。
 // 复合条件（`&&`/`||`）取两侧兜底分支的并集、`!(cond)` 交换 if 体/else 块
 // 同属命中面：`if x == 0 && flag { x = 5 }` 这类「零值守卫 + 附加条件」是
 // 最常见的现实书写，只看顶层比较会让它们整段逃逸。
@@ -29,11 +32,11 @@ package services
 import (
 	"bytes"
 	"go/ast"
+	"go/constant"
 	"go/parser"
 	"go/printer"
 	"go/token"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -423,14 +426,23 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 				}
 			}
 		case *ast.SwitchStmt:
-			// `switch { case x <= 0: x = 10 }` 与 `case x == 0:` 形态。
+			// 每个 case 子句的守卫表达式：expressionless switch 直接取 case
+			// 表达式（`switch { case x <= 0: x = 10 }` / `case x == 0:`）；
+			// tagged switch 用 Tag 与 case 值构造等值比较再复用同一判定
+			// （`switch x { case 0: x = 5 }` ≡ `if x == 0 { x = 5 }`）——只认
+			// case 表达式自身的守卫会让 tagged 形态整段逃出命中面。`default:`
+			// 的 List 为空，不是零值守卫，自然跳过。
 			for _, stmt := range node.Body.List {
 				clause, ok := stmt.(*ast.CaseClause)
 				if !ok {
 					continue
 				}
 				for _, expr := range clause.List {
-					if guardBranchOf(expr) != guardNone {
+					guardExpr := expr
+					if node.Tag != nil {
+						guardExpr = &ast.BinaryExpr{X: node.Tag, Y: expr, Op: token.EQL}
+					}
+					if guardBranchOf(guardExpr) != guardNone {
 						scanBranch(&ast.BlockStmt{List: clause.Body})
 						break
 					}
@@ -531,57 +543,46 @@ func comparisonGuardBranch(bin *ast.BinaryExpr) guardBranch {
 			return guardFallbackElse
 		}
 		return guardNone
-	case token.INT:
-		switch bin.Op {
-		case token.EQL, token.LEQ:
-			if lit.Value == "0" {
-				return guardFallbackBody
-			}
-		case token.LSS:
-			if lit.Value == "0" || lit.Value == "1" {
-				return guardFallbackBody
-			}
-		case token.NEQ:
-			if lit.Value == "0" {
-				return guardFallbackElse
-			}
-		case token.GTR:
-			if lit.Value == "0" {
-				return guardFallbackBoth
-			}
-		case token.GEQ:
-			if lit.Value == "1" {
-				return guardFallbackElse
-			}
+	case token.INT, token.FLOAT:
+		// 整数域与浮点域同形（`x <= 0` / `x <= 0.0` / `x > 0.0`）——共用同一
+		// 判定，按数值而非源码文本比较：0x0 / 00 / 0_0 / 0b0 / 0e0 等合法
+		// 写法与 0 同值，文本比较会让这些等价形态整段逃出命中面。
+		return numericLiteralGuardBranch(lit, bin.Op)
+	}
+	return guardNone
+}
+
+// numericLiteralGuardBranch 以常量数值判定数值字面量（整数/浮点）与 0/1 的
+// 关系，供 comparisonGuardBranch 在 EQL/LEQ/LSS/NEQ/GTR/GEQ 上复用同一张
+// 分支表。进制、前导零、下划线分组与指数写法都由 go/constant 归一，源码
+// 文本不参与判定；无法解析的字面量（常量为 Unknown）不计命中。
+func numericLiteralGuardBranch(lit *ast.BasicLit, op token.Token) guardBranch {
+	value := constant.MakeFromLiteral(lit.Value, lit.Kind, 0)
+	if value.Kind() == constant.Unknown {
+		return guardNone
+	}
+	isZero := constant.Compare(value, token.EQL, constant.MakeInt64(0))
+	isOne := constant.Compare(value, token.EQL, constant.MakeInt64(1))
+	switch op {
+	case token.EQL, token.LEQ:
+		if isZero {
+			return guardFallbackBody
 		}
-	case token.FLOAT:
-		// 浮点域同形（`x <= 0.0` / `x > 0.0` / `x != 0.0`）——原命中面只认
-		// INT，写死兜底的浮点守卫可静默绕过机制。
-		value, parseErr := strconv.ParseFloat(lit.Value, 64)
-		if parseErr != nil {
-			return guardNone
+	case token.LSS:
+		if isZero || isOne {
+			return guardFallbackBody
 		}
-		switch bin.Op {
-		case token.EQL, token.LEQ:
-			if value == 0 {
-				return guardFallbackBody
-			}
-		case token.LSS:
-			if value == 0 || value == 1 {
-				return guardFallbackBody
-			}
-		case token.NEQ:
-			if value == 0 {
-				return guardFallbackElse
-			}
-		case token.GTR:
-			if value == 0 {
-				return guardFallbackBoth
-			}
-		case token.GEQ:
-			if value == 1 {
-				return guardFallbackElse
-			}
+	case token.NEQ:
+		if isZero {
+			return guardFallbackElse
+		}
+	case token.GTR:
+		if isZero {
+			return guardFallbackBoth
+		}
+	case token.GEQ:
+		if isOne {
+			return guardFallbackElse
 		}
 	}
 	return guardNone
@@ -775,6 +776,34 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 			name:   "negated-guard",
 			source: "package p\nfunc f(s string) string { if !(s != \"\") { s = \"x\" }; return s }\n",
 		},
+		{
+			name:   "tagged-switch-zero-case",
+			source: "package p\nfunc f(x int) int { switch x { case 0: x = 5 }; return x }\n",
+		},
+		{
+			name:   "tagged-switch-multi-case-zero",
+			source: "package p\nfunc f(x int) int { switch x { case 2, 0: x = 5 }; return x }\n",
+		},
+		{
+			name:   "hex-zero-guard",
+			source: "package p\nfunc f(x int) int { if x == 0x0 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "binary-zero-guard",
+			source: "package p\nfunc f(x int) int { if x == 0b0 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "legacy-octal-zero-guard",
+			source: "package p\nfunc f(x int) int { if x == 00 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "underscore-zero-guard",
+			source: "package p\nfunc f(x int) int { if x == 0_0 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "hex-zero-not-equal-else",
+			source: "package p\nfunc f(x int) int { if x != 0x0 { x = x } else { x = 7 }; return x }\n",
+		},
 	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -802,19 +831,39 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 
 // 反向形状：正常业务分支的数值赋值（非零值守卫）不得被误判为兜底。
 func TestFallbackScan_ignoresNonZeroGuardBranches(t *testing.T) {
-	source := "package p\nfunc f(x int) int { if x == 1 { x = 5 }; return x }\n"
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "nonzero.go", source, 0)
-	if err != nil {
-		t.Fatalf("parse fixture: %v", err)
+	fixtures := []struct {
+		name   string
+		source string
+	}{
+		{
+			name:   "non-zero-comparison",
+			source: "package p\nfunc f(x int) int { if x == 1 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "non-zero-hex-comparison",
+			source: "package p\nfunc f(x int) int { if x == 0x1 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "tagged-switch-non-zero-case",
+			source: "package p\nfunc f(x int) int { switch x { case 1: x = 5 }; return x }\n",
+		},
 	}
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "f" {
-			continue
-		}
-		if hits := fallbackAssignmentsInFunction(fset, fn); len(hits) != 0 {
-			t.Fatalf("非零值守卫被误报为兜底: %v", hits)
-		}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, fixture.name+".go", fixture.source, 0)
+			if err != nil {
+				t.Fatalf("parse fixture: %v", err)
+			}
+			for _, decl := range file.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Name.Name != "f" {
+					continue
+				}
+				if hits := fallbackAssignmentsInFunction(fset, fn); len(hits) != 0 {
+					t.Fatalf("非零值守卫被误报为兜底: %v", hits)
+				}
+			}
+		})
 	}
 }

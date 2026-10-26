@@ -122,6 +122,18 @@ func TestOIDCLogin_state_entries_capped(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Fatalf("expired entries must be cleaned before cap check (login should pass), got %d body=%s", rec.Code, rec.Body.String())
 	}
+	// 302 也出现在「state 满员」失败形态（本测试上方已证）——必须再排除
+	// 错误页并核对跳转确为 IdP 授权端点，否则死 state 卡死登录仍会假绿。
+	location := rec.Header().Get("Location")
+	if strings.Contains(location, "oidc_error=") {
+		t.Fatalf("cleaned login fell back to error page: %q", location)
+	}
+	if !strings.HasPrefix(location, idp.issuer+"/authorize?") {
+		t.Fatalf("cleaned login must redirect to IdP authorize endpoint, got %q", location)
+	}
+	if got := oidcStateCount.Load(); got != 1 {
+		t.Fatalf("cleaned login state 在册数=%d, want 1（过期条目清理后只登记本次登录）", got)
+	}
 }
 
 // discovery 失败须短 TTL 负缓存——IdP 故障时不重复回源放大。

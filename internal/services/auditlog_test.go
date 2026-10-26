@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"log"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	sqlitedriver "github.com/glebarez/go-sqlite"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 func TestGetConfigSourceSection(t *testing.T) {
@@ -486,5 +488,210 @@ func TestCleanupAuditLogs_cancelBetweenBatchesReturnsContextError(t *testing.T) 
 	}
 	if n != 3 {
 		t.Fatalf("CleanupAuditLogs()=%d, want 3（已删除批次必须计入真实部分计数）", n)
+	}
+}
+
+// blockableConnector 用同一主库文件挂「查询闸门」包装句柄：release 关闭前
+// 每次查询都停在闸门，ctx 取消则立即返回该错误——用于钉住保留月数读取
+// 不再脱离 ctx（关停/导入取消不得被主库慢查询拖过预算）。
+type blockableConnector struct {
+	dsn   string
+	inner driver.Driver
+	gate  *queryGate
+}
+
+// queryGate entered 报告查询已到达闸门（缓冲 1，只报首次），release 关闭后
+// 放行真实查询。
+type queryGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newQueryGate() *queryGate {
+	return &queryGate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (c blockableConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.inner.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &blockableConn{Conn: conn, gate: c.gate}, nil
+}
+
+func (c blockableConnector) Driver() driver.Driver { return c.inner }
+
+type blockableConn struct {
+	driver.Conn
+	gate *queryGate
+}
+
+func (c *blockableConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	select {
+	case c.gate.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-c.gate.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if q, ok := c.Conn.(driver.QueryerContext); ok {
+		return q.QueryContext(ctx, query, args)
+	}
+	return nil, driver.ErrSkip
+}
+
+// installBlockableMainDB 把 db.DB 换成同一主库文件上的闸门句柄（本用例结束
+// 时恢复原句柄）。
+func installBlockableMainDB(t *testing.T) *queryGate {
+	t.Helper()
+	var seq int
+	var name, file string
+	if err := db.DB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		t.Fatalf("read main db path: %v", err)
+	}
+	if file == "" {
+		t.Fatal("主库测试库不是文件库，无法附加闸门句柄")
+	}
+	previous := db.DB
+	gate := newQueryGate()
+	wrapped := sql.OpenDB(blockableConnector{
+		dsn:   file + "?_pragma=busy_timeout(30000)",
+		inner: &sqlitedriver.Driver{},
+		gate:  gate,
+	})
+	db.DB = wrapped
+	t.Cleanup(func() {
+		_ = wrapped.Close()
+		db.DB = previous
+	})
+	return gate
+}
+
+// seedPurgeableTaskRuns 在主库建最小 task_runs 表并种一条 2020 年的过期行。
+func seedPurgeableTaskRuns(t *testing.T) {
+	t.Helper()
+	if _, err := db.DB.Exec(`CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, started_at DATETIME)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, started_at) VALUES ('audit-retention', '2020-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func purgeableTaskRunRows(t *testing.T) int {
+	t.Helper()
+	var rows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+// Given 保留月数读取停在主库查询上（慢查询/写锁），随后任务被取消。
+// When 执行保留清理。
+// Then 读取按 ctx 立即返回 context.Canceled，且不进入任何 DELETE——关停/
+// 导入排空不得被首段无 ctx 查询拖过预算。
+func TestCleanupAuditLogs_retentionQueryHonorsContext(t *testing.T) {
+	auditDB := newAuditCleanupFixture(t, 7, 3)
+	counter, restore := wrapAuditDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+	gate := installBlockableMainDB(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	var (
+		n   int
+		err error
+	)
+	go func() {
+		n, err = CleanupAuditLogs(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("保留月数查询未到达注入点（首段读取未走可取消句柄）")
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后保留月数读取仍在阻塞（关停被拖过预算）")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("CleanupAuditLogs()=%d, want 0（取消后不得进入 DELETE）", n)
+	}
+	if got := counter.count(); got != 0 {
+		t.Fatalf("DELETE 次数=%d, want 0（首段取消不得触发删除）", got)
+	}
+	var rows int
+	if err := auditDB.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 7 {
+		t.Fatalf("审计行=%d, want 7（取消后一条都不删）", rows)
+	}
+}
+
+// Given 过期审计行跨多批，第一批完成后任务被取消。
+// When 执行一轮审计保留清理。
+// Then 第二段任务历史删除不启动：task_runs 过期行仍在，计数 0，错误为取消。
+func TestAuditRetentionRound_skipsTaskRunPurgeAfterCancel(t *testing.T) {
+	newAuditCleanupFixture(t, 7, 3)
+	counter, restore := wrapAuditDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+	seedPurgeableTaskRuns(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	counter.afterExec = func(n int) {
+		if n == 1 {
+			cancel()
+		}
+	}
+
+	auditDeleted, runsDeleted, err := auditRetentionRound(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled, got %v", err)
+	}
+	if auditDeleted != 3 {
+		t.Fatalf("auditDeleted=%d, want 3（已删批次计数如实）", auditDeleted)
+	}
+	if runsDeleted != 0 {
+		t.Fatalf("runsDeleted=%d, want 0（取消后不得启动第二段删除）", runsDeleted)
+	}
+	if got := purgeableTaskRunRows(t); got != 1 {
+		t.Fatalf("task_runs 行=%d, want 1（取消后不得删除任务历史）", got)
+	}
+}
+
+// Given 主库存在过期任务运行行。
+// When 以已取消 ctx 调用任务历史清理。
+// Then 不执行 DELETE，返回取消错误，过期行仍在。
+func TestPurgeTaskRuns_canceledContextSkipsDelete(t *testing.T) {
+	newAuditCleanupFixture(t, 0, 3)
+	seedPurgeableTaskRuns(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	n, err := taskengine.PurgeTaskRuns(ctx, 90)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("PurgeTaskRuns()=%d, want 0（取消后不得删除）", n)
+	}
+	if got := purgeableTaskRunRows(t); got != 1 {
+		t.Fatalf("task_runs 行=%d, want 1（取消后不得删除）", got)
 	}
 }

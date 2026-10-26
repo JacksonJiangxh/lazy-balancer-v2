@@ -1159,10 +1159,66 @@ func TestCertificateService_waitingCALogsScanAndIterationFailures(t *testing.T) 
 		logs := captureApplicationLogs(t)
 		resetCertificateServiceForTest(t)
 
-		NewCertificateService().requeueWaitingCAJobs()
+		requeued, _, err := NewCertificateService().requeueWaitingCAJobs()
 
 		if !strings.Contains(logs.String(), "waiting_ca scan: scan row failed") {
 			t.Fatalf("scan failure must be visible, logs=%q", logs.String())
+		}
+		// 单行读取失败必须上抛：只打日志会让补扫按成功轮记账（监控看不到
+		// 「结果不完整」），该畸形行也就永远等不到人工介入。
+		if err == nil {
+			t.Fatal("requeueWaitingCAJobs err=nil, want 单行读取失败上抛")
+		}
+		if !strings.Contains(err.Error(), "1 行读取失败") {
+			t.Fatalf("err=%v, want 失败行数", err)
+		}
+		if requeued != 0 {
+			t.Fatalf("requeued=%d, want 0（唯一候选行不可读）", requeued)
+		}
+	})
+	t.Run("scan error keeps processing readable rows", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		// active=true 但不起 worker：入队路径生效（requeued 计数可信），执行链
+		// 不运行——否则测试会真实访问 CA 目录并让行终态取决于网络。
+		oldManager := caQueueManager
+		caQueueManager = &CAQueueManager{
+			queues:       make(map[int]*caQueue),
+			blockedRules: make(map[string]map[RuleBlockToken]struct{}),
+			active:       true,
+			reloader:     func() error { return nil },
+		}
+		t.Cleanup(func() { caQueueManager.Stop(); caQueueManager = oldManager })
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+			VALUES ('lb_waiting_ok','waiting-ok','ok.example.test','http',8443,1,1,'acme_dns')`); err != nil {
+			t.Fatalf("seed rule: %v", err)
+		}
+		// 畸形行（ca_provider_id 为文本）+ 可读行同轮存在。
+		if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_available_after,ca_provider_id)
+			VALUES ('lb_bad_waiting','bad.example','waiting_ca',datetime('now','-1 minute'),'not-an-integer')`); err != nil {
+			t.Fatal(err)
+		}
+		goodID := seedOrphanCertJob(t, "lb_waiting_ok", "ok.example.test", "waiting_ca")
+		if _, err := database.Exec(`UPDATE cert_jobs SET ca_provider_id=1, ca_available_after=datetime('now','-1 minute') WHERE id=?`, goodID); err != nil {
+			t.Fatalf("arm readable row: %v", err)
+		}
+		resetCertificateServiceForTest(t)
+
+		requeued, _, err := NewCertificateService().requeueWaitingCAJobs()
+
+		if err == nil {
+			t.Fatal("err=nil, want 读取失败上抛")
+		}
+		if requeued != 1 {
+			t.Fatalf("requeued=%d, want 1（可读行必须照常处置，不得因他人失败一并放弃）", requeued)
+		}
+		// 不启动队列 worker：断言只钉「该行已离开 waiting_ca」（排队后由 worker
+		// 决定后续终态，与本次扫描语义无关，且会给测试引入真实网络依赖）。
+		var status string
+		if scanErr := database.QueryRow(`SELECT status FROM cert_jobs WHERE id=?`, goodID).Scan(&status); scanErr != nil {
+			t.Fatalf("read job status: %v", scanErr)
+		}
+		if status == "waiting_ca" {
+			t.Fatalf("readable job status=%q, want 已离开 waiting_ca（可读行必须照常处置）", status)
 		}
 	})
 	t.Run("iteration error", func(t *testing.T) {
@@ -1177,12 +1233,49 @@ func TestCertificateService_waitingCALogsScanAndIterationFailures(t *testing.T) 
 		t.Cleanup(func() { db.DB = realDB; _ = fake.Close() })
 		resetCertificateServiceForTest(t)
 
-		NewCertificateService().requeueWaitingCAJobs()
+		if _, _, err := NewCertificateService().requeueWaitingCAJobs(); err == nil {
+			t.Fatal("iterating rows failure must be returned, got nil")
+		}
 
 		if !strings.Contains(logs.String(), "waiting_ca scan: iterate rows failed") {
 			t.Fatalf("rows.Err failure must be visible, logs=%q", logs.String())
 		}
 	})
+}
+
+// 单行扫描失败必须让 30s 补扫落失败终态：畸形行被跳过时若仍写「补扫完成」，
+// 任务监控对「本次扫描不完整」完全不可见（带外改库/异常旧快照是唯一来源）。
+func TestCertWaitingCATickOnce_scanRowFailureWritesFailureSummary(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	t.Cleanup(func() { SetActiveCertificateService(nil) })
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil })
+	t.Cleanup(ResetCAQueueManagerForTest)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_available_after,ca_provider_id)
+		VALUES ('lb_tick_bad_row','bad.example','waiting_ca',datetime('now','-1 minute'),'not-an-integer')`); err != nil {
+		t.Fatalf("seed malformed waiting job: %v", err)
+	}
+
+	// When
+	err := CertWaitingCATickOnce()
+
+	// Then 1：扫描不完整必须上抛（task_runs 记失败）
+	if err == nil {
+		t.Fatal("CertWaitingCATickOnce err=nil, want 单行扫描失败上抛")
+	}
+	// Then 2：失败轮摘要不得谎报「补扫完成」
+	data, readErr := os.ReadFile(taskengine.TaskLogPath("cert-waiting-ca"))
+	if readErr != nil {
+		t.Fatalf("read task log: %v", readErr)
+	}
+	if !strings.Contains(string(data), "补扫失败") {
+		t.Fatalf("失败轮摘要缺失「补扫失败」: %q", string(data))
+	}
+	if strings.Contains(string(data), "补扫完成") {
+		t.Fatalf("失败轮摘要谎报完成: %q", string(data))
+	}
 }
 
 func TestCertificateService_requeueWaitingCAJobs_disables_orphaned_waiting_job(t *testing.T) {

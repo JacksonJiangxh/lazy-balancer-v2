@@ -1204,13 +1204,15 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// (2026-09-10 审计):allow 模式+空生效名单——发射端 len>0 门静默跳过
-	// (「其余一律拒绝」实际全放行 fail-open)。写入侧 400(与 UI 守卫同口径,
-	// 同型先例)。判定口径从「内联∪引用个数」改为
-	// 「内联∪引用名单**实际条目**并集」——引用一个空名单同样是空生效集合。
+	// allow 模式 + 空生效名单：渲染端把空 allow 集照常并入交集，交集为空即
+	// 发射「@rx .* 恒拒」——空名单的运行时语义是**拒绝全部（fail-closed）**，
+	// 不是放行。写入侧 400（与 UI 守卫同口径）是防「一次保存锁死全站」的
+	// UX 门，不是渲染语义的前提：绕过本门落库的形态仍按恒拒渲染。
+	// 判定口径为「内联 ∪ 引用名单**实际条目**并集」——引用一个空名单同样是
+	// 空生效集合。
 	// 门控读必须位于 BEGIN IMMEDIATE 事务内（此前在事务外，
-	// ImportConfigBackup 不持 caddyOpMu，可在门与 INSERT 之间清空所引用名单，
-	// 落 allow+启用+空生效集 fail-open）——与 Update 的同口径。
+	// ImportConfigBackup 不持 caddyOpMu，可在校验与 INSERT 之间清空被引用
+	// 名单，于是请求被拒却没有任何写入）——与 Update 的同口径。
 	if err := services.ValidateCustomRulesJSON(req.CustomRules); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
@@ -1801,8 +1803,11 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			return
 		}
 	}
-	// (2026-09-10 审计):同 Create——生效配置(请求值缺失回落存量)为
-	// allow+启用+空合并名单时 400,防 fail-open 形态落库。
+	// 同 Create：生效配置（请求值缺失时回落存量）为 allow+启用+空合并名单时
+	// 400——渲染端空 allow 集是恒拒（fail-closed），本门的作用是防止把「锁死
+	// 全站」的策略存进库，属 UX 门而非渲染语义的前提。门控读与 Create 一样
+	// 必须在 BEGIN IMMEDIATE 事务内（校验与写入之间被并发清空所引用名单同属
+	// 该窗口）。
 	{
 		var storedEnabled bool
 		var storedMode, storedList, storedRefs string

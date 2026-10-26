@@ -33,13 +33,22 @@ func TestSetupAdmin_slaveNodeGate(t *testing.T) {
 	// When / Then 1:GetSetupStatus 不得引导初始化
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/auth/setup", nil))
+	// 先断言状态码与业务码：500（角色读失败）或错误信封解码出的
+	// needs_setup=false 零值同样满足「不引导初始化」，必须排除。
+	if response.Code != http.StatusOK {
+		t.Fatalf("setup status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
 	var statusBody struct {
+		Code int `json:"code"`
 		Data struct {
 			NeedsSetup bool `json:"needs_setup"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &statusBody); err != nil {
 		t.Fatalf("decode setup status: %v body=%s", err, response.Body.String())
+	}
+	if statusBody.Code != 0 {
+		t.Fatalf("setup status code=%d body=%s, want 0", statusBody.Code, response.Body.String())
 	}
 	if statusBody.Data.NeedsSetup {
 		t.Fatalf("slave node must not report needs_setup, body=%s", response.Body.String())

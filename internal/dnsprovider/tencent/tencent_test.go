@@ -400,6 +400,43 @@ func TestProvider_Present_sendsExpectedChallengeRecordFields(t *testing.T) {
 	}
 }
 
+// 大小写不敏感必须贯通到 sub_domain 派生：保存前探针用「ResolveZone 归一后的
+// 小写 zone + 输入原样的混合大小写 FQDN」，后缀比较若不做归一便失配，整个
+// FQDN 会被当作子域名写进 API——探针 TXT 落到错误名字（与 dnspod 侧同契约）。
+func TestProvider_mixedCaseFQDN_derivesRelativeSubDomain(t *testing.T) {
+	transport := &recordTransport{records: map[uint64]string{}}
+	provider, err := New("secret-id", "secret-key")
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	provider.client.WithHttpTransport(transport)
+	const mixedFQDN = "_acme-challenge.lb-test.Example.COM."
+
+	// When
+	if err := provider.Present(t.Context(), "example.com", mixedFQDN, "probe", 600); err != nil {
+		t.Fatalf("present mixed-case fqdn: %v", err)
+	}
+	if got := provider.CountCleanupRecords("example.com", mixedFQDN, "probe"); got != 1 {
+		t.Fatalf("CountCleanupRecords(mixed-case fqdn)=%d, want 1（派生口径必须与 Present 一致）", got)
+	}
+	if err := provider.CleanUpValue(t.Context(), "example.com", mixedFQDN, "probe"); err != nil {
+		t.Fatalf("clean up mixed-case fqdn: %v", err)
+	}
+
+	// Then
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.creates) != 1 {
+		t.Fatalf("CreateRecord calls=%d, want 1", len(transport.creates))
+	}
+	if got := transport.creates[0].SubDomain; got != "_acme-challenge.lb-test" {
+		t.Fatalf("SubDomain=%q, want %q（大小写归一无贯通到相对子域派生）", got, "_acme-challenge.lb-test")
+	}
+	if len(transport.records) != 0 {
+		t.Fatalf("remaining records=%v, want none after cleanup", transport.records)
+	}
+}
+
 // slowFlakyTransport answers the first failCount calls of failAction with a
 // slow 5xx response, then behaves like recordTransport.
 type slowFlakyTransport struct {

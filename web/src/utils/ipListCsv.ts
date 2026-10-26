@@ -43,13 +43,26 @@ function readQuotedField(raw: string, start: number): { text: string; next: numb
 export const ipListRemarkMaxLength = 100
 
 /**
- * 解析导入行：第一列可为双引号包裹的 CSV 字段（`""` 反转义），列间分隔符为
- * 半角逗号或空白（与旧行为兼容；纯文本行不带引号时按原正则切分）。
+ * 引号字段闭合后的剩余部分：只允许空白，或「空白 + 单个逗号 + 空白」再进入
+ * 下一字段；其余残留返回 null（整行按非法拒绝）。旧实现把首字段残留整体
+ * 并入备注、把备注字段残留静默丢弃——导入结果与源文件不一致却无提示。
+ */
+function readFieldRest(raw: string, from: number): string | null {
+  const match = raw.slice(from).match(/^\s*(?:,\s*([\s\S]*))?$/)
+  return match ? match[1] ?? '' : null
+}
+
+/**
+ * 解析导入行：第一列可为双引号包裹的 CSV 字段（`""` 反转义）；引号字段之后
+ * 只认「空白 + 逗号 + 空白」，闭合引号后的任何残留都按非法行拒绝。纯文本行
+ * 不带引号时按原正则切分，逗号/空白分隔均兼容。
  * validate 由调用方注入（isValidCidr）——本模块不依赖校验实现。
  *
  * 返回：合法行 { value, remark }；备注超过 ipListRemarkMaxLength 返回
  * { error: 'remark_too_long' }（调用方须带行号拒绝，与非法 CIDR 同策略点名）；
- * 其余不可解析形态（空行/非法值/未闭合引号）返回 null。
+ * 其余不可解析形态（空行/非法值/未闭合引号/引号闭合后的残留）返回 null。
+ * 残留按非法行拒绝而非并入备注或丢弃：导入结果必须与源文件一致，且由导入
+ * 流程按行号点名，用户才知道该行没被采用。
  */
 export function parseIpListEntryLine(
   line: string,
@@ -63,7 +76,9 @@ export function parseIpListEntryLine(
     const field = readQuotedField(text, 0)
     if (!field) return null
     value = field.text
-    rest = text.slice(field.next).replace(/^\s*,\s*/, '').replace(/^\s+/, '')
+    const afterField = readFieldRest(text, field.next)
+    if (afterField === null) return null
+    rest = afterField
   } else {
     const match = text.match(/^([^,\s]+)(?:[,\s]+([\s\S]*))?$/)
     if (!match) return null
@@ -76,6 +91,8 @@ export function parseIpListEntryLine(
   if (remark.startsWith('"')) {
     const field = readQuotedField(remark, 0)
     if (!field) return null
+    // 备注是最后一列：闭合引号后除空白外的任何内容都是无机型残留
+    if (readFieldRest(remark, field.next) !== '') return null
     remark = field.text
   }
   if (Array.from(remark).length > ipListRemarkMaxLength) {

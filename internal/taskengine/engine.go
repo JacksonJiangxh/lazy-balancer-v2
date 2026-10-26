@@ -2891,11 +2891,22 @@ func (e *Engine) LatestRun(taskID string) *RunRecord {
 	return &runs[0]
 }
 
-func PurgeTaskRuns(days int) (int64, error) {
-	if db.DB == nil || days <= 0 {
+// PurgeTaskRuns 删除超过保留天数的任务运行历史。d<=0 或主库不可用时为
+// no-op；ctx 贯穿删除语句——取消/关停后不再启动新的不可逆删除，句柄取局部
+// 快照（nil 判定与 ExecContext 必须针对同一个 *sql.DB，关停尾部 db.Close()
+// 可能在两者之间把包级 db.DB 置 nil）。
+func PurgeTaskRuns(ctx context.Context, days int) (int64, error) {
+	if days <= 0 {
 		return 0, nil
 	}
-	res, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days))
+	database := db.DB
+	if database == nil {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	res, err := database.ExecContext(ctx, `DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days))
 	if err != nil {
 		log.Printf("WARNING: taskengine: 清理过期任务记录失败: %v", err)
 		return 0, err

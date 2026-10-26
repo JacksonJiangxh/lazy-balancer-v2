@@ -37,9 +37,10 @@ var certRuleFileLocks refCountedLockTable
 
 // refCountedLockTable 是按 key 引用计数的互斥锁表。与「sync.Map + LoadOrStore
 // 只增不删」的旧形态不同，最后一个持有者释放后条目即回收：规则可反复创建/删除
-// （caddy_id 随机生成），只增不删的表会按历史规则总数线性增长。refs 在 Lock
-// 前置自增（含阻塞等待者），只要有人持有或等待条目就不会被回收——不会出现同
-// key 两把不同锁的并发窗口。
+// （caddy_id 随机生成），只增不删的表会按历史规则总数线性增长。refs 在 acquire
+// 内与「查找/创建条目」同一临界区自增（含阻塞等待者），只要有人持有或等待条目
+// 就不会被回收——同 key 因此不会出现两把不同锁的并发窗口。查找与登记分属两处
+// 是本表唯一需要防止的形态（见 acquire 注释）。
 type refCountedLockTable struct {
 	mu    sync.Mutex
 	locks sync.Map // key -> *refCountedLock
@@ -52,18 +53,24 @@ type refCountedLock struct {
 	refs  int
 }
 
-// get 返回 key 对应的锁条目（不存在则注册；不改变引用计数）。
-func (t *refCountedLockTable) get(key string) *refCountedLock {
+// acquire 原子地取得 key 的锁条目：查找/创建与引用登记在同一个表级临界区内
+// 完成，返回的锁尚未持有，调用方须再调用 Lock 阻塞获取。
+//
+// 两步必须在同一临界区：若先返回指针、稍后才登记引用，最后一个持有者可能在
+// 其间把 refs 减到 0 并回收条目——迟到的获取者拿到的旧锁已不在表里，第三者
+// 随即建出新锁，同 key 因此出现两把并存的锁（per-rule 互斥失效）。
+func (t *refCountedLockTable) acquire(key string) *refCountedLock {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	value, _ := t.locks.LoadOrStore(key, &refCountedLock{table: t, key: key})
-	return value.(*refCountedLock)
+	lock := value.(*refCountedLock)
+	lock.refs++
+	return lock
 }
 
-// Lock 先登记引用再阻塞：refs 覆盖「持有 + 等待」全体，回收判定因此安全。
-// 表锁只在计数读写期间持有，不与条目锁嵌套（无锁序反转）。
+// Lock 只阻塞在条目自身的互斥量上：引用已在 acquire 时登记（覆盖持有 + 等待
+// 全体），回收判定因此安全——本方法不再触碰表锁，也不存在锁序反转。
 func (l *refCountedLock) Lock() {
-	l.table.mu.Lock()
-	l.refs++
-	l.table.mu.Unlock()
 	l.mu.Lock()
 }
 
@@ -80,7 +87,7 @@ func (l *refCountedLock) Unlock() {
 // lockCertRuleFile 返回单规则的 per-rule 文件锁。调用方必须先持
 // certWriteMu.RLock（锁序：certWriteMu → per-rule，单向不逆）。
 func lockCertRuleFile(ruleID string) *refCountedLock {
-	return certRuleFileLocks.get(ruleID)
+	return certRuleFileLocks.acquire(ruleID)
 }
 
 // lockCertRuleFiles 按序取多条规则的 per-rule 锁（排序+去重防死锁/自锁），
@@ -115,7 +122,7 @@ var certificateDeployLocks refCountedLockTable
 // one rule while allowing unrelated rules to deploy concurrently. 条目随最后
 // 持有者释放回收（refCountedLockTable），与 certRuleFileLocks 同一实现。
 func DeployLock(ruleID string) func() {
-	lock := certificateDeployLocks.get(ruleID)
+	lock := certificateDeployLocks.acquire(ruleID)
 	lock.Lock()
 	return lock.Unlock
 }

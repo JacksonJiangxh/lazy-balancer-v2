@@ -915,8 +915,12 @@ func insertSnapshotUsersAndKeys(ctx context.Context, tx *sql.Tx, snapshot models
 		}
 	}
 	// 保护目标本地归一：canonical 载荷（v3 唯一下发形态）里的 is_setup_admin
-	// 已被 sanitizeUsersForHash 清零，故本处恒按「最低 id 的启用管理员」在从节点
-	// 重建，保证本地保护面可用（旧协议/手工载荷即便携带标记，也以本地用户表为准）。
+	// 已被 sanitizeUsersForHash 清零，故本处恒命中「无标记」分支——按「最低 id 的
+	// 启用管理员」在从节点重建，保证本地保护面可用。
+	// 携带标记的非 canonical 载荷（旧协议/手工构造）不走该分支，归一按载荷事实
+	// 处理：单条有效标记即便落在非最低 id 也保留（与配置备份同语义，迁移等于篡改
+	// 载荷），陈旧标记（挂在非启用管理员行）清除，多条并存才收敛到最低 id。想要
+	// 「恒按本地重建」的前提是载荷本身不带标记——这一点由 canonical 清零保证。
 	if err := db.EnsureSetupAdminFlag(ctx, tx); err != nil {
 		return fmt.Errorf("归一 setup 管理员标记: %w", err)
 	}

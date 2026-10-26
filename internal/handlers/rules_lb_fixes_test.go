@@ -328,7 +328,8 @@ func TestGetRuleCaddyConfig_returns_sibling_path_routes(t *testing.T) {
 }
 
 // UpdateRule 健康检查双阈值指针化 ----
-// （nil=沿用存量，显式值落库；显式 0=落库 0=渲染默认 3/2，与同口径）
+// （nil=沿用存量，显式值落库；显式 0 不是「沿用存量」也不是渲染默认——
+// 写入侧要求 ≥1，显式 0 直接 400）
 
 func seedHCThresholdRule(t *testing.T, caddyID string, listenPort int) {
 	t.Helper()
@@ -419,7 +420,7 @@ func TestUpdateRule_persists_explicit_health_check_thresholds(t *testing.T) {
 	}
 }
 
-// 健康检查双阈值负值 400（>=0 放行，0=默认语义）----
+// 健康检查双阈值小于 1 一律 400（负值与显式 0 同属无效值；0 不再是「默认」语义）----
 
 func TestCreateRule_rejects_negative_health_check_thresholds(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)

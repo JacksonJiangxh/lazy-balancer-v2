@@ -328,7 +328,7 @@ func RuntimeLogCleanupOnce(ctx context.Context, logFile string) RuntimeCleanupRe
 	// 库里读不到口径就一条都不删——不可逆删除不得按默认 3 月执行（用户设 12
 	// 月时那是 9 个月的日志证据）。nil 库覆盖关停后 db.Close() 的形态：排空
 	// 放弃的在途轮仍可能跑到这里。
-	months, monthsErr := auditRetentionMonths()
+	months, monthsErr := auditRetentionMonths(ctx)
 	result.RetentionMonths = months
 	result.TaskLogs = taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
 	if monthsErr != nil {

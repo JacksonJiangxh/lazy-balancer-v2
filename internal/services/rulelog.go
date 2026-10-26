@@ -59,7 +59,9 @@ func fileComponentSafe(value string) bool {
 // encodeFileComponent 把任意字符串转为文件名安全且**可逆**的主体：字母表内
 // 原样返回（既有文件命名零变化），否则 "%" + hex(utf8)。'%' 不在字母表内，
 // 与任何合法 ID 不可能碰撞，且不同 ID 恒得不同文件名（旧剔除实现会让
-// `lb.dot`/`lbdot` 共文件与共写锁）。空串编码为 "%"（合法文件名主体）。
+// `lb.dot`/`lbdot` 共文件与共写锁）。空串原样返回空串（fileComponentSafe 对
+// 空串无迭代即判安全）——生产 caddy_id 由写入校验保证非空，日志端点另有
+// 存在性门，空 ID 不会产生空文件名主体。
 func encodeFileComponent(value string) string {
 	if fileComponentSafe(value) {
 		return value

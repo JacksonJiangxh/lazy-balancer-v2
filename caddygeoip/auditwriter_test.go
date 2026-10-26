@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/experimental/plugins"
@@ -2568,9 +2569,9 @@ func TestAuditTimingSegmentConstants_wireContract(t *testing.T) {
 	}
 }
 
-// auxProbeAuditLog/auxProbeTx/auxProbeReq 是只携带 uri/body/files 的最小 AuditLog 实现
-// （客户端可控非体段上限单测）：嵌入 nil 接口补足不可命名的 Args() 等方法，
-// 其余访问器走本地值。
+// auxProbeAuditLog/auxProbeTx/auxProbeReq/auxProbeResp 是只携带
+// method/uri/body/files/headers 的最小 AuditLog 实现（客户端可控段上限单测）：
+// 嵌入 nil 接口补足不可命名的 Args() 等方法，其余访问器走本地值。
 type auxProbeAuditLog struct{ tx auxProbeTx }
 
 func (l auxProbeAuditLog) Parts() types.AuditLogParts { return nil }
@@ -2581,40 +2582,67 @@ func (l auxProbeAuditLog) Messages() []plugintypes.AuditLogMessage { return nil 
 
 type auxProbeTx struct {
 	plugintypes.AuditLogTransaction
-	req auxProbeReq
+	req      auxProbeReq
+	resp     auxProbeResp
+	serverID string
 }
 
-func (t auxProbeTx) Timestamp() string                                 { return "" }
-func (t auxProbeTx) UnixTimestamp() int64                              { return 0 }
-func (t auxProbeTx) ID() string                                        { return "tx-aux-probe" }
-func (t auxProbeTx) ClientIP() string                                  { return "" }
-func (t auxProbeTx) ClientPort() int                                   { return 0 }
-func (t auxProbeTx) HostIP() string                                    { return "" }
-func (t auxProbeTx) HostPort() int                                     { return 0 }
-func (t auxProbeTx) ServerID() string                                  { return "" }
-func (t auxProbeTx) HighestSeverity() string                           { return "" }
-func (t auxProbeTx) IsInterrupted() bool                               { return false }
-func (t auxProbeTx) Request() plugintypes.AuditLogTransactionRequest   { return t.req }
-func (t auxProbeTx) Response() plugintypes.AuditLogTransactionResponse { return nil }
+func (t auxProbeTx) Timestamp() string       { return "" }
+func (t auxProbeTx) UnixTimestamp() int64    { return 0 }
+func (t auxProbeTx) ID() string              { return "tx-aux-probe" }
+func (t auxProbeTx) ClientIP() string        { return "" }
+func (t auxProbeTx) ClientPort() int         { return 0 }
+func (t auxProbeTx) HostIP() string          { return "" }
+func (t auxProbeTx) HostPort() int           { return 0 }
+func (t auxProbeTx) ServerID() string        { return t.serverID }
+func (t auxProbeTx) HighestSeverity() string { return "" }
+func (t auxProbeTx) IsInterrupted() bool     { return false }
+func (t auxProbeTx) Request() plugintypes.AuditLogTransactionRequest {
+	return t.req
+}
+func (t auxProbeTx) Response() plugintypes.AuditLogTransactionResponse {
+	if t.resp.headers == nil && t.resp.body == "" {
+		return nil
+	}
+	return t.resp
+}
 func (t auxProbeTx) Producer() plugintypes.AuditLogTransactionProducer { return nil }
 
 type auxProbeReq struct {
 	plugintypes.AuditLogTransactionRequest
-	uri   string
-	body  string
-	files []plugintypes.AuditLogTransactionRequestFiles
+	method  string
+	uri     string
+	body    string
+	headers map[string][]string
+	files   []plugintypes.AuditLogTransactionRequestFiles
 }
 
-func (r auxProbeReq) Method() string               { return "POST" }
+func (r auxProbeReq) Method() string {
+	if r.method != "" {
+		return r.method
+	}
+	return "POST"
+}
 func (r auxProbeReq) Protocol() string             { return "HTTP/1.1" }
 func (r auxProbeReq) URI() string                  { return r.uri }
 func (r auxProbeReq) HTTPVersion() string          { return "HTTP/1.1" }
-func (r auxProbeReq) Headers() map[string][]string { return nil }
+func (r auxProbeReq) Headers() map[string][]string { return r.headers }
 func (r auxProbeReq) Body() string                 { return r.body }
 func (r auxProbeReq) Files() []plugintypes.AuditLogTransactionRequestFiles {
 	return r.files
 }
 func (r auxProbeReq) Length() int32 { return 0 }
+
+type auxProbeResp struct {
+	plugintypes.AuditLogTransactionResponse
+	body    string
+	headers map[string][]string
+}
+
+func (r auxProbeResp) Protocol() string             { return "HTTP/1.1" }
+func (r auxProbeResp) Status() int                  { return 200 }
+func (r auxProbeResp) Headers() map[string][]string { return r.headers }
+func (r auxProbeResp) Body() string                 { return r.body }
 
 // 客户端可控的「非体段」（uri 与 multipart files[].name/mime）必须与体/头同门
 // 封顶且入估算：否则单个 90KiB 全 `&` 文件名（≈540KiB 转义）+ 64KiB 全 `&`
@@ -2756,5 +2784,288 @@ func TestSnapshotAuditLog_auxSegmentsPassThroughWhenUnderCap(t *testing.T) {
 	}
 	if wire.Files[0].Name != "report.pdf" || wire.Files[0].Mime != "application/pdf" {
 		t.Fatalf("文件条目被改写：%#v", wire.Files[0])
+	}
+}
+
+// 截断原语只在 UTF-8 边界停：上限按转义字节累计，落点却可能切进多字节字符
+// 中间。按字节切的实现会把中文 URI/文件名切成半个字符，落盘 JSON 经 UI 渲染
+// 成替换符——用户看到的是「被损坏」而不是「被截断」。故断言三件事：结果仍是
+// 合法 UTF-8、保留字符数等于「不越过上限的最大前缀」、末尾带截断标记。
+func TestSnapshotClipEscaped_stopsOnRuneBoundary(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		max   int
+		runes int
+	}{
+		// 三字节字符：上限 8 落在第三个「中」（字节 6..9）内部。
+		{"cjk mid-rune", strings.Repeat("中", 3), 8, 2},
+		// 四字节字符：上限 10 落在第三个 emoji（字节 8..12）内部。
+		{"emoji mid-rune", strings.Repeat("😀", 3), 10, 2},
+		// 转义放大 6×：`<`/`>` 每个按 6 字节计，上限 13 只容得下两个字符。
+		{"escaped 6x stops at character", "<><><>", 13, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, truncated := snapshotClipEscaped(tc.in, tc.max)
+			if !truncated {
+				t.Fatalf("未截断：%q（上限 %d 转义字节）", got, tc.max)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("截断结果不是合法 UTF-8：%q", got)
+			}
+			if !strings.HasSuffix(got, auditTruncatedMarker) {
+				t.Fatalf("截断结果缺少显式标记：%q", got)
+			}
+			body := strings.TrimSuffix(got, auditTruncatedMarker)
+			if n := utf8.RuneCountInString(body); n != tc.runes {
+				t.Fatalf("保留 %d 个字符，期望 %d（按字节集会切坏字符）", n, tc.runes)
+			}
+			if n := jsonStringEscapedLen(body); n > tc.max {
+				t.Fatalf("保留内容转义字节 %d 越过上限 %d", n, tc.max)
+			}
+		})
+	}
+}
+
+// 恰好等于上限不得截断（边界判定是 `> max` 而不是 `>= max`）：差一个字节的
+// off-by-one 会把「刚好装满」的正常取值标成 TRUNCATED，取证时误判为丢数据。
+func TestSnapshotClipEscaped_keepsInputThatExactlyFillsTheCap(t *testing.T) {
+	in := strings.Repeat("a", 128)
+	got, truncated := snapshotClipEscaped(in, len(in))
+	if truncated {
+		t.Fatalf("恰好等于上限被截断：%q", got)
+	}
+	if got != in {
+		t.Fatalf("未超限取值被改写：%q", got)
+	}
+
+	// 少一字节上限必须截断，且切口落在「上限-1」：与上一条配对，任何方向的
+	// 边界错位（>= / 提前一字节）都会让两者之一失败。
+	got, truncated = snapshotClipEscaped(in, len(in)-1)
+	if !truncated {
+		t.Fatalf("超限一字节未截断：%q", got)
+	}
+	if want := strings.Repeat("a", len(in)-1) + auditTruncatedMarker; got != want {
+		t.Fatalf("截断切口错位：got %q, want %q", got, want)
+	}
+
+	// 早退形态：空串与非正上限原样返回（上限 0 是「不限额」语义，不是「全截」）。
+	if got, truncated := snapshotClipEscaped("", 16); got != "" || truncated {
+		t.Fatalf("空串被改写：%q truncated=%v", got, truncated)
+	}
+	if got, truncated := snapshotClipEscaped(in, 0); got != in || truncated {
+		t.Fatalf("非正上限未按不限额处理：len=%d truncated=%v", len(got), truncated)
+	}
+}
+
+// 调用点契约：超限 URI 必须以标记结尾（标记缺失时 UI 无法区分「半截」与
+// 「完整」），未超限 URI 必须逐字节原样。
+func TestSnapshotAuditLog_uriSegmentsCarryTruncationMarker(t *testing.T) {
+	overCap := "/probe?" + strings.Repeat("&", 60*1024) // `&` 转义 6×，必然越限
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{uri: overCap}}})
+	req := snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+	if !strings.HasSuffix(req.URI_, auditTruncatedMarker) {
+		t.Fatalf("超限 URI 缺少截断标记（尾部 %q）", tailOf(req.URI_, 24))
+	}
+	if n := jsonStringEscapedLen(req.URI_); n > auditURIMaxEscapedBytes {
+		t.Fatalf("超限 URI 转义字节 %d 越过上限 %d", n, auditURIMaxEscapedBytes)
+	}
+
+	// 未超限形态：同一字段必须原样保留（上面所有截断逻辑不得外溢）。
+	const underCap = "/api/v1/rules?page=2"
+	snap = snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{uri: underCap}}})
+	req = snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+	if req.URI_ != underCap {
+		t.Fatalf("未超限 URI 被改写：%q", req.URI_)
+	}
+}
+
+// tailOf 返回 s 的末 n 个字节（失败信息用，避免把 60KiB 夹具打印出来）。
+func tailOf(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// files_dropped 是文件条目截断的披露键，估算必须为它留出固定开销：少算这一项，
+// 「截断披露」本身就会把实际序列化体积推过估算口径，而估算正是入队/单条字节
+// 预算的执法值。断言差值与常量逐字节相等，删除该估算项或改小常量都会红。
+func TestEstimateAuditSnapshotBytes_countsFilesDroppedDisclosure(t *testing.T) {
+	build := func(dropped int) *auditSnapshot {
+		return &auditSnapshot{Transaction_: auditSnapshotTransaction{
+			Request_: &auditSnapshotRequest{URI_: "/upload", FilesDropped_: dropped},
+		}}
+	}
+	withoutDrop, withDrop := build(0), build(3)
+	base := estimateAuditSnapshotBytes(withoutDrop)
+	got := estimateAuditSnapshotBytes(withDrop)
+	if diff := got - base; diff != auditFilesDroppedOverhead {
+		t.Fatalf("files_dropped 估算增量 %d，期望 %d（披露键未被计入）", diff, auditFilesDroppedOverhead)
+	}
+	// 上界性：估算不得低于实际序列化体积（含披露键）。
+	raw, err := json.Marshal(withDrop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got < int64(len(raw)) {
+		t.Fatalf("估算 %d < 序列化 %d", got, len(raw))
+	}
+}
+
+// denseHeaderSet 返回 5000 条三字符键/值互不相同的 header 表：序列化体积
+// ~70KiB，越过 64KiB 快照上限，用于构造「头段打满」的最坏形态夹具。
+func denseHeaderSet() map[string][]string {
+	headers := make(map[string][]string, 5000)
+	for i := range 5000 {
+		n := i
+		key := []byte{'a', 'a', 'a'}
+		for pos := 2; pos >= 0; pos-- {
+			key[pos] = byte('a' + n%26)
+			n /= 26
+		}
+		headers[string(key)] = []string{string(key)}
+	}
+	return headers
+}
+
+// 事务字符串（request.method 与 transaction.server_id）与 uri/files 同属
+// 客户端可控段：不设限时任一项都能把快照推过 auditItemMaxBytes，让「触发
+// WAF 的这次请求」自身的安全事件整行丢弃（事件列表/大屏/自动封禁喂入全缺）。
+// 钉：越限按转义字节封顶并留标记、估算仍 ≥ 实际序列化且 ≤ 单条上限、入队
+// 零丢弃。
+func TestSnapshotAuditLog_transactionStringsStayUnderItemCap(t *testing.T) {
+	denseBody := strings.Repeat("&", auditBodyMaxBytes)
+	denseField := strings.Repeat("&", 90*1024)
+	files := make([]plugintypes.AuditLogTransactionRequestFiles, 0, 200)
+	for range 200 {
+		files = append(files, auditSnapshotFile{Name_: denseField, Size_: 1, Mime_: denseField})
+	}
+	headers := denseHeaderSet()
+	denseFixture := func() auxProbeTx {
+		return auxProbeTx{
+			req: auxProbeReq{
+				uri:     "/probe?" + strings.Repeat("&", 60*1024),
+				body:    denseBody,
+				headers: headers,
+				files:   files,
+			},
+			resp: auxProbeResp{body: denseBody, headers: headers},
+		}
+	}
+	// 上限门槛写字面量：用例要在未修复基线上也能编译，从而红在断言上。
+	const (
+		methodCapEscaped = 64
+		serverCapEscaped = 256
+		truncatedSuffix  = "\n...[TRUNCATED]"
+	)
+	wide := func(ch string) string { return strings.Repeat(ch, 128*1024) }
+	cases := []struct {
+		name     string
+		mutate   func(*auxProbeTx)
+		field    func(*auditSnapshotTransaction) string
+		capBytes int
+	}{
+		{
+			name:     "长 method",
+			mutate:   func(tx *auxProbeTx) { tx.req.method = wide("M") },
+			field:    func(tr *auditSnapshotTransaction) string { return tr.Request_.Method_ },
+			capBytes: methodCapEscaped,
+		},
+		{
+			name:     "长 server_id",
+			mutate:   func(tx *auxProbeTx) { tx.serverID = wide("h") },
+			field:    func(tr *auditSnapshotTransaction) string { return tr.ServerID_ },
+			capBytes: serverCapEscaped,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := denseFixture()
+			tc.mutate(&tx)
+			snap := snapshotAuditLog(auxProbeAuditLog{tx: tx})
+			got := tc.field(&snap.Transaction_)
+			if !strings.HasSuffix(got, truncatedSuffix) {
+				t.Fatalf("截断标记缺失：保留 %d 字节", len(got))
+			}
+			if escaped := jsonStringEscapedLen(got); escaped > tc.capBytes+len(truncatedSuffix) {
+				t.Fatalf("转义字节 %d 越过 %d 上限", escaped, tc.capBytes)
+			}
+
+			serialized, err := json.Marshal(snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			size := estimateAuditSnapshotBytes(snap)
+			if size < int64(len(serialized)) {
+				t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", size, len(serialized))
+			}
+			if size > auditItemMaxBytes {
+				t.Fatalf("估算 %d > 单条上限 %d（被构造的这次请求自身事件仍会被整行丢弃）", size, auditItemMaxBytes)
+			}
+
+			p := &auditPipeline{
+				target: filepath.Join(t.TempDir(), "audit.log"),
+				queue:  make(chan lbAuditItem, 2),
+				done:   make(chan struct{}),
+			}
+			if err := p.openFile(0o644); err != nil {
+				t.Fatal(err)
+			}
+			p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"tx-string-dense"}`)}})
+			if dropped := p.dropped.Load(); dropped != 0 {
+				t.Fatalf("dropped=%d, want 0（客户端构造的超长 method/server_id 不得挤掉自身事件）", dropped)
+			}
+			if length := len(p.queue); length != 1 {
+				t.Fatalf("queue length=%d, want 1", length)
+			}
+		})
+	}
+}
+
+// 未超限的 method/server_id 必须原样保留（封顶只在越限时生效，不改写正常值）。
+func TestSnapshotAuditLog_transactionStringsPassThroughWhenUnderCap(t *testing.T) {
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{
+		serverID: "edge-node-1",
+		req:      auxProbeReq{method: "PROPFIND"},
+	}})
+	if got := snap.Transaction_.Request_.Method_; got != "PROPFIND" {
+		t.Fatalf("method 被改写：%q", got)
+	}
+	if got := snap.Transaction_.ServerID_; got != "edge-node-1" {
+		t.Fatalf("server_id 被改写：%q", got)
+	}
+}
+
+// auditItemMaxBytes 的上界推导必须可复算：所有客户端可控段的上限之和 + 48KiB
+// 余量 ≤ 单条上限。任何新增客户端可控段（或放宽既有上限）若不同步扩容，本门
+// 立即失败——否则「封顶后仍整行丢弃」的同族缺陷会以新字段形式回归。
+func TestAuditItemMaxBytes_coversAllClientControlledSegments(t *testing.T) {
+	const reserve int64 = 48 * 1024
+	marker := int64(len(auditTruncatedMarker))
+	worst := 2*(6*int64(auditBodyMaxBytes)+marker) + // 请求/响应体（64KiB 全 `&` + 标记）
+		2*int64(auditHeadersMaxBytes) + // 请求/响应头（快照侧已按转义字节封顶）
+		int64(auditMessagesMaxBytes) + // messages 内容预算
+		int64(auditMethodMaxEscapedBytes) + // 内容预算已扣除标记长度
+		int64(auditServerIDMaxEscapedBytes) +
+		int64(auditURIMaxEscapedBytes) +
+		int64(auditFilesMaxEscapedBytes) +
+		int64(auditFilesMaxEntries)*auditFileEntryOverhead // files 条目固定开销
+	if worst+reserve > auditItemMaxBytes {
+		t.Fatalf("客户端可控段上限之和 %d + 余量 %d = %d > 单条上限 %d",
+			worst, reserve, worst+reserve, auditItemMaxBytes)
+	}
+	// 夹具有效性：上限之和 + 余量后剩余的头部空间必须小于 16KiB（条目固定
+	// 开销与插件侧字符串的既有实测余量）。放宽到 ≥16KiB 说明出现了未被任何
+	// 段声明的空间，新客户端可控段会在不报错的情况下挤占它。
+	if slack := auditItemMaxBytes - worst - reserve; slack >= 16*1024 {
+		t.Fatalf("余量口径漂移：上限之和 + 余量后仍余 %d 字节未被任何段声明", slack)
 	}
 }

@@ -9,10 +9,10 @@
       </div>
     </template>
 
-    <el-form :model="settings" label-width="140px" class="caddy-form">
+    <el-form :model="settings" label-width="140px" class="caddy-form" :disabled="formFrozen">
       <el-divider content-position="left">运行日志</el-divider>
       <el-form-item label="日志级别">
-        <el-select v-model="settings.caddy_log_level" :disabled="isReadOnly" style="width: 140px">
+        <el-select v-model="settings.caddy_log_level" :disabled="formFrozen" style="width: 140px">
           <el-option label="debug" value="debug" />
           <el-option label="info" value="info" />
           <el-option label="warn" value="warn" />
@@ -21,7 +21,7 @@
         <span class="form-tip-inline">建议 info；debug 日志量大</span>
       </el-form-item>
       <el-form-item label="日志大小">
-        <el-input-number v-model="settings.caddy_log_size_mb" :disabled="isReadOnly" :min="100" :max="10240" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.caddy_log_size_mb" :disabled="formFrozen" :min="100" :max="10240" controls-position="right" class="number-input" />
         <span class="form-tip-inline tip-nowrap">MB，超限归档保留 5 份</span>
       </el-form-item>
       <el-form-item label="运行日志">
@@ -31,39 +31,39 @@
 
       <el-divider content-position="left">请求与超时</el-divider>
       <el-form-item label="请求体大小">
-        <el-input-number v-model="settings.request_body_max_size_mb" :disabled="isReadOnly" :min="1" :max="4096" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.request_body_max_size_mb" :disabled="formFrozen" :min="1" :max="4096" controls-position="right" class="number-input" />
         <span class="form-tip-inline tip-nowrap">MB，请求体上限；默认 128，必须为 1-4096（0 不再表示默认）</span>
       </el-form-item>
       <el-form-item label="读取超时">
-        <el-input-number v-model="settings.http_read_timeout" :disabled="isReadOnly" :min="1" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.http_read_timeout" :disabled="formFrozen" :min="1" controls-position="right" class="number-input" />
         <span class="form-tip-inline tip-nowrap">秒，读请求超时；必须 ≥1（0 不再表示无超时），常用 60</span>
       </el-form-item>
       <el-form-item label="写入超时">
-        <el-input-number v-model="settings.http_write_timeout" :disabled="isReadOnly" :min="1" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.http_write_timeout" :disabled="formFrozen" :min="1" controls-position="right" class="number-input" />
         <span class="form-tip-inline">秒，写响应超时；必须 ≥1（0 不再表示无超时），常用 60</span>
       </el-form-item>
       <el-form-item label="空闲超时">
-        <el-input-number v-model="settings.http_idle_timeout" :disabled="isReadOnly" :min="1" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.http_idle_timeout" :disabled="formFrozen" :min="1" controls-position="right" class="number-input" />
         <span class="form-tip-inline">秒，Keep-Alive 空闲超时；必须 ≥1（0 不再表示默认），常用 120</span>
       </el-form-item>
       <el-form-item label="上游 Keepalive">
-        <el-input-number v-model="settings.upstream_keepalive_timeout" :disabled="isReadOnly" :min="0" controls-position="right" class="number-input" />
+        <el-input-number v-model="settings.upstream_keepalive_timeout" :disabled="formFrozen" :min="0" controls-position="right" class="number-input" />
         <span class="form-tip-inline">秒，上游空闲保持；0 = 默认 2 分钟</span>
       </el-form-item>
 
       <el-divider content-position="left">代理超时</el-divider>
-      <ProxyTimeoutFields :value="settings" inherit-label="Caddy 默认" :disabled="isReadOnly" show-suggested @update="updateProxyTimeout" />
+      <ProxyTimeoutFields :value="settings" inherit-label="Caddy 默认" :disabled="formFrozen" show-suggested @update="updateProxyTimeout" />
 
       <el-divider content-position="left">响应头</el-divider>
       <el-form-item label="Server Tokens">
-        <el-switch v-model="settings.server_tokens_hidden" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
+        <el-switch v-model="settings.server_tokens_hidden" :disabled="formFrozen" active-text="开启" inactive-text="关闭" />
         <span class="form-tip-inline">隐藏响应 Server 头，减少指纹暴露</span>
       </el-form-item>
 
       <el-divider content-position="left">安全防护</el-divider>
       <el-form-item label="受信代理">
         <div class="trusted-toggle">
-          <el-switch v-model="settings.trusted_proxy_enabled" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
+          <el-switch v-model="settings.trusted_proxy_enabled" :disabled="formFrozen" active-text="开启" inactive-text="关闭" />
           <div class="form-tip-line">CDN/前置代理回源时开启，按真实客户端 IP 判定名单/地域/限流</div>
         </div>
       </el-form-item>
@@ -76,7 +76,7 @@
               filterable
               allow-create
               default-first-option
-              :disabled="isReadOnly"
+              :disabled="formFrozen"
               placeholder="粘贴该 CDN 回源网段（CIDR），以官方公布为准"
               class="trusted-field"
             />
@@ -85,7 +85,7 @@
               link
               type="primary"
               class="trusted-save-list-btn"
-              :disabled="trustedRanges.length === 0"
+              :disabled="formFrozen || trustedRanges.length === 0"
               @click="openSaveListDialog"
             >存为列表</el-button>
           </div>
@@ -101,7 +101,7 @@
             v-model="trustedRangeRefs"
             multiple
             filterable
-            :disabled="isReadOnly"
+            :disabled="formFrozen"
             placeholder="选择要引用的 IP 地址列表"
             class="trusted-field"
           >
@@ -122,7 +122,7 @@
             filterable
             allow-create
             default-first-option
-            :disabled="isReadOnly"
+            :disabled="formFrozen"
             placeholder="留空 = 仅 X-Forwarded-For"
             class="trusted-field"
           />
@@ -132,7 +132,7 @@
         <el-form-item label="预设填充">
           <el-select
             v-model="trustedPresetKey"
-            :disabled="isReadOnly"
+            :disabled="formFrozen"
             placeholder="按 CDN 填充请求头"
             clearable
             class="trusted-preset-field"
@@ -143,7 +143,7 @@
           <div class="form-tip-line">按所选 CDN 一键填充上方「请求头」推荐值；仅辅助输入，不影响已填内容以外的配置</div>
         </el-form-item>
         <el-form-item label="严格模式">
-          <el-switch v-model="settings.trusted_proxy_strict" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
+          <el-switch v-model="settings.trusted_proxy_strict" :disabled="formFrozen" active-text="开启" inactive-text="关闭" />
           <el-tooltip content="关闭后按最左值取 IP，可被伪造，不建议关闭" placement="top">
             <span class="form-tip-inline">严格取「最右可信」值；关闭仅用于特殊代理链</span>
           </el-tooltip>
@@ -159,7 +159,7 @@
 
       <el-divider content-position="left">访问日志</el-divider>
       <el-form-item label="自定义格式">
-        <el-switch v-model="settings.access_log_json" :disabled="isReadOnly" active-text="自定义 JSON" inactive-text="Caddy JSON" />
+        <el-switch v-model="settings.access_log_json" :disabled="formFrozen" active-text="自定义 JSON" inactive-text="Caddy JSON" />
         <div class="form-tip-line">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生 JSON（X-API-Key 请求头始终脱敏）。关闭后保存会清空已配置的自定义字段映射</div>
       </el-form-item>
       <el-form-item v-if="settings.access_log_json" label="日志格式">
@@ -170,10 +170,10 @@
             :rows="8"
             maxlength="16384"
             show-word-limit
-            :disabled="isReadOnly"
+            :disabled="formFrozen"
             placeholder="每行一个字段映射，格式: caddy字段路径 -> 自定义名称，或 caddy字段路径 -> delete"
           />
-          <el-button text type="primary" size="small" :disabled="isReadOnly" @click="settings.access_log_format = DEFAULT_ACCESS_LOG_FORMAT">还原默认格式</el-button>
+          <el-button text type="primary" size="small" :disabled="formFrozen" @click="settings.access_log_format = DEFAULT_ACCESS_LOG_FORMAT">还原默认格式</el-button>
           <div class="form-tip-line format-tip">
             <!-- 上限与后端写侧门同源（internal/handlers/caddy.go：16KiB / 200 行，
                  按 UTF-8 字节计）——超限保存会被拒绝，先在此告知而不是让用户试错 -->
@@ -187,7 +187,7 @@
       </el-form-item>
       <div class="form-actions">
         <el-button type="primary" :loading="saving" :disabled="isReadOnly || !props.configLoaded" @click="handleSave">保存</el-button>
-        <el-button type="warning" :loading="reloading" :disabled="isReadOnly || reloading" @click="handleReloadCaddy">重载 Caddy</el-button>
+        <el-button type="warning" :loading="reloading" :disabled="formFrozen || reloading" @click="handleReloadCaddy">重载 Caddy</el-button>
       </div>
     </el-form>
   </el-card>
@@ -236,7 +236,7 @@
     <template #header>
       <DialogHeader :icon="Tickets" title="存为地址列表" subtitle="内联网段转为可复用的共享 IP 列表" />
     </template>
-    <el-form label-width="80px" @submit.prevent>
+    <el-form label-width="80px" @submit.prevent :disabled="savingList">
       <el-form-item label="来源">
         <span>当前内联网段（{{ trustedRanges.length }} 条）</span>
       </el-form-item>
@@ -338,6 +338,9 @@ const emit = defineEmits<{ (event: 'save'): void }>()
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 const saving = ref(false)
+// 保存中冻结整卡表单：Caddy 应用可达数秒，成功由父级回填整卡——在途编辑会被
+// 静默覆盖（口径与 BasicSettings/策略向导一致）。
+const formFrozen = computed(() => isReadOnly.value || saving.value)
 
 // —— 受信代理（CDN 真实 IP，v2.3.x）：settings 携 JSON 文本，表单用数组代理 ——
 const trustedRanges = ref<string[]>([])

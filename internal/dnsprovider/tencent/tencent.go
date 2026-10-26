@@ -14,6 +14,7 @@ import (
 	tcerr "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
+	"lazy-balancer-v2/internal/dnsname"
 	"lazy-balancer-v2/internal/dnsprovider/internal/retry"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
@@ -101,9 +102,10 @@ func New(secretID, secretKey string) (*Provider, error) {
 // Present for the same name adds another record, and cleanup removes records by
 // ownership record ID / value.
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
-	zone = strings.TrimSuffix(zone, ".")
-	subDomain := strings.TrimSuffix(tokenFQDN, ".")
-	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	// zone 与 tokenFQDN 都按 dnsname 单源归一后再派生相对子域（与 dnspod 侧
+	// 同一实现）：大小写敏感的后缀比较会把混合大小写 FQDN 整体当成 sub_domain。
+	zone = dnsname.NormalizeName(zone)
+	subDomain := dnsname.RelativeTo(tokenFQDN, zone)
 
 	recordID, err := p.createRecord(ctx, zone, subDomain, value, ttl)
 	if err != nil {
@@ -154,9 +156,8 @@ func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value stri
 // 纯本地计数按值清理将选中的记录条数。键为 zone+"|"+subDomain——按
 // "|"+subDomain 后缀聚合，跨 zone 同名子域的少量多计只会让预算偏大。
 func (p *Provider) CountCleanupRecords(zone, tokenFQDN, value string) int {
-	zone = strings.TrimSuffix(zone, ".")
-	subDomain := strings.TrimSuffix(tokenFQDN, ".")
-	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	zone = dnsname.NormalizeName(zone)
+	subDomain := dnsname.RelativeTo(tokenFQDN, zone)
 	p.mu.Lock()
 	fallback := 0
 	for key, entries := range p.owned {
@@ -187,9 +188,8 @@ func (p *Provider) CountCleanupRecords(zone, tokenFQDN, value string) int {
 // cleanUp 是同构双实现（有意保留——两者底层 SDK/记录 ID 类型不同）。任一侧
 // 修改删除/留痕/兜底排空逻辑时，MUST 同步另一侧并保持语义一致。
 func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, byValue bool) error {
-	zone = strings.TrimSuffix(zone, ".")
-	subDomain := strings.TrimSuffix(tokenFQDN, ".")
-	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	zone = dnsname.NormalizeName(zone)
+	subDomain := dnsname.RelativeTo(tokenFQDN, zone)
 
 	key := zone + "|" + subDomain
 	var records []ownership.Record

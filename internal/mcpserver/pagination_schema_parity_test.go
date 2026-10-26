@@ -2,6 +2,9 @@ package mcpserver
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -44,6 +47,32 @@ func readHandlerSource(t *testing.T, name string) string {
 		t.Fatalf("读 %s: %v", name, err)
 	}
 	return string(body)
+}
+
+// readHandlerCodeText 返回 handler 源文件里**代码字符串字面量**的联接文本：
+// 走 go/parser 取 AST 的 BasicLit，注释与文档块一律不在面内。原文包含匹配
+// 会让「文案只剩注释」也满足「单源」断言——实现漂移、注释留旧句时门禁仍绿。
+func readHandlerCodeText(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join("..", "handlers", name)
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("解析 %s: %v", path, err)
+	}
+	var literals []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			if v, err := strconv.Unquote(lit.Value); err == nil {
+				literals = append(literals, v)
+			}
+		}
+		return true
+	})
+	if len(literals) == 0 {
+		t.Fatalf("%s 未解析到任何字符串字面量（AST 面为空，断言会恒失败）", name)
+	}
+	return strings.Join(literals, "\n")
 }
 
 // handlerFunctionSource 截取某个 handler 方法体（到下一个顶层 func 声明）。

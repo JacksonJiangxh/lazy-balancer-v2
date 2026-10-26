@@ -239,4 +239,45 @@ func TestUpdateConfig_accessLogFormatSizeLimit(t *testing.T) {
 	if res := send(http.MethodPut, "/config", exact+"c"); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "字节") {
 		t.Fatalf("16KiB+1 save status=%d body=%s, want 400 含「字节」", res.Code, res.Body.String())
 	}
+
+	// 纯空白格式=「不裁剪原生字段」的语义，但空白串仍是可落库自由串：规模门
+	// 必须先于空白短路，否则纯空格/空行超限串可绕过 16KiB/200 行上限落库。
+	// 先钉一个已知落库值——超限请求必须零落库。
+	if _, err := db.DB.Exec(`UPDATE global_config SET access_log_format='request>host -> h' WHERE id=1`); err != nil {
+		t.Fatalf("seed access_log_format: %v", err)
+	}
+	readStored := func() string {
+		var stored string
+		if err := db.DB.QueryRow(`SELECT COALESCE(access_log_format,'') FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+			t.Fatalf("read access_log_format: %v", err)
+		}
+		return stored
+	}
+	if res := preview(strings.Repeat(" ", maxBytes)); res.Code != http.StatusOK {
+		t.Fatalf("16KiB 纯空格 preview status=%d body=%s, want 200（上限内不得拦截）", res.Code, res.Body.String())
+	}
+	overSpaces := strings.Repeat(" ", maxBytes+1)
+	if res := preview(overSpaces); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "字节") {
+		t.Fatalf("16KiB+1 纯空格 preview status=%d body=%s, want 400 含「字节」", res.Code, res.Body.String())
+	}
+	if res := send(http.MethodPut, "/config", overSpaces); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "字节") {
+		t.Fatalf("16KiB+1 纯空格 save status=%d body=%s, want 400 含「字节」", res.Code, res.Body.String())
+	}
+	if stored := readStored(); stored != "request>host -> h" {
+		t.Fatalf("超限纯空格请求落库=%q, want 原值（零落库）", stored)
+	}
+	// 行数域同理：每行一个空格+换行，空白行逐行计数。
+	blankLines := func(n int) string { return strings.Repeat(" \n", n) }
+	if res := preview(blankLines(200)); res.Code != http.StatusOK {
+		t.Fatalf("200 空白行 preview status=%d body=%s, want 200", res.Code, res.Body.String())
+	}
+	if res := preview(blankLines(201)); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("201 空白行 preview status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	if res := send(http.MethodPut, "/config", blankLines(201)); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("201 空白行 save status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	if stored := readStored(); stored != "request>host -> h" {
+		t.Fatalf("超限空白行请求落库=%q, want 原值（零落库）", stored)
+	}
 }

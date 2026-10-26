@@ -1,7 +1,9 @@
 package retryafter
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -43,5 +45,38 @@ func TestParse_httpDateEqualToNowIsZero(t *testing.T) {
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	if got := Parse(now.Format(http.TimeFormat), now); got != 0 {
 		t.Fatalf("Parse(now)=%v, want 0", got)
+	}
+}
+
+// 超大秒数的乘法溢出：time.Duration 是 int64 纳秒，`seconds * time.Second` 会
+// 绕回——可解析的异常上游值（如 18446744074 → 约 290ms、9223372037 → 负值）
+// 会让退避从「长期等待」变成「立刻重试」，反而加剧限流。超界必须饱和为最大
+// 时长，由消费方既有的 3h/30s 上限继续收敛。
+func TestParse_saturatesOverflowingSeconds(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	maxSeconds := int64(math.MaxInt64 / int64(time.Second))
+
+	cases := []struct {
+		name   string
+		header string
+		want   time.Duration
+	}{
+		{"max safe seconds", strconv.FormatInt(maxSeconds, 10), time.Duration(maxSeconds) * time.Second},
+		{"one second past safe", strconv.FormatInt(maxSeconds+1, 10), time.Duration(math.MaxInt64)},
+		{"wraps to negative", "9223372037", time.Duration(math.MaxInt64)},
+		{"wraps to sub-second", "18446744074", time.Duration(math.MaxInt64)},
+		{"max int", strconv.FormatInt(math.MaxInt64, 10), time.Duration(math.MaxInt64)},
+		{"ordinary seconds unaffected", "120", 120 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Parse(tc.header, now)
+			if got != tc.want {
+				t.Fatalf("Parse(%q)=%v, want %v", tc.header, got, tc.want)
+			}
+			if got < 120*time.Second {
+				t.Fatalf("Parse(%q)=%v：溢出绕回成短等待", tc.header, got)
+			}
+		})
 	}
 }

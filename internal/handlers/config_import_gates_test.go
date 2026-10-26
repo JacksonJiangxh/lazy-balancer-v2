@@ -9,24 +9,46 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 导入侧 upstream_keepalive_timeout 缺非负门——写侧拒绝
-// 负值，负值落库后基础设置保存恒 400、规则编辑被同门卡死。
-func TestValidateV2BackupRuntimeSettings_normalizesNegativeKeepalive(t *testing.T) {
-	config := map[string]any{"upstream_keepalive_timeout": int64(-5)}
-	if err := validateV2BackupRuntimeSettings(config, nil); err != nil {
-		t.Fatalf("runtime settings: %v", err)
-	}
-	if got, ok := backupInteger(config["upstream_keepalive_timeout"]); !ok || got != 0 {
-		t.Fatalf("keepalive=%v, want 0（负数必须归零）", config["upstream_keepalive_timeout"])
+// 导入侧 upstream_keepalive_timeout 的负值/非整数归零由链内全局配置数值归一
+// 单点完成并产生说明（预览 warning 与导入成功审计同源）；写侧拒绝负值，负值
+// 落库后基础设置保存恒 400、规则编辑被同门卡死。
+func TestImportChain_normalizesKeepaliveWithClampNote(t *testing.T) {
+	normalize := func(value any) (any, []string) {
+		t.Helper()
+		config := map[string]any{"upstream_keepalive_timeout": value}
+		chain := &importValidationChain{backup: &configBackup{Config: config}}
+		if err := chain.normalizeGlobalConfigNumbers(); err != nil {
+			t.Fatalf("normalizeGlobalConfigNumbers(%v): %v", value, err)
+		}
+		return config["upstream_keepalive_timeout"], chain.result.ConfigClampNotes
 	}
 
-	// 回归形状：合法值原样保留（不得把钳制扩大成恒零）。
-	config = map[string]any{"upstream_keepalive_timeout": int64(60)}
-	if err := validateV2BackupRuntimeSettings(config, nil); err != nil {
-		t.Fatalf("runtime settings: %v", err)
+	for _, tt := range []struct {
+		name  string
+		value any
+	}{
+		{"负整数", int64(-5)},
+		{"负浮点", float64(-5)},
+		{"非整数形态", "not-a-number"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stored, notes := normalize(tt.value)
+			if got, ok := backupInteger(stored); !ok || got != 0 {
+				t.Fatalf("keepalive=%v, want 0（负值/非整数必须归零）", stored)
+			}
+			if len(notes) != 1 || !strings.Contains(notes[0], "upstream_keepalive_timeout") {
+				t.Fatalf("notes=%v, want 一条点名 upstream_keepalive_timeout 的归一说明", notes)
+			}
+		})
 	}
-	if got, _ := backupInteger(config["upstream_keepalive_timeout"]); got != 60 {
+
+	// 回归形状：合法值原样保留且不产生说明（不得把钳制扩大成恒零）。
+	stored, notes := normalize(int64(60))
+	if got, _ := backupInteger(stored); got != 60 {
 		t.Fatalf("keepalive=%d, want 60", got)
+	}
+	if len(notes) != 0 {
+		t.Fatalf("合法值产生归一说明: %v", notes)
 	}
 }
 

@@ -422,12 +422,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			// 传任务 ctx——Stop(cancel) 可在大批量分批删除中途生效（批间
-			// 复检），不让审计保留清理拖过关停预算。
-			auditDeleted, auditErr := CleanupAuditLogs(rc.Ctx)
-			runsDeleted, runsErr := taskengine.PurgeTaskRuns(90)
+			// 复检），且取消后不再启动任务历史删除，不让清理拖过关停预算。
+			auditDeleted, runsDeleted, err := auditRetentionRound(rc.Ctx)
 			// 失败传播：两段清理任一失败都让 task_runs 落 failed，且摘要行
 			// 不得称「清理完成」（失败轮谎报完成会把排障方向带偏）。
-			if err := errors.Join(auditErr, runsErr); err != nil {
+			if err != nil {
 				TaskLogfWarn("audit-retention", "cleanup", "清理未完成：审计日志已删除 %d 条、任务运行历史已删除 %d 行后中止，错误：%v", auditDeleted, runsDeleted, err)
 				return err
 			}

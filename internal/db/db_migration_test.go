@@ -2601,6 +2601,7 @@ func TestMigrateTCPRuleSecurityPolicyBindings_clusterBumpFailureRollsBack(t *tes
 		BEGIN SELECT RAISE(ABORT, 'injected cluster version failure'); END;`); err != nil {
 		t.Fatalf("seed bindings and bump failure trigger: %v", err)
 	}
+	drainSystemAuditBuffer()
 
 	// When
 	err := migrateTCPRuleSecurityPolicyBindings()
@@ -2622,6 +2623,9 @@ func TestMigrateTCPRuleSecurityPolicyBindings_clusterBumpFailureRollsBack(t *tes
 	if tcpBindings != 1 || httpBindings != 1 || version != 0 {
 		t.Fatalf("after bump failure tcp/http/version=%d/%d/%d, want 1/1/0", tcpBindings, httpBindings, version)
 	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("回滚后不得留下「已审计但绑定未删」的假留痕: %+v", entries)
+	}
 
 	// And 故障解除后重试成功，版本恰好推进一次。
 	if _, err := database.Exec(`DROP TRIGGER fail_tcp_binding_version_bump`); err != nil {
@@ -2641,6 +2645,10 @@ func TestMigrateTCPRuleSecurityPolicyBindings_clusterBumpFailureRollsBack(t *tes
 	}
 	if tcpBindings != 0 || httpBindings != 1 || version != 1 {
 		t.Fatalf("after retry tcp/http/version=%d/%d/%d, want 0/1/1", tcpBindings, httpBindings, version)
+	}
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || !strings.Contains(entries[0].detail, "安全策略绑定") {
+		t.Fatalf("重试成功应恰留一条聚合审计: %+v", entries)
 	}
 }
 

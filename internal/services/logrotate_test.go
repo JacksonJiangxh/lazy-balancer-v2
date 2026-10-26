@@ -215,7 +215,7 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 // 先前用例留下的全局库，定向单跑/乱序运行时必红，且失败文案指错方向。
 func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
 	setupIsolatedDB(t)
-	if months, err := auditRetentionMonths(); err != nil {
+	if months, err := auditRetentionMonths(t.Context()); err != nil {
 		t.Fatalf("前置：审计保留月数口径不可用（保留期清理会被整体跳过，本用例测不到写锁等待）: %v", err)
 	} else if months < 1 {
 		t.Fatalf("前置：审计保留月数=%d，保留期清理不会删任何文件", months)
@@ -275,7 +275,7 @@ func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
 // 断言会把「保留期门未通过」误报成「尺寸求值阻塞了清理」。
 func TestTaskLogsHousekeeping_runsWhileSizeEvalInFlight(t *testing.T) {
 	setupIsolatedDB(t)
-	if months, err := auditRetentionMonths(); err != nil {
+	if months, err := auditRetentionMonths(t.Context()); err != nil {
 		t.Fatalf("前置：审计保留月数口径不可用（保留期清理会被整体跳过）: %v", err)
 	} else if months < 1 {
 		t.Fatalf("前置：审计保留月数=%d，保留期清理不会删任何文件", months)
@@ -369,7 +369,7 @@ func TestRuntimeLogCleanupOnce_reportsRetentionMonthsSingleSource(t *testing.T) 
 	res := RuntimeLogCleanupOnce(context.Background(), logFile)
 
 	// Then：保留月数=单源取值，且与实际删除口径一致（13 月前副本超 6 月保留期）
-	wantMonths, monthsErr := auditRetentionMonths()
+	wantMonths, monthsErr := auditRetentionMonths(t.Context())
 	if monthsErr != nil {
 		t.Fatalf("读取保留月数: %v", monthsErr)
 	}

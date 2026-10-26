@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // ConfigFieldSections 配置字段 → 面板卡片段落映射（字段级审计归因用）。
@@ -202,19 +203,33 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 // log-cleanup 摘要行不再自行查库复算月数，改为复用
 // RuntimeLogCleanupOnce 回填的 RuntimeCleanupResult.RetentionMonths——仍在
 // 上述三消费点内，未新增第四份口径。
-func auditRetentionMonths() (int, error) {
+//
+// ctx 贯穿本条首段读取：调用方都处在有界关停/导入排空预算内，取消已发出即
+// 按 ctx 返回，不把「查询被主库写锁挡住」拖过预算。句柄取局部快照——nil
+// 判定与查询必须针对同一个 *sql.DB，关停尾部 db.Close() 可能在两者之间把
+// 包级 db.DB 置 nil。
+func auditRetentionMonths(ctx context.Context) (int, error) {
 	defaultMonths := db.DefaultAuditRetentionMonths
-	if db.DB == nil {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	database := db.DB
+	if database == nil {
 		Logf("warn", "审计保留月数口径未知（数据库未初始化或已关闭），本轮跳过保留期删除")
 		return 0, fmt.Errorf("保留月数口径未知：数据库未初始化或已关闭")
 	}
 	var months int
-	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months, ?) FROM global_config WHERE id=1", db.DefaultAuditRetentionMonths).Scan(&months); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COALESCE(audit_retention_months, ?) FROM global_config WHERE id=1", db.DefaultAuditRetentionMonths).Scan(&months); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// 配置行缺失＝从未配置：默认值即用户口径，继续清理（仍留痕，
 			// 与「读取失败不得静默」口径一致）。
 			Logf("warn", "审计保留月数配置行缺失，按默认 %d 个月执行: %v", defaultMonths, err)
 			return defaultMonths, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// 取消打断查询：按取消原因返回，不记为「读取失败」（关停窗口
+			// 不刷误导性 warn）。
+			return 0, ctxErr
 		}
 		Logf("warn", "读取审计保留月数失败，本轮跳过保留期删除（不按默认 %d 个月删除证据）: %v", defaultMonths, err)
 		return 0, fmt.Errorf("读取审计保留月数失败: %w", err)
@@ -243,7 +258,7 @@ var errAuditDBUnavailable = errors.New("审计数据库未初始化")
 // 复检 ctx（删除按批幂等，中途取消语义无损——关停/取消可中断本轮，不让
 // 日志清理轮拖过关停预算）。
 func CleanupAuditLogs(ctx context.Context) (int, error) {
-	retentionMonths, monthsErr := auditRetentionMonths()
+	retentionMonths, monthsErr := auditRetentionMonths(ctx)
 	if monthsErr != nil {
 		// 保留期口径未知时一条都不删：按更短默认删除是不可逆的证据损失。
 		return 0, monthsErr
@@ -280,6 +295,22 @@ func CleanupAuditLogs(ctx context.Context) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// auditRetentionRound 一轮审计保留清理：审计日志分段 + 任务运行历史分段。
+// 两段共用任务 ctx，且分段之间复检——本轮已被取消/关停打断时不得再启动
+// 第二段不可逆删除（首段已删的行不可逆，但计数如实上报）。
+func auditRetentionRound(ctx context.Context) (auditDeleted int, runsDeleted int64, err error) {
+	auditDeleted, auditErr := CleanupAuditLogs(ctx)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// 首段因同一取消提前返回时不再叠加同一条取消错误（摘要行只说一次）。
+		if auditErr != nil && errors.Is(auditErr, ctxErr) {
+			return auditDeleted, 0, auditErr
+		}
+		return auditDeleted, 0, errors.Join(auditErr, ctxErr)
+	}
+	runsDeleted, runsErr := taskengine.PurgeTaskRuns(ctx, 90)
+	return auditDeleted, runsDeleted, errors.Join(auditErr, runsErr)
 }
 
 // FormatAuditAction 中间件侧通用审计的动作映射。仅保留 5 条 Generic

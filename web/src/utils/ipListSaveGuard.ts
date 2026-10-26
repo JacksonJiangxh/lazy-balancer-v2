@@ -44,3 +44,40 @@ export function entriesMissingFromPayload(
   }
   return missing
 }
+
+/** 名单条目最小形状（value 为身份，其余字段随详情原样回写）。 */
+interface IpListEntryLike {
+  readonly value: string
+  readonly remark?: string
+  readonly created_at?: string
+  readonly expires_at?: string
+}
+
+const entryKey = (value: string): string => value.trim().toLowerCase()
+
+/**
+ * 保存前的最终复核：把「打开弹框后由任务新增、本次载荷又没有」的封禁条目
+ * 原样并入载荷，避免整表替换把它们删掉（提前解封）。
+ *
+ * 只看「打开快照里没有」的条目——打开时就存在、用户主动删掉的不算并发新增，
+ * 否则手动解封会被静默回填，用户的删除动作失效。比对按值（去空白、大小写
+ * 不敏感）去重，返回并入的条目与并入的值（供保存后显性提示）。
+ */
+export function mergeConcurrentBanEntries<T extends IpListEntryLike>(
+  serverEntries: readonly T[],
+  payloadEntries: readonly T[],
+  openSnapshotValues: readonly string[],
+): { entries: T[]; preserved: string[] } {
+  const missing = new Set(entriesMissingFromPayload(serverEntries.map((entry) => entry.value), payloadEntries.map((entry) => entry.value)).map(entryKey))
+  const knownAtOpen = new Set(openSnapshotValues.map(entryKey))
+  const preserved: string[] = []
+  const merged: T[] = [...payloadEntries]
+  for (const entry of serverEntries) {
+    const key = entryKey(entry.value)
+    if (!missing.has(key) || knownAtOpen.has(key)) continue
+    missing.delete(key)
+    preserved.push(entry.value.trim())
+    merged.push(entry)
+  }
+  return { entries: merged, preserved }
+}

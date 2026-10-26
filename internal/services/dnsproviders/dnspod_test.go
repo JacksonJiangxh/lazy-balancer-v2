@@ -53,6 +53,15 @@ func TestDNSPod_Validate_usesRegisteredZoneForProviderCalls(t *testing.T) {
 			wantZone: "example.co.uk",
 			wantFQDN: "_acme-challenge.lb-test.api.example.co.uk.",
 		},
+		{
+			// 混合大小写输入的契约：zone 由 ResolveZone 归一为小写，challenge
+			// FQDN 保留输入原样——相对子域派生（present 内部的 sub_domain）
+			// 因此必须在 provider 边界做大小写归一，不能依赖调用方。
+			name:     "mixed case input keeps raw fqdn but normalizes zone",
+			input:    "Example.COM",
+			wantZone: "example.com",
+			wantFQDN: "_acme-challenge.lb-test.Example.COM.",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

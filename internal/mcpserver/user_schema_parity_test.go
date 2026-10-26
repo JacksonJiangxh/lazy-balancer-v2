@@ -89,15 +89,16 @@ func TestUserToolSchemasMatchPasswordAndUsernamePolicy(t *testing.T) {
 
 // 初始化管理员的保护面在 MCP 侧同样必须可发现：Agent 能读到的只有工具
 // description 与 usage 文本，缺提示会让它反复重试同一必败操作（终态 400）。
-// 保护文案从 handlers 的实现字面量派生，两侧漂移即红。
+// 保护文案从 handlers 的实现字面量派生（AST 字面量面，注释不计），两侧漂移即红。
 func TestUserToolsDocumentSetupAdminProtection(t *testing.T) {
-	source := readHandlerSource(t, "users.go")
+	source := readHandlerCodeText(t, "users.go")
 	for _, tc := range []struct {
 		tool  string
 		guard string // handlers 实现里的 400 文案
 		verb  string // MCP 侧必须点名的保护动作
 	}{
 		{"update_user", "初始管理员不可降级", "降级"},
+		{"toggle_user_status", "初始管理员不可禁用", "禁用"},
 		{"delete_user", "初始管理员不可删除", "删除"},
 	} {
 		if !strings.Contains(source, tc.guard) {

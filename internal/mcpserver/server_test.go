@@ -1405,3 +1405,113 @@ func withIsolatedMCPDatabase(t *testing.T) {
 		RestoreDBForTest(oldDB, oldMetricsDB, oldAuditDB)
 	})
 }
+
+// list_certificates 的 rule_id 必须真正转发到 REST 查询串：转发层只遍历
+// toolSpec.queryArgs，漏登记时 Agent 的过滤参数会被静默丢弃（返回全局首页，
+// 目标规则不在首页即被误判为无证书），而 schema 声明了却没有转发同样难察觉。
+func TestListCertificatesForwardsRuleIDFilter(t *testing.T) {
+	var gotQuery url.Values
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/certificates" {
+			t.Errorf("request=%s %s", r.Method, r.URL.Path)
+		}
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"certificates":[],"total":0,"page":1,"page_size":1000}}`))
+	}))
+	defer rest.Close()
+
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
+	result := callTool(t, handler, "list_certificates", `{"rule_id":"lb_cert-rule","page":2,"page_size":50}`)
+	if !strings.Contains(result, `\"total\":0`) {
+		t.Fatalf("result=%q", result)
+	}
+	if got := gotQuery.Get("rule_id"); got != "lb_cert-rule" {
+		t.Fatalf("内部请求 rule_id=%q, want lb_cert-rule（过滤参数不得静默丢弃）", got)
+	}
+	// 分页参数回归：与 rule_id 同一条查询串。
+	if got := gotQuery.Get("page"); got != "2" {
+		t.Fatalf("内部请求 page=%q, want 2", got)
+	}
+	if got := gotQuery.Get("page_size"); got != "50" {
+		t.Fatalf("内部请求 page_size=%q, want 50", got)
+	}
+}
+
+// schema 声明的 query 参数集合必须与注册表的 queryArgs 完全一致——两个方向
+// 都要查：漏声明（Agent 看不见）与漏转发（参数被静默丢弃）同样是契约缺口。
+func TestCertificateToolsQueryArgsMatchSchema(t *testing.T) {
+	for tool, want := range map[string][]string{
+		"list_certificates": {"rule_id", "page", "page_size"},
+		"list_cert_jobs":    {"rule_id", "page", "page_size"},
+	} {
+		spec, ok := toolSpecsByName[tool]
+		if !ok {
+			t.Fatalf("%s 未在工具注册表中", tool)
+		}
+		var properties map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(toolSpecPropertyBlock(t, spec)), &properties); err != nil {
+			t.Fatalf("%s schema 解析失败: %v", tool, err)
+		}
+		for _, name := range want {
+			if _, ok := properties[name]; !ok {
+				t.Errorf("%s schema 缺少 query 参数 %q", tool, name)
+			}
+			if !containsString(spec.queryArgs, name) {
+				t.Errorf("%s queryArgs 缺少 %q（schema 声明了却不转发）", tool, name)
+			}
+		}
+		if len(properties) != len(spec.queryArgs) {
+			t.Errorf("%s schema 参数数=%d, queryArgs 数=%d（两处必须同集）", tool, len(properties), len(spec.queryArgs))
+		}
+	}
+}
+
+func toolSpecPropertyBlock(t *testing.T, spec toolSpec) string {
+	t.Helper()
+	var schema struct {
+		Properties json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(spec.schema), &schema); err != nil {
+		t.Fatalf("%s schema 解析失败: %v", spec.name, err)
+	}
+	return string(schema.Properties)
+}
+
+// 权限说明里的写方法集合必须覆盖工具注册表实际使用的全部非 GET 方法：
+// 漏掉 PATCH 会让 Agent 误判 update_api_key_status 这类工具的读写属性，
+// 也说明新增方法（如未来的 PATCH 工具）没有同步到 initialize 说明与手册。
+func TestPermissionTextsCoverRegisteredWriteMethods(t *testing.T) {
+	writeMethods := map[string]struct{}{}
+	for _, spec := range tools {
+		if spec.method == http.MethodGet {
+			continue
+		}
+		writeMethods[spec.method] = struct{}{}
+	}
+	if len(writeMethods) == 0 {
+		t.Fatal("工具清单没有任何非 GET 工具——派生基线失效")
+	}
+	texts := map[string]string{
+		"initialize instructions": serverInstructions,
+		"ops playbook":            opsPlaybook,
+	}
+	for label, text := range texts {
+		for method := range writeMethods {
+			if !strings.Contains(text, method) {
+				t.Errorf("%s 未把注册表实际使用的写方法 %s 计入权限说明", label, method)
+			}
+		}
+	}
+	// 有 PATCH 工具时必须明确点名（上面的集合断言在 PATCH 消失后不再覆盖）。
+	hasPatchTool := false
+	for _, spec := range tools {
+		if spec.method == http.MethodPatch {
+			hasPatchTool = true
+			break
+		}
+	}
+	if hasPatchTool && (!strings.Contains(serverInstructions, "POST/PUT/PATCH/DELETE") || !strings.Contains(opsPlaybook, "POST/PUT/PATCH/DELETE")) {
+		t.Fatal("存在 PATCH 工具时，两处权限说明都必须写全 POST/PUT/PATCH/DELETE")
+	}
+}

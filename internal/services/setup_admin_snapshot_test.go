@@ -67,6 +67,48 @@ func TestSnapshotCanonicalDropsSetupAdminMarker(t *testing.T) {
 	}
 }
 
+// TestInsertSnapshotUsers_keepsSingleMarkerOnNonLowestAdmin 钉住归一注释承诺的
+// 「非 canonical 载荷按载荷事实处理」：载荷只带一条标记且落在非最低 id 的启用
+// 管理员上时，归一只校验不变量、不把标记迁移到最低 id（迁移等于篡改载荷）。
+// canonical 载荷恒无标记，真实同步走的是下方补标分支。
+func TestInsertSnapshotUsers_keepsSingleMarkerOnNonLowestAdmin(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	// 旧协议/手工构造形态：标记落在 id=4，最低 id 的启用管理员是 id=1。
+	users := []models.ClusterUser{
+		{ID: 1, Username: "plain-admin", PasswordHash: "h", Role: "admin", IsEnabled: true, CreatedAt: time.Now()},
+		{ID: 4, Username: "setup-admin", PasswordHash: "h", Role: "admin", IsEnabled: true, CreatedAt: time.Now(), IsSetupAdmin: true},
+	}
+	if err := insertSnapshotUsersAndKeys(ctx, tx, models.ClusterSnapshot{Users: users}); err != nil {
+		t.Fatalf("insert snapshot users: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var flagged string
+	if err := database.QueryRow(`SELECT username FROM users WHERE COALESCE(is_setup_admin,0)=1`).Scan(&flagged); err != nil {
+		t.Fatalf("read flagged user: %v", err)
+	}
+	if flagged != "setup-admin" {
+		t.Fatalf("flagged=%q, want setup-admin（单标记是载荷事实，归一只校验不迁移）", flagged)
+	}
+	var lowestFlagged int
+	if err := database.QueryRow(`SELECT COALESCE(is_setup_admin,0) FROM users WHERE id=1`).Scan(&lowestFlagged); err != nil {
+		t.Fatalf("read lowest admin flag: %v", err)
+	}
+	if lowestFlagged != 0 {
+		t.Fatalf("lowest admin flagged=%d, want 0（标记不得被补到最低 id）", lowestFlagged)
+	}
+	if n := countFlaggedUsers(t, database, ctx); n != 1 {
+		t.Fatalf("flagged rows=%d, want 1（归一后恰一个保护入口）", n)
+	}
+}
+
 func TestInsertSnapshotUsers_rebuildsMarkerWhenPayloadLacksIt(t *testing.T) {
 	_, database := newClusterTestService(t)
 	ctx := context.Background()

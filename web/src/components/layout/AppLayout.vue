@@ -2,7 +2,10 @@
   <el-container class="layout-container">
     <el-aside :width="effectiveCollapsed ? '64px' : '220px'" class="layout-aside">
       <div class="aside-header">
-        <div class="logo-area" role="button" tabindex="0" aria-label="切换侧边栏" @click="collapsed = !collapsed" @keydown.enter.prevent="collapsed = !collapsed" @keydown.space.prevent="collapsed = !collapsed">
+        <!-- 折叠入口的展开状态必须对读屏可见：折叠只由宽度表达，此前读屏无从得知
+             （aria-expanded + aria-controls 指向被折叠的导航）。长按 Enter/Space
+             经 activateOnce 去重，否则按系统重复率反复切换。 -->
+        <div class="logo-area" role="button" tabindex="0" aria-label="切换侧边栏" :aria-expanded="!effectiveCollapsed" aria-controls="app-sidebar-nav" @click="toggleSidebar" @keydown.enter.prevent="activateOnce($event, toggleSidebar)" @keydown.space.prevent="activateOnce($event, toggleSidebar)">
           <AppLogo :size="28" />
           <transition name="fade">
             <span v-if="!effectiveCollapsed" class="logo-text">
@@ -13,6 +16,7 @@
       </div>
 
       <el-menu
+        id="app-sidebar-nav"
         :default-active="currentPage"
         class="layout-menu"
         :collapse="effectiveCollapsed"
@@ -216,11 +220,13 @@ import { appName, footerHtml } from '@/utils/branding'
 import { restartServiceWithFeedback } from '@/utils/restart'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { SETTINGS_BREADCRUMB_PARENT, SETTINGS_TAB_IDS, SETTINGS_TAB_TITLES } from '@/utils/settingsPages'
+import { activateOnce } from '@/utils/keyboardActivate'
 
 const authStore = useAuthStore()
 const collapsed = ref(false)
 const isNarrowViewport = useMediaQuery('(max-width: 768px)')
 const effectiveCollapsed = computed(() => collapsed.value || isNarrowViewport.value)
+const toggleSidebar = (): void => { collapsed.value = !collapsed.value }
 const showProfile = ref(false)
 const loggingOut = ref(false)
 

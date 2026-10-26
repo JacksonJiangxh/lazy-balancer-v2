@@ -18,7 +18,7 @@
           </div>
         </div>
       </template>
-      <el-form :model="global" label-width="140px" :disabled="isReadOnly">
+      <el-form :model="global" label-width="140px" :disabled="isReadOnly || savingGlobal">
         <el-form-item label="ACME 邮箱" required>
           <el-input v-model="global.acme_email" placeholder="your@email.com" style="width: 240px;" />
           <span class="form-tip-inline">用于 CA 账户注册，使用 ACME 签发时必须填写</span>
@@ -141,7 +141,7 @@
         <DialogHeader :icon="Connection" :title="editingId ? '编辑 DNS 提供商配置' : '添加 DNS 提供商配置'" tone="success"
           subtitle="ACME DNS-01 验证使用的解析商凭证，保存后可测试连通性" />
       </template>
-      <el-form :model="form" label-width="120px" class="lb-form">
+      <el-form :model="form" label-width="120px" class="lb-form" :disabled="savingConfig">
         <el-form-item label="配置名称" required>
           <el-input v-model="form.name" placeholder="例如：我的证书配置" maxlength="100" />
         </el-form-item>

@@ -5,6 +5,7 @@ package handlers
 // 中途重试时剩余时长早已不足 10 分钟。
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -115,8 +116,19 @@ func TestLogin_expiredLockSameDayBoundaryNotLocked(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/auth/login",
 		strings.NewReader(`{"username":"unlocked","password":"Secret123!"}`)))
-	if recorder.Code == http.StatusTooManyRequests {
-		t.Fatalf("status=429 body=%s, want 非 429（过期锁值不得判锁定）", recorder.Body.String())
+	// 「不是 429」也会被 401（密码/用户异常）或 500（解析失败 500 分支）满足——
+	// 必须断言登录真的成功并签发 JWT，否则过期锁被误判为锁定时仍会假绿。
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（过期锁值不得拦登录，也不得报内部错误）", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse login response: %v body=%s", err, recorder.Body.String())
+	}
+	if body.Token == "" {
+		t.Fatalf("body=%s, want 非空 token（过期锁值用户必须正常登录）", recorder.Body.String())
 	}
 }
 

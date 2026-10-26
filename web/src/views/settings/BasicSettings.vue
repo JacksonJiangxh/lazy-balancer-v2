@@ -9,9 +9,9 @@
           </div>
         </div>
       </template>
-        <el-form :model="settings" label-width="120px" class="settings-form">
+        <el-form :model="settings" label-width="120px" class="settings-form" :disabled="formFrozen">
           <el-form-item label="日志级别">
-            <el-select v-model="settings.log_level" :disabled="isReadOnly" style="width: 140px">
+            <el-select v-model="settings.log_level" :disabled="formFrozen" style="width: 140px">
               <el-option label="Debug" value="debug" />
               <el-option label="Info" value="info" />
               <el-option label="Warning" value="warn" />
@@ -20,40 +20,40 @@
             <span class="form-tip-inline">控制 Lazy Balancer 自身日志详细程度</span>
           </el-form-item>
           <el-form-item label="任务日志大小">
-            <el-input-number v-model="settings.task_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.task_log_size_mb" :disabled="formFrozen" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">MB，任务与库更新日志轮转阈值</span>
           </el-form-item>
           <el-form-item label="审计日志大小">
-          <el-input-number v-model="settings.audit_log_size_mb" :disabled="isReadOnly" :min="1" :max="512" controls-position="right" style="width: 120px;" />
+          <el-input-number v-model="settings.audit_log_size_mb" :disabled="formFrozen" :min="1" :max="512" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">MB，WAF 审计日志轮转阈值</span>
           </el-form-item>
           <el-form-item label="运行日志大小">
-            <el-input-number v-model="settings.runtime_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.runtime_log_size_mb" :disabled="formFrozen" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">MB，轮转阈值</span>
           </el-form-item>
           <el-form-item label="操作审计保留">
-            <el-input-number v-model="settings.audit_retention_months" :disabled="isReadOnly" :min="1" :max="12" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.audit_retention_months" :disabled="formFrozen" :min="1" :max="12" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">个月，仅操作审计日志超期自动清理</span>
           </el-form-item>
           <el-form-item label="安全事件保留">
-            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="seRetentionDays" :disabled="formFrozen" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">天</span>
-            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
+            <el-input-number v-model="seRowCap" :disabled="formFrozen" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
             <span class="form-tip-inline">行数上限</span>
             <div class="form-tip-line">安全事件日志每日清理：超出保留天数或行数上限时按最旧优先删除（行数上限在两次清理之间可能短暂超出）。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
           <el-form-item label="登录过期">
-            <el-input-number v-model="settings.jwt_expire_minutes" :disabled="isReadOnly" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.jwt_expire_minutes" :disabled="formFrozen" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">分钟，登录令牌有效期</span>
           </el-form-item>
           <el-form-item label="时区">
-            <el-select v-model="settings.timezone" :disabled="isReadOnly" filterable allow-create default-first-option class="compact-select">
+            <el-select v-model="settings.timezone" :disabled="formFrozen" filterable allow-create default-first-option class="compact-select">
               <el-option v-for="opt in timezoneOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
             </el-select>
             <div class="form-tip-line">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；标注「自定义」的值为 API/备份写入、不在常用列表内的 IANA 时区（可继续使用或改选）；仅 Caddy 日志需重启服务生效</div>
           </el-form-item>
           <el-form-item label="大屏本站坐标">
-            <el-select v-model="siteLocationKey" :disabled="isReadOnly" filterable clearable placeholder="选择省份或国家" style="width: 260px" @change="applySiteLocation">
+            <el-select v-model="siteLocationKey" :disabled="formFrozen" filterable clearable placeholder="选择省份或国家" style="width: 260px" @change="applySiteLocation">
               <el-option-group label="中国省份">
                 <el-option v-for="item in CHINA_SITE_CHOICES" :key="item.key" :label="item.label" :value="item.key" />
               </el-option-group>
@@ -65,21 +65,21 @@
             <div class="form-tip-line">威胁大屏地图本站信标坐标；选择中国省份或海外国家后自动换算经纬度。未选择表示未设置，按地图视觉中心显示。</div>
           </el-form-item>
           <el-form-item label="大屏视觉模式">
-            <el-radio-group v-model="threatScreenMode" :disabled="isReadOnly">
+            <el-radio-group v-model="threatScreenMode" :disabled="formFrozen">
               <el-radio value="map">360° 地图 · 雷达扫掠</el-radio>
               <el-radio value="globe">3D 地球 · 垂直扫描</el-radio>
             </el-radio-group>
             <div class="form-tip-line">威胁大屏中央攻击流光的呈现方式；进入大屏时生效（已打开的大屏重新进入后切换）</div>
           </el-form-item>
           <el-form-item label="流量采样">
-            <el-select v-model="trafficSampleN" :disabled="isReadOnly" style="width: 160px">
+            <el-select v-model="trafficSampleN" :disabled="formFrozen" style="width: 160px">
               <el-option label="自适应（推荐）" :value="-1" />
               <el-option label="关闭逐请求光流" :value="0" />
             </el-select>
             <div class="form-tip-line">大屏逐请求光流的采样开关；自适应从全量起步，并随事件量在 1/4、1/8 档之间自动切换。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
           </el-form-item>
           <el-form-item label="下载代理">
-            <el-select v-model="githubProxyUrl" :disabled="isReadOnly || !githubProxyLoaded" style="width: 160px" :placeholder="githubProxyLoaded ? '选择代理' : '未加载'">
+            <el-select v-model="githubProxyUrl" :disabled="formFrozen || !githubProxyLoaded" style="width: 160px" :placeholder="githubProxyLoaded ? '选择代理' : '未加载'">
               <el-option
                 v-for="option in githubProxyOptions"
                 :key="option.value"
@@ -97,26 +97,26 @@
               show-password
               style="width: 320px"
               :placeholder="settings.has_github_token ? '已配置（留空保持不变）' : '未配置（未认证限流 60 次/小时）'"
-              :disabled="isReadOnly"
+              :disabled="formFrozen"
               maxlength="255"
               @input="githubTokenClearPending = false"
             />
-            <el-button v-if="settings.has_github_token && !githubTokenClearPending" type="danger" link size="small" style="margin-left: 8px" :disabled="isReadOnly" @click="clearGithubToken">清除</el-button>
+            <el-button v-if="settings.has_github_token && !githubTokenClearPending" type="danger" link size="small" style="margin-left: 8px" :disabled="formFrozen" @click="clearGithubToken">清除</el-button>
             <el-text v-if="githubTokenClearPending" type="danger" size="small" style="margin-left: 8px">已标记清除，保存后生效</el-text>
             <div class="form-tip-line">可选 GITHUB_TOKEN：令牌认证后 GitHub API 限流由 60 提升至 5000 次/小时，缓解规则库自动更新 403；令牌仅随 GitHub 直连发送，不经第三方代理；点「清除」可撤销已配置令牌（保存后生效）。<el-link type="primary" href="https://github.com/settings/tokens" target="_blank" rel="noopener">前往 GitHub 创建令牌</el-link>（只需公共仓库只读权限，无需勾选任何 scope）</div>
           </el-form-item>
           <el-form-item label="写操作验证">
-            <el-switch v-model="settings.mfa_write_guard" :disabled="isReadOnly" />
+            <el-switch v-model="settings.mfa_write_guard" :disabled="formFrozen" />
             <span class="form-tip-inline">写操作需 1 分钟内的 MFA 验证</span>
             <AccessibleLink type="info" underline="never" size="small" class="tip-link" style="margin-left: 6px" @click="mfaScopeVisible = true">支持的操作</AccessibleLink>
           </el-form-item>
           <el-form-item label="登录失败锁定">
-            <el-switch v-model="settings.mfa_lockout_enabled" :disabled="isReadOnly" />
+            <el-switch v-model="settings.mfa_lockout_enabled" :disabled="formFrozen" />
             <span class="form-tip-inline">密码或验证码失败 5 次锁 10 分钟（关闭则不锁定）</span>
           </el-form-item>
           <el-form-item label="强制加密">
-            <el-switch v-model="adminTls.enabled" :disabled="isReadOnly || !adminTlsLoaded" @change="onAdminTlsToggle" />
-            <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" :disabled="isReadOnly" @click="openAdminTlsDialog">配置证书</el-button>
+            <el-switch v-model="adminTls.enabled" :disabled="formFrozen || !adminTlsLoaded" @change="onAdminTlsToggle" />
+            <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" :disabled="formFrozen" @click="openAdminTlsDialog">配置证书</el-button>
             <!-- 降级读优先于暂存/失败提示：开关当前显示的是后端降级值，
                  用户必须先知道「不可信」再考虑其它动作（重试走同一读路径）。 -->
             <template v-if="adminTlsUnavailable">
@@ -1396,6 +1396,9 @@ const clearGithubToken = () => {
 }
 
 const saving = ref(false)
+// 保存中冻结整卡表单：保存成功由父级重新取 /config 回填整卡，在途时的编辑
+// 会被回填静默覆盖（且成功提示不披露被丢弃的字段）。
+const formFrozen = computed(() => isReadOnly.value || saving.value)
 // 大屏本站坐标：地点选择（中国城市/海外国家）→ 经纬度；替代按公网 IP
 // 归属地自动检测（常落到省会/国家质心，无法精确到城市）。
 const siteLocationKey = ref('')
