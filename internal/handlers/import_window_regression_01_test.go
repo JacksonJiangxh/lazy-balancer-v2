@@ -161,9 +161,8 @@ func TestUserAndAPIKeyWrites409DuringImport(t *testing.T) {
 	router.PUT("/api-keys/:id/status", h.UpdateAPIKeyStatus)
 	router.PUT("/users/current", h.UpdateCurrentUser)
 
-	// 模拟导入会话持锁（configImportBusy 的探测对象）。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// 模拟导入会话进行中（configImportBusy 的事实源：窗口计数）。
+	beginImportWindowForTest(t)
 
 	calls := []struct{ method, path, body string }{
 		{"POST", "/users", `{"username":"winuser","password":"Passw0rd!x","role":"user"}`},
@@ -205,9 +204,8 @@ func TestMFAWrites409DuringImport(t *testing.T) {
 	router.POST("/auth/mfa/recovery-codes", h.MFARecoveryCodes)
 	router.POST("/users/:id/mfa/reset", h.MFAResetByAdmin)
 
-	// 模拟导入会话持锁（configImportBusy 的探测对象）。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// 模拟导入会话进行中（configImportBusy 的事实源：窗口计数）。
+	beginImportWindowForTest(t)
 
 	calls := []struct{ method, path, body string }{
 		{"POST", "/auth/mfa/setup", `{}`},
@@ -267,8 +265,7 @@ func TestRuleAndRawConfigWrites409DuringImport(t *testing.T) {
 	router.POST("/config/validate", h.ValidateConfig)
 	router.PUT("/caddy/config", h.PutCaddyConfig)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 
 	calls := []struct{ method, path, body string }{
 		{"POST", "/rules", `{"name":"r","protocol":"http","listen_port":8080}`},

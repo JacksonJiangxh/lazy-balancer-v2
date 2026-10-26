@@ -95,9 +95,8 @@ func TestGetBranding_skipsWriteSideEffectsDuringImport(t *testing.T) {
 		resetBrandingSyncGateForTest()
 	})
 
-	// Given：配置导入会话进行中（会话锁被持有 = configImportBusy()==true）。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// Given：配置导入会话进行中（窗口计数非零 = configImportBusy()==true）。
+	beginImportWindowForTest(t)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

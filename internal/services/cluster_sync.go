@@ -146,6 +146,9 @@ type SyncService struct {
 	beforeApplySnapshot    func()
 	beforeApplyWrite       func()
 	beforeRecordSyncStatus func()
+	// commitSnapshotTx 是提交结果不确定故障的确定性测试注入口；生产为 nil，
+	// applySnapshot 回退 sql.Tx.Commit。任何错误都按结果不确定处理。
+	commitSnapshotTx func(*sql.Tx) error
 	// applyGuard 记录本次拉取在 admission 前复核通过的角色/凭据快照：
 	// applySnapshot 在事务内二次复核，覆盖「复核通过 → 事务开启」
 	// 之间角色被 Promote 翻转的窗口。零值=直接调用 applySnapshot 的测试路径，
@@ -996,11 +999,10 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 					// 持续失败 5 轮后降频为每 10 轮一次，避免后置副作用持续
 					// 故障时每周期全量重拉打主从负载；last_sync_error 中的
 					// marker 保持可见（节点页面），恢复后首轮重拉成功即自愈。
-					// 品牌落盘失败（apply_ok_branding_failed）与重载
-					// 失败共用本补偿通道与退避计数器。
+					// 品牌落盘失败、重载失败与提交结果不确定共用本补偿通道与退避计数器。
 					failures := s.reloadRepullFailures.Add(1)
 					if failures == wafRepullMaxFailures {
-						Logf("error", "同步应用后后置操作持续失败（已连续 %d 轮，重载/品牌落盘），补偿全量重拉降频为每 %d 轮一次", wafRepullMaxFailures, wafRepullEvery)
+						Logf("error", "同步应用后后置操作持续失败（已连续 %d 轮，重载/品牌落盘/提交不确定），补偿全量重拉降频为每 %d 轮一次", wafRepullMaxFailures, wafRepullEvery)
 					}
 					if !backoffDue(failures) {
 						// 降频期：本轮跳过补偿重拉，走 304 返回（marker 保持可见）。
@@ -1477,6 +1479,11 @@ const syncReloadFailureMarkerPrefix = "apply_ok_reload_failed"
 // 重试品牌落盘；成功路径（事务内 last_sync_error=”）自动清除。
 const syncBrandingFailureMarkerPrefix = "apply_ok_branding_failed"
 
+// syncCommitUncertainMarkerPrefix 标记「快照 Commit 返回错误，真实提交结果
+// 不确定」。证书与 DNS 文件保持本轮内容，304 分支必须全量重拉重放；
+// 下一次成功应用由事务内 last_sync_error=” 清除标记。
+const syncCommitUncertainMarkerPrefix = "snapshot_commit_uncertain"
+
 // MarkStartupFallbackPending 在启动 last-good 回退成功后写入与 applySnapshot
 // 同语义的 apply_ok_reload_failed 补偿标记（裁定 2026-09-07）：Pull 的 304
 // 分支识别该标记后全量重拉，使从节点在主节点无变更时也能收敛到 DB 最新渲染，
@@ -1519,10 +1526,9 @@ const (
 	syncFailureCountSuffix = " 次）"
 )
 
-// syncPostCommitMarkerPrefixes 是「快照事务已提交但后置副作用失败」的可重试
-// 标记族：两者都要求 304 分支全量重拉补偿，且都
-// 必须跨停机/跨周期存活到下一次成功。
-var syncPostCommitMarkerPrefixes = []string{syncReloadFailureMarkerPrefix, syncBrandingFailureMarkerPrefix}
+// syncPostCommitMarkerPrefixes 是提交后副作用失败或提交结果不确定的可重试
+// 标记族：全部要求 304 分支全量重拉补偿，且必须跨停机/跨周期存活到下一次成功。
+var syncPostCommitMarkerPrefixes = []string{syncReloadFailureMarkerPrefix, syncBrandingFailureMarkerPrefix, syncCommitUncertainMarkerPrefix}
 
 // syncPostCommitMarkerPrefix 返回消息命中的后置副作用标记前缀（无则空串）。
 func syncPostCommitMarkerPrefix(message string) string {

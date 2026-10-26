@@ -56,9 +56,8 @@ func TestCaddyProcessControlRejectsDuringImportWindow(t *testing.T) {
 	router.POST("/caddy/stop", handler.StopCaddy)
 	router.POST("/caddy/restart", handler.RestartCaddy)
 
-	// 模拟进行中的导入会话：begin 锁被持有 = configImportBusy()==true。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// 模拟进行中的导入会话：窗口计数非零 = configImportBusy()==true。
+	beginImportWindowForTest(t)
 
 	for _, endpoint := range []string{"/caddy/start", "/caddy/stop", "/caddy/restart"} {
 		response := httptest.NewRecorder()

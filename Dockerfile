@@ -125,8 +125,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # go.mod/go.sum 已在上方下载层复制（本阶段内，同在清单范围），此处不再重复。
 # 清单必须覆盖 go list 派生到的全部顶层 Go 目录（cmd/internal/caddygeoip/
 # caddydeps/wafiplist/geoipnames）——scripts/check-dockerfile-copy-manifest.sh
-# 按 backend 阶段切块比对清单与 git 跟踪的顶层 Go 目录，新增顶层 Go 目录必须
-# 同步本行。
+# 按 backend 阶段切块，比对清单与受控 + 未跟踪（未被 .gitignore 忽略）的顶层
+# Go 目录，与 test-all 同口径；新增顶层 Go 目录必须同步本行。
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY caddygeoip/ ./caddygeoip/

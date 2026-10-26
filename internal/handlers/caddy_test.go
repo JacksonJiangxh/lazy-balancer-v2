@@ -564,7 +564,7 @@ func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
 	router := gin.New()
 	router.PUT("/config", h.UpdateConfig)
 	rec := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"log_level":"warn"}`))
+	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"caddy_log_size_mb":123}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
 	if rec.Code != http.StatusOK {
@@ -873,7 +873,7 @@ func TestUpdateConfig_configRejectionDoesNotPersistBanner(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/config", handler.UpdateConfig)
-	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"log_level":"debug"}`))
+	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"request_body_max_size_mb":9}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -1176,7 +1176,7 @@ func TestPreviewConfigUpdate_serverFaultIsNotReportedAsBadRequest(t *testing.T) 
 		router.ServeHTTP(response, request)
 		return response
 	}
-	body := `{"source":"basic","log_level":"debug"}`
+	body := `{"source":"basic","request_body_max_size_mb":9}`
 	save := post(http.MethodPut, "/config", body)
 	if save.Code != http.StatusInternalServerError {
 		t.Fatalf("save status=%d body=%s, want 500", save.Code, save.Body.String())

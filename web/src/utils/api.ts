@@ -14,12 +14,14 @@ import type {
   SystemMetrics,
   UpdateCurrentUserInput,
 } from '@/types'
-import { classifyAuthFailure, createMfaGraceTracker, createMfaStepUp } from '@/utils/apiFailure'
+import { classifyAuthFailure, createMfaGraceTracker, createMfaStepUp, isRequestAuthTokenCurrent } from '@/utils/apiFailure'
 
 declare module 'axios' {
   interface AxiosRequestConfig {
     /** Skip the global error toast for this request (used by background pollers). */
     silent?: boolean
+    /** 发起请求时的本地会话令牌；响应 401 用它识别迟到的旧会话请求。 */
+    _authToken?: string
   }
 }
 
@@ -171,8 +173,10 @@ service.interceptors.request.use(
     // 确认期间不再出站任何请求。
     if (sessionExpiredDetected) throw sessionHaltedRequestError()
     const token = localStorage.getItem('token')
-    if (token && token !== 'null' && token !== 'undefined') {
-      config.headers.Authorization = `Bearer ${token}`
+    const authToken = token && token !== 'null' && token !== 'undefined' ? token : undefined
+    config._authToken = authToken
+    if (authToken) {
+      config.headers.Authorization = `Bearer ${authToken}`
     }
     return config
   },
@@ -265,6 +269,10 @@ service.interceptors.response.use(
       return Promise.reject(new ApiRequestError(message, status))
     }
     if (kind === 'session-expired') {
+      // 登出 A、登录 B 后，A 的在途请求才返回 401：它只属于 A，不得弹框或止损 B。
+      if (error.config && !isRequestAuthTokenCurrent(error.config._authToken, localStorage.getItem('token'))) {
+        return Promise.reject(new ApiRequestError(message, status, error.response?.data))
+      }
       const { useAuthStore } = await import('@/stores/auth')
       const authStore = useAuthStore()
       if (authStore.intentionalLogout || !authStore.token || !localStorage.getItem('token')) {

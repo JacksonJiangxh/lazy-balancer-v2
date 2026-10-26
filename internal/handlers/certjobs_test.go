@@ -1326,9 +1326,8 @@ func TestRetryCertJobBlockedDuringConfigImport(t *testing.T) {
 	router.POST("/jobs/:id/retry", h.RetryCertJob)
 	router.POST("/system/tasks/:id/trigger", h.TriggerSystemTask)
 
-	// 模拟导入会话持锁（configImportBusy 的探测对象）。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// 模拟导入会话进行中（configImportBusy 的事实源：窗口计数）。
+	beginImportWindowForTest(t)
 
 	for _, tc := range []struct{ name, path string }{
 		{"RetryCertJob 端点", "/jobs/1/retry"},

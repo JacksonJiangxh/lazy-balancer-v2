@@ -69,3 +69,22 @@ func TestClassifyCaddyValidateFailure_nonZeroExitIsRejection(t *testing.T) {
 		t.Fatalf("拒绝错误缺少分类文本/校验输出: %v", err)
 	}
 }
+
+// Go 运行时致命 abort（线程/内存耗尽）发生在配置解析之前：退出码非零但与
+// 配置内容无关，必须归为校验器不可用——否则 ulimit 过紧的宿主上任何保存都会
+// 被误报为「配置被拒」。
+func TestClassifyCaddyValidateFailure_runtimeFatalIsUnavailable(t *testing.T) {
+	runErr := exec.Command("/bin/sh", "-c", "exit 2").Run()
+	if runErr == nil {
+		t.Fatal("前置失败：期望非零退出")
+	}
+	output := []byte("runtime: failed to create new OS thread (have 3 already; errno=11)\n" +
+		"fatal error: newosproc\n\nruntime stack:\nruntime.throw(...)")
+	err := classifyCaddyValidateFailure(nil, runErr, output)
+	if !errors.Is(err, ErrCLIValidatorUnavailable) {
+		t.Fatalf("运行时致命分类=%v, want ErrCLIValidatorUnavailable", err)
+	}
+	if IsConfigRejected(err) {
+		t.Fatal("运行时致命不得归为配置被拒（会 400 回滚并误导用户）")
+	}
+}

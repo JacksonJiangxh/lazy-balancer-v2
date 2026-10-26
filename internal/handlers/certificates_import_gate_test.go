@@ -23,8 +23,7 @@ func TestCertificateWrites409DuringImport(t *testing.T) {
 	router.PUT("/ca-providers/:id", h.UpdateCAProvider)
 	router.POST("/certificates/issue", h.IssueCertificate)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 
 	calls := []struct{ method, path, body string }{
 		{"POST", "/certificates/configs", `{"name":"dns","dns_provider":"dnspod","dns_credentials":{"id":"1","token":"t"},"enabled":true}`},

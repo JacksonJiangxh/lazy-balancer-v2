@@ -861,13 +861,13 @@ func copyDirTransactional(src, dst string) error {
 	return nil
 }
 
-// replaceDirFrom 用 src 的完整副本替换 dst 目录：先复制到
-// dst+".tmp"，复制成功后才删旧树并 rename——磁盘满/IO 中断只在 .tmp 留下
-// 残树（被清理），dst 保持上一代完整树，不会出现「旧树已删 + 新树半树」。
+// replaceDirFrom 用 src 的完整副本替换 dst 目录：先复制到 dst+".tmp"，
+// 再把旧 dst rename 到 .old，最后把 tmp rename 到位并删除 .old。最终 rename
+// 失败时旧树从 .old 复位，完整 tmp 保留供诊断；第一步失败则 dst 原样不动。
 // 与 copyDirTransactional 的区别：后者用于「生成备份」，本函数用于「替换
-// 现有目录」（恢复/播种路径），因此显式删除旧 dst。
-// 唯一调用面是 live rules 树（快照恢复/播种）——必须进入树交换窗口：删旧树
-// 与 rename 之间 live 缺失，窗口内生成须失败而不是发布无安全链配置。
+// 现有目录」（恢复/播种路径），因此需要旧树回滚语义。
+// 唯一调用面是 live rules 树（快照恢复/播种）——必须进入树交换窗口：旧树
+// 与 tmp 两次 rename 之间 live 缺失，窗口内生成须失败而不是发布无安全链配置。
 func replaceDirFrom(src, dst string) error {
 	return withTreeSwapWindow(func() error { return replaceDirFromInWindow(src, dst) })
 }
@@ -877,29 +877,53 @@ func replaceDirFromInWindow(src, dst string) error {
 	if err := os.RemoveAll(tmp); err != nil {
 		return err
 	}
-	if err := copyDir(src, tmp); err != nil {
-		if rErr := os.RemoveAll(tmp); rErr != nil {
-			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, rErr)
+	cleanupTmp := func() {
+		if err := os.RemoveAll(tmp); err != nil {
+			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, err)
 		}
+	}
+	if err := copyDir(src, tmp); err != nil {
+		cleanupTmp()
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		if rErr := os.RemoveAll(tmp); rErr != nil {
-			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, rErr)
+		cleanupTmp()
+		return err
+	}
+	old := dst + ".old"
+	previousExisted := false
+	if _, err := os.Stat(dst); err == nil {
+		// dst 完好时 .old 只是上次成功替换后的残骸，可以安全清理。
+		if err := os.RemoveAll(old); err != nil {
+			cleanupTmp()
+			return err
+		}
+		if err := osRename(dst, old); err != nil {
+			cleanupTmp()
+			return err
+		}
+		previousExisted = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		cleanupTmp()
+		return err
+	} else if _, oldErr := os.Stat(old); oldErr == nil {
+		// dst 缺失而 .old 存在 = 上次回滚未完成；它是唯一旧树，
+		// 本次无论成功还是再次失败都必须以它恢复，而非当残骸删除。
+		previousExisted = true
+	} else if !errors.Is(oldErr, os.ErrNotExist) {
+		cleanupTmp()
+		return oldErr
+	}
+	if err := osRename(tmp, dst); err != nil {
+		if previousExisted {
+			if restoreErr := osRename(old, dst); restoreErr != nil {
+				Logf("error", "crs: failed to restore previous tree %s from %s: %v（旧树与完整暂存树均保留在磁盘）", dst, old, restoreErr)
+			}
 		}
 		return err
 	}
-	if err := os.RemoveAll(dst); err != nil {
-		if rErr := os.RemoveAll(tmp); rErr != nil {
-			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, rErr)
-		}
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		if rErr := os.RemoveAll(tmp); rErr != nil {
-			Logf("error", "crs: failed to clean staging tree %s after rename failure: %v", tmp, rErr)
-		}
-		return err
+	if err := os.RemoveAll(old); err != nil {
+		Logf("warn", "crs: failed to remove replaced tree %s: %v（新树已生效，残留下次替换前清理）", old, err)
 	}
 	return nil
 }

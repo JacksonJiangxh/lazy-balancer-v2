@@ -25,6 +25,11 @@ func TestClusterService_Promote_auditsPendingCompensationMarkers(t *testing.T) {
 			wantDetail:  []string{"未完成补偿", "重载失败补偿", "系统配置载入"},
 		},
 		{
+			name:        "commit uncertainty marker",
+			storedError: encodeSyncError(syncCommitUncertainMarkerPrefix+": 提交结果不确定", models.SyncErrorCodeApplyFailed),
+			wantDetail:  []string{"未完成补偿", "提交不确定补偿", "系统配置载入"},
+		},
+		{
 			name:        "branding failure marker",
 			storedError: encodeSyncError(syncBrandingFailureMarkerPrefix+": 品牌配置落盘失败", models.SyncErrorCodeApplyFailed),
 			wantDetail:  []string{"未完成补偿", "品牌落盘补偿", "系统配置载入"},

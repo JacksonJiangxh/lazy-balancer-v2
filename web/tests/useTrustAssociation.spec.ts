@@ -178,21 +178,51 @@ test('无同侧列表：确认后创建（建单即带 IP）→ 关联 refs，�
   assert.equal(changed, 1)
 })
 
-test('新建路径关联失败：名单已带 IP、未被引用，不留「被引用的空名单」', async () => {
+test('新建路径关联失败：刷新后重试复用已创建名单，不再撞同名', async () => {
   const { posts, puts } = reset()
+  let failAssociation = true
   g.__put = async (url: string, body?: unknown) => {
     puts.push({ url, body })
-    throw new Error('policy update failed')
+    if (failAssociation) {
+      failAssociation = false
+      throw new Error('policy update failed')
+    }
+    return { data: undefined }
   }
-  const { ensureListAndJoin } = useTrustAssociation({ getList: () => lists })
-  await ensureListAndJoin({ id: 5, name: '策略 A', ip_acl_list_refs: '' }, '203.0.113.9', 'deny')
+  const refreshedLists: Array<{
+    id: number
+    name: string
+    system?: number
+    entry_count?: number
+    ref_policies?: Array<{ id: number; name: string }>
+  }> = [...lists]
+  let changed = 0
+  const { ensureListAndJoin } = useTrustAssociation({
+    getList: () => refreshedLists,
+    onChanged: () => {
+      changed += 1
+      if (!refreshedLists.some((list) => list.id === 42)) {
+        refreshedLists.push({ id: 42, name: '策略 A-黑名单', ref_policies: [] })
+      }
+    },
+  })
+  const policy = { id: 5, name: '策略 A', ip_acl_list_refs: '' }
+  await ensureListAndJoin(policy, '203.0.113.9', 'deny')
 
   assert.equal(posts.length, 1, '只应有创建请求（加入条目不单独发起）')
   const body: unknown = posts[0].body
   assert.ok(body && typeof body === 'object' && 'entries' in body, '创建载荷必须是对象')
   assert.deepEqual(JSON.parse(String(body.entries)), [{ value: '203.0.113.9', remark: '' }], '创建载荷必须已带本次 IP')
   assert.equal(puts.length, 1, '关联确实尝试过')
+  assert.equal(changed, 1, '关联失败后必须刷新名单快照，供当前弹框重试复用')
   assert.equal(callsOf('mfaAwareSuccess').length, 0, '关联失败不得报成功')
+  assert.match(String(callsOf('ElMessage.error')[0]?.arg), /重试将复用该名单/)
+
+  await ensureListAndJoin(policy, '203.0.113.9', 'deny')
+  assert.equal(posts.filter((post) => post.url === '/security/ip-lists').length, 1, '重试不得再次创建同名名单')
+  assert.deepEqual(posts[1], { url: '/security/ip-lists/42/ips', body: { value: '203.0.113.9' } })
+  assert.deepEqual(puts[1], { url: '/security/policies/5', body: { ip_acl_list_refs: '[42]' } })
+  assert.equal(changed, 2)
 })
 
 test('同名未引用列表复用而非重复创建（仍关联并加入）', async () => {

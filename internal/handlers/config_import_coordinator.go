@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -215,6 +216,12 @@ const importCleanupBudget = 60 * time.Second
 // 后到导入在暂停开始前排队。
 var configImportBeginMu sync.Mutex
 
+// importWindowActive 是导入会话的显式活动计数（非零=窗口开启）。
+// configImportBusy 不得用 TryLock 探测：任何持锁者（含测试模拟窗口）都会
+// 被当成真实导入，锁的生命周期与「窗口是否开启」是两个事实。计数只由
+// begin/close 在锁内边界维护，读侧无锁且无假阳性。
+var importWindowActive atomic.Int32
+
 // 测试屏障（生产恒 nil）：分别在会话锁获取前与业务 prelock 获取前触发，
 // 供锁序测试用通道证明到达点，替代固定 sleep。
 var configImportBeginAttemptHook func()
@@ -227,11 +234,7 @@ var importPostCommitCleanupHook func()
 // configImportBusy 探测导入会话是否持有全局导入锁（不阻塞）：启停/控制
 // 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain。
 func configImportBusy() bool {
-	if configImportBeginMu.TryLock() {
-		configImportBeginMu.Unlock()
-		return false
-	}
-	return true
+	return importWindowActive.Load() > 0
 }
 
 // rejectNodeWriteDuringImport：配置导入窗口内
@@ -297,7 +300,11 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		configImportBeginAttemptHook()
 	}
 	configImportBeginMu.Lock()
-	releaseSession := func() { configImportBeginMu.Unlock() }
+	importWindowActive.Add(1)
+	releaseSession := func() {
+		importWindowActive.Add(-1)
+		configImportBeginMu.Unlock()
+	}
 	// 导入将全量替换业务数据——先暂停 tick
 	// 派发并取消在途 Scheduled/Periodic/Oneshot Run（Daemon 不在范围），再有界
 	// 等待其在途落定，避免其提交落在导入事务之后形成 last-writer-wins。

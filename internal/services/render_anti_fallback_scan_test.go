@@ -533,7 +533,10 @@ func comparisonGuardBranch(bin *ast.BinaryExpr) guardBranch {
 	}
 	switch lit.Kind {
 	case token.STRING:
-		if lit.Value != `""` {
+		// 双引号与原始字符串按字面值判定：`` 与 "" 都是空串，源码文本
+		// 比较会漏掉等价写法；非空原始字符串不得误报。
+		value := constant.MakeFromLiteral(lit.Value, lit.Kind, 0)
+		if value.Kind() == constant.Unknown || constant.StringVal(value) != "" {
 			return guardNone
 		}
 		switch bin.Op {
@@ -804,6 +807,18 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 			name:   "hex-zero-not-equal-else",
 			source: "package p\nfunc f(x int) int { if x != 0x0 { x = x } else { x = 7 }; return x }\n",
 		},
+		{
+			name:   "raw-empty-string-guard",
+			source: "package p\nfunc f(s string) string { if s == `` { s = \"x\" }; return s }\n",
+		},
+		{
+			name:   "reversed-raw-empty-string-guard",
+			source: "package p\nfunc f(s string) string { if `` == s { s = \"x\" }; return s }\n",
+		},
+		{
+			name:   "tagged-switch-raw-empty-string-case",
+			source: "package p\nfunc f(s string) string { switch s { case ``: s = \"x\" }; return s }\n",
+		},
 	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -846,6 +861,10 @@ func TestFallbackScan_ignoresNonZeroGuardBranches(t *testing.T) {
 		{
 			name:   "tagged-switch-non-zero-case",
 			source: "package p\nfunc f(x int) int { switch x { case 1: x = 5 }; return x }\n",
+		},
+		{
+			name:   "non-empty-raw-string-comparison",
+			source: "package p\nfunc f(s string) string { if s == `x` { s = \"y\" }; return s }\n",
 		},
 	}
 	for _, fixture := range fixtures {

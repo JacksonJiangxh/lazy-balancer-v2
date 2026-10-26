@@ -52,12 +52,15 @@ func selfSignedTestCert(t *testing.T) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
-func TestMCPForwardFollowsRealMux302PreservingMethodAndBody(t *testing.T) {
+func TestMCPForwardFollowsRealMux302PreservingMethodBodyAndHeaders(t *testing.T) {
 	// Given：真实 newHTTPRedirectMux + TLS 面板端点（生产 ServeTLS 同构）。
 	wantBody := `{"caddy_id":"rule-1","domain":"example.com"}`
-	var gotMethod, gotPath, gotBody string
+	var gotMethod, gotPath, gotBody, gotAPIKey, gotInternalAuth, gotClientIP string
 	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod, gotPath = r.Method, r.URL.Path
+		gotAPIKey = r.Header.Get("X-API-Key")
+		gotInternalAuth = r.Header.Get(mcpserver.InternalAuthHeader)
+		gotClientIP = r.Header.Get(mcpserver.InternalClientIPHeader)
 		body, _ := io.ReadAll(r.Body)
 		gotBody = string(body)
 		w.Header().Set("Content-Type", "application/json")
@@ -85,11 +88,12 @@ func TestMCPForwardFollowsRealMux302PreservingMethodAndBody(t *testing.T) {
 	// 必须锚定生产回环客户端（middleware.LoopbackAPIClient，由 SetupRouter
 	// 注入 MCP 转发链）——用测试自注入的「跳过校验」客户端只能证明重放逻辑，
 	// 不能证明生产 TLS 行为（曾因此让自签 HTTPS 下的回环重放缺陷假绿）。
-	handler := mcpserver.NewForTest(fmt.Sprintf("http://%s/api/v1", listener.Addr().String()), middleware.LoopbackAPIClient())
+	handler := mcpserver.NewWithInternalAuth(fmt.Sprintf("http://%s/api/v1", listener.Addr().String()), middleware.LoopbackAPIClient(), "tls-upgrade-internal-secret")
 
 	// When：经 MCP 信封调用 POST 工具——转发层先以 http 明文命中嗅探层 302。
 	envelope := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_certificate","arguments":` + wantBody + `}}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", strings.NewReader(envelope))
+	request = request.WithContext(mcpserver.WithClientIP(request.Context(), "192.0.2.44"))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	request.Header.Set("X-API-Key", "lb_sk_tls-upgrade-test")
@@ -102,5 +106,8 @@ func TestMCPForwardFollowsRealMux302PreservingMethodAndBody(t *testing.T) {
 	}
 	if gotMethod != http.MethodPost || gotPath != "/api/v1/certificates/issue" || gotBody != wantBody {
 		t.Fatalf("重放请求失真: method=%s path=%s body=%q", gotMethod, gotPath, gotBody)
+	}
+	if gotAPIKey != "lb_sk_tls-upgrade-test" || gotInternalAuth != "tls-upgrade-internal-secret" || gotClientIP != "192.0.2.44" {
+		t.Fatalf("重放认证/审计头失真: api_key=%q internal_auth=%q client_ip=%q", gotAPIKey, gotInternalAuth, gotClientIP)
 	}
 }

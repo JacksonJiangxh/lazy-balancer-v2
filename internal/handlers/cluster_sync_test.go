@@ -245,8 +245,7 @@ func TestPullClusterSnapshot_conflictsWhileImportInProgress(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.Use(gin.Recovery())

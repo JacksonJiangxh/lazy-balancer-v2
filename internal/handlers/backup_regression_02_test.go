@@ -373,6 +373,26 @@ func TestImportAccessLogFormatGate(t *testing.T) {
 		if rec := importFormat(strings.Repeat(" ", maxAccessLogFormatBytes)); rec.Code != http.StatusOK {
 			t.Fatalf("16KiB 纯空格导入 status=%d body=%s, want 200", rec.Code, rec.Body.String())
 		}
+		// 纯换行同样按真实数量计数，预览与导入都不能绕过上限。
+		pureNewlines := func(n int) string { return strings.Repeat("\n", n) }
+		if resp := validateResponseShared(t, h, legacyBackupJSON(t, nil, map[string]any{"access_log_format": pureNewlines(200)}, nil)); !resp.Valid {
+			t.Fatal("200 个纯换行预览 valid=false, want true")
+		}
+		if resp := validateResponseShared(t, h, legacyBackupJSON(t, nil, map[string]any{"access_log_format": pureNewlines(201)}, nil)); resp.Valid {
+			t.Fatal("201 个纯换行预览 valid=true, want false")
+		}
+		if rec := importFormat(pureNewlines(200)); rec.Code != http.StatusOK {
+			t.Fatalf("200 个纯换行导入 status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		if _, err := db.DB.Exec(`UPDATE global_config SET access_log_format='request>host -> h' WHERE id=1`); err != nil {
+			t.Fatalf("reset access_log_format: %v", err)
+		}
+		if rec := importFormat(pureNewlines(201)); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "200 行") {
+			t.Fatalf("201 个纯换行导入 status=%d body=%s, want 400 含「200 行」", rec.Code, rec.Body.String())
+		}
+		if stored := readStored(); stored != "request>host -> h" {
+			t.Fatalf("超限纯换行导入后落库=%q, want 原值（零部分写入）", stored)
+		}
 	})
 }
 
@@ -564,8 +584,7 @@ func TestClusterWriteEndpoints409DuringImport(t *testing.T) {
 	router.POST("/cluster/nodes/:id/forget-pin", h.ForgetClusterNodePin)
 	router.POST("/cluster/nodes/report", h.ReportClusterNode)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 	calls := []struct {
 		method, path, body string
 	}{
@@ -654,8 +673,7 @@ func TestUpdateClusterNodeAccessURL_importGatePrecedesBodyParse(t *testing.T) {
 	router := gin.New()
 	router.PUT("/cluster/nodes/:id/access-url", h.UpdateClusterNodeAccessURL)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPut, "/cluster/nodes/2/access-url", strings.NewReader(`{not-json`))
 	req.Header.Set("Content-Type", "application/json")

@@ -65,6 +65,21 @@ test('安全规则页：自定义规则与 IP 名单表单保存中冻结', () =
   assert.match(page, /:disabled="ipListDialogReadOnly \|\| editingIpListPreset \|\| savingIpList"/)
 })
 
+test('自动封禁名单：最终复核 GET 前进入保存态并在 finally 释放', () => {
+  const page = code('src/views/security/SecurityRules.vue')
+  const save = section(page, 'const saveIpList = async', 'const deletingIpListId')
+  const savingAt = at(save, 'savingIpList.value = true', '名单保存占位')
+  const verifyAt = at(save, 'mergeFreshAutobanEntries(editingIpListId.value, entries)', '最终复核 GET')
+  assert.ok(savingAt < verifyAt, '复核在途时表单必须已经冻结')
+  assert.match(save, /finally \{ savingIpList\.value = false \}/)
+})
+
+test('共享定时更新编辑器：保存中冻结星期、时间与保存入口', () => {
+  const editor = code('src/components/RuleLibScheduleEditor.vue')
+  assert.match(editor, /const controlsDisabled = computed\(\(\) => props\.disabled \|\| props\.saving \|\| Boolean\(props\.unavailableHint\)\)/)
+  assert.match(section(editor, 'const emitSave = ', '</script>'), /if \(props\.saving\) return/)
+})
+
 test('绑定编辑器：保存中冻结策略/规则选择与分页（含函数级守卫）', () => {
   const page = code('src/components/SecurityBindingEditor.vue')
   assert.match(page, /:multiple="!section\.single"[\s\S]{0,80}:disabled="saving"/)
@@ -82,6 +97,15 @@ test('自动封禁配置弹框：保存中禁 ESC/X/取消并冻结表单', () =
   assert.match(page, /:close-on-press-escape="!autobanSaving" :show-close="!autobanSaving"/)
   assert.match(page, /<el-form :model="autobanForm" label-width="96px" label-position="right" :disabled="autobanSaving">/)
   assert.match(page, /<el-button :disabled="autobanSaving" @click="autobanDialogVisible = false">取消<\/el-button>/)
+})
+
+test('自动封禁禁用：占位先于确认并在 finally 释放', () => {
+  const page = code('src/views/security/SecurityEvents.vue')
+  const toggle = section(page, 'const toggleAutobanEnabled = ', 'const ctxWafFamily')
+  const pendingAt = at(toggle, 'autobanToggling.value = true', '禁用占位')
+  const confirmAt = at(toggle, 'await ElMessageBox.confirm', '禁用确认')
+  assert.ok(pendingAt < confirmAt, '确认阶段必须已经单飞')
+  assert.match(toggle, /finally \{ autobanToggling\.value = false \}/)
 })
 
 test('规则向导：保存中各步表单冻结、步骤条与前进/后退锁定', () => {

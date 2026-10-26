@@ -249,7 +249,12 @@ export const useTrustAssociation = (options: {
         ElMessage.error(`列表「${createName}」创建响应异常，请重试`)
         return
       }
-      const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...latestRefs, newId]) })
+      const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...latestRefs, newId]) }).catch(() => null)
+      if (!assocRes) {
+        ElMessage.error(`列表「${createName}」已创建并加入 ${ip}，但策略关联失败；重试将复用该名单`)
+        await options.onChanged?.()
+        return
+      }
       // 关联是最后一步：退化后缀弹警告，正常成功用动作口径文案（响应 message 是
       // 策略更新的通用文案，不能拿来当本次动作的反馈）。
       if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')

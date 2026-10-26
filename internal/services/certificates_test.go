@@ -2058,7 +2058,7 @@ func TestRequeueCertJobsSnapshot_midflight_jobs_enter_queue_as_queued_and_surviv
 			drainQueue.pending = nil
 			delete(drainQueue.active, int(jobID))
 			drainQueue.mu.Unlock()
-			drainQueue.failPendingProviderUnavailable([]queueItem{{jobID: int(jobID), ruleID: ruleID, domains: domain}}, "CA Provider 不可用：配置已禁用或删除（ID 7）")
+			manager.failPendingProviderUnavailable([]queueItem{{jobID: int(jobID), ruleID: ruleID, domains: domain}}, "CA Provider 不可用：配置已禁用或删除（ID 7）")
 
 			// Then 4：任务被标记 failed 而非跳过（不得滞留至重启）
 			var attempts int

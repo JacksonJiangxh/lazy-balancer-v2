@@ -872,7 +872,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 }
 
 // promotePendingCompensations 解析升主前 last_sync_error 现值中尚未完成的
-// 补偿标记（重载失败/品牌落盘失败/安全数据未收敛），返回人类可读清单；
+// 补偿标记（重载失败/品牌落盘失败/提交结果不确定/安全数据未收敛），返回人类可读清单；
 // 非补偿性质的普通同步错误（传输失败等）不纳入。
 func promotePendingCompensations(stored string) []string {
 	msg, _ := decodeSyncError(stored)
@@ -885,6 +885,8 @@ func promotePendingCompensations(stored string) []string {
 		pending = append(pending, "重载失败补偿")
 	case syncBrandingFailureMarkerPrefix:
 		pending = append(pending, "品牌落盘补偿")
+	case syncCommitUncertainMarkerPrefix:
+		pending = append(pending, "提交不确定补偿")
 	}
 	if strings.Contains(msg, wafRepullFailureMessagePrefix) {
 		pending = append(pending, "安全数据未收敛")

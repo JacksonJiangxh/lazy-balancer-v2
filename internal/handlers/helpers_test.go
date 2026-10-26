@@ -188,6 +188,7 @@ func TestGetSystemMetrics_diskFailureDegradesWithoutLosingOtherParts(t *testing.
 func TestGetSystemMetrics_allPartsFailingReturnsError(t *testing.T) {
 	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
 	resetDiskUsageCacheForTest(t)
+	resetCPUSampleStateForTest(t)
 	systemMetricsReadFile = func(string) ([]byte, error) { return nil, errors.New("unavailable") }
 	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, "sh", "-c", "exit 3")

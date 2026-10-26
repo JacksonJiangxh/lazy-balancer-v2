@@ -559,7 +559,7 @@
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
           <template #default="{ row }">
-            <el-switch v-model="row.update_enabled" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleThreatFlag(row, 'update_enabled', v)" />
+            <el-switch v-model="row.update_enabled" :loading="sourceFlagPending('threat', row.id)" :disabled="isReadOnly || isSlaveNode || sourceFlagPending('threat', row.id)" @change="(v: boolean) => toggleThreatFlag(row, v)" />
           </template>
         </el-table-column>
       </el-table>
@@ -619,7 +619,7 @@
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
           <template #default="{ row }">
-            <el-switch v-model="row.update_enabled" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleCrawlerFlag(row, 'update_enabled', v)" />
+            <el-switch v-model="row.update_enabled" :loading="sourceFlagPending('crawler', row.id)" :disabled="isReadOnly || isSlaveNode || sourceFlagPending('crawler', row.id)" @change="(v: boolean) => toggleCrawlerFlag(row, v)" />
           </template>
         </el-table-column>
       </el-table>
@@ -709,14 +709,40 @@ const fetchThreatLib = async () => {
   }
 }
 
-const toggleThreatFlag = async (row: ThreatSource, field: 'update_enabled', val: boolean) => {
+type SourceFlagLibrary = 'threat' | 'crawler'
+const sourceFlagSaving = ref(new Set<string>())
+const sourceFlagRequestSeq = new Map<string, number>()
+const sourceFlagKey = (library: SourceFlagLibrary, id: number): string => `${library}:${id}`
+const sourceFlagPending = (library: SourceFlagLibrary, id: number): boolean => sourceFlagSaving.value.has(sourceFlagKey(library, id))
+
+// 同一来源只允许一个在途写；序号保证过期失败不会回滚后续选择。
+// 回拉也留在占位期内，避免旧详情响应覆盖下一次乐观置值。
+const toggleSourceFlag = async (
+  library: SourceFlagLibrary,
+  row: ThreatSource,
+  val: boolean,
+  refresh: () => Promise<void>,
+): Promise<void> => {
+  const key = sourceFlagKey(library, row.id)
+  if (sourceFlagSaving.value.has(key)) return
+  const requestSeq = (sourceFlagRequestSeq.get(key) ?? 0) + 1
+  sourceFlagRequestSeq.set(key, requestSeq)
+  sourceFlagSaving.value.add(key)
   try {
-    await request.put(`/security/threat-lib/${row.id}/flags`, { [field]: val })
-    mfaAwareSuccess('已更新')
-  } catch {
-    row[field] = !val // 失败回滚开关
+    try {
+      await request.put(`/security/${library}-lib/${row.id}/flags`, { update_enabled: val })
+      mfaAwareSuccess('已更新')
+    } catch {
+      if (sourceFlagRequestSeq.get(key) === requestSeq) row.update_enabled = !val
+    }
+    await refresh()
+  } finally {
+    if (sourceFlagRequestSeq.get(key) === requestSeq) sourceFlagSaving.value.delete(key)
   }
-  fetchThreatLib()
+}
+
+const toggleThreatFlag = async (row: ThreatSource, val: boolean): Promise<void> => {
+  await toggleSourceFlag('threat', row, val, fetchThreatLib)
 }
 
 // —— 爬虫地址库（独立源表/总闸/排程/日志，与威胁情报库完全分离）——
@@ -744,14 +770,8 @@ const fetchCrawlerLib = async () => {
   }
 }
 
-const toggleCrawlerFlag = async (row: CrawlerSource, field: 'update_enabled', val: boolean) => {
-  try {
-    await request.put(`/security/crawler-lib/${row.id}/flags`, { [field]: val })
-    mfaAwareSuccess('已更新')
-  } catch {
-    row[field] = !val // 失败回滚开关
-  }
-  fetchCrawlerLib()
+const toggleCrawlerFlag = async (row: CrawlerSource, val: boolean): Promise<void> => {
+  await toggleSourceFlag('crawler', row, val, fetchCrawlerLib)
 }
 
 // —— 规则库统一表（v2.3.2）：CRS/IP2Region/威胁三源五行同一口径 ——
@@ -1287,16 +1307,16 @@ const saveIpList = async () => {
   try {
     await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目${expiredNote}）？`, '确认', { type: 'warning' })
   } catch { return }
-  // 并发新增核对必须落在最后一次确认之后（此前它在确认之前完成，确认框停留期间
-  // 任务新写入的封禁条目仍会被整表替换掉）。此处到 PUT 之间无任何用户交互。
-  let payloadEntries: IPListEntry[] = entries
-  if (editingIpListPreset.value && editingIpListId.value) {
-    const merged = await mergeFreshAutobanEntries(editingIpListId.value, entries)
-    if (merged === null) return
-    payloadEntries = merged
-  }
+  // 并发新增核对必须落在最后一次确认之后。保存占位先于复核取得，
+  // 使核对 GET 与 PUT 在途期间表单均保持冻结。
   savingIpList.value = true
   try {
+    let payloadEntries: IPListEntry[] = entries
+    if (editingIpListPreset.value && editingIpListId.value) {
+      const merged = await mergeFreshAutobanEntries(editingIpListId.value, entries)
+      if (merged === null) return
+      payloadEntries = merged
+    }
     // entries 与其余名单字段同口径：JSON 数组文本（后端 CreateIPListRequest.Entries 为 string）
     const body = { name, description: ipListForm.value.description.trim(), category: ipListForm.value.category.trim(), entries: JSON.stringify(payloadEntries) }
     const res = editingIpListId.value

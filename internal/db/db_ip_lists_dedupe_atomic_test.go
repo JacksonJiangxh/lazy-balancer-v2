@@ -40,6 +40,8 @@ func TestMigrateSystemIPListUniqueIndex_dedupeRollsBackAtomically(t *testing.T) 
 	if _, err := database.Exec(`CREATE TABLE u_security_ip_lists_system_name (placeholder INTEGER)`); err != nil {
 		t.Fatalf("create index-name placeholder: %v", err)
 	}
+	// 只观察本用例产生的审计；其它迁移用例的缓冲残留不属于本回滚契约。
+	drainSystemAuditBuffer()
 
 	if err := migrateSystemIPListUniqueIndex(); err == nil {
 		t.Fatal("create unique index must fail with the placeholder table occupying the index name")

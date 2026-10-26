@@ -1387,14 +1387,22 @@ func (h *Handlers) OIDCSettings(c *gin.Context) {
 			masked = "****"
 		}
 	}
+	allowedEmailDomains := cfg.AllowedEmailDomains
+	if allowedEmailDomains == nil {
+		allowedEmailDomains = []string{}
+	}
+	allowedGroups := cfg.AllowedGroups
+	if allowedGroups == nil {
+		allowedGroups = []string{}
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 		"enabled": cfg.Enabled, "issuer": cfg.Issuer, "client_id": cfg.ClientID,
 		"client_secret_masked": masked, "has_secret": cfg.ClientSecret != "",
 		"display_name":  cfg.DisplayName,
 		"callback_hint": "/api/v1/auth/oidc/callback",
 		// 访问白名单回显（admin 端点，值非敏感——域/组名本就是配置面数据）。
-		"allowed_email_domains": cfg.AllowedEmailDomains,
-		"allowed_groups":        cfg.AllowedGroups,
+		"allowed_email_domains": allowedEmailDomains,
+		"allowed_groups":        allowedGroups,
 	}})
 }
 

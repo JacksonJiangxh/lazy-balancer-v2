@@ -652,14 +652,33 @@ func execCaddyValidate(rendered []byte) error {
 	return nil
 }
 
+// isRuntimeFatalOutput 识别 Go 运行时在配置解析前自行 abort 的输出签名。
+// 生产实证：容器 ulimit -u 过紧时 caddy validate 以
+// 「runtime: failed to create new OS thread ... fatal error: newosproc」退出，
+// 退出码 2——若不区分，任何保存（含基础设置）都会被误报为配置被拒。
+func isRuntimeFatalOutput(output []byte) bool {
+	for _, sig := range [...]string{
+		"fatal error:",
+		"failed to create new OS thread",
+		"runtime: out of memory",
+		"fatal error: newosproc",
+	} {
+		if bytes.Contains(output, []byte(sig)) {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyCaddyValidateFailure 归类 `caddy validate` 的执行错误：
-//   - 配置被拒 = 进程确实运行并以非零退出码结束（*exec.ExitError 且 Exited()）；
+//   - 配置被拒 = 进程确实运行并以非零退出码结束（*exec.ExitError 且 Exited()），
+//     且输出不是 Go 运行时致命错误；
 //   - 校验器不可用 = 其余全部形态（超时 ctx 到期、二进制缺失/不可执行/权限
 //     拒绝（*fs.PathError/*exec.Error，无 ExitError）、信号致死/OOM
-//     （*exec.ExitError 但 !Exited()））。
+//     （*exec.ExitError 但 !Exited()）、运行时 fatal abort）。
 //
-// 抽取为纯函数以钉住后两类分支：把环境故障（权限/被信号杀死）归为「配置被拒」
-// 会以 400+回滚把基础设施问题伪装成用户配置错误。
+// 抽取为纯函数以钉住后两类分支：把环境故障（权限/被信号杀死/线程耗尽）归为
+// 「配置被拒」会以 400+回滚把基础设施问题伪装成用户配置错误。
 func classifyCaddyValidateFailure(ctxErr, runErr error, output []byte) error {
 	var exitErr *exec.ExitError
 	if ctxErr != nil || errors.Is(runErr, exec.ErrNotFound) || !errors.As(runErr, &exitErr) {
@@ -667,6 +686,12 @@ func classifyCaddyValidateFailure(ctxErr, runErr error, output []byte) error {
 	}
 	if state := exitErr.ProcessState; state != nil && !state.Exited() {
 		return fmt.Errorf("%w: caddy validate 进程异常终止: %v", ErrCLIValidatorUnavailable, runErr)
+	}
+	// Go 运行时致命错误（ulimit 线程耗尽/内存耗尽）会在任何配置解析之前
+	// 直接 abort，退出码非零却与配置内容无关——归为校验器不可用，避免把
+	// 宿主资源问题伪装成「配置被拒」阻断保存。
+	if isRuntimeFatalOutput(output) {
+		return fmt.Errorf("%w: caddy validate 进程运行时崩溃: %s: %s", ErrCLIValidatorUnavailable, runErr, string(boundedValidateDetail(output)))
 	}
 	// caddy validate 以非零退出码表达「配置被拒」。
 	return fmt.Errorf("caddy validate 拒绝配置: %s", string(boundedValidateDetail(output)))

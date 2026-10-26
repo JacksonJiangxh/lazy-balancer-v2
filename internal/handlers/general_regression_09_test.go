@@ -300,7 +300,7 @@ func TestUpdateConfig_flags_enabled_rule_with_unknown_tls_source(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/config", handler.UpdateConfig)
-	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"source":"basic","log_level":"debug"}`))
+	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"source":"basic","request_body_max_size_mb":9}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 

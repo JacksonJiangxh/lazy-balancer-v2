@@ -95,6 +95,23 @@ test('服务控制卡：roving + 方向键 + 焦点跟进（四张卡片不再�
   assert.match(handlers, /serviceCardRefs\.get\(next\)\?\.focus\(\)/)
 })
 
+test('威胁大屏 TOP 维度：APG roving、方向键与 tabpanel 关联', () => {
+  const page = code('src/views/security/ThreatScreen.vue')
+  const tabs = section(page, 'class="stat-tabs"', '</div>')
+  assert.match(tabs, /role="tablist"/)
+  assert.match(tabs, /@keydown="onStatTabKeydown"/)
+  assert.match(tabs, /:tabindex="statTabindex\('targets'\)"/)
+  assert.match(tabs, /:tabindex="statTabindex\('rules'\)"/)
+  for (const value of ['targets', 'rules']) {
+    assert.match(page, new RegExp(`id="threat-stat-tab-${value}"[^>]*aria-controls="threat-stat-panel-${value}"`))
+    assert.match(page, new RegExp(`id="threat-stat-panel-${value}"[^>]*role="tabpanel"[^>]*aria-labelledby="threat-stat-tab-${value}"`))
+  }
+  const handlers = section(page, 'const statTabRefs = ', 'const peakSlot')
+  assert.match(handlers, /rovingTabindex\(/)
+  assert.match(handlers, /nextRadioValue\(/)
+  assert.match(handlers, /statTabRefs\.get\(next\)\?\.focus\(\)/)
+})
+
 test('侧栏折叠入口：aria-expanded + aria-controls 指向导航，长按不反复切换', () => {
   const page = code('src/components/layout/AppLayout.vue')
   const logo = section(page, '<div class="logo-area"', '<AppLogo')

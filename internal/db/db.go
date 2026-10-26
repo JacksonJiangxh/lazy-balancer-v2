@@ -2905,19 +2905,28 @@ func migrateAutoBackupNodeTopologySection() error {
 			return err
 		}
 	}
+	appendNodeTopology := false
 	if len(sections) == 0 {
 		sections = []string{"users", "rules", "security", "cluster"}
 	} else if slices.Equal(sections, []string{"users", "rules", "security"}) {
 		// 旧默认全选（三分类）一次追加节点拓扑；用户此后取消勾选会保存
 		// 三键并把 version 置 1，不会在下次启动被重新加回。
 		sections = append(sections, "cluster")
+		appendNodeTopology = true
 	}
 	encoded, err := json.Marshal(sections)
 	if err != nil {
 		return err
 	}
-	_, err = DB.Exec(`UPDATE global_config SET auto_backup_sections=?, auto_backup_sections_version=1 WHERE id=1`, string(encoded))
-	return err
+	if _, err = DB.Exec(`UPDATE global_config SET auto_backup_sections=?, auto_backup_sections_version=1 WHERE id=1`, string(encoded)); err != nil {
+		return err
+	}
+	if appendNodeTopology {
+		detail := "启动迁移：自动备份旧默认范围已追加节点拓扑（cluster）分类"
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "系统配置", detail)
+	}
+	return nil
 }
 
 func normalizeUpstreamWeightsMigration() error {

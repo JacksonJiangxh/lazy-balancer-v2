@@ -345,8 +345,7 @@ func TestClusterRoleEndpoints409DuringImport(t *testing.T) {
 	router.POST("/cluster/promote", h.PromoteClusterNode)
 	router.PUT("/cluster/settings", h.UpdateClusterSettings)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 	calls := []struct {
 		method, path, body string
 	}{

@@ -161,7 +161,8 @@ const (
 
 var mfaVerifyAttempts = struct {
 	sync.Mutex
-	failures map[int][]time.Time
+	failures  map[int][]time.Time
+	lastSweep time.Time
 }{failures: make(map[int][]time.Time)}
 
 // mfaPruneVerifyAttemptsLocked 清理窗口外条目（调用方须持锁）。
@@ -188,9 +189,12 @@ func MFAVerifyAttemptLimited(userID int, now time.Time) bool {
 	return len(mfaPruneVerifyAttemptsLocked(userID, now)) >= mfaVerifyAttemptLimit
 }
 
+// mfaVerifyAttemptsSweepInterval 节制全表清扫频率；窗口内只裁剪当前用户，
+// 避免大量活跃失败用户让每笔失败都持锁遍历全表。
+const mfaVerifyAttemptsSweepInterval = mfaVerifyAttemptWindow
+
 // mfaVerifyAttemptsSweepThreshold 触发全表清扫的条目数阈值。条目有界于
-// 「窗口内失败过的用户数」，但删除/一次性用户会残留到窗口过期；阈值触发
-// 的整表裁剪把所有窗口外条目一并移除（每用户裁剪只在被访问时发生）。
+// 「窗口内失败过的用户数」，删除/一次性用户由周期清扫回收。
 const mfaVerifyAttemptsSweepThreshold = 64
 
 // mfaSweepVerifyAttemptsLocked 整表裁剪窗口外条目（调用方须持锁）。
@@ -207,8 +211,10 @@ func MFARecordVerifyAttemptFailure(userID int, now time.Time) {
 	defer mfaVerifyAttempts.Unlock()
 	kept := mfaPruneVerifyAttemptsLocked(userID, now)
 	mfaVerifyAttempts.failures[userID] = append(kept, now)
-	if len(mfaVerifyAttempts.failures) > mfaVerifyAttemptsSweepThreshold {
+	if len(mfaVerifyAttempts.failures) > mfaVerifyAttemptsSweepThreshold &&
+		(mfaVerifyAttempts.lastSweep.IsZero() || now.Sub(mfaVerifyAttempts.lastSweep) >= mfaVerifyAttemptsSweepInterval) {
 		mfaSweepVerifyAttemptsLocked(now)
+		mfaVerifyAttempts.lastSweep = now
 	}
 }
 
@@ -225,6 +231,7 @@ func MFAClearVerifyAttempts(userID int) {
 func MFAResetVerifyAttemptsForTest() {
 	mfaVerifyAttempts.Lock()
 	mfaVerifyAttempts.failures = make(map[int][]time.Time)
+	mfaVerifyAttempts.lastSweep = time.Time{}
 	mfaVerifyAttempts.Unlock()
 }
 

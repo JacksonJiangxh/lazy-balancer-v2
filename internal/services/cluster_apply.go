@@ -173,6 +173,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 状态」会清空 last_sync_error，提交后再读永远漏判，品牌节又不在哈希口径内
 	// （users 节未变时不会重放），没有标记就会永久停在上轮失败态。
 	brandingRetry := s.syncBrandingFailureMarkerPresent(ctx)
+	// Commit 结果不确定标记同样在事务前捕获：补偿轮必须重试品牌落盘并
+	// 强制重载，即使已提交形态的三节哈希与证书材料均已一致。
+	commitUncertainRetry := s.syncMarkerPresent(ctx, syncCommitUncertainMarkerPrefix)
 	// previous 只装载 apply 消费面（三节哈希/证书轴/ACME
 	// ownership），不再全量构建快照（避免每次 apply 白做 CRS 树全量哈希）。
 	previous, err := s.cluster.clusterSnapshotForApply(ctx)
@@ -277,11 +280,18 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			s.restoreSnapshotArtifacts(previous, snapshot),
 		)
 	}
-	if err := tx.Commit(); err != nil {
-		return errors.Join(
-			fmt.Errorf("提交快照事务: %w", err),
-			s.restoreSnapshotArtifacts(previous, snapshot),
-		)
+	commitSnapshot := s.commitSnapshotTx
+	if commitSnapshot == nil {
+		commitSnapshot = (*sql.Tx).Commit
+	}
+	if err := commitSnapshot(tx); err != nil {
+		// database/sql 的 Commit 错误不能证明事务未提交：实际已提交时恢复旧
+		// 文件会制造 DB/磁盘分叉。释放可能仍未结束的事务，保留本轮材料并
+		// 持久化补偿标记；下轮无论 304 与否都按主端快照重新收敛。
+		_ = tx.Rollback()
+		marker := fmt.Sprintf("%s: 提交结果不确定；证书与 DNS 文件保留本轮内容，下轮同步将全量重拉: %v", syncCommitUncertainMarkerPrefix, err)
+		s.persistSyncError(ctx, marker, models.SyncErrorCodeApplyFailed)
+		return fmt.Errorf("提交快照事务失败，提交结果不确定（已保留本轮证书与 DNS 文件，下轮同步将全量重拉）: %w", err)
 	}
 	// 规则日志清理（快照已提交）：与证书轴同层同门——rules 节应用后按
 	// 「上一版有、快照没有」的差集删除本地访问日志。失败仅 warn/审计，
@@ -329,7 +339,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 补偿重拉轮三节哈希可能全一致，漏并入重载判据会让默认站点落地文案
 	// 滞留旧值（标记已被事务清空，无后续自愈）。
 	brandingWritten := false
-	if snapshot.BasicSettings.BrandingJSON != nil && (!skip.skip("users") || brandingRetry || reloadCompensation) {
+	if snapshot.BasicSettings.BrandingJSON != nil && (!skip.skip("users") || brandingRetry || reloadCompensation || commitUncertainRetry) {
 		var brandingErr error
 		brandingWritten, brandingErr = s.applySnapshotBrandingChecked(s.cfg, *snapshot.BasicSettings.BrandingJSON)
 		if brandingErr != nil {
@@ -460,7 +470,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// last_good 兼容：渲染未变则既有 last_good 仍是当前运行配置的准确
 	// 快照，无需重写。
 	renderInputsChanged := !(skip.skip("users") && skip.skip("rules") && skip.skip("security"))
-	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || brandingWritten || reloadCompensation
+	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || brandingWritten || reloadCompensation || commitUncertainRetry
 	var reloadErr error
 	if mustReload {
 		// defer 释放：panic（gin.Recovery 恢复）后包级锁不得泄漏——否则后续

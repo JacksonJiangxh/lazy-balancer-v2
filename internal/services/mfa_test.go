@@ -3,6 +3,7 @@ package services
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -18,18 +19,40 @@ import (
 // mfaTestEnv 建临时库并注入时间可控环境。
 func mfaTestEnv(t *testing.T) {
 	t.Helper()
-	oldDB := db.DB
-	oldCurrent := db.GetDB()
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-		db.DB = oldDB
-		// 后台循环句柄（db.GetDB）随 Close 置 nil，必须一并还原。
-		db.SetDB(oldCurrent)
-	})
+	setupIsolatedDB(t)
 	// Initialize 已种 global_config id=1（caddy_config '{}'）
+}
+
+func TestMFATestEnv_restoresAllDatabaseHandles(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB, oldCurrent := db.DB, db.MetricsDB, db.AuditDB, db.GetDB()
+	mainSentinel, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "main.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsSentinel, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metrics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditSentinel, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.DB, db.MetricsDB, db.AuditDB = mainSentinel, metricsSentinel, auditSentinel
+	db.SetDB(mainSentinel)
+	t.Cleanup(func() {
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldCurrent)
+		_ = mainSentinel.Close()
+		_ = metricsSentinel.Close()
+		_ = auditSentinel.Close()
+	})
+
+	for run := 1; run <= 2; run++ {
+		t.Run(fmt.Sprintf("run-%d", run), mfaTestEnv)
+		if db.DB != mainSentinel || db.MetricsDB != metricsSentinel || db.AuditDB != auditSentinel || db.GetDB() != mainSentinel {
+			t.Fatalf("第 %d 次夹具清理后句柄未完整恢复: DB=%p MetricsDB=%p AuditDB=%p GetDB=%p", run, db.DB, db.MetricsDB, db.AuditDB, db.GetDB())
+		}
+	}
 }
 
 func mfaSeedUser(t *testing.T, id int) {
@@ -587,5 +610,78 @@ func TestMFARecordVerifyAttemptFailure_sweepsExpiredEntries(t *testing.T) {
 	}
 	if _, ok := mfaVerifyAttempts.failures[9999]; !ok {
 		t.Fatal("当前用户的最新失败记录必须保留")
+	}
+}
+
+func TestMFARecordVerifyAttemptFailure_timeGatesFullSweep(t *testing.T) {
+	MFAResetVerifyAttemptsForTest()
+	t.Cleanup(MFAResetVerifyAttemptsForTest)
+	now := time.Now()
+
+	mfaVerifyAttempts.Lock()
+	for i := 1; i <= mfaVerifyAttemptsSweepThreshold; i++ {
+		mfaVerifyAttempts.failures[i] = []time.Time{now.Add(-2 * mfaVerifyAttemptWindow)}
+	}
+	mfaVerifyAttempts.Unlock()
+	MFARecordVerifyAttemptFailure(9999, now)
+
+	mfaVerifyAttempts.Lock()
+	mfaVerifyAttempts.failures = make(map[int][]time.Time)
+	for i := 1; i <= mfaVerifyAttemptsSweepThreshold+1; i++ {
+		mfaVerifyAttempts.failures[i] = []time.Time{now}
+	}
+	mfaVerifyAttempts.failures[9998] = []time.Time{now.Add(-2 * mfaVerifyAttemptWindow)}
+	mfaVerifyAttempts.Unlock()
+	MFARecordVerifyAttemptFailure(9999, now.Add(time.Second))
+
+	mfaVerifyAttempts.Lock()
+	_, sentinelExists := mfaVerifyAttempts.failures[9998]
+	for i := 1; i <= mfaVerifyAttemptsSweepThreshold+1; i++ {
+		if got := len(mfaVerifyAttempts.failures[i]); got != 1 {
+			mfaVerifyAttempts.Unlock()
+			t.Fatalf("未过期用户 %d 的失败数=%d, want 1", i, got)
+		}
+	}
+	mfaVerifyAttempts.Unlock()
+	if !sentinelExists {
+		t.Fatal("距上次全表清扫不足一个窗口时，不得再次全表扫描")
+	}
+
+	later := now.Add(mfaVerifyAttemptWindow + time.Second)
+	mfaVerifyAttempts.Lock()
+	for i := 1; i <= mfaVerifyAttemptsSweepThreshold+1; i++ {
+		mfaVerifyAttempts.failures[i] = []time.Time{later}
+	}
+	mfaVerifyAttempts.Unlock()
+	MFARecordVerifyAttemptFailure(9999, later)
+	mfaVerifyAttempts.Lock()
+	defer mfaVerifyAttempts.Unlock()
+	if _, exists := mfaVerifyAttempts.failures[9998]; exists {
+		t.Fatal("清扫间隔到期后，过期哨兵必须回收")
+	}
+	for i := 1; i <= mfaVerifyAttemptsSweepThreshold+1; i++ {
+		if got := len(mfaVerifyAttempts.failures[i]); got != 1 {
+			t.Fatalf("周期清扫误淘汰未过期用户 %d: failures=%d", i, got)
+		}
+	}
+}
+
+func TestMFAVerifyAttempts_limitWindowAndSuccessReset(t *testing.T) {
+	MFAResetVerifyAttemptsForTest()
+	t.Cleanup(MFAResetVerifyAttemptsForTest)
+	now := time.Now()
+	for range mfaVerifyAttemptLimit {
+		MFARecordVerifyAttemptFailure(1, now)
+	}
+	if !MFAVerifyAttemptLimited(1, now) || MFAVerifyAttemptLimited(2, now) {
+		t.Fatal("5 次窗口限流必须按用户隔离")
+	}
+	MFAClearVerifyAttempts(1)
+	if MFAVerifyAttemptLimited(1, now) {
+		t.Fatal("验码成功清零后不得继续限流")
+	}
+	MFARecordVerifyAttemptFailure(1, now)
+	if MFAVerifyAttemptLimited(1, now.Add(mfaVerifyAttemptWindow)) {
+		t.Fatal("窗口边界的旧失败必须过期")
 	}
 }

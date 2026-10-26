@@ -91,8 +91,8 @@ export function parseIpListEntryLine(
   if (remark.startsWith('"')) {
     const field = readQuotedField(remark, 0)
     if (!field) return null
-    // 备注是最后一列：闭合引号后除空白外的任何内容都是无机型残留
-    if (readFieldRest(remark, field.next) !== '') return null
+    // 备注是最后一列：闭合引号后只允许空白；即使第三列为空也属畸形行
+    if (!/^\s*$/.test(remark.slice(field.next))) return null
     remark = field.text
   }
   if (Array.from(remark).length > ipListRemarkMaxLength) {

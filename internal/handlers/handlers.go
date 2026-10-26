@@ -316,13 +316,16 @@ func (h *Handlers) caddyApplyNoteLocked() string {
 // Commit 成功后才落盘）。两段式：
 //   - auditReload()：只落「重载」审计（幂等）。提交后的失败分支也必须调用
 //     ——真实 /load 已经发生，「触发重载必须留痕」不因随后失败而豁免。
-//   - finalize()：成功收尾（LKG 补写 → 清横幅 → 重载审计 → 计时）。
-//     失败分支**不得**调用：它会清掉失败横幅并（在补偿回滚场景下）把候选
-//     字节写进 LKG，制造假恢复信号。
+//   - finalize()：成功收尾（LKG 补写 → 清横幅 → 重载审计 → 计时）。若后续
+//     强制重载已成功并写入更新的 LKG，首轮载荷即被 supersede，finalize 只执行
+//     清横幅/审计等收尾，不再回写旧载荷。失败分支**不得**调用：它会清掉失败横幅
+//     并（在补偿回滚场景下）把候选字节写进 LKG，制造假恢复信号。
 type txApplyNote struct {
-	audited bool
-	audit   func()
-	finish  func()
+	audited            bool
+	lastGoodSuperseded bool
+	audit              func()
+	persistLastGood    func()
+	finish             func()
 }
 
 // auditReload 落一次「重载」审计（重复调用无副作用）。nil 句柄（应用失败）
@@ -335,10 +338,21 @@ func (n *txApplyNote) auditReload() {
 	n.audit()
 }
 
+// markLastGoodSuperseded 标记后续强制重载已写入更新的 LKG。只能在该重载成功后
+// 调用；失败路径保持原补偿链，不改变首轮 note 的状态。
+func (n *txApplyNote) markLastGoodSuperseded() {
+	if n != nil {
+		n.lastGoodSuperseded = true
+	}
+}
+
 // finalize 成功收尾。顺序与拆分前一致（LKG → 清横幅 → 审计 → 计时）。
 func (n *txApplyNote) finalize() {
 	if n == nil {
 		return
+	}
+	if !n.lastGoodSuperseded && n.persistLastGood != nil {
+		n.persistLastGood()
 	}
 	if n.finish != nil {
 		n.finish()
@@ -389,15 +403,16 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 		audit: func() {
 			recordAudit(c, "重载", "Caddy服务", reloadDetail)
 		},
-		finish: func() {
+		persistLastGood: func() {
 			// commit 成功后才写 last-known-good（事务内 apply 有意不落盘）：
 			// 本闭包在全部调用点都只在 tx.Commit() 成功返回后执行——LKG 的语义
 			// 因此恒为「已提交且已下发」的配置，进程中断窗口不再把从未提交的
 			// 候选固化成启动兜底。
 			h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
-			// 2026-09-07：成功重载后清除既往失败标记（对齐 finishTxApply
-			// 成功分支与 UpdateConfig/PutCaddyConfig 的口径——规则×5 不清
-			// 陈旧 caddy_apply_error 会导致横幅长亮）。
+		},
+		finish: func() {
+			// 成功重载后清除既往失败标记；supersede 只跳过上方旧 LKG 载荷，
+			// 不影响这里的横幅与计时收尾。
 			h.recordCaddyApplyResult(nil)
 			services.Logf("info", "保存链计时: apply_total=%dms（含渲染+Caddy 重载）", time.Since(applyStart).Milliseconds())
 		},

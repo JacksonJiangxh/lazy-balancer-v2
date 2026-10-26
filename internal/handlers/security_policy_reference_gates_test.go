@@ -24,8 +24,7 @@ import (
 // IP2Region 与 CRS/威胁同族：版本表在导入全量替换清单内，窗口内写入会被
 // 静默覆盖或撞写锁 500。
 func TestLibAutoUpdateEndpoints_rejectWriteDuringImport(t *testing.T) {
-	configImportBeginMu.Lock()
-	t.Cleanup(configImportBeginMu.Unlock)
+	beginImportWindowForTest(t)
 
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}

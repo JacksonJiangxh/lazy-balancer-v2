@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -74,6 +75,33 @@ func TestOIDCCallback_token_carries_pwd_ver(t *testing.T) {
 	v, ok = claims["pwd_ver"]
 	if !ok || v != float64(3) {
 		t.Fatalf("post-bump jwt must carry pwd_ver=3, got present=%v value=%v", ok, v)
+	}
+}
+
+func TestOIDCUserStatusToggle_bumpsSessionVersionAcrossReenable(t *testing.T) {
+	idp := newMockIdP(t)
+	router, h := setupOIDCTest(t, idp)
+	seedUserAuditTest(t, 999, "status-admin", "admin", true)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true}`)
+	claims := oidcLoginAndGetClaims(t, router)
+	if got := claims["pwd_ver"]; got != float64(0) {
+		t.Fatalf("initial pwd_ver=%v, want 0", got)
+	}
+	var userID int
+	if err := db.DB.QueryRow("SELECT id FROM users WHERE auth_provider='oidc'").Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	path := "/users/" + strconv.Itoa(userID)
+	for _, body := range []string{`{"is_enabled":false}`, `{"is_enabled":true}`} {
+		response := serveUserMutation(h, http.MethodPut, path, body, 999, h.ToggleUserStatus)
+		if response.Code != http.StatusOK {
+			t.Fatalf("toggle %s: status=%d body=%s", body, response.Code, response.Body.String())
+		}
+	}
+
+	claims = oidcLoginAndGetClaims(t, router)
+	if got := claims["pwd_ver"]; got != float64(2) {
+		t.Fatalf("new OIDC login pwd_ver=%v, want 2 after disable+enable", got)
 	}
 }
 

@@ -464,9 +464,13 @@ func TestMetricsService_updateOverview_keepsPreviousCountsOnQueryFailure(t *test
 }
 
 func TestMetricsService_updateOverview_nilDBPreservesCountsAndSamples(t *testing.T) {
-	oldDB := db.DB
+	oldDB, oldCurrent := db.DB, db.GetDB()
 	db.DB = nil
-	t.Cleanup(func() { db.DB = oldDB })
+	db.SetDB(nil)
+	t.Cleanup(func() {
+		db.DB = oldDB
+		db.SetDB(oldCurrent)
+	})
 	service := &MetricsService{overview: models.MetricsOverview{ActiveRules: 7, TotalRules: 9, OnlineNodes: 2}}
 
 	// When/Then：启动/拆除窗口 DB 未初始化不得 panic；计数保留而流量样本照常推进。

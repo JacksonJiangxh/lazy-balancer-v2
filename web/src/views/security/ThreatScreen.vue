@@ -217,11 +217,11 @@
 
         <div class="stat-section">
           <div class="stat-title"><span>TOP 目标 / 规则</span><span class="n" title="当前维度前 3 条命中合计">{{ activeStatSum }}</span></div>
-          <div class="stat-tabs" role="tablist" aria-label="TOP 排名维度">
-            <button type="button" class="stat-tab" role="tab" :aria-selected="statTab === 'targets'" @click="statTab = 'targets'">被攻击目标</button>
-            <button type="button" class="stat-tab" role="tab" :aria-selected="statTab === 'rules'" @click="statTab = 'rules'">命中规则</button>
+          <div class="stat-tabs" role="tablist" aria-label="TOP 排名维度" @keydown="onStatTabKeydown">
+            <button id="threat-stat-tab-targets" type="button" class="stat-tab" role="tab" :aria-selected="statTab === 'targets'" aria-controls="threat-stat-panel-targets" :tabindex="statTabindex('targets')" :ref="(el: unknown) => setStatTabRef('targets', el)" @click="statTab = 'targets'">被攻击目标</button>
+            <button id="threat-stat-tab-rules" type="button" class="stat-tab" role="tab" :aria-selected="statTab === 'rules'" aria-controls="threat-stat-panel-rules" :tabindex="statTabindex('rules')" :ref="(el: unknown) => setStatTabRef('rules', el)" @click="statTab = 'rules'">命中规则</button>
           </div>
-          <template v-if="statTab === 'targets'">
+          <div v-if="statTab === 'targets'" id="threat-stat-panel-targets" role="tabpanel" aria-labelledby="threat-stat-tab-targets" tabindex="0">
             <ul v-if="topTargets.length" class="rules">
               <li v-for="item in topTargets" :key="item.name + item.domain" class="rule" :title="item.domain || item.name">
                 <span class="rule-name">{{ item.domain || item.name }}</span>
@@ -230,8 +230,8 @@
               </li>
             </ul>
             <div v-else class="empty">暂无目标数据</div>
-          </template>
-          <template v-else>
+          </div>
+          <div v-else id="threat-stat-panel-rules" role="tabpanel" aria-labelledby="threat-stat-tab-rules" tabindex="0">
             <ul v-if="topRules.length" class="rules">
               <li v-for="item in topRules" :key="item.name" class="rule" :title="item.name">
                 <span class="rule-name">{{ ruleLabel(item.name) }}</span>
@@ -240,7 +240,7 @@
               </li>
             </ul>
             <div v-else class="empty">暂无数据</div>
-          </template>
+          </div>
         </div>
       </div>
       <div class="panel-footer" title="自最近一次 Caddy 配置重载/进程启动以来累计；含上游自返 429；不受窗口切换影响">
@@ -309,6 +309,7 @@ import { trafficDelta, formatRecentRate, hourlyBucketLabel, bucketTerminology, t
 import { anomalySeverity, overlayDetectionGrade, zeroScoreSeverity, type AnomalySeverity } from '@/utils/severityScale'
 import { displayThreatScreenMode } from '@/utils/configValues'
 import { flowTimestamp, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, planFlowEvents, FLOW_REALTIME_MAX_AGE_MS } from '@/utils/threatFlowRules'
+import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
 // 威胁大屏（v2.3.8 Threat Wall 版式）：三栏 HUD 网格（左事件流/中引擎舞台/
@@ -428,6 +429,23 @@ const topRuleHits = computed(() => topRules.value.reduce((m, item) => m + item.v
 const hourlyHist = computed(() => stats.value?.hourly_hist ?? [])
 const statTab = ref<'targets' | 'rules'>('targets')
 const activeStatSum = computed(() => statTab.value === 'rules' ? topRuleHits.value : targetHits.value)
+const statTabValues = ['targets', 'rules'] as const
+type StatTab = typeof statTabValues[number]
+const statTabRefs = new Map<StatTab, HTMLElement>()
+const setStatTabRef = (value: StatTab, el: unknown): void => {
+  if (el instanceof HTMLElement) statTabRefs.set(value, el)
+  else statTabRefs.delete(value)
+}
+const statTabindex = (value: StatTab): number =>
+  rovingTabindex(statTabValues, statTab.value, () => false, value)
+const onStatTabKeydown = (event: KeyboardEvent): void => {
+  if (event.repeat) return
+  const next = nextRadioValue(statTabValues, statTab.value, () => false, event.key)
+  if (next !== 'targets' && next !== 'rules') return
+  event.preventDefault()
+  statTab.value = next
+  statTabRefs.get(next)?.focus()
+}
 // 峰值时段与有事件小时：窗口概览摆脱不可解释的对数指数，改为可直接读懂的
 // 分布指标；并列峰值取时间靠前者（后端桶按时间升序）。
 const peakSlot = computed(() => hourlyHist.value.reduce(

@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 ./scripts/check-bulk-edit-safety.sh
 ./scripts/tests/guard-selftest.sh
 ./scripts/tests/bulk-edit-safety-selftest.sh
+./scripts/tests/shuffle-gate-selftest.sh
 # 修复声称反向核对（R-4b）：台账 -> 代码/测试事实。自检常开；带台账时
 # （FIX_LEDGER=<file> [FIX_COMMIT=<rev>] ./scripts/test-all.sh）逐条验证
 # code:path:line:token 与 test:Name 仍存在，并核对提交 message 的 Fixes: 声明。
@@ -103,7 +104,7 @@ fi
 
 # Dockerfile 后端阶段用显式 COPY 清单（避免 web/docs/scripts 等非 Go 变更 bust
 # Go 编译层）——清单漏项只会在镜像构建时才暴露（go build 缺包），故在此比对：
-# git 跟踪的顶层 Go 目录必须全部在清单内。
+# 受控 + 未跟踪（未被 .gitignore 忽略）的顶层 Go 目录必须全部在清单内。
 # 门禁本体按 `^FROM ... AS <stage>` 切块，只断言 backend 阶段：xcaddy-builder
 # 阶段也 COPY 同名模块目录（--with 载体），整文件汇总会掩盖 backend 侧的漏项。
 # 自检在临时夹具仓里验证该边界（删 backend 的 wafiplist/geoipnames 必红）。
@@ -170,27 +171,9 @@ for module in "${modules[@]}"; do
   (cd "$module" && go test ./... -count=1)
 done
 
-# 顺序依赖门（-shuffle 固定 seed）：单包内用例共享进程内全局态（包级缓存、
-# 测试用 seam、ingestion 健康位等），默认的声明顺序让「写侧在清理前」恰好成立，
-# 换个排列就红——这类泄漏只能靠打乱顺序暴露，而人工偶发跑一次 -shuffle 不算门禁。
-# 固定 seed 而非随机：失败必须可复放，报告里直接给出同一条命令。
-# 两个 seed 取不同排列（单 seed 可能恰好把污染方排在受害方之后而全绿）；
-# 两个并发密集包合跑一条命令，go test 自身按包并行，门禁时长不翻倍。
-shuffle_seeds=(1792946460835645000 1)
-echo "== go test -shuffle (fixed seeds: ${shuffle_seeds[*]}) =="
-for seed in "${shuffle_seeds[@]}"; do
-  echo "-- -shuffle=${seed} ./internal/handlers ./internal/services"
-  set +e
-  go test -count=1 -shuffle="${seed}" ./internal/handlers ./internal/services
-  shuffle_rc=$?
-  set -e
-  if [[ ${shuffle_rc} -ne 0 ]]; then
-    echo "顺序依赖门失败（rc=${shuffle_rc}）：固定 seed 可复放——" >&2
-    echo "  go test -count=1 -shuffle=${seed} ./internal/handlers ./internal/services" >&2
-    echo "先查共享全局态（包级缓存/测试 seam/健康位）的写侧与清理侧配对，勿改 seed 绕过。" >&2
-    exit 1
-  fi
-done
+# 顺序依赖门：固定 seed 可复放，随机 seed 扩展排列面；五个持有进程级全局态的
+# 包统一使用 900s 超时。自测用真实的声明顺序安全、乱序失败的夹具包验证鉴别力。
+./scripts/test-shuffle.sh
 
 # 交叉编译等价性（不是「镜像构建等价性」）：验证 GOOS=linux CGO_ENABLED=0
 # 这组构建参数下代码可编译——平台/cgo 相关代码路径不进本地测试面，四个嵌套

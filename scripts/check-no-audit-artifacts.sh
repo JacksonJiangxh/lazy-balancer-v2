@@ -201,7 +201,7 @@ if [[ -n "$scan_targets" ]]; then
     echo "ERROR: 需要 perl 才能运行内容扫描（缺少 perl，拒绝静默通过）" >&2
     exit 1
   fi
-  scan_prog="$(mktemp "${TMPDIR:-/tmp}/audit-guard-scan.XXXXXX.pl")"
+  scan_prog="$(mktemp "${TMPDIR:-/tmp}/audit-guard-scan.XXXXXX")"
   list_file="$(mktemp "${TMPDIR:-/tmp}/audit-guard-files.XXXXXX")"
   trap 'rm -f "$scan_prog" "$list_file"' EXIT
 

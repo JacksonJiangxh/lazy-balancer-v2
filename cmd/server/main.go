@@ -622,8 +622,8 @@ func (b *shutdownBudget) segmentReserving(max, reserveAfter time.Duration) time.
 // engineDrain 引擎排空上限 = 剩余预算 − 收尾段预留（metrics/时区/日志轮转
 // 等待 + ACME 收尾）。
 //
-// 引擎排空是关停链最长的一段（在途清理任务不消费取消信号），若吃满剩余
-// 预算，其后的收尾段将无预算可用。归零时返回 1ms：引擎把 <=0 视为
+// 引擎排空是关停链最长的一段（部分在途任务段不消费取消信号），若吃满
+// 剩余预算，其后的收尾段将无预算可用。归零时返回 1ms：引擎把 <=0 视为
 // 「未指定」并回落到默认 30s（engine.StopWithTimeout），绝不能传 0。
 func (b *shutdownBudget) engineDrain() time.Duration {
 	d := b.remaining() - trailingStopReserve

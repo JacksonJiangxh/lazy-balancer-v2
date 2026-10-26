@@ -637,6 +637,9 @@ func TestUpdateCurrentUserAPIKeyStatus_missingAuthContextIs401(t *testing.T) {
 // 提交重复 CIDR 时不得显示 2 条而库内只有 1 条。
 func TestUpdateAPIKeyStatus_auditUsesNormalizedWhitelistCount(t *testing.T) {
 	setupAPIKeyTestDB(t)
+	if _, err := db.DB.Exec("CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_write_guard BOOLEAN DEFAULT 0); INSERT INTO global_config (id,mfa_write_guard) VALUES (1,0)"); err != nil {
+		t.Fatalf("seed disabled MFA guard: %v", err)
+	}
 	if _, err := db.AuditDB.Exec(`CREATE TABLE audit_log (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		username VARCHAR(50), action VARCHAR(50), resource VARCHAR(50),

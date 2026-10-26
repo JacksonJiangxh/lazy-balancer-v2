@@ -713,16 +713,20 @@ const auditLogSizeCacheTTL = 60 * time.Second
 // 语义与任务日志侧统一——此前两套实现易单侧漏改）。
 var auditLogSizeValueCache = dbValueCache{ttl: auditLogSizeCacheTTL}
 
+// beforeAuditLogSizeQuery 保留审计轮转阈值查询前注入缝，供关停交错回归测试使用。
+var beforeAuditLogSizeQuery = func() {}
+
 func getAuditLogSizeBytes() int64 {
 	defaultBytes := int64(db.DefaultAuditLogSizeMB) * 1024 * 1024
-	// 未初始化库回退治理默认值（db.DefaultAuditLogSizeMB），不得 nil deref
-	// （当前不可达；与同包多数配置读取 helper 的 db.DB==nil 守卫口径一致）。
-	if db.DB == nil {
+	// 未初始化库回退治理默认值（db.DefaultAuditLogSizeMB），不得 nil deref。
+	database := db.DB
+	if database == nil {
 		return defaultBytes
 	}
 	return auditLogSizeValueCache.get(func() (int64, error) {
 		var sizeMB int
-		if err := db.DB.QueryRow("SELECT COALESCE(audit_log_size_mb, ?) FROM global_config WHERE id = 1", db.DefaultAuditLogSizeMB).Scan(&sizeMB); err != nil {
+		beforeAuditLogSizeQuery()
+		if err := database.QueryRow("SELECT COALESCE(audit_log_size_mb, ?) FROM global_config WHERE id = 1", db.DefaultAuditLogSizeMB).Scan(&sizeMB); err != nil {
 			// 读失败回退默认值当轮生效，且必须留痕：此前静默回退让「轮转阈值
 			// 长期按兜底值滚动而面板配置形同虚设」零信号。状态转换口径（首报
 			// warn + 恢复 info）与同族配置读取（运行日志尺寸/时区刷新）同源，

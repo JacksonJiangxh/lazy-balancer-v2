@@ -280,4 +280,18 @@ func TestUpdateConfig_accessLogFormatSizeLimit(t *testing.T) {
 	if stored := readStored(); stored != "request>host -> h" {
 		t.Fatalf("超限空白行请求落库=%q, want 原值（零落库）", stored)
 	}
+	// 纯换行不能被 TrimRight 折叠成一行：200 个换行放行，201 个拒绝且零落库。
+	pureNewlines := func(n int) string { return strings.Repeat("\n", n) }
+	if res := preview(pureNewlines(200)); res.Code != http.StatusOK {
+		t.Fatalf("200 个纯换行 preview status=%d body=%s, want 200", res.Code, res.Body.String())
+	}
+	if res := preview(pureNewlines(201)); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("201 个纯换行 preview status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	if res := send(http.MethodPut, "/config", pureNewlines(201)); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "200 行") {
+		t.Fatalf("201 个纯换行 save status=%d body=%s, want 400 含「200 行」", res.Code, res.Body.String())
+	}
+	if stored := readStored(); stored != "request>host -> h" {
+		t.Fatalf("超限纯换行请求落库=%q, want 原值（零落库）", stored)
+	}
 }

@@ -47,6 +47,15 @@ func testCertificatePEM(t *testing.T, notAfter time.Time) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
+// testCertJobSeq 给本包种子任务分配高位 ID：异步部署重试 goroutine 可能
+// 越过测试边界，若新库因 db.Initialize 重用 id=1，前一个用例的重试会改写
+// 本用例的行（随机顺序门实证：第 3 次退避读到的 attempt 已多 1）。
+var testCertJobSeq atomic.Int64
+
+func nextTestCertJobID() int64 {
+	return 900000 + testCertJobSeq.Add(1)
+}
+
 func seedCertificateJob(t *testing.T, status string) (int, string) {
 	t.Helper()
 	_, database := newClusterTestService(t)
@@ -54,15 +63,11 @@ func seedCertificateJob(t *testing.T, status string) (int, string) {
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?, 'issue test', 'example.com', 'http', 8080, 1, 1, 'acme_dns')`, ruleID); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
-	result, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) VALUES (?, 'example.com', ?, 1)`, ruleID, status)
-	if err != nil {
+	jobIDValue := nextTestCertJobID()
+	if _, err := database.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES (?, ?, 'example.com', ?, 1)`, jobIDValue, ruleID, status); err != nil {
 		t.Fatalf("seed certificate job: %v", err)
 	}
-	jobID, err := result.LastInsertId()
-	if err != nil {
-		t.Fatalf("read certificate job ID: %v", err)
-	}
-	return int(jobID), ruleID
+	return int(jobIDValue), ruleID
 }
 
 func TestCertIssuer_deployIssuedCertificate_keeps_nonterminal_state_when_reload_fails(t *testing.T) {

@@ -48,14 +48,16 @@ export const classifyAuthFailure = (input: AuthFailureInput): AuthFailureKind =>
   return 'generic'
 }
 
+/** 401 是否仍属于发起请求的会话：跨登出/登录后，旧请求的迟到响应不得处置新会话。 */
+export const isRequestAuthTokenCurrent = (requestToken: string | undefined, currentToken: string | null): boolean =>
+  requestToken === (currentToken ?? undefined)
+
 interface MfaStepUpCoordinator {
   /** 弹码（单飞）：在途时并发 428 共享同一 Promise，不连环弹窗。 */
   readonly prompt: () => Promise<string | null>
   /** 验证码刷新（单飞）：同一轮在途提供者共享同一次 verify-step（同码重放会被
    *  后端按 mfa_last_timestep 拒绝并计失败）。 */
   readonly ensureRefresh: (code: string, refresh: (code: string) => Promise<void>) => Promise<void>
-  /** 新一轮弹码作废旧刷新句柄（在途旧刷新仍会跑完，但其结果不再被复用）。 */
-  readonly resetRefresh: () => void
   /** 诊断/测试用：弹窗是否在途（生产代码零消费）。 */
   readonly isPromptPending: () => boolean
 }
@@ -100,7 +102,6 @@ export const createMfaStepUp = (openPrompt: () => Promise<string | null>): MfaSt
   return {
     prompt,
     ensureRefresh,
-    resetRefresh: () => { refresh = null },
     isPromptPending: () => pending !== null,
   }
 }

@@ -57,17 +57,21 @@ func InvalidateTaskLogSizeCache() {
 	taskLogSizeCache.invalidate()
 }
 
+// beforeTaskLogSizeQuery 保留任务日志阈值查询前注入缝，供关停交错回归测试使用。
+var beforeTaskLogSizeQuery = func() {}
+
 func getTaskLogSizeBytes() int64 {
 	// 未初始化库回退治理默认值（db.DefaultTaskLogSizeMB）；与多数配置读取
 	// helper 的 db.DB==nil 守卫一致。
 	defaultBytes := int64(db.DefaultTaskLogSizeMB) * 1024 * 1024
-	if db.DB == nil {
+	database := db.DB
+	if database == nil {
 		return defaultBytes
 	}
 	return taskLogSizeCache.get(func() (int64, error) {
 		var sizeMB int
-		if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, ?) FROM global_config WHERE id = 1", db.DefaultTaskLogSizeMB).Scan(&sizeMB); err != nil {
-			// 状态转换口径（首报 warn + 恢复 info）与审计侧同源：本读取经
+		beforeTaskLogSizeQuery()
+		if err := database.QueryRow("SELECT COALESCE(task_log_size_mb, ?) FROM global_config WHERE id = 1", db.DefaultTaskLogSizeMB).Scan(&sizeMB); err != nil {
 			// SetTaskLogSizeBytesFn 在每次任务日志写入前求值，主库持续故障时
 			// 裸 warn 会按写入行数洪泛并与全项目去重口径漂移。
 			if lvl := logStateTransition("task-log-size-refresh", true); lvl != "" {

@@ -31,8 +31,7 @@ func TestDeleteCertJobBlockedDuringConfigImport(t *testing.T) {
 	router := gin.New()
 	router.DELETE("/cert-jobs/:id", h.DeleteCertJob)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 
 	recorder := httptest.NewRecorder()
 	done := make(chan struct{})

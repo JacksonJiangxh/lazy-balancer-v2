@@ -3386,6 +3386,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					failUpdateWithStatus("恢复证书任务后重载 Caddy 配置失败", http.StatusInternalServerError, reapplyErr)
 					return
 				}
+				// 第二轮已持久化恢复后的 TLS 配置，首轮 note 不得再回写无 TLS 载荷。
+				reloadNote.markLastGoodSuperseded()
 				resumedValidJob = true
 				// 与 /enable 的恢复留痕同通道、同 stage；后缀点名入口，
 				// 让用户区分「更新规则时重新启用」与显式启用操作。
@@ -4815,6 +4817,8 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failEnable("恢复证书任务后重载 Caddy 配置失败", reapplyErr)
 				return
 			}
+			// 第二轮已持久化恢复后的 TLS 配置，首轮 note 不得再回写无 TLS 载荷。
+			reloadNote.markLastGoodSuperseded()
 			// 恢复成功（DB + 重渲染均已完成）后留痕，补偿分支不写。
 			services.WriteCertJobLogByRule(caddyID, "INFO", "resumed", "规则已启用，证书任务已恢复")
 			recordAudit(c, "启用", "证书任务", fmt.Sprintf("启用规则 %s，证书仍有效，恢复使用现有证书", caddyID))

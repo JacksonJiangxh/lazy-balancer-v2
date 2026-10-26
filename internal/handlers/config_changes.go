@@ -63,6 +63,31 @@ type configChangePlan struct {
 	Section        string              `json:"section"`
 	Changes        []string            `json:"changes"`
 	SectionChanges map[string][]string `json:"-"`
+	// AffectsCaddy 表示本次变更字段是否进入 Caddy 配置渲染。为 false 时
+	// 保存端点不渲染、不校验、不 /load——仅写库（面板设置、保留策略等
+	// 不参与 Caddy 的字段被 Caddy 可用性绑架是错误耦合）。
+	AffectsCaddy bool `json:"affects_caddy"`
+}
+
+// fieldAffectsCaddy 枚举渲染侧真实消费的 global_config 字段（单一真相：
+// services 渲染读列清单 + trusted_proxy_* 的 server 级字段）。新增字段
+// 若被渲染函数读取，必须同步登记，否则保存只写库不重载。
+func fieldAffectsCaddy(field string) bool {
+	switch field {
+	case "caddy_log_level", "caddy_log_size_mb",
+		"request_body_max_size_mb",
+		"http_read_timeout", "http_write_timeout", "http_idle_timeout",
+		"upstream_keepalive_timeout",
+		"proxy_dial_timeout", "proxy_response_header_timeout",
+		"proxy_read_timeout", "proxy_write_timeout", "proxy_stream_timeout",
+		"proxy_flush_interval", "proxy_stream_close_delay",
+		"server_tokens_hidden",
+		"access_log_json", "access_log_format",
+		"trusted_proxy_enabled", "trusted_proxy_ranges", "trusted_proxy_range_refs",
+		"trusted_proxy_headers", "trusted_proxy_strict":
+		return true
+	}
+	return false
 }
 
 func loadConfigSnapshot() (configSnapshot, error) {
@@ -139,6 +164,9 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 			return
 		}
 		plan.Changed = true
+		if fieldAffectsCaddy(field) {
+			plan.AffectsCaddy = true
+		}
 		appendConfigChange(&plan, seen, field, label)
 	}
 

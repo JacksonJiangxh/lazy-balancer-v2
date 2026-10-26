@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
@@ -693,5 +694,92 @@ func TestPurgeTaskRuns_canceledContextSkipsDelete(t *testing.T) {
 	}
 	if got := purgeableTaskRunRows(t); got != 1 {
 		t.Fatalf("task_runs 行=%d, want 1（取消后不得删除）", got)
+	}
+}
+
+// Given 过期与未过期任务运行行各一条。
+// When 按 90 天保留期清理。
+// Then 只删除过期行并返回真实删除计数，保留行不受影响。
+func TestPurgeTaskRuns_deletesOnlyExpiredRows(t *testing.T) {
+	newAuditCleanupFixture(t, 0, 3)
+	seedPurgeableTaskRuns(t)
+	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, started_at) VALUES ('recent-task', '2999-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := taskengine.PurgeTaskRuns(t.Context(), 90)
+
+	if err != nil {
+		t.Fatalf("PurgeTaskRuns: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("PurgeTaskRuns()=%d, want 1", n)
+	}
+	var remaining string
+	if err := db.DB.QueryRow(`SELECT task_id FROM task_runs`).Scan(&remaining); err != nil {
+		t.Fatalf("read remaining task run: %v", err)
+	}
+	if remaining != "recent-task" {
+		t.Fatalf("remaining task_id=%q, want recent-task", remaining)
+	}
+}
+
+// 非正保留期是显式 no-op：即使上下文已取消也不得误删或报错。
+func TestPurgeTaskRuns_nonPositiveRetentionIsNoOp(t *testing.T) {
+	for _, days := range []int{0, -1} {
+		t.Run(fmt.Sprint(days), func(t *testing.T) {
+			newAuditCleanupFixture(t, 0, 3)
+			seedPurgeableTaskRuns(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			n, err := taskengine.PurgeTaskRuns(ctx, days)
+
+			if err != nil || n != 0 {
+				t.Fatalf("PurgeTaskRuns(days=%d)=(%d,%v), want (0,nil)", days, n, err)
+			}
+			if got := purgeableTaskRunRows(t); got != 1 {
+				t.Fatalf("task_runs rows=%d, want 1", got)
+			}
+		})
+	}
+}
+
+// SQLite 拒绝 DELETE 时错误必须上抛、计数归零且目标行保留，禁止把失败写成成功。
+func TestPurgeTaskRuns_deleteFailureIsReported(t *testing.T) {
+	newAuditCleanupFixture(t, 0, 3)
+	seedPurgeableTaskRuns(t)
+	if _, err := db.DB.Exec(`CREATE TRIGGER reject_task_run_delete BEFORE DELETE ON task_runs BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := taskengine.PurgeTaskRuns(t.Context(), 90)
+
+	if err == nil || !strings.Contains(err.Error(), "injected delete failure") {
+		t.Fatalf("PurgeTaskRuns error=%v, want injected delete failure", err)
+	}
+	if n != 0 {
+		t.Fatalf("PurgeTaskRuns()=%d, want 0 after DELETE failure", n)
+	}
+	if got := purgeableTaskRunRows(t); got != 1 {
+		t.Fatalf("task_runs rows=%d, want 1 after DELETE failure", got)
+	}
+}
+
+// 正常保留链必须把任务历史的真实删除计数传回调用方，而非仅覆盖取消分支。
+func TestAuditRetentionRound_reportsPurgedTaskRuns(t *testing.T) {
+	newAuditCleanupFixture(t, 0, 3)
+	seedPurgeableTaskRuns(t)
+
+	auditDeleted, runsDeleted, err := auditRetentionRound(t.Context())
+
+	if err != nil {
+		t.Fatalf("auditRetentionRound: %v", err)
+	}
+	if auditDeleted != 0 || runsDeleted != 1 {
+		t.Fatalf("deleted=(audit:%d,runs:%d), want (0,1)", auditDeleted, runsDeleted)
+	}
+	if got := purgeableTaskRunRows(t); got != 0 {
+		t.Fatalf("task_runs rows=%d, want 0", got)
 	}
 }

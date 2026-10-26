@@ -860,6 +860,75 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 	}
 }
 
+func TestAPIDocs_oidcSettingsAndProbeExamplesMatchImplementation(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	decodeData := func(t *testing.T, response *httptest.ResponseRecorder) map[string]any {
+		t.Helper()
+		var envelope struct {
+			Code int            `json:"code"`
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode response: %v body=%s", err, response.Body.String())
+		}
+		if envelope.Code != 0 || envelope.Data == nil {
+			t.Fatalf("response envelope=%s, want code=0 and object data", response.Body.String())
+		}
+		return envelope.Data
+	}
+
+	settingsResponse := httptest.NewRecorder()
+	router.ServeHTTP(settingsResponse, httptest.NewRequest(http.MethodGet, "/api/v1/settings/oidc", nil))
+	if settingsResponse.Code != http.StatusOK {
+		t.Fatalf("GET settings status=%d body=%s", settingsResponse.Code, settingsResponse.Body.String())
+	}
+	settings := decodeData(t, settingsResponse)
+	assertKeySetsEqual(t, "GET /settings/oidc", mapKeysOf(docResponseExample(t, "GET /settings/oidc")), mapKeysOf(settings))
+	for _, key := range []string{"allowed_email_domains", "allowed_groups"} {
+		values, ok := settings[key].([]any)
+		if !ok || len(values) != 0 {
+			t.Errorf("未配置白名单 %s=%#v, want 稳定空数组", key, settings[key])
+		}
+	}
+
+	probeRoute := routesEntry(t, "POST /settings/oidc/test")
+	var documentedRequest map[string]any
+	if err := json.Unmarshal([]byte(probeRoute.Request), &documentedRequest); err != nil {
+		t.Fatalf("decode documented probe request: %v", err)
+	}
+	assertKeySetsEqual(t, "POST /settings/oidc/test request", mapKeysOf(documentedRequest), mapKeysOf(map[string]any{
+		"issuer": true, "client_id": true, "client_secret": true,
+	}))
+	probeBody := `{"issuer":"` + idp.issuer + `","client_id":"test-client","client_secret":"super-secret-123"}`
+	probeResponse := httptest.NewRecorder()
+	router.ServeHTTP(probeResponse, httptest.NewRequest(http.MethodPost, "/api/v1/settings/oidc/test", strings.NewReader(probeBody)))
+	if probeResponse.Code != http.StatusOK {
+		t.Fatalf("probe success status=%d body=%s", probeResponse.Code, probeResponse.Body.String())
+	}
+	probe := decodeData(t, probeResponse)
+	if probe["ok"] != true || probe["credentials_checked"] != true {
+		t.Fatalf("probe success data=%#v", probe)
+	}
+	assertKeySetsEqual(t, "POST /settings/oidc/test success", mapKeysOf(docResponseExample(t, "POST /settings/oidc/test")), mapKeysOf(probe))
+
+	failureResponse := httptest.NewRecorder()
+	router.ServeHTTP(failureResponse, httptest.NewRequest(http.MethodPost, "/api/v1/settings/oidc/test", strings.NewReader(`{"issuer":"http://127.0.0.1:1"}`)))
+	if failureResponse.Code != http.StatusOK {
+		t.Fatalf("probe failure status=%d body=%s, want HTTP 200 contract", failureResponse.Code, failureResponse.Body.String())
+	}
+	failure := decodeData(t, failureResponse)
+	assertKeySetsEqual(t, "POST /settings/oidc/test failure", mapKeysOf(failure), mapKeysOf(map[string]any{"ok": true, "error": true}))
+	if failure["ok"] != false || failure["error"] == "" {
+		t.Fatalf("probe failure data=%#v, want ok=false and non-empty error", failure)
+	}
+	for _, want := range []string{"HTTP 200", "ok=false", "error"} {
+		if !strings.Contains(probeRoute.Description, want) {
+			t.Errorf("探测描述缺少失败契约 %q: %q", want, probeRoute.Description)
+		}
+	}
+}
+
 func routesEntry(t *testing.T, key string) apiDocRoute {
 	t.Helper()
 	for _, route := range apiDocRoutes {
@@ -2211,12 +2280,14 @@ func TestAPIDocs_certJobExamplesMatchImplementation(t *testing.T) {
 	assertStructKeysDocumented(t, "GET /certificates/jobs list[0]", mapKeysOf(listEnvelope.List[0]), certJobListItem{})
 	assertStructKeysDocumented(t, "GET /certificates/jobs/:id", mapKeysOf(docResponseExample(t, "GET /certificates/jobs/:id")), certJobListItem{})
 
-	// 冷却三态是消费契约（0/正数/null），两个端点的描述都必须说明，
+	// 冷却三态是消费契约（0/正数/null），两个端点的描述都必须完整说明，
 	// 否则调用方只能从 429 反推可重试性。
 	for _, key := range []string{"GET /certificates/jobs", "GET /certificates/jobs/:id"} {
 		description := routesEntry(t, key).Description
-		if !strings.Contains(description, "retry_cooldown_seconds") || !strings.Contains(description, "null=永久不可重试") {
-			t.Errorf("%s 描述未说明 retry_cooldown_seconds 三态: %q", key, description)
+		for _, want := range []string{"retry_cooldown_seconds", "0=现在即可重试", "正数=还需等待的秒数", "null=永久不可重试"} {
+			if !strings.Contains(description, want) {
+				t.Errorf("%s 描述缺少冷却契约 %q: %q", key, want, description)
+			}
 		}
 	}
 }

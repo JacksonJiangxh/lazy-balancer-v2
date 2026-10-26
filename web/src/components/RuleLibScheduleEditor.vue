@@ -50,7 +50,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{ save: [payload: { days: number[]; time: string }] }>()
 
-const controlsDisabled = computed(() => props.disabled || Boolean(props.unavailableHint))
+const controlsDisabled = computed(() => props.disabled || props.saving || Boolean(props.unavailableHint))
 
 const weekdayOptions = [
   { value: 1, label: '周一' },
@@ -79,6 +79,7 @@ watch(() => [props.days, props.time] as const, ([days, time], prev) => {
 })
 
 const emitSave = () => {
+  if (props.saving) return
   // 时间被清空时不得静默回落 04:00（原 `editTime.value || '04:00'`
   // 让输入框显示空、落库却是 04:00）；校验单源 utils/securityLibraries。
   const time = editTime.value

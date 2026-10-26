@@ -176,8 +176,8 @@ func TestLoad_warnsOnMismatchedCaddyAdminURL(t *testing.T) {
 		return logBuf.String()
 	}
 
-	// 不一致 → WARN（端口不同与主机非回环两种形态）。
-	for _, adminURL := range []string{`"http://127.0.0.1:2020"`, `"http://localhost:2020"`, `"http://0.0.0.0:2019"`} {
+	// 地址或 scheme 与自管 admin 不等价 → WARN。
+	for _, adminURL := range []string{`"http://127.0.0.1:2020"`, `"http://localhost:2020"`, `"http://0.0.0.0:2019"`, `"https://127.0.0.1:2019"`, `"ftp://127.0.0.1:2019"`} {
 		logs := loadAndLog(t, writeConfig(t, adminURL))
 		if !strings.Contains(logs, "caddy_admin_url") || !strings.Contains(logs, "127.0.0.1:2019") {
 			t.Fatalf("caddy_admin_url=%s 必须 WARN, log=%q", adminURL, logs)
@@ -195,6 +195,26 @@ func TestLoad_warnsOnMismatchedCaddyAdminURL(t *testing.T) {
 	// 缺省路径（无配置文件，沿用内置默认 http://localhost:2019）→ 零告警。
 	if logs := loadAndLog(t, ""); strings.Contains(logs, "caddy_admin_url") {
 		t.Fatalf("缺省 caddy_admin_url 不应告警, log=%q", logs)
+	}
+}
+
+func TestLoad_caddyMetricsURLSchemeIndependent(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	content := `{"data_dir":"/tmp/config-test-data","caddy_admin_url":"http://127.0.0.1:2019","caddy_metrics_url":"https://127.0.0.1:9443/metrics"}`
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOut)
+	cfg := loadForTest(configPath)
+	if cfg.CaddyMetricsURL != "https://127.0.0.1:9443/metrics" {
+		t.Fatalf("CaddyMetricsURL=%q, want 原样保留独立 HTTPS 指标地址", cfg.CaddyMetricsURL)
+	}
+	if strings.Contains(logBuf.String(), "caddy_admin_url") || strings.Contains(logBuf.String(), "caddy_metrics_url") {
+		t.Fatalf("独立指标 scheme 不得触发 admin 一致性告警: %q", logBuf.String())
 	}
 }
 

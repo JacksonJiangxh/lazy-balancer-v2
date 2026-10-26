@@ -847,20 +847,26 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
-		writeConfigValidationFailure(c, err, true)
-		return
-	}
+	// 只有进入渲染的变更才需要 Caddy 侧前置条件（存量规则可渲染性、运行
+	// 配置快照）。面板/保留策略等非渲染字段的保存不得被 Caddy 可用性绑架。
+	var oldRuntimeConfig map[string]interface{}
+	if plan.AffectsCaddy {
+		if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
+			writeConfigValidationFailure(c, err, true)
+			return
+		}
 
-	// 2026-09-07 裁定：撤 pre-tx /load 探针（与 ④'「探针已撤除」对齐）——
-	// 候选合法性由 applyFromTxNote 内 CLI 真 validate-only + 事务内应用承担；
-	// 探针曾使 SQL 失败分支面临「运行配置已换候选但 DB 未提交」的分叉，
-	// 撤除后该窗口不存在。只读快照保留，仅供提交失败回弹使用。
-	oldRuntimeConfig, err := h.caddyService.GetConfig()
-	if err != nil {
-		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("获取当前 Caddy 配置失败", err.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "获取当前 Caddy 配置失败"})
-		return
+		// 2026-09-07 裁定：撤 pre-tx /load 探针（与 ④'「探针已撤除」对齐）——
+		// 候选合法性由 applyFromTxNote 内 CLI 真 validate-only + 事务内应用承担；
+		// 探针曾使 SQL 失败分支面临「运行配置已换候选但 DB 未提交」的分叉，
+		// 撤除后该窗口不存在。只读快照保留，仅供提交失败回弹使用。
+		var err error
+		oldRuntimeConfig, err = h.caddyService.GetConfig()
+		if err != nil {
+			recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("获取当前 Caddy 配置失败", err.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "获取当前 Caddy 配置失败"})
+			return
+		}
 	}
 
 	// Validation passed — write in a transaction; Caddy applies the uncommitted
@@ -973,61 +979,73 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 
 	// rulesWrittenInTx=false：本事务只写 global_config（lb_rules 视图与已提交
 	// 视图恒一致），ACME 谓词 miss 补查在本路径无意义（逐 acme 规则空查）。
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, "保存配置后自动重载", false)
-	if applyErr != nil {
-		// CLI 预检/事务内应用两轮渲染已按未提交内容重写
-		// 投影（tp.txt 等）——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
-		if services.IsSameConfig(restoreErr) {
-			// 回弹目标=请求前运行配置：拒绝/生成失败时字节相同，回升是
-			// 成功空操作，不得 join 成「恢复失败」假信号（横幅/审计污染）。
-			restoreErr = nil
+	// 非渲染字段（面板/保留策略/坐标等）不进入 Caddy：直接提交事务，零渲染、
+	// 零 CLI 校验、零 /load——这类保存不应被 Caddy 进程可用性阻断。
+	var reloadNote *txApplyNote
+	if plan.AffectsCaddy {
+		var applyErr error
+		reloadNote, applyErr = h.applyFromTxNote(c, tx, "保存配置后自动重载", false)
+		if applyErr != nil {
+			// CLI 预检/事务内应用两轮渲染已按未提交内容重写
+			// 投影（tp.txt 等）——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
+			h.caddyService.RollbackIPListProjectionsToCommittedInLock()
+			restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
+			if services.IsSameConfig(restoreErr) {
+				// 回弹目标=请求前运行配置：拒绝/生成失败时字节相同，回升是
+				// 成功空操作，不得 join 成「恢复失败」假信号（横幅/审计污染）。
+				restoreErr = nil
+			}
+			applyErr = errors.Join(applyErr, restoreErr)
+			// 回弹目标可能本身就是漂移形态（外来路由/带外改动）——先回滚事务
+			// 释放写锁，再把 LKG 钉回已提交库视图：LKG 的全族不变量是「最后一次
+			// 已提交且已下发的配置」，不得被请求前运行配置固化。
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				applyErr = errors.Join(applyErr, rbErr)
+			}
+			if pinErr := h.pinLastGoodAfterCompensation(); pinErr != nil {
+				// 附带失败走统一留痕（`recordCaddyApplyFailure` 的两态标签只由
+				// 运行配置恢复决定，LKG 未钉回不改变该事实，但重启兜底可能回放
+				// 漂移形态，必须留下审计而不只是可能被过滤的 warn 日志）。
+				h.recordCompensationSideEffects("Caddy 配置应用失败", pinErr)
+			}
+			// 横幅事实源：只有库态与运行态可能分叉的失败才写——配置拒绝（CLI
+			// 校验/admin 4xx）时候选未 /load、事务已回滚，运行配置仍是旧形态，
+			// 横幅会制造不存在的不一致（finishTxApply 拒绝分支即不写）；恢复失败
+			// （Caddy 不可达/超时）则运行配置状态未知，必须落横幅。
+			rejected := services.IsConfigRejected(applyErr)
+			if !rejected || restoreErr != nil {
+				h.recordCaddyApplyFailure(applyErr, restoreErr)
+			}
+			recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure")))
+			// 2026-09-07：与规则域统一——配置拒绝→400，传输/系统→500。
+			if rejected {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，配置未保存: " + applyErr.Error()})
+			} else {
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置应用失败，配置未保存: " + applyErr.Error()})
+			}
+			return
 		}
-		applyErr = errors.Join(applyErr, restoreErr)
-		// 回弹目标可能本身就是漂移形态（外来路由/带外改动）——先回滚事务
-		// 释放写锁，再把 LKG 钉回已提交库视图：LKG 的全族不变量是「最后一次
-		// 已提交且已下发的配置」，不得被请求前运行配置固化。
-		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			applyErr = errors.Join(applyErr, rbErr)
+		if err := commitTx(tx); err != nil {
+			// +: apply 已把未提交事务视图的投影/证书写盘并把
+			// 该内容写入 LKG；commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
+			// /load + 回退 LKG——恢复 /load 失败时仍把已提交字节写回 LKG）。
+			recovery := h.recoverCommittedViewAfterCommitFailure(tx)
+			// 真实 /load 已在 commit 之前发生——「触发重载必须留痕」不因随后失败
+			// 而豁免（同规则族 commit 失败分支）。
+			reloadNote.auditReload()
+			// 横幅两态：恢复失败=「运行配置状态未知」，恢复成功=「旧配置已保留」。
+			// 提交失败不是配置应用失败（apply 已发生）——失败对象用提交口径。
+			h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
+			err = errors.Join(err, recovery.err())
+			recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(commitUncertainLabel+"："+err.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
+			return
 		}
-		if pinErr := h.pinLastGoodAfterCompensation(); pinErr != nil {
-			// 附带失败走统一留痕（`recordCaddyApplyFailure` 的两态标签只由
-			// 运行配置恢复决定，LKG 未钉回不改变该事实，但重启兜底可能回放
-			// 漂移形态，必须留下审计而不只是可能被过滤的 warn 日志）。
-			h.recordCompensationSideEffects("Caddy 配置应用失败", pinErr)
-		}
-		// 横幅事实源：只有库态与运行态可能分叉的失败才写——配置拒绝（CLI
-		// 校验/admin 4xx）时候选未 /load、事务已回滚，运行配置仍是旧形态，
-		// 横幅会制造不存在的不一致（finishTxApply 拒绝分支即不写）；恢复失败
-		// （Caddy 不可达/超时）则运行配置状态未知，必须落横幅。
-		rejected := services.IsConfigRejected(applyErr)
-		if !rejected || restoreErr != nil {
-			h.recordCaddyApplyFailure(applyErr, restoreErr)
-		}
-		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure")))
-		// 2026-09-07：与规则域统一——配置拒绝→400，传输/系统→500。
-		if rejected {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，配置未保存: " + applyErr.Error()})
-		} else {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置应用失败，配置未保存: " + applyErr.Error()})
-		}
-		return
-	}
-	if err := commitTx(tx); err != nil {
-		// +: apply 已把未提交事务视图的投影/证书写盘并把
-		// 该内容写入 LKG；commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
-		// /load + 回退 LKG——恢复 /load 失败时仍把已提交字节写回 LKG）。
-		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
-		// 真实 /load 已在 commit 之前发生——「触发重载必须留痕」不因随后失败
-		// 而豁免（同规则族 commit 失败分支）。
-		reloadNote.auditReload()
-		// 横幅两态：恢复失败=「运行配置状态未知」，恢复成功=「旧配置已保留」。
-		// 提交失败不是配置应用失败（apply 已发生）——失败对象用提交口径。
-		h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
-		err = errors.Join(err, recovery.err())
-		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(commitUncertainLabel+"："+err.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
+	} else if err := commitTx(tx); err != nil {
+		// 非渲染变更没有 Caddy 交互：提交失败只回滚事务、不触碰运行配置与
+		// LKG（本次保存从未下发任何内容）。
+		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("提交配置失败", err.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交配置失败：" + err.Error()})
 		return
 	}
 	committed = true
@@ -1063,6 +1081,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	reloadNote.finalize()
 
 	message := "配置已更新并应用"
+	if !plan.AffectsCaddy {
+		message = "配置已更新"
+	}
 	if formatCleared {
 		message += "（访问日志 JSON 已关闭，自定义格式已清空：该格式不生效）"
 	}
@@ -1815,8 +1836,16 @@ func validateAccessLogFormatSize(format string) error {
 	if n := len(format); n > maxAccessLogFormatBytes {
 		return fmt.Errorf("访问日志格式过长（最多 %d 字节，当前 %d 字节）", maxAccessLogFormatBytes, n)
 	}
-	if n := strings.Count(strings.TrimRight(format, "\n"), "\n") + 1; n > maxAccessLogFormatLines {
-		return fmt.Errorf("访问日志格式行数过多（最多 %d 行，当前 %d 行）", maxAccessLogFormatLines, n)
+	lines := strings.Count(strings.TrimRight(format, "\n"), "\n") + 1
+	if strings.TrimSpace(format) == "" {
+		// 空白格式不裁剪落库；纯换行若先 TrimRight 会任意数量都折叠成一行。
+		lines = strings.Count(format, "\n")
+		if lines == 0 {
+			lines = 1
+		}
+	}
+	if lines > maxAccessLogFormatLines {
+		return fmt.Errorf("访问日志格式行数过多（最多 %d 行，当前 %d 行）", maxAccessLogFormatLines, lines)
 	}
 	return nil
 }

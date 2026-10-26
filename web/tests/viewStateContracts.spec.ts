@@ -43,7 +43,7 @@ test('规则库排程在库信息未落地/读取失败时禁用并提示', () =
   }
   const editor = code('src/components/RuleLibScheduleEditor.vue')
   assert.match(editor, /unavailableHint\?: string/)
-  assert.match(editor, /const controlsDisabled = computed\(\(\) => props\.disabled \|\| Boolean\(props\.unavailableHint\)\)/)
+  assert.match(editor, /const controlsDisabled = computed\(\(\) => props\.disabled \|\| props\.saving \|\| Boolean\(props\.unavailableHint\)\)/)
 })
 
 test('弹框保存中禁止关闭（遮罩/ESC/关闭按钮与取消一致）', () => {
@@ -108,6 +108,21 @@ test('规则库信息低频回刷且自动更新开关乐观置值', () => {
   assert.match(page, /const autoUpdateSaving = ref\(new Set<string>\(\)\)/)
   const toggle = section(page, 'const toggleLibAutoUpdate = async', 'const setLibAutoUpdateShown')
   assert.match(toggle, /setLibAutoUpdateShown\(row\.key, val\)/, '点击即置值（不再等响应）')
+})
+
+test('威胁与爬虫来源开关：逐来源单飞、请求序号与在途禁用', () => {
+  const page = code('src/views/security/SecurityRules.vue')
+  assert.match(page, /const sourceFlagSaving = ref\(new Set<string>\(\)\)/)
+  assert.match(page, /const sourceFlagRequestSeq = new Map<string, number>\(\)/)
+  const toggle = section(page, 'const toggleSourceFlag = ', 'type CrawlerSource')
+  assert.match(toggle, /if \(sourceFlagSaving\.value\.has\(key\)\) return/)
+  assert.match(toggle, /const requestSeq = \(sourceFlagRequestSeq\.get\(key\) \?\? 0\) \+ 1/)
+  assert.match(toggle, /if \(sourceFlagRequestSeq\.get\(key\) === requestSeq\) row\.update_enabled = !val/)
+  assert.match(toggle, /finally \{[\s\S]*sourceFlagSaving\.value\.delete\(key\)/)
+  for (const library of ['threat', 'crawler']) {
+    assert.match(page, new RegExp(`:loading="sourceFlagPending\\('${library}', row\\.id\\)"`))
+    assert.match(page, new RegExp(`:disabled="isReadOnly \\|\\| isSlaveNode \\|\\| sourceFlagPending\\('${library}', row\\.id\\)"`))
+  }
 })
 
 test('大屏：窗口切换保留上一帧并标注切换中，配置读取失败区别于未配置', () => {

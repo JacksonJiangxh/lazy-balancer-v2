@@ -19,8 +19,7 @@ func TestExportConfigBackup409DuringImportWindow(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	router := newBackupSectionRouter(h)
 
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	beginImportWindowForTest(t)
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config/export", nil))

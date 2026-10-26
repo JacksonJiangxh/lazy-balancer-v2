@@ -315,8 +315,8 @@ func load(path string, warnf configWarnf) *Config {
 	// Caddy admin 即迁到该地址。caddy_admin_url 只是「首次 /load 之前」的引导
 	// 端点——指向其他地址时面板配置的端点在首次 /load 后失联（需人工恢复），
 	// 启动期必须可见而非届时静默断联。
-	if listen, ok := adminURLListen(cfg.CaddyAdminURL); ok && !adminListenEquivalentToRender(listen) {
-		warnf("config: caddy_admin_url=%q 的监听地址与渲染产物 admin 监听 127.0.0.1:2019 不一致——首次成功 /load 后 Caddy admin 将迁到 127.0.0.1:2019，本配置端点随即失联；请改为 http://127.0.0.1:2019 或移除该配置项", cfg.CaddyAdminURL)
+	if scheme, listen, ok := adminURLListen(cfg.CaddyAdminURL); ok && (scheme != "http" || !adminListenEquivalentToRender(listen)) {
+		warnf("config: caddy_admin_url=%q 与渲染产物自管 admin 的 http://127.0.0.1:2019 不等价——首次成功 /load 后 Caddy admin 将迁到该 HTTP 回环端点，本配置端点随即失联；请改为 http://127.0.0.1:2019 或移除该配置项", cfg.CaddyAdminURL)
 	}
 
 	return cfg
@@ -340,12 +340,13 @@ func adminListenEquivalentToRender(listen string) bool {
 	return false
 }
 
-// adminURLListen 解析 caddy_admin_url 的 host:port（失败时 ok=false——畸形 URL
-// 由使用方连接时报错，此处不重复告警）。
-func adminURLListen(rawURL string) (string, bool) {
+// adminURLListen 解析 caddy_admin_url 的 scheme 与 host:port（失败时 ok=false——
+// 畸形 URL 由使用方连接时报错，此处不重复告警）。非 HTTP scheme 即使缺省端口
+// 无法推导也返回 ok=true，让调用方对 scheme 本身发出一致性告警。
+func adminURLListen(rawURL string) (string, string, bool) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Host == "" {
-		return "", false
+		return "", "", false
 	}
 	host := parsed.Hostname()
 	port := parsed.Port()
@@ -357,12 +358,12 @@ func adminURLListen(rawURL string) (string, bool) {
 		case "https":
 			port = "443"
 		default:
-			return "", false
+			return parsed.Scheme, "", true
 		}
 	}
 	// JoinHostPort 而非字符串拼接：IPv6 回环（::1）必须成 [::1]:2019 才能
 	// 被 SplitHostPort 还原，否则等价类判定永远 miss。
-	return net.JoinHostPort(host, port), true
+	return parsed.Scheme, net.JoinHostPort(host, port), true
 }
 
 func getEnv(key, defaultValue string) string {

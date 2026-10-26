@@ -442,12 +442,10 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	if err := db.DB.QueryRow(query, args...).Scan(&name, &beforeEnabled, &beforeMCPEnabled, &beforeReadOnly, &beforeWhitelist); dbQueryNotFound(c, err, "API 密钥不存在", "updateAPIKeyStatus query key") {
 		return
 	}
-	// 特权变更（收回只读/开启 MCP/放宽已启用 MCP 的白名单）与创建侧同构
-	// 走 requireAPIKeyStepUp（判定/响应单源）。
-	// 白名单变更在更新后该 Key 仍启用 MCP 时算特权变更（与路由级守卫开启时的
-	// 覆盖面对齐；此集合是「守卫开关读失败」场景下的纵深防御口径）。白名单
-	// 实际约束该 Key 的全部 REST 与 MCP 调用（middleware 不看 mcp_enabled），
-	// 字段名 mcp_ip_whitelist 为历史遗留。
+	// 特权变更（收回只读/开启 MCP/实际白名单变化）与创建侧同构走
+	// requireAPIKeyStepUp（判定/响应单源）。此集合是「守卫开关读失败」场景下
+	// 的纵深防御口径。白名单实际约束该 Key 的全部 REST 与 MCP 调用
+	//（middleware 不看 mcp_enabled），字段名 mcp_ip_whitelist 为历史遗留。
 	afterMCPEnabled := beforeMCPEnabled == 1
 	if req.MCPEnabled != nil {
 		afterMCPEnabled = *req.MCPEnabled
@@ -461,7 +459,7 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	privilegeEscalation := enablePrivileged ||
 		(req.ReadOnly != nil && !*req.ReadOnly && beforeReadOnly == 1) ||
 		(req.MCPEnabled != nil && *req.MCPEnabled && beforeMCPEnabled != 1) ||
-		(whitelistChanged && afterMCPEnabled)
+		whitelistChanged
 	if privilegeEscalation {
 		if requireAPIKeyStepUp(c) {
 			return

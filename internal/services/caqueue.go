@@ -16,25 +16,26 @@ import (
 
 // CAQueueManager schedules ACME issuance jobs per CA provider.
 type CAQueueManager struct {
-	mu                  sync.Mutex
-	queues              map[int]*caQueue
-	retiredQueues       []retiredCAQueue
-	zombieJobs          map[int]zombieJob
-	reloader            func() error
-	active              bool
-	blockedRules        map[string]map[RuleBlockToken]struct{}
-	nextBlockToken      RuleBlockToken
-	compensationCtx     context.Context
-	compensationCancel  context.CancelFunc
-	compensationWG      sync.WaitGroup
-	compensationBackoff func(int) time.Duration
-	compensationTimeout time.Duration
-	compensationDrain   func(context.Context, string) error
-	compensationRestore func(context.Context, CertJobsSnapshot) error
-	compensationRequeue func(context.Context, CertJobsSnapshot, *CAQueueManager) error
-	dataDir             string
-	beforeEnqueue       func()
-	beforeActiveEnqueue func()
+	mu                            sync.Mutex
+	queues                        map[int]*caQueue
+	retiredQueues                 []retiredCAQueue
+	zombieJobs                    map[int]zombieJob
+	reloader                      func() error
+	active                        bool
+	blockedRules                  map[string]map[RuleBlockToken]struct{}
+	nextBlockToken                RuleBlockToken
+	compensationCtx               context.Context
+	compensationCancel            context.CancelFunc
+	compensationWG                sync.WaitGroup
+	compensationBackoff           func(int) time.Duration
+	compensationTimeout           time.Duration
+	compensationDrain             func(context.Context, string) error
+	compensationRestore           func(context.Context, CertJobsSnapshot) error
+	compensationRequeue           func(context.Context, CertJobsSnapshot, *CAQueueManager) error
+	dataDir                       string
+	beforeEnqueue                 func()
+	beforeActiveEnqueue           func()
+	beforeProviderUnavailableFail func()
 }
 
 type RuleBlockToken uint64
@@ -801,6 +802,7 @@ func (m *CAQueueManager) MarkJobRunningForTest(ruleID string, jobID int) {
 		// 队列惰建（Enqueue 时按 provider 创建）；测试缝自建一个零值 provider
 		// 队列以承载标记，Stop（ResetCAQueueManagerForTest）会正常收走其 loop。
 		q := newCAQueue(models.CAProvider{}, m.reloader, m.dataDir)
+		q.manager = m
 		m.queues[q.provider.ID] = q
 		go q.loop()
 	}
@@ -820,6 +822,7 @@ func (m *CAQueueManager) MarkRetiredJobRunningForTest(ruleID string, jobID int) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	queue := newCAQueue(models.CAProvider{}, m.reloader, m.dataDir)
+	queue.manager = m
 	done := make(chan struct{})
 	queue.active[jobID] = struct{}{}
 	queue.runningRules[jobID] = ruleID
@@ -1064,6 +1067,7 @@ func (m *CAQueueManager) enqueueLocked(providerID int, jobID int, ruleID, domain
 	q, ok := m.queues[provider.ID]
 	if !ok {
 		q = newCAQueue(provider, m.reloader, m.dataDir)
+		q.manager = m
 		m.queues[provider.ID] = q
 		go q.loop()
 	} else {
@@ -1167,6 +1171,7 @@ type queueItem struct {
 }
 
 type caQueue struct {
+	manager         *CAQueueManager
 	provider        models.CAProvider
 	providerVersion uint64 // 最近一次加载 provider 时的 caProviderConfigVersion 快照
 	pending         []queueItem
@@ -1308,7 +1313,7 @@ func (q *caQueue) tick() {
 		}
 		q.mu.Unlock()
 		message := fmt.Sprintf("CA Provider 不可用：配置已禁用或删除（ID %d）", providerID)
-		q.failPendingProviderUnavailable(pending, message)
+		q.manager.failPendingProviderUnavailable(pending, message)
 		return
 	}
 	// loadCAProvider 已在唯一出口归一 max_concurrent/min_interval_ms，此处不再
@@ -1351,7 +1356,7 @@ func (q *caQueue) refreshProviderLocked() bool {
 		}
 		q.mu.Unlock()
 		message := fmt.Sprintf("CA Provider 不可用：配置已禁用或删除（ID %d）", providerID)
-		q.failPendingProviderUnavailable(pending, message)
+		q.manager.failPendingProviderUnavailable(pending, message)
 		return false
 	}
 	// 归一已在 loadCAProvider 唯一出口完成（见 normalizeCAProviderSnapshot）。
@@ -1360,25 +1365,25 @@ func (q *caQueue) refreshProviderLocked() bool {
 	return true
 }
 
-// failPendingProviderUnavailable 在解锁后逐个处置因 provider 失效而排空的
-// pending 项：解锁→failJob 的窗口内，并发路径可能已接管该任务——
-// 手动重试/滞留巡检的重入队会把行重置为新的一次尝试（renewal_attempts=0）
-// 并重新占位 q.active/q.pending，此时无条件 failJob 会把新尝试误标 failed
-// （attempts+1 + 错误审计，后续自愈但噪声）。故逐项复核：任务已被重新入队
-// （q.active 再现）或行已消失/不再处于入队时预期的 'queued' 态（被删除/
-// 取消/退役）则跳过，由新属主接管该行。复核含一次只读查询，不持锁写库。
-func (q *caQueue) failPendingProviderUnavailable(items []queueItem, message string) {
+// failPendingProviderUnavailable 在队列解锁后逐个处置因 provider 失效而排空的
+// pending 项。旧队列排空与新尝试入队可能交错，因此全局在途复核、queued 行复核
+// 与旧尝试 failJob 必须在同一 m.mu 临界区内完成，并与 EnqueueIfActive 的
+// 「在途判定→状态迁移→入队」串行：若另一 provider（含退役队列/zombie）已经
+// 接管则跳过；若接管在复核后到达，则旧失败先落定，新尝试随后从 failed 重新入队。
+func (m *CAQueueManager) failPendingProviderUnavailable(items []queueItem, message string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, item := range items {
-		q.mu.Lock()
-		_, superseded := q.active[item.jobID]
-		q.mu.Unlock()
-		if superseded {
+		if m.isJobActiveLocked(item.jobID) {
 			Logf("warn", "CA queue: provider-unavailable fail skipped for job %d: re-enqueued by concurrent path", item.jobID)
 			continue
 		}
 		if !queuedJobStillExists(item.jobID) {
 			Logf("warn", "CA queue: provider-unavailable fail skipped for job %d: job deleted or no longer queued", item.jobID)
 			continue
+		}
+		if m.beforeProviderUnavailableFail != nil {
+			m.beforeProviderUnavailableFail()
 		}
 		failJob(item.jobID, message)
 	}

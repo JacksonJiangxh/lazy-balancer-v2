@@ -15,14 +15,6 @@ import (
 
 func TestWriterStatsHealth_formatErrorsAreParsedSeparately(t *testing.T) {
 	isolationForWriterHealth(t)
-	resetFormatBaseline := func() {
-		securityEventsWriterHealth.mu.Lock()
-		securityEventsWriterHealth.baselineFormat = 0
-		securityEventsWriterHealth.formatTotal = 0
-		securityEventsWriterHealth.mu.Unlock()
-	}
-	resetFormatBaseline()
-	t.Cleanup(resetFormatBaseline)
 	payload := `{"dropped":1,"io_errors":0,"format_errors":3,"written_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `"}`
 	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(payload), 0o644); err != nil {
@@ -45,6 +37,34 @@ func TestWriterStatsHealth_formatErrorsAreParsedSeparately(t *testing.T) {
 	securityEventsObserveAuditWriterStats()
 	if got := SecurityEventsIngestionHealthSnapshot().WriterFormatErrors; got != 3 {
 		t.Fatalf("重复观测同一文件重复计数: %d", got)
+	}
+}
+
+func TestWriterStatsHealth_resetClearsFormatCounters(t *testing.T) {
+	isolationForWriterHealth(t)
+	oldDropped := securityEventsMessagesDropped.Load()
+	securityEventsMessagesDropped.Store(0)
+	t.Cleanup(func() { securityEventsMessagesDropped.Store(oldDropped) })
+	payload := `{"dropped":0,"io_errors":0,"format_errors":3,"written_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsObserveAuditWriterStats()
+	if got := SecurityEventsIngestionHealthSnapshot().WriterFormatErrors; got != 3 {
+		t.Fatalf("测试前置注入失败: writer_format_errors=%d, want 3", got)
+	}
+
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	status := SecurityEventsIngestionHealthSnapshot()
+	if status.WriterFormatErrors != 0 || status.DataLoss {
+		t.Fatalf("重置后格式化错误状态必须归零: writer_format_errors=%d data_loss=%v", status.WriterFormatErrors, status.DataLoss)
+	}
+
+	// 同一侧车必须按新基线重新计数，避免上一用例的 baseline 吞掉增量。
+	securityEventsObserveAuditWriterStats()
+	if got := SecurityEventsIngestionHealthSnapshot().WriterFormatErrors; got != 3 {
+		t.Fatalf("重置后重读同一侧车应重新计数: writer_format_errors=%d, want 3", got)
 	}
 }
 

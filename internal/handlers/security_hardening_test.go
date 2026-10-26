@@ -128,8 +128,7 @@ func TestSplitSecurityPolicy_rejectsDanglingReferences(t *testing.T) {
 // 同族 CRS/IP2Region 端点同口径：导入窗口 409 fast-fail（
 // security_threat_sources 在导入全量替换清单内，窗口内写入会被静默覆盖）。
 func TestThreatEndpoints_rejectWriteDuringImport(t *testing.T) {
-	configImportBeginMu.Lock()
-	t.Cleanup(configImportBeginMu.Unlock)
+	beginImportWindowForTest(t)
 
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}

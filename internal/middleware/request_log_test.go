@@ -64,6 +64,11 @@ func TestRequestLogFormatterAppendsErrorMessage(t *testing.T) {
 }
 
 func TestShouldLogRequestAppliesConfiguredThreshold(t *testing.T) {
+	oldLevel, oldMode := services.CurrentLogLevel(), gin.Mode()
+	t.Cleanup(func() {
+		_ = services.ConfigureLogLevel(oldLevel)
+		gin.SetMode(oldMode)
+	})
 	tests := []struct {
 		name    string
 		level   string
@@ -94,5 +99,28 @@ func TestShouldLogRequestAppliesConfiguredThreshold(t *testing.T) {
 			}
 		})
 	}
-	t.Cleanup(func() { _ = services.ConfigureLogLevel("info") })
+}
+
+func TestRequestLogThresholdTest_restoresLevelAndGinMode(t *testing.T) {
+	oldLevel, oldMode := services.CurrentLogLevel(), gin.Mode()
+	t.Cleanup(func() {
+		_ = services.ConfigureLogLevel(oldLevel)
+		gin.SetMode(oldMode)
+	})
+
+	for _, level := range []string{"warn", "debug"} {
+		t.Run(level, func(t *testing.T) {
+			if err := services.ConfigureLogLevel(level); err != nil {
+				t.Fatal(err)
+			}
+			wantMode := gin.Mode()
+			t.Run("threshold cases", TestShouldLogRequestAppliesConfiguredThreshold)
+			if got := services.CurrentLogLevel(); got != level {
+				t.Fatalf("清理后日志级别=%q, want %q", got, level)
+			}
+			if got := gin.Mode(); got != wantMode {
+				t.Fatalf("清理后 Gin mode=%q, want %q", got, wantMode)
+			}
+		})
+	}
 }

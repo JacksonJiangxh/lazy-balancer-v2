@@ -3308,8 +3308,10 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 	securityEventsWriterHealth.mu.Lock()
 	securityEventsWriterHealth.baselineDropped = 0
 	securityEventsWriterHealth.baselineIO = 0
+	securityEventsWriterHealth.baselineFormat = 0
 	securityEventsWriterHealth.droppedTotal = 0
 	securityEventsWriterHealth.ioTotal = 0
+	securityEventsWriterHealth.formatTotal = 0
 	securityEventsWriterHealth.windowStart = time.Time{}
 	securityEventsWriterHealth.windowFailures = 0
 	securityEventsWriterHealth.lastFailureAt = time.Time{}

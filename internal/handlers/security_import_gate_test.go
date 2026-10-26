@@ -49,9 +49,8 @@ func TestSecurityWrites409DuringImport(t *testing.T) {
 		countsBefore[table] = rowCountOf(t, table)
 	}
 
-	// 模拟导入会话持锁（configImportBusy 的探测对象）。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// 模拟导入会话进行中（configImportBusy 的事实源：窗口计数）。
+	beginImportWindowForTest(t)
 
 	calls := []struct{ method, path, body string }{
 		{"POST", "/security/custom-rules", `{"name":"waf","rule":"SecRule"}`},

@@ -55,7 +55,7 @@ var errCRSTreeSwapInFlight = errors.New("CRS 规则树正在更新（树交换�
 // 搬移 live rules 树的路径都必须进入窗口：swapCRSTreeFromStaging 的
 // RemoveAll→moveTree→setup 落盘段、restoreRulesBackup 的
 // live→rules.old→bak 搬移、replaceDirFrom（快照恢复/播种）的
-// RemoveAll→rename 段，以及 seed 的残缺树清除段。渲染侧不持 wafFileMu——
+// live→.old 与 .tmp→live 搬移段，以及 seed 的残缺树清除段。渲染侧不持 wafFileMu——
 // 渲染/重载在 CaddyOpLock 临界区内，而全局锁序为导入=排空→wafFileMu→
 // CaddyOpLock，持 CaddyOpLock 再取 wafFileMu 即反向嵌套（AB-BA），故以
 // 代际标记代替加锁：窗口内生成直接失败，窗口结束后由调用方重试。

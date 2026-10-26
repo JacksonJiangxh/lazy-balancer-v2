@@ -323,10 +323,10 @@ func (e *Engine) IsStopped() bool { return e.stopped.Load() }
 // 对账等）立即退出，而不用等下一个周期轮询 IsStopped。
 func (e *Engine) Done() <-chan struct{} { return e.schedDone }
 
-// engineStopDrainTimeout 是 Stop 等待在途 Run/daemon 的兜底上限
-// cert 四 tick / log-cleanup / audit-retention 等 Run 体不消费 rc.Ctx，
-// 取消等价 no-op——无界 Wait 会被单个长跑清理任务拖到容器 grace 期结束
-// 后 SIGKILL，审计/日志尾部丢失。
+// engineStopDrainTimeout 是 Stop 等待在途 Run/daemon 的兜底上限。
+// cert 四 tick / log-cleanup 中尚未上下文化的文件操作段不消费 rc.Ctx；
+// audit-retention 已在首段查询、批间和分段间响应取消。无界 Wait 仍可能被
+// 未上下文化的任务段拖到容器 grace 期结束后 SIGKILL，造成审计/日志尾部丢失。
 const engineStopDrainTimeout = 30 * time.Second
 
 func (e *Engine) Stop() { e.StopWithTimeout(engineStopDrainTimeout) }
@@ -908,9 +908,9 @@ func (e *Engine) PauseScheduling() {
 //	...导入事务...
 //	engine.ResumeScheduling()         // 成功/失败都必须恢复
 //
-// 注意：Run 体不消费 rc.Ctx 的族（cert 四 tick / log-cleanup / audit-retention
-// 等）取消等价 no-op，等待会跑满其单轮时长——因此 ctx deadline 是必需的
-// 兜底（建议与证书队列 PauseAndDrain 同量级 30s）。实现为计数轮询
+// 注意：Run 体中不消费 rc.Ctx 的任务段（cert 四 tick / log-cleanup 的
+// 文件操作段等）取消等价 no-op，等待会跑满该段时长——因此 ctx deadline
+// 仍是必需的兜底（建议与证书队列 PauseAndDrain 同量级 30s）。实现为计数轮询
 // （runWG 无取消语义；暂停后计数单调递减，无伪排空窗口）。
 func (e *Engine) WaitInFlightRuns(ctx context.Context) bool {
 	if ctx == nil {

@@ -1,12 +1,14 @@
 package mcpserver_test
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/mcpserver"
+	"lazy-balancer-v2/internal/services"
 )
 
 // docs/mcp.zh-CN.md 的「工具权限」表此前把 3 个读探测 POST 整体算作非管理员
@@ -150,4 +152,40 @@ func probeClauses(text, tool string) []string {
 		}
 	}
 	return clauses
+}
+
+func TestMCPPlaybookSlavePostExceptionMatchesReadOnlyPolicy(t *testing.T) {
+	const slaveContract = "从节点上仅 /cluster/"
+	const readOnlyException = "预览/解析/只读查询类 POST 除外"
+	var clauses []string
+	for _, line := range strings.Split(mcpserver.OpsPlaybook(), "\n") {
+		if strings.Contains(line, slaveContract) {
+			clauses = append(clauses, line)
+			if !strings.Contains(line, readOnlyException) || strings.Contains(line, "测试类 POST") {
+				t.Errorf("从节点 POST 例外与只读策略不一致: %q", line)
+			}
+		}
+	}
+	if len(clauses) != 2 {
+		t.Fatalf("从节点契约出现 %d 处, want 权限表与集群工作流共 2 处", len(clauses))
+	}
+
+	for _, route := range []string{
+		"POST /api/v1/certificate-configs/test",
+		"POST /api/v1/certificate-configs/:id/test",
+		"POST /api/v1/ca-providers/:id/test",
+	} {
+		if services.IsReadOnlyWriteRoute("POST", strings.TrimPrefix(route, "POST ")) {
+			t.Errorf("具有写副作用的测试端点不得列入只读豁免: %s", route)
+		}
+	}
+	for _, route := range []string{
+		"/api/v1/certificates/parse",
+		"/api/v1/config/import/validate",
+		"/api/v1/config/preview",
+	} {
+		if !services.IsReadOnlyWriteRoute(http.MethodPost, route) {
+			t.Errorf("只读查询端点缺失既有豁免: POST %s", route)
+		}
+	}
 }

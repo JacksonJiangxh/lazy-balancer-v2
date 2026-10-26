@@ -621,15 +621,13 @@ const toggleAutobanEnabled = async (): Promise<void> => {
   // 守卫：仅在已启用状态执行禁用（此前条件写反致禁用按钮无效——用户报告修复）；
   // autobanWritable 函数级纵深门（与 openAutobanConfig/saveAutobanConfig 同构）
   if (autobanToggling.value || !autobanStatus.value.enabled || !autobanWritable.value) return
+  autobanToggling.value = true
   try {
     await ElMessageBox.confirm(
       '确认禁用自动封禁？任务调度将停止，禁用时会立即清除已到期的封禁条目并即时生效；未到期条目保留至到期自动失效。',
       '禁用自动封禁',
       { confirmButtonText: '确认禁用', cancelButtonText: '取消', type: 'warning' },
     )
-  } catch { return }
-  autobanToggling.value = true
-  try {
     await request.put('/security/autoban', {
       enabled: false,
       dry_run: autobanStatus.value.dry_run,
@@ -640,7 +638,7 @@ const toggleAutobanEnabled = async (): Promise<void> => {
     })
     mfaAwareSuccess('自动封禁已禁用（调度已停止）')
     fetchAutobanStatus()
-  } catch { /* 错误已由全局拦截器 toast */ }
+  } catch { /* 取消无需处理；请求错误已由全局拦截器 toast */ }
   finally { autobanToggling.value = false }
 }
 

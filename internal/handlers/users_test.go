@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -641,5 +642,68 @@ func TestToggleUserStatus_disableKeepsLoginLock(t *testing.T) {
 	}
 	if attempts != 3 || !lockedUntil.Valid {
 		t.Fatalf("attempts=%d locked_until=%v, want 3/保留（禁用不解锁）", attempts, lockedUntil)
+	}
+}
+
+func TestToggleUserStatus_challengeRevocationFailureRollsBack(t *testing.T) {
+	for _, initiallyEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("initially_enabled=%v", initiallyEnabled), func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			seedUserAuditTest(t, 1, "admin", "admin", true)
+			seedUserAuditTest(t, 5, "target", "user", initiallyEnabled)
+			if _, err := db.DB.Exec("UPDATE users SET password_version=4 WHERE id=5"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.DB.Exec("INSERT INTO mfa_challenges (token,user_id,expires_at) VALUES ('status-challenge',5,datetime('now','+5 minutes'))"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.DB.Exec("CREATE TRIGGER reject_status_challenge_revoke BEFORE DELETE ON mfa_challenges BEGIN SELECT RAISE(FAIL,'revoke blocked'); END"); err != nil {
+				t.Fatal(err)
+			}
+			body := `{"is_enabled":true}`
+			if initiallyEnabled {
+				body = `{"is_enabled":false}`
+			}
+			response := serveUserMutation(h, http.MethodPut, "/users/5", body, 1, h.ToggleUserStatus)
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+			}
+			var enabled bool
+			var version, challenges int
+			if err := db.DB.QueryRow("SELECT is_enabled,password_version,(SELECT COUNT(*) FROM mfa_challenges WHERE user_id=5) FROM users WHERE id=5").Scan(&enabled, &version, &challenges); err != nil {
+				t.Fatal(err)
+			}
+			if enabled != initiallyEnabled || version != 4 || challenges != 1 {
+				t.Fatalf("事务未回滚: enabled=%v version=%d challenges=%d", enabled, version, challenges)
+			}
+		})
+	}
+}
+
+func TestToggleUserStatus_sameValueDoesNotRevokeSessionsOrChallenges(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%v", enabled), func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			seedUserAuditTest(t, 1, "admin", "admin", true)
+			seedUserAuditTest(t, 5, "target", "user", enabled)
+			if _, err := db.DB.Exec("UPDATE users SET password_version=7 WHERE id=5"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.DB.Exec("INSERT INTO mfa_challenges (token,user_id,expires_at) VALUES ('same-status-challenge',5,datetime('now','+5 minutes'))"); err != nil {
+				t.Fatal(err)
+			}
+			body := fmt.Sprintf(`{"is_enabled":%v}`, enabled)
+			response := serveUserMutation(h, http.MethodPut, "/users/5", body, 1, h.ToggleUserStatus)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var version, challenges int
+			if err := db.DB.QueryRow("SELECT password_version,(SELECT COUNT(*) FROM mfa_challenges WHERE user_id=5) FROM users WHERE id=5").Scan(&version, &challenges); err != nil {
+				t.Fatal(err)
+			}
+			if version != 7 || challenges != 1 {
+				t.Fatalf("同值请求误吊销会话: version=%d challenges=%d", version, challenges)
+			}
+		})
 	}
 }

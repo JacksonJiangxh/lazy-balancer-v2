@@ -49,9 +49,8 @@ func TestSettingsWrites409DuringImport(t *testing.T) {
 		t.Fatalf("read crawler source: %v", err)
 	}
 
-	// 模拟导入会话持锁（configImportBusy 的探测对象）。
-	configImportBeginMu.Lock()
-	defer configImportBeginMu.Unlock()
+	// 模拟导入会话进行中（configImportBusy 的事实源：窗口计数）。
+	beginImportWindowForTest(t)
 
 	calls := []struct{ method, path, body string }{
 		{"PUT", "/settings/auto-backup", `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["rules"]}`},

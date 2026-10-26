@@ -55,8 +55,26 @@ func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
 func assertNoConfigImportWindowLeak(t *testing.T) {
 	t.Helper()
 	if configImportBusy() {
-		t.Fatal("导入窗口泄漏：configImportBeginMu 仍被前序用例的异步导入持有")
+		t.Fatal("导入窗口泄漏：导入会话未释放（窗口计数非零）")
 	}
+}
+
+// beginImportWindowForTest 以显式窗口计数模拟「导入会话进行中」（与生产
+// 会话同一个事实源）。不得用 Lock 真实会话锁模拟：持锁者不一定是导入会话，
+// 且真实锁只用于串行化，不得兼任可观测状态。
+func beginImportWindowForTest(t *testing.T) func() {
+	t.Helper()
+	importWindowActive.Add(1)
+	closed := false
+	closeWindow := func() {
+		if closed {
+			return
+		}
+		closed = true
+		importWindowActive.Add(-1)
+	}
+	t.Cleanup(closeWindow)
+	return closeWindow
 }
 
 // 并发导入必须串行；第二个会话在第一个
@@ -499,5 +517,36 @@ func TestImportConfigBackup_invalidatesTaskLogCacheAndCancelsInFlightRuns(t *tes
 	}
 	if invalidations != 1 || cancellations != 1 {
 		t.Fatalf("invalidations=%d cancellations=%d, want 1/1", invalidations, cancellations)
+	}
+}
+
+// 导入窗口的可观测状态必须只由真实会话驱动：串行化锁被任意持锁者占住
+// （含其他测试的模拟）不得让无关写端点误报 409。锁生命周期与窗口状态是
+// 两个事实，读侧不得用 TryLock 推测。
+func TestConfigImportBusy_ignoresSessionLockHeldWithoutSession(t *testing.T) {
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+
+	if configImportBusy() {
+		t.Fatal("仅持串行化锁（无导入会话）不得判定为导入窗口")
+	}
+}
+
+func TestConfigImportBusy_tracksRealSessionLifecycle(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if configImportBusy() {
+		t.Fatal("前置失败：窗口应在初始关闭态")
+	}
+	session, err := h.beginConfigImport(context.Background(), "导入")
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if !configImportBusy() {
+		session.close()
+		t.Fatal("会话建立后窗口必须开启")
+	}
+	session.close()
+	if configImportBusy() {
+		t.Fatal("会话关闭后窗口必须关闭")
 	}
 }

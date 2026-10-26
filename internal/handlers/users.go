@@ -562,16 +562,31 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 			services.Logf("error", "ToggleUserStatus rollback failed for id=%d: %v", id, err)
 		}
 	}()
+	var statusUsername string
+	var wasEnabled bool
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT username, is_enabled FROM users WHERE id = ?", id).Scan(&statusUsername, &wasEnabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "用户不存在"})
+		} else {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})
+		}
+		return
+	}
+	statusChanged := wasEnabled != enable
+	versionBump := ""
+	if statusChanged {
+		versionBump = ", password_version = password_version + 1"
+	}
 	var query string
 	var args []any
 	if enable {
 		// 启用即「恢复该账号」：沿用改密语义的解锁片段（passwordResetColumns
 		// 同款）——锁定中/失败计数残留会让管理员刚启用的账号继续 429，且错误
 		// 文案会让人以为账号仍被禁用，恢复意图被 10 分钟锁定打断。
-		query = "UPDATE users SET is_enabled = 1, login_failed_attempts = 0, login_locked_until = NULL WHERE id = ?"
+		query = "UPDATE users SET is_enabled = 1, login_failed_attempts = 0, login_locked_until = NULL" + versionBump + " WHERE id = ?"
 		args = []any{id}
 	} else {
-		query = "UPDATE users SET is_enabled = 0 WHERE id = ? AND (role <> 'admin' OR is_enabled = 0 OR EXISTS (SELECT 1 FROM users WHERE id <> ? AND role = 'admin' AND is_enabled = 1))"
+		query = "UPDATE users SET is_enabled = 0" + versionBump + " WHERE id = ? AND (role <> 'admin' OR is_enabled = 0 OR EXISTS (SELECT 1 FROM users WHERE id <> ? AND role = 'admin' AND is_enabled = 1))"
 		args = []any{id, id}
 	}
 	result, err := tx.ExecContext(c.Request.Context(), query, args...)
@@ -595,12 +610,11 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		}
 		return
 	}
-	var statusUsername string
-	// 审计富化回填不再静默吞错——读失败与其余 DB
-	// 错误同口径 500（tx 未提交，操作随回滚不生效）。
-	if err := tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&statusUsername); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})
-		return
+	if statusChanged {
+		if err := revokeMFAChallenges(tx, id); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})
+			return
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})

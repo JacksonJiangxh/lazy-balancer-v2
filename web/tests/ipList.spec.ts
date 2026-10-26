@@ -314,6 +314,8 @@ test('C11 引号字段闭合后的残留被拒绝（合法/首字段残留/备�
   assert.equal(parseIpListEntryLine('"10.0.0.4"junk,备注', isValidCidr), null)
   // 备注字段残留（曾被静默丢弃）
   assert.equal(parseIpListEntryLine('"10.0.0.4","备注"junk', isValidCidr), null)
-  // 第三列：无对应语义，同样拒绝而非并进备注
+  // 第三列：无论是否有内容都没有对应语义，同样拒绝而非并进备注
   assert.equal(parseIpListEntryLine('"10.0.0.4","备注","多余"', isValidCidr), null)
+  assert.equal(parseIpListEntryLine('"10.0.0.4","备注",', isValidCidr), null)
+  assert.equal(parseIpListEntryLine('"10.0.0.4","备注",   ', isValidCidr), null)
 })

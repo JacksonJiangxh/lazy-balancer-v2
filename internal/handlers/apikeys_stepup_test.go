@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -93,6 +94,82 @@ func TestUpdateAPIKeyStatus_privilegeChangeRequiresStepUp(t *testing.T) {
 	// 同值/降权提交不触发 step-up：read_only 提交 true（库中已是 1）直通。
 	if rec := serveAPIKeyStatusUpdate(h, "10", `{"read_only":true}`); rec.Code == http.StatusPreconditionRequired {
 		t.Fatalf("read_only→true (no change) must not require step-up, got 428")
+	}
+}
+
+func TestUpdateAPIKeyStatus_whitelistChangeFailsClosedWhenGuardUnreadable(t *testing.T) {
+	for _, mcpEnabled := range []int{0, 1} {
+		t.Run(fmt.Sprintf("mcp_enabled=%d", mcpEnabled), func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			seedAPIKeyForStepUp(t, 10, 1, mcpEnabled)
+			const originalWhitelist = `["10.0.0.1/32"]`
+			if _, err := db.DB.Exec("UPDATE api_keys SET mcp_ip_whitelist=? WHERE id=10", originalWhitelist); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.DB.Exec("ALTER TABLE global_config RENAME COLUMN mfa_write_guard TO mfa_write_guard_unreadable"); err != nil {
+				t.Fatalf("break guard switch column: %v", err)
+			}
+
+			rec := serveAPIKeyStatusUpdate(h, "10", `{"mcp_ip_whitelist":["192.0.2.1"]}`)
+			if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "MFA 写操作验证开关读取失败") {
+				t.Fatalf("status=%d body=%s, want 500 fail-closed", rec.Code, rec.Body.String())
+			}
+			var enabled, readOnly, gotMCPEnabled int
+			var whitelist string
+			if err := db.DB.QueryRow("SELECT is_enabled,read_only,mcp_enabled,mcp_ip_whitelist FROM api_keys WHERE id=10").Scan(&enabled, &readOnly, &gotMCPEnabled, &whitelist); err != nil {
+				t.Fatal(err)
+			}
+			if enabled != 1 || readOnly != 1 || gotMCPEnabled != mcpEnabled || whitelist != originalWhitelist {
+				t.Fatalf("fail-closed 后 Key 被修改: enabled=%d read_only=%d mcp_enabled=%d whitelist=%q", enabled, readOnly, gotMCPEnabled, whitelist)
+			}
+		})
+	}
+}
+
+func TestUpdateAPIKeyStatus_whitelistChangeRequiresStepUp(t *testing.T) {
+	for _, mcpEnabled := range []int{0, 1} {
+		t.Run(fmt.Sprintf("mcp_enabled=%d", mcpEnabled), func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			seedAPIKeyForStepUp(t, 10, 1, mcpEnabled)
+			const originalWhitelist = `["10.0.0.1/32","192.0.2.1/32"]`
+			if _, err := db.DB.Exec("UPDATE api_keys SET mcp_ip_whitelist=? WHERE id=10", originalWhitelist); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1, mfa_secret='JBSWY3DPEHPK3PXP' WHERE id=1"); err != nil {
+				t.Fatal(err)
+			}
+			setMfaWriteGuard(t, true)
+
+			// 收窄也是实际白名单变化，与放宽同样进入既有 step-up 集合。
+			rec := serveAPIKeyStatusUpdate(h, "10", `{"mcp_ip_whitelist":["10.0.0.1"]}`)
+			if rec.Code != http.StatusPreconditionRequired {
+				t.Fatalf("status=%d body=%s, want 428", rec.Code, rec.Body.String())
+			}
+			var whitelist string
+			if err := db.DB.QueryRow("SELECT mcp_ip_whitelist FROM api_keys WHERE id=10").Scan(&whitelist); err != nil {
+				t.Fatal(err)
+			}
+			if whitelist != originalWhitelist {
+				t.Fatalf("428 后白名单=%q, want 原值 %q", whitelist, originalWhitelist)
+			}
+		})
+	}
+}
+
+func TestUpdateAPIKeyStatus_canonicalUnchangedWhitelistDoesNotRequireStepUp(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedAPIKeyForStepUp(t, 10, 1, 0)
+	if _, err := db.DB.Exec("UPDATE api_keys SET mcp_ip_whitelist='[\"10.0.0.1/32\"]' WHERE id=10"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1, mfa_secret='JBSWY3DPEHPK3PXP' WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	setMfaWriteGuard(t, true)
+
+	rec := serveAPIKeyStatusUpdate(h, "10", `{"mcp_ip_whitelist":["10.0.0.1"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("归一化同值不应触发 step-up: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

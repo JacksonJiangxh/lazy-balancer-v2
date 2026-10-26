@@ -159,16 +159,21 @@ func sanitizeAuditDetail(detail string) string {
 	return cleaned[:cut]
 }
 
+// beforeAuditLogExec 保留审计写入前注入缝，供关停交错回归测试使用。
+var beforeAuditLogExec = func() {}
+
 func RecordAuditLog(username, action, resource, detail, ipAddress string) {
 	detail = sanitizeAuditDetail(detail)
-	if db.AuditDB == nil {
+	auditDB := db.AuditDB
+	if auditDB == nil {
 		Logf("warn", "audit log write skipped: audit database is not initialized")
 		return
 	}
 	if aw, rw := auditVocabWords(action), auditVocabWords(resource); aw > auditActionMaxWords || rw > auditResourceMaxWords {
 		Logf("info", "audit vocabulary over limit (action<=%d, resource<=%d): action=%q(%d) resource=%q(%d)", auditActionMaxWords, auditResourceMaxWords, action, aw, resource, rw)
 	}
-	if _, err := db.AuditDB.Exec("INSERT INTO audit_log (username, action, resource, detail, ip_address) VALUES (?, ?, ?, ?, ?)",
+	beforeAuditLogExec()
+	if _, err := auditDB.Exec("INSERT INTO audit_log (username, action, resource, detail, ip_address) VALUES (?, ?, ?, ?, ?)",
 		username, action, resource, detail, ipAddress); err != nil {
 		Logf("error", "audit log write failed: %v", err)
 	}

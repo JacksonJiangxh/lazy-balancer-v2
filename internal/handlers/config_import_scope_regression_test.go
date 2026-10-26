@@ -356,8 +356,7 @@ func TestImportUniqueKeyPrecheck_booleanSharesNumericDomainWithoutFalsePositive(
 
 // global_config 写者在导入窗口内 409 fast-fail（不再排队至导入结束后落库）。
 func TestGlobalConfigWritersRejectWriteDuringImport(t *testing.T) {
-	configImportBeginMu.Lock()
-	t.Cleanup(configImportBeginMu.Unlock)
+	beginImportWindowForTest(t)
 
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}

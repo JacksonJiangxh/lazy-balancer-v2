@@ -38,7 +38,7 @@ func putSettingsForCommitFailure(t *testing.T, handler *Handlers) *httptest.Resp
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/config", handler.UpdateConfig)
-	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"log_level":"debug"}`))
+	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"request_body_max_size_mb":9}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)

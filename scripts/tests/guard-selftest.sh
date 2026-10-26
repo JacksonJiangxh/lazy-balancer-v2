@@ -53,6 +53,10 @@ run_guard() {
   ( cd "$tmp_root" && bash scripts/check-no-audit-artifacts.sh )
 }
 
+run_guard_with_tmpdir() {
+  ( cd "$tmp_root" && TMPDIR="$tmp_root/tmp" bash scripts/check-no-audit-artifacts.sh )
+}
+
 # assert_bad <用例名> <输出中必须出现的片段>
 assert_bad() {
   local name="$1" needle="$2" out rc
@@ -224,6 +228,52 @@ awk -v line="$bad_cache_line" '/^tracked_cache_re=/ { print line; next } { print
   "$tmp_root/scripts/check-no-audit-artifacts.sh" >"$tmp_root/scripts/guard.tmp"
 mv "$tmp_root/scripts/guard.tmp" "$tmp_root/scripts/check-no-audit-artifacts.sh"
 assert_bad "invalid cache regex fails closed" "fail-closed"
+
+# 0f) 扫描器临时文件必须在 macOS/BSD mktemp 下也真正随机：历史后缀模板会退化为
+#     固定路径，残留文件与并发进程互相阻断。先预置旧字面残留验证不再误伤，再以
+#     8 路并发跑同一夹具；成功退出后本次创建的扫描器/清单临时文件均须清理。
+reset_fixture
+mkdir -p "$tmp_root/tmp"
+stale_scan="$tmp_root/tmp/audit-guard-scan.XXXXXX.pl"
+printf 'stale\n' >"$stale_scan"
+set +e
+residual_out="$(run_guard_with_tmpdir 2>&1)"
+residual_rc=$?
+set -e
+if [[ $residual_rc -ne 0 ]]; then
+  echo "FAIL [stale scanner temp does not block guard] rc=$residual_rc" >&2
+  echo "$residual_out" >&2
+  fail=$((fail + 1))
+else
+  echo "ok   [stale scanner temp does not block guard]"
+  pass=$((pass + 1))
+fi
+rm -f "$stale_scan"
+concurrent_pids=()
+for i in 1 2 3 4 5 6 7 8; do
+  run_guard_with_tmpdir >"$tmp_root/concurrent.$i.out" 2>&1 &
+  concurrent_pids+=("$!")
+done
+concurrent_failed=0
+for pid in "${concurrent_pids[@]}"; do
+  if ! wait "$pid"; then
+    concurrent_failed=$((concurrent_failed + 1))
+  fi
+done
+if [[ $concurrent_failed -ne 0 ]]; then
+  echo "FAIL [concurrent scanner temps] $concurrent_failed/8 guards failed" >&2
+  for i in 1 2 3 4 5 6 7 8; do
+    printf '%s\n' "--- concurrent.$i ---" >&2
+    cat "$tmp_root/concurrent.$i.out" >&2
+  done
+  fail=$((fail + 1))
+elif compgen -G "$tmp_root/tmp/audit-guard-scan.*" >/dev/null || compgen -G "$tmp_root/tmp/audit-guard-files.*" >/dev/null; then
+  echo "FAIL [scanner temp cleanup] temporary files remain after concurrent guards" >&2
+  fail=$((fail + 1))
+else
+  echo "ok   [8 concurrent guards and scanner temp cleanup]"
+  pass=$((pass + 1))
+fi
 
 # 1) 未跟踪文件同样入扫描面（不 git add，直接写）
 reset_fixture

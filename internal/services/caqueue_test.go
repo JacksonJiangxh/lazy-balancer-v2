@@ -520,6 +520,8 @@ func TestCAQueue_tick_fails_pending_job_when_provider_disabled(t *testing.T) {
 		t.Fatalf("read certificate job ID: %v", err)
 	}
 	queue := newCAQueue(models.CAProvider{ID: int(providerID), MaxConcurrent: 1}, func() error { return nil })
+	manager := &CAQueueManager{queues: map[int]*caQueue{int(providerID): queue}, active: true}
+	queue.manager = manager
 	queue.enqueue(queueItem{jobID: int(jobID), ruleID: "lb_queue_test", domains: "example.com"})
 	if _, err := database.Exec("UPDATE ca_providers SET enabled=0 WHERE id=?", providerID); err != nil {
 		t.Fatalf("disable CA provider: %v", err)
@@ -1550,6 +1552,151 @@ func TestCaExecutionTimeoutFor_counts_domains(t *testing.T) {
 	}
 }
 
+func TestCAQueueManager_providerUnavailableFail_skipsCrossProviderTakeover(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		name := "pending"
+		if running {
+			name = "active"
+		}
+		t.Run(name, func(t *testing.T) {
+			// Given：旧 provider A 的 pending 已排空，同一任务已由 provider B 接管。
+			installCAQueueTestFixture(t)
+			if _, err := db.DB.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,enabled) VALUES
+				(7,'old CA','letsencrypt','https://old.example/directory',0),
+				(8,'new CA','letsencrypt','https://new.example/directory',1)`); err != nil {
+				t.Fatalf("seed CA providers: %v", err)
+			}
+			if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES
+				(42,'lb_cross_provider','cross.example.com','queued',7)`); err != nil {
+				t.Fatalf("seed certificate job: %v", err)
+			}
+			oldQueue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
+			newQueue := newCAQueue(models.CAProvider{ID: 8, MaxConcurrent: 1}, nil)
+			t.Cleanup(oldQueue.cancel)
+			t.Cleanup(newQueue.cancel)
+			item := queueItem{jobID: 42, ruleID: "lb_cross_provider", domains: "cross.example.com"}
+			oldQueue.enqueue(item)
+			oldQueue.mu.Lock()
+			oldQueue.pending = nil
+			delete(oldQueue.active, item.jobID)
+			oldQueue.mu.Unlock()
+			if running {
+				newQueue.mu.Lock()
+				newQueue.active[item.jobID] = struct{}{}
+				newQueue.runningRules[item.jobID] = item.ruleID
+				newQueue.running++
+				newQueue.mu.Unlock()
+			} else {
+				newQueue.enqueue(item)
+			}
+			manager := &CAQueueManager{queues: map[int]*caQueue{7: oldQueue, 8: newQueue}, active: true}
+
+			// When：旧 provider 的延迟失败处置在 B 接管之后到达。
+			manager.failPendingProviderUnavailable([]queueItem{item}, "CA Provider 不可用：配置已禁用或删除（ID 7）")
+
+			// Then：旧尝试不得覆盖新尝试的状态与重试计数。
+			var status string
+			var attempts int
+			if err := db.DB.QueryRow("SELECT status, COALESCE(renewal_attempts,0) FROM cert_jobs WHERE id=42").Scan(&status, &attempts); err != nil {
+				t.Fatalf("read certificate job: %v", err)
+			}
+			if status != "queued" || attempts != 0 {
+				t.Fatalf("replacement job status=%q attempts=%d, want queued/0", status, attempts)
+			}
+		})
+	}
+}
+
+func TestCAQueueManager_providerUnavailableFail_serializesLaterTakeover(t *testing.T) {
+	// Given：旧 provider 已完成全局在途与 queued 复核，尚未写入 failed。
+	installCAQueueTestFixture(t)
+	if _, err := db.DB.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,enabled) VALUES
+		(7,'old CA','letsencrypt','https://old.example/directory',0),
+		(8,'new CA','letsencrypt','https://new.example/directory',1)`); err != nil {
+		t.Fatalf("seed CA providers: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES
+		(42,'lb_after_recheck','after.example.com','queued',7)`); err != nil {
+		t.Fatalf("seed certificate job: %v", err)
+	}
+	oldQueue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
+	newQueue := newCAQueue(models.CAProvider{ID: 8, MaxConcurrent: 1}, nil)
+	t.Cleanup(oldQueue.cancel)
+	t.Cleanup(newQueue.cancel)
+	item := queueItem{jobID: 42, ruleID: "lb_after_recheck", domains: "after.example.com"}
+	oldQueue.enqueue(item)
+	oldQueue.mu.Lock()
+	oldQueue.pending = nil
+	delete(oldQueue.active, item.jobID)
+	oldQueue.mu.Unlock()
+	rechecked := make(chan struct{})
+	releaseFailure := make(chan struct{})
+	takeoverStarted := make(chan struct{})
+	manager := &CAQueueManager{
+		queues: map[int]*caQueue{7: oldQueue, 8: newQueue},
+		active: true,
+		beforeActiveEnqueue: func() {
+			close(takeoverStarted)
+		},
+		beforeProviderUnavailableFail: func() {
+			close(rechecked)
+			<-releaseFailure
+		},
+	}
+	drainDone := make(chan struct{})
+	go func() {
+		manager.failPendingProviderUnavailable([]queueItem{item}, "CA Provider 不可用：配置已禁用或删除（ID 7）")
+		close(drainDone)
+	}()
+	<-rechecked
+
+	// When：复核之后另一 provider 尝试接管；它必须与旧失败写库串行。
+	type enqueueResult struct {
+		changed bool
+		err     error
+	}
+	enqueueDone := make(chan enqueueResult, 1)
+	go func() {
+		_, changed, err := manager.EnqueueIfActive(8, item.jobID, item.ruleID, item.domains, func() (int, bool, error) {
+			// 只有旧失败先完成，这次 failed→queued 的新尝试才可能成功。
+			err := transitionJob(db.DB, item.jobID, []string{"failed"}, "queued", map[string]any{
+				"message":          "重新排队签发",
+				"renewal_attempts": 0,
+			})
+			return item.jobID, err == nil, err
+		})
+		enqueueDone <- enqueueResult{changed: changed, err: err}
+	}()
+	<-takeoverStarted
+	select {
+	case result := <-enqueueDone:
+		t.Fatalf("takeover crossed provider failure critical section: %+v", result)
+	default:
+	}
+	close(releaseFailure)
+	<-drainDone
+	result := <-enqueueDone
+	if result.err != nil || !result.changed {
+		t.Fatalf("takeover changed=%v err=%v, want successful failed→queued transition", result.changed, result.err)
+	}
+
+	// Then：最终行属于 B 的新尝试，而非 A 的旧失败结果。
+	var status string
+	var attempts int
+	if err := db.DB.QueryRow("SELECT status, COALESCE(renewal_attempts,0) FROM cert_jobs WHERE id=42").Scan(&status, &attempts); err != nil {
+		t.Fatalf("read certificate job: %v", err)
+	}
+	if status != "queued" || attempts != 0 {
+		t.Fatalf("final job status=%q attempts=%d, want queued/0", status, attempts)
+	}
+	newQueue.mu.Lock()
+	_, active := newQueue.active[item.jobID]
+	newQueue.mu.Unlock()
+	if !active {
+		t.Fatal("replacement job missing from new provider queue")
+	}
+}
+
 func TestCAQueue_providerUnavailable_fail_skips_reenqueued_job(t *testing.T) {
 	// Given：provider 失效，tick 已排空 pending（active 摘除）；窗口内并发
 	// 手动重试按 RetryCertJob 的 CAS 语义把任务重置为新的一次尝试并重新入队。
@@ -1571,6 +1718,7 @@ func TestCAQueue_providerUnavailable_fail_skips_reenqueued_job(t *testing.T) {
 		t.Fatalf("read certificate job ID: %v", err)
 	}
 	queue := newCAQueue(models.CAProvider{ID: int(providerID), MaxConcurrent: 1}, func() error { return nil })
+	manager := &CAQueueManager{queues: map[int]*caQueue{int(providerID): queue}, active: true}
 	queue.enqueue(queueItem{jobID: int(jobID), ruleID: "lb_queue_test", domains: "example.com"})
 	if _, err := database.Exec("UPDATE ca_providers SET enabled=0 WHERE id=?", providerID); err != nil {
 		t.Fatalf("disable CA provider: %v", err)
@@ -1591,7 +1739,7 @@ func TestCAQueue_providerUnavailable_fail_skips_reenqueued_job(t *testing.T) {
 	queue.enqueue(queueItem{jobID: int(jobID), ruleID: "lb_queue_test", domains: "example.com"})
 
 	// When：旧的 provider 失效处置路径
-	queue.failPendingProviderUnavailable([]queueItem{{jobID: int(jobID), ruleID: "lb_queue_test", domains: "example.com"}}, "CA Provider 不可用：配置已禁用或删除（ID 1）")
+	manager.failPendingProviderUnavailable([]queueItem{{jobID: int(jobID), ruleID: "lb_queue_test", domains: "example.com"}}, "CA Provider 不可用：配置已禁用或删除（ID 1）")
 
 	// Then：新尝试未被误标 failed（attempts 不 +1、状态保持 queued）
 	var status string
@@ -1633,6 +1781,7 @@ func TestCAQueue_providerUnavailable_fail_skips_deleted_or_disabled_job(t *testi
 		t.Fatalf("read disabled job ID: %v", err)
 	}
 	queue := newCAQueue(models.CAProvider{ID: int(providerID), MaxConcurrent: 1}, func() error { return nil })
+	manager := &CAQueueManager{queues: map[int]*caQueue{int(providerID): queue}, active: true}
 
 	if _, err := database.Exec("DELETE FROM cert_jobs WHERE id=?", deletedJobID); err != nil {
 		t.Fatalf("delete job: %v", err)
@@ -1642,7 +1791,7 @@ func TestCAQueue_providerUnavailable_fail_skips_deleted_or_disabled_job(t *testi
 	}
 
 	// When
-	queue.failPendingProviderUnavailable([]queueItem{
+	manager.failPendingProviderUnavailable([]queueItem{
 		{jobID: int(deletedJobID), ruleID: "lb_deleted", domains: "example.com"},
 		{jobID: int(disabledJobID), ruleID: "lb_disabled", domains: "example.com"},
 	}, "CA Provider 不可用：配置已禁用或删除（ID 1）")

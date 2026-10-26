@@ -112,14 +112,19 @@ func PurgeOrphanMetricsHistory(ctx context.Context) (int, error) {
 	return deletedRules, nil
 }
 
+// beforeLiveRuleIDsQuery 保留存活规则查询前注入缝，供关停交错回归测试使用。
+var beforeLiveRuleIDsQuery = func() {}
+
 // liveRuleIDs 读取主库存活规则 caddy_id 集合。
 func liveRuleIDs(ctx context.Context) (map[string]bool, error) {
 	// nil 库守卫（两个消费方共用：孤儿规则日志兜底、孤儿指标清理）——
 	// 关停时 db.Close() 把 db.DB 置 nil，仍在跑的本轮不得 nil 解引用 panic。
-	if db.DB == nil {
+	database := db.DB
+	if database == nil {
 		return nil, errors.New("数据库未初始化")
 	}
-	rows, err := db.DB.QueryContext(ctx, `SELECT caddy_id FROM lb_rules`)
+	beforeLiveRuleIDsQuery()
+	rows, err := database.QueryContext(ctx, `SELECT caddy_id FROM lb_rules`)
 	if err != nil {
 		return nil, err
 	}
