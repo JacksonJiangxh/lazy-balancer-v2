@@ -49,7 +49,7 @@ type ChainUpstream struct {
 // 预算公式（全挂兜底最坏情形）：总耗时 ≈ (N−1)×RaceInterval + RequestTimeout，
 // 按 N=6 封顶 + 浏览器 60s 等待约束设计：5×3000+30000=45s < 60s（15s 余量），
 // N<6 自动收敛（2 路最坏 33s）。RaceInterval=3s 兼顾竞速收益与非幂等请求
-//（POST）重复执行窗口；RequestTimeout=30s 为单路无响应头的判死阈值。
+// （POST）重复执行窗口；RequestTimeout=30s 为单路无响应头的判死阈值。
 const (
 	DefaultRaceIntervalMS   = 3000
 	DefaultRequestTimeoutMS = 30000

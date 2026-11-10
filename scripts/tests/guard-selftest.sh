@@ -12,7 +12,8 @@
 #     型轮次命名）、.gitignore 双向校验（含重复模式行）、轮次引用的
 #     各书写形态（裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、
 #     跨行拆字含续行注释前缀）、依赖/构建缓存通道（node_modules 内外两种缓存
-#     目录、正则在各 grep 实现下可执行、非法正则必须 fail-closed）；
+#     目录、正则在各 grep 实现下可执行、非法正则必须 fail-closed）、
+#     扫描起点豁免路径（台账目录/合并文档/体系总纲/上游原文文件）及其边界；
 #   • 误报面：npm 生成物（package-lock.json 内容面豁免）、百分位、版本串、
 #     十六进制摘要/哈希算法名、协议与产品 token、
 #     容量边界常量、合法测试函数名、中文“轮播/轮询”、循环轮次表述（心跳/共识/
@@ -699,6 +700,46 @@ mkdir_in .npc-teams/audit96-notes.md
 printf 'x\n' >"$tmp_root/.npc-teams/audit96-notes.md"
 git -C "$tmp_root" add -f .npc-teams/audit96-notes.md
 assert_good "exempt dir skips audit-named file (dir-level scope, ruled)"
+
+# 13g) 扫描起点豁免（r3 驳回处置裁决第 2 条，最小化）：AGENTS.md（体系总纲，
+# 认证分级表述的「大写前缀-分段序号」形态与编号家族正则同形）与
+# internal/services/caqueue.go（上游原文注释自带的锁纪律术语，同族形态）——
+# 两路径从扫描起点排除（模式表与 .gitignore 块不动）。夹具一律 git add -f：
+# .gitignore 已按宽形态忽略 **/AGENTS.md，不强制入库就根本不进扫描面，钉的
+# 会是 .gitignore 而不是 skip_re 豁免本身。豁免边界必须钉住：豁免路径不再红，
+# 豁免面之外的同形态命中（嵌套同名文件/其它文件里的同族术语）仍必须红，
+# 否则豁免会长成漏检通道。
+reset_fixture
+cat >"$tmp_root/AGENTS.md" <<'EOF'
+# 体系总纲
+
+各平台结论的可信度按 T0-T3 认证分级判定（T0 = 平台自身运行时实审，仅该平台能签）。
+EOF
+git -C "$tmp_root" add -f AGENTS.md
+assert_good "AGENTS.md exempt at scan start"
+
+reset_fixture
+mkdir_in internal/services/caqueue.go
+cat >"$tmp_root/internal/services/caqueue.go" <<'EOF'
+package services
+
+// 锁纪律例外（有意违背 no-IO-under-m.mu，勿按先例顺手拆锁）：
+func noop() {}
+EOF
+git -C "$tmp_root" add -f internal/services/caqueue.go
+assert_good "caqueue.go exempt at scan start"
+
+reset_fixture
+mkdir_in sub/AGENTS.md
+printf '# T0-T3 认证分级（嵌套同名，不在豁免面）\n' >"$tmp_root/sub/AGENTS.md"
+git -C "$tmp_root" add -f sub/AGENTS.md
+assert_bad "nested AGENTS.md outside exemption still hits" "sub/AGENTS.md"
+
+reset_fixture
+mkdir_in internal/services/otherqueue.go
+printf 'package services\n\n// 同款锁纪律术语 no-IO-under-m.mu，豁免面外仍红。\nfunc noop() {}\n' >"$tmp_root/internal/services/otherqueue.go"
+git -C "$tmp_root" add -f internal/services/otherqueue.go
+assert_bad "same-form comment outside exemption still hits" "internal/services/otherqueue.go"
 
 # 14) .gitignore 双向校验：少一行 / 多一行都失败
 reset_fixture

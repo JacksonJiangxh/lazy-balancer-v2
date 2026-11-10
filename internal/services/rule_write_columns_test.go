@@ -36,7 +36,7 @@ func testLbRuleFullyPopulated(t *testing.T) models.LbRule {
 		TLSCert: "CERT-PEM", TLSKey: "KEY-PEM",
 		TLSCertPath: "/app/certs/full.example.test.crt", TLSKeyPath: "/app/certs/full.example.test.key",
 		TLSHTTPRedirect: true,
-		EnableCompress: true, CompressTypes: "zstd", Enabled: true, LogEnabled: true,
+		EnableCompress:  true, CompressTypes: "zstd", Enabled: true, LogEnabled: true,
 		CreatedBy: 51, UpdatedBy: 52,
 		CreatedAt:         time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC),
 		UpdatedAt:         models.JSONNullTime{NullTime: mustParseTime(t, "2026-03-05 06:07:08")},

@@ -3650,7 +3650,7 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		// 存在启用上游的规则进入 TLS 策略（无上游/关 TLS 规则在真实配置中不存在）。
 		// 证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
 		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
-			FROM lb_rules WHERE ` + publishableRulesSQLPredicate + ` AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
+			FROM lb_rules WHERE `+publishableRulesSQLPredicate+` AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
 			ORDER BY rowid`, listenPort)
 		if err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取端口 %d TLS 策略失败: %v", listenPort, err)

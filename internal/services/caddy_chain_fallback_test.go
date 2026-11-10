@@ -14,10 +14,10 @@ import (
 //   - 竞速参数 0 值兜底 3000/30000（与写侧 CreateRule 同口径）。
 func TestBuildHTTPHandleChain_chainFallback_emitsChainProxy(t *testing.T) {
 	rule := SingleRuleConfig{
-		CaddyID:             "lb_chain_gate",
-		Domain:              "chain-gate.test",
-		Protocol:            "http",
-		Strategy:            "chain_fallback",
+		CaddyID:              "lb_chain_gate",
+		Domain:               "chain-gate.test",
+		Protocol:             "http",
+		Strategy:             "chain_fallback",
 		RequestBodyMaxSizeMB: 128,
 	}
 	ups := []UpstreamConfig{
@@ -147,10 +147,10 @@ func TestBuildChainProxyConfig_paramsAndDialTimeout(t *testing.T) {
 // 逐上游回源域名三级回退：上游 origin_domain > 规则级 origin_domain > 空（不发射）。
 func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 	rule := SingleRuleConfig{
-		CaddyID:      "lb_chain_host",
-		Protocol:     "http",
-		Strategy:     "chain_fallback",
-		HostHeader:   "rule-level.test",
+		CaddyID:    "lb_chain_host",
+		Protocol:   "http",
+		Strategy:   "chain_fallback",
+		HostHeader: "rule-level.test",
 	}
 	ups := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 9501, Weight: 1, Protocol: "http", Enabled: true, OriginDomain: "upstream-level.test"},

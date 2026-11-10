@@ -122,6 +122,7 @@ baseline_modules=(
   "caddydeps"
   "caddygeoip"
   "caddyl4sec"
+  "caddychain"
   "geoipnames"
   "wafiplist"
 )

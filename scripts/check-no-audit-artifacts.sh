@@ -57,13 +57,21 @@ fi
 # waf.log/）：宽形态 `waf[^/]*/` 会连带命中嵌套 Go 模块 wafiplist/，把整个模块
 # 从路径与内容两条通道同时摘掉——模块里的注释编号与轮次测试文件名因此永不入面
 # （永久静默盲区）。运行目录以 `-`/`.` 起后缀，模块名不会。
-# 总经理授权豁免（任务档案 §4.3 裁决第 4 条，最小化）：
+# 总经理授权豁免（任务档案 §4.3 裁决第 4 条与 r3 驳回处置裁决第 2 条，最小化）：
 #   • .npc-teams/——本 fork 任务协作台账目录，档案正文必然引用轮次元数据，
 #     目录整体从扫描起点排除（模式表 audit_path_rules 与 .gitignore 块不动）；
 #   • docs/upstream-merge.zh-CN.md——单文件豁免，正文记录各轮合并事实，
 #     轮次引用属文档正当内容。豁免边界由 guard-selftest.sh 钉住：两处之外的
-#     命中仍必须红（含同名近似路径不受豁免）。
-skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf([-.][^/]*)?/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/|\.npc-teams/|^docs/upstream-merge\.zh-CN\.md$)'
+#     命中仍必须红（含同名近似路径不受豁免）；
+#   • AGENTS.md——体系总纲，其中认证分级等体系口径表述形态上与编号家族正则
+#     同形（大写前缀-分段序号），并非审计产物，单文件从扫描起点排除
+#     （总纲属体系侧文件，本仓不改写）；
+#   • internal/services/caqueue.go——上游原文注释自带的锁纪律术语形态上同样
+#     落入编号家族正则（大写缩写-英文小写段连写），本仓不改上游文件，
+#     单文件从扫描起点排除。
+#   后两条的豁免边界同样由 guard-selftest.sh 钉住：豁免路径外的同形态命中
+#   （嵌套同名文件/其它文件里的同款术语）仍必须红。
+skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf([-.][^/]*)?/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/|\.npc-teams/|^docs/upstream-merge\.zh-CN\.md$|^AGENTS\.md$|^internal/services/caqueue\.go$)'
 
 # ---------------------------------------------------------------------------
 # 审计产物路径模式——单一事实源。
