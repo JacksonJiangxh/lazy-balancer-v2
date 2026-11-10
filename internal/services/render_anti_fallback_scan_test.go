@@ -68,6 +68,10 @@ var antiFallbackScanTargets = map[string][]string{
 		"GenerateSingleRuleCaddyConfig",
 		"generateHTTPRouteObjects",
 		"buildHTTPHandleChain",
+		// 链式回退渲染族（2026-10-09）：竞速参数 0 值兜底与权重 0→1 是设计
+		// 语义（UI 无 0=关闭形态，兜底值与写侧 CreateRule 同口径），纳入扫描
+		// 面后逐条在 antiFallbackAllowlist 披露 Ruling。
+		"buildChainProxyConfig",
 		"buildTCPProxyHandler",
 		"buildTCPServer",
 		"buildRateLimitHandler",
@@ -110,6 +114,17 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	// 文案 = "Connection blocked by " + branding app_name；app_name 空/未
 	// 注入回退默认品牌是产品语义（默认文案形态），不是「库值静默替值」：
 	// 渲染层唯一真相是 branding 内存快照 + 裁定默认，非省略型兜底（Ruling 2026-11-06）。
+	// 链式回退渲染族（2026-10-09 用户裁定）：三组兜底均为「0=缺省」设计语义，
+	// 与写侧 CreateRule 的 0 值兜底（rules.go chain_fallback 分支）同口径——
+	// UI 不提供 0=关闭形态（预算公式 5×3000+30000=45s<60s），渲染侧兜底是
+	// 「省略型缺省替换」而非库值静默替值（钉测 TestCreateRule_chainFallback_
+	// defaultsApplied 与 TestBuildChainProxyConfig_hostHeaderFallback 钉住）。
+	"buildChainProxyConfig": {
+		"wi = 1":  "权重 <=0 排序位归一 1：chain 语义无 WRR 除零面，「发射权重恒 >0」不变量退化为权重排序（0=末位）——设计语义，Ruling 2026-10-09",
+		"wj = 1":  "同上（排序比较两侧同格）——Ruling 2026-10-09",
+		"raceIntervalMS = chainProxyDefaultRaceIntervalMS":       "竞速间隔 0 值兜底 3000ms：与写侧 CreateRule 兜底同口径（UI 无 0=关闭语义）——Ruling 2026-10-09",
+		"requestTimeoutMS = chainProxyDefaultRequestTimeoutMS":   "单请求兜底超时 0 值兜底 30000ms：与写侧 CreateRule 兜底同口径——Ruling 2026-10-09",
+	},
 	"buildTCPBlockNotice": {
 		"brand = tcpBlockNoticeFallbackBrand": "branding app_name 空/未注入 → 默认品牌 'Lazy Balancer v2'：功能无配置项，默认文案即裁定行为——Ruling 2026-11-06",
 	},

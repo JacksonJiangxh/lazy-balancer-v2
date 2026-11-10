@@ -97,6 +97,9 @@ export interface Rule extends ProxyTimeoutConfig {
   ntlm_compatible: number
   // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）；NTLM 接管时恒 1
   upstream_force_http1: number
+  // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
+  chain_race_interval_ms: number
+  chain_request_timeout_ms: number
   // 认证网关（forward_auth）：1=全部请求先经网关校验（仅 HTTP 规则）
   forward_auth_enabled: number
   // 网关地址 http(s)://host:port
@@ -115,6 +118,10 @@ export interface Rule extends ProxyTimeoutConfig {
   ca_provider_id: number
   tls_cert?: string
   tls_key?: string
+  // 引用型证书（tls_source="file"）：/app/certs 内成品证书/私钥文件的摄取源路径
+  // （内容保存时入库，数据库是运行时唯一信任源）
+  tls_cert_path?: string
+  tls_key_path?: string
   // GetRule 对只读 Key/非管理员掩码 tls_key 时的「已有隐藏私钥」标记
   tls_key_set?: boolean
   tls_http_redirect: boolean
@@ -162,6 +169,9 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   server_tokens_hidden: number
   ntlm_compatible: number
   upstream_force_http1: number
+  // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
+  chain_race_interval_ms: number
+  chain_request_timeout_ms: number
   // 认证网关四件套（仅 HTTP；enabled=1 时 upstream 必填）
   forward_auth_enabled: number
   forward_auth_upstream: string
@@ -178,6 +188,10 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   ca_provider_id: number
   tls_cert: string
   tls_key: string
+  // 引用型证书（tls_source="file"）：/app/certs 内成品证书/私钥文件的摄取源路径
+  // （内容保存时入库，数据库是运行时唯一信任源）
+  tls_cert_path: string
+  tls_key_path: string
   tls_http_redirect: boolean
   enable_compress: boolean
   compress_types: string
@@ -190,6 +204,8 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   | 'server_tokens_hidden'
   | 'ntlm_compatible'
   | 'upstream_force_http1'
+  | 'chain_race_interval_ms'
+  | 'chain_request_timeout_ms'
   | 'forward_auth_enabled'
   | 'forward_auth_upstream'
   | 'forward_auth_uri'
@@ -207,6 +223,9 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   server_tokens_hidden?: number
   ntlm_compatible?: number
   upstream_force_http1?: number
+  // 链式回退竞速参数：可选——省略=保留原值（后端 *int 合并语义）
+  chain_race_interval_ms?: number
+  chain_request_timeout_ms?: number
   // 认证网关四件套：省略=保留原值（后端指针合并语义）；显式空串=清空
   forward_auth_enabled?: number
   forward_auth_upstream?: string

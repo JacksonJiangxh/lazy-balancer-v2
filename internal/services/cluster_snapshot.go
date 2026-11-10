@@ -1283,11 +1283,13 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 			&rule.HealthCheckPath, &rule.HealthCheckInterval, &rule.HealthCheckTimeout, &rule.HealthCheckUnhealthyThreshold, &rule.HealthCheckHealthyThreshold,
 			&rule.EnableActiveHealthCheck, &rule.TCPHealthCheckPort, &rule.TCPProxyProtocol, &rule.TCPTryDuration, &rule.TCPTryInterval,
 			&rule.RequestBodyMaxSizeMB, &rule.UpstreamKeepaliveTimeout, &rule.ServerTokensHidden, &rule.NTLMCompatible, &rule.UpstreamForceHTTP1,
+			&rule.ChainRaceIntervalMS, &rule.ChainRequestTimeoutMS,
 			&rule.ForwardAuthEnabled, &rule.ForwardAuthUpstream, &rule.ForwardAuthURI, &rule.ForwardAuthCopyHeaders,
 			&rule.CustomRoutesEnabled,
 			&rule.ProxyDialTimeout, &rule.ProxyResponseHeaderTimeout, &rule.ProxyReadTimeout, &rule.ProxyWriteTimeout, &rule.ProxyStreamTimeout, &rule.ProxyFlushInterval, &rule.ProxyStreamCloseDelay,
 			&rule.HostHeader, &rule.HealthCheckHost,
 			&rule.EnableTLS, &rule.TLSSource, &rule.ACMEConfigID, &rule.CAProviderID, &rule.TLSCert, &rule.TLSKey,
+			&rule.TLSCertPath, &rule.TLSKeyPath,
 			&rule.TLSHTTPRedirect, &rule.EnableCompress, &rule.CompressTypes, &rule.Enabled, &rule.LogEnabled,
 			&rule.CreatedBy, &rule.CreatedAt, &rule.UpdatedAt, &rule.UpdatedBy,
 			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status); err != nil {

@@ -692,6 +692,16 @@ func TestConfigFileKeys_everyKeyAppliesAndValidates(t *testing.T) {
 				t.Fatalf("port=%d", cfg.Port)
 			}
 		}},
+		{key: "http_port", goodJSON: `18082`, check: func(t *testing.T, cfg *Config) {
+			if cfg.HTTPPort != 18082 {
+				t.Fatalf("http_port=%d", cfg.HTTPPort)
+			}
+		}},
+		{key: "https_port", goodJSON: `18443`, check: func(t *testing.T, cfg *Config) {
+			if cfg.HTTPSPort != 18443 {
+				t.Fatalf("https_port=%d", cfg.HTTPSPort)
+			}
+		}},
 		{key: "caddy_admin_url", goodJSON: `"http://127.0.0.1:12019"`, check: func(t *testing.T, cfg *Config) {
 			if cfg.CaddyAdminURL != "http://127.0.0.1:12019" {
 				t.Fatalf("caddy_admin_url=%q", cfg.CaddyAdminURL)

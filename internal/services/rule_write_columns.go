@@ -57,6 +57,9 @@ var lbRuleColumnSpecs = []lbRuleColumnSpec{
 	{"server_tokens_hidden", "COALESCE(server_tokens_hidden,0)"},
 	{"ntlm_compatible", "COALESCE(ntlm_compatible,0)"},
 	{"upstream_force_http1", "COALESCE(upstream_force_http1,0)"},
+	// 链式回退竞速参数（2026-10-09）：Create/Duplicate/镜像/快照四路同源。
+	{"chain_race_interval_ms", "COALESCE(chain_race_interval_ms,0)"},
+	{"chain_request_timeout_ms", "COALESCE(chain_request_timeout_ms,0)"},
 	{"forward_auth_enabled", "COALESCE(forward_auth_enabled,0)"},
 	{"forward_auth_upstream", "COALESCE(forward_auth_upstream,'')"},
 	{"forward_auth_uri", "COALESCE(forward_auth_uri,'')"},
@@ -77,6 +80,9 @@ var lbRuleColumnSpecs = []lbRuleColumnSpec{
 	{"ca_provider_id", "COALESCE(ca_provider_id,0)"},
 	{"tls_cert", "COALESCE(tls_cert,'')"},
 	{"tls_key", "COALESCE(tls_key,'')"},
+	// 引用型证书（tls_source="file"）摄取源路径列（2026-10-09）：同源四路携带。
+	{"tls_cert_path", "COALESCE(tls_cert_path,'')"},
+	{"tls_key_path", "COALESCE(tls_key_path,'')"},
 	{"tls_http_redirect", "COALESCE(tls_http_redirect,0)"},
 	{"enable_compress", "COALESCE(enable_compress,0)"},
 	{"compress_types", "COALESCE(compress_types,'gzip')"},
@@ -197,6 +203,10 @@ func lbRuleWriteValue(rule *models.LbRule, column string) any {
 		return rule.NTLMCompatible
 	case "upstream_force_http1":
 		return rule.UpstreamForceHTTP1
+	case "chain_race_interval_ms":
+		return rule.ChainRaceIntervalMS
+	case "chain_request_timeout_ms":
+		return rule.ChainRequestTimeoutMS
 	case "forward_auth_enabled":
 		return rule.ForwardAuthEnabled
 	case "forward_auth_upstream":
@@ -237,6 +247,10 @@ func lbRuleWriteValue(rule *models.LbRule, column string) any {
 		return rule.TLSCert
 	case "tls_key":
 		return rule.TLSKey
+	case "tls_cert_path":
+		return rule.TLSCertPath
+	case "tls_key_path":
+		return rule.TLSKeyPath
 	case "tls_http_redirect":
 		return rule.TLSHTTPRedirect
 	case "enable_compress":

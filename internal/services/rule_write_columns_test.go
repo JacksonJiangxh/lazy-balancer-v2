@@ -25,6 +25,7 @@ func testLbRuleFullyPopulated(t *testing.T) models.LbRule {
 		EnableActiveHealthCheck: true, TCPHealthCheckPort: 19001, TCPProxyProtocol: true,
 		TCPTryDuration: 7, TCPTryInterval: 251,
 		RequestBodyMaxSizeMB: 13, UpstreamKeepaliveTimeout: 17, ServerTokensHidden: 2,
+		ChainRaceIntervalMS: 14, ChainRequestTimeoutMS: 15,
 		NTLMCompatible: 1, UpstreamForceHTTP1: 1, CustomRoutesEnabled: true,
 		ForwardAuthEnabled: 1, ForwardAuthUpstream: "http://gw.internal:7000",
 		ForwardAuthURI: "/api/authz/forward-auth", ForwardAuthCopyHeaders: "Remote-User,Remote-Groups",
@@ -32,7 +33,9 @@ func testLbRuleFullyPopulated(t *testing.T) models.LbRule {
 		ProxyWriteTimeout: 24, ProxyStreamTimeout: 25, ProxyFlushInterval: 26, ProxyStreamCloseDelay: 27,
 		HostHeader: "host.example.test", HealthCheckHost: "probe.example.test",
 		EnableTLS: true, TLSSource: "manual", ACMEConfigID: 31, CAProviderID: 32,
-		TLSCert: "CERT-PEM", TLSKey: "KEY-PEM", TLSHTTPRedirect: true,
+		TLSCert: "CERT-PEM", TLSKey: "KEY-PEM",
+		TLSCertPath: "/app/certs/full.example.test.crt", TLSKeyPath: "/app/certs/full.example.test.key",
+		TLSHTTPRedirect: true,
 		EnableCompress: true, CompressTypes: "zstd", Enabled: true, LogEnabled: true,
 		CreatedBy: 51, UpdatedBy: 52,
 		CreatedAt:         time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC),
@@ -100,6 +103,14 @@ func testLbRuleExpectedColumnValue(rule *models.LbRule, column string) any {
 		return rule.NTLMCompatible
 	case "upstream_force_http1":
 		return rule.UpstreamForceHTTP1
+	case "chain_race_interval_ms":
+		return rule.ChainRaceIntervalMS
+	case "chain_request_timeout_ms":
+		return rule.ChainRequestTimeoutMS
+	case "tls_cert_path":
+		return rule.TLSCertPath
+	case "tls_key_path":
+		return rule.TLSKeyPath
 	case "forward_auth_enabled":
 		return rule.ForwardAuthEnabled
 	case "forward_auth_upstream":

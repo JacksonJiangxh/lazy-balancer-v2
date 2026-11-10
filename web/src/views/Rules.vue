@@ -453,9 +453,12 @@
               <el-input-number v-model="wizardForm.listen_port" :min="1" :max="65535" controls-position="right" @change="userExplicitPort = true" />
               <span class="form-tip-inline">
                 <span v-if="portWarning" class="port-warning">{{ portWarning }}</span>
-                <span v-else-if="wizardForm.protocol === 'http'">建议使用 80 或其他非保留端口</span>
+                <span v-else-if="wizardForm.protocol === 'http'">建议使用 {{ proxyPorts.http_port }} 或其他非保留端口</span>
                 <span v-else>建议使用 10000-60000 范围内的端口</span>
               </span>
+              <!-- 存量规则端口提示（ISSUE #7）：部署默认口已改、但本条规则仍是旧端口时，
+                   明示「保存即按当前值落库」——不会被自动迁移，改了才覆盖。 -->
+              <div v-if="stalePortHint" class="form-tip-line">{{ stalePortHint }}</div>
               <div class="form-tip-line">服务端还会按当前部署校验实际管理端口（面板监听端口与 Caddy admin 端口），自定义端口以保存结果为准</div>
             </el-form-item>
 
@@ -490,6 +493,7 @@
               <el-radio-group v-model="wizardForm.tls_source" :disabled="isCurrentRuleLocked" aria-label="证书来源">
                 <el-radio value="manual">手动上传</el-radio>
                 <el-radio value="acme_dns">ACME + DNS 自动</el-radio>
+                <el-radio value="file">引用证书文件</el-radio>
               </el-radio-group>
               <div v-if="isCurrentRuleLocked" class="form-tip-line port-warning">证书申请中，暂不能修改证书来源</div>
             </el-form-item>
@@ -511,6 +515,16 @@
                   <el-option v-for="p in wizardCAProviderOptions" :key="p.id" :label="referencedOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
                 </el-select>
                 <div class="form-tip-line">选择自动签发证书使用的 CA 提供商，留空或「系统默认」将跟随全局默认设置</div>
+              </el-form-item>
+            </template>
+            <template v-else-if="wizardForm.tls_source === 'file'">
+              <el-form-item label="证书文件">
+                <el-input v-model="wizardForm.tls_cert_path" placeholder="如 /app/certs/example.com.crt" />
+                <div class="form-tip-line">引用程序可读写目录内的成品证书文件（需位于 /app/certs 目录内），保存时读取并校验后内容入库；外部更新文件后会自动同步入库并重载</div>
+              </el-form-item>
+              <el-form-item label="私钥文件">
+                <el-input v-model="wizardForm.tls_key_path" placeholder="如 /app/certs/example.com.key" />
+                <div class="form-tip-line">与证书文件配对的私钥文件路径（需位于 /app/certs 目录内），内容随保存入库</div>
               </el-form-item>
             </template>
             <template v-else>
@@ -629,7 +643,9 @@
               </el-table-column>
               <el-table-column width="80">
                 <template #header>
-                  权重 %<FieldHelpIcon content="数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。" />
+                  权重 %<FieldHelpIcon :content="wizardForm.strategy === 'chain_fallback'
+                    ? '链式回退下权重即优先级：权重越大越先被请求，相同权重按列表顺序；仍按百分比录入（总和须为 100）。'
+                    : '数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。'" />
                 </template>
                 <template #default="{ row, $index }">
                   <el-input-number v-model="row.weight" :min="1" :max="100" size="small" controls-position="right" class="upstream-input-small" :aria-label="`上游第 ${$index + 1} 行权重（%）`" :disabled="!row.enabled" @change="onWeightChange($index)" />
@@ -775,6 +791,18 @@
               </el-tooltip>
             </div>
 
+            <!-- 链式回退竞速参数（strategy=chain_fallback，仅 HTTP）——自维护能力，
+                 上游无此块，合并时原样保留 -->
+            <template v-if="wizardForm.strategy === 'chain_fallback' && wizardForm.protocol === 'http'">
+              <el-form-item label="竞速间隔">
+                <el-input-number v-model="wizardForm.chain_race_interval_ms" :min="10" :max="60000" :step="50" controls-position="right" style="width: 140px;" />
+                <span class="form-tip-inline">毫秒，等待该时长仍无有效响应即向下一优先级上游并行发出请求竞速</span>
+              </el-form-item>
+              <el-form-item label="兜底超时">
+                <el-input-number v-model="wizardForm.chain_request_timeout_ms" :min="100" :max="600000" :step="100" controls-position="right" style="width: 140px;" />
+                <span class="form-tip-inline">毫秒，单个上游超过该时长仍未响应将被截断取消，避免耗时浪费</span>
+              </el-form-item>
+            </template>
 
             <el-divider content-position="left" class="compact-divider">健康检查</el-divider>
 
@@ -1042,6 +1070,10 @@
             </el-descriptions-item>
             <el-descriptions-item label="TLS 证书" v-if="wizardForm.enable_tls">
               <div v-if="wizardForm.tls_source === 'acme_dns'">{{ certTypeLabels.auto }} ({{ caProviderLabel }})</div>
+              <div v-else-if="wizardForm.tls_source === 'file'">
+                <div>{{ certTypeLabels.file }}</div>
+                <div class="cert-preview-info">{{ wizardForm.tls_cert_path || '未填写证书文件' }}</div>
+              </div>
               <div v-else>
                 <div>{{ certTypeLabels.manual }}</div>
                 <div v-if="certInfo.valid">
@@ -1130,8 +1162,9 @@
           <el-descriptions-item label="后端域名" v-if="ruleConfig.protocol === 'http'">{{ ruleConfig.host_header || '-' }}</el-descriptions-item>
           <el-descriptions-item label="TLS" v-if="ruleConfig.enable_tls">
             {{ ruleConfig.tls_http_redirect ? '启用 (HTTP重定向)' : '启用' }}
-            <span v-if="ruleConfig.tls_source === 'manual'">(手动上传)</span>
-            <span v-else-if="ruleConfig.tls_source === 'acme_dns'">(ACME 自动)</span>
+            <span v-if="ruleConfig.tls_source === 'manual'" class="tls-source-tag">(手动上传)</span>
+            <span v-else-if="ruleConfig.tls_source === 'acme_dns'" class="tls-source-tag">(ACME 自动)</span>
+            <span v-else-if="ruleConfig.tls_source === 'file'" class="tls-source-tag">(引用文件)</span>
           </el-descriptions-item>
           <el-descriptions-item label="TLS" v-else>禁用</el-descriptions-item>
           <el-descriptions-item label="压缩" v-if="ruleConfig.protocol === 'http'">
@@ -1170,6 +1203,9 @@
             <template #default="{ row }">
               <el-tag size="small" :type="row.protocol === 'https' ? 'warning' : 'primary'">{{ row.protocol || 'http' }}</el-tag>
             </template>
+          </el-table-column>
+          <el-table-column v-if="ruleConfig?.protocol !== 'tcp'" label="回源Host">
+            <template #default="{ row }">{{ row.origin_domain || '跟随规则/自身地址' }}</template>
           </el-table-column>
           <el-table-column label="权重" align="center">
             <template #default="{ row }">{{ weightPercent(ruleConfig?.upstreams, row) }}%</template>
@@ -1573,6 +1609,7 @@ let disposed = false
 const certTypeLabels = {
   auto: 'ACME 自动证书',
   manual: '手动证书',
+  file: '引用证书文件',
 }
 
 const caProviderLabel = computed(() => {
@@ -1606,6 +1643,24 @@ class CertInfoRefreshError extends Error {
 }
 
 const rules = ref<Rule[]>([])
+// 部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT，ISSUE #7）。
+// 出厂默认与后端一致；onMounted 拉取 /system/ports 后覆盖——保证「compose 改了
+// 变量、面板向导默认值随动」不割裂。只影响默认语义，不迁移存量规则的 listen_port。
+const proxyPorts = ref({ http_port: 80, https_port: 443, panel_port: 8000 })
+const fetchProxyPorts = async () => {
+  try {
+    const res = await request.get<APIResponse<{ http_port: number; https_port: number; panel_port: number }>>('/system/ports', { silent: true })
+    if (res.code === 0 && res.data) {
+      proxyPorts.value = {
+        http_port: res.data.http_port || 80,
+        https_port: res.data.https_port || 443,
+        panel_port: res.data.panel_port || 8000,
+      }
+    }
+  } catch {
+    // 装饰性预取失败保出厂默认
+  }
+}
 // v2.2.0：一规则可绑多策略——/security/bindings 返回 rule_caddy_id → 绑定数组（rank 序=提交序=执行序；policy_id 仅作遗留 rank=0 行的并列兜底）。
 
 const securityBindings = ref<Record<string, SecurityStageBinding[]>>({})
@@ -2308,8 +2363,14 @@ const wizardForm = reactive<RuleForm>({
   description: '',
   protocol: 'http',
   domain: '',
-  listen_port: 80,
+  // 初值随部署 HTTP 默认口（/system/ports 异步返回后由 resetWizard/新建流程再赋值；
+  // 此初值仅为挂载前的占位，出厂 80）
+  listen_port: proxyPorts.value.http_port,
   strategy: 'weighted_round_robin',
+  // 链式回退竞速参数（strategy=chain_fallback 时消费；默认按 N=6 封顶 +
+  // 浏览器 60s 等待约束设计：5×3s+30s=45s < 60s）
+  chain_race_interval_ms: 3000,
+  chain_request_timeout_ms: 30000,
   dynamic_dns: false,
   enable_dns_server: false,
   dns_server: '',
@@ -2332,6 +2393,8 @@ const wizardForm = reactive<RuleForm>({
   ca_provider_id: undefined as number | undefined,
   tls_cert: '',
   tls_key: '',
+  tls_cert_path: '',
+  tls_key_path: '',
   tlsKeySet: false,
   tls_http_redirect: false,
   enable_compress: false,
@@ -2385,28 +2448,32 @@ const userExplicitPort = ref(false)
 let preTcpSnapshot: { listenPort: number; enableTls: boolean } | null = null
 
 // Watch for enable_tls toggle to adjust default listen port
-// （用户裁定）：启用 TLS 时端口直接默认 443（不仅是提示）——
+// （用户裁定）：启用 TLS 时端口直接默认 HTTPS 口（不仅是提示）——
 // 编辑态与创建态统一，开启分支必须先于 userExplicitPort 短路（2026-10-13
 // 生产实证：短路前置导致编辑态拨 TLS 永不改端口）。用户随后手动改端口即置
-// userExplicitPort，关闭方向的自动回 80 仍受其约束（既有语义）。
+// userExplicitPort，关闭方向的自动回 HTTP 口仍受其约束（既有语义）。
+// 自维护合并（圈层规则）：上游此处硬编码 443/80，本仓口径须走 proxyPorts
+// 动态默认口（默认端口换位能力，见 internal/services/default_ports.go）。
 watch(() => wizardForm.enable_tls, (newVal, oldVal) => {
   if (hydratingWizard) return
+  const defHttp = proxyPorts.value.http_port
+  const defHttps = proxyPorts.value.https_port
   if (wizardForm.protocol !== 'http') return
   if (newVal && !oldVal) {
-    if (wizardForm.listen_port !== 443) {
-      wizardForm.listen_port = 443
-      showTlsHint('已默认切换为 443 端口')
+    if (wizardForm.listen_port !== defHttps) {
+      wizardForm.listen_port = defHttps
+      showTlsHint(`已默认切换为 ${defHttps} 端口`)
     }
     return
   }
-  if (!newVal && oldVal && userExplicitPort.value && wizardForm.listen_port === 443) {
-    showTlsHint('端口当前为 443，关闭 TLS 后如需 HTTP 访问建议改为 80')
+  if (!newVal && oldVal && userExplicitPort.value && wizardForm.listen_port === defHttps) {
+    showTlsHint(`端口当前为 ${defHttps}，关闭 TLS 后如需 HTTP 访问建议改为 ${defHttp}`)
   }
   if (userExplicitPort.value) return
   if (!newVal && oldVal) {
-    // Disabling HTTPS: revert to 80 if currently 443
-    if (wizardForm.listen_port === 443) {
-      wizardForm.listen_port = 80
+    // Disabling HTTPS: revert to HTTP 默认口 if currently on HTTPS 默认口
+    if (wizardForm.listen_port === defHttps) {
+      wizardForm.listen_port = defHttp
     }
   }
 }, { flush: 'sync' })
@@ -2419,13 +2486,14 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     // 快照进入 TCP 前的 HTTP 态（须先于下方端口/ enable_tls 变更），供回转提示判断
     preTcpSnapshot = { listenPort: wizardForm.listen_port, enableTls: wizardForm.enable_tls }
     // Switching to TCP: use a neutral high port and plain TCP upstreams.
-    // 无条件迁移：DB 中不存在 TCP:80/443 存量规则（后端无条件拒绝），编辑态无需保留该值
-    if (wizardForm.listen_port === 80 || wizardForm.listen_port === 443) {
+    // 无条件迁移：DB 中不存在 TCP:HTTP/HTTPS 默认口存量规则（后端无条件拒绝），编辑态无需保留该值
+    if (wizardForm.listen_port === proxyPorts.value.http_port || wizardForm.listen_port === proxyPorts.value.https_port) {
       wizardForm.listen_port = 8080
       ElMessage.info('已切换为 TCP，监听端口自动调整为 8080')
     }
     wizardForm.enable_tls = false
-    if (wizardForm.strategy === 'cookie') wizardForm.strategy = 'weighted_round_robin'
+    // 切换 TCP：HTTP 专属策略（cookie/chain_fallback）回落默认
+    if (wizardForm.strategy === 'cookie' || wizardForm.strategy === 'chain_fallback') wizardForm.strategy = 'weighted_round_robin'
     // NTLM 兼容是 HTTP 语义：切 TCP 开关自动关 + 接管字段恢复默认（静默，设计定稿）
     if (wizardForm.ntlm_compatible === 1) {
       wizardForm.ntlm_compatible = 0
@@ -2460,7 +2528,7 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     // 无条件迁移 80/443→8080，回转不还原会保存即静默改写 DB 端口
     const portChanged =
       wizardForm.listen_port === 8080 &&
-      (preTcpSnapshot?.listenPort === 80 || preTcpSnapshot?.listenPort === 443)
+      (preTcpSnapshot?.listenPort === proxyPorts.value.http_port || preTcpSnapshot?.listenPort === proxyPorts.value.https_port)
     const tlsWasOn = preTcpSnapshot?.enableTls === true
     if (portChanged && preTcpSnapshot) wizardForm.listen_port = preTcpSnapshot.listenPort
     wizardForm.upstreams.forEach(u => {
@@ -2494,8 +2562,11 @@ watch(() => wizardForm.enable_active_health_check, (newVal) => {
 // 真实判据在服务端（validateRuleListenPortForSave 校验本进程面板端口 +
 // caddy_admin_url 端口 + 2019）：自定义部署（如面板 8443、admin 不落 2019）时
 // 这里可能漏拦/误拦，保存结果以服务端 400 为准（下方提示文案已声明）。
-const DEFAULT_DEPLOYMENT_ADMIN_PORTS: readonly number[] = [8000, 2019]
-const httpReservedPorts = [80, 443]
+// 管理口 / HTTP(S) 保留口随部署配置（/system/ports）：管理口含面板实际口与固定
+// 的 Caddy admin 2019；保留口取 HTTP_PORT/HTTPS_PORT（出厂 80/443）。computed
+// 以随 /system/ports 异步返回更新——向导校验实时用最新值。
+const adminPorts = computed(() => [proxyPorts.value.panel_port, 8000, 2019])
+const httpReservedPorts = computed(() => [proxyPorts.value.http_port, proxyPorts.value.https_port])
 
 const showTlsStep = computed(() => wizardForm.protocol === 'http' && wizardForm.enable_tls)
 const showCustomRoutesStep = computed(() => wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled)
@@ -2539,23 +2610,23 @@ const portWarning = computed(() => {
   
   if (wizardForm.protocol === 'http') {
     // HTTP rules cannot use admin ports and cannot share a port with any TCP rule.
-    if (DEFAULT_DEPLOYMENT_ADMIN_PORTS.includes(wizardForm.listen_port)) {
+    if (adminPorts.value.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为管理端口，不可使用`
     }
     if (tcpPorts.includes(wizardForm.listen_port)) {
       return `端口已被 TCP 规则占用`
     }
-    // 80 端口 + TLS 跳转自环（跳转目标 https://host:80 与来源同端口）：
+    // HTTP 默认口 + TLS 跳转自环（跳转目标与来源同端口）：
     // 后端保存门同判据，前端先拦并在端口行内提示。
-    if (wizardForm.listen_port === 80 && wizardForm.enable_tls && wizardForm.tls_http_redirect) {
-      return '80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转'
+    if (wizardForm.listen_port === proxyPorts.value.http_port && wizardForm.enable_tls && wizardForm.tls_http_redirect) {
+      return `${proxyPorts.value.http_port} 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 ${proxyPorts.value.https_port} 端口或关闭跳转`
     }
   } else if (wizardForm.protocol === 'tcp') {
-    // TCP rules cannot use admin ports, 80/443, or share a port with any other rule.
-    if (httpReservedPorts.includes(wizardForm.listen_port)) {
+    // TCP rules cannot use admin ports, HTTP(S) 默认口, or share a port with any other rule.
+    if (httpReservedPorts.value.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为 HTTP/Web 端口，TCP 规则不可使用`
     }
-    if (DEFAULT_DEPLOYMENT_ADMIN_PORTS.includes(wizardForm.listen_port)) {
+    if (adminPorts.value.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为管理端口，不可使用`
     }
     if (httpPorts.includes(wizardForm.listen_port) || tcpPorts.includes(wizardForm.listen_port)) {
@@ -2563,6 +2634,16 @@ const portWarning = computed(() => {
     }
   }
   return ''
+})
+
+// stalePortHint：编辑存量规则时，若其已存端口既非 HTTP 默认口也非 HTTPS 默认口
+// （说明部署侧换过口号或该规则建于换口前），提示保存语义——避免用户误以为改
+// compose 变量后老规则会自动跟着变（ISSUE #7：不自动迁移，手动改后保存即覆盖）。
+const stalePortHint = computed(() => {
+  if (!editingRule.value) return ''
+  const stored = wizardForm.listen_port
+  if (stored === proxyPorts.value.http_port || stored === proxyPorts.value.https_port) return ''
+  return `本条规则当前监听 ${stored}，与部署默认口（HTTP ${proxyPorts.value.http_port} / HTTPS ${proxyPorts.value.https_port}）不同；端口不会自动迁移，改好后点保存即按当前值生效`
 })
 
 // 策略文案映射提取至 utils/strategyLabels（Dashboard 共用，
@@ -2703,6 +2784,9 @@ const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
   domain: fullRule.domain || '',
   listen_port: fullRule.listen_port,
   strategy: fullRule.strategy || 'weighted_round_robin',
+  // 链式回退竞速参数回填（0=后端兜底默认，UI 显示默认值）
+  chain_race_interval_ms: fullRule.chain_race_interval_ms || 3000,
+  chain_request_timeout_ms: fullRule.chain_request_timeout_ms || 30000,
   dynamic_dns: fullRule.dynamic_dns || false,
   enable_dns_server: fullRule.enable_dns_server || false,
   dns_server: fullRule.dns_server || '',
@@ -2731,6 +2815,8 @@ const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
   ca_provider_id: fullRule.ca_provider_id ?? 0,
   tls_cert: fullRule.tls_cert || '',
   tls_key: fullRule.tls_key || '',
+  tls_cert_path: fullRule.tls_cert_path || '',
+  tls_key_path: fullRule.tls_key_path || '',
   // GetRule 掩码私钥时仅回 tls_key_set：区分「未配置」与「已隐藏」，
   // 提交空 tls_key 时后端保留原值。
   tlsKeySet: fullRule.tls_key_set === true,
@@ -2933,8 +3019,10 @@ const openWizard = async (rule?: Rule) => {
       description: '',
       protocol: 'http',
       domain: '',
-      listen_port: 80,
+      listen_port: proxyPorts.value.http_port,
       strategy: 'weighted_round_robin',
+      chain_race_interval_ms: 3000,
+      chain_request_timeout_ms: 30000,
       dynamic_dns: false,
       health_check_path: '',
       health_check_interval: 10,
@@ -2956,6 +3044,8 @@ const openWizard = async (rule?: Rule) => {
       ca_provider_id: 0,
       tls_cert: '',
       tls_key: '',
+      tls_cert_path: '',
+      tls_key_path: '',
       tlsKeySet: false, // 私钥掩码态随表单重置（stale true 曾致新建/复制误显「已配置」）
       tls_http_redirect: false,
       enable_compress: false,
@@ -3262,6 +3352,11 @@ const nextStep = (): void => {
       ElMessage.warning(wizardForm.tls_cert.trim() ? '请上传证书和私钥（或粘贴新私钥以更换）' : '请上传证书和私钥')
       return
     }
+    // 引用文件模式：证书与私钥文件路径均必填（后端另校验位于 /app/certs 内且配对）
+    if (wizardForm.tls_source === 'file' && (!wizardForm.tls_cert_path.trim() || !wizardForm.tls_key_path.trim())) {
+      ElMessage.warning('请填写证书文件与私钥文件路径')
+      return
+    }
     moveToAdjacentWizardStep(1)
     return
   }
@@ -3363,6 +3458,12 @@ const submitWizard = async () => {
         saving.value = false
         return
       }
+    }
+    // 引用文件模式镜像：两个路径均必填
+    if (wizardForm.tls_source === 'file' && (!wizardForm.tls_cert_path?.trim() || !wizardForm.tls_key_path?.trim())) {
+      ElMessage.warning('引用证书文件模式须填写证书与私钥文件路径')
+      saving.value = false
+      return
     }
   }
   if (wizardForm.upstreams.length === 0) {
@@ -3592,6 +3693,9 @@ const submitWizard = async () => {
       domain: wizardForm.domain,
       listen_port: wizardForm.listen_port,
       strategy: wizardForm.strategy,
+      // 链式回退竞速参数（非 chain 策略时后端忽略；0 值后端兜底默认）
+      chain_race_interval_ms: wizardForm.chain_race_interval_ms,
+      chain_request_timeout_ms: wizardForm.chain_request_timeout_ms,
       dynamic_dns: wizardForm.dynamic_dns,
       enable_dns_server: wizardForm.enable_dns_server,
       dns_server: wizardForm.dns_server,
@@ -3614,6 +3718,9 @@ const submitWizard = async () => {
       ca_provider_id: Number(wizardForm.ca_provider_id || 0),
       tls_cert: wizardForm.tls_source === 'manual' ? wizardForm.tls_cert : '',
       tls_key: wizardForm.tls_source === 'manual' ? wizardForm.tls_key : '',
+      // 引用文件模式：提交两个路径；其余来源清空（后端亦按形态互为清空）
+      tls_cert_path: wizardForm.tls_source === 'file' ? wizardForm.tls_cert_path.trim() : '',
+      tls_key_path: wizardForm.tls_source === 'file' ? wizardForm.tls_key_path.trim() : '',
       tls_http_redirect: wizardForm.tls_http_redirect,
       enable_compress: wizardForm.enable_compress,
       compress_types: wizardForm.compress_types.join(',') || 'gzip',
@@ -4331,6 +4438,7 @@ onMounted(() => {
     searchQuery.value = rs
     window.history.replaceState(null, '', window.location.pathname)
   }
+  void fetchProxyPorts()
   void fetchRules(true)
   void fetchUsers()
   void fetchCertConfigs()

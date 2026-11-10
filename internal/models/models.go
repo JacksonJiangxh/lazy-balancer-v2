@@ -164,6 +164,13 @@ type LbRule struct {
 	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
 	NTLMCompatible     int `json:"ntlm_compatible"`
 	UpstreamForceHTTP1 int `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
+	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
+	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
+	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
+	// 该路。0 值在写侧（CreateRule/UpdateRule）与渲染侧兜底 3000/30000
+	//（预算公式：(N−1)×race+timeout ≤ 60s，按 N=6 封顶设计，见 caddy.go）。
+	ChainRaceIntervalMS   int `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS int `json:"chain_request_timeout_ms"`
 	// 认证网关（forward_auth）：1=该规则全部请求先经认证网关校验（GET 子请求，
 	// 未认证返回网关响应、认证通过注入身份头后转发后端）。仅 HTTP 语义，TCP 行
 	// 恒 0；upstream=http(s)://host:port，uri=网关校验路径，copy_headers=认证
@@ -193,6 +200,11 @@ type LbRule struct {
 	CAProviderID    int    `json:"ca_provider_id"`
 	TLSCert         string `json:"tls_cert,omitempty"`
 	TLSKey          string `json:"tls_key,omitempty"`
+	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：/app/certs 内成品
+	// 证书文件的摄取源路径——保存时读取并校验，PEM 内容入库（tls_cert/tls_key，
+	// 与 manual 同列）；数据库是运行时唯一信任源，路径仅供看门狗检测外部更新。
+	TLSCertPath string `json:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `json:"tls_key_path,omitempty"`
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key
 	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」。
 	TLSKeySet       bool   `json:"tls_key_set,omitempty"`
@@ -532,6 +544,10 @@ type CreateRuleRequest struct {
 	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
 	NTLMCompatible                int    `json:"ntlm_compatible"`      // 0=off, 1=NTLM 兼容形态（要求 strategy=cookie）
 	UpstreamForceHTTP1            int    `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
+	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
+	// 竞速间隔 / 单请求兜底截断（毫秒）；0=写侧/渲染侧按策略兜底 3000/30000。
+	ChainRaceIntervalMS   int `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS int `json:"chain_request_timeout_ms"`
 	// 认证网关四件套（仅 HTTP；enabled=1 时保存门强制 upstream 齐备，
 	// uri/copy_headers 空值由写侧回填确定默认）。
 	ForwardAuthEnabled         int        `json:"forward_auth_enabled"`
@@ -557,10 +573,14 @@ type CreateRuleRequest struct {
 	CAProviderID    int        `json:"ca_provider_id"`
 	TLSCert         string     `json:"tls_cert"`
 	TLSKey          string     `json:"tls_key"`
-	TLSHTTPRedirect bool       `json:"tls_http_redirect"`
-	EnableCompress  bool       `json:"enable_compress"`
-	CompressTypes   string     `json:"compress_types"`
-	LogEnabled      bool       `json:"log_enabled"`
+	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
+	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
+	TLSCertPath     string `json:"tls_cert_path"`
+	TLSKeyPath      string `json:"tls_key_path"`
+	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
+	EnableCompress  bool   `json:"enable_compress"`
+	CompressTypes   string `json:"compress_types"`
+	LogEnabled      bool   `json:"log_enabled"`
 	// 阶段拦截页覆盖层（0=跟随策略；status ∈ {0,400,401,403,404,503}）
 	BlockPageStage1ID     int `json:"block_page_stage1_id"`
 	BlockPageStage1Status int `json:"block_page_stage1_status"`
@@ -581,10 +601,11 @@ type CreateRuleRequest struct {
 //  2. 不可清空字段族（值类型，零值一律按「未提交」合并存量，见
 //     handlers.UpdateRule 的合并块）：Name、Protocol、Domain、ListenPort、
 //     Strategy、DnsFamily、HealthCheckInterval、HealthCheckTimeout、
-//     TLSSource、ACMEConfigID、TLSCert、TLSKey、CompressTypes、
-//     ExpectedUpdatedAt。这些字段的保存终态要么必填、要么必须落在合法值域，
+//     TLSSource、ACMEConfigID、TLSCert、TLSKey、TLSCertPath、TLSKeyPath、
+//     CompressTypes、ExpectedUpdatedAt。这些字段的保存终态要么必填、要么必须落在合法值域，
 //     「空」没有业务含义（端口/名称/域名/策略/健康检查间隔等）或由实体开关
-//     表达（关闭压缩用 EnableCompress、清除证书材料用切换 TLSSource）。
+//     表达（关闭压缩用 EnableCompress、清除证书材料用切换 TLSSource——
+//     引用型证书路径列是摄取源记录，空串=保留存量路径）。
 //     API/MCP 客户端因此无法把它们清空——这是有意的契约，不是遗漏；
 //     清空语义登记由 models 包的
 //     TestUpdateRuleRequest_clearSemanticsRegisteredAndDocumented 守门，
@@ -625,6 +646,10 @@ type UpdateRuleRequest struct {
 	// NTLM 兼容开关：指针化——省略（nil）=保留原值，显式 0=关闭。
 	NTLMCompatible     *int `json:"ntlm_compatible"`
 	UpstreamForceHTTP1 *int `json:"upstream_force_http1"`
+	// 链式回退竞速参数（指针合并口径）：指针化——省略（nil）=保留原值，
+	// 显式 0=落库 0（写侧/渲染侧按 chain 策略兜底 3000/30000）。
+	ChainRaceIntervalMS   *int `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS *int `json:"chain_request_timeout_ms"`
 	// 认证网关四件套：指针化同 NTLM——省略（nil）=保留原值；upstream/
 	// uri/copy_headers 显式空串=清空（enabled=1 时保存门拒绝清空 upstream）。
 	ForwardAuthEnabled         *int        `json:"forward_auth_enabled"`
@@ -650,11 +675,15 @@ type UpdateRuleRequest struct {
 	CAProviderID    *int       `json:"ca_provider_id"`
 	TLSCert         string     `json:"tls_cert"`
 	TLSKey          string     `json:"tls_key"`
-	TLSHTTPRedirect *bool      `json:"tls_http_redirect"`
-	EnableCompress  *bool      `json:"enable_compress"`
-	CompressTypes   string     `json:"compress_types"`
-	Enabled         *bool      `json:"enabled"`
-	LogEnabled      *bool      `json:"log_enabled"`
+	// 引用型证书（tls_source="file"）：摄取源路径——内容保存时入库，
+	// 路径仅供看门狗检测外部更新（写侧解析，语义同 CreateRuleRequest）。
+	TLSCertPath     string `json:"tls_cert_path"`
+	TLSKeyPath      string `json:"tls_key_path"`
+	TLSHTTPRedirect *bool  `json:"tls_http_redirect"`
+	EnableCompress  *bool  `json:"enable_compress"`
+	CompressTypes   string `json:"compress_types"`
+	Enabled         *bool  `json:"enabled"`
+	LogEnabled      *bool  `json:"log_enabled"`
 	// 阶段拦截页覆盖层：指针化——省略（nil）=保留原值（同 CAProviderID 先例），
 	// 显式 0=清除覆盖（跟随策略）。
 	BlockPageStage1ID     *int `json:"block_page_stage1_id"`

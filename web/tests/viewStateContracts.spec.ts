@@ -199,7 +199,9 @@ test('IP 地理快捷弹框的可点击单元保留键盘可达语义', () => {
 
 test('视图口径与样式契约：端口门、CA 门、摘要披露、分页夹紧、样式单源', () => {
   const rules = code('src/views/Rules.vue')
-  assert.match(rules, /80 端口开启 TLS 跳转无意义/, '80+TLS 跳转必须前端镜像后端门')
+  // 自维护端口换位合并：跳转自环门判据随部署默认口（/system/ports）——
+  // 前端文案动态化，契约仍锁定「门必须前端镜像后端门」这一口径本身。
+  assert.match(rules, /端口开启 TLS 跳转无意义/, '80+TLS 跳转必须前端镜像后端门')
   const certs = code('src/views/settings/FreeCertificates.vue')
   assert.match(certs, /默认 CA 提供商已被禁用/, '默认 CA 被禁用必须前置中文提示')
   assert.match(certs, /caForm\.min_interval_ms" :min="1"/, '最小间隔下限与写侧门（1..60000）同源')

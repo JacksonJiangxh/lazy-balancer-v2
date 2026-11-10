@@ -56,6 +56,9 @@ type ruleFeatureInput struct {
 	ForwardAuthUpstream          string
 	ForwardAuthURI               string
 	ForwardAuthCopyHeaders       string
+	// 链式回退竞速参数（strategy=chain_fallback 时参与范围校验）。
+	ChainRaceIntervalMS   int
+	ChainRequestTimeoutMS int
 }
 
 func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
@@ -81,6 +84,8 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 		ForwardAuthUpstream:          req.ForwardAuthUpstream,
 		ForwardAuthURI:               req.ForwardAuthURI,
 		ForwardAuthCopyHeaders:       req.ForwardAuthCopyHeaders,
+		ChainRaceIntervalMS:          req.ChainRaceIntervalMS,
+		ChainRequestTimeoutMS:        req.ChainRequestTimeoutMS,
 		ListenPort:                   req.ListenPort,
 		EnableTLS:                    req.EnableTLS,
 		TLSHTTPRedirect:              req.TLSHTTPRedirect,
@@ -234,6 +239,16 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	if req.TCPTryInterval != nil {
 		input.TCPTryInterval = *req.TCPTryInterval
 	}
+	// 链式回退竞速参数：指针字段同口径合并（nil 沿用 existing），使范围校验
+	// 在更新路径看到真实值。
+	input.ChainRaceIntervalMS = existing.ChainRaceIntervalMS
+	input.ChainRequestTimeoutMS = existing.ChainRequestTimeoutMS
+	if req.ChainRaceIntervalMS != nil {
+		input.ChainRaceIntervalMS = *req.ChainRaceIntervalMS
+	}
+	if req.ChainRequestTimeoutMS != nil {
+		input.ChainRequestTimeoutMS = *req.ChainRequestTimeoutMS
+	}
 	// NTLM 兼容开关：nil=沿用存量（handler 已预合并），显式 0/1 落库。
 	if req.NTLMCompatible != nil {
 		input.NTLMCompatible = *req.NTLMCompatible
@@ -332,6 +347,9 @@ func validateStrategyForProtocol(protocol, strategy string) error {
 		"weighted_round_robin": true, "least_conn": true,
 		"ip_hash": true, "cookie": true,
 		"random": true, "first": true,
+		// 链式回退（2026-10-09）：竞速 + 兜底截断，依赖 HTTP 响应语义，
+		// 仅 HTTP 支持（同 cookie 先例）。
+		"chain_fallback": true,
 	}
 	tcpStrategies := map[string]bool{
 		"weighted_round_robin": true, "least_conn": true,
@@ -341,7 +359,7 @@ func validateStrategyForProtocol(protocol, strategy string) error {
 	switch protocol {
 	case "http":
 		if !httpStrategies[strategy] {
-			return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie")
+			return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie / chain_fallback")
 		}
 	case "tcp":
 		if !tcpStrategies[strategy] {
@@ -404,6 +422,16 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	// strategy 白名单校验，非法值不再透传到 Caddy。
 	if err := validateStrategyForProtocol(input.Protocol, input.Strategy); err != nil {
 		return err
+	}
+	// 链式回退竞速参数范围校验（2026-10-09）：竞速间隔 0–60000ms、单请求
+	// 兜底超时 0–600000ms；0 值合法（写侧/渲染侧按策略兜底 3000/30000）。
+	if input.Strategy == "chain_fallback" {
+		if input.ChainRaceIntervalMS < 0 || input.ChainRaceIntervalMS > 60000 {
+			return fmt.Errorf("链式回退竞速间隔（%d ms）需在 0–60000 ms 之间", input.ChainRaceIntervalMS)
+		}
+		if input.ChainRequestTimeoutMS < 0 || input.ChainRequestTimeoutMS > 600000 {
+			return fmt.Errorf("链式回退单请求兜底超时（%d ms）需在 0–600000 ms 之间", input.ChainRequestTimeoutMS)
+		}
 	}
 	// NTLM 兼容开关（2026-10-12 用户定稿）：①值域 0/1；②仅 HTTP 语义；③开启
 	// 时强制 Cookie 会话保持——挑战-应答必须固定同一上游，任何无会话策略都会
@@ -540,10 +568,12 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 		}
 	}
-	// 80 端口 + TLS 跳转自环：跳转目标 https://host:80 与来源同为 80 端口，
-	// 请求会被跳回自身监听器形成循环，必须在保存前拒绝。
-	if input.Protocol == "http" && input.ListenPort == 80 && input.EnableTLS && input.TLSHTTPRedirect {
-		return fmt.Errorf("80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转")
+	// C-F2: HTTP 默认口 + TLS 跳转自环：跳转目标 https://host:HTTP_PORT 与来源
+	// 同为该口，请求会被跳回自身监听器形成循环，必须在保存前拒绝（HTTP_PORT 在
+	// 部署侧可变，目标口随之判定）。
+	if input.Protocol == "http" && input.ListenPort == services.DefaultHTTPPort() && input.EnableTLS && input.TLSHTTPRedirect {
+		return fmt.Errorf("%d 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 %d 端口或关闭跳转",
+			services.DefaultHTTPPort(), services.DefaultHTTPSPort())
 	}
 	// 同族残留缺口：80 端口 + HTTPS（未开跳转）。Caddy 对配置的 HTTP 端口
 	// （默认 80）从不启用 TLS（http app 的 useTLS 判端口 != httpPort），
@@ -1079,10 +1109,15 @@ var lbRuleListColumns = deriveLbRuleListColumns()
 // deriveLbRuleListColumns 从完整投影派生列表投影并断言替换命中（列表投影派生断言）。
 func deriveLbRuleListColumns() string {
 	const certColumns = "COALESCE(tls_cert,''), COALESCE(tls_key,'')"
-	if !strings.Contains(lbRuleColumns, certColumns) {
-		panic("lbRuleColumns 证书列字样缺失：lbRuleListColumns 派生失效（列表投影会回读 tls_cert/tls_key 正文）")
+	const certPathColumns = "COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')"
+	for _, anchor := range []string{certColumns, certPathColumns} {
+		if !strings.Contains(lbRuleColumns, anchor) {
+			panic("lbRuleColumns 证书列字样缺失：lbRuleListColumns 派生失效（列表回读证书正文/摄取源路径，大字段 I/O 回归）")
+		}
 	}
-	return strings.Replace(lbRuleColumns, certColumns, "'', ''", 1)
+	// 引用型证书路径列与正文列同口径置空：路径仅供看门狗检测外部更新，
+	// 列表视图无消费面（详情走 GetRule 完整投影）。
+	return strings.Replace(strings.Replace(lbRuleColumns, certColumns, "'', ''", 1), certPathColumns, "'', ''", 1)
 }
 
 // lbRuleColumns 是规则完整投影（GetRule/DuplicateRule/loadRulesForConfigValidation
@@ -1097,9 +1132,10 @@ var lbRuleColumns = fmt.Sprintf(`COALESCE(id,0), COALESCE(caddy_id,''), name, CO
 	COALESCE(health_check_path,''), COALESCE(health_check_interval,%d), COALESCE(health_check_timeout,%d), COALESCE(health_check_unhealthy_threshold,%d), COALESCE(health_check_healthy_threshold,%d),
 	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,%d),
 	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
+	COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
+	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
 	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`,
@@ -1112,7 +1148,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 	rules := make([]models.LbRule, 0)
 	for rows.Next() {
 		var r models.LbRule
-		var description, domain, strategy, dnsFamily, tlsSource, tlsCert, tlsKey, compressTypes, hostHeader, healthCheckHost string
+		var description, domain, strategy, dnsFamily, tlsSource, tlsCert, tlsKey, tlsCertPath, tlsKeyPath, compressTypes, hostHeader, healthCheckHost string
 		var dynamicDNS, enableDnsServer, enableActiveHealthCheck, enableTLS, tlsHTTPRedirect, enableCompress bool
 		var acmeConfigID, caProviderID int
 		var createdBy, updatedBy sql.NullInt64
@@ -1122,9 +1158,10 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 			&r.HealthCheckPath, &r.HealthCheckInterval, &r.HealthCheckTimeout, &r.HealthCheckUnhealthyThreshold, &r.HealthCheckHealthyThreshold,
 			&enableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
 			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.NTLMCompatible, &r.UpstreamForceHTTP1,
+			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS,
 			&r.CustomRoutesEnabled,
 			&r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout, &r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
-			&enableTLS, &tlsSource, &acmeConfigID, &caProviderID, &tlsCert, &tlsKey, &tlsHTTPRedirect,
+			&enableTLS, &tlsSource, &acmeConfigID, &caProviderID, &tlsCert, &tlsKey, &tlsCertPath, &tlsKeyPath, &tlsHTTPRedirect,
 			&enableCompress, &compressTypes, &r.Enabled, &r.LogEnabled,
 			&createdBy, &createdAt, &updatedAt, &updatedBy, &hostHeader, &healthCheckHost,
 			&r.BlockPageStage1ID, &r.BlockPageStage1Status, &r.BlockPageStage3ID, &r.BlockPageStage3Status); err != nil {
@@ -1146,6 +1183,8 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 		r.CAProviderID = caProviderID
 		r.TLSCert = tlsCert
 		r.TLSKey = tlsKey
+		r.TLSCertPath = tlsCertPath
+		r.TLSKeyPath = tlsKeyPath
 		r.TLSHTTPRedirect = tlsHTTPRedirect
 		r.EnableCompress = enableCompress
 		r.CompressTypes = compressTypes
@@ -1472,17 +1511,18 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 		return errStoredRuleMissing
 	}
 	rule := rules[0]
-	// 与 validateRuleFeatures 同口径，兜住历史存量/导入的 80 端口 + TLS 跳转自环规则。
-	if rule.Protocol == "http" && rule.ListenPort == 80 && rule.EnableTLS && rule.TLSHTTPRedirect {
-		return &configValidationError{message: "80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转"}
+	// C-F2: 与 validateRuleFeatures 同口径，兜住历史存量/导入的 HTTP 默认口 + TLS 跳转自环规则。
+	if rule.Protocol == "http" && rule.ListenPort == services.DefaultHTTPPort() && rule.EnableTLS && rule.TLSHTTPRedirect {
+		return &configValidationError{message: fmt.Sprintf("%d 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 %d 端口或关闭跳转",
+			services.DefaultHTTPPort(), services.DefaultHTTPSPort())}
 	}
 	// 与保存侧同口径：80 端口 + HTTPS（未开跳转）在 Caddy 侧永不终止 TLS，
 	// 存量/导入/直改库形态启用前必须点名拒绝。
 	if rule.Protocol == "http" && rule.ListenPort == 80 && rule.EnableTLS {
 		return &configValidationError{message: "80 端口是 HTTP 端口，Caddy 不会在此端口终止 TLS（规则将按明文转发），请改用 443 等 TLS 端口或关闭 HTTPS"}
 	}
-	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource != "manual" && rule.TLSSource != "acme_dns" {
-		return &configValidationError{message: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"}
+	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource != "manual" && rule.TLSSource != "acme_dns" && rule.TLSSource != "file" {
+		return &configValidationError{message: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"}
 	}
 	// 发现1：共享 ACME 引用校验（0 值门 + 存在性/enabled=1），与
 	// Create/Update 写侧 400 口径对齐——导入残留的 acme_dns+0 坏规则与悬挂/禁用
@@ -1496,6 +1536,12 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "manual" &&
 		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
 		return &configValidationError{message: "手动证书模式下必须提供 TLS 证书和私钥"}
+	}
+	// 引用型证书：运行时唯一信任源是 DB——启用状态下内容必须已摄取入库
+	// （路径仅作摄取源记录；内容缺失（如旧备份/导入行）先经保存路径摄取）。
+	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" &&
+		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
+		return &configValidationError{message: "引用证书文件模式下证书内容未入库，请重新保存规则以从文件摄取"}
 	}
 	// 策略白名单、NTLM、TCP dynamic_dns、上游池混布
 	// 与启动/UpdateConfig 聚合门共用同一 helper。
@@ -1535,11 +1581,17 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 		}
 		// 与 validateStoredRuleConfig 同口径的 tls_source 白名单——
 		// 存量（白名单上线前落库）/直改 DB 的垃圾 tls_source 启用行必须在启动与
-		// UpdateConfig 聚合校验点名（渲染侧 availableCerts 仅认 manual/acme_dns →
+		// UpdateConfig 聚合校验点名（渲染侧 availableCerts 仅认 manual/file/acme_dns →
 		// 无 tls_connection_policies → TLS 端口明文服务，disable_certificates 阻自愈）。
-		if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource != "manual" && rule.TLSSource != "acme_dns" {
-			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）启用 TLS 时必须选择证书来源（manual 或 acme_dns）", rule.Name, rule.CaddyID)})
+		if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource != "manual" && rule.TLSSource != "acme_dns" && rule.TLSSource != "file" {
+			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）", rule.Name, rule.CaddyID)})
 			continue
+		}
+		// 引用型证书：运行时唯一信任源是 DB——启用状态下内容缺失的行
+		// （旧备份/导入行未摄取）与 manual 空材料同危害，聚合点名。
+		if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" &&
+			(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
+			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）引用证书文件模式下证书内容未入库，请重新保存规则以从文件摄取", rule.Name, rule.CaddyID)})
 		}
 		// 发现1：启动/UpdateConfig 聚合校验与 EnableRule 同门——ACME 引用
 		// 不可解析（0 值/悬挂/已禁用）的启用规则必须点名，不得静默通过。

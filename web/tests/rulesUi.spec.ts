@@ -94,7 +94,9 @@ test('配置预览的主动健康检查判据是 enable_active_health_check', ()
 })
 
 test('开启 TCP 主动检查不再自动写首上游端口（0=按各上游自身端口）', () => {
-  const watcher = section(page, 'watch(() => wizardForm.enable_active_health_check', 'DEFAULT_DEPLOYMENT_ADMIN_PORTS')
+  // 自维护端口换位合并：段落终止标记由 DEFAULT_DEPLOYMENT_ADMIN_PORTS 常量
+  // 改为其替代物 adminPorts computed（部署口动态化，判据语义不变）。
+  const watcher = section(page, 'watch(() => wizardForm.enable_active_health_check', 'const adminPorts = computed')
   assert.doesNotMatch(watcher, /tcp_health_check_port = firstUpstream\.port/)
   assert.doesNotMatch(watcher, /firstUpstream/)
   assert.match(watcher, /health_check_path = '\/'/)

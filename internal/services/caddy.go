@@ -2158,22 +2158,25 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		ServerTokensHidden            int
 		NTLMCompatible                int
 		UpstreamForceHTTP1            int
-		ForwardAuthEnabled            int
-		ForwardAuthUpstream           string
-		ForwardAuthURI                string
-		ForwardAuthCopyHeaders        string
-		CustomRoutesEnabled           bool
-		ProxyDialTimeout              int
-		ProxyResponseHeaderTimeout    int
-		ProxyReadTimeout              int
-		ProxyWriteTimeout             int
-		ProxyStreamTimeout            int
-		ProxyFlushInterval            int
-		ProxyStreamCloseDelay         int
-		PathRules                     []PathRuleConfig
-		HostHeader                    string
-		HealthCheckHost               string
-		LogEnabled                    bool
+		// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底）。
+		ChainRaceIntervalMS        int
+		ChainRequestTimeoutMS      int
+		ForwardAuthEnabled         int
+		ForwardAuthUpstream        string
+		ForwardAuthURI             string
+		ForwardAuthCopyHeaders     string
+		CustomRoutesEnabled        bool
+		ProxyDialTimeout           int
+		ProxyResponseHeaderTimeout int
+		ProxyReadTimeout           int
+		ProxyWriteTimeout          int
+		ProxyStreamTimeout         int
+		ProxyFlushInterval         int
+		ProxyStreamCloseDelay      int
+		PathRules                  []PathRuleConfig
+		HostHeader                 string
+		HealthCheckHost            string
+		LogEnabled                 bool
 	}
 
 	type upstream struct {
@@ -2203,7 +2206,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		       IIF(tls_http_redirect IN ('1',1),1,0),
 		       IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), tcp_try_interval,
-	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
+	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
+	       COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
+	       COALESCE(host_header,''), COALESCE(health_check_host,''),
 	       COALESCE(forward_auth_enabled,0), COALESCE(forward_auth_upstream,''), COALESCE(forward_auth_uri,''), COALESCE(forward_auth_copy_headers,''),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
 		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0)
@@ -2223,7 +2228,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			&r.EnableTLS, &r.TLSSource, &r.TLSCert, &r.TLSKey,
 			&r.TLSHTTPRedirect, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
-			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.NTLMCompatible, &r.UpstreamForceHTTP1, &r.HostHeader, &r.HealthCheckHost,
+			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.NTLMCompatible, &r.UpstreamForceHTTP1,
+			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS, &r.HostHeader, &r.HealthCheckHost,
 			&r.ForwardAuthEnabled, &r.ForwardAuthUpstream, &r.ForwardAuthURI, &r.ForwardAuthCopyHeaders, &r.LogEnabled,
 			&r.CustomRoutesEnabled, &r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout,
 			&r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay)
@@ -2402,7 +2408,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		if r.Protocol != "http" || !r.EnableTLS {
 			continue
 		}
-		if r.TLSSource == "manual" && r.TLSCert != "" && r.TLSKey != "" {
+		// 引用型证书与手动证书同流：PEM 内容已在保存/摄取时入库，运行时唯一信任源
+		// 是数据库，文件不参与运行配置真相。
+		if (r.TLSSource == "manual" || r.TLSSource == "file") && r.TLSCert != "" && r.TLSKey != "" {
 			material := CertMaterial{RuleID: r.CaddyID, CertPEM: r.TLSCert, KeyPEM: r.TLSKey}
 			availableCerts[r.CaddyID] = material
 			materials = append(materials, material)
@@ -2633,6 +2641,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 				ServerTokensHidden:             r.ServerTokensHidden,
 				NTLMCompatible:                 r.NTLMCompatible,
 				UpstreamForceHTTP1:             r.UpstreamForceHTTP1,
+				ChainRaceIntervalMS:            r.ChainRaceIntervalMS,
+				ChainRequestTimeoutMS:          r.ChainRequestTimeoutMS,
 				ForwardAuthEnabled:             r.ForwardAuthEnabled,
 				ForwardAuthUpstream:            r.ForwardAuthUpstream,
 				ForwardAuthURI:                 r.ForwardAuthURI,
@@ -2785,7 +2795,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	port80Candidates := make([]port80RuleCandidate, 0, len(allRules))
 	for _, other := range allRules {
 		otherRule := other.rule
-		if otherRule.Protocol != "http" || otherRule.ListenPort != 80 {
+		if otherRule.Protocol != "http" || otherRule.ListenPort != DefaultHTTPPort() {
 			continue
 		}
 		// （审计）：遮蔽复核的比对方也过启用上游门——零启用上游的规则不生成
@@ -2980,8 +2990,14 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		layer4Servers[fmt.Sprintf("tcp_%d", port)] = tcpServer
 	}
 
+	// httpDefaultPort/httpDefaultServer 是兜底站与 HTTP→HTTPS 跳转的落点：
+	// 出厂 80（HTTP_PORT 未改时行为与旧硬编码一致）；改 HTTP_PORT 后兜底站与
+	// 全部跳转路由跟随——规则本身仍是用户显式指定的端口。
+	httpDefaultPort := DefaultHTTPPort()
+	httpDefaultServer := fmt.Sprintf("http_%d", httpDefaultPort)
+
 	defaultSite := map[string]interface{}{
-		"listen": []string{":80"},
+		"listen": []string{fmt.Sprintf(":%d", httpDefaultPort)},
 		"routes": []interface{}{
 			map[string]interface{}{
 				"handle": []interface{}{
@@ -3002,13 +3018,13 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		return generationFailure("%v", err)
 	}
 
-	if _, exists := servers["http_80"]; !exists {
+	if _, exists := servers[httpDefaultServer]; !exists {
 		if len(redirectRoutes) > 0 {
 			defaultSite["routes"] = append(redirectRoutes, defaultSite["routes"].([]interface{})...)
 		}
-		servers["http_80"] = defaultSite
+		servers[httpDefaultServer] = defaultSite
 	} else {
-		server := servers["http_80"].(map[string]interface{})
+		server := servers[httpDefaultServer].(map[string]interface{})
 		// 不再重复 applyTimeouts——server 在:1456 创建时已
 		// 应用,两处之间无超时值变异,重复调用是幂等同值覆写。
 		routes, ok := server["routes"].([]interface{})
@@ -3029,7 +3045,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		}
 		routes = append(routes, defaultRoute)
 		server["routes"] = routes
-		servers["http_80"] = server
+		servers[httpDefaultServer] = server
 	}
 
 	// logger_names 按 server（端口）拆分——同域名跨端口双规则时全局
@@ -3394,7 +3410,9 @@ func httpsRedirectLocation(listenPort int) string {
 	// （补正重写）：Location 必须追加 {http.request.uri}（path+query）
 	// ——Caddy static_response 不会自动保留原 URI（原生 auto-HTTPS 重定向会保留），
 	// 缺失时 http://a.com/page?x=1 会被跳到根路径。首版实施因脚本断言中止丢失。
-	if listenPort != 443 {
+	// 判定基准是部署侧 HTTPS 默认口（HTTPS_PORT，出厂 443）：非默认口需显式带
+	// 端口号自引用（否则跳回浏览器默认 443），默认口则省略。
+	if listenPort != DefaultHTTPSPort() {
 		return fmt.Sprintf("https://{http.request.host}:%d{http.request.uri}", listenPort)
 	}
 	return "https://{http.request.host}{http.request.uri}"
@@ -3431,6 +3449,9 @@ type SingleRuleConfig struct {
 	ServerTokensHidden       int
 	NTLMCompatible           int
 	UpstreamForceHTTP1       int
+	// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底 3000/30000）。
+	ChainRaceIntervalMS   int
+	ChainRequestTimeoutMS int
 	// 认证网关四件套（forward_auth）：渲染消费全部列（buildHTTPHandleChain
 	// 链首网关子请求处理器）；enabled=1 的字段齐备性由保存门+启动迁移保证，
 	// 渲染层对 upstream 缺失/格式非法显性失败（零兜底）。
@@ -3583,6 +3604,109 @@ func formatFlushInterval(v int) string {
 		return "-1s"
 	}
 	return fmt.Sprintf("%ds", v)
+}
+
+// GenerateRuleServerContext builds a Caddy-config-shaped map containing only
+// the server context hosting a single rule: the deterministic server identity
+// for its listen port, the same-port TLS connection policies (mirroring
+// generateCaddyConfigFromStore's available-cert semantics), and the rule's own
+// certificate files. 上游 v2.4.2 在渲染重构中移除本函数（GetRuleCaddyConfig
+// 改走运行配置归集），此处按 v2.3.6 语义移植回自维护面：引用型证书
+// （tls_source=file）与 manual 同口径判有证（内容在库即有证，路径列只是
+// 摄取源记录），TLS 判定复用 certstore 的 ACME 就绪查询。
+func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain string) map[string]interface{} {
+	serverName := fmt.Sprintf("http_%d", listenPort)
+	if protocol != "http" {
+		serverName = fmt.Sprintf("tcp_%d", listenPort)
+	}
+	server := map[string]interface{}{
+		"listen": []string{fmt.Sprintf(":%d", listenPort)},
+		"routes": []interface{}{map[string]interface{}{"@id": caddyID}},
+	}
+	apps := map[string]interface{}{}
+	hasCert := false
+	if protocol == "http" {
+		var tlsSource string
+		var certPresent, keyPresent, enableTLS bool
+		// Round 34 F-3: 查询失败必须留痕，对话框不得静默显示"无证书"。
+		// 证书存在性判断：仅需存在与否，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
+			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
+		} else if enableTLS {
+			// Round 34 F-2: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
+			// 要求 EnableTLS），未开 TLS 的规则不加载证书。
+			// 引用型证书与手动证书同口径：内容（tls_cert/tls_key）在库即有证，
+			// 路径列只是摄取源记录，不参与运行配置判定。
+			if (tlsSource == "manual" || tlsSource == "file") && certPresent && keyPresent {
+				hasCert = true
+			} else if tlsSource == "acme_dns" {
+				hasCert = isACMECertIssuedFromStore(db.DB, caddyID, domain)
+			}
+		}
+		// 预览投影约定：初始化为空切片——nil 会让预览 JSON 输出
+		// tls_connection_policies: null（消费方按数组形状解构）。
+		policies := []interface{}{}
+		// Round 34 F-2: 与全量渲染 httpServersByPort 同口径——仅 enable_tls=1 且
+		// 存在启用上游的规则进入 TLS 策略（无上游/关 TLS 规则在真实配置中不存在）。
+		// 证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
+		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
+			FROM lb_rules WHERE ` + publishableRulesSQLPredicate + ` AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
+			ORDER BY rowid`, listenPort)
+		if err != nil {
+			Logf("error", "GenerateRuleServerContext: 读取端口 %d TLS 策略失败: %v", listenPort, err)
+		} else {
+			for rows.Next() {
+				var ruleID, ruleDomain, tlsSource string
+				var hasInlineCert bool
+				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasInlineCert) != nil {
+					Logf("error", "GenerateRuleServerContext: 扫描端口 %d 规则 TLS 字段失败", listenPort)
+					continue
+				}
+				available := (tlsSource == "manual" || tlsSource == "file") && hasInlineCert || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
+				if !available {
+					continue
+				}
+				domainHosts := splitAndTrim(ruleDomain)
+				if len(domainHosts) == 0 {
+					continue
+				}
+				policies = append(policies, map[string]interface{}{
+					"match": map[string]interface{}{
+						"sni": domainHosts,
+					},
+					"certificate_selection": map[string]interface{}{
+						"any_tag": []string{ruleID},
+					},
+				})
+			}
+
+			// Round 35 F-4: 遍历中途 DB 错误会截断 TLS 策略且此前静默（仅关行），
+			// 与规则主循环同口径显式留痕。
+			if err := rows.Err(); err != nil {
+				Logf("error", "GenerateRuleServerContext: 遍历端口 %d TLS 策略失败: %v", listenPort, err)
+			}
+			_ = rows.Close()
+		}
+		server["tls_connection_policies"] = policies
+		apps["http"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}
+	} else {
+		apps["layer4"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}
+	}
+	if hasCert {
+		certPath, keyPath := CertFilePaths(caddyID)
+		apps["tls"] = map[string]interface{}{
+			"certificates": map[string]interface{}{
+				"load_files": []interface{}{
+					map[string]interface{}{
+						"certificate": certPath,
+						"key":         keyPath,
+						"tags":        []string{caddyID},
+					},
+				},
+			},
+		}
+	}
+	return map[string]interface{}{"apps": apps}
 }
 
 func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{} {
@@ -4356,6 +4480,72 @@ var lbInternalControlHeaders = []string{
 	"X-Lb-Security-Timing-Start-Ns",
 }
 
+// chainProxyDefaults 与 caddychain 模块 Default* 常量同口径（模块侧 Provision
+// 亦有兜底，此处显式落 JSON 便于配置可读与测试断言）。预算公式（全挂兜底最坏
+// 情形）：总耗时 ≈ (N−1)×RaceInterval + RequestTimeout，按 N=6 封顶 + 浏览器
+// 60s 等待约束设计：5×3000+30000=45s < 60s（15s 余量）。
+const (
+	chainProxyDefaultRaceIntervalMS   = 3000
+	chainProxyDefaultRequestTimeoutMS = 30000
+	chainProxyBodyReplayLimitBytes    = 5 * 1024 * 1024
+)
+
+// buildChainProxyConfig 组装 chain_proxy 处理器配置（strategy=chain_fallback）。
+// 上游按权重降序稳定排序（同权重保持列表顺序；weight<=0→1，满足「发射权重
+// 恒 > 0」不变量——chain 配置不发射 weights 键，但优先级语义同样依赖正权重）；
+// 逐上游回源域名按「上游 origin_domain > 规则级 host_header > 空=用 dial 地址」
+// 三级回退解析（与 reverse_proxy 侧 map 方案同语义，chain 车道直接下发静态值）。
+func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamConfig) map[string]interface{} {
+	sorted := make([]UpstreamConfig, len(enabledUpstreams))
+	copy(sorted, enabledUpstreams)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		wi, wj := sorted[i].Weight, sorted[j].Weight
+		if wi <= 0 {
+			wi = 1
+		}
+		if wj <= 0 {
+			wj = 1
+		}
+		return wi > wj
+	})
+	entries := make([]interface{}, 0, len(sorted))
+	for _, u := range sorted {
+		entry := map[string]interface{}{"dial": joinUpstreamAddress(u.Host, u.Port)}
+		if u.Protocol == "https" {
+			entry["scheme"] = "https"
+		}
+		host := strings.TrimSpace(u.OriginDomain)
+		if host == "" {
+			host = strings.TrimSpace(rule.HostHeader)
+		}
+		if host != "" {
+			entry["host"] = host
+		}
+		entries = append(entries, entry)
+	}
+	raceIntervalMS := rule.ChainRaceIntervalMS
+	if raceIntervalMS <= 0 {
+		raceIntervalMS = chainProxyDefaultRaceIntervalMS
+	}
+	requestTimeoutMS := rule.ChainRequestTimeoutMS
+	if requestTimeoutMS <= 0 {
+		requestTimeoutMS = chainProxyDefaultRequestTimeoutMS
+	}
+	handler := map[string]interface{}{
+		"handler":                 "chain_proxy",
+		"upstreams":               entries,
+		"race_interval_ms":        raceIntervalMS,
+		"request_timeout_ms":      requestTimeoutMS,
+		"body_replay_limit_bytes": chainProxyBodyReplayLimitBytes,
+		"strip_request_headers":   lbInternalControlHeaders,
+	}
+	timeouts := resolveProxyTimeouts(rule)
+	if timeouts.dial > 0 {
+		handler["dial_timeout_ms"] = timeouts.dial * 1000
+	}
+	return handler
+}
+
 func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
 	var ctx *securityPolicyContext
 	if len(securityCtx) > 0 {
@@ -4733,6 +4923,23 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		if upstream.Protocol == "https" {
 			hasHTTPSUpstream = true
 		}
+	}
+
+	// 链式回退（2026-10-09）：strategy=chain_fallback 渲染为自定义 chain_proxy
+	// 处理器（caddychain 模块）——上游按权重降序组成回退链，竞速 + 兜底截断 +
+	// 失败即切。reverse_proxy 专属的负载均衡/健康检查/transport/headers/回源
+	// Host 占位符全部不发射（竞速即可用性机制；逐上游回源域名在生成侧解析后
+	// 随车道下发）。安全链/静态响应短路等链上前置 handler 不变。
+	if rule.Protocol == "http" && rule.Strategy == "chain_fallback" {
+		chainConfig := buildChainProxyConfig(rule, enabledUpstreams)
+		if effectiveServerTokensHidden {
+			handleChain = append(handleChain, map[string]interface{}{
+				"handler":  "headers",
+				"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
+			})
+		}
+		handleChain = append(handleChain, chainConfig)
+		return handleChain, nil
 	}
 
 	proxyConfig := map[string]interface{}{"handler": "reverse_proxy"}

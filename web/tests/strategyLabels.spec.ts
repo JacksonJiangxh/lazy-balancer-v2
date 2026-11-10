@@ -29,17 +29,21 @@ test('策略键集与后端逐协议白名单一致（同集，顺序无关）',
   assert.ok(GO_HTTP.length >= 6 && GO_TCP.length >= 5, '后端策略白名单未解析')
   assert.deepEqual([...strategyValuesForProtocol('http')].sort(), [...GO_HTTP].sort())
   assert.deepEqual([...strategyValuesForProtocol('tcp')].sort(), [...GO_TCP].sort())
-  // cookie 仅 HTTP（TCP 白名单不含）
+  // 仅 HTTP 键集（cookie 与 chain_fallback 同族：依赖 HTTP 响应语义，TCP 拒绝）
   assert.equal(GO_TCP.includes('cookie'), false)
-  assert.deepEqual(GO_HTTP.filter((value) => !GO_TCP.includes(value)), ['cookie'])
+  assert.equal(GO_TCP.includes('chain_fallback'), false)
+  assert.deepEqual(GO_HTTP.filter((value) => !GO_TCP.includes(value)).sort(), ['chain_fallback', 'cookie'])
 })
 
-test('卡片集按协议派生：TCP 剔除 cookie，HTTP 全量', () => {
+test('卡片集按协议派生：TCP 剔除 httpOnly 卡（cookie/chain_fallback），HTTP 全量', () => {
   const http = strategyCardsForProtocol('http')
   const tcp = strategyCardsForProtocol('tcp')
   assert.equal(http.length, STRATEGY_CARD_OPTIONS.length)
-  assert.equal(tcp.length, http.length - 1)
+  // 仅 HTTP 卡不止一张（cookie + chain_fallback 同族）：TCP 剔除全部 httpOnly 卡
+  const httpOnlyCount = STRATEGY_CARD_OPTIONS.filter((card) => card.httpOnly).length
+  assert.equal(tcp.length, http.length - httpOnlyCount)
   assert.equal(tcp.some((card) => card.value === 'cookie'), false, 'TCP 不得出现 Cookie 粘滞卡片')
+  assert.equal(tcp.some((card) => card.value === 'chain_fallback'), false, 'TCP 不得出现链式回退卡片')
   assert.deepEqual([...strategyValuesForProtocol('http')], http.map((card) => card.value))
   assert.deepEqual([...strategyValuesForProtocol('tcp')], tcp.map((card) => card.value))
   for (const card of STRATEGY_CARD_OPTIONS) {

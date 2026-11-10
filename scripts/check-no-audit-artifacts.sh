@@ -57,7 +57,13 @@ fi
 # waf.log/）：宽形态 `waf[^/]*/` 会连带命中嵌套 Go 模块 wafiplist/，把整个模块
 # 从路径与内容两条通道同时摘掉——模块里的注释编号与轮次测试文件名因此永不入面
 # （永久静默盲区）。运行目录以 `-`/`.` 起后缀，模块名不会。
-skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf([-.][^/]*)?/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/)'
+# 总经理授权豁免（任务档案 §4.3 裁决第 4 条，最小化）：
+#   • .npc-teams/——本 fork 任务协作台账目录，档案正文必然引用轮次元数据，
+#     目录整体从扫描起点排除（模式表 audit_path_rules 与 .gitignore 块不动）；
+#   • docs/upstream-merge.zh-CN.md——单文件豁免，正文记录各轮合并事实，
+#     轮次引用属文档正当内容。豁免边界由 guard-selftest.sh 钉住：两处之外的
+#     命中仍必须红（含同名近似路径不受豁免）。
+skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf([-.][^/]*)?/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/|\.npc-teams/|^docs/upstream-merge\.zh-CN\.md$)'
 
 # ---------------------------------------------------------------------------
 # 审计产物路径模式——单一事实源。

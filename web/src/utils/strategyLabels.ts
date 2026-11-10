@@ -1,7 +1,7 @@
 // 负载策略→文案映射（Rules/Dashboard 共用）。
 // 键集与后端 httpStrategies 全集对齐（weighted_round_robin/least_conn/
-// ip_hash/random/first/cookie）；Dashboard 原死键 round_robin 与 Rules 原
-// 死键 header 已删除（后端不接受该两形态）。
+// ip_hash/random/first/cookie/chain_fallback）；Dashboard 原死键 round_robin 与
+// Rules 原死键 header 已删除（后端不接受该两形态）。
 // 映射对象收窄为模块内私有（外泄面只剩 getStrategyLabel 一个函数，
 // 消费方禁止绕过函数直读映射，防第二份映射/直改键值）
 import { hasOwn } from './hasOwn.ts'
@@ -13,6 +13,8 @@ const strategyLabels: Record<string, string> = {
   cookie: '粘滞',
   first: '首个可用',
   random: '随机',
+  // 链式回退（2026-10-09）：权重降序回退链 + 竞速 + 兜底截断，仅 HTTP。
+  chain_fallback: '链式回退',
 }
 
 // 映射是普通对象且 strategy 可能来自导入/API（非向导白名单路径）：原型键直接
@@ -42,6 +44,9 @@ export const STRATEGY_CARD_OPTIONS: readonly StrategyCardOption[] = [
   { value: 'random', title: '随机', desc: '随机分配给一个可用上游' },
   { value: 'first', title: '首个可用', desc: '始终使用列表中第一个可用上游' },
   { value: 'cookie', title: 'Cookie 粘滞', desc: '通过 Cookie 实现精确会话粘滞', httpOnly: true },
+  // 链式回退（2026-10-09）：权重降序回退链 + 竞速 + 兜底截断，仅 HTTP
+  // （上游无此策略；卡片集与提交白名单同源派生，加此处两处同步放行）。
+  { value: 'chain_fallback', title: '链式回退', desc: '按上游权重降序组成回退链，等待竞速间隔无有效响应即并行发出下一路，先回者胜', httpOnly: true },
 ]
 
 /** 该协议可选的策略卡片（TCP 剔除 cookie）。 */

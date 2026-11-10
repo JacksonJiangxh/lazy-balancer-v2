@@ -28,6 +28,8 @@ var ruleUpdateNonClearableFields = map[string]string{
 	"HealthCheckInterval": "0=保留存量（值域 >0 由写侧校验）",
 	"HealthCheckTimeout":  "0=保留存量（值域 >0 由写侧校验）",
 	"TLSSource":           "空串=保留存量来源（证书材料清理由 tls_source 分支驱动）",
+	"TLSCertPath":         "空串=保留存量路径（引用型证书摄取源记录，清除靠切换 tls_source）",
+	"TLSKeyPath":          "空串=保留存量路径（同上）",
 	"ACMEConfigID":        "0=保留存量（非 acme_dns 来源随后统一清零）",
 	"TLSCert":             "空串=保留存量证书（手动证书留空=沿用，清除靠切换 tls_source）",
 	"TLSKey":              "空串=保留存量私钥（同上）",

@@ -1071,14 +1071,14 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 	// 「副本默认禁用 + 启用侧 stored 门」兜底（在导入侧实证的漂移形态
 	// enable_tls=1 + tls_source 非白名单值 → 渲染 availableCerts 不认 → TLS
 	// 端口明文服务）；request_body_max_size_mb 同样在三处各调一次。
-	if data.EnableTLS && data.TLSSource != "manual" && data.TLSSource != "acme_dns" {
-		return fmt.Errorf("启用 TLS 时必须选择证书来源（manual 或 acme_dns）")
+	if data.EnableTLS && data.TLSSource != "manual" && data.TLSSource != "acme_dns" && data.TLSSource != "file" {
+		return fmt.Errorf("启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）")
 	}
 	// 关闭 TLS 时同样校验值域（无条件枚举门）：非空非法值不得落库——渲染
 	// 零消费，但会随导出/备份/集群快照放大，且用户后续只开 TLS 时才报错。
 	// 空值放行（Create/Update 写侧归默认）。
-	if data.TLSSource != "" && data.TLSSource != "manual" && data.TLSSource != "acme_dns" {
-		return fmt.Errorf("无效的证书来源 '%s'（仅支持 manual 或 acme_dns）", data.TLSSource)
+	if data.TLSSource != "" && data.TLSSource != "manual" && data.TLSSource != "acme_dns" && data.TLSSource != "file" {
+		return fmt.Errorf("无效的证书来源 '%s'（仅支持 manual、acme_dns 或 file）", data.TLSSource)
 	}
 	if err := validateRuleRequestBodyMaxSizeMB(data.RequestBodyMaxSizeMB); err != nil {
 		return err

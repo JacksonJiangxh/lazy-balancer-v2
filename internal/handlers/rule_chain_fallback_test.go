@@ -16,13 +16,17 @@ import (
 //   - HTTP 规则放行；0 值参数落库前兜底 3000/30000（与渲染侧同口径）；
 //   - TCP 规则拒绝（协议感知白名单，同 cookie 先例）；
 //   - 参数越界 400；
-//   - Update 指针合并：省略（nil）=保留原值（LB-02 口径）。
+//   - Update 指针合并：省略（nil）=保留原值（链式回退列口径）.
 
 func chainFallbackCreateBody(strategy string, race, timeout any) map[string]any {
 	body := map[string]any{
 		"name": "chain-rule", "protocol": "http", "domain": "chain.example.test",
 		"listen_port": 443, "strategy": strategy,
 		"enable_tls": false, "tls_source": "manual", "enabled": false,
+		// 库值唯一真相批 1+2 后健康检查族 0 值一律 400（前端表单初值=默认），
+		// 载荷按表单初值显式携带（本组用例焦点是 chain 参数，不是健康检查门）。
+		"health_check_interval": 10, "health_check_timeout": 2,
+		"health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{
 			{"host": "10.0.0.1", "port": 8081, "weight": 70, "enabled": true},
 			{"host": "10.0.0.2", "port": 8082, "weight": 30, "enabled": true},

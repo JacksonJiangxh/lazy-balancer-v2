@@ -40,7 +40,10 @@ func postReferencedCertRule(t *testing.T, router *gin.Engine, certPath, keyPath 
 		"tls_source":    "file",
 		"tls_cert_path": certPath,
 		"tls_key_path":  keyPath,
-		"upstreams":     []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
+		// 批 1+2 后健康检查族 0 值一律 400，按表单初值显式携带。
+		"health_check_interval": 10, "health_check_timeout": 2,
+		"health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
+		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

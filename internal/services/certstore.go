@@ -3,12 +3,15 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"lazy-balancer-v2/internal/db"
@@ -21,6 +24,117 @@ func SetCertDirForTest(dir string) func() {
 	old := certDir
 	certDir = dir
 	return func() { certDir = old }
+}
+
+// CertDir 返回引用型证书允许的根目录（tls_source="file" 白名单边界）。
+func CertDir() string { return certDir }
+
+// ReferencedCertificate 引用型证书（tls_source="file"）的校验结果：
+// 归一后的路径 + 已读取的 PEM 内容（仅供调用方校验与预检，不落库）。
+type ReferencedCertificate struct {
+	CertPath string
+	KeyPath  string
+	CertPEM  string
+	KeyPEM   string
+}
+
+// ResolveReferencedCertPath 校验并归一引用型证书文件路径（2026-10-09）：
+//   - 绝对路径、位于 certDir 内（前缀 + 分隔符边界，防 /app/certs-evil 绕过）；
+//   - 拒绝空串、目录、含 NUL 的路径；
+//   - 文件须存在且为常规文件；
+//   - 解析符号链接后再次校验边界（防目录内软链指向容器任意文件）。
+//
+// 返回归一路径用于展示与落库（保持用户输入语义），安全性由真实路径校验保证。
+func ResolveReferencedCertPath(rawPath string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return "", fmt.Errorf("证书文件路径不能为空")
+	}
+	if strings.ContainsRune(trimmed, 0) {
+		return "", fmt.Errorf("证书文件路径含非法字符")
+	}
+	cleaned := filepath.Clean(trimmed)
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("证书文件路径必须是绝对路径")
+	}
+	base := filepath.Clean(certDir)
+	if !pathWithinBase(cleaned, base) {
+		return "", fmt.Errorf("证书文件路径必须位于 %s 目录内", base)
+	}
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("证书文件不存在: %s", cleaned)
+		}
+		return "", fmt.Errorf("读取证书文件失败: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("证书文件路径不能是目录: %s", cleaned)
+	}
+	// 符号链接逃逸：目录与文件均解析为真实路径后复核边界（目录本身为软链时
+	// 以解析后的真实目录为基准，避免误判）。
+	realPath, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("解析证书文件路径失败: %w", err)
+	}
+	if realBase, baseErr := filepath.EvalSymlinks(base); baseErr == nil {
+		base = realBase
+	}
+	if !pathWithinBase(realPath, base) {
+		return "", fmt.Errorf("证书文件路径（解析符号链接后）必须位于 %s 目录内", base)
+	}
+	return cleaned, nil
+}
+
+// pathWithinBase 判定 path 是否位于 base 内（严格边界：base 本身不计入）。
+func pathWithinBase(path, base string) bool {
+	if path == base {
+		return false
+	}
+	return strings.HasPrefix(path, base+string(os.PathSeparator))
+}
+
+// LoadReferencedCertificate 校验引用型证书的证书/私钥两个路径并读取内容，
+// 同时校验二者能配成合法密钥对（与物化路径同口径，提前失败以免 Caddy 加载期报错）。
+func LoadReferencedCertificate(certPath, keyPath string) (ReferencedCertificate, error) {
+	resolvedCert, err := ResolveReferencedCertPath(certPath)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("证书文件：%w", err)
+	}
+	resolvedKey, err := ResolveReferencedCertPath(keyPath)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("私钥文件：%w", err)
+	}
+	certPEM, err := os.ReadFile(resolvedCert)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("读取证书文件失败: %w", err)
+	}
+	keyPEM, err := os.ReadFile(resolvedKey)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("读取私钥文件失败: %w", err)
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("证书与私钥不匹配: %w", err)
+	}
+	return ReferencedCertificate{
+		CertPath: resolvedCert,
+		KeyPath:  resolvedKey,
+		CertPEM:  string(certPEM),
+		KeyPEM:   string(keyPEM),
+	}, nil
+}
+
+// ReferencedCertFileDigest 返回引用型证书文件对的内容指纹（含文件不存在标记）。
+// 供「外部更新证书文件 → 自动重载」的变更检测使用：与上次快照比对，不同即视为
+// 证书已更新。
+func ReferencedCertFileDigest(certPath, keyPath string) string {
+	certData, certErr := os.ReadFile(certPath)
+	keyData, keyErr := os.ReadFile(keyPath)
+	if certErr != nil || keyErr != nil {
+		return fmt.Sprintf("missing:%v:%v", certErr != nil, keyErr != nil)
+	}
+	sum := sha256.Sum256(append(append([]byte{}, certData...), keyData...))
+	return hex.EncodeToString(sum[:])
 }
 
 // certWriteMu 保护证书文件操作的层级互斥：读锁（RLock）覆盖按规则并行的
@@ -508,18 +622,73 @@ func restoreCertFile(path string, snapshot CertFileSnapshot) error {
 	return syncParentDir(path)
 }
 
+// IngestMissingReferencedCerts 启动期回填：引用型证书（tls_source="file"）的
+// 运行时唯一信任源是数据库——旧版本升级、旧备份还原或 v2 导入产生的「只有
+// 摄取源路径、内容为空」的行，在本机源文件可读时摄取回填内容；不可读则保留
+// 空内容并留痕（渲染按无证、EnableRule 门拒绝启用，用户重新保存即修复）。
+//   - 返回成功回填的规则数（0=无可回填行或全部失败，调用方按需留警告）。
+//
+// 幂等：内容已非空的行不命中。
+func IngestMissingReferencedCerts() int {
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
+		FROM lb_rules WHERE enable_tls=1 AND tls_source='file'
+		AND COALESCE(tls_cert,'')='' AND COALESCE(tls_key,'')=''
+		AND COALESCE(tls_cert_path,'')<>'' AND COALESCE(tls_key_path,'')<>''`)
+	if err != nil {
+		Logf("warn", "certstore: query referenced certs missing content failed: %v", err)
+		return 0
+	}
+	type pending struct{ certPath, keyPath string }
+	pendings := map[string]pending{}
+	order := []string{}
+	for rows.Next() {
+		var caddyID, certPath, keyPath string
+		if err := rows.Scan(&caddyID, &certPath, &keyPath); err != nil {
+			continue
+		}
+		pendings[caddyID] = pending{certPath, keyPath}
+		order = append(order, caddyID)
+	}
+	rows.Close()
+	if len(order) == 0 {
+		return 0
+	}
+	sort.Strings(order)
+	recovered := 0
+	for _, caddyID := range order {
+		p := pendings[caddyID]
+		referenced, loadErr := LoadReferencedCertificate(p.certPath, p.keyPath)
+		if loadErr != nil {
+			Logf("warn", "certstore: referenced cert ingest skipped for %s (source files unavailable): %v", caddyID, loadErr)
+			continue
+		}
+		if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id=?`, referenced.CertPEM, referenced.KeyPEM, caddyID); err != nil {
+			Logf("error", "certstore: referenced cert ingest write failed for %s: %v", caddyID, err)
+			continue
+		}
+		RecordAuditLog("system", "证书摄取", "负载规则", FormatAuditDetail(AuditRulePart(caddyID), "启动回填：源文件内容已入库"), "")
+		recovered++
+	}
+	if recovered > 0 {
+		TaskLogf("startup:config-load", "certs", "引用证书内容回填完成：%d 条规则", recovered)
+	}
+	return recovered
+}
+
 func MaterializeAllCertsFromDB() {
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		Logf("error", "certstore: create cert dir failed: %v", err)
 		return
 	}
+	// 引用型证书内容回填先行（升级/还原后「有路径无内容」的行先摄取，再统一物化）。
+	IngestMissingReferencedCerts()
 	manualRecovered := 0
 	acmeRecovered := 0
 
-	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source='manual' AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
+	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source IN ('manual','file') AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
 	if err != nil {
 		Logf("error", "certstore: query manual certs failed: %v", err)
-		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动证书", AuditResultPart("query_failed")), "")
+		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动/引用证书", AuditResultPart("query_failed")), "")
 	} else {
 		for rows.Next() {
 			var ruleID, certPEM, keyPEM string
@@ -530,7 +699,7 @@ func MaterializeAllCertsFromDB() {
 			changed, materializeErr := materializeCertPair(ruleID, certPEM, keyPEM)
 			if materializeErr != nil {
 				Logf("error", "certstore: write manual cert %s failed: %v", ruleID, materializeErr)
-				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动证书", AuditResultPart("io_error")), "")
+				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动/引用证书", AuditResultPart("io_error")), "")
 			} else if changed {
 				manualRecovered++
 			}
@@ -560,9 +729,9 @@ func MaterializeAllCertsFromDB() {
 		}
 	}
 	if manualRecovered > 0 || acmeRecovered > 0 {
-		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
+		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动/引用证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
 	}
-	TaskLogf("startup:config-load", "certs", "证书物化完成：手动证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
+	TaskLogf("startup:config-load", "certs", "证书物化完成：手动/引用证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
 }
 
 // materializeCertPair 把库内证书对物化到磁盘，返回是否真正发生了写入。

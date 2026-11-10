@@ -534,12 +534,21 @@ func createTables() error {
 		proxy_stream_timeout INTEGER NOT NULL DEFAULT 0,
 		proxy_flush_interval INTEGER NOT NULL DEFAULT 0,
 		proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
-	host_header VARCHAR(255),
+		-- 链式回退（strategy=chain_fallback，2026-10-09）竞速参数：竞速间隔与
+		-- 单请求兜底截断（毫秒）；0=写侧/渲染侧按策略兜底 3000/30000。
+		chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
+		chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
+		host_header VARCHAR(255),
 	-- 逐上游回源域名特性（2026-10-10）：健康检查域名（probe Host 头），空=跟随 host_header。
 	health_check_host TEXT NOT NULL DEFAULT '',
 		enable_tls BOOLEAN DEFAULT FALSE,
 		tls_cert TEXT,
 		tls_key TEXT,
+		-- 引用型证书（tls_source='file'）：/app/certs 内成品证书文件的摄取源路径
+		-- ——保存时读取并校验，PEM 内容入库（tls_cert/tls_key）；数据库是运行时
+		-- 唯一信任源，路径仅供看门狗检测外部更新（空串=未使用）。
+		tls_cert_path VARCHAR(512) NOT NULL DEFAULT '',
+		tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
 		tls_http_redirect BOOLEAN DEFAULT FALSE,
 		tls_source VARCHAR(20) DEFAULT 'manual',
 		acme_config_id INTEGER DEFAULT 0,
@@ -1158,6 +1167,18 @@ var newColumnsRegistry = map[string]string{
 	"lb_rules.server_tokens_hidden":       "INTEGER DEFAULT 0",
 	"lb_rules.ntlm_compatible":            "INTEGER NOT NULL DEFAULT 0",
 	"lb_rules.upstream_force_http1":       "INTEGER NOT NULL DEFAULT 0",
+	// 链式回退竞速参数（2026-10-09）：存量库补列，0=写侧/渲染侧按策略兜底。
+	"lb_rules.chain_race_interval_ms":   "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.chain_request_timeout_ms": "INTEGER NOT NULL DEFAULT 0",
+	// 引用型证书（tls_source="file"）摄取源路径列：重建 DDL 与运行期读取均依赖
+	// 其存在（渲染不消费路径，仅看门狗检测外部更新用）。
+	"lb_rules.tls_cert_path": "VARCHAR(512) NOT NULL DEFAULT ''",
+	"lb_rules.tls_key_path":  "VARCHAR(512) NOT NULL DEFAULT ''",
+	// 规则级回源 Host 列兜底：fresh DDL 携带，但本 fork 历史版本曾把该列改名
+	// 为 lb_rules.origin_domain（2026-10-11 合并口径，v2.4.2 上游仍用 host_header）
+	// ——改名版存量库缺 host_header，渲染读列会 no such column。登记保证任意
+	// 形态库上列存在，再由 migrateLbRuleOriginDomainToHostHeader 搬回存量值。
+	"lb_rules.host_header": "VARCHAR(255)",
 	// 认证网关四件套（存量库幂等补列 ensureNewColumns；uri/copy_headers 由
 	// 启动回填确定默认）。
 	"lb_rules.forward_auth_enabled":      "INTEGER NOT NULL DEFAULT 0",
@@ -1520,6 +1541,30 @@ func runMigrations() error {
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
 		return err
 	}
+
+	// 一次性搬迁（本次上游合并起）：自定义路由「静态响应/301 跳转」由自研
+	// path_rules.action='respond' + status_code/redirect_url 切换到上游
+	// response_mode 三值（C2 决策）。先搬后留：旧四列本轮不删。
+	if err := migratePathRuleActionToResponseMode(); err != nil {
+		return err
+	}
+
+	// 一次性搬迁（自研过渡口径收口）：逐上游回源 Host 由自研早期列
+	// upstreams.host_header 切换到 upstreams.origin_domain。必须先于下方
+	// legacyUpstreamDeadColumns 清理执行（上游把 host_header 列入死列即 DROP
+	// 且无搬迁）——先搬后删语义由本调用保证，避免存量值被无迁移清理丢弃。
+	if err := migrateUpstreamHostHeaderToOriginDomain(); err != nil {
+		return err
+	}
+
+	// 一次性搬迁（本 fork 改名版存量库收口）：本 fork 曾把规则级回源域名改名
+	// 为 lb_rules.origin_domain（2026-10-11 合并口径），上游 v2.4.2 仍用
+	// host_header——改名版库的存量值搬回 host_header（先搬后留：origin_domain
+	// 列本轮不删，人工核对窗口保留；上游口径库无 origin_domain 列时静默返回）。
+	if err := migrateLbRuleOriginDomainToHostHeader(); err != nil {
+		return err
+	}
+
 	// 带外非 0/1 的 is_enabled 先归一，重建/读取链路只消费规范两态
 	// （NOT NULL 列上 NULL 不可达，非两态整数是唯一残余入口）。
 	if err := normalizeUsersIsEnabledDomain(); err != nil {
@@ -2358,6 +2403,9 @@ func normalizeCertJobsCAAvailableAfter() (sql.Result, error) {
 		AND ca_available_after != datetime(ca_available_after)`))
 }
 
+// 引用型证书与手动证书同口径：内容（tls_cert/tls_key）在库即有证——路径列只是
+// 摄取源记录，渲染不消费，仅路径无内容的行按无证归一（升级/还原后由启动期
+// IngestMissingReferencedCerts 从源文件回填内容，文件也不可用时保持无证）。
 // legacyHTTPSHasCertPredicate 是 migrateLegacyHTTPSProtocol 的「有证」判定
 // （SELECT 预判与 UPDATE 归一必须同谓词，否则审计详情与实际分支发散）。
 const legacyHTTPSHasCertPredicate = `(
@@ -5033,6 +5081,9 @@ func migrateLbRulesPrimaryKey() error {
 			proxy_stream_timeout INTEGER NOT NULL DEFAULT 0,
 			proxy_flush_interval INTEGER NOT NULL DEFAULT 0,
 			proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
+			-- 链式回退竞速参数（2026-10-09）：重建 DDL 须携带，否则陈旧重建丢列。
+			chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
+			chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
 			host_header VARCHAR(255),
 			-- 与 fresh CREATE 同步携带（ensureNewColumns 在本重建之前已加列，
 			-- 陈旧 DDL 会把列连同值一并丢弃——先例）。
@@ -5040,6 +5091,9 @@ func migrateLbRulesPrimaryKey() error {
 			enable_tls BOOLEAN DEFAULT FALSE,
 			tls_cert TEXT,
 			tls_key TEXT,
+			-- 引用型证书（2026-10-09）：重建 DDL 须携带，否则陈旧重建丢列。
+			tls_cert_path VARCHAR(512) NOT NULL DEFAULT '',
+			tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
 			tls_http_redirect BOOLEAN DEFAULT FALSE,
 			tls_source VARCHAR(20) DEFAULT 'manual',
 			acme_config_id INTEGER DEFAULT 0,
@@ -5077,11 +5131,12 @@ func migrateLbRulesPrimaryKey() error {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, ntlm_compatible, upstream_force_http1,
+			chain_race_interval_ms, chain_request_timeout_ms,
 			forward_auth_enabled, forward_auth_upstream, forward_auth_uri, forward_auth_copy_headers,
 			custom_routes_enabled,
 			proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 			host_header, health_check_host, enable_tls, tls_cert,
-			tls_key, tls_http_redirect, tls_source, acme_config_id,
+			tls_key, tls_cert_path, tls_key_path, tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, enabled, log_enabled,
 			created_by, created_at, updated_at, updated_by, caddy_id,
 			block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status
@@ -5098,11 +5153,12 @@ func migrateLbRulesPrimaryKey() error {
 			COALESCE(health_check_healthy_threshold,` + fmt.Sprint(DefaultHealthCheckHealthyThreshold) + `),
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, COALESCE(tcp_try_interval,` + fmt.Sprint(DefaultTCPTryInterval) + `),
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
+			COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 			COALESCE(forward_auth_enabled,0), COALESCE(forward_auth_upstream,''), COALESCE(forward_auth_uri,''), COALESCE(forward_auth_copy_headers,''),
 			COALESCE(custom_routes_enabled,0),
 			COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 			host_header, COALESCE(health_check_host,''), enable_tls, tls_cert,
-			tls_key, tls_http_redirect, tls_source, acme_config_id,
+			tls_key, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''), tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, COALESCE(enabled,0), COALESCE(log_enabled,0),
 			created_by, created_at, updated_at, updated_by, caddy_id,
 			COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)
@@ -5616,12 +5672,13 @@ const tcpDeadFieldsResetSetProjection = `UPDATE lb_rules SET
 	strategy=CASE WHEN strategy='cookie' OR strategy='' OR strategy IS NULL THEN 'weighted_round_robin' ELSE strategy END,
 	dns_family='ipv4',
 	enable_tls=0, tls_source='manual', tls_http_redirect=0, tls_cert='', tls_key='',
+	tls_cert_path='', tls_key_path='',
 	log_enabled=0`
 
 // TCPRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（HTTP 头/健康检查/
 // 压缩/请求体/NTLM/force_http1 + TLS 来源、跳转与材料 + 代理超时族七列 +
 // 自定义路由 + dynamic_dns + strategy(cookie/空串) + dns_family(ipv4)
-// + log_enabled，共 28 列 SET；规则级阶段页四列已停用（2026-11 裁定）故不入列）的 SQL 字面量单源——启动迁移（migrateTCPRuleDeadFields）
+// + log_enabled，共 30 列 SET；规则级阶段页四列已停用（2026-11 裁定）故不入列）的 SQL 字面量单源——启动迁移（migrateTCPRuleDeadFields）
 // 与导入归一（handlers normalizeRuleRowsForTransport）共用本常量；此前跨包
 // 双份逐字镜像靠测试字符串 parity 维系，任一侧扩列漏同步即终态漂移。
 // WHERE 谓词与探测共用 tcpDeadFieldsStalePredicate（单一出处，禁止再抄第二份）。
@@ -5773,7 +5830,9 @@ const ruleTLSModeResidueProbeSQL = `SELECT
 // 存在性，残留死引用签发期才暴露；空来源与 manual 同理）。三种残留渲染零消费，
 // 但会让同一终态在「主端库 / 导出 canonical / 从端落库」呈现两种形态。
 var ruleTLSModeResidueResetSQLs = []string{
-	`UPDATE lb_rules SET tls_cert='', tls_key='' WHERE ` + ruleTLSResidueCertPredicate,
+	// 死列清理口径延伸：file 形态的 path 列一并清理，避免留下悬挂路径引用
+	// （tls_cert_path/tls_key_path 清空与 tls_cert/tls_key 同语义）。
+	`UPDATE lb_rules SET tls_cert='', tls_key='', tls_cert_path='', tls_key_path='' WHERE ` + ruleTLSResidueCertPredicate,
 	`UPDATE lb_rules SET ca_provider_id=0 WHERE ` + ruleTLSResidueCAProviderPredicate,
 	`UPDATE lb_rules SET acme_config_id=0 WHERE ` + ruleTLSResidueACMEConfigPredicate,
 }
@@ -5820,5 +5879,105 @@ func migrateRuleTLSModeResidue() error {
 	detail := fmt.Sprintf("存量规则跨模式 TLS 残留已清零：%d 处（按实际变更计数；非 manual 源不保留证书材料、非 acme_dns 源不保留 CA 引用、manual 源不保留 ACME 配置引用）", changed)
 	log.Print(detail)
 	recordSystemAudit("启动迁移", "系统配置", detail)
+	return nil
+}
+
+// migratePathRuleActionToResponseMode 把自研路径规则静态响应（action='respond'
+// + status_code/redirect_url/response_body/content_type）搬迁到上游口径
+// response_mode（”/static/redirect）+ response_status/redirect_to/
+// response_body/response_content_type（上游合并 C2 决策：切上游）。
+//
+//	3xx -> response_mode='redirect'，redirect_to=redirect_url
+//	其余 -> response_mode='static'，response_status/response_content_type
+//	仅处理仍是自研遗留形态的行（response_mode='' 且 action='respond'），幂等。
+//
+// 旧列缺失（fresh 库 / 上游原版库）时静默返回。
+func migratePathRuleActionToResponseMode() error {
+	var hasAction, hasMode int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('path_rules') WHERE name='action'").Scan(&hasAction); err != nil {
+		return fmt.Errorf("failed to check path_rules.action: %w", err)
+	}
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('path_rules') WHERE name='response_mode'").Scan(&hasMode); err != nil {
+		return fmt.Errorf("failed to check path_rules.response_mode: %w", err)
+	}
+	if hasAction == 0 || hasMode == 0 {
+		return nil
+	}
+	// redirect：3xx（301/302/303/307/308）走上游 redirect 模式
+	res, err := DB.Exec(`UPDATE path_rules SET response_mode='redirect', redirect_to=COALESCE(redirect_url,'')
+		WHERE COALESCE(response_mode,'') = '' AND action='respond' AND status_code >= 300 AND status_code < 400`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate path_rules.action respond(3xx) -> response_mode: %w", err)
+	}
+	n1, _ := res.RowsAffected()
+	// static：其余 respond 行（含 200/204 等）走上游 static 模式
+	res, err = DB.Exec(`UPDATE path_rules SET response_mode='static',
+			response_status=CASE WHEN COALESCE(response_status,0)=0 THEN COALESCE(status_code,200) ELSE response_status END,
+			response_content_type=CASE WHEN COALESCE(response_content_type,'')='' THEN COALESCE(content_type,'') ELSE response_content_type END
+		WHERE COALESCE(response_mode,'') = '' AND action='respond'`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate path_rules.action respond -> response_mode: %w", err)
+	}
+	n2, _ := res.RowsAffected()
+	if n1+n2 > 0 {
+		log.Printf("Migrated %d path_rules respond row(s) into response_mode (redirect=%d)", n1+n2, n1)
+	}
+	return nil
+}
+
+// migrateUpstreamHostHeaderToOriginDomain 把自研早期逐上游回源 Host（host_header）
+// 搬迁到上游口径的 origin_domain（上游合并 C1 决策：切上游 origin_domain +
+// 原生 map）。幂等：origin_domain 已有值时不动（显式配置优先于遗留列）。
+// 两列任一不存在（fresh 库 / 极端残库 / 已删列）时静默返回——
+// 搬迁与删列都幂等，任意顺序重入都收敛到同一形态。
+// 调用点必须先于 legacyUpstreamDeadColumns 清理（上游把 host_header 列入
+// 死列即 DROP 且无搬迁，后置会丢存量值）。
+func migrateUpstreamHostHeaderToOriginDomain() error {
+	var hasHostHeader, hasOriginDomain int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='host_header'").Scan(&hasHostHeader); err != nil {
+		return fmt.Errorf("failed to check upstreams.host_header: %w", err)
+	}
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='origin_domain'").Scan(&hasOriginDomain); err != nil {
+		return fmt.Errorf("failed to check upstreams.origin_domain: %w", err)
+	}
+	if hasHostHeader == 0 || hasOriginDomain == 0 {
+		return nil
+	}
+	res, err := DB.Exec(`UPDATE upstreams SET origin_domain = host_header
+		WHERE COALESCE(origin_domain,'') = '' AND COALESCE(host_header,'') <> ''`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate upstreams.host_header -> origin_domain: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("Migrated %d upstreams.host_header value(s) into origin_domain", n)
+	}
+	return nil
+}
+
+// migrateLbRuleOriginDomainToHostHeader 把规则级回源域名从本 fork 改名列
+// lb_rules.origin_domain 搬回上游口径 lb_rules.host_header（2026-10-11 合并曾
+// 改名收口，上游 v2.4.2 仍用 host_header——渲染/写侧全链按上游字段名消费）。
+// 幂等：host_header 已有值时不动（显式配置优先）。host_header 列由
+// newColumnsRegistry 登记兜底保证存在；origin_domain 列不存在（上游原版库）
+// 时静默返回。先搬后留：origin_domain 列本轮不删，保留人工核对窗口。
+func migrateLbRuleOriginDomainToHostHeader() error {
+	var hasOriginDomain, hasHostHeader int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('lb_rules') WHERE name='origin_domain'").Scan(&hasOriginDomain); err != nil {
+		return fmt.Errorf("failed to check lb_rules.origin_domain: %w", err)
+	}
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('lb_rules') WHERE name='host_header'").Scan(&hasHostHeader); err != nil {
+		return fmt.Errorf("failed to check lb_rules.host_header: %w", err)
+	}
+	if hasOriginDomain == 0 || hasHostHeader == 0 {
+		return nil
+	}
+	res, err := DB.Exec(`UPDATE lb_rules SET host_header = origin_domain
+		WHERE COALESCE(host_header,'') = '' AND COALESCE(origin_domain,'') <> ''`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate lb_rules.origin_domain -> host_header: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("Migrated %d lb_rules.origin_domain value(s) into host_header", n)
+	}
 	return nil
 }

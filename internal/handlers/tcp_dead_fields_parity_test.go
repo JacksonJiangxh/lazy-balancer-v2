@@ -46,6 +46,8 @@ var tcpSQLColumnFallback = map[string]string{
 	"tls_http_redirect":             "TLSHTTPRedirect",
 	"tls_cert":                      "TLSCert",
 	"tls_key":                       "TLSKey",
+	"tls_cert_path":                 "TLSCertPath",
+	"tls_key_path":                  "TLSKeyPath",
 	"log_enabled":                   "LogEnabled",
 	"dns_family":                    "DnsFamily",
 }

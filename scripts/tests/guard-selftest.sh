@@ -656,6 +656,50 @@ cat >"$tmp_root/web/package-lock.json" <<'EOF'
 EOF
 assert_good "package-lock.json content exempt"
 
+# 13f) 扫描起点豁免（TASK-2026-1110-01 r1 裁决第 4 条，最小化）：.npc-teams/
+# 目录与 docs/upstream-merge.zh-CN.md 单文件——台账与合并文档的轮次元数据属
+# 文档正当内容，从扫描起点排除（模式表与 .gitignore 块不动）。豁免边界必须
+# 钉住：豁免面之外（近似目录名/近似文件名/子目录同名/完全无关路径）的命中
+# 仍必须红，否则豁免会长成漏检通道。
+reset_fixture
+mkdir_in .npc-teams/tasks/ledger.md
+printf '# 任务台账\n\n审计第 96 轮修复收敛，归档见私有仓。\n' >"$tmp_root/.npc-teams/tasks/ledger.md"
+assert_good "npc-teams ledger exempt at scan start"
+
+reset_fixture
+mkdir_in docs/upstream-merge.zh-CN.md
+printf '# 合并记录\n\n第 96 轮审计：上游追平事实与逐路径核对。\n' >"$tmp_root/docs/upstream-merge.zh-CN.md"
+assert_good "upstream-merge doc exempt at scan start"
+
+reset_fixture
+mkdir_in .npc-teams-x/tasks/notes.md
+printf '# 审计第 96 轮修复\n' >"$tmp_root/.npc-teams-x/tasks/notes.md"
+assert_bad "near-miss dir outside exemption still hits" ".npc-teams-x/tasks/notes.md"
+
+reset_fixture
+mkdir_in docs/upstream-merge.zh-TW.md
+printf '第 96 轮审计\n' >"$tmp_root/docs/upstream-merge.zh-TW.md"
+assert_bad "near-miss filename outside exemption still hits" "docs/upstream-merge.zh-TW.md"
+
+reset_fixture
+mkdir_in sub/docs/upstream-merge.zh-CN.md
+printf '第 96 轮审计\n' >"$tmp_root/sub/docs/upstream-merge.zh-CN.md"
+assert_bad "nested same-name doc outside exemption still hits" "sub/docs/upstream-merge.zh-CN.md"
+
+reset_fixture
+mkdir_in docs/merge-notes.zh-CN.md
+printf '第 96 轮审计\n' >"$tmp_root/docs/merge-notes.zh-CN.md"
+assert_bad "unrelated doc outside exemption still hits" "docs/merge-notes.zh-CN.md"
+
+# 目录级豁免的边界声明：.npc-teams/ 内审计产物**路径**不再由守卫拦截（由
+# .gitignore 与台账管理流程兜底，属授权范围）——此处钉住该形态确为绿，防止
+# 有人误以为豁免只到内容通道而把目录级改成单文件级后让台账入库失败。
+reset_fixture
+mkdir_in .npc-teams/audit96-notes.md
+printf 'x\n' >"$tmp_root/.npc-teams/audit96-notes.md"
+git -C "$tmp_root" add -f .npc-teams/audit96-notes.md
+assert_good "exempt dir skips audit-named file (dir-level scope, ruled)"
+
 # 14) .gitignore 双向校验：少一行 / 多一行都失败
 reset_fixture
 grep -v '^\*\*/r\[0-9\]\*_test\.go$' "$tmp_root/.gitignore" >"$tmp_root/.gitignore.tmp"

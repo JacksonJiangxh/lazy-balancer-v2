@@ -583,6 +583,11 @@ func retireCertJobsForDomain(database *sql.DB, ruleID, canonicalDomain, reversed
 	return err
 }
 
+// validateRuleListenPort 是包级规则端口校验（导入/备份还原链走此路径，无
+// Handlers 实例）。管理口口径为「出厂默认 8000/2019」——真实管理口校验由
+// validateRuleListenPortForSave 叠加（保留端口判定口径）。HTTP/HTTPS 保留端口取部署侧
+// 默认口（HTTP_PORT/HTTPS_PORT，出厂 80/443）：改口后 TCP 规则不得再抢
+// 服务端默认 HTTP/HTTPS 口（那是代理面本身的落点）。
 func validateRuleListenPort(protocol string, port int) error {
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("端口必须在 1-65535 之间")
@@ -590,7 +595,7 @@ func validateRuleListenPort(protocol string, port int) error {
 	if port == 8000 || port == 2019 {
 		return fmt.Errorf("端口 %d 为管理端口，不可使用", port)
 	}
-	if protocol == "tcp" && (port == 80 || port == 443) {
+	if protocol == "tcp" && (port == services.DefaultHTTPPort() || port == services.DefaultHTTPSPort()) {
 		return fmt.Errorf("端口 %d 为 HTTP/HTTPS 保留端口", port)
 	}
 	return nil
@@ -649,10 +654,11 @@ func enabledRuleDomainConflict(domain string, listenPort int, excludeCaddyID str
 	return queryRuleDomainConflict(domain, listenPort, excludeCaddyID, " AND enabled = 1")
 }
 
-// queryRedirectShadowConflict 检查 80 端口跳转遮蔽：启用中的 TLS+HTTP 跳转规则会在
-// 80 端口服务器头部生成 terminal 跳转路由（caddy.go redirectRoutes），同域名直接
-// 监听 80 的规则会被遮蔽为死规则。两个方向同判：保存 80 端口规则时查跳转规则占用；
-// 保存/启用 TLS+跳转规则时查 80 端口规则占用。返回冲突规则描述与冲突域名。
+// queryRedirectShadowConflict 检查 HTTP 默认口（HTTP_PORT，出厂 80）的跳转遮蔽：
+// 启用中的 TLS+HTTP 跳转规则会在该口服务器头部生成 terminal 跳转路由
+// （caddy.go redirectRoutes），同域名直接监听该口的规则会被遮蔽为死规则。两个
+// 方向同判：保存该口规则时查跳转规则占用；保存/启用 TLS+跳转规则时查该口规则
+// 占用。返回冲突规则描述与冲突域名。
 func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHTTPRedirect bool, excludeCaddyID string) (string, string, error) {
 	candidates := normalizedRuleDomains(domain)
 	if len(candidates) == 0 {
@@ -662,22 +668,23 @@ func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHT
 	for _, candidate := range candidates {
 		wanted[candidate] = struct{}{}
 	}
+	defaultHTTPPort := services.DefaultHTTPPort()
 	var rows *sql.Rows
 	var err error
 	switch {
-	case listenPort == 80:
-		// 排除对方 80 端口自环跳转规则（listen_port=80 + TLS + 跳转本身
-		// 生成自环 Location、属非法存量，不应作为占用方拦截新建 80 规则）。
+	case listenPort == defaultHTTPPort:
+		// 排除对方默认口自环跳转规则（listen_port=默认口 + TLS + 跳转本身
+		// 生成自环 Location、属非法存量，不应作为占用方拦截新建默认口规则）。
 		// 镜像 2026-09 复审裁定 2(跳转分支同款 EXISTS)
 		// 全部上游被禁用的规则不产生 host 路由与跳转(caddy.go ),
-		// 不作为占用方;此前裁定只落了单侧,该形态下 80 规则被纯误拦 400。
-		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != 80 AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`)`, excludeCaddyID)
+		// 不作为占用方;此前裁定只落了单侧,该形态下默认口规则被纯误拦 400。
+		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != ? AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`)`, defaultHTTPPort, excludeCaddyID)
 	case enableTLS && tlsHTTPRedirect:
-		// 2026-09 复审裁定 2：与渲染面同口径——全部上游被禁用的 80 规则不产生
+		// 2026-09 复审裁定 2：与渲染面同口径——全部上游被禁用的默认口规则不产生
 		// host 路由、不会遮蔽跳转，不再作为占用方（报错与真实渲染行为一致）。
 		rows, err = db.DB.Query(`SELECT r.caddy_id, r.name, COALESCE(r.domain,'') FROM lb_rules r
-			WHERE r.protocol='http' AND r.enabled=1 AND r.listen_port=80 AND r.caddy_id != ?
-			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=r.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`)`, excludeCaddyID)
+			WHERE r.protocol='http' AND r.enabled=1 AND r.listen_port = ? AND r.caddy_id != ?
+			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=r.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`)`, defaultHTTPPort, excludeCaddyID)
 	default:
 		return "", "", nil
 	}
@@ -947,10 +954,14 @@ func inactiveHealthCheckAuditHint(cleared []string) string {
 // HealthCheckHost——显式携带由保存门 400 拒绝，不做静默弃置；Update 的
 // NTLMCompatible 由调用点按「是否显式提供」分别 400/自愈）。
 type tcpDeadFields struct {
-	EnableTLS                *bool
-	TLSSource                *string
-	TLSCert                  *string
-	TLSKey                   *string
+	EnableTLS *bool
+	TLSSource *string
+	TLSCert   *string
+	TLSKey    *string
+	// 引用型证书路径（2026-10-09）：与 tls_cert/tls_key 同格清空——TCP 无
+	// 证书消费面，路径列残留即悬挂引用随导出/快照放大。
+	TLSCertPath              *string
+	TLSKeyPath               *string
 	ACMEConfigID             *int
 	CAProviderID             *int
 	Domain                   *string
@@ -1026,7 +1037,7 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 	if fields.DnsFamily != nil {
 		*fields.DnsFamily = "ipv4"
 	}
-	for _, target := range []*string{fields.TLSCert, fields.TLSKey, fields.Domain, fields.HostHeader, fields.HealthCheckPath, fields.HealthCheckHost, fields.CompressTypes} {
+	for _, target := range []*string{fields.TLSCert, fields.TLSKey, fields.TLSCertPath, fields.TLSKeyPath, fields.Domain, fields.HostHeader, fields.HealthCheckPath, fields.HealthCheckHost, fields.CompressTypes} {
 		if target != nil {
 			*target = deadEmpty
 		}
@@ -1068,6 +1079,8 @@ func createRuleTCPDeadFields(req *models.CreateRuleRequest) tcpDeadFields {
 		TLSSource:                &req.TLSSource,
 		TLSCert:                  &req.TLSCert,
 		TLSKey:                   &req.TLSKey,
+		TLSCertPath:              &req.TLSCertPath,
+		TLSKeyPath:               &req.TLSKeyPath,
 		ACMEConfigID:             &req.ACMEConfigID,
 		CAProviderID:             &req.CAProviderID,
 		Domain:                   &req.Domain,
@@ -1092,6 +1105,8 @@ func updateRuleTCPDeadFields(req *models.UpdateRuleRequest) tcpDeadFields {
 		TLSSource:                &req.TLSSource,
 		TLSCert:                  &req.TLSCert,
 		TLSKey:                   &req.TLSKey,
+		TLSCertPath:              &req.TLSCertPath,
+		TLSKeyPath:               &req.TLSKeyPath,
 		ACMEConfigID:             &req.ACMEConfigID,
 		CAProviderID:             req.CAProviderID,
 		Domain:                   &req.Domain,
@@ -1132,6 +1147,8 @@ func storedRuleTCPDeadFields(rule *models.LbRule) tcpDeadFields {
 		TLSSource:                &rule.TLSSource,
 		TLSCert:                  &rule.TLSCert,
 		TLSKey:                   &rule.TLSKey,
+		TLSCertPath:              &rule.TLSCertPath,
+		TLSKeyPath:               &rule.TLSKeyPath,
 		ACMEConfigID:             &rule.ACMEConfigID,
 		CAProviderID:             &rule.CAProviderID,
 		Domain:                   &rule.Domain,
@@ -1370,9 +1387,15 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "协议不能为空"})
 		return
 	}
-	// When TLS is enabled for HTTP, default the listen port to 443 unless the user explicitly set another port.
-	if req.Protocol == "http" && req.EnableTLS && req.ListenPort == 0 {
-		req.ListenPort = 443
+	// HTTP 规则的端口兜底（端口为 0=未指定）：TLS 开 → HTTPS 默认口（出厂 443），
+	// 否则 → HTTP 默认口（出厂 80）。部署侧改 HTTP_PORT/HTTPS_PORT 后向导与 API
+	// 的缺省落点随动（ISSUE #7）；显式传了端口则原样使用，不做任何改写。
+	if req.Protocol == "http" && req.ListenPort == 0 {
+		if req.EnableTLS {
+			req.ListenPort = services.DefaultHTTPSPort()
+		} else {
+			req.ListenPort = services.DefaultHTTPPort()
+		}
 	}
 
 	if req.ListenPort <= 0 {
@@ -1467,16 +1490,27 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			return
 		}
 		if shadowRule != "" {
-			if req.ListenPort == 80 {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 80 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule)})
+			if req.ListenPort == services.DefaultHTTPPort() {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 %d 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			} else {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 80 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule)})
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			}
 			return
 		}
 	}
 	if req.Strategy == "" {
 		req.Strategy = "weighted_round_robin"
+	}
+	// 链式回退（2026-10-09）：0 值兜底默认参数（UI 不提供 0=关闭语义，避免
+	// 配置分叉；参考项目 speculativeMs=0 关闭语义不引入）。默认按 N=6 封顶 +
+	// 浏览器 60s 等待约束设计：5×3000+30000=45s < 60s（预算公式见 caddy.go）。
+	if req.Strategy == "chain_fallback" {
+		if req.ChainRaceIntervalMS == 0 {
+			req.ChainRaceIntervalMS = 3000
+		}
+		if req.ChainRequestTimeoutMS == 0 {
+			req.ChainRequestTimeoutMS = 30000
+		}
 	}
 	// 库值唯一真相（批 1+2）：健康检查 interval/timeout 为类型①值型列——
 	// 0→10/2 的写侧静默归一废除（0 由 validateRulePayloadBeforeSave 的 <1
@@ -1510,6 +1544,22 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		certWarnings = tlsCertificateWarnings(req.TLSCert, req.TLSKey, req.Domain)
 		for _, warning := range certWarnings {
 			services.Logf("warn", "CreateRule manual TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
+		}
+	}
+	// 引用型证书：文件只是采集来源——校验路径边界与文件有效性后，把读取到的
+	// PEM 内容摄取入库（tls_cert/tls_key，与 manual 同列）；路径列保留作摄取源
+	// 记录（看门狗据此检测外部更新并同步回写 DB）。
+	if req.EnableTLS && req.TLSSource == "file" {
+		certPath, keyPath, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(req.TLSCertPath, req.TLSKeyPath, req.Domain)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "引用证书文件校验失败: " + err.Error()})
+			return
+		}
+		req.TLSCertPath, req.TLSKeyPath = certPath, keyPath
+		req.TLSCert, req.TLSKey = certPEM, keyPEM
+		certWarnings = warnings
+		for _, warning := range warnings {
+			services.Logf("warn", "CreateRule referenced TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
 		}
 	}
 
@@ -1625,6 +1675,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		TCPProxyProtocol: req.TCPProxyProtocol, TCPTryDuration: req.TCPTryDuration, TCPTryInterval: req.TCPTryInterval,
 		RequestBodyMaxSizeMB: req.RequestBodyMaxSizeMB, UpstreamKeepaliveTimeout: req.UpstreamKeepaliveTimeout,
 		ServerTokensHidden: req.ServerTokensHidden, NTLMCompatible: req.NTLMCompatible, UpstreamForceHTTP1: req.UpstreamForceHTTP1,
+		ChainRaceIntervalMS: req.ChainRaceIntervalMS, ChainRequestTimeoutMS: req.ChainRequestTimeoutMS,
 		ForwardAuthEnabled: req.ForwardAuthEnabled, ForwardAuthUpstream: req.ForwardAuthUpstream,
 		ForwardAuthURI: req.ForwardAuthURI, ForwardAuthCopyHeaders: req.ForwardAuthCopyHeaders,
 		CustomRoutesEnabled: features.CustomRoutesEnabled,
@@ -1634,7 +1685,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		ProxyStreamCloseDelay: features.ProxyStreamCloseDelay,
 		HostHeader:            req.HostHeader, HealthCheckHost: req.HealthCheckHost,
 		EnableTLS: req.EnableTLS, TLSSource: req.TLSSource, ACMEConfigID: req.ACMEConfigID, CAProviderID: req.CAProviderID,
-		TLSCert: req.TLSCert, TLSKey: req.TLSKey, TLSHTTPRedirect: req.TLSHTTPRedirect,
+		TLSCert: req.TLSCert, TLSKey: req.TLSKey, TLSCertPath: req.TLSCertPath, TLSKeyPath: req.TLSKeyPath, TLSHTTPRedirect: req.TLSHTTPRedirect,
 		EnableCompress: req.EnableCompress, CompressTypes: req.CompressTypes,
 		Enabled: enabledVal == 1, LogEnabled: req.LogEnabled, CreatedBy: int(userIDInt),
 		UpdatedAt: models.JSONNullTime{NullTime: sql.NullTime{Time: time.Now().UTC(), Valid: true}},
@@ -1939,6 +1990,8 @@ var updateRuleBaselineSelectColumns = []updateRuleSelectColumn{
 	{"strategy", "COALESCE(strategy,'weighted_round_robin')"},
 	{"tls_cert", "COALESCE(tls_cert,'')"},
 	{"tls_key", "COALESCE(tls_key,'')"},
+	{"tls_cert_path", "COALESCE(tls_cert_path,'')"},
+	{"tls_key_path", "COALESCE(tls_key_path,'')"},
 	{"tls_source", "COALESCE(tls_source,'manual')"},
 	{"acme_config_id", "COALESCE(acme_config_id,0)"},
 	{"ca_provider_id", "COALESCE(ca_provider_id,0)"},
@@ -1963,6 +2016,8 @@ var updateRuleBaselineSelectColumns = []updateRuleSelectColumn{
 	{"server_tokens_hidden", "COALESCE(server_tokens_hidden,0)"},
 	{"ntlm_compatible", "COALESCE(ntlm_compatible,0)"},
 	{"upstream_force_http1", "COALESCE(upstream_force_http1,0)"},
+	{"chain_race_interval_ms", "COALESCE(chain_race_interval_ms,0)"},
+	{"chain_request_timeout_ms", "COALESCE(chain_request_timeout_ms,0)"},
 	{"forward_auth_enabled", "COALESCE(forward_auth_enabled,0)"},
 	{"forward_auth_upstream", "COALESCE(forward_auth_upstream,'')"},
 	{"forward_auth_uri", "COALESCE(forward_auth_uri,'')"},
@@ -2037,6 +2092,10 @@ var updateRuleSetColumns = []updateRuleSetColumn{
 	{"server_tokens_hidden", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ServerTokensHidden }},
 	{"ntlm_compatible", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.NTLMCompatible }},
 	{"upstream_force_http1", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.UpstreamForceHTTP1 }},
+	// 链式回退竞速参数（指针合并口径）：合并区已保证指针非 nil（nil=沿用存量，
+	// 显式 0=落库 0，渲染侧按 chain 策略兜底）。
+	{"chain_race_interval_ms", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ChainRaceIntervalMS }},
+	{"chain_request_timeout_ms", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ChainRequestTimeoutMS }},
 	// 认证网关四件套：合并区已保证指针非 nil（显式空串=清空，enabled=1 时
 	// 由保存门拒绝清空 upstream；uri/copy_headers 清空随写侧默认回填归一）。
 	{"forward_auth_enabled", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ForwardAuthEnabled }},
@@ -2072,6 +2131,10 @@ var updateRuleSetColumns = []updateRuleSetColumn{
 		return req.TLSKey != "" || protocolChanged || req.Protocol == "tcp" || clearingTLSMaterial
 	}, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return req.TLSKey }},
 	{"tls_http_redirect", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.TLSHTTPRedirect }},
+	// 引用型证书路径（2026-10-09）：无条件写入——req 已在校验分支按形态归一并
+	// 清空互斥字段（含从 file 切走的清空语义）。
+	{"tls_cert_path", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return req.TLSCertPath }},
+	{"tls_key_path", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return req.TLSKeyPath }},
 	{"enable_compress", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.EnableCompress }},
 	{"compress_types", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return req.CompressTypes }},
 	{"enabled", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.Enabled }},
@@ -2257,7 +2320,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// expr 顺序 = 下方 Scan 顺序；全集断言见文件头 init）。
 	err := db.DB.QueryRow(`SELECT `+updateRuleBaselineSelectExprs()+` FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(
 		&existingRule.Protocol, &existingRule.Domain, &existingRule.ListenPort, &existingRule.Strategy,
-		&existingRule.TLSCert, &existingRule.TLSKey, &existingRule.TLSSource, &existingRule.ACMEConfigID,
+		&existingRule.TLSCert, &existingRule.TLSKey, &existingRule.TLSCertPath, &existingRule.TLSKeyPath, &existingRule.TLSSource, &existingRule.ACMEConfigID,
 		&existingRule.CAProviderID,
 		&existingRule.EnableTLS, &existingRule.TLSHTTPRedirect,
 		&existingRule.DynamicDNS, &existingRule.EnableDnsServer, &existingRule.DnsServer, &existingRule.DnsFamily,
@@ -2265,6 +2328,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.HealthCheckUnhealthyThreshold, &existingRule.HealthCheckHealthyThreshold,
 		&existingRule.EnableActiveHealthCheck, &existingRule.TCPHealthCheckPort, &existingRule.TCPProxyProtocol, &existingRule.TCPTryDuration, &existingRule.TCPTryInterval,
 		&existingRule.RequestBodyMaxSizeMB, &existingRule.UpstreamKeepaliveTimeout, &existingRule.ServerTokensHidden, &existingRule.NTLMCompatible, &existingRule.UpstreamForceHTTP1,
+		&existingRule.ChainRaceIntervalMS, &existingRule.ChainRequestTimeoutMS,
 		&existingRule.ForwardAuthEnabled, &existingRule.ForwardAuthUpstream, &existingRule.ForwardAuthURI, &existingRule.ForwardAuthCopyHeaders,
 		&existingRule.CustomRoutesEnabled,
 		&existingRule.ProxyDialTimeout, &existingRule.ProxyResponseHeaderTimeout, &existingRule.ProxyReadTimeout, &existingRule.ProxyWriteTimeout, &existingRule.ProxyStreamTimeout, &existingRule.ProxyFlushInterval, &existingRule.ProxyStreamCloseDelay,
@@ -2510,6 +2574,14 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	if req.HostHeader == nil {
 		req.HostHeader = &existingRule.HostHeader
+	}
+	// 链式回退竞速参数（指针合并口径）：nil=沿用存量，显式 0=落库 0（渲染侧按
+	// chain 策略兜底 3000/30000）。
+	if req.ChainRaceIntervalMS == nil {
+		req.ChainRaceIntervalMS = &existingRule.ChainRaceIntervalMS
+	}
+	if req.ChainRequestTimeoutMS == nil {
+		req.ChainRequestTimeoutMS = &existingRule.ChainRequestTimeoutMS
 	}
 	if req.HealthCheckHost == nil {
 		req.HealthCheckHost = &existingRule.HealthCheckHost
@@ -2816,10 +2888,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				return
 			}
 			if shadowRule != "" {
-				if req.ListenPort == 80 {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 80 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule)})
+				if req.ListenPort == services.DefaultHTTPPort() {
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 %d 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 				} else {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 80 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule)})
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 				}
 				return
 			}
@@ -2963,6 +3035,32 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
+	// 引用型证书：同模式可沿用存量路径（前端编辑回填已带），跨模式必须显式提供
+	// （空路径由校验层响亮拒绝）；通过后归一落库，并把读取到的 PEM 内容摄取入库
+	// （文件只是采集来源，运行时唯一信任源是数据库）。
+	if (*req.EnableTLS || req.TLSCertPath != "" || req.TLSKeyPath != "") && req.TLSSource == "file" {
+		certPath, keyPath := req.TLSCertPath, req.TLSKeyPath
+		if existingRule.TLSSource == "file" {
+			if strings.TrimSpace(certPath) == "" {
+				certPath = existingRule.TLSCertPath
+			}
+			if strings.TrimSpace(keyPath) == "" {
+				keyPath = existingRule.TLSKeyPath
+			}
+		}
+		resolvedCert, resolvedKey, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(certPath, keyPath, req.Domain)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "引用证书文件校验失败: " + err.Error()})
+			return
+		}
+		req.TLSCertPath, req.TLSKeyPath = resolvedCert, resolvedKey
+		req.TLSCert, req.TLSKey = certPEM, keyPEM
+		certWarnings = warnings
+		for _, warning := range warnings {
+			services.Logf("warn", "UpdateRule referenced TLS certificate warning for caddy_id=%s (domain %s): %s", caddyID, req.Domain, warning)
+		}
+	}
+
 	// 端口类 400 前移至快照/validate 之前（与 CreateRule 的
 	// validateRuleListenPortForSave/validatePortFromDB 前置顺序对齐）
 	// ——TCP 候选 server 名含端口，validate 经 /load 真实加载会把同端口启用中规则 B
@@ -3010,13 +3108,19 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 「队列已摘、行仍非终态」的复活态）。
 	// acme_config_id 的清零在同格合并后的「非 acme_dns」门统一完成（覆盖 manual
 	// 与空来源，见上方合并块），此处不再重复。
-	// 生效证书来源非 manual 时不保留任何证书材料——
+	// 生效证书来源非 manual/file 时不保留任何证书材料——
 	// manual→acme_dns 此前保留 tls_cert/tls_key（渲染按 tls_source 分流零消费，
 	// 但私钥正文长期留在 lb_rules 并随导出/备份/集群快照放大）。与
-	// 「acme→manual 必须重新上传」对称清理。
-	clearingTLSMaterial := req.TLSSource != "manual"
+	// 「acme→manual 必须重新上传」对称清理。file 源豁免：内容刚经上方校验分支
+	// 摄取入库（文件只是采集来源）。
+	clearingTLSMaterial := req.TLSSource != "manual" && req.TLSSource != "file"
 	if clearingTLSMaterial {
 		req.TLSCert, req.TLSKey = "", ""
+	}
+	// 形态互斥归一（2026-10-09）：非 file 模式清空引用路径列，避免切走后残留
+	// 悬挂路径（file 模式的内联 PEM 摄取入库已在上方校验分支完成）。
+	if req.TLSSource != "file" {
+		req.TLSCertPath, req.TLSKeyPath = "", ""
 	}
 	// 生效来源非 acme_dns 时 ca_provider_id 归零（与
 	// CreateRule 非 ACME 分支同口径）。此前仅 acme→manual 切换 / tcp 归零，
@@ -4253,6 +4357,10 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		TCPHealthCheckPort: rule.TCPHealthCheckPort,
 		TCPTryDuration:     rule.TCPTryDuration,
 		TCPTryInterval:     rule.TCPTryInterval,
+		// 链式回退竞速参数随值域门接入——源行带外值（直改 DB/历史版本落库）
+		// 复制即命中 400 死端且用户无自救路径，与 TCP 三字段同格。
+		ChainRaceIntervalMS:   rule.ChainRaceIntervalMS,
+		ChainRequestTimeoutMS: rule.ChainRequestTimeoutMS,
 	}); err != nil {
 		fail(http.StatusBadRequest, "源规则配置不合法："+err.Error())
 		return
@@ -4792,10 +4900,10 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			return
 		}
 		if shadowRule != "" {
-			if rulePort == 80 {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 80 端口优先生效，启用后本规则将不可达），无法启用", shadowDomain, shadowRule)})
+			if rulePort == services.DefaultHTTPPort() {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 %d 端口优先生效，启用后本规则将不可达），无法启用", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			} else {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 80 端口，启用 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule)})
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，启用 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			}
 			return
 		}

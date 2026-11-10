@@ -114,6 +114,7 @@ var mcpUncoveredRoutes = map[string]string{
 	"GET /api/v1/security/crs/setup":            "CRS setup.conf 配置文件原文查看，面板 CRS 配置展示用；Agent 排查规则走 get_crs_rule/get_crs_rule_index",
 	"GET /api/v1/security/events/count":         "IP 弹框上下文查询(近 N 天单 IP 事件计数),轻量专用端点;MCP 场景用 list_security_events 的 ip 过滤+total 覆盖同等信息",
 	"GET /api/v1/system/tasks/stats-24h-series": "面板「近 24 小时执行」时间序列图专用聚合（task_runs 分小时桶）；Agent 查任务状态用 list_system_tasks/get_system_task_history 覆盖同等信息",
+	"GET /api/v1/system/ports":                  "部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT）只读探测，前端向导默认值与保留端口判定用；属部署环境常量，无 Agent 操作语义",
 	// —— 威胁情报库（v2.3.x）：内置只读源的面板管理面。CRS/IP2Region 同族端点
 	//    已有 toggle/trigger 工具覆盖，威胁库按面板低频操作口径未补工具（能力面
 	//    不一致为已知状态，如需 Agent 侧管理再按需补） ——

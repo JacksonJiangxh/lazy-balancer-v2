@@ -56,6 +56,124 @@ func ResetConfigDrift() {
 	configDriftQueryWarned = false
 	configDriftReadWarned = false
 	configDriftGeneration++
+	// 引用型证书指纹快照同源重置：从→主切换后下一轮 scan 重新建基线，避免用
+	// 旧快照误判「证书已更新」而触发一次多余重载。
+	ResetReferencedCertWatch()
+}
+
+// 引用型证书（tls_source="file"）外部更新自动摄取（摄取入库语义）：引用文件只是
+// 采集来源——保存时已把 PEM 内容入库，运行时唯一信任源是数据库。看门狗（主节点，
+// 60s 节拍）检测 /app/certs 内源文件的内容指纹变化，变化后读取并校验新内容回写
+// DB（tls_cert/tls_key，审计留痕），再触发强制重载：物化路径不变导致渲染 JSON
+// 同字节，普通 apply 会被 errSameConfig 短路（caddy changeConfig），必须 force
+// 变体让 Caddy 重新 provision TLS 证书。文件缺失/配对无效时跳过本轮摄取并留痕，
+// DB 保留上次有效内容（last-good），下轮重试。
+var (
+	referencedCertWatchMu    sync.Mutex
+	referencedCertWatchState = map[string]string{}
+	referencedCertWatchReady bool
+	referencedCertReloadFn   func() error
+)
+
+// SetReferencedCertReload 注入引用证书摄取入库后的强制重载实现（main: caddyReloader）。
+func SetReferencedCertReload(fn func() error) { referencedCertReloadFn = fn }
+
+// ResetReferencedCertWatch 清空引用型证书指纹快照——角色切换/测试隔离复用；
+// 清空后下一轮 scan 只重建基线、不触发重载（首扫语义）。
+func ResetReferencedCertWatch() {
+	referencedCertWatchMu.Lock()
+	defer referencedCertWatchMu.Unlock()
+	referencedCertWatchState = map[string]string{}
+	referencedCertWatchReady = false
+}
+
+// checkReferencedCertFiles 扫描引用型证书规则，逐条比对证书/私钥源文件的内容
+// 指纹；检出变化即摄取新内容回写 DB（校验失败/文件缺失跳过并留痕），任一回写
+// 成功后触发强制重载。首扫仅建基线不摄取——避免启动/升主即产生一次多余重载。
+func checkReferencedCertFiles() {
+	if db.DB == nil {
+		return
+	}
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
+		FROM lb_rules WHERE enable_tls=1 AND tls_source='file'
+		AND COALESCE(tls_cert_path,'')<>'' AND COALESCE(tls_key_path,'')<>''`)
+	if err != nil {
+		Logf("warn", "引用证书看门狗: 读取规则失败: %v", err)
+		return
+	}
+	defer rows.Close()
+	current := make(map[string]string)
+	paths := make(map[string][2]string)
+	for rows.Next() {
+		var caddyID, certPath, keyPath string
+		if err := rows.Scan(&caddyID, &certPath, &keyPath); err != nil {
+			Logf("warn", "引用证书看门狗: 扫描规则失败: %v", err)
+			return
+		}
+		current[caddyID] = ReferencedCertFileDigest(certPath, keyPath)
+		paths[caddyID] = [2]string{certPath, keyPath}
+	}
+	if err := rows.Err(); err != nil {
+		Logf("warn", "引用证书看门狗: 遍历规则失败: %v", err)
+		return
+	}
+
+	referencedCertWatchMu.Lock()
+	prev := referencedCertWatchState
+	ready := referencedCertWatchReady
+	var changed []string
+	if ready {
+		for id, digest := range current {
+			if old, ok := prev[id]; !ok || old != digest {
+				changed = append(changed, id)
+			}
+		}
+	}
+	referencedCertWatchState = current
+	referencedCertWatchReady = true
+	referencedCertWatchMu.Unlock()
+
+	if !ready || len(changed) == 0 {
+		return
+	}
+	sort.Strings(changed)
+
+	// 逐条摄取：文件缺失（digest missing:）或配对无效（外部工具更新到一半）时
+	// 跳过该规则并留痕，DB 保留上次有效内容；有效内容回写 tls_cert/tls_key。
+	ingested := 0
+	for _, id := range changed {
+		if strings.HasPrefix(current[id], "missing:") {
+			Logf("warn", "引用证书看门狗: 规则 %s 源文件缺失，跳过摄取（数据库保留上次有效证书）", id)
+			continue
+		}
+		p := paths[id]
+		referenced, loadErr := LoadReferencedCertificate(p[0], p[1])
+		if loadErr != nil {
+			Logf("warn", "引用证书看门狗: 规则 %s 源文件校验失败，跳过摄取（数据库保留上次有效证书）: %v", id, loadErr)
+			continue
+		}
+		if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id=?`, referenced.CertPEM, referenced.KeyPEM, id); err != nil {
+			Logf("error", "引用证书看门狗: 规则 %s 摄取回写数据库失败: %v", id, err)
+			continue
+		}
+		RecordAuditLog("system", "证书摄取", "负载规则", FormatAuditDetail(AuditRulePart(id), "来源文件外部更新，新证书内容已入库"), "")
+		ingested++
+	}
+	if ingested == 0 {
+		TaskLogf("config-watchdog", "cert-file", "引用证书源文件变化但全部摄取失败，数据库保留上次有效内容（规则: %s）", strings.Join(changed, "、"))
+		return
+	}
+	if referencedCertReloadFn == nil {
+		Logf("warn", "引用证书看门狗: 检出证书文件变化并已入库，但重载未接线，跳过（规则: %s）", strings.Join(changed, "、"))
+		return
+	}
+	if err := referencedCertReloadFn(); err != nil {
+		Logf("error", "引用证书看门狗: 证书摄取入库后重载失败: %v", err)
+		TaskLogf("config-watchdog", "cert-file", "引用证书已摄取入库，自动重载失败：%v", err)
+		return
+	}
+	Logf("info", "引用证书看门狗: 检出证书文件变化，已摄取入库并重载（规则: %s）", strings.Join(changed, "、"))
+	TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，已摄取入库并重载 %d 条规则", ingested)
 }
 
 // CurrentConfigDrift 返回看门狗当前状态（GetCaddyStatus 等展示路径消费）。
@@ -189,6 +307,10 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	if !isMaster {
 		return nil
 	}
+	// 引用型证书文件变化检测（外部更新 /app/certs 内成品证书后自动摄取入库并重载）：
+	// 与一致性检查同节拍、同主节点门（从节点 Caddy 无需本地证书热更），复用
+	// 上方同一次角色查询——不另发 is_master 查询。
+	checkReferencedCertFiles()
 	defer func() {
 		if r := recover(); r != nil {
 			Logf("error", "配置一致性看门狗：检查 panic: %v", r)

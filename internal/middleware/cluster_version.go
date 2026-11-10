@@ -202,6 +202,8 @@ var (
 		"ntlm_compatible", "upstream_force_http1", "host_header", "health_check_host",
 		"custom_routes_enabled", "forward_auth_enabled", "forward_auth_upstream",
 		"forward_auth_uri", "forward_auth_copy_headers",
+		// 链式回退竞速参数（2026-10-09）：写侧落库即 bump，从节点渲染兜底口径一致。
+		"chain_race_interval_ms", "chain_request_timeout_ms",
 	}
 	lbRuleProxyTimeoutColumns = []string{
 		"proxy_dial_timeout", "proxy_response_header_timeout", "proxy_read_timeout",
@@ -211,6 +213,8 @@ var (
 	lbRuleTLSColumns = []string{
 		"enable_tls", "tls_source", "acme_config_id", "ca_provider_id",
 		"tls_cert", "tls_key", "tls_http_redirect",
+		// 引用型证书摄取源路径列（tls_source=file）：路径写入/清空同 bump。
+		"tls_cert_path", "tls_key_path",
 	}
 	lbRuleCompressColumns  = []string{"enable_compress", "compress_types"}
 	lbRuleLifecycleColumns = []string{
