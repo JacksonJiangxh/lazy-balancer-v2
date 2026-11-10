@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"lazy-balancer-v2/internal/db"
 )
 
 // 操作日志词汇硬卡控（系统标准：操作标签 ≤4 词、事件对象 ≤5 词，词制计数见
@@ -21,7 +19,7 @@ import (
 // 调用点，其余动态传参视为违规（强制新调用点用字面量，保持可扫描）。
 
 // auditVocabDynamicAllowlist 是已人工核清的动态词条调用点，粒度为
-// 「相对 internal/ 的路径 + 参数下标 + 外层函数名」（R47 C-发现2：文件级
+// 「相对 internal/ 的路径 + 参数下标 + 外层函数名」（C-发现2：文件级
 // 白名单会放行同文件内新增函数的动态传参，收紧到函数级后新增函数即违规）：
 //   - handlers/audit.go recordAudit 与 middleware auditMiddleware 是
 //     recordAudit/RecordAuditLog 的透传封装；
@@ -31,36 +29,69 @@ import (
 //   - handlers/cluster_registration.go clusterNodeAction 的动作形参实参仅有
 //     审批/拒绝/删除/更新地址；
 //   - handlers/config_backup.go importConfigBackupCore（HTTP 导入端点与自动
-//     备份还原共用）与 config_import_v1.go ImportV1Config 的动作变量取值仅有
-//     导入/还原/导入失败/还原失败/部分失败；handlers/autobackup.go
+//     备份还原共用）、failImportAbort/failImportValidation（事务内/事务前失败
+//     收尾，动作取 action+"失败"；failImportTx 已改为其薄封装，无独立动态
+//     调用点）与 config_import_v1.go ImportV1Config 的
+//     动作变量取值仅有导入/还原/导入失败/还原失败/部分失败；handlers/autobackup.go
 //     RunAutoBackupOnce 的动作变量取值仅有 自动备份/手动备份；
+//   - handlers/autobackup.go failAutoBackupAccess 是还原/下载/删除进入高危
+//     操作核心之前的行面/文件面失败收口（动作取 verb+"失败"，取值仅
+//     还原失败/下载失败/删除失败，均 ≤4 词；对象固定「配置备份」）；
 //   - services/certificates.go renewExpiringCertificates 的动作变量取值仅有
 //     续签排队/重试排队；
 //   - handlers/handlers.go finishTxApply 的动作/对象取自 txApplyFinish 的字面量
 //     字段（16 个调用点：动作 创建/更新/删除/写入+失败，对象 自定义规则/
-//     拦截页面/安全策略/IP 地址列表，均 ≤ 上限；2026-09-06 裁定 ①② 家族 3
-//     统一收尾）；
-//   - services/downloadintegrity.go recordDownloadIntegrity 的对象变量由调用方
-//     传入字面量（CRS规则库/IP数据库，已纳入扫描）；
+//     拦截页面/安全策略/IP 地址列表，均 ≤ 上限；2026-09-06 裁定 ①②
+//     事务内应用门控统一收尾）；
+//   - services/downloadintegrity.go recordDownloadIntegrityAudits 的动作/对象变量由调用方
+//     传入字面量（动作 校验阻断/下载校验、对象 CRS规则库/IP数据库/完整性记录，
+//     均纳入扫描；锁外落库改造后审计写点收敛到该 flush 函数）；
 var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/audit.go":                {1: {"recordAudit"}, 2: {"recordAudit"}},
 	"middleware/middleware.go":         {1: {"auditMiddleware"}, 2: {"auditMiddleware"}},
 	"handlers/caddy.go":                {2: {"UpdateConfig"}},
 	"handlers/cluster_registration.go": {1: {"clusterNodeAction"}},
-	"handlers/config_backup.go":        {1: {"importConfigBackupCore"}},
-	// applyLbbakWafFiles：动作透传 core 的 action（取值仅 导入/还原——第 57 轮
-	// 修复还原路径归因漂移），词汇均在标准动作集内。
-	"handlers/config_backup_lbbak.go": {1: {"applyLbbakWafFiles"}},
-	"handlers/autobackup.go":          {1: {"RunAutoBackupOnce"}},
-	"handlers/config_import_v1.go":    {1: {"ImportV1Config"}},
-	"handlers/handlers.go":            {1: {"finishTxApply"}, 2: {"finishTxApply"}},
-	"services/certificates.go":        {1: {"renewExpiringCertificates"}},
-	"services/downloadintegrity.go":   {2: {"recordDownloadIntegrity"}},
+	// failImportAbort 是 failImportTx 与 29 处锁内复核分支共用的「回滚→失败
+	// 审计」收口（动作取 action+"失败"，取值仅 导入失败/还原失败）。
+	"handlers/config_backup.go": {1: {"importConfigBackupCore", "failImportAbort", "failImportValidation"}},
+	// config_import_coordinator abort：WAF 文件回退失败/说明性告警必须系统身份
+	// 留痕，动作取 actionLabel()+"警告"（取值仅 导入警告/还原警告，均 ≤4 词），
+	// 对象固定「配置备份」。会话上下文不携带用户身份，故在 abort 内直写。
+	"handlers/config_import_coordinator.go": {1: {"abort",
+		// close 兜底 abort：动作=session.actionLabel()+"失败"（取值仅
+		// 导入失败/还原失败，均 ≤4 词）——未完成导入的回滚必须留痕，
+		// 与 abort 同族的透传语义。
+		"close"}},
+	// applyLbbakWafFilesInLock：动作透传 core 的 action（取值仅 导入/还原——历史
+	// 修复还原路径归因漂移），词汇均在标准动作集内。warn 是同一 action 的
+	// 逐文件失败包装（action+"警告" ∈ 导入警告/还原警告，均 ≤4 词）。
+	"handlers/config_backup_lbbak.go": {1: {"warn"}},
+	// 触发审计统一在 RecordTaskTriggerResult 写库；Family 由调用点字面量
+	// 传入（任务监控/安全防护/配置备份等，均 ≤5 词），动作固定为字面量
+	// 「触发」/「触发失败」。TriggerTaskAsync 仅转发上下文，不再直写审计。
+	"services/task_trigger.go": {2: {"RecordTaskTriggerResult"}},
+	"handlers/autobackup.go":   {1: {"RunAutoBackupOnce", "failAutoBackupAccess"}},
+	"handlers/handlers.go":     {1: {"finishTxApply", "writeApplyFailureBanner"}, 2: {"finishTxApply", "writeApplyFailureBanner"}},
+	// tryIPListHotPathApply 的动作/对象透传 txApplyFinish 字段（热路径收尾镜像
+	// finishTxApply 家族语义；字面量词条在各名单写路径调用点核清，
+	// 2026-10-15 核清入白名单）。
+	"handlers/securityiplists.go":   {1: {"tryIPListHotPathApply"}, 2: {"tryIPListHotPathApply"}},
+	"services/certificates.go":      {1: {"renewExpiringCertificates"}},
+	"services/downloadintegrity.go": {1: {"recordDownloadIntegrityAudits"}, 2: {"recordDownloadIntegrityAudits"}},
+	// RunAutobanCycle 的动作传 AutobanAuditAction 包级常量（字面值「自动封禁」
+	// 单源——merge 审计写点与 AutobanBannedToday 的 audit_log 计数共用同一
+	// 常量，两处字面量漂移会让今日封禁恒 0；2026-10-15 核清入白名单）。
+	// autobanAuditBanned：动作传 AutobanAuditAction 包级常量（字面值「自动封禁」
+	// 单源）；逐 IP 行与超限汇总行共用。
+	"services/autoban.go": {1: {"autobanAuditBanned"}},
+	// updateLibSourceFlags：事件对象来自 libSourceFlagsSpec.Family，取值仅
+	// 爬虫名单/威胁库两族（包内常量装配），词数均在标准内。
+	"handlers/lib_source_flags.go": {2: {"updateLibSourceFlags"}},
 }
 
 // auditVocabCallSpecs 给出各审计写入口的 动作/对象 参数下标。
 // recordAuthenticationSecurityAudit 是 middleware.go:38 对 services.RecordAuditLog
-// 的函数变量别名（R50 D-01：不登记则该调用点整点不被扫描，「认证拒绝」不进
+// 的函数变量别名（不登记则该调用点整点不被扫描，「认证拒绝」不进
 // 后端动作集，danger 契约条目虚设）。
 var auditVocabCallSpecs = map[string][2]int{
 	"RecordAuditLog":                    {1, 2},
@@ -96,15 +127,9 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 			violations = append(violations, file+":"+strconv.Itoa(line)+" "+kind+" "+strconv.Quote(value)+" 超上限（"+strconv.Itoa(n)+" 词 > "+strconv.Itoa(limit)+"）")
 		}
 	}
-	// SEC-C-U1 ④（第 69 轮）：字面量 (action, resource) 对命中归一表旧侧即违规
-	// ——词数门只查词数不查规范名（「IP2Region数据库」=2 词曾静默放行）。必须
-	// 成对判定：归一表多为动作作用域条目（重载+Caddy配置→Caddy服务），裸资源
-	// 名判定会误伤合法写点（如 更新+Caddy配置）。
-	checkPair := func(file string, line int, action, resource string) {
-		if action != "" && resource != "" && db.IsRetiredAuditVocabulary(action, resource) {
-			violations = append(violations, file+":"+strconv.Itoa(line)+" 词条对 ("+strconv.Quote(action)+","+strconv.Quote(resource)+") 命中归一表旧侧，请改用规范名（见 internal/db/audit.go 归一表）")
-		}
-	}
+	// 字面量 (action, resource) 对命中归一表旧侧的
+	// 成对判定已随移入 internal/db（谓词不再导出）
+	// audit_vocabulary_migration_test.go 的 TestAuditWritePointsUseCanonicalVocabulary。
 	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
@@ -135,7 +160,6 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 				if !ok {
 					return true
 				}
-				var litAction, litResource string
 				line := fset.Position(call.Pos()).Line
 				for _, arg := range []struct {
 					idx   int
@@ -149,11 +173,6 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 						if value != "" {
 							check(path, line, arg.kind, value, arg.limit)
 						}
-						if arg.kind == "操作标签" {
-							litAction = value
-						} else {
-							litResource = value
-						}
 						continue
 					}
 					if !slices.Contains(auditVocabDynamicAllowlist[rel][arg.idx], enclosing) {
@@ -162,7 +181,6 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 						usedAllowlist[rel+"|"+strconv.Itoa(arg.idx)+"|"+enclosing] = true
 					}
 				}
-				checkPair(path, line, litAction, litResource)
 				return true
 			})
 		}
@@ -176,16 +194,12 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 							return true
 						}
 						line := fset.Position(ret.Pos()).Line
-						var retAction, retResource string
 						if value, ok := auditVocabStringLit(ret.Results[0]); ok && value != "" {
 							check(path, line, "操作标签", value, auditActionMaxWords)
-							retAction = value
 						}
 						if value, ok := auditVocabStringLit(ret.Results[1]); ok && value != "" {
 							check(path, line, "事件对象", value, auditResourceMaxWords)
-							retResource = value
 						}
-						checkPair(path, line, retAction, retResource)
 						return true
 					})
 					continue

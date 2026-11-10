@@ -5,6 +5,75 @@
 >
 > 口径说明：本文是工程标准文档（不在 README 用户文档索引内），用于工程实现与裁定溯源；面向用户/官网的文案不得引用内部流程口径。
 
+## 0. 职责与边界（v2.2，用户裁定 2026-10-30）
+
+**原则**：统一任务引擎提供通用全生命周期能力（调度、单飞、角色、启停、取消、运行历史、日志滚动、状态镜像、导入屏障）；任务与业务逻辑解耦；**禁止引擎外的调度与生命周期入口**。
+
+### 0.1 归口矩阵
+
+| 关注点 | 引擎 | 任务体（业务） |
+|---|---|---|
+| 何时执行（节拍/槽/间隔） | ✅ `RunTicker` / `IntervalFn` / `NextSlotFn` | ❌ 不得自建 ticker |
+| 启停/取消/角色翻转/导入屏障/单飞 | ✅ StartLoop/StopLoop/Cancel/SetRole | ❌ 不得自起常驻 goroutine |
+| 运行历史、日志滚动、`[start]/[done]` | ✅ | 只经 `TaskLogf`/`TeeTaskLog` 写业务行 |
+| 状态镜像（running/pending/next） | ✅ `StatusFn` | 提供纯只读投影 |
+| 业务判定、准入闸门、外部 API、业务写入 | ❌ | ✅ |
+
+### 0.2 唯一许可的四种执行形态
+
+| 形态 | 适用 | 禁止 |
+|---|---|---|
+| `Daemon` + **`taskengine.RunTicker(ctx, interval, wake, fn)`** | 高频/事件驱动常驻（节拍不限——daemon 形态零 task_runs 噪音） | 业务体内手写 `for/select/ticker` |
+| `Daemon` + 自管理阻塞循环（仅当循环含协议状态机，如从节点拉取） | 长生命周期连接/同步 | 为绕开 `RunTicker` 而自建 |
+| `Periodic`（`IntervalFn`） | 节拍 ≥10s 的轮询 | 用高频 Periodic 制造 task_runs 噪音 |
+| `Scheduled` / `Oneshot` | 排程/手动 | 借 BootSync 绕过调度 |
+
+**第五种形态不存在**：任何"引擎外常驻循环/子资源自建 goroutine/独立 ticker 泵"均违规（含按业务实体拆分出的 per-provider、per-tenant、per-rule 循环）。
+
+### 0.3 唤醒协议
+
+- 业务事件只能表达三种意图：**唤醒**（`RearmLoop(id, hasWork=true)`）、**停止**（`StopLoop(id)`）、**复位节拍**（`RearmLoop(id,false)`）。
+- 业务**不得**在事件里直接执行任务体，也不得用 `StartLoop` 越过用户停止态。
+- 唤醒信号是"提示"：错过唤醒只会延迟下一次节拍，不得导致漏执行（引擎按库内时间/到期判定兜底）。
+
+### 0.4 子资源（队列/租户/提供商/规则）归属
+
+- 子资源只允许**状态与准入策略**（pending/在途/并发上限/最小间隔）留在业务域。
+- 子资源的**泵**必须由宿主 daemon 的 `RunTicker` 的 `fn` 遍历驱动（如 `Manager.DispatchOnce`），不得 `go queue.loop()`。
+
+### 0.5 分类：违规（必须修）与范围外（定义排除）
+
+**违规 = 独立于任务运行、自行定期触发工作的循环。必须改为注册任务，无例外、无豁免、无「后续迁移」。**
+
+| 违规项（v2.2 立案） | 立案位置（修复前） | 状态 |
+|---|---|---|
+| 每个 CA 提供商一个 `go q.loop()` | `internal/services/caqueue.go:1163-1166` | 已归口 → `cert-issuance` daemon `RunTicker` 派发泵 |
+| `MetricsService.Start` 30s 抓取 + 24h 清理 | `internal/services/services.go:79-114` | 已归口 → `metrics-collector` daemon + `metrics-history-cleanup` Periodic |
+| rollup warmer 60s（启动即首轮） | `internal/handlers/security_threat_screen.go:1085-1124` | 已归口 → `threat-rollup-warmer` daemon |
+| caddy-restart 触发源 2s 轮询 | `internal/handlers/handlers.go:1175-1203` | 已归口 → `caddy-restart-watcher` daemon |
+| API-Key last_used 1min flush + 1h 清理 | `internal/db/apikey_last_used.go:76-125` | 已归口 → `apikey-usage-flusher` daemon |
+| 运行日志尺寸阈值 30s | `internal/services/logrotate.go:41-92` | 已归口 → `runtime-log-threshold` daemon |
+| 时区/日志级别 30s | `internal/services/tz.go:48-92` | 已归口 → `runtime-tz-refresh` daemon |
+| 限流桶内存清扫 1min | `internal/middleware/middleware.go:703-708` | 已归口 → `ratelimit-bucket-sweep` daemon |
+| legacy `RecordRunStart/Finish` 直写 `task_runs` | `internal/handlers/autobackup.go:354-366` | 已归口 → 符号删除（`task_runs` 唯一写方=引擎） |
+
+**范围外（不是调度器，不构成任何豁免）**：
+
+| 类别 | 判据 |
+|---|---|
+| 任务体内的子 goroutine | 由 Run 派生、被 Run 同步等待、随 Run 的 ctx 结束（如 crs/ip2region manager 的执行协程）——属执行实现 |
+| 单次运行内的有界轮询/等待 | 随本次 Run ctx 结束（如 acme 3–5s 传播/验证轮询） |
+| 一次性 goroutine | 有 `WaitGroup`/deadline 收口，不跨调用存活 |
+| 引擎内部 ticker | 引擎自身实现（`engine.go:1960`），不属于"任务外挂调度器" |
+| 生命周期 Teardown | 停止/关闭路径的清理（如 `db.Close` 内的 flusher 停止） |
+
+### 0.6 机器守卫（缺一即视为未完成）
+
+1. 注册表断言：每个 `Daemon` 的 `Run` 必须调用 `RunTicker`（或为范围外的阻塞协议循环，须在 §6.4 范围表登记判据，而非豁免申请）。钉测：`internal/services/taskengine_scope_guards_test.go`（登记表=机器可查常量清单，与本节/§2/§6.4 同步）。
+2. 静态扫描：`internal/services`、`internal/handlers`、`internal/db`、`internal/middleware` 禁止存在 `time.NewTicker` / 常驻 `go func()` / `time.AfterFunc` 自续循环（§6.4 范围外形态须以 `//scope-exempt: <类别>` 标注并命中范围表判据，不得新增第四类）。钉测同上（零命中判红，词表外类别判红）。
+3. 子资源循环守卫：禁止 `go <queue|worker>.loop()` 形态。
+4. 唤醒守卫：业务侧只允许 `RearmLoop/StopLoop`；业务事件路径禁止 `StartLoop`——仅控制面（用户操作）与**角色翻转恢复已开启态**（`loopEnabled` 保留语义，promote/demote 恢复分支）除外。执行「禁止任何业务事件/导入/就绪路径调用 StartLoop」。
+
 ## 1. 四类型定义
 
 | 维度 | 定时 Scheduled | 常驻 Daemon | 循环 Periodic | 触发 Oneshot |
@@ -41,7 +110,16 @@ Scheduled 槽语义（槽缓存 + 同一槽只执行一次）：
   自然恢复。失败轮不消费（走 1s→5s→30s 退避重投，仅「已到期槽未推进+failed」形态）。
 - **用户取消**：仅**自动轮**的**已到期**槽被消费（取消=显式放弃本槽）。手动触发轮不改
   预约（未来槽是下一次预约，与手动轮无归属关系），取消手动轮也不得消费槽——否则未来
-  槽被水位永久压住，自动更新静默停摆。`CancelHook` 返回 false（取消未生效）不消费。
+  槽被水位永久压住，自动更新静默停摆。`CancelHook` 返回 false（取消未生效）不消费；调用前复核运行代际，执行期间拒绝新代占位，返回后再次复核，旧取消请求不得作用于新一轮。
+- **成功轮的槽推进**（业务写侧门，`slotSuccessGateSQL` 单源）：`auto` 轮推进
+  **空槽或过期槽**，`manual` 轮**只推进已过期槽**。引擎成功轮（含手动轮）会消费过期槽，
+  业务侧不推进则水位与业务槽单边分叉（tick 的「槽 > 已消费水位」门永不成立 → 该族自动
+  更新永久静默停摆，人工反复「立即更新」只会反复加固）。空槽不在 manual 范围：零值槽
+  不会进入引擎消费分支（无停摆面），且预约只由排程保存/启用/启动武装路径建立。失败轮与
+  取消轮仍只走 auto 门（手动轮失败时引擎按退避重投同一槽，业务抢先推进会把该自动槽吃掉）。
+- **槽域 = 运行域**：`NextSlotFn` 取「启用源最早槽」时，源集合必须与运行体的处理集合
+  一致（威胁族=内置注册表源名，爬虫族=全部启用行）。槽域宽于运行域时，运行域外的启用行
+  槽没有任何推进写点，一旦过期「最早槽」恒钉过去 → 该族自动更新永久停摆。
 - **显式复位**：`StartLoop` 关→开与业务侧重排槽（`RearmSecurityLibrarySlots`）经
   `ResetScheduleProgress` 清空槽缓存/水位/退避——否则旧水位会压住新预约。
 - **导入排空**（`CancelInFlightRuns`）与 demote 取消不消费槽：恢复后到期轮补跑。
@@ -73,9 +151,14 @@ type Descriptor struct {
 2. 必须显式声明 `RunsOn=RoleAny`（含空值拒绝）——启动执行面无角色语义，
    漏声明不得回落到旧任务兼容默认值。
 
+`Daemon` 不得声明 `Cancelable`（注册期拒绝）：`Cancel` 只按 `Cancelable` 路由，被取消的
+常驻任务走「非异常退出」分支——`loop_on` 保持 true 而 `running=false`，监控判 idle，常驻
+采集/签发/同步永久停摆且无任何异常信号。常驻族启停一律 `StartLoop`/`StopLoop`。同理
+`EnabledFn` 仅 Scheduled/Periodic、`RestartOnRoleFlip` 仅 Daemon 可声明（越界即注册失败）。
+
 已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费；`TaskMeta.Enabled`（任务监控只认 `loop_on`，`Lookup/DescribeAll` 不再求值 `EnabledFn`）——`Descriptor.EnabledFn` 仍保留为 Scheduled/Periodic 调度门。
 
-## 2. 任务清单（19 注册任务）
+## 2. 任务清单（27 注册任务；实时全集以 `DescribeAll` 为准）
 
 ### 定时（5）——排程槽驱动，Run 纯业务
 
@@ -97,13 +180,22 @@ failed 行（没有执行就没有 task_runs 记录）。该形态的可观测�
 （1s→5s→30s 封顶，连续失败节流 WARN）——但那要求 Run 至少执行过一次；
 纯排程读取失败（连首轮都无法投递）不在退避覆盖面内。
 
-### 常驻（3）——Run 阻塞自管理循环
+### 常驻（10）——Run 阻塞至停止（`RunTicker` 节拍或自管理阻塞循环）
 
 | 任务 | Run 体 | 实际工作 |
 |---|---|---|
-| security-events-ingestion | `runIngestionLoop(ctx)`（内部 2s ticker） | 尾读 coraza 审计日志 |
-| cert-issuance | daemonLifecycleRun（真实 StartACME/StopACME 挂钩——B 完全标准化） | CAQueueManager+证书 worker（引擎 daemon 即生命周期所有者）——**RunsOn=MasterOnly** |
-| cluster-sync | Run 体按角色分流：从节点=daemonLifecycleRun（真实 SyncService.Start/Stop 挂钩，Halted/Resume 内部状态机保留）；主节点=masterSyncServingLifecycleRun（服务面巡检：节点在线/版本滞后） | **RunsOn=RoleAny + RestartOnRoleFlip**（2026-10-03 裁定：两角色同启停语义，角色翻转换代重启使 Run 分支与角色同步切换；原「RunsOn=SlaveOnly」口径已随主节点巡检引入过期） |
+| security-events-ingestion | `runIngestionLoop(ctx)`（形态② 自管理循环，内部 2s ticker） | 尾读 coraza 审计日志 |
+| cert-issuance | daemonLifecycleRun（真实 StartACME/StopACME 挂钩——B 完全标准化）+ `RunTicker(100ms, WakeCh, DispatchOnce)` 派发泵 | CAQueueManager+证书 worker（引擎 daemon 即生命周期所有者）——**RunsOn=MasterOnly** |
+| cluster-sync | Run 体按角色分流：从节点=daemonLifecycleRun（真实 SyncService.Start/Stop 挂钩，Halted/Resume 内部状态机保留）；主节点=masterSyncServingLifecycleRun（服务面巡检：节点在线/版本滞后，`masterSyncServingLoop` 内部 ticker） | **RunsOn=RoleAny + RestartOnRoleFlip**（2026-10-03 裁定：两角色同启停语义，角色翻转换代重启使 Run 分支与角色同步切换；原「RunsOn=SlaveOnly」口径已随主节点巡检引入过期） |
+| metrics-collector | `RunTicker(cfg.MetricsInterval)`（bootstrap 立即首轮） | Caddy admin `/metrics` 抓取与仪表盘聚合 |
+| threat-rollup-warmer | `RunTicker(60s)`（启动即首轮） | 威胁大屏分钟级 rollup 预固化（就绪后请求路径不再懒固化） |
+| caddy-restart-watcher | `RunTicker(2s)` | 探测监督器 Caddy 重启触发文件 → `caddy-restart` 触发执行与启动一致的配置载入（失败退避 2s→30s） |
+| ratelimit-bucket-sweep | `RunTicker(60s)` | 删除已过窗的登录限流内存桶 |
+| apikey-usage-flusher | `RunTicker(60s)`（附表清理 1h 业务闸门，非第二调度源） | `api_keys.last_used` 批量落库 + 过期吊销 JWT/集群注册密钥清理 |
+| runtime-log-threshold | `RunTicker(30s)`（装配期同步首跑 `RefreshRuntimeLogSizeOnce`） | `global_config.runtime_log_size_mb` 应用到运行日志滚动阈值 |
+| runtime-tz-refresh | `RunTicker(30s)`（装配期同步首跑 `RefreshTimezoneOnce`） | `global_config.timezone` 应用到面板/任务/审计展示时区 |
+
+运行期常驻族 7 个 daemon（metrics-collector/threat-rollup-warmer/caddy-restart-watcher/ratelimit-bucket-sweep/apikey-usage-flusher/runtime-log-threshold/runtime-tz-refresh）与其余运行期循环任务（metrics-history-cleanup）描述符与工作体在 `taskengine_wire_runtime.go`；跨包工作体经 `Set*` 钩子注入（main 在 `InitTaskEngine` 前装配），钩子未接线时空载体阻塞至停止（零 task_runs 噪音）。
 
 系统启动即运行（默认 StartLoop）；关闭调度=启动也不运行；允许手动停止和启用。
 
@@ -125,7 +217,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 且状态列呈现 `failed`（修复前恒 `idle`「空闲」，采集/签发静默停摆无信号）；
 显式停止调度后回 `idle`。
 
-### 循环（10）——固定间隔，每轮独立执行+记录
+### 循环（11）——固定间隔，每轮独立执行+记录
 
 | 任务 | 间隔 |
 |---|---|
@@ -138,6 +230,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 | audit-retention | 24h |
 | security-events-retention | 24h |
 | metrics-orphan-cleanup | 24h（已删除规则的残留历史指标收敛清理，单轮限量分批） |
+| metrics-history-cleanup | 24h（>7 天指标历史清理，5000 行/批让锁推进；失败进任务失败终态） |
 | autoban | 60s（调度唯一前提=业务启用：PUT 保存联动启停+启动按库实态对齐，Descriptor 无 EnabledFn；观察模式默认开） |
 
 
@@ -154,6 +247,13 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 （`cert_jobs.status` 等，如已签发/限流中/已禁用）**不属于任务面**——由
 免费证书页与规则 TLS 列维护；任务列表的任何列（名称列、状态列、状态词表、
 兜底）均不得引入业务词表。`TaskStatus` 枚举与前端状态列模板由钉测固化。
+
+**状态归属本进程生命周期**：状态列的「运行中」只由本进程真实在途执行支撑。
+crs/ip2region 状态镜像仅在对应 manager 本进程在途时采纳——持久化活动态可能是
+上次进程崩溃残留或集群快照回放，采纳即伪造「运行中」死态；启动装配把残留
+活动态归一为 failed（message「进程重启回收」）。`task_runs` 终态更新失败按
+有界退避重试，仍有残留 running 行时视图按中断呈现，且进程内无在途执行时不再
+显示运行中（「运行」按钮可用）。从节点上的 master-only 族状态镜像不采纳。
 
 ### 触发（1）
 
@@ -197,7 +297,12 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 页面（任务监控）：
 - 类型标签四色：定时(蓝)/常驻(绿)/循环(青)/触发(橙)
 - 筛选：全部/定时/常驻/循环/触发
-- 调度列：非触发类=开关（绑定 loop_on）；触发类=禁用开关（一致性）；cert-job 动态行=「—」
+- 调度列：非触发类=开关（绑定 loop_on）；触发类=禁用开关（一致性）；cert-job 动态行=「—」；
+  `role_applicable=false`（从节点上的 master-only 族，服务端按 `RunsOn` 派生）的行改显
+  「仅主节点」标签并解释从节点不调度，对应「下次执行」列显示「—」——避免把主节点语义的
+  预约时刻误读为即将运行；`/system/tasks` 的 `next_run_at` 同口径置空（门覆盖全部来源：
+  定时族 `NextSlotFn`、周期族「最近运行 + 间隔」兜底与 cert 等待时刻），直接消费该字段的
+  脚本不得对角色不适用任务排程；详情弹框同步展示「角色适用性」
 - 常驻族停止需确认弹框；操作列常驻族有「重启」
 
 ### 4.1 逐任务启停持久化（2026-10-18 用户裁定）
@@ -227,6 +332,7 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 - 任务监控的六个业务驱动任务调度开关**只读**：只允许查看 `loop_on`，不得从引擎或任务监控反写业务配置；非业务驱动任务仍可由任务监控启停。任务清单唯一事实源=`businessTaskDrivers`。
 - 启动装配按业务实态对齐 `loop_on`；首槽武装必须覆盖全部四个规则库源表，缺槽时开启业务即补槽。
 - `EnabledFn` 仅作执行面纵深校验，不向任务视图暴露额外「业务开关」字段；`TaskMeta.Enabled` 已删除，任务监控与详情只展示 `loop_on` 调度开关（`Lookup/DescribeAll` 不求值 `EnabledFn`），另以只读 `business_driven` 标记驱动 toggle 禁用（不是第二个开关）。
+- 对齐时的读取分三态（`known`）：库瞬断/未初始化（`known=false`）**不得**落 `StopLoop`——保留上一次生效的调度态并登记待重试，由 60s 角色对账周期重对齐，读恢复即收敛到业务实态；tick 侧 `EnabledFn` 仍按二态 fail-closed（读错本轮不跑、下轮重新求值），两者不得混用同一口径。
 
 ### 4.3 API 写门与执行角色分层
 
@@ -247,6 +353,7 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 | 手动触发 | 1 行（trigger=manual） | 同上 |
 | 崩溃恢复 | 残留 running → interrupted | — |
 | 用户取消自动轮 | 本轮 1 行（终态 cancelled） | [done] cancelled |
+| 零到期源的成功轮 | 1 行（success） | 一行「本轮无更新」业务摘要；审计动作「更新」+ detail「无到期源」 |
 
 用户取消（`Cancel`）只消费「自动轮所属的已到期槽」：本轮 `task_runs` 落 cancelled，
 本槽不再投递；业务推进/重排新槽后恢复。手动触发轮被取消不改预约（不消费槽），
@@ -256,18 +363,22 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 
 **配置导入暂停/排空**：`PauseScheduling` 与 `ResumeScheduling` 成对使用，均在 `e.mu` 内提交暂停状态，与 `runNow` 的 `inFlight` 登记严格定序。暂停后 tick 不再派发，`Trigger`、`RunSync` 及已越过入口检查的迟到 `runNow` 均返回 `ErrSchedulingPaused`；仅装配期 BootSync（`trigger=startup`）豁免。因此除该启动路径外，暂停返回后 `inFlight` 只减不增，导入可安全排空在途执行；恢复同样在 `e.mu` 内提交，暂停/恢复边界不留下登记窗口。
 
+**装配期启动屏障**：`Options.StartPaused` 只覆盖 tick 投递与 `Trigger`/`RunSync`/`runNow` 登记，**不覆盖常驻族启停**——默认清单里 `security-events-ingestion`/`cert-issuance`/`cluster-sync` 先于 `startup:config-load` 被 `StartLoop` 拉起，其 Run 体起步即真实接管服务（证书签发 → `StartACME` → CA 队列 / 证书部署重试 → Caddy `/load`）。其中只有 `cert-issuance` 写部署面。因此装配方在启动默认清单**之前**进入配置屏障（`BeginConfigImportHold`），BootSync（规则库载入 → 证书物化 → Caddy 渲染/应用）完成后 `EndConfigImportHold` 兑现被延迟的队列与生命周期启动：配置载入前面板不得已有证书部署写入运行配置。**屏障的实际覆盖范围只有部署面**（`startCertIssuanceLifecycle` 与 `caqueue` 的 `configImportHoldActive` 门）：`security-events-ingestion`（只读尾读）与 `cluster-sync` 照常先启动，行为与引入屏障前一致（从节点快照应用由快照应用自身收敛），不得据此宣称「全部常驻族被挡在配置载入之后」。不得把常驻启停并入 `schedPaused`（会与 `loopEnabled`/`pendingRestart` 语义纠缠）。
+
+**调度自动停摆的留痕口径**：两类「引擎自行停止调度」都必须与用户主动停止可区分——① `IntervalFn` 返回非正周期：立即停调并落一条 `failed` 运行行（状态列呈现 failed，含原因）+ `[error]` 日志；② 定时槽连续 `scheduledFailStreakStopLimit`（4）轮**自动轮**未推进且本轮失败/跳过：停调 + `[error]` 日志（失败轮本身已有 failed 行），并在任务元数据透出 `schedule_stopped_reason=fail-streak`（视图据此把「引擎停调」与「用户停止」分开呈现，业务驱动任务提示到业务页重新保存自动更新）。手动轮失败只走退避节流，不消耗停调预算。恢复入口：`StartLoop` 关→开（业务驱动任务=对应业务页重新保存开关）、`ResetScheduleProgress` 或重启进程，均清空停调来源与退避/槽水位。
+
 ## 6. 业务侧 helper
 
 - `TaskLogf(taskID, stage, format, ...)` — 业务摘要行（tee 到任务日志）
 - `taskengine.TeeTaskLog` — 分阶段流水
 - `taskRunStartedAt(rc)` — 业务状态表开始/检查时刻唯一时间源：回读 `task_runs.started_at` 并归一 UTC；threat/CRS/IP2Region/crawler 共用
-- `RecordRunStart/RecordRunFinish` — legacy 直调路径（引擎外执行）
 
 ### 6.1 统一日志滚动与统计（2026-10-17 用户裁定）
 
 所有任务日志只使用一种滚动标准：**写入前按真实文件大小滚动**。
 
 - 统一入口为 `taskengine.RotateTaskLogBeforeWrite`：`size(path)+len(待写入行) > task_log_size_mb` 时先 `RotateTaskLogFile` 再追加。`taskLogAppend`、`TeeTaskLog` 与证书任务日志全部经过该入口，禁止另设每日巡检滚动或第二套滚动实现。
+- 普通任务与证书任务日志共用 `taskengine.TruncateTaskLogLine`：滚动判定前将单行按 UTF-8 安全截到 4096 字节并保留显式截断标记，避免巨型错误行突破活动文件尺寸治理。
 - 主流水 `tasks/{id}.log` 保 1 份，证书任务 `tasks/certjobs/*.log` 保 5 份；归档份数是保留策略差异，不是第二种滚动机制。
 - `log-cleanup` 只负责保留期清理，不再负责尺寸滚动。`tasks/` 根日志删除统一经 `taskengine.RemoveTaskLogIfModifiedBefore`，在路径写锁内重新 stat 后删除（避免锁外旧 FileInfo 与 `rotate→rename→append` 交错误删新一代）；`tasks/certjobs/` 子目录仍由 ruleID 写锁同源复核。
 - 每个 `tasks/{id}.log` 只能由该任务执行链写入：cluster-sync/普通配置导入不得写三库日志；`SecurityEventsPollOnce` 只返回条数，ingestion 自行记录；autoban 仅 Run/候选修剪同链写日志，摄取热路径不直接写。
@@ -285,8 +396,77 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 5. `/logs/stats` 返回 `task:<id>` 真实文件统计，任务监控弹框不得使用目录聚合值。
 6. 注册级测试必须覆盖：默认调度、精确槽值/间隔与 **`DescribeAll` 注册全集**（不写死条数——全集以注册表/`DescribeAll` 输出为准，本文 §2 的「当前 N 个」仅作对照；曾写死 18 与实际的 19 分叉）、全部业务开关双向同源、日志与状态时间、逐任务真实文件统计、停止/取消/角色翻转/崩溃恢复、旧调度器零旁路。
 
+### 6.3 仅测试消费的 API 面（勿新增生产消费方）
+
+以下导出符号**没有生产调用方**，保留供测试装配与排障断言；生产线走注明的替代入口。登记目的是避免后续轮次重复判定为死代码：
+
+| 符号 | 替代/说明 |
+|---|---|
+| `Engine.RunAsync` | 生产手动触发唯一入口=`services.TriggerTaskAsync`→`Engine.RunAsyncResult`（需 onDone 补记补偿审计） |
+| `Engine.Stats24h` | 任务视图走 `Engine.RunOverview` 批量聚合（同 SQL 单源） |
+| `Engine.Trigger` | 同步驱动测试；生产走异步入口 |
+| `Engine.IsRunning` | 诊断投影（`Run 存活 或 loopEnabled∧roleAllows`），**不得**用作「是否正在执行」判据——该语义用 `IsTaskInFlight` |
+| `RoleSlaveOnly` | 仅测试注册使用（生产 27 任务全集只有 RoleAny/RoleMasterOnly） |
+
+### 6.4 范围外形态登记（判据，不是豁免）
+
+| 形态 | 判据（机器可判） | 现有示例 |
+|---|---|---|
+| 任务体内子协程 | 由 Run 派生 + Run 同步等待 + ctx 结束即止 | `internal/services/crsupdate.go:348-361`、`internal/services/ip2regionupdate.go:173-176` |
+| 运行内有界轮询 | 存活期 ⊆ 单次 Run，且带宽上限 | `internal/acme/issuer.go:491/645/883` |
+| 一次性协程 | `WaitGroup`/deadline 收口 | `internal/services/cluster_apply.go:31-34`、`internal/handlers/config_import_coordinator.go:594-598` |
+| 引擎内部 tick | 位于 `internal/taskengine` | `engine.go:934/1960` |
+| Teardown 清理 | 仅在停止/关闭路径执行 | `db.Close` 内 flusher 停止 |
+| daemon Run 体自管理阻塞循环（§0.2 形态②） | Run 派生 + ctx 取消即退 + Run 存活即任务运行中 | `runIngestionLoop`（securityevents.go）、`masterSyncServingLoop`（cluster_masterserving.go） |
+| 引擎附属对账循环 | 位于 internal/services、服务于引擎自身角色/状态收敛、不受用户停止看门狗影响、有代际停机与有界排空（判据可机器识别：函数名+代际停机断言） | `taskengine_wire.go` `startRoleReconciler` |
+
+新增任何超出上表的循环形态 = 违规，必须先注册任务。
+
+`//scope-exempt: <类别>` 标注词表（与守卫钉测 `internal/services/taskengine_scope_guards_test.go` 的常量词表逐字同步，词表外类别=变相豁免即违规）：`daemon-run-body-loop`（daemon Run 体自管理阻塞循环，§0.2 形态②）、`engine-reconciler`（引擎附属对账循环）、`one-shot-deadline-callback`（一次性延迟回调，canceled/deadline 收口，不跨调用自续）、`one-shot-bounded-poll`（单次调用内有界轮询，deadline 收口）。
+
+### 6.5 归口台账（全部为必做项，完成后只保留"已完成"记录）
+
+| # | 违规项 | 目标注册任务 | 状态 |
+|---|---|---|---|
+| 1 | per-provider `go q.loop()` | `cert-issuance`（Daemon + `RunTicker` 遍历 `DispatchOnce`） | 已完成（`taskengine_wire.go` cert-issuance Run：`RunTicker(100ms, WakeCh, DispatchOnce)`；工作体 `caqueue.go` `DispatchOnce` 单源） |
+| 2 | `MetricsService.Start`（30s + 24h） | 新 daemon `metrics-collector`（RunsOn=RoleAny；24h 清理拆 `Periodic`） | 已完成（`taskengine_wire_runtime.go`：`metrics-collector` daemon + `metrics-history-cleanup` Periodic；工作体 `services.go`/`metrics.go`） |
+| 3 | rollup warmer（60s） | 独立 daemon `threat-rollup-warmer`（实际实现未并入 `security-events-ingestion`——60s 预热与 2s 摄取节拍/生命周期不同域，独立 daemon 各自启停且零 task_runs 噪音） | 已完成（`taskengine_wire_runtime.go`；工作体 `handlers.RunThreatRollupWarmerRound`） |
+| 4 | caddy-restart 触发源（2s） | 新 daemon `caddy-restart-watcher`（Daemon 生命周期只落 1 行，无 task_runs 噪音） | 已完成（`taskengine_wire_runtime.go`；工作体 `handlers.CaddyRestartWatcherOnce`） |
+| 5 | API-Key last_used（1min/1h） | 新 daemon `apikey-usage-flusher`（循环移出 db 包，db 只暴露 flush/cleanup 函数） | 已完成（`taskengine_wire_runtime.go` `runAPIKeyUsageFlusher`；db 只暴露 `FlushAPIKeyLastUsed`/`CleanupAPIKeyAuxTables`） |
+| 6 | 运行日志尺寸阈值（30s） | 新 daemon `runtime-log-threshold`（装配序调整：daemon 先于日志消费启动） | 已完成（`taskengine_wire_runtime.go`；装配期同步首跑与 daemon 节拍共用 `RefreshRuntimeLogSizeOnce`） |
+| 7 | 时区/日志级别（30s） | 新 daemon `runtime-tz-refresh` | 已完成（`taskengine_wire_runtime.go`；`RefreshTimezoneOnce` 同 Once 口径） |
+| 8 | 限流桶内存清扫（1min） | 新 daemon `ratelimit-bucket-sweep`（middleware 暴露 sweep 函数） | 已完成（`taskengine_wire_runtime.go`；工作体 `middleware.SweepRateLimitBuckets`） |
+| 9 | legacy `RecordRunStart/Finish` | 删除该兜底：`engineRunID<=0` 时响亮失败，不再自写 `task_runs` | 已完成（`internal/taskengine` 符号删除，`task_runs` 唯一写方=引擎终态路径） |
+
 ## 7. 修订记录
 
+- **v2.3（2026-10-30，标准回写与守卫落地）**：按代码实况回写——§0.5 违规表 9 项全部「已归口」并注明去向；§6.5 台账 9 项全部「已完成（实现位置）」，#3 目标口径按实际实现改写（独立 `threat-rollup-warmer` daemon，未并入 ingestion——60s 预热与 2s 摄取不同节拍/生命周期域）；§2 重写为 27 任务（定时 5/常驻 10/循环 11/触发 1）并补齐 8 个运行期任务行；§6.4 行号更新（`internal/acme/issuer.go:491/645/883`；`internal/handlers/config_import_coordinator.go:594-598` 标包路径）并新增「daemon Run 体自管理阻塞循环（形态②）」「引擎附属对账循环」两判据行与 `//scope-exempt` 标注词表（登记 `startRoleReconciler`）；§0.6-1/2 守卫钉测落地（`taskengine_scope_guards_test.go`：注册表断言+静态扫描+词表外类别判红）；§0.2 daemon 形态「节拍不限（零 task_runs 噪音）」；§0.3 删除 `WakeTask` 字样统一为 `RearmLoop(id, hasWork)`；§0.6-4 唤醒守卫措辞改为「业务事件路径禁止 StartLoop；控制面与角色翻转恢复已开启态除外」；legacy `RecordRunStart/Finish` 符号删除（§6/§6.3 不再登记）；钩子未接线的 runtime daemon 契约改为空载体阻塞至停止（零 task_runs 噪音、不触发 premature-exit 重拉）。
+
+- **v2.2（2026-10-30，用户裁定「标准即底线，不得有例外/待办/可接受」）**：删除 §6.4「豁免登记」与一切"后续迁移/可接受"口径，改为**范围外形态判据**（任务体内子协程/运行内有界轮询/一次性协程/引擎内部 tick/Teardown，均按定义排除，不构成豁免）；§0.5 重写为「违规（必须修）／范围外（定义排除）」二分，列出 9 项既有违规；§6.5 改为**归口台账（全部必做）**；§0.6 守卫取消"命中豁免"出口，`StartLoop` 仅限控制面；取消 `BecomeSlave` 强制 `StartLoop` 例外（保持用户停止态 + 显式提示）。
+
+- **v2.1（2026-10-30，用户裁定）**：新增 §0「职责与边界」——归口矩阵、唯一许可的四种执行形态（`RunTicker`）、唤醒协议、子资源归属、违规反例、机器守卫；新增 §6.4 循环豁免登记与 §6.5 待归口清单（per-provider 队列泵 / metrics 采集 / rollup warmer）。起因：`caqueue.go:1163` 每提供商自建 goroutine 绕开引擎，导致不可枚举/不可停止/不可观测，并让证书签发派发节拍长期游离于引擎之外。
+
+- v2.0.9（2026-10-24）：联动契约收敛——① 「活动态只属执行进程」补上导入通道：配置导入把四表 `update_status` 的活动态（版本表四活动词 + 源表 `running`）按类判据 `services.IsActiveUpdateStatus` 归一为 failed + 归属文案，`running` 补入共享词表（不再被误判为词表外值归 idle）；② 「槽域=运行域」落到写侧：威胁族首槽武装、时区重排与排程保存统一按注册表源名过滤，注册表外启用行的槽不再被清理后的武装反向补回；③ 角色不适用任务的 `next_run_at` 全部来源置空（定时族 `NextSlotFn`/cert 等待时刻同门），与 `role_applicable=false` 不再自相矛盾；④ 规则库读面（`/security/crs`、`/security/ip2region`、`/security/overview`）接入角色投影，从节点残留活动态与状态端点同结论。
+- v2.0.8（2026-10-24）：停调语义与恢复入口口径收敛——① 只有自动轮消耗停调预算：手动轮失败/跳过只走退避节流、不推进 `schedFailStreak`（不再让几次手动重试提前用尽自动停调预算）；② 引擎停调来源机器可读（`schedule_stopped_reason=fail-streak`），任务视图把「引擎停调」与「用户停止」分开呈现，业务驱动任务给出「到业务页重新保存自动更新 / 重启进程」的可执行恢复入口；`[error]` 日志文案同步改为可执行指引；③ `RearmLoop(hasWork=true)` 只在「已停止→开启」过渡复位 Scheduled 槽水位/退避（已开启任务的普通唤醒不再把已消费的过期槽重新投递，与 `StartLoop` 同口径）；④ 源表族启动归一的告警写入注册任务 ID `threat`（此前写入不存在的 `threat-update`，产生游离日志文件且任务日志弹框不可见）；⑤ 任务/审计日志尺寸的兜底值单源 `db.DefaultTaskLogSizeMB`/`db.DefaultAuditLogSizeMB`（删除各自字面量）；⑥ 已停引擎的 `Cancel` 与 toggle/control 同口径回 503，`Register` 的停止门移到描述符校验之后（先报真正缺失的字段）；⑦ §5 装配期屏障口径收窄为「只覆盖部署面」。
+- v2.0.7（2026-10-24）：调度自动停摆与观测口径收敛——① Periodic 的 `IntervalFn`
+  返回非正周期时停调并落 failed 运行行 + `[error]` 日志（此前只有日志行，与用户
+  主动停止同形；失败行让状态列与「近 24 小时」失败计数可见）；② 定时槽连续
+  `scheduledFailStreakStopLimit`（4）轮未推进且本轮失败/跳过 → 停调（只对自动轮，
+  手动轮有界不触发），退避兜底不再是无限重投；③ `RearmLoop(hasWork=true)` 越过
+  停止态时复位 Scheduled 槽水位/退避（否则旧水位永久压住当前槽）；④ 装配期服务
+  屏障：常驻族先于 `startup:config-load` 启动，配置载入完成前用
+  `BeginConfigImportHold`/`EndConfigImportHold` 挡住部署面启动；⑤ 调度闭包 panic
+  告警按任务分桶（跨任务不再互相遮蔽，被抑制次数随下次放行披露）；⑥ 运行历史与
+  列表共用残留 `running` 行判定（归一 `interrupted` + 同源文案）；⑦ 从节点上
+  角色不适用任务不再推算「下次执行」；⑧ 引擎已停止时调度写端点回 503 且
+  `Register` 返回 `ErrEngineStopped`（不再回 200 假成功）；⑨ §6.3 登记仅测试
+  消费的 API 面。
+- v2.0.6（2026-10-24）：补充 §1.1「成功轮的槽推进」（auto=空/过期、manual=仅过期，
+  `slotSuccessGateSQL` 单源）与「槽域=运行域」（威胁族槽按内置注册表源名收窄，注册表外
+  启用行的槽在启动期清空）；§1.2 登记 `Daemon ∧ Cancelable` 注册期拒绝（及
+  `EnabledFn`/`RestartOnRoleFlip` 的 Kind 约束）。§5 记录口径补：零到期源的成功轮在两族
+  审计同记动作「更新」、detail 声明「无到期源，本轮无更新」，「跳过」专留降级中止。
+- v2.0.5（2026-10-24）：任务状态归属本进程生命周期——状态镜像只在 manager 本进程在途时采纳、启动装配归一残留活动态（failed「进程重启回收」）、`task_runs` 终态写有界重试且残留 running 行按中断呈现；任务视图新增 `role_applicable`（从节点上 master-only 族标注「仅主节点」并解释调度开关不可用、下次执行显示「—」）；业务驱动调度对齐读失败保持上一次生效态并由 60s 角色对账重试（tick 侧 `EnabledFn` 仍二态 fail-closed）。
 - v2.0.4（2026-10-23）：补充 §1.1 Scheduled 槽语义——槽缓存降频求值（前导窗 30s/地板 1min）、同一槽只执行一次（成功/自动轮到期的用户取消消费；失败退避不消费）、取消只消费「自动轮已到期槽」、`ResetScheduleProgress` 显式复位、导入排空/demote 不消费。同步 §5 记录口径（用户取消自动轮=放弃本槽）。
 - v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控只认 `loop_on`，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；历史补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
 

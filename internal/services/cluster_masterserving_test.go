@@ -36,6 +36,26 @@ func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Fatal("等待条件超时")
 }
 
+// waitForStableCond 要求条件连续稳定成立 stablePolls 次；用于负断言，
+// 防止异步副作用尚未落库时把一次零值采样误判为通过。
+func waitForStableCond(t *testing.T, timeout time.Duration, stablePolls int, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	stable := 0
+	for time.Now().Before(deadline) {
+		if cond() {
+			stable++
+			if stable >= stablePolls {
+				return
+			}
+		} else {
+			stable = 0
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("条件未连续稳定 %d 次", stablePolls)
+}
+
 func readClusterSyncLog(t *testing.T) string {
 	t.Helper()
 	body, err := os.ReadFile(taskengine.TaskLogPath("cluster-sync"))
@@ -59,7 +79,7 @@ func servingLines(log string) []string {
 }
 
 // seedServingNode 种子一个从节点；interval 写 global_config.sync_interval（真实
-// 上报周期，L2-67-01 起巡检阈值随它）——nodes.sync_interval 是写侧从不写的死列
+// 上报周期， 起巡检阈值随它）——nodes.sync_interval 是写侧从不写的死列
 // （schema 默认 60），此前种子它掩盖了阈值钉死 120s 的 bug。
 func seedServingNode(t *testing.T, name, lastSeenUTC string, version, interval int) int64 {
 	t.Helper()
@@ -80,15 +100,19 @@ func seedServingNode(t *testing.T, name, lastSeenUTC string, version, interval i
 // 跑，diff≈8h 触发离线告警污染共享日志；2026-10-04 测试污染修复）。
 func newServingTestEnv(t *testing.T) {
 	t.Helper()
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	oldDB, oldMetricsDB, oldAuditDB, oldCurrent := db.DB, db.MetricsDB, db.AuditDB, db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize test database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreGlobalDBHandles(oldDB, oldMetricsDB, oldAuditDB, oldCurrent)
 	})
+	// 日志目录是包级状态：用例结束必须还原，否则后续用例把任务日志写进已
+	// 删除的临时目录（同包 cert_renewal_demote_test 的既有范式）。
+	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(t.TempDir() + "/tasks")
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 	_ = os.MkdirAll(taskengine.LogDir(), 0755)
 }
 
@@ -109,6 +133,9 @@ func TestTaskEngineWire_ClusterSyncMasterRunsForReal(t *testing.T) {
 	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
 	waitForCond(t, 2*time.Second, func() bool {
 		return strings.Contains(readClusterSyncLog(t), "[start] 常驻启动")
+	})
+	waitForCond(t, 2*time.Second, func() bool {
+		return strings.Contains(readClusterSyncLog(t), "主节点巡检启动")
 	})
 	var status string
 	if err := db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='cluster-sync' ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
@@ -144,6 +171,11 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 		t.Fatal("主节点不应触碰从节点同步挂钩（主分支=巡检）")
 	}
 
+	// demote 必须同时落库（角色对账按 DB 修正引擎）：仅 SetRole(false)
+	// 而 DB 仍为主节点时，对账会在测试窗口内把引擎翻回主角色（换代竞态）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	te.SetRole(false) // demote：换代 → 从分支
 	waitForCond(t, 2*time.Second, func() bool { return syncStarts.Load() >= 1 })
 	if syncStops.Load() != 0 {
@@ -153,6 +185,9 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 		return strings.Count(readClusterSyncLog(t), "[done] stopped") >= 1
 	})
 
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	te.SetRole(true) // promote：换代回主分支
 	waitForCond(t, 2*time.Second, func() bool { return syncStops.Load() >= 1 })
 	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
@@ -164,7 +199,7 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 func TestMasterServingRound_offlineWarnsOnce(t *testing.T) {
 	// 合成轮测试用轻量环境（不启动 daemon）——live 引擎的 cluster-sync daemon
 	// 以真实时间巡检，seed 的旧 last_seen 必触发离线 WARN 污染合成轮断言
-	//（第 69 轮修复期实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
+	//（实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
 	newServingTestEnv(t)
 	seedServingNode(t, "edge-a", servingBase.Add(-10*time.Minute).UTC().Format("2006-01-02 15:04:05"), 3, 60)
 	w := newServingWatch()
@@ -183,7 +218,7 @@ func TestMasterServingRound_offlineWarnsOnce(t *testing.T) {
 	}
 }
 
-// L2-67-01（第 67 轮审计）：巡检离线阈值须跟随 global_config.sync_interval
+// 巡检离线阈值须跟随 global_config.sync_interval
 // （与 cluster_sync 同口径）——此前读 nodes.sync_interval 死列（写侧从不写，
 // schema 默认 60），阈值钉死 2×60=120s，interval>120s 部署逐轮误报离线。
 func TestMasterServingRound_offlineThresholdFollowsGlobalSyncInterval(t *testing.T) {
@@ -224,7 +259,7 @@ func TestMasterServingRound_offlineThresholdFollowsGlobalSyncInterval(t *testing
 func TestMasterServingRound_cleanRoundsSilent(t *testing.T) {
 	// 合成轮测试用轻量环境（不启动 daemon）——live 引擎的 cluster-sync daemon
 	// 以真实时间巡检，seed 的旧 last_seen 必触发离线 WARN 污染合成轮断言
-	//（第 69 轮修复期实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
+	//（实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
 	newServingTestEnv(t)
 	seedServingNode(t, "edge-a", servingBase.Add(-10*time.Second).UTC().Format("2006-01-02 15:04:05"), 3, 3600)
 	w := newServingWatch()
@@ -319,6 +354,63 @@ func TestMasterServingRound_lagWarnsAfterPersistence(t *testing.T) {
 	}
 }
 
+// 滞后→离线数轮→恢复仍滞后：离线分支必须清滞后计时窗（lagSince）与已告警位
+// （lagAlerted）——否则恢复后沿用离线前旧窗，「持续超过 5 分钟」把离线期计入
+// 滞后时长（文案失真），且已告警位不清会让恢复后的新一轮滞后永不再告警。
+func TestMasterServingRound_lagWindowResetsAfterOffline(t *testing.T) {
+	newServingTestEnv(t)
+	nodeID := seedServingNode(t, "edge-d", servingBase.Add(-10*time.Second).UTC().Format("2006-01-02 15:04:05"), 3, 3600)
+	// cluster_version=7 > 已应用 3：在线即滞后（阈值=max(2×3600,120s)=7200s）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET cluster_version=7 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec(`UPDATE global_config SET cluster_version=0 WHERE id=1`) })
+	w := newServingWatch()
+	ctx := context.Background()
+	lagWarns := func() int {
+		count := 0
+		for _, line := range servingLines(readClusterSyncLog(t)) {
+			if strings.Contains(line, "edge-d") && strings.Contains(line, "版本滞后") {
+				count++
+			}
+		}
+		return count
+	}
+	// 滞后满 5 分钟窗（since 在首轮落下，累计到 300s 时）→ WARN 一次。
+	for i := 0; i <= 5; i++ {
+		masterSyncServingRound(ctx, servingBase.Add(time.Duration(i)*masterSyncInspectInterval), w)
+	}
+	if lagWarns() != 1 {
+		t.Fatalf("滞后满窗应恰好 WARN 一次, got %d", lagWarns())
+	}
+	// 离线数轮（last_seen 落后 3h > 7200s 阈值）：首轮 WARN 离线一次。
+	if _, err := db.DB.Exec(`UPDATE nodes SET last_seen=? WHERE id=?`,
+		servingBase.Add(-3*time.Hour).UTC().Format("2006-01-02 15:04:05"), nodeID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 6; i <= 8; i++ {
+		masterSyncServingRound(ctx, servingBase.Add(time.Duration(i)*masterSyncInspectInterval), w)
+	}
+	// 恢复上报且仍滞后：滞后窗必须重新计——首轮静默。
+	if _, err := db.DB.Exec(`UPDATE nodes SET last_seen=? WHERE id=?`,
+		servingBase.Add(9*masterSyncInspectInterval).Add(-10*time.Second).UTC().Format("2006-01-02 15:04:05"), nodeID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 9; i <= 11; i++ {
+		masterSyncServingRound(ctx, servingBase.Add(time.Duration(i)*masterSyncInspectInterval), w)
+	}
+	if got := lagWarns(); got != 1 {
+		t.Fatalf("离线恢复后未重新满 5 分钟不得再次告警, got %d", got)
+	}
+	// 重新满窗（累计再达 300s）→ 第二次 WARN。
+	for i := 12; i <= 14; i++ {
+		masterSyncServingRound(ctx, servingBase.Add(time.Duration(i)*masterSyncInspectInterval), w)
+	}
+	if got := lagWarns(); got != 2 {
+		t.Fatalf("恢复后重新满 5 分钟应再次 WARN, got %d: %v", got, servingLines(readClusterSyncLog(t)))
+	}
+}
+
 // 巡检错误：WARN 不中断（下轮继续）。
 func TestMasterServingRound_dbErrorWarnsAndContinues(t *testing.T) {
 	// 合成轮测试用轻量环境（不启动 daemon）——与 offlineWarnsOnce/cleanRoundsSilent 同格。
@@ -348,6 +440,10 @@ func TestMasterServingRound_dbErrorWarnsAndContinues(t *testing.T) {
 func TestTaskEngineWire_CertIssuanceSlaveShowsLocalState(t *testing.T) {
 	te := newWireTestEngine(t)
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status) VALUES ('r1','a.test','pending')`); err != nil {
+		t.Fatal(err)
+	}
+	// DB 从角色先落库（对账按 DB 修正引擎，避免等待窗口被翻回主）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	te.SetRole(false)

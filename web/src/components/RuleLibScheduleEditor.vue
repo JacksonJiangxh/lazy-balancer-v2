@@ -8,7 +8,7 @@
       <el-select
         v-model="editDays"
         multiple
-        :disabled="disabled"
+        :disabled="controlsDisabled"
         class="schedule-editor__days"
         placeholder="选择星期"
       >
@@ -16,24 +16,28 @@
       </el-select>
       <el-time-picker
         v-model="editTime"
-        :disabled="disabled"
+        :disabled="controlsDisabled"
         format="HH:mm"
         value-format="HH:mm"
         placeholder="时间"
         class="schedule-editor__time"
       />
-      <el-button size="small" type="primary" :disabled="disabled" :loading="saving" @click="emitSave">保存定时</el-button>
+      <el-button size="small" type="primary" :disabled="controlsDisabled" :loading="saving" @click="emitSave">保存定时</el-button>
     </div>
-    <div class="schedule-editor__tip">自动更新开关关闭时不执行；手动「立即更新」不受影响</div>
+    <div v-if="unavailableHint" class="schedule-editor__tip schedule-editor__tip--error" role="status">{{ unavailableHint }}</div>
+    <div v-else class="schedule-editor__tip">自动更新开关关闭时不执行；手动「立即更新」不受影响</div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { libraryScheduleError, scheduleEditUntouched } from '@/utils/securityLibraries'
 
-// 规则库（CRS/IP2Region/威胁情报库）更新弹框共享的「定时更新」卡片区：
+// 规则库（CRS/IP2Region/威胁情报库/爬虫地址库）更新弹框共享的「定时更新」卡片区：
 // 星期多选（1=周一…7=周日）+ HH:MM 时间，保存即由后端重排下次更新。
+// 库信息读取失败/未落地时传 unavailableHint：控件与保存按钮一并禁用，
+// 不得用默认值（周一–周日 04:00）冒充库内排程并可保存覆盖真实排程。
 
 const props = withDefaults(defineProps<{
   days: number[]
@@ -41,9 +45,12 @@ const props = withDefaults(defineProps<{
   disabled?: boolean
   saving?: boolean
   tz?: string
-}>(), { disabled: false, saving: false, tz: '' })
+  unavailableHint?: string
+}>(), { disabled: false, saving: false, tz: '', unavailableHint: '' })
 
 const emit = defineEmits<{ save: [payload: { days: number[]; time: string }] }>()
+
+const controlsDisabled = computed(() => props.disabled || props.saving || Boolean(props.unavailableHint))
 
 const weekdayOptions = [
   { value: 1, label: '周一' },
@@ -61,9 +68,10 @@ const editTime = ref(props.time || '04:00')
 // 保存成功后父级刷新库信息 → props 变化时回填（不覆盖用户未保存的编辑：
 // 仅当与父级值一致时才同步——编辑中父级轮询刷新不丢输入）
 watch(() => [props.days, props.time] as const, ([days, time], prev) => {
-  const prevDays = prev?.[0] ?? []
-  const prevTime = prev?.[1] ?? ''
-  const untouched = editDays.value.join() === prevDays.join() && editTime.value === (prevTime || '04:00')
+  const untouched = scheduleEditUntouched(
+    { days: editDays.value, time: editTime.value },
+    { days: prev?.[0] ?? [], time: prev?.[1] ?? '' },
+  )
   if (untouched) {
     editDays.value = [...days]
     editTime.value = time || '04:00'
@@ -71,11 +79,16 @@ watch(() => [props.days, props.time] as const, ([days, time], prev) => {
 })
 
 const emitSave = () => {
-  if (!editDays.value.length) {
-    ElMessage.warning('至少选择一天')
+  if (props.saving) return
+  // 时间被清空时不得静默回落 04:00（原 `editTime.value || '04:00'`
+  // 让输入框显示空、落库却是 04:00）；校验单源 utils/securityLibraries。
+  const time = editTime.value
+  const error = libraryScheduleError(editDays.value, time)
+  if (error) {
+    ElMessage.warning(error)
     return
   }
-  emit('save', { days: [...editDays.value], time: editTime.value || '04:00' })
+  emit('save', { days: [...editDays.value], time })
 }
 </script>
 
@@ -94,4 +107,5 @@ const emitSave = () => {
 .schedule-editor__days { flex: 1 1 220px; min-width: 180px; }
 .schedule-editor__time { width: 110px; }
 .schedule-editor__tip { margin-top: 8px; font-size: 12px; color: #909399; line-height: 1.6; }
+.schedule-editor__tip--error { color: var(--el-color-danger); }
 </style>

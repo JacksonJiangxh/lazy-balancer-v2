@@ -16,8 +16,9 @@
           :status="status"
           :loading="clusterModeChanging"
           :registration-request="registrationRequest"
+          :registration-succeeded="registrationSucceeded"
           :read-only="isReadOnlyProp"
-          :interval-saving="intervalSaving"
+          :interval-saving="clusterSettingsSaving"
           @register="registerAsSlave"
           @promote="promoteToMaster"
           @update-interval="updateSyncInterval"
@@ -31,10 +32,9 @@
           :nodes="nodes"
           :loading="nodesLoading"
           :token-loading="tokenLoading"
-          :settings-loading="settingsLoading"
+          :settings-loading="clusterSettingsSaving"
           :pending-node-id="pendingNodeId"
           :login-node-id="loginNodeId"
-          :access-url-saving="accessUrlSaving"
           :read-only="isReadOnlyProp || status?.node_mode === 'slave'"
           @generate-token="generateRegisterToken"
           @update-sync-field="updateSyncField"
@@ -43,7 +43,7 @@
           @remove="removeNode"
           @login="loginNode"
           @service-control="openServiceControlDialog"
-          @edit-access-url="openAccessUrlDialog"
+          @edit-config="openNodeConfigDialog"
         />
       </el-col>
     </el-row>
@@ -54,10 +54,9 @@
       :nodes="nodes"
       :loading="nodesLoading"
       :token-loading="tokenLoading"
-      :settings-loading="settingsLoading"
+      :settings-loading="clusterSettingsSaving"
       :pending-node-id="pendingNodeId"
       :login-node-id="loginNodeId"
-      :access-url-saving="accessUrlSaving"
       :read-only="isReadOnlyProp"
       @generate-token="generateRegisterToken"
       @update-sync-field="updateSyncField"
@@ -66,7 +65,7 @@
       @remove="removeNode"
       @login="loginNode"
       @service-control="openServiceControlDialog"
-      @edit-access-url="openAccessUrlDialog"
+      @edit-config="openNodeConfigDialog"
     />
 
     <ClusterSlavePanel
@@ -82,19 +81,19 @@
       @forget-pins="forgetPins"
     />
 
-    <ClusterAccessUrlDialog
-      :visible="accessUrlDialogVisible"
-      :node="editingAccessUrlNode"
-      :saving="accessUrlSaving"
-      @close="closeAccessUrlDialog"
-      @save="updateAccessUrl"
+    <ClusterNodeConfigDialog
+      :visible="nodeConfigDialogVisible"
+      :node="editingNodeConfigLive"
+      :saving="nodeConfigSaving"
+      @close="closeNodeConfigDialog"
+      @save="updateNodeConfig"
     />
 
-    <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" class="register-token-dialog">
+    <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" :before-close="closeTokenDialog" @closed="registerToken = null" class="register-token-dialog">
       <template #header>
         <DialogHeader :icon="Key" title="一次性注册令牌" subtitle="仅展示一次，请立即复制并妥善保存" tone="warning" />
       </template>
-      <div class="token-box">
+      <div class="dialog-panel token-box">
         <code>{{ registerToken?.token }}</code>
         <el-button type="primary" @click="copyRegisterToken">
           <el-icon><CopyDocument /></el-icon>复制令牌
@@ -107,29 +106,29 @@
     <el-dialog v-model="serviceControlDialogVisible" class="service-control-dialog dialog-body-inset" width="min(520px, 92vw)" :close-on-click-modal="false" :close-on-press-escape="!serviceControlLoading" :show-close="!serviceControlLoading">
       <template #header>
         <div class="service-control-header">
-          <div class="service-control-title">
-            <el-icon :size="18"><Monitor /></el-icon>
-            <span>服务控制</span>
-          </div>
-          <div v-if="serviceControlNodeLive" class="service-control-node">
-            <el-tag :type="serviceControlNodeLive.status === 'online' ? 'success' : 'info'" size="small">{{ serviceControlNodeLive.status === 'online' ? '在线' : '离线' }}</el-tag>
-            <span class="service-control-node-name">{{ serviceControlNodeLive.name }}</span>
-            <span class="service-control-node-url">{{ serviceControlNodeLive.access_url || `${serviceControlNodeLive.ip_address}:${serviceControlNodeLive.port}` }}</span>
-          </div>
+          <DialogHeader
+            :icon="Monitor"
+            title="服务控制"
+            :subtitle="serviceControlNodeLive ? `${serviceControlNodeLive.name} · ${serviceControlNodeLive.access_url || `${serviceControlNodeLive.ip_address}:${serviceControlNodeLive.port}`}` : undefined"
+          />
+          <el-tag v-if="serviceControlNodeLive" class="service-control-status" :type="serviceControlNodeLive.status === 'online' ? 'success' : 'info'" size="small">{{ serviceControlNodeLive.status === 'online' ? '在线' : '离线' }}</el-tag>
         </div>
       </template>
 
-      <div class="service-control-grid">
+      <div class="service-control-grid" role="radiogroup" aria-label="服务控制操作">
         <div
           v-for="item in serviceControlOptions"
           :key="item.value"
           class="service-control-card"
           :class="{ 'is-active': serviceControlAction === item.value, [`is-${item.tone}`]: true }"
-          role="button"
-          tabindex="0"
-          @click="serviceControlAction = item.value"
-          @keydown.enter.prevent="serviceControlAction = item.value"
-          @keydown.space.prevent="serviceControlAction = item.value"
+          role="radio"
+          :aria-checked="serviceControlAction === item.value"
+          :tabindex="serviceControlTabindex(item.value)"
+          :ref="(el: unknown) => setServiceCardRef(item.value, el)"
+          @click="selectServiceAction(item.value)"
+          @keydown="onServiceCardKeydown($event)"
+          @keydown.enter.prevent="activateOnce($event, () => selectServiceAction(item.value))"
+          @keydown.space.prevent="activateOnce($event, () => selectServiceAction(item.value))"
         >
           <div class="service-control-card-icon">
             <el-icon :size="22"><component :is="item.icon" /></el-icon>
@@ -145,10 +144,10 @@
       </div>
 
       <transition name="el-fade-in">
-        <div v-if="serviceControlWarnings[serviceControlAction]" class="info-note-bar service-control-warning"><span class="info-note-desc">{{ serviceControlWarnings[serviceControlAction] }}</span></div>
+        <div v-if="hasOwn(serviceControlWarnings, serviceControlAction)" class="info-note-bar service-control-warning"><span class="info-note-desc">{{ serviceControlWarnings[serviceControlAction] }}</span></div>
       </transition>
 
-      <!-- C-3：服务控制返回证书指纹不匹配时提供按节点重钉通道（与从节点侧
+      <!-- 服务控制返回证书指纹不匹配时提供按节点重钉通道（与从节点侧
            forget-pins 补救对称）；确认后调用 POST /cluster/nodes/:id/forget-pin。 -->
       <transition name="el-fade-in">
         <div v-if="serviceControlPinMismatch" class="info-note-bar service-control-warning">
@@ -174,13 +173,16 @@
  </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { CopyDocument, Key, Monitor, RefreshRight, Select, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { copyText } from '@/utils/copy'
+import { CLUSTER_SYNC_SWITCHES } from '@/utils/clusterSyncSwitches'
+import { clusterWriteBlocked } from '@/utils/clusterWriteGate'
+import { createOneTimeSecretCloseGuard } from '@/utils/oneTimeSecretGuard'
 import { formatDate } from '@/utils/date'
 import type {
   APIResponse,
@@ -193,12 +195,15 @@ import type {
   ClusterSyncResult,
 } from '@/types'
 import ClusterMasterPanel from './cluster/ClusterMasterPanel.vue'
-import ClusterAccessUrlDialog from './cluster/ClusterAccessUrlDialog.vue'
+import ClusterNodeConfigDialog from './cluster/ClusterNodeConfigDialog.vue'
 import ClusterModeCard from './cluster/ClusterModeCard.vue'
 import ClusterSlavePanel from './cluster/ClusterSlavePanel.vue'
 import ClusterStatusCard from './cluster/ClusterStatusCard.vue'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
+import { activateOnce } from '@/utils/keyboardActivate'
+import { hasOwn } from '@/utils/hasOwn'
+import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
 
 interface ActionResponse {
   readonly code: number
@@ -213,7 +218,7 @@ interface LoginTicketResponse {
 const authStore = useAuthStore()
 let disposed = false
 let requestSequence = 0
-// A4-S4：fetchNodes 独立计数器——updateAccessUrl 的手动刷新若与 fetchStatus 共享
+// fetchNodes 独立计数器——updateNodeConfig 的手动刷新若与 fetchStatus 共享
 // requestSequence，会顶掉轮询在途 fetchStatus 的序列号，导致状态响应被当作过期丢弃
 let nodesRequestSequence = 0
 const status = ref<ClusterStatus | null>(null)
@@ -222,16 +227,27 @@ const initialLoading = ref(true)
 const nodesLoading = ref(false)
 const modeLoading = ref(false)
 const tokenLoading = ref(false)
-const settingsLoading = ref(false)
+// 同步设置写通道单飞：开关（updateSyncField）与间隔（updateSyncInterval）都写
+// PUT /cluster/settings——共用一个 saving 态，二者在途时互斥且 loading 同源。
+const clusterSettingsSaving = ref(false)
 const syncing = ref(false)
 const promoting = ref(false)
-const intervalSaving = ref(false)
 const pendingNodeId = ref<number | null>(null)
 const loginNodeId = ref<number | null>(null)
-const accessUrlDialogVisible = ref(false)
-const editingAccessUrlNode = ref<ClusterNode | null>(null)
-const accessUrlSaving = ref(false)
+const nodeConfigDialogVisible = ref(false)
+const editingNodeConfig = ref<ClusterNode | null>(null)
+// 弹框基线随 15s 轮询更新：按 id 回查最新节点行；查不到（刚被删除）再退回
+// 打开时快照，避免弹框瞬间清空。子组件只在字段未被编辑时回填，不覆盖用户输入。
+const editingNodeConfigLive = computed<ClusterNode | null>(() => {
+  const snapshot = editingNodeConfig.value
+  if (!snapshot) return null
+  return nodes.value.find((node) => node.id === snapshot.id) ?? snapshot
+})
+const nodeConfigSaving = ref(false)
 const registrationRequest = ref(0)
+// 注册请求被主节点受理后递增——子组件据此清空已消耗的一次性令牌
+//（取消确认或请求失败时令牌仍可能有效，必须保留）。
+const registrationSucceeded = ref(0)
 const tokenDialogVisible = ref(false)
 
 const serviceControlDialogVisible = ref(false)
@@ -262,6 +278,29 @@ const serviceControlWarnings: Record<string, string> = {
   restart_app: '重启应用将短暂中断该节点的全部服务（约数秒）',
 }
 
+// 服务控制卡片是自定义单选组（role=radiogroup + role=radio）：整组只有一个
+// tab stop（roving tabindex），方向键移动并切换——原生 radio 组/APG 语义，
+// 不再要求四张卡片逐个 Tab 且方向键无效。
+const serviceCardRefs = new Map<string, HTMLElement>()
+const setServiceCardRef = (value: string, el: unknown): void => {
+  if (el instanceof HTMLElement) serviceCardRefs.set(value, el)
+  else serviceCardRefs.delete(value)
+}
+const serviceControlTabindex = (value: string): number =>
+  rovingTabindex(serviceControlOptions.map((item) => item.value), serviceControlAction.value, () => false, value)
+const selectServiceAction = (value: string): void => {
+  if (serviceControlLoading.value) return // 指令在途时冻结选择，避免与已下发动作错位
+  serviceControlAction.value = value
+}
+const onServiceCardKeydown = (event: KeyboardEvent): void => {
+  if (event.repeat) return
+  const next = nextRadioValue(serviceControlOptions.map((item) => item.value), serviceControlAction.value, () => false, event.key)
+  if (next === null) return
+  event.preventDefault()
+  selectServiceAction(next)
+  serviceCardRefs.get(next)?.focus()
+}
+
 const openServiceControlDialog = (node: ClusterNode): void => {
   serviceControlNode.value = node
   serviceControlAction.value = ''
@@ -270,25 +309,31 @@ const openServiceControlDialog = (node: ClusterNode): void => {
 }
 
 const executeServiceControl = async (): Promise<void> => {
+  if (isReadOnlyProp.value) return
   if (!serviceControlNode.value || !serviceControlAction.value) return
-  // 2026-09-20 用户裁定:执行服务控制前必须二次确认(停止 Caddy/重启应用
-  // 会中断从节点服务),复用本文件 confirmAction(与清除指纹钉同格)。
-  const option = serviceControlOptions.find((o) => o.value === serviceControlAction.value)
-  const nodeName = serviceControlNodeLive.value?.name ?? `#${serviceControlNode.value.id}`
-  const confirmed = await confirmAction(
-    `确定对节点“${nodeName}”执行「${option?.label ?? serviceControlAction.value}」吗？${option?.description ?? ''}`,
-    '服务控制确认',
-  )
-  if (!confirmed) return
+  // 占位先于确认——双击「执行操作」不再叠加两个确认框/重复下发。
+  if (serviceControlLoading.value) {
+    ElMessage.warning('服务控制请求正在执行，请稍候')
+    return
+  }
   serviceControlLoading.value = true
   try {
+    // 2026-09-20 用户裁定:执行服务控制前必须二次确认(停止 Caddy/重启应用
+    // 会中断从节点服务),复用本文件 confirmAction(与清除指纹钉同格)。
+    const option = serviceControlOptions.find((o) => o.value === serviceControlAction.value)
+    const nodeName = serviceControlNodeLive.value?.name ?? `#${serviceControlNode.value.id}`
+    const confirmed = await confirmAction(
+      `确定对节点“${nodeName}”执行「${option?.label ?? serviceControlAction.value}」吗？${option?.description ?? ''}`,
+      '服务控制确认',
+    )
+    if (!confirmed) return
     await request.post(`/cluster/nodes/${serviceControlNode.value.id}/service`, { action: serviceControlAction.value })
     serviceControlDialogVisible.value = false
     serviceControlPinMismatch.value = false
     mfaAwareSuccess('服务控制指令已下发')
   } catch (error: unknown) {
     // 全局拦截器已弹 toast；428 MFA 重试也由全局处理。
-    // C-3：指纹不匹配（后端 502 专属文案）在弹框内提供按节点重钉通道。
+    // 指纹不匹配（后端 502 专属文案）在弹框内提供按节点重钉通道。
     if (error instanceof Error && error.message.includes('证书指纹不匹配')) {
       serviceControlPinMismatch.value = true
     }
@@ -298,18 +343,19 @@ const executeServiceControl = async (): Promise<void> => {
   }
 }
 
-// C-3：清除该节点的 TOFU 证书指纹钉（POST /cluster/nodes/:id/forget-pin），
+// 清除该节点的 TOFU 证书指纹钉（POST /cluster/nodes/:id/forget-pin），
 // 成功后留在弹框内便于直接重试服务控制。
 const forgetNodePin = async (): Promise<void> => {
   const node = serviceControlNodeLive.value
-  if (!node || nodePinForgetting.value) return
-  const confirmed = await confirmAction(
-    `确定清除对节点“${node.name}”的证书指纹钉吗？下次服务控制将按该节点当前证书重新验证并钉扎。`,
-    '清除节点证书指纹',
-  )
-  if (!confirmed) return
+  if (isReadOnlyProp.value || !node || nodePinForgetting.value) return
+  // 占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
   nodePinForgetting.value = true
   try {
+    const confirmed = await confirmAction(
+      `确定清除对节点“${node.name}”的证书指纹钉吗？下次服务控制将按该节点当前证书重新验证并钉扎。`,
+      '清除节点证书指纹',
+    )
+    if (!confirmed) return
     const response = await request.post<ActionResponse>(`/cluster/nodes/${node.id}/forget-pin`)
     mfaAwareSuccess(response.message || '已清除该节点的证书指纹，下次服务控制将按其当前证书重新钉扎')
     serviceControlPinMismatch.value = false
@@ -322,19 +368,33 @@ const forgetNodePin = async (): Promise<void> => {
   }
 }
 const registerToken = ref<ClusterRegisterToken | null>(null)
-// A6-S3：readOnlyReason 为 unknown（token 有效但 /users/me 尚未拉取成功）时同样
-// fail-closed——集群操作在该窗口期按只读呈现。slave 除外照旧：从节点管理员仍可
-// 操作集群管理（含「提升为主节点」），不随本项收紧。
-const isReadOnlyProp = computed(() => {
-  const reason = authStore.readOnlyReason
-  return reason === 'non-admin' || reason === 'unknown'
+/** 注册令牌仅此一次下发：ESC / 右上角 X 不得静默关闭（与 API 密钥明文、
+ *  MFA 恢复码同一守卫单源）。确认后才关闭，@closed 清空内存里的令牌。 */
+const closeTokenDialog = createOneTimeSecretCloseGuard({
+  message: '注册令牌仅此一次显示，关闭后将无法再次查看。已复制并妥善保存？',
+  title: '保存注册令牌',
 })
+
+// 同一设置页跨账号复用时，一次性凭据不得留给下一位登录用户；
+// watch 仅在 user.id 实际变化时触发，同账号资料刷新不影响已打开弹框。
+watch(() => authStore.user?.id, () => {
+  registerToken.value = null
+  tokenDialogVisible.value = false
+})
+// 写门单源在 utils/clusterWriteGate（角色独立参与）：stores/auth 的
+// readOnlyReason 先判节点模式，从节点上任何角色都只得到 'slave'——只按 reason
+// 集合判会漏掉「从节点 + 非管理员」，把破坏性按钮呈现为可写（点击 403）。
+// unknown（信息未就绪）fail-closed；从节点 admin 仍可操作集群管理。
+const isReadOnlyProp = computed(() => clusterWriteBlocked({
+  readOnlyReason: authStore.readOnlyReason,
+  role: authStore.user?.role,
+}))
 const clusterModeChanging = computed(() => syncing.value || promoting.value || modeLoading.value)
-const fetchStatus = async (): Promise<ClusterStatus> => {
+const fetchStatus = async (roundSignal?: AbortSignal): Promise<ClusterStatus> => {
   const requestSeq = ++requestSequence
-  const response = await request.get<APIResponse<ClusterStatus>>('/cluster/status', { signal: clusterPolling.signal, silent: true })
+  const response = await request.get<APIResponse<ClusterStatus>>('/cluster/status', { signal: roundSignal ?? clusterPolling.signal, silent: true })
   const data = response.data
-  // FE40-D1-4：协议违例用 TypeError（Error 保留给业务失败）。
+  // 协议违例用 TypeError（Error 保留给业务失败）。
   if (!data) throw new TypeError('集群状态响应缺少数据')
   if (!disposed && requestSeq === requestSequence) {
     status.value = data
@@ -343,24 +403,24 @@ const fetchStatus = async (): Promise<ClusterStatus> => {
   return data
 }
 
-const fetchNodes = async (): Promise<void> => {
+const fetchNodes = async (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return
   const requestSeq = ++nodesRequestSequence
   nodesLoading.value = true
   try {
-    const response = await request.get<APIResponse<readonly ClusterNodeWithSyncError[]>>('/cluster/nodes', { signal: clusterPolling.signal, silent: true })
+    const response = await request.get<APIResponse<readonly ClusterNodeWithSyncError[]>>('/cluster/nodes', { signal: roundSignal ?? clusterPolling.signal, silent: true })
     if (!disposed && requestSeq === nodesRequestSequence) nodes.value = response.data ?? []
   } finally {
     if (!disposed && requestSeq === nodesRequestSequence) nodesLoading.value = false
   }
 }
 
-const refreshCluster = async (): Promise<void> => {
+const refreshCluster = async (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return
-  const currentStatus = await fetchStatus()
+  const currentStatus = await fetchStatus(roundSignal)
   if (disposed) return
   if (currentStatus.node_mode === 'master') {
-    await fetchNodes()
+    await fetchNodes(roundSignal)
   } else {
     nodes.value = []
   }
@@ -392,6 +452,7 @@ const registerAsSlave = async (input: ClusterRegistrationInput): Promise<void> =
     if (!confirmed) return
     await request.post<APIResponse<ClusterModeResult>>('/cluster/mode', { mode: 'slave', ...input })
     mfaAwareSuccess('注册请求已提交，等待主节点审批')
+    registrationSucceeded.value += 1
     await clusterPolling.run()
   } catch (error: unknown) {
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
@@ -407,7 +468,7 @@ const promoteToMaster = async (): Promise<void> => {
   try {
     const confirmed = await confirmAction('将脱离集群，当前数据成为权威数据', '确认提升为主节点')
     if (!confirmed) return
-    // CL10-N18:Promote 在途同步排空(含 apply+Caddy 重载)可超默认 30s——
+    // Promote 在途同步排空(含 apply+Caddy 重载)可超默认 30s——
     // 放大至 120s,防前端超时误报失败诱导重复点击(后端随后实际成功)。
     await request.post<ActionResponse>('/cluster/promote', undefined, { timeout: 120000 })
     mfaAwareSuccess('已提升为主节点')
@@ -421,12 +482,21 @@ const promoteToMaster = async (): Promise<void> => {
 }
 
 const syncNow = async (): Promise<void> => {
-  if (isReadOnlyProp.value || clusterModeChanging.value) return
-  const ok = await confirmAction('立即从主节点拉取并应用最新配置？', '手动同步')
-  if (!ok) return
+  if (isReadOnlyProp.value) return
+  // 占位先于确认——双击「立即同步」不再叠加确认框或重复拉取。
+  if (syncing.value) {
+    ElMessage.warning('同步请求正在执行，请稍候')
+    return
+  }
+  if (clusterModeChanging.value) return
   syncing.value = true
   try {
-    const response = await request.post<APIResponse<ClusterSyncResult>>('/cluster/sync/pull')
+    const ok = await confirmAction('立即从主节点拉取并应用最新配置？', '手动同步')
+    if (!ok) return
+    // /cluster/sync/pull 同样含「拉快照 → 应用 → Caddy 重载」，与
+    // Promote 同口径放大到 120s——沿用全局 30s 会在后端成功时先超时误报失败，
+    // 诱导用户重复点击（后端可能仍在应用）。
+    const response = await request.post<APIResponse<ClusterSyncResult>>('/cluster/sync/pull', undefined, { timeout: 120000 })
     const result = response.data
     if (result) mfaAwareSuccess(result.changed ? `同步完成，已应用版本 ${result.applied_version}` : '当前已是最新配置')
     // fetchStatus 为 silent 请求，失败仅记录日志，避免逃逸为未处理的 rejection
@@ -439,24 +509,23 @@ const syncNow = async (): Promise<void> => {
   }
 }
 
-// C-2：PinMismatch 补救入口——主节点更换管理面板证书后从节点同步持续指纹不匹配，
+// PinMismatch 补救入口——主节点更换管理面板证书后从节点同步持续指纹不匹配，
 // 「重新注册」复用同一 TOFU transport 无法自救；清空本节点 TOFU 指纹钉
 // （POST /cluster/forget-pins）后，下一同步周期按主节点当前证书重新验证并钉扎。
 const forgettingPins = ref(false)
 const forgetPins = async (): Promise<void> => {
-  if (isReadOnlyProp.value || forgettingPins.value) return
-  try {
-    await ElMessageBox.confirm(
-      '将清除本节点保存的全部主节点 TLS 证书指纹钉（TOFU），下一同步周期将按主节点当前证书重新验证并钉扎。是否继续？',
-      '清除证书指纹',
-      { confirmButtonText: '清除并重新钉扎', cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch {
-    // 取消弹框：不做任何操作
+  if (isReadOnlyProp.value) return
+  // 占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
+  if (forgettingPins.value) {
+    ElMessage.warning('清除指纹请求正在执行，请稍候')
     return
   }
   forgettingPins.value = true
   try {
+    if (!(await confirmAction(
+      '将清除本节点保存的全部主节点 TLS 证书指纹钉（TOFU），下一同步周期将按主节点当前证书重新验证并钉扎。是否继续？',
+      '清除证书指纹',
+    ))) return
     await request.post<ActionResponse>('/cluster/forget-pins')
     mfaAwareSuccess('已清除全部主节点证书指纹，下次同步将按当前证书重新钉扎')
     // 刷新状态：last_sync_error 的 pin_mismatch 将随下一同步周期成功而自清
@@ -470,7 +539,10 @@ const forgetPins = async (): Promise<void> => {
 }
 
 const generateRegisterToken = async (): Promise<void> => {
-  if (isReadOnlyProp.value) return
+  // 重入守卫：同一 tick 内的双击不会等渲染出 loading —— 每枚令牌独立入库且
+  // 一次性有效，两次请求会留下第二枚界面再也查不到的令牌（凭据卫生）。
+  // 「占位先于确认」与本文件其余写入口同构。
+  if (isReadOnlyProp.value || tokenLoading.value) return
   tokenLoading.value = true
   try {
     const response = await request.post<APIResponse<ClusterRegisterToken>>('/cluster/register-tokens')
@@ -489,7 +561,7 @@ const generateRegisterToken = async (): Promise<void> => {
 const copyRegisterToken = async (): Promise<void> => {
   const token = registerToken.value?.token
   if (!token) return
-  // FE40-D1-3：复用 utils/copy 的 copyText（降级路径/类型收口与全站一致）。
+  // 复用 utils/copy 的 copyText（降级路径/类型收口与全站一致）。
   const ok = await copyText(token)
   if (ok) {
     mfaAwareSuccess('注册令牌已复制')
@@ -498,28 +570,32 @@ const copyRegisterToken = async (): Promise<void> => {
   }
 }
 
-const syncSwitchLabels: Record<string, string> = {
-  sync_users: '系统数据',
-  sync_rules: '负载均衡规则',
-  sync_security: '安全防护',
-}
+// 三分类标签单源 utils/clusterSyncSwitches（与 ClusterMasterPanel 开关行同源，
+// 原父子各持一份字面量，改名/新增必漏一侧致确认文案与实际开关不符）。
+const syncSwitchLabels: Record<string, string> = Object.fromEntries(
+  CLUSTER_SYNC_SWITCHES.map((item) => [item.key, item.label]),
+)
 
 const updateSyncField = async (field: string, value: boolean): Promise<void> => {
   if (isReadOnlyProp.value) return
-  const label = syncSwitchLabels[field] ?? field
-  const action = value ? '开启' : '关闭'
-  try {
-    await ElMessageBox.confirm(
-      `确定要${action}「${label}」的集群同步吗？${value ? '开启后主节点该类变更将同步到所有从节点。' : '关闭后从节点将保留本地数据，不再接收主节点该类变更。'}`,
-      '同步设置确认',
-      { confirmButtonText: action, cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch {
-    await fetchStatus().catch((error: unknown) => console.error('Failed to refresh cluster status:', error))
+  // 占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
+  // 复位开关显示。
+  if (clusterSettingsSaving.value) {
+    ElMessage.warning('同步设置正在保存，请稍候')
     return
   }
-  settingsLoading.value = true
+  const label = hasOwn(syncSwitchLabels, field) ? syncSwitchLabels[field] : field
+  const action = value ? '开启' : '关闭'
+  clusterSettingsSaving.value = true
   try {
+    const confirmed = await confirmAction(
+      `确定要${action}「${label}」的集群同步吗？${value ? '开启后主节点该类变更将同步到所有从节点。' : '关闭后从节点将保留本地数据，不再接收主节点该类变更。'}`,
+      '同步设置确认',
+    )
+    if (!confirmed) {
+      await fetchStatus().catch((error: unknown) => console.error('Failed to refresh cluster status:', error))
+      return
+    }
     await request.put<ActionResponse>('/cluster/settings', { [field]: value })
     mfaAwareSuccess('同步设置已更新')
     await fetchStatus().catch((error: unknown) => console.error('Failed to refresh cluster status:', error))
@@ -528,13 +604,24 @@ const updateSyncField = async (field: string, value: boolean): Promise<void> => 
     console.error('Failed to update sync field:', error)
     await fetchStatus().catch((refreshError: unknown) => console.error('Failed to refresh cluster status:', refreshError))
   } finally {
-    settingsLoading.value = false
+    clusterSettingsSaving.value = false
   }
 }
 
-const updateSyncInterval = async (value: number): Promise<void> => {
+const updateSyncInterval = async (value: number | null | undefined): Promise<void> => {
   if (isReadOnlyProp.value) return
-  intervalSaving.value = true
+  // 空值不得直发：后端把缺失的 sync_interval 当成「未提供」（保持现值）并回
+  // 200——界面会提示「同步间隔已更新」而实际未改。写侧与卡片提交门同口径拒绝。
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    ElMessage.warning('请输入 10–86400 之间的同步间隔')
+    return
+  }
+  // 与开关保存共用同一写通道门（并发落库会互相覆盖 sync_interval/开关字段）
+  if (clusterSettingsSaving.value) {
+    ElMessage.warning('同步设置正在保存，请稍候')
+    return
+  }
+  clusterSettingsSaving.value = true
   try {
     await request.put<ActionResponse>('/cluster/settings', { sync_interval: value })
     mfaAwareSuccess('同步间隔已更新')
@@ -543,13 +630,16 @@ const updateSyncInterval = async (value: number): Promise<void> => {
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
     console.error('Failed to update sync interval:', error)
   } finally {
-    intervalSaving.value = false
+    clusterSettingsSaving.value = false
   }
 }
 
+// 「入口取占位 → 确认 → 请求 → finally 释放」。占位（pendingNodeId）必须
+// 先于确认弹框取得——原实现在确认之后才占位，双击审批/拒绝/删除会叠加两个确认框，
+// 确认第二个时动作被静默丢弃（用户以为已处理）。与 TaskMonitor.runTaskAction
+// 同范式。
 const runNodeAction = async (node: ClusterNode, action: 'approve' | 'reject' | 'remove'): Promise<void> => {
-  if (isReadOnlyProp.value || pendingNodeId.value !== null) return
-  pendingNodeId.value = node.id
+  // 占位已由调用方取得；本函数只负责请求与释放。
   try {
     if (action === 'approve') {
       await request.post<ActionResponse>(`/cluster/nodes/${node.id}/approve`)
@@ -566,50 +656,49 @@ const runNodeAction = async (node: ClusterNode, action: 'approve' | 'reject' | '
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
     console.error('Failed to run node action:', error)
   } finally {
-    pendingNodeId.value = null
+    if (pendingNodeId.value === node.id) pendingNodeId.value = null
   }
 }
 
-// R63 D-N1：审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
-// 入集群并开始同步），与拒绝/删除对称补二次确认，防 pending 列表误点。
-const approveNode = async (node: ClusterNode): Promise<void> => {
+const confirmAndRunNodeAction = async (
+  node: ClusterNode,
+  action: 'approve' | 'reject' | 'remove',
+  message: string,
+  title: string,
+): Promise<void> => {
+  if (isReadOnlyProp.value) return
+  if (pendingNodeId.value !== null) {
+    ElMessage.warning('节点操作正在进行，请稍候')
+    return
+  }
+  pendingNodeId.value = node.id
   try {
-    const confirmed = await confirmAction(`确定确认节点“${node.name}”加入集群吗？确认后该节点将开始同步。`, '审批确认')
-    if (confirmed) await runNodeAction(node, 'approve')
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to approve node:', error)
+    if (!(await confirmAction(message, title))) return
+    await runNodeAction(node, action)
+  } finally {
+    if (pendingNodeId.value === node.id) pendingNodeId.value = null
   }
 }
+
+// 审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
+// 入集群并开始同步），与拒绝/删除对称补二次确认，防 pending 列表误点。
+const approveNode = (node: ClusterNode): Promise<void> =>
+  confirmAndRunNodeAction(node, 'approve', `确定确认节点“${node.name}”加入集群吗？确认后该节点将开始同步。`, '审批确认')
 
 const requestRegistration = (): void => {
   if (isReadOnlyProp.value) return
   registrationRequest.value += 1
 }
 
-const rejectNode = async (node: ClusterNode): Promise<void> => {
-  try {
-    const confirmed = await confirmAction(`确定拒绝节点“${node.name}”吗？`, '拒绝确认')
-    if (confirmed) await runNodeAction(node, 'reject')
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to reject node:', error)
-  }
-}
+const rejectNode = (node: ClusterNode): Promise<void> =>
+  confirmAndRunNodeAction(node, 'reject', `确定拒绝节点“${node.name}”吗？`, '拒绝确认')
 
-const removeNode = async (node: ClusterNode): Promise<void> => {
-  try {
-    const confirmed = await confirmAction(`确定删除节点“${node.name}”吗？删除后该节点将无法继续同步。`, '删除确认')
-    if (confirmed) await runNodeAction(node, 'remove')
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to remove node:', error)
-  }
-}
+const removeNode = (node: ClusterNode): Promise<void> =>
+  confirmAndRunNodeAction(node, 'remove', `确定删除节点“${node.name}”吗？删除后该节点将无法继续同步。`, '删除确认')
 
 const loginNode = async (node: ClusterNode): Promise<void> => {
   if (isReadOnlyProp.value || node.status !== 'online' || loginNodeId.value !== null) return
-  // R72 六次：403（未启用 MFA）预检——文案指向正确入口（用户管理）。
+  // 403（未启用 MFA）预检——文案指向正确入口（用户管理）。
   // v2.3.0:OIDC 会话豁免(与后端 cluster_ticket 两道门同口径)——二因子
   // 由 IdP 承担,本地 MFA 概念不适用。
   if (!authStore.user?.mfa_enabled && authStore.user?.auth_provider !== 'oidc') {
@@ -618,7 +707,7 @@ const loginNode = async (node: ClusterNode): Promise<void> => {
   }
   loginNodeId.value = node.id
   try {
-    // R72 九次（用户反馈：先弹验证码再开页面）：票据请求先行、开窗后置——
+    // （用户反馈：先弹验证码再开页面）：票据请求先行、开窗后置——
     // 此前先 window.open 再 POST，428（每次都要求 MFA）时验证码弹框期间
     // 空白页已挂在旁边且取消后不一定关闭。现在 428 由全局拦截器弹码（无窗
     // 口），验证成功 → 拦截器自动重试 → 成功后才开窗导航；失败/取消则根本
@@ -644,33 +733,50 @@ const loginNode = async (node: ClusterNode): Promise<void> => {
   }
 }
 
-const openAccessUrlDialog = (node: ClusterNode): void => {
-  if (isReadOnlyProp.value || accessUrlSaving.value) return
-  editingAccessUrlNode.value = node
-  accessUrlDialogVisible.value = true
+const openNodeConfigDialog = (node: ClusterNode): void => {
+  if (isReadOnlyProp.value || nodeConfigSaving.value) return
+  editingNodeConfig.value = node
+  nodeConfigDialogVisible.value = true
 }
 
-const closeAccessUrlDialog = (): void => {
-  if (accessUrlSaving.value) return
-  accessUrlDialogVisible.value = false
-  editingAccessUrlNode.value = null
+const closeNodeConfigDialog = (): void => {
+  if (nodeConfigSaving.value) return
+  nodeConfigDialogVisible.value = false
+  editingNodeConfig.value = null
 }
 
-const updateAccessUrl = async (accessUrl: string): Promise<void> => {
-  const node = editingAccessUrlNode.value
-  if (!node || isReadOnlyProp.value || accessUrlSaving.value) return
-  accessUrlSaving.value = true
+const updateNodeConfig = async (payload: { accessUrl: string; lat: number; lon: number; siteChanged: boolean }): Promise<void> => {
+  const node = editingNodeConfigLive.value
+  if (!node || isReadOnlyProp.value || nodeConfigSaving.value) return
+  nodeConfigSaving.value = true
   try {
-    await request.put<ActionResponse>(`/cluster/nodes/${node.id}/access-url`, { access_url: accessUrl })
-    mfaAwareSuccess('访问地址已更新')
-    accessUrlDialogVisible.value = false
-    editingAccessUrlNode.value = null
+    // 两个写端点在权限/MFA 上同构；顺序提交，任一失败保留弹框与已完成项，
+    // 重试时同值写入为 no-op（站点坐标仅在真实变更时提交，不 bump 集群版本）。
+    const accessChanged = payload.accessUrl !== (node.access_url ?? '')
+    if (accessChanged) {
+      await request.put<ActionResponse>(`/cluster/nodes/${node.id}/access-url`, { access_url: payload.accessUrl })
+    }
+    if (payload.siteChanged) {
+      await request.put<ActionResponse>(`/cluster/nodes/${node.id}/site`, {
+        server_map_lat: payload.lat,
+        server_map_lon: payload.lon,
+      })
+    }
+    if (accessChanged && payload.siteChanged) {
+      mfaAwareSuccess('节点配置已更新，站点坐标下一同步周期生效')
+    } else if (accessChanged) {
+      mfaAwareSuccess('访问地址已更新')
+    } else {
+      mfaAwareSuccess('节点站点坐标已保存，下一同步周期生效')
+    }
+    nodeConfigDialogVisible.value = false
+    editingNodeConfig.value = null
     await fetchNodes()
   } catch (error: unknown) {
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to update access url:', error)
+    console.error('Failed to update node config:', error)
   } finally {
-    accessUrlSaving.value = false
+    nodeConfigSaving.value = false
   }
 }
 
@@ -683,9 +789,9 @@ const clusterPollingErrorDescription = computed(() => {
     : `最后错误：${lastError}`
 })
 const clusterRetrying = ref(false)
-const clusterPolling = usePollingTask(async () => {
+const clusterPolling = usePollingTask(async (task) => {
   if (!clusterPollingError.canRun()) return
-  await refreshCluster()
+  await refreshCluster(task.signal)
   clusterPollingError.clear()
 }, {
   interval: 15000,
@@ -724,22 +830,19 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.equal-height-row :deep(.el-card) { height: 100%; }
+/* el-card 高度由全局 .equal-height-row（main.css）供给，此处不重复声明 */
 .equal-height-row :deep(.el-card__body) { height: 100%; box-sizing: border-box; }
 .cluster-settings { display: flex; flex-direction: column; gap: 20px; }
 .polling-error-alert { align-self: stretch; }
-/* .polling-error-title/.polling-error-meta 已收敛 main.css（FE-R2） */
-.token-box { display: flex; align-items: center; gap: 12px; margin-top: 4px; padding: 14px; border-radius: var(--radius-md); background: var(--bg-secondary); border: 1px dashed var(--border-color, #dcdfe6); }
+/* .polling-error-title/.polling-error-meta 已收敛 main.css*/
+.token-box { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
 .token-expiry { margin-top: 10px; }
 
 .token-box code { flex: 1; min-width: 0; color: var(--text-primary); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; word-break: break-all; }
 
 /* ── 服务控制弹框 ── */
-.service-control-header { display: flex; flex-direction: column; gap: 6px; }
-.service-control-title { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; color: var(--text-primary); }
-.service-control-node { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
-.service-control-node-name { font-weight: 500; color: var(--text-primary); }
-.service-control-node-url { color: var(--text-tertiary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 280px; }
+.service-control-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.service-control-status { flex: none; }
 
 .service-control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
 .service-control-card {
@@ -754,7 +857,7 @@ onUnmounted(() => {
 .service-control-card.is-active.is-danger { border-color: var(--el-color-danger, #f56c6c); background: var(--el-color-danger-light-9, #fef0f0); }
 .service-control-card.is-active.is-warning { border-color: var(--el-color-warning, #e6a23c); background: var(--el-color-warning-light-9, #fdf6ec); }
 
-.service-control-card-icon { flex-shrink: 0; display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 8px; }
+.service-control-card-icon { flex-shrink: 0; display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 0; }
 .is-success .service-control-card-icon { color: var(--el-color-success, #67c23a); background: var(--el-color-success-light-9, #f0f9eb); }
 .is-danger .service-control-card-icon { color: var(--el-color-danger, #f56c6c); background: var(--el-color-danger-light-9, #fef0f0); }
 .is-warning .service-control-card-icon { color: var(--el-color-warning, #e6a23c); background: var(--el-color-warning-light-9, #fdf6ec); }

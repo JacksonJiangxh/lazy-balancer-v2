@@ -22,11 +22,15 @@ backup*/
 # Test UI (staging)
 test-ui/
 
-# Pre-built UI (rebuilt during docker build)
+# 镜像内前端路径（Dockerfile: COPY web/dist /app/ui），非仓库产物——本地若出现
+# 同名目录只是无意义副本。前端产物由宿主预构建（cd web && npm run build），
+# 镜像构建期**不**产出 ui/。
 ui/
 
-# Node modules (installed during docker build)
-web/node_modules/
+# Node modules（含 web/ 与仓根两种安装位置；不带前导斜杠的规则匹配任意层级）。
+# 仓根的 node_modules 由在仓库根直接跑 vitest/node 侧脚本产生（.vite/.vitest-cache
+# 转译缓存），属构建产物，不入库也不进 Docker 构建上下文。
+node_modules/
 
 # Editor and IDE
 .idea/
@@ -72,18 +76,15 @@ round*-*.png
 **/acme_accounts/
 
 # AI 辅助工具产物——不入库（本地保留）
+# （.superpowers//.opencode//.omo//.sisyphus//openspec/ 已在上文各自分组，不重复列）
+AGENTS.md
+**/AGENTS.md
 docs/superpowers/
-.superpowers/
-.opencode/
-.omo/
-.sisyphus/
-openspec/
 
 # AI agent 本地工具目录(会话规则/技能,非项目代码)
 .omp/
 .agent/
 story.md
-参考项目/
 
 # TypeScript 增量构建缓存
 *.tsbuildinfo
@@ -102,6 +103,11 @@ docs/audit/
 **/*_round[0-9]*_test.go
 **/*audit[0-9]*
 **/*round[0-9]*
+**/*audit[_-][0-9]*
+**/*round[_-][0-9]*
 **/*audit[0-9]*/
 **/*round[0-9]*/
 # <<< audit-artifact patterns
+
+# 本地开发容器覆盖层（开发线 beta 通道，不入库）
+docker-compose.override.yml

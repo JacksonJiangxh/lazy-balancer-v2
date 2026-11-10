@@ -9,7 +9,7 @@ func TestLoad_proxyPortsFromEnv(t *testing.T) {
 	t.Setenv("HTTPS_PORT", "8443")
 	t.Setenv("PANEL_PORT", "9000")
 
-	cfg := Load("")
+	cfg := loadForTest("")
 
 	if cfg.HTTPPort != 8080 {
 		t.Fatalf("HTTPPort = %d, want 8080", cfg.HTTPPort)
@@ -25,7 +25,7 @@ func TestLoad_proxyPortsFromEnv(t *testing.T) {
 func TestLoad_proxyPortsDefaultWhenUnset(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 
-	cfg := Load("")
+	cfg := loadForTest("")
 
 	if cfg.HTTPPort != 80 {
 		t.Fatalf("HTTPPort = %d, want 80", cfg.HTTPPort)
@@ -44,7 +44,7 @@ func TestLoad_proxyPortsRejectInvalidEnv(t *testing.T) {
 	t.Setenv("HTTPS_PORT", "not-a-port")
 	t.Setenv("PANEL_PORT", "70000")
 
-	cfg := Load("")
+	cfg := loadForTest("")
 
 	if cfg.HTTPPort != 80 {
 		t.Fatalf("invalid HTTP_PORT should fall back to 80, got %d", cfg.HTTPPort)

@@ -1,9 +1,9 @@
 package handlers
 
-// 第 71 轮审计域 A（rows.Err 家族收敛）：三处 RED 钉测——
-//   - SEC-C-N1：GetThreatLib 迭代错误 → 500（R36/R37「残缺列表不得以 200」口径）
-//   - F-CORE-2：GetAuditLogOptions fetchDistinct 迭代/Scan 失败须 warn+不写缓存
-//   - F-SYSR-2：DeleteUser 级联 Key 清单迭代失败须 warn（白名单缓存清扫缺口留痕）
+// 历史域 A（rows.Err 家族收敛）：三处 RED 钉测——
+//   GetThreatLib 迭代错误 → 500
+//   GetAuditLogOptions fetchDistinct 迭代/Scan 失败须 warn+不写缓存
+//   DeleteUser 级联 Key 清单迭代失败须 warn（白名单缓存清扫缺口留痕）
 
 import (
 	"context"
@@ -24,7 +24,7 @@ import (
 
 // rowsErrStubConnector 通用「语句执行成功、迭代第一步即失败」驱动：match 命中
 // 的查询返回失败行集（cols 列），其余查询返回空行集——只有循环后检查
-// rows.Err() 才能发现，否则表现为「部分数据 + 200」（与 r36_security_test.go
+// rows.Err() 才能发现，否则表现为「部分数据 + 200」（与 security_regression_02_test.go
 // 的 aggregateFailingConnector 同型，注入面通用化）。
 type rowsErrStubConnector struct {
 	match func(query string) bool
@@ -79,6 +79,7 @@ func (rowsErrZeroRows) Next([]driver.Value) error { return io.EOF }
 // captureLog 捕获标准库日志输出（services.Logf 的 warn/error 落点）。
 func captureLog(t *testing.T) *strings.Builder {
 	t.Helper()
+	preserveApplicationLogLevel(t, "info")
 	var buf strings.Builder
 	old := log.Writer()
 	log.SetOutput(&buf)
@@ -86,8 +87,8 @@ func captureLog(t *testing.T) *strings.Builder {
 	return &buf
 }
 
-// SEC-C-N1（第 71 轮 P4·家族漏收敛）：GetThreatLib 主查询迭代错误（rows.Err）
-// 时此前仍以「部分/空列表 + 200」返回——与 R36/R37 在 GetSecurityOverview/
+// GetThreatLib 主查询迭代错误（rows.Err）
+// 时此前仍以「部分/空列表 + 200」返回——与在 GetSecurityOverview/
 // ListSecurityEvents 建立的「残缺列表不得以 200」口径冲突。修复：循环后补
 // rows.Err() → 500（与 Scan 失败分支同响应形）。
 func TestThreatLib_listIterationFailureReturns500(t *testing.T) {
@@ -112,11 +113,11 @@ func TestThreatLib_listIterationFailureReturns500(t *testing.T) {
 	}
 }
 
-// F-CORE-2（第 71 轮 P5）：fetchDistinct 单行 Scan 失败此前静默丢行、迭代错误
-// （rows.Err）更整段吞掉且 fetchErr 不置位——空下拉会被 SYS42-5 缓存门放行
+// fetchDistinct 单行 Scan 失败此前静默丢行、迭代错误
+// （rows.Err）更整段吞掉且 fetchErr 不置位——空下拉会被缓存门放行
 // 写入 60s 缓存。修复：Scan 失败 warn；rows.Err 上抛 fetchErr（响应仍 200 部分
-// 数据，但缓存门按 SYS42-5 口径拦下故障轮）。本测试钉「迭代失败轮不毒化
-// 缓存」+ warn 留痕（与 audit_options_round42_test.go 的查询失败形状互补）。
+// 数据，但缓存门按口径拦下故障轮）。本测试钉「迭代失败轮不毒化
+// 缓存」+ warn 留痕（与 audit_options_regression_01_test.go 的查询失败形状互补）。
 func TestAuditLogOptions_iterationErrorRoundDoesNotPoisonCache(t *testing.T) {
 	router, _ := newAuditLogRouter(t)
 	t.Cleanup(resetAuditOptionsCacheForTest)
@@ -181,7 +182,7 @@ func TestAuditLogOptions_iterationErrorRoundDoesNotPoisonCache(t *testing.T) {
 
 // deleteKeyIterFailConnector：DeleteUser 事务链驱动桩——目标用户单行查询
 // 正常返回、api_keys 级联清单「执行成功、迭代失败」、Exec 恒成功、Begin/Commit
-// 恒成功。用于注入 keyRows 迭代错误（F-SYSR-2）。
+// 恒成功。用于注入 keyRows 迭代错误。
 type deleteKeyIterFailConnector struct{}
 
 func (deleteKeyIterFailConnector) Connect(context.Context) (driver.Conn, error) {
@@ -206,6 +207,10 @@ func (deleteKeyIterFailConn) Begin() (driver.Tx, error) {
 }
 func (deleteKeyIterFailConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
+	// 保护标记查询（DeleteUser 前置门）必须与目标用户行查询分判：标记缺失
+	// （零行）按缺省判定处理，不影响本用例要验证的级联清单迭代失败路径。
+	case strings.Contains(query, "is_setup_admin"):
+		return rowsErrZeroRows{}, nil
 	case strings.Contains(query, "FROM users WHERE id"):
 		return &deleteTargetUserRows{}, nil
 	case strings.Contains(query, "FROM api_keys WHERE created_by"):
@@ -224,20 +229,22 @@ func (deleteKeyFakeTx) Rollback() error { return nil }
 
 type deleteTargetUserRows struct{ done bool }
 
-func (deleteTargetUserRows) Columns() []string { return []string{"username", "role", "is_enabled"} }
-func (*deleteTargetUserRows) Close() error     { return nil }
+func (deleteTargetUserRows) Columns() []string {
+	return []string{"username", "role", "is_enabled", "auth_provider"}
+}
+func (*deleteTargetUserRows) Close() error { return nil }
 func (r *deleteTargetUserRows) Next(dest []driver.Value) error {
 	if r.done {
 		return io.EOF
 	}
 	r.done = true
-	dest[0], dest[1], dest[2] = "victim", "user", int64(1)
+	dest[0], dest[1], dest[2], dest[3] = "victim", "user", int64(1), "local"
 	return nil
 }
 
-// F-SYSR-2（第 71 轮 P5）：DeleteUser 级联 Key 清单迭代失败此前静默——部分
+// DeleteUser 级联 Key 清单迭代失败此前静默——部分
 // 删除的 Key 白名单解析缓存不清扫（孤儿缓存驻留）。修复：keyRows.Err() warn
-// 留痕（删除照常——warn-only 口径，与 SEC-A-F1 fail-closed 不同：本清单仅驱动
+// 留痕（删除照常——warn-only 口径，与 fail-closed 不同：本清单仅驱动
 // 缓存清扫，孤儿缓存无越权面）。
 func TestDeleteUser_cascadeKeyIterationErrorWarns(t *testing.T) {
 	h := newBackupTestHandlers(t)

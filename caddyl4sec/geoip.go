@@ -1,0 +1,519 @@
+// Package caddyl4sec 提供 L4（TCP）安全链路的 Caddy 模块：
+//
+//   - layer4.handlers.lb_l4_sec：TCP 安全路由的事件合成/上报与连接计数
+//     （阶段 0/1 IP 控制在 L4 的消费端，路由形状见 L4 阶段契约 C2）；
+//   - layer4.matchers.lb_geoip：连接级 GeoIP 匹配器（查库失败/缺库 fail-open，
+//     用户已裁定）；
+//   - admin.api.lb_l4_conn_stats：GET /lb/l4-conn-stats 连接计数端点（契约
+//     C3）+ GET /lb/l4-shipper-stats 投递/丢弃计数端点（丢弃可观测）。
+//
+// 与 caddygeoip（HTTP 侧）共享同一跨进程契约：合成审计事件行经 Unix socket
+// IPC 投递面板 POST /security-events/ingest（换行分隔 JSON，204=本批 DB
+// commit 完成），失败整批落 fallback spool 供补采。两条事件线互不复用实现
+// （跨 Go module 无共享包；本包是 caddygeoip auditwriter 的 L4 子集移植：
+// 无 coraza 快照、无审计文件兜底层）。
+package caddyl4sec
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/lionsoul2014/ip2region/binding/golang/service"
+	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
+	"github.com/mholt/caddy-l4/layer4"
+	"go.uber.org/zap"
+	"lazy-balancer-v2/geoipnames"
+)
+
+// l4DefaultXdbPath 与 caddygeoip GeoIPHandler 的容器默认一致（自定义 data_dir
+// 部署由渲染侧显式发射 xdb_path）。
+const l4DefaultXdbPath = "/app/data/ip2region.xdb"
+
+// locOverseas 是地域匹配哨兵：与 HTTP 侧 X-LB-GeoIP-Loc 的 fail-closed 兜底
+// 值同值（「海外」）。
+const locOverseas = "海外"
+
+// normalizeCountryKey 国家列归一（与 caddygeoip normalizeTrafficCountryKey
+// 同口径：「中国」保留为国内判定键，其余经 geoipnames.NormalizeCountry 异体
+// 折叠——Reserved/空/0 归空串，海外行发规范英文名）。跨模块无共享包，漂移由
+// 两侧对 geoipnames 单源表依赖约束。
+func normalizeCountryKey(country string) string {
+	country = strings.TrimSpace(country)
+	if country == "中国" {
+		return country
+	}
+	return geoipnames.NormalizeCountry(country)
+}
+
+// regionRow 是 xdb region 行的解析投影（caddygeoip geoIPRegionFields 的 L4
+// 子集：GeoIP 匹配与国家桶只需要 country/province/city/loc）。
+type regionRow struct {
+	country  string
+	province string
+	city     string
+	loc      string
+}
+
+// parseRegionRow 解析 xdb 行：国家列归一；省/市列经 geoipnames 发射侧规范化
+// （台湾城市误入省列时城市列取省列值）；省列归一为空时城市一律置空（树不变
+// 式，不得发射树侧不可表达的「/城市」Loc）；Loc 与 HTTP 侧 geoipLocFor 同构：
+// 国内=省 或 省/市，海外=归一国名，国家列不可解析=「海外」哨兵。少于 5 列的
+// 残行判解析失败（false）。
+func parseRegionRow(region string) (regionRow, bool) {
+	fields := strings.Split(region, "|")
+	if len(fields) < 5 {
+		return regionRow{}, false
+	}
+	out := regionRow{country: normalizeCountryKey(fields[0])}
+	if raw := fields[1]; raw != "" && raw != "0" {
+		out.province = geoipnames.ProvinceForEmit(raw)
+	}
+	if geoipnames.IsTaiwanCity(strings.TrimSpace(fields[1])) {
+		out.city = strings.TrimSpace(fields[1])
+	} else if c := strings.TrimSpace(fields[2]); c != "" && c != "0" {
+		out.city = geoipnames.CityForEmit(c)
+	}
+	if out.province == "" {
+		out.city = ""
+	}
+	switch {
+	case out.country == "中国":
+		if out.city != "" {
+			out.loc = out.province + "/" + out.city
+		} else {
+			out.loc = out.province
+		}
+	case out.country != "":
+		out.loc = out.country
+	default:
+		out.loc = locOverseas
+	}
+	return out, true
+}
+
+// geoipLocMatches 地域条目匹配：与 HTTP 侧 geoipLocOperator 的锚定正则语义
+// 同构（跨模块无共享包，L4 用等价字符串判定）——
+//   - 「海外」条目：已解析海外行（归一国名或 Reserved 兜底哨兵）命中，国内不命中
+//     （HTTP 侧哨兵∪树全集展开在本判定下等价：海外行 Loc 恒为裸国名，无「/」后缀）；
+//   - 含「/」条目：精确匹配（省-市）；
+//   - 其余条目：前缀匹配（省条目命中省 或 省/市 形态的 Loc）。
+//
+// 国家列不可解析的行（regionRow 解析失败/查库失败）在 Match 入口已 fail-open
+// 返回，不进入本函数——与 HTTP 侧 fail-closed 哨兵的差异为契约裁定的 L4
+// fail-open 语义。
+func geoipLocMatches(country, loc string, countries []string) bool {
+	for _, entry := range countries {
+		if entry == locOverseas {
+			if country != "中国" {
+				return true
+			}
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if loc == entry {
+				return true
+			}
+			continue
+		}
+		if loc == entry || strings.HasPrefix(loc, entry+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// —— 共享 searcher 单例（caddygeoip sharedGeoIPSearcher 的移植）——
+//
+// 每条 GeoIP 规则各开一份 Ip2Region 会各持 xdb fd + vIndex 缓冲，重载期新旧
+// 并存再翻倍；fd 耗尽 → Provision 降级 fail-open。同路径进程级共享一份，
+// modTime/size 记录建库形态（xdb rename 换库后文件形态变化即重建），被替换
+// 旧实例延迟关闭（重载窗口内在途查询继续服务，窗口过后 Close 收敛）。
+// stat 失败/重建失败按 fail-stale 返回旧实例（返回 error 会让 matcher 全量
+// 降级 fail-open——比短暂旧数据更伤），并标记下次 Provision 强制重建。
+// 双协议：缓存键为（v4 路径, v6 有效路径）二元组，v6 形态（modTime/size）
+// 变化同样触发重建；v6 健康门（xdb 头校验）失败降级为 v6 禁用（v6 查询
+// fail-open 放行，用户裁定语义），v4 链不受影响。
+// 采样是纯读路径：探测（v6 头读 + v4/v6 stat）按 TTL 窗口节流，窗口内复用
+// 上次探测投影（首批与过界实测），换库收敛最多延迟一个窗口（reloader 周期
+// 远大于 TTL）；v4 stat 失败不落缓存，失败形态逐采样实测。
+type sharedSearcherEntry struct {
+	searcher     *service.Ip2Region
+	modTime      time.Time
+	size         int64
+	v6ModTime    time.Time
+	v6Size       int64
+	needsRebuild bool
+}
+
+var (
+	sharedSearcherMu       sync.Mutex
+	sharedSearchers        = map[string]*sharedSearcherEntry{}
+	sharedOldInstanceDelay = 60 * time.Second
+)
+
+// keyedWarnThrottle 同键同原因告警节流：首次立即，其后每窗口一条。每条地域
+// 规则各调一次 sharedGeoIPSearcher，不节流会按规则数放大重复 WARN。
+type keyedWarnThrottle struct {
+	mu      sync.Mutex
+	last    map[string]time.Time
+	window  time.Duration
+	nowFunc func() time.Time
+}
+
+func newKeyedWarnThrottle(window time.Duration) *keyedWarnThrottle {
+	return &keyedWarnThrottle{last: map[string]time.Time{}, window: window, nowFunc: time.Now}
+}
+
+func (t *keyedWarnThrottle) allow(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.nowFunc()
+	if last, ok := t.last[key]; ok && now.Sub(last) < t.window {
+		return false
+	}
+	t.last[key] = now
+	return true
+}
+
+func (t *keyedWarnThrottle) clearPrefix(prefix string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for k := range t.last {
+		if strings.HasPrefix(k, prefix) {
+			delete(t.last, k)
+		}
+	}
+}
+
+var searcherWarnThrottle = newKeyedWarnThrottle(time.Minute)
+
+func searcherWarn(reason, path, msg string, fields ...zap.Field) {
+	if !searcherWarnThrottle.allow(path + "|" + reason) {
+		return
+	}
+	caddy.Log().Named("l4sec").Warn(msg, fields...)
+}
+
+// 探测 I/O 缝（生产直连真实实现；测试换计数桩——探测节流钉测按计数断言
+// 头读/stat 不随采样次数线性增长）。
+var (
+	v6HeaderLoadFromFile = xdb.LoadHeaderFromFile
+	probeFileStat        = os.Stat
+)
+
+// sharedSearcherProbeTTL 探测节流窗口：窗口内采样复用上次（v6 头读 + 双 stat）
+// 探测投影，首批与窗口过界实测。换库形态判定的窗口内延迟不影响收敛时序
+// （ip2regionupdate reloader 周期远大于本 TTL）。
+var sharedSearcherProbeTTL = 5 * time.Second
+
+// searcherProbe 是一次探测的投影：v6 健康门判定 + v4/v6 文件形态。调用方据此
+// 完成缓存命中判定与重建元数据，窗口内不再触碰磁盘。
+type searcherProbe struct {
+	v6Effective string
+	v4ModTime   time.Time
+	v4Size      int64
+	v6ModTime   time.Time
+	v6Size      int64
+	v6Missing   bool
+	v4Err       error
+	probedAt    time.Time
+}
+
+// searcherProbeCache 探测结果 TTL 缓存（键=（v4 路径, v6 原始路径））：窗口内
+// 采样复用上次探测，过界条目由调用方重新实测。v4 stat 失败不落缓存（失败
+// 形态逐采样实测，fail-stale/unavailable 语义不变）。
+type searcherProbeCache struct {
+	mu      sync.Mutex
+	entries map[string]searcherProbe
+	nowFunc func() time.Time
+}
+
+func newSearcherProbeCache() *searcherProbeCache {
+	return &searcherProbeCache{entries: map[string]searcherProbe{}, nowFunc: time.Now}
+}
+
+func (c *searcherProbeCache) get(path, v6Path string) (searcherProbe, bool) {
+	key := path + "\x00" + v6Path
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	probe, ok := c.entries[key]
+	if !ok {
+		return searcherProbe{}, false
+	}
+	if c.nowFunc().Sub(probe.probedAt) >= sharedSearcherProbeTTL {
+		delete(c.entries, key)
+		return searcherProbe{}, false
+	}
+	return probe, true
+}
+
+func (c *searcherProbeCache) put(path, v6Path string, probe searcherProbe) {
+	probe.probedAt = c.nowFunc()
+	c.mu.Lock()
+	c.entries[path+"\x00"+v6Path] = probe
+	c.mu.Unlock()
+}
+
+var sharedSearcherProbes = newSearcherProbeCache()
+
+// probeSearcherFiles 做一次真实探测：v6 健康门（头读）+ v4/v6 文件 stat。
+// v4 stat 失败只投影给本次调用（不落缓存）。
+func probeSearcherFiles(path, v6Path string) searcherProbe {
+	probe := searcherProbe{v6Effective: healthyV6Path(v6Path, path)}
+	st, err := probeFileStat(path)
+	if err != nil {
+		probe.v4Err = err
+		return probe
+	}
+	probe.v4ModTime, probe.v4Size = st.ModTime(), st.Size()
+	if probe.v6Effective == "" {
+		return probe
+	}
+	if v6st, v6err := probeFileStat(probe.v6Effective); v6err == nil {
+		probe.v6ModTime, probe.v6Size = v6st.ModTime(), v6st.Size()
+	} else {
+		probe.v6Missing = true
+	}
+	return probe
+}
+
+// sharedGeoIPSearcher 返回按（v4 路径, v6 有效路径）共享的单例（fail-stale
+// 语义见类型注释）。v6Path 为空或健康门不过时按「v6 禁用」构造——绑定库
+// 双协议 API 对禁用族的 Search 返回空串，matcher 侧 fail-open 放行（用户
+// 裁定语义不变，仅作用于不可解析形态）。
+func sharedGeoIPSearcher(path, v6Path string) (*service.Ip2Region, error) {
+	probe, probed := sharedSearcherProbes.get(path, v6Path)
+	if !probed {
+		probe = probeSearcherFiles(path, v6Path)
+		if probe.v4Err == nil {
+			sharedSearcherProbes.put(path, v6Path, probe)
+		}
+	}
+	v6Effective := probe.v6Effective
+	key := path + "\x00" + v6Effective
+	if probe.v4Err != nil {
+		sharedSearcherMu.Lock()
+		cached, ok := sharedSearchers[key]
+		if ok {
+			cached.needsRebuild = true
+		}
+		sharedSearcherMu.Unlock()
+		if !ok {
+			searcherWarn("unavailable", path, "l4sec: ip2region database unavailable, geoip matcher fails open",
+				zap.String("xdb_path", path), zap.Error(probe.v4Err))
+			return nil, probe.v4Err
+		}
+		searcherWarn("stat", path, "l4sec: ip2region database is not stat-able, serving the previous instance",
+			zap.String("xdb_path", path), zap.Error(probe.v4Err))
+		return cached.searcher, nil
+	}
+	sharedSearcherMu.Lock()
+	defer sharedSearcherMu.Unlock()
+	if cached, ok := sharedSearchers[key]; ok && !cached.needsRebuild &&
+		cached.modTime.Equal(probe.v4ModTime) && cached.size == probe.v4Size &&
+		probeV6FormUnchanged(cached, probe) {
+		searcherWarnThrottle.clearPrefix(path + "|")
+		return cached.searcher, nil
+	}
+	searcher, err := service.NewIp2RegionWithPath(path, v6Effective)
+	if err != nil {
+		// 重建失败不驱逐旧实例（fail-stale，与 stat 失败同理由）。
+		if cached, ok := sharedSearchers[key]; ok {
+			searcherWarn("rebuild", path, "l4sec: ip2region rebuild failed, serving the previous instance",
+				zap.String("xdb_path", path), zap.Error(err))
+			return cached.searcher, nil
+		}
+		searcherWarn("rebuild-unavailable", path, "l4sec: ip2region database unavailable, geoip matcher fails open",
+			zap.String("xdb_path", path), zap.Error(err))
+		return nil, err
+	}
+	entry := &sharedSearcherEntry{searcher: searcher, modTime: probe.v4ModTime, size: probe.v4Size}
+	if probe.v6Effective != "" && !probe.v6Missing {
+		entry.v6ModTime, entry.v6Size = probe.v6ModTime, probe.v6Size
+	}
+	if replaced, ok := sharedSearchers[key]; ok {
+		old := replaced.searcher
+		time.AfterFunc(sharedOldInstanceDelay, func() { old.Close() })
+	}
+	sharedSearchers[key] = entry
+	searcherWarnThrottle.clearPrefix(path + "|")
+	return searcher, nil
+}
+
+// healthyV6Path 是 v6 文件健康门：空值=禁用直接放行空串；非空时读 256B 头
+// 校验（xdb.LoadHeaderFromFile + VersionFromHeader 必须判定为 IPv6 库），
+// 失败按「v6 禁用」降级（节流 WARN，v4Path 仅作告警键归属）。
+func healthyV6Path(v6Path, v4Path string) string {
+	if v6Path == "" {
+		return ""
+	}
+	header, err := v6HeaderLoadFromFile(v6Path)
+	if err != nil {
+		searcherWarn("v6-unavailable", v4Path, "l4sec: ip2region v6 database unavailable, v6 lookups degrade to disabled",
+			zap.String("xdb_v6_path", v6Path), zap.Error(err))
+		return ""
+	}
+	version, verr := xdb.VersionFromHeader(header)
+	if verr != nil || version != xdb.IPv6 {
+		searcherWarn("v6-invalid", v4Path, "l4sec: ip2region v6 database is not an IPv6 xdb, v6 lookups degrade to disabled",
+			zap.String("xdb_v6_path", v6Path))
+		return ""
+	}
+	return v6Path
+}
+
+// probeV6FormUnchanged 报告缓存条目的 v6 形态是否与本次探测投影一致（判定
+// 语义与磁盘 stat 版相同）：v6 禁用（空路径）恒一致（条目必为零值形态）；
+// 启用时探测发现 v6 文件不可读或形态（modTime/size）漂移即条目失效重建——
+// 与 v4 的 modTime/size 判定同构（ip2regionupdate 依赖「Caddy 侧 geoip 随
+// reloader 收敛」，v6 换库同样依赖本判定；TTL 窗口内的收敛延迟是探测节流
+// 的已接受边界）。
+func probeV6FormUnchanged(cached *sharedSearcherEntry, probe searcherProbe) bool {
+	if probe.v6Effective == "" {
+		return cached.v6ModTime.IsZero() && cached.v6Size == 0
+	}
+	if probe.v6Missing {
+		return false
+	}
+	return cached.v6ModTime.Equal(probe.v6ModTime) && cached.v6Size == probe.v6Size
+}
+
+// —— layer4.matchers.lb_geoip ——
+
+// L4GeoIPMatcher 按客户端归属地匹配连接。Mode 直接表达「连接应否断连」的
+// 阻断谓词：deny（缺省）=归属∈名单断连；allow=归属∉名单断连。所有不可判定
+// 形态（缺库/查库失败/IP 不可解析/私网与保留地址）一律返回 (false, nil)——
+// fail-open 放行（用户裁定；匹配失败不应扩大为断连，allow 模式由 matcher
+// 自身编码方向，渲染侧不用 not 包裹——not 会把不可判定反转为断连）。
+type L4GeoIPMatcher struct {
+	// Countries 是地域条目，值域与 HTTP 侧策略 geoip_countries 同域：
+	// 国名/省/省-市/「海外」哨兵（见 geoipLocMatches）。
+	Countries []string `json:"countries,omitempty"`
+
+	// Mode 是阻断方向：deny（缺省，命中名单断连）或 allow（名单外断连）。
+	Mode string `json:"mode,omitempty"`
+
+	// XdbPath 可选：自定义 data_dir 部署由渲染侧发射；空值用容器默认路径。
+	XdbPath string `json:"xdb_path,omitempty"`
+
+	// XdbV6Path 可选：IPv6 库路径（渲染侧仅在面板 v6 开关开启时发射；空=
+	// v6 禁用——IPv6 连接查不到归属，fail-open 放行语义不变）。文件缺失/
+	// 损坏在共享 searcher 健康门降级为禁用，不影响 v4 链。
+	XdbV6Path string `json:"xdb_v6_path,omitempty"`
+
+	countries []string
+	allowMode bool
+	xdbPath   string
+	searcher  *service.Ip2Region
+}
+
+// CaddyModule returns the Caddy module information.
+func (*L4GeoIPMatcher) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "layer4.matchers.lb_geoip",
+		New: func() caddy.Module { return new(L4GeoIPMatcher) },
+	}
+}
+
+// Provision 编译条目并打开共享 searcher；库不可用降级 fail-open（不拒绝
+// 配置加载——地域库缺失不应阻断整个 L4 站点，与用户裁定的 fail-open 同向）。
+func (m *L4GeoIPMatcher) Provision(ctx caddy.Context) error {
+	if len(m.Countries) == 0 {
+		return fmt.Errorf("lb_geoip: countries 不能为空（空名单在渲染侧应被内容门控拦截）")
+	}
+	entries := make([]string, 0, len(m.Countries))
+	for _, c := range m.Countries {
+		trimmed := strings.TrimSpace(c)
+		if trimmed == "" {
+			return fmt.Errorf("lb_geoip: countries 不能包含空条目")
+		}
+		entries = append(entries, trimmed)
+	}
+	m.countries = entries
+	switch strings.TrimSpace(m.Mode) {
+	case "", "deny":
+		m.Mode = "deny"
+		m.allowMode = false
+	case "allow":
+		m.Mode = "allow"
+		m.allowMode = true
+	default:
+		return fmt.Errorf("lb_geoip: mode 只接受 deny/allow，得到 %q", m.Mode)
+	}
+	if m.XdbPath == "" {
+		m.XdbPath = l4DefaultXdbPath
+	}
+	m.xdbPath = m.XdbPath
+	searcher, err := sharedGeoIPSearcher(m.xdbPath, m.XdbV6Path)
+	if err != nil {
+		// 告警已在 sharedGeoIPSearcher 内按（原因|路径）节流。
+		ctx.Logger().Debug("lb_geoip: ip2region unavailable, matcher fails open",
+			zap.String("xdb_path", m.xdbPath), zap.Error(err))
+		m.searcher = nil
+		return nil
+	}
+	m.searcher = searcher
+	return nil
+}
+
+// Match 实现层4.ConnMatcher：命中=true（=该连接应被断连）。所有不可判定
+// 形态（缺库/查库错/IP 不可解析/残行/私网与保留地址）fail-open 返回 false
+// （无 error——error 在 MatcherSet 语义下同样是不匹配，但显式 false 让
+// 「放行」成为唯一出口，不放大为路由错误）。
+func (m *L4GeoIPMatcher) Match(cx *layer4.Connection) (bool, error) {
+	if m.searcher == nil {
+		return false, nil
+	}
+	ip := clientIPFromConn(cx)
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false, nil
+	}
+	// 私网/回环/链路本地豁免：与 HTTP 链首私网豁免同语义（内网源连接不经
+	// GeoIP 判定；xdb 对这些段返回 Reserved 行，deny「海外」会误拦内网）。
+	if parsed.IsPrivate() || parsed.IsLoopback() || parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast() || parsed.IsUnspecified() {
+		return false, nil
+	}
+	region, err := m.searcher.Search(parsed.String())
+	if err != nil || region == "" {
+		return false, nil
+	}
+	row, ok := parseRegionRow(region)
+	if !ok {
+		return false, nil
+	}
+	inList := geoipLocMatches(row.country, row.loc, m.countries)
+	if m.allowMode {
+		return !inList, nil
+	}
+	return inList, nil
+}
+
+// clientIPFromConn 取连接客户端 IP：cx.RemoteAddr 的 host 部分。lb_geoip
+// 是路由 matcher，先于 handle 链评估——即使规则开 PROXY protocol 且同路由
+// handle 内有 layer4.handlers.lb_l4_pp（仓内模块，对受信网段来源把连接
+// 改写为 PROXY 头里的声明源，见 pp.go），改写也到不了 matcher：地域判定
+// 恒读 socket 对端（与 docs 安全指南披露一致）；lb_l4_pp 的改写只惠及
+// handle 链内其后的 handler（lb_l4_sec 事件归因、发往上游的转发头）。
+func clientIPFromConn(cx *layer4.Connection) string {
+	if cx == nil {
+		return ""
+	}
+	addr := cx.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	raw := addr.String()
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		return host
+	}
+	if net.ParseIP(raw) != nil {
+		return raw
+	}
+	return ""
+}

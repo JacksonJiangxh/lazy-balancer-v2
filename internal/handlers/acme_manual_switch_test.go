@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// L4-66-01：UpdateRule acme→manual 切换必须在事务内先把非终态 cert_jobs 收敛为
+// UpdateRule acme→manual 切换必须在事务内先把非终态 cert_jobs 收敛为
 // 终态（镜像 DisableRule 的 'disabled' 终态）再执行主 UPDATE，并在提交后再取消
 // 队列在途签发。此前切换只做 cancelRuleJobs（零 DB 状态写）：主 UPDATE 的
 // NOT EXISTS 非终态守卫恒 409（用户无法完成切换的死锁），queued/waiting_ca 行
@@ -51,10 +51,10 @@ func seedACMEManualSwitchFixture(t *testing.T, caddyID, domain, jobStatus string
 	return jobID
 }
 
-func putUpdateRule(t *testing.T, h interface{}, caddyID, body string) *httptest.ResponseRecorder {
+func putUpdateRule(t *testing.T, h *updateAuditHarness, caddyID, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	router := gin.New()
-	router.PUT("/rules/:caddy_id", h.(*updateAuditHarness).handler.UpdateRule)
+	router.PUT("/rules/:caddy_id", h.handler.UpdateRule)
 	request := httptest.NewRequest(http.MethodPut, "/rules/"+caddyID, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -63,24 +63,24 @@ func putUpdateRule(t *testing.T, h interface{}, caddyID, body string) *httptest.
 }
 
 // 主形状：acme→manual 切换携带 queued 任务——必须 200，任务行**直接删除**
-// （R10 第 72 轮用户裁定：脱离 ACME 即删任务，取代 L4-66-01 的「翻终态
+// （用户裁定：脱离 ACME 即删任务，取代 的「翻终态
 // disabled」——30s 补扫对象已不存在），acme_config_id 清零。
 func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 	// Given
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_sw_manual", 0, false)
 	jobID := seedACMEManualSwitchFixture(t, "lb_sw_manual", "sw.example.test", "queued")
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	certPEM, keyPEM, err := generateTestCert("sw.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatalf("generate test cert: %v", err)
 	}
 
-	// When：切换到手动证书（F63-B2-1：必须提供新证书材料）
+	// When：切换到手动证书
 	response := putUpdateRule(t, harness, "lb_sw_manual", fmt.Sprintf(
 		`{"name":"after","enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q}`, certPEM, keyPEM))
 
@@ -110,9 +110,7 @@ func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 // 已翻终态的任务行与旧规则不一致的漂移）。
 func TestUpdateRule_acmeToManual_flipRollsBackWhenApplyFails(t *testing.T) {
 	// Given：/load 首次必失败
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_sw_rb", 1, false)
 	jobID := seedACMEManualSwitchFixture(t, "lb_sw_rb", "rb.example.test", "queued")
 	certPEM, keyPEM, err := generateTestCert("rb.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))

@@ -20,6 +20,7 @@ package wafiplist
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -36,8 +37,14 @@ import (
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
+// DefaultAllowedPathPrefix 是算子参数的目录白名单出厂值（防目录穿越）。
+// 这是 Caddy 二进制内的编译期常量：面板进程改写 AllowedPathPrefix 不会传播
+// 到 Caddy（data_dir 非默认时的派生只在面板侧生效），故该值也是「部署形态
+// 是否受支持」的判据——面板侧 ConfigureWafDirs 会据此显性留痕。
+const DefaultAllowedPathPrefix = "/app/waf/"
+
 // AllowedPathPrefix 是算子参数的目录白名单（防目录穿越）。测试可改。
-var AllowedPathPrefix = "/app/waf/"
+var AllowedPathPrefix = DefaultAllowedPathPrefix
 
 // ipListLoadLocks 按路径串行化解析。条目在最后一个使用者释放后立即退役
 // （引用计数归零删除）——u-*/p<id>-* 投影按规则身份命名，删除规则后旧路径
@@ -73,16 +80,18 @@ func lockIPListLoad(path string) func() {
 	}
 }
 
-// MaxFileBytes / MaxEntries 是加载侧体积与条目的硬上限（防异常文件拖垮
-// 内存；威胁库下载侧 200000 条上限先行拦截，此为纵深）。测试可收窄。
+// maxFileBytes / maxEntries 是加载侧体积与条目的硬上限（防异常文件拖垮
+// 内存；威胁库下载侧 200000 条上限先行拦截，此为纵深）。包内可调（仅同包
+// 测试收窄），不构成跨模块契约：加载上限是内部不变量。
 var (
-	MaxFileBytes int64 = 64 << 20
-	MaxEntries         = 1_000_000
+	maxFileBytes int64 = 64 << 20
+	maxEntries         = 1_000_000
 )
 
 // StatCheckInterval 是 Evaluate 侧复查文件 mtime/size 的最小间隔（默认 1s）。
 // 正常变更路径（策略保存/威胁库更新）都会触发 Caddy 重载重建算子实例，
 // 本节流只兜底带外文件改动的感知时延；0=每次都 stat（测试用）。
+// 非契约（导出仅为跨模块测试装配收窄）：生产消费方无读取需求，勿依赖。
 var StatCheckInterval = time.Second
 
 // OnStaleServe 是 fail-stale 事件的观测钩子（运维可见性）：文件被删/重建
@@ -94,38 +103,69 @@ var OnStaleServe = func(path string, err error) {
 	log.Printf("WARNING: IP 名单 %q 重建失败，继续按最近一次成功加载的集合判定（fail-stale）: %v", path, err)
 }
 
-// StaleServeLogInterval 是同一路径 fail-stale 上报的最小间隔（默认 1 分钟；
-// 0=不节流，测试用）。恢复成功后清除节流记录——再次故障即时上报。
-var StaleServeLogInterval = time.Minute
+// OnListUnavailableServe 是「名单不可读且无缓存集合」的观测钩子：Evaluate
+// 在该形态返回未命中（黑名单方向=放行、信任面=无来源），唯一可见性就是本
+// 告警。与 fail-stale 分开：文案不得声称「继续按旧集合判定」（此时没有旧集合）。
+var OnListUnavailableServe = func(path string, err error) {
+	log.Printf("WARNING: IP 名单 %q 不可读且无缓存集合，本次判定按未命中处理（等待文件恢复或重载）: %v", path, err)
+}
 
+// staleServeLogInterval 是同一路径同类上报的最小间隔（默认 1 分钟；
+// 0=不节流，测试用）。恢复成功后清除节流记录——再次故障即时上报。
+var staleServeLogInterval = time.Minute
+
+// staleReports.last 的键是 "kind|path"：fail-stale 与「无缓存不可读」各自
+// 独立节流（同路径可能先不可读后回退到旧集合）。
 var staleReports = struct {
 	sync.Mutex
-	last map[string]int64 // path → 上次上报的单调读数（monotonicNowNano）
+	last map[string]int64 // kind|path → 上次上报的单调读数（monotonicNowNano）
 }{last: make(map[string]int64)}
 
-// reportStaleServe 按路径节流后调用 OnStaleServe。
-func reportStaleServe(path string, err error) {
-	hook := OnStaleServe
+// reportServeThrottled 按（种类, 路径）节流后调用对应钩子。
+func reportServeThrottled(kind, path string, err error, hook func(string, error)) {
 	if hook == nil {
 		return
 	}
-	if StaleServeLogInterval > 0 {
+	key := kind + "|" + path
+	if staleServeLogInterval > 0 {
 		now := monotonicNowNano()
 		staleReports.Lock()
-		if last, ok := staleReports.last[path]; ok && time.Duration(now-last) < StaleServeLogInterval {
+		if last, ok := staleReports.last[key]; ok && time.Duration(now-last) < staleServeLogInterval {
 			staleReports.Unlock()
 			return
 		}
-		staleReports.last[path] = now
+		staleReports.last[key] = now
 		staleReports.Unlock()
 	}
 	hook(path, err)
 }
 
-// clearStaleReport 清除路径的节流记录（成功加载后调用）。
+// reportStaleServe 按路径节流后调用 OnStaleServe。
+func reportStaleServe(path string, err error) {
+	reportServeThrottled("stale", path, err, OnStaleServe)
+}
+
+// reportListUnavailableServe 按路径节流后调用 OnListUnavailableServe。
+func reportListUnavailableServe(path string, err error) {
+	reportServeThrottled("unavailable", path, err, OnListUnavailableServe)
+}
+
+// ReportListUnavailable 是「名单不可读且无缓存集合」的显式上报入口：供已
+// 自行归一化路径的消费方（http.ip_sources.lb_file 的 GetIPRanges）在契约
+// 要求「运行期 MUST NOT fail」时仍留下状态迁移痕迹。节流/恢复语义与
+// Evaluate 内部路径同源。
+func ReportListUnavailable(path string, err error) {
+	reportListUnavailableServe(path, err)
+}
+
+// clearStaleReport 清除路径的全部节流记录（成功加载后调用）。
 func clearStaleReport(path string) {
 	staleReports.Lock()
-	delete(staleReports.last, path)
+	for key := range staleReports.last {
+		if strings.HasSuffix(key, "|"+path) {
+			delete(staleReports.last, key)
+		}
+	}
 	staleReports.Unlock()
 }
 
@@ -138,11 +178,12 @@ var clockBase = time.Now()
 // monotonicNowNano 返回基线以来的单调纳秒读数。
 func monotonicNowNano() int64 { return int64(time.Since(clockBase)) }
 
-// parseCountForTest 文件解析次数计数（测试观测构建期去重）。
+// testseam: parseCountForTest 文件解析次数计数（测试观测构建期去重；
+// 生产热路径自增、无法迁走——宿主留驻产品文件由 testonly 守卫登记）。
 var parseCountForTest atomic.Int64
 
-// parseEntryCallsForTest 条目解析调用计数（测试观测「逐条目单次解析」——
-// 修复前后分别为 2×/1×）。仅在 ParseIPEntry 入口 incr，成本可忽略。
+// testseam: parseEntryCallsForTest 条目解析调用计数（测试观测「逐条目单次
+// 解析」——修复前后分别为 2×/1×）。仅在 ParseIPEntry 入口 incr，成本可忽略。
 var parseEntryCallsForTest atomic.Int64
 
 func init() {
@@ -183,12 +224,43 @@ func NormalizeAllowedPath(path string) (string, error) {
 // 形态），因此不再对原始串做 contains("..")——那会误拒文件名合法的
 // `a..b.txt`，且错误信息误导排查。算子与导出入口（LoadPrefixesFresh/
 // NormalizeAllowedPath）共用单源。
+//
+// 符号链接硬化：Clean+前缀只能防 `..` 穿越，白名单内的 symlink 仍可指向
+// 白名单外（如 /app/waf/x.txt -> /etc/passwd）。本函数只在构建期/装配期
+// （Provision、算子构建）与热路径之外调用，故在此做一次 EvalSymlinks：
+// 解引用后必须仍落在白名单内。白名单前缀本身也解引用，兼容 data_dir 位于
+// symlink 路径下的部署（如 macOS /var → /private/var）；文件尚不存在时
+// 跳过（首次投影前），由加载路径按缺失 fail-closed。
 func resolveAllowedPath(path string) (string, error) {
 	cleaned := filepath.Clean(path)
-	if !filepath.IsAbs(cleaned) || !strings.HasPrefix(cleaned, AllowedPathPrefix) {
+	// 首道门用 pathWithinPrefix 而非裸 HasPrefix：裸前缀把 `/app/waf-other/x`
+	// 当成 `/app/waf` 的子路径（此前正确性只靠 AllowedPathPrefix 恰好带尾
+	// 分隔符）。pathWithinPrefix 自行补齐尾分隔符，两种写法语义一致——同一
+	// 函数内的两道边界（本门与下方 symlink 复检）从此共用一套口径。
+	if !filepath.IsAbs(cleaned) || !pathWithinPrefix(cleaned, AllowedPathPrefix) {
 		return "", fmt.Errorf("名单路径越出白名单（须为 %s 下的绝对路径）: %q", AllowedPathPrefix, path)
 	}
+	if resolved, rerr := filepath.EvalSymlinks(cleaned); rerr == nil {
+		resolvedPrefix, perr := filepath.EvalSymlinks(strings.TrimSuffix(AllowedPathPrefix, string(filepath.Separator)))
+		if perr == nil && !pathWithinPrefix(resolved, AllowedPathPrefix) && !pathWithinPrefix(resolved, resolvedPrefix) {
+			return "", fmt.Errorf("名单路径经符号链接越出白名单（须为 %s 下的绝对路径）: %q → %q", AllowedPathPrefix, path, resolved)
+		}
+	}
 	return cleaned, nil
+}
+
+// pathWithinPrefix 报告 path 是否位于 prefix 目录内（prefix 缺尾分隔符时补齐，
+// 防 /app/wafevil 被当作 /app/waf 的子路径）。
+func pathWithinPrefix(path, prefix string) bool {
+	// 前缀可能来自测试/部署环境拼接（TMPDIR 自带尾斜杠时会出现 "//"）。
+	// 先 Clean 再补尾分隔符，避免形状差异把合法路径误判为越界。
+	if prefix != "" {
+		prefix = filepath.Clean(prefix)
+	}
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	return strings.HasPrefix(path, prefix)
 }
 
 func newIPListFast(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
@@ -212,10 +284,13 @@ func loadIPListFileFresh(path string) (*ipListFileState, error) {
 	return loadIPListFile(path, true)
 }
 
-// ipListStatCalls 读盘路径的 stat 调用计数（测试观测节流窗口边界的单飞语义）。
+// testseam: ipListStatCalls 读盘路径的 stat 调用计数（测试观测节流窗口
+// 边界的单飞语义；生产读路径自增、无法迁走）。
 var ipListStatCalls atomic.Int64
 
-// statIPListFile 是 os.Stat 的唯一调用点（计数缝；生产零额外成本）。
+// testseam: statIPListFile 是 os.Stat 的唯一调用点（计数缝包装；生产读路径
+// 经它转发，测试靠 ipListStatCalls 观测——宿主留驻产品文件由 testonly
+// 守卫登记）。
 func statIPListFile(path string) (os.FileInfo, error) {
 	ipListStatCalls.Add(1)
 	return os.Stat(path)
@@ -297,8 +372,8 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 	if err != nil {
 		return staleOrError(path, nil, fmt.Errorf("IP 名单不可读 %q: %w", path, err), fresh)
 	}
-	if info.Size() > MaxFileBytes {
-		return staleOrError(path, nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20), fresh)
+	if info.Size() > maxFileBytes {
+		return staleOrError(path, nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, maxFileBytes>>20), fresh)
 	}
 	ipListCache.RLock()
 	cached := ipListCache.states[path]
@@ -374,18 +449,21 @@ func staleOrError(path string, cached *ipListFileState, err error, fresh bool) (
 
 // EvictIPListCache 淘汰指定路径的运行期缓存条目（services 侧 GC 删除超龄
 // 未引用名单文件后调用）——否则 fail-stale 会把已删文件的集合无限期留在
-// 内存。返回实际淘汰条数。
+// 内存。逐路径与解析共用锁：等待在途解析落定后再删，旧代际不能在淘汰后写回。
+// 返回实际淘汰条数。
 func EvictIPListCache(paths ...string) int {
-	ipListCache.Lock()
-	defer ipListCache.Unlock()
 	evicted := 0
 	for _, path := range paths {
+		unlock := lockIPListLoad(path)
+		ipListCache.Lock()
 		if _, ok := ipListCache.states[path]; ok {
 			delete(ipListCache.states, path)
 			evicted++
 		}
+		ipListCache.Unlock()
 		// 同步清掉节流记录（防路径无限期占 map；下次故障重新上报）。
 		clearStaleReport(path)
+		unlock()
 	}
 	return evicted
 }
@@ -400,53 +478,72 @@ func ipListGenerationChanged(before os.FileInfo, after os.FileInfo, statErr erro
 	return after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())
 }
 
-// parseIPListFile 读盘+严格解析+防御性归并（写入侧已聚合，加载侧再跑一次
-// 保证「排序+去重+不相交」检索不变式——二分正确性依赖不相交）。逐条目
-// **只解析一次**（此前「逐行校验解析 → AggregatePrefixes 再解析」
-// 是每条目 2×）；逐行遍历取原串子串而非 strings.Split（百万条名单的
-// []string 头分配约 16MB+）。
+// ReadBoundedFile 的可判别失败：调用方按各自语境包装（名单加载器的中文
+// 文案 / 爬虫快照的告警与 fail-closed）。
+var (
+	// ErrFileSizeLimit 文件尺寸超过调用方给定的硬上限。
+	ErrFileSizeLimit = errors.New("file exceeds size limit")
+	// ErrFileRewriteDuringRead 文件在「Stat → 定长读」窗口内被原位改写
+	// （追加/截断/同尺寸改写）：读到的是某一瞬间的前缀或混合字节，不能
+	// 当作完整代际。
+	ErrFileRewriteDuringRead = errors.New("file rewritten during read")
+)
+
+// boundedReadSource 是「可 stat 的读者」：生产恒为 *os.File；测试以替身
+// 注入「stat 形态与读到的内容分属两代」的确定性窗口（无需在 helper 里留
+// 钩子）。
+type boundedReadSource interface {
+	io.Reader
+	Stat() (os.FileInfo, error)
+}
+
+// ReadBoundedFile 按体积上限读取一份可能被并发替换的文件，返回内容与该
+// 内容所属代际的 inode 形态（mtime/size）。名单加载器与爬虫段快照加载器
+// 共用（两处 fail-closed 语义一致，避免第三份实现）。
 //
-// 体积上限在读侧再判一次：调用方的 stat 只用于缓存命中/早退，stat 与
-// 本次读之间的窗口内文件可被 tmp+rename 替换成任意大小——只按 stat 判限
-// 不构成硬上限。代际元数据（mtime/size）取自**同一个 inode**（fd.Stat）：内容
-// 与 (mtime,size) 必属同一代际，缓存命中判据不会把上一代的 stat 形态贴到新内容上。
-func parseIPListFile(path string) (*ipListFileState, error) {
-	parseCountForTest.Add(1)
+// 三条不变量：
+//   - stat 与读针对同一个 fd：rename 换的是路径，fd 指向的 inode 不变，
+//     读到的恒是该 stat 描述的 inode（不能读后按路径再 stat）；
+//   - 定长读：缓冲容量=stat 尺寸，stat 与读之间的追加不会放大实际读入
+//     （只按 stat 判限不构成硬上限）；
+//   - 读后复核同 inode：原位追加/截断/同尺寸原位改写使内容与 (mtime,size)
+//     不再对应一代，返回 ErrFileRewriteDuringRead 让调用方放弃本次加载。
+func ReadBoundedFile(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
 	fd, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
+		return nil, nil, err
 	}
 	defer fd.Close()
-	info, err := fd.Stat()
+	return readBoundedFrom(fd, path, maxBytes)
+}
+
+func readBoundedFrom(src boundedReadSource, name string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	info, err := src.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
+		return nil, nil, err
 	}
-	if info.Size() > MaxFileBytes {
-		return nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20)
+	if info.Size() > maxBytes {
+		return nil, info, fmt.Errorf("%w: %s (size %d > %d)", ErrFileSizeLimit, name, info.Size(), maxBytes)
 	}
-	// 定长读（容量=stat 尺寸，不放大）：rename 换掉的是路径而非本 fd 指向的
-	// inode，所以读到的恒是该 stat 描述的完整一代内容。
 	raw := make([]byte, info.Size())
-	if _, err := io.ReadFull(fd, raw); err != nil {
-		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
+	if _, err := io.ReadFull(src, raw); err != nil {
+		return nil, info, err
 	}
-	// 读后复核同一 inode：若被原位追加/截断/同尺寸原位改写（非 tmp+rename
-	// 的写入方式），读到的只是某一瞬间的前缀或混合字节，不能当作完整代际
-	// ——本次放弃，下次复查重建。只比 size 不够：同尺寸原位改写 size 不变，
-	// 必须同时复核 mtime。
-	if after, statErr := fd.Stat(); ipListGenerationChanged(info, after, statErr) {
-		return nil, fmt.Errorf("IP 名单 %q 在读取期间被改写，本次加载放弃", path)
+	if after, statErr := src.Stat(); ipListGenerationChanged(info, after, statErr) {
+		return nil, info, ErrFileRewriteDuringRead
 	}
-	// 容量预估：平均每条约 12 字节，封顶 MaxEntries+1（超限在追加处拦截）。
-	capHint := len(raw)/12 + 1
-	if capHint > MaxEntries+1 {
-		capHint = MaxEntries + 1
-	}
-	prefixes := make([]netip.Prefix, 0, capHint)
-	// 直接在原始字节上按行迭代（bytes.IndexByte + TrimSpace），
-	// 不再整文件复制成 string（MaxFileBytes 64MB 上限时 raw+string 双份常驻
-	// =2× 文件体积峰值）；仅实际条目行短生命周期转 string 供 ParseIPEntry，
-	// 空行/注释行零分配跳过。
+	return raw, info, nil
+}
+
+// ForEachIPListLine 按行遍历 .iplist 文本的有效条目行：空行与 #/; 开头的注释
+// 行跳过，行内容 TrimSpace 归一（CRLF 源与历史 Split 实现同口径）；lineNo 从
+// 1 起计数供错误文案。fn 返回 false 提前终止。
+//
+// 本函数是**跨模块**的行过滤单一事实源：wafiplist 的严格解析与
+// internal/services 的编译/渲染/UI/下载四处都转发到此处。此前两侧各持一份
+// 等价循环，前缀/空白归一规则演化时会静默分叉（坏行处置策略由调用方各自
+// 决定：本包严格报错，services 侧按场景跳过或计数）。
+func ForEachIPListLine(raw []byte, fn func(lineNo int, line string) bool) {
 	for lineNo, start := 1, 0; start <= len(raw); lineNo++ {
 		line := raw[start:]
 		if i := bytes.IndexByte(line, '\n'); i >= 0 {
@@ -459,14 +556,77 @@ func parseIPListFile(path string) (*ipListFileState, error) {
 		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
 			continue
 		}
-		prefix, perr := ParseIPEntry(string(line))
+		if !fn(lineNo, string(line)) {
+			return
+		}
+	}
+}
+
+// prefixCapHint 返回加载侧一次性预分配的条目容量。
+// 按「平均每条约 12 字节」预估在条目密集文件上接近真实值；但注释/空行密集
+// 的文件（带外写入、损坏残留）会把预估放大到 maxEntries+1（每项 32B ≈ 32MiB）
+// 却几乎全空。预分配只服务热路径常量因子，故再封顶 initialPrefixCapacity——
+// 超出部分由 append 的几何增长补齐，不改变任何拒绝语义（体积门与条目门
+// 仍先/后独立生效）。
+func prefixCapHint(size int) int {
+	capHint := size/12 + 1
+	if capHint > maxEntries+1 {
+		capHint = maxEntries + 1
+	}
+	if capHint > initialPrefixCapacity {
+		capHint = initialPrefixCapacity
+	}
+	return capHint
+}
+
+// initialPrefixCapacity 是加载侧预分配的条目上限（2^16 × 32B ≈ 2MiB）。
+const initialPrefixCapacity = 1 << 16
+
+// parseIPListFile 读盘+严格解析+防御性归并（写入侧已聚合，加载侧再跑一次
+// 保证「排序+去重+不相交」检索不变式——二分正确性依赖不相交）。逐条目
+// **只解析一次**（此前「逐行校验解析 → AggregatePrefixes 再解析」
+// 是每条目 2×）；逐行遍历取原串子串而非 strings.Split（百万条名单的
+// []string 头分配约 16MB+）。
+//
+// 体积上限在读侧再判一次：调用方的 stat 只用于缓存命中/早退，stat 与
+// 本次读之间的窗口内文件可被 tmp+rename 替换成任意大小——只按 stat 判限
+// 不构成硬上限。代际元数据（mtime/size）取自**同一个 inode**（fd.Stat）：内容
+// 与 (mtime,size) 必属同一代际，缓存命中判据不会把上一代的 stat 形态贴到新内容上。
+func parseIPListFile(path string) (*ipListFileState, error) {
+	parseCountForTest.Add(1)
+	raw, info, err := ReadBoundedFile(path, maxFileBytes)
+	switch {
+	case errors.Is(err, ErrFileSizeLimit):
+		return nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, maxFileBytes>>20)
+	case errors.Is(err, ErrFileRewriteDuringRead):
+		// 只比 size 不够：同尺寸原位改写 size 不变，必须同时复核 mtime
+		// （ipListGenerationChanged）——本次放弃，下次复查重建。
+		return nil, fmt.Errorf("IP 名单 %q 在读取期间被改写，本次加载放弃", path)
+	case err != nil:
+		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
+	}
+	// 容量预估见 prefixCapHint（注释/空行密集文件不得把预分配放大到 32MiB）。
+	prefixes := make([]netip.Prefix, 0, prefixCapHint(len(raw)))
+	// 直接在原始字节上按行迭代（共享 ForEachIPListLine：bytes.IndexByte +
+	// TrimSpace，不再整文件复制成 string（maxFileBytes 64MB 上限时
+	// raw+string 双份常驻=2× 文件体积峰值）；仅实际条目行短生命周期转 string
+	// 供 ParseIPEntry，空行/注释行零分配跳过。
+	var lineErr error
+	ForEachIPListLine(raw, func(lineNo int, line string) bool {
+		prefix, perr := ParseIPEntry(line)
 		if perr != nil {
-			return nil, fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo, line)
+			lineErr = fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo, line)
+			return false
 		}
 		prefixes = append(prefixes, prefix)
-		if len(prefixes) > MaxEntries {
-			return nil, fmt.Errorf("IP 名单 %q 条目数超过上限 %d", path, MaxEntries)
+		if len(prefixes) > maxEntries {
+			lineErr = fmt.Errorf("IP 名单 %q 条目数超过上限 %d", path, maxEntries)
+			return false
 		}
+		return true
+	})
+	if lineErr != nil {
+		return nil, lineErr
 	}
 	// 空文件合法（2026-10-15 始终发射收敛）：渲染层空名单投影 0 字节空文件，
 	// 空集=匹配器永不命中（与无规则语义等价）——空↔非空纯内容变化走热路径，
@@ -495,7 +655,12 @@ func (op *ipListFastOperator) Evaluate(_ plugintypes.TransactionState, value str
 	addr = addr.Unmap()
 	state, err := resolveIPListFile(op.path)
 	if err != nil {
-		return false // 从未成功加载过（理论上构建期已拦截）——按未命中
+		// 从未成功加载过（构建期本应拦截）——按未命中处理，但该分支方向是
+		// fail-open（黑名单=放行）且旧实现完全静默：缓存被淘汰 + 文件消失
+		// （Reload 失败的窗口）下每次判定都会静默放行。按路径节流上报，
+		// 把「构建期已拦截」的假设变成可观测断言。
+		reportListUnavailableServe(op.path, err)
+		return false
 	}
 	set := state.v4
 	if addr.Is6() {

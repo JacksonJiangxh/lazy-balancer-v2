@@ -6,8 +6,16 @@
 #   1) 路径：审计报告目录与轮次测试文件名（Go/TS）——受控文件与未跟踪文件同扫，
 #      仅跳过 .gitignore 已忽略者与构建/运行产物目录；
 #   2) 内容：注释行与测试声明行里的审计编号/轮次元数据——覆盖 Go/TS/Vue/JS/CSS/
-#      Markdown/Shell/YAML/SQL/go.mod/Dockerfile/docker-entrypoint.sh/
-#      .dockerignore/Caddyfile。轮次引用按「审计动作共现」判定：裸轮次＋审计
+#      Markdown/Shell/YAML/SQL/go.mod/Python/Dockerfile/docker-entrypoint.sh/
+#      .dockerignore/.gitignore/.gitattributes/Caddyfile。JSON/HTML/TOML/conf 同样入面（夹具字符串与
+#      模板文案里可能混入审计编号），其中 JSON/HTML 按「全文」扫描而非仅注释行
+#      ——JSON 字符串值与 HTML 文本节点没有注释前缀，只扫注释行等于留通道。
+#      作业面无扩展名约定文件（.gitignore/.gitattributes）与 Python 脚本同样在面内：
+#      批量脚本与忽略清单的注释块都是审计编号的真实混入面（扫描面声明见
+#      content_scan_exts / content_scan_basenames）。
+#      刻意例外：web/package-lock.json（npm 生成物，integrity 为混合大小写
+#      base64、随依赖升级整份重写，人工审计标注不进该文件）不入内容面。
+#      轮次引用按「审计动作共现」判定：裸轮次＋审计
 #      动作（N 轮修复）、斜杠并列（第 N/N 轮审计）、无「第」的中文数字归属、
 #      注释头被编辑截断的残骸（// N 轮）：…）都命中；循环轮次表述（每 N 轮
 #      落行、连续 N 轮共识、第 N/N 轮打点）不按裸数字判罚；
@@ -19,8 +27,8 @@
 #
 # 误报收窄：白名单只锚定“审计编号形态”，不按裸数字判罚。百分位 P50/P95/P99、
 # 版本串 v2.3.x、sha256/十六进制摘要、HTTP/3、TLS 1.3、PID1、X509、ED25519、
-# HS256、LBF1 文件魔数等产品 token 不触发（见内嵌扫描器的 SHIELD 与纯十六进制
-# 令牌过滤）。
+# HS256、LBF1 文件魔数、时间格式骨架（YYYY-MM-DD / HH-mm-ss / HH:mm:ss）等
+# 产品 token 不触发（见内嵌扫描器的 SHIELD 与纯十六进制令牌过滤）。
 #
 # 用法：bash scripts/check-no-audit-artifacts.sh [--self-test]
 set -euo pipefail
@@ -45,13 +53,38 @@ fi
 
 # 构建产物/运行数据/本地工具目录一律不入扫描面（.gitignore 已覆盖大部分，
 # 这里再显式声明一次：守卫不依赖 .gitignore 的完整性来避免扫描噪声）。
-skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf[^/]*/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/)'
+# WAF 运行目录按「waf」+ 可选后缀分隔符收窄（waf/、waf-slave/、waf.dist/、
+# waf.log/）：宽形态 `waf[^/]*/` 会连带命中嵌套 Go 模块 wafiplist/，把整个模块
+# 从路径与内容两条通道同时摘掉——模块里的注释编号与轮次测试文件名因此永不入面
+# （永久静默盲区）。运行目录以 `-`/`.` 起后缀，模块名不会。
+# 总经理授权豁免（任务档案 §4.3 裁决第 4 条与 r3 驳回处置裁决第 2 条，最小化）：
+#   • .npc-teams/——本 fork 任务协作台账目录，档案正文必然引用轮次元数据，
+#     目录整体从扫描起点排除（模式表 audit_path_rules 与 .gitignore 块不动）；
+#   • docs/upstream-merge.zh-CN.md——单文件豁免，正文记录各轮合并事实，
+#     轮次引用属文档正当内容。豁免边界由 guard-selftest.sh 钉住：两处之外的
+#     命中仍必须红（含同名近似路径不受豁免）；
+#   • AGENTS.md——体系总纲，其中认证分级等体系口径表述形态上与编号家族正则
+#     同形（大写前缀-分段序号），并非审计产物，单文件从扫描起点排除
+#     （总纲属体系侧文件，本仓不改写）；
+#   • internal/services/caqueue.go——上游原文注释自带的锁纪律术语形态上同样
+#     落入编号家族正则（大写缩写-英文小写段连写），本仓不改上游文件，
+#     单文件从扫描起点排除。
+#   后两条的豁免边界同样由 guard-selftest.sh 钉住：豁免路径外的同形态命中
+#   （嵌套同名文件/其它文件里的同款术语）仍必须红。
+skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf([-.][^/]*)?/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/|\.npc-teams/|^docs/upstream-merge\.zh-CN\.md$|^AGENTS\.md$|^internal/services/caqueue\.go$)'
 
 # ---------------------------------------------------------------------------
 # 审计产物路径模式——单一事实源。
 # 每条 = “<.gitignore 行><TAB><检测正则>”。.gitignore 的审计排除块必须与第一列
 # 逐行一致（双向校验：多一行、少一行、改一行都失败），检测正则取第二列并集。
 # 新增形态时两列同时加。
+#
+# 「宽名族」四条（*audit[0-9]* / *round[0-9]* 及其目录变体）的检测正则要求
+# 词元边界：audit/round 前必须是路径分隔符或非字母数字字符。无边界写法会把
+# 合法名字误判成审计产物并阻断提交——背景图/地面层文档这类文件名里恰好含
+# 「round 紧接数字」的片段即为实例（守卫 fail-closed，代价是错误文案指向
+# 「审计记录不得提交」，排查方向被误导）。.gitignore 第一列仍按宽形态忽略
+# （误忽略无害）。误报对照由 scripts/tests/guard-selftest.sh 钉住。
 # ---------------------------------------------------------------------------
 audit_path_rules=(
   $'docs/audit/\t^docs/audit/'
@@ -62,10 +95,12 @@ audit_path_rules=(
   $'**/round[0-9]*_test.go\t(^|/)round[0-9]+[^/]*_test\\.go$'
   $'**/*_r[0-9]*_test.go\t(^|/)[^/]+_r[0-9]+[^/]*_test\\.go$'
   $'**/*_round[0-9]*_test.go\t(^|/)[^/]+_round[0-9]+[^/]*_test\\.go$'
-  $'**/*audit[0-9]*\t(^|/)[^/]*audit[0-9][^/]*'
-  $'**/*round[0-9]*\t(^|/)[^/]*round[0-9][^/]*'
-  $'**/*audit[0-9]*/\t(^|/)[^/]*audit[0-9][^/]*'
-  $'**/*round[0-9]*/\t(^|/)[^/]*round[0-9][^/]*'
+  $'**/*audit[0-9]*\t(^|/|[^A-Za-z0-9])audit[0-9][^/]*'
+  $'**/*round[0-9]*\t(^|/|[^A-Za-z0-9])round[0-9][^/]*'
+  $'**/*audit[_-][0-9]*\t(^|/|[^A-Za-z0-9])audit[_-][0-9][^/]*'
+  $'**/*round[_-][0-9]*\t(^|/|[^A-Za-z0-9])round[_-][0-9][^/]*'
+  $'**/*audit[0-9]*/\t(^|/|[^A-Za-z0-9])audit[0-9][^/]*'
+  $'**/*round[0-9]*/\t(^|/|[^A-Za-z0-9])round[0-9][^/]*'
 )
 
 path_regex=""
@@ -90,15 +125,67 @@ fi
 
 actual_ignore="$(awk -v b="$begin_marker" -v e="$end_marker" '$0==b{f=1;next} $0==e{f=0} f' .gitignore | sed '/^[[:space:]]*$/d')"
 expected_ignore="$(printf '%s' "$ignore_expected" | sed '/^[[:space:]]*$/d')"
-if [[ "$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort -u)" != "$(printf '%s\n' "$expected_ignore" | LC_ALL=C sort -u)" ]]; then
+# 去重口径不得用于比较：重复模式行对 git 行为无害，但破坏「逐行一致」契约
+# （重复行被 sort -u 折叠后两侧相等 → 门禁给绿，之后删掉其中一行仍判一致）。
+# 故先单独拒绝重复行，再按排序后全量（保留重复）比较。
+duplicate_ignore="$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort | uniq -d)"
+if [[ -n "$duplicate_ignore" ]]; then
+  echo "ERROR: .gitignore 审计排除块存在重复模式行（逐行一致契约不成立）：" >&2
+  printf '%s\n' "$duplicate_ignore" | sed 's/^/  /' >&2
+  exit 1
+fi
+if [[ "$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort)" != "$(printf '%s\n' "$expected_ignore" | LC_ALL=C sort)" ]]; then
   echo "ERROR: .gitignore 审计排除块与本脚本模式表不一致（两侧模式集必须一一对应）：" >&2
-  diff <(printf '%s\n' "$expected_ignore" | LC_ALL=C sort -u) \
-       <(printf '%s\n' "$actual_ignore" | LC_ALL=C sort -u) | sed 's/^/  /' >&2 || true
+  diff <(printf '%s\n' "$expected_ignore" | LC_ALL=C sort) \
+       <(printf '%s\n' "$actual_ignore" | LC_ALL=C sort) | sed 's/^/  /' >&2 || true
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 通道 0：依赖/构建缓存不得「被跟踪」。
+# skip_re 把 node_modules 从内容扫描面摘掉（按源码形态设计的扫描器不该读转译
+# 副本），但被跟踪本身就是仓卫生缺陷：一次 `git add -A` 就会把 vitest 的
+# .vite/.vitest-cache 转译缓存连同其中的失败记录一起发布，且与 tests 源随时
+# 分叉。故此处单列一条反向断言——.gitignore 只负责「不被暂存」，本通道负责
+# 「已在索引里的也拦下」。
+# ---------------------------------------------------------------------------
+# 正则必须是 GNU/BSD 通用的 ERE：非捕获组 `(?:…)` 属 PCRE，GNU grep -E 会以
+# rc=2 报「repetition-operator operand invalid」。故 rc 必须与「无命中」区分开：
+# 只有 0（有命中）/1（无命中）是正常结果，>1 一律 fail-closed——用 `|| true`
+# 兜住会把正则错误吞成空结果，通道永远假绿且自检无法变红。
+tracked_cache_re='(^|/)node_modules/|(^|/)[.](vite|vitest-cache)/'
+tracked_cache_rc=0
+tracked_cache="$(printf '%s\n' "$controlled" | grep -E "$tracked_cache_re")" || tracked_cache_rc=$?
+if [[ $tracked_cache_rc -gt 1 ]]; then
+  echo "ERROR: 依赖/构建缓存通道的正则无法执行（grep rc=${tracked_cache_rc}）：${tracked_cache_re}" >&2
+  echo "门禁 fail-closed——正则错误不等于无命中，请改成通用 ERE。" >&2
+  exit 1
+fi
+if [[ -n "$tracked_cache" ]]; then
+  echo "ERROR: 依赖/构建缓存目录不得入库（git rm -r --cached 撤销，并确认 .gitignore 覆盖）：" >&2
+  echo "$tracked_cache" >&2
   exit 1
 fi
 
 # —— 通道 1：路径 ——
-bad_paths="$(printf '%s\n' "$controlled" | grep -v -E "$skip_re" | grep -E "$path_regex" || true)"
+# 与通道 0 同口径 fail-closed：skip_re / path_regex（由上方十四条规则拼装）
+# 损坏时 grep 以 rc>1 报错，`|| true` 会把它吞成空结果——审计产物路径通道
+# 静默放行、永远假绿。rc 只有 0（有命中）/1（无命中）是正常结果，>1 一律
+# 报错退出并点名出错的正则。
+path_filter_rc=0
+path_candidates="$(printf '%s\n' "$controlled" | grep -v -E "$skip_re")" || path_filter_rc=$?
+if [[ $path_filter_rc -gt 1 ]]; then
+  echo "ERROR: 路径通道的 skip_re 无法执行（grep rc=${path_filter_rc}）：${skip_re}" >&2
+  echo "门禁 fail-closed——正则错误不等于无命中，请改成通用 ERE。" >&2
+  exit 1
+fi
+path_filter_rc=0
+bad_paths="$(printf '%s\n' "$path_candidates" | grep -E "$path_regex")" || path_filter_rc=$?
+if [[ $path_filter_rc -gt 1 ]]; then
+  echo "ERROR: 路径通道的 path_regex 无法执行（grep rc=${path_filter_rc}）：${path_regex}" >&2
+  echo "门禁 fail-closed——正则错误不等于无命中，请改成通用 ERE。" >&2
+  exit 1
+fi
 if [[ -n "$bad_paths" ]]; then
   echo "ERROR: 审计记录/轮次测试不得提交到公网仓库：" >&2
   echo "$bad_paths" >&2
@@ -116,10 +203,37 @@ if [[ ${#content_exempt_paths[@]} -ne 1 ]]; then
 fi
 content_exempt="^$(printf '%s' "${content_exempt_paths[0]}" | sed 's/[.]/\\./g')$"
 
+# 内容面豁免：npm 生成物（integrity 为 base64，且随依赖升级整份重写）——
+# 只豁免该单一路径，业务 JSON 夹具/种子仍须扫描。
+content_scan_exempt_re='(^|/)package-lock\.json$'
+
+# 内容扫描面（单一事实源）：可扫描的文本扩展名 + 无扩展名的约定文件。
+# 新增可写文本形态时只改这两个数组；自检按同一清单逐项造夹具断言确实入面
+# （漏登记即红）。py 与 check-bulk-edit-safety.sh 的 scripts/*.py 作业面同口径
+# ——一次性批量脚本写在 .py 里时，其注释同样可能夹带审计编号；.gitignore /
+# .gitattributes 没有扩展名，但注释块同样是可写入审计编号的地方。
+content_scan_exts=(go ts vue js css md markdown txt sh yml yaml sql mod json html htm toml conf py)
+content_scan_basenames=(Dockerfile docker-entrypoint.sh .dockerignore .gitignore .gitattributes Caddyfile)
+content_scan_ext_alt=""
+for ext in "${content_scan_exts[@]}"; do
+  content_scan_ext_alt+="${content_scan_ext_alt:+|}${ext}"
+done
+content_scan_name_alt=""
+for name in "${content_scan_basenames[@]}"; do
+  if [[ "$name" == "Dockerfile" ]]; then
+    # Dockerfile 派生文件（Dockerfile.dev 等）与主文件同族入面。
+    content_scan_name_alt+="${content_scan_name_alt:+|}(^|/)Dockerfile[^/]*"
+  else
+    content_scan_name_alt+="${content_scan_name_alt:+|}(^|/)${name//./[.]}"
+  fi
+done
+content_scan_re="\\.(${content_scan_ext_alt})$|${content_scan_name_alt}$"
+
 scan_targets="$(printf '%s\n' "$controlled" \
   | grep -v -E "$skip_re" \
   | grep -v -E "$content_exempt" \
-  | grep -Ei '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
+  | grep -v -E "$content_scan_exempt_re" \
+  | grep -Ei "$content_scan_re" \
   | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done || true)"
 
 if [[ -n "$scan_targets" ]]; then
@@ -129,7 +243,7 @@ if [[ -n "$scan_targets" ]]; then
     echo "ERROR: 需要 perl 才能运行内容扫描（缺少 perl，拒绝静默通过）" >&2
     exit 1
   fi
-  scan_prog="$(mktemp "${TMPDIR:-/tmp}/audit-guard-scan.XXXXXX.pl")"
+  scan_prog="$(mktemp "${TMPDIR:-/tmp}/audit-guard-scan.XXXXXX")"
   list_file="$(mktemp "${TMPDIR:-/tmp}/audit-guard-files.XXXXXX")"
   trap 'rm -f "$scan_prog" "$list_file"' EXIT
 
@@ -151,6 +265,9 @@ my $shield = join '|',
   q{P[0-9]{2}(-P?[0-9]{2})?},            # P50/P95/P99 与 P50-P99 百分位
   q{v[0-9]+\.[0-9]+(?:\.[0-9x*]+)*(?:-[A-Za-z0-9.]+)?},  # 版本串 v2.3.x / v2.3.8-beta
   q{YYYY-MM-DD}, q{NOT-NULL}, q{NULL-[a-z]+},
+  # 时间格式骨架（日志文件名/时间戳布局注释里的 HH-mm-ss、HH:mm:ss）：
+  # 两字母+分隔的三段形态不是审计编号，属产品口径 token。
+  q{[Hh]{2}[-:][Mm]{2}[-:][Ss]{2}},
   q{BY-DESIGN}, q{TOP-LEVEL}, q{HTTP-only}, q{TCP-only}, q{HTTP-date},
   q{TLS-enabled}, q{TLS-only}, q{VERSION-only}, q{JSON-[A-Za-z]*},
   q{IP-control}, q{IP-level}, q{ACME-issued}, q{UPSERT-overwritten},
@@ -160,6 +277,8 @@ my $shield = join '|',
   q{CRS-active}, q{LBF1}, q{PID1}, q{DNS-01},
   q{IPv[46]-(?:only|first|mapped|compatible)},  # IPv6-only 等网络口径
   q{YYYYMMDD(?:-HHMMSS)?},                      # 日志轮转文件名骨架
+  q{[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}(?:\.[0-9]+)?},
+  q{[0-9]{8}T[0-9]{2}-[0-9]{2}-[0-9]{2}},       # 日志轮转 ISO 时间戳（含毫秒）
   q{MAX-[0-9]+}, q{MIN-[0-9]+},      # 容量边界常量（MAX-1 个自有键），非编号
   q{[A-F0-9]{16,}};                      # 长十六进制摘要（逐段哈希/指纹）
 
@@ -195,6 +314,15 @@ my $cn_stop_punct = '(?:\xef\xbc\x8c|\xe3\x80\x81|\xef\xbc\x9b|\xe3\x80\x82|\xef
 my $cn_slash_round = $cn_di . '[ \t]*[0-9]+(?:\.[0-9]+)?'
   . '(?:/[ \t]*[0-9]+(?:\.[0-9]+)?)+[ \t]*' . $cn_round;
 
+# 括号/破折号引导的轮次归属：全角/ASCII 左括号或破折号之后直接跟「NN 轮」。
+# 其后不是倍数（「（NN 轮×60s」）、不是收尾括号（「（NN 轮」）也不接数字时，
+# 属回溯到某轮的审计归属而非循环计数——循环计数必然带倍数/单位或直接收尾；
+# 破折号前紧邻数字是区间写法（「第 N-NN 轮」），同样排除。审计动作常被折到
+# 下一行注释，同行动作词判定看不到，故这一形态必须独立成条。
+# 前缀逐字节写完整字符序列：写成字节字符类会误伤首字节相同的汉字。
+my $cn_round_attr = '(?<![0-9])(?:\xef\xbc\x88|\(|(?:\xe2\x80\x94){1,2}|--?)'
+  . '[ \t]*[0-9]{2,3}[ \t]*' . $cn_round . '(?!(?:\xc3\x97|\xef\xbc\x89|[0-9]))';
+
 # 轮次/编号的其它书写形态：中文轮次（含裸轮次与并列轮次）、审计序数、
 # round/audit 前缀、R 两位数、A 两位数、SYS/SEC/HP/CL 前缀，以及编号紧邻
 # “裁定”的审计结论引用。
@@ -212,10 +340,15 @@ my $legacy = join '|',
   '\xe5\xae\xa1\xe8\xae\xa1[ \t]*\xef\xbc\x88' . $cn_di
     . '[^\n]{1,8}?' . $cn_round,
   '\xe5\xae\xa1\xe8\xae\xa1[ \t]*[0-9]{2,3}(?![0-9])',
+  # 被历史清洗截断的注释残骸（「历史」+「问题」+冒号连写形态）——语义已被
+  # 剥离，只剩审计过程的痕迹；正常产品文案不会以该形态开头。
+  '\xe5\x8e\x86\xe5\x8f\xb2[ \t]*\xe9\x97\xae\xe9\xa2\x98[ \t]*[:\xef\xbc\x9a]',
   '(?i:\b(?:round|audit))[-_]?[0-9]{1,3}\b',
   '\b[Rr][0-9]{2}[a-z]?\b',
   '\bA[0-9]{2}[A-Za-z]?\b',
   '\b(?:SYS|SEC|HP|CL)[-_]?[0-9]{1,3}\b',
+  # 括号/破折号引导的轮次归属（见 $cn_round_attr）。
+  $cn_round_attr,
   '[A-Z][A-Za-z]{0,4}[0-9]{1,3}[A-Za-z]?[ \t]*\xe8\xa3\x81\xe5\xae\x9a';
 
 # 连写形态（无短横线）：1-5 位大写字母 + 2-3 位数字 + 1-2 位大写字母收尾。
@@ -232,7 +365,11 @@ my $cross = join '|',
   $cn_di . '[ \t]*\r?\n[ \t]*' . $cont_prefix . '[0-9]+(?:\.[0-9]+)?[ \t]*'
     . '\r?\n?[ \t]*' . $cn_round . $cn_not_carousel,
   $cn_di . '[ \t]*[0-9]+(?:\.[0-9]+)?[ \t]*\r?\n[ \t]*' . $cont_prefix
-    . $cn_round . $cn_not_carousel;
+    . $cn_round . $cn_not_carousel,
+  # 轮次写在本行（须是括号/破折号归属形态）、审计动作折到下一行注释：行级判定
+  # 只看同行共现，折行写法会把动作词挪出匹配窗口。轮次形态沿用 $cn_round_attr
+  # （循环计数写法已在源头排除），续行必须是注释（审计动作只出现在注释里）。
+  $cn_round_attr . '[^\n]*\r?\n[ \t]*(?://+|#|\*|/\*|--|;)[ \t]*(?:' . $cn_audit_verbs . ')';
 
 my $comment_re = qr{^[ \t]*(?://|///|\*|/\*|<!--|--|#|;)};
 my $decl_re    = qr{^[ \t]*(?:func (?:Test|Benchmark|Fuzz)|describe\(|test\(|it\(|t\.Run\()};
@@ -263,7 +400,10 @@ while (my $f = <$lf>) {
     $hits++;
     next;
   }
-  my $is_doc = ($f =~ /\.(?:md|markdown|txt)$/i);
+  # 文档/结构化文本按全文扫描：Markdown 与纯文本整篇都是可读文案；JSON 的
+  # 字符串值、HTML 的文本节点没有注释前缀，只扫注释行等于给编号留通道
+  # （夹具/种子 JSON、模板文案是真实混入面）。
+  my $is_doc = ($f =~ /\.(?:md|markdown|txt|html|htm|json)$/i);
 
   $text =~ s/(?:$shield)//g;
 

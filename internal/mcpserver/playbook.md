@@ -13,9 +13,9 @@
 
 | 范围 | 说明 |
 |---|---|
-| 只读 Key（read_only） | 可调用 GET 查询类工具（export_config 除外——导出含用户/密钥哈希，隐藏）及 5 个读探测 POST 工具（test_ca_provider/test_certificate_config/parse_certificate/validate_import/preview_config）；其余写工具返回 403 |
-| 写工具（POST/PUT/DELETE） | 需非只读 Key，且 Key 属主须为 admin 角色（非管理员 Key 调用写工具返回 403）；从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/测试类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点 |
-| IP 白名单 | 配了白名单的 Key，请求来源 IP 必须命中（MCP 内部转发不受影响） |
+| 只读 Key（read_only） | 可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希、后者原始 Caddy 配置可能含内联私钥，二者对只读 Key 恒 403，tools/list 亦隐藏）及 3 个读探测 POST 工具；其中 parse_certificate 对非管理员开放，validate_import/preview_config 需 Key 属主为管理员（属 admin 组路由，非管理员调用恒 403 且 tools/list 不展示）；其余写工具返回 403（test_certificate_config 证书配置测试会写 DNS TXT 记录、test_ca_provider 缺 EAB 时会写 CA 凭据，只读 Key 均不可用） |
+| 写工具（POST/PUT/PATCH/DELETE） | 需非只读 Key，且 Key 属主须为 admin 角色（非管理员 Key 的 tools/list 已隐藏全部恒 403 工具：admin 组路由 + business 组未豁免只读白名单的写路由）；从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点 |
+| IP 白名单 | 配了白名单的 Key，请求来源 IP 必须命中（约束该 Key 的全部 REST 与 MCP 调用；MCP 内部转发不受影响） |
 | 生效方式 | 写操作校验后即时生效，失败自动回滚，无需手动 reload |
 
 ## 3. 工具分组速览（节选，全部百余工具以 tools/list 返回为准）
@@ -38,14 +38,15 @@
 ### 4.2 新建 TCP 四层代理
 
 1. `create_rule`：`protocol=tcp` + `listen_port` + `upstreams[{host,port}]`，**不要填 domain**
-2. 后端需要真实客户端 IP 时加 `tcp_proxy_protocol=true`（注意：后端必须支持 PROXY v2，否则连接会解析失败）
+2. 后端需要真实客户端 IP 时加 `tcp_proxy_protocol=true`（注意：后端必须支持 PROXY v2，否则连接会解析失败；入站 PROXY 头仅在规则绑定了安全策略后才会解析，且仅来自系统设置受信代理网段内的来源时采信（用于事件归因与发往上游的源地址），其余来源按直连地址处理，直连客户端无需发送 PROXY 头；未绑定安全策略的 TCP 规则不解析 PROXY 头，伪造头原样透传上游）
 3. `get_upstream_health` 验证
 
 ### 4.3 修改规则（安全姿势：先读后写）
 
 1. `get_rule` 取完整现状
-2. `update_rule` 只传要改的字段（部分更新）；协议切换会自动迁移上游协议并清理对侧字段
-3. `get_rule` 复查 + `get_upstream_health` 验证流量
+2. `update_rule` 只传要改的标量字段（部分更新）；协议切换会自动迁移上游协议并清理对侧字段
+3. **例外：`upstreams` 与 `path_rules` 是全量替换**——必须携带完整数组（每个上游含 `enabled`），先用 `get_rule` 取全集再改目标项，漏传的元素会被删除（流量收窄）
+4. `get_rule` 复查 + `get_upstream_health` 验证流量
 
 ### 4.4 排查流量异常
 
@@ -60,7 +61,7 @@
 
 ### 4.6 集群环境操作前
 
-`get_cluster_status` 确认本节点角色：从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/测试类 POST 除外）——集群运维在目标从节点本身调用，不要发往主节点；其余写操作对主节点发起。
+`get_cluster_status` 确认本节点角色：从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标从节点本身调用，不要发往主节点；其余写操作对主节点发起。
 
 ## 5. 操作纪律
 
@@ -72,8 +73,8 @@
 ## 6. 性能建议
 
 - 轻量优先：能 `get_metrics_overview` 就不用 `get_metrics_dashboard`；能 `get_rule` 就不用反复 `list_rules`
-- 审计日志务必分页；单工具响应上限 4 MiB，超限请改用分页参数（page/page_size）缩小返回范围
-- 配置备份导入（import_config/import_v1_config/validate_import）请求体上限 1 MiB（网关体积限制，REST 侧为 48 MiB）：备份超过 1 MiB 时 MCP 通道不可用，请改用管理面板或 REST 导入
+- 审计日志务必分页；单工具响应上限 4 MiB，超限请改用分页参数（page/page_size）缩小返回范围；无分页参数的整份返回工具（list_rules/list_ip_lists/get_config 等）超限时改用对应的单条查询工具（get_* 系列）缩小范围，或经管理面板查看/导出
+- 配置备份导入（import_config/import_v1_config/validate_import）请求体上限 1 MiB（网关体积限制，REST 侧为 128 MiB）：备份超过 1 MiB 时 MCP 通道不可用，请改用管理面板或 REST 导入
 - 保持 HTTP 连接复用（一个 MCP 会话内不要每次新建连接）
 
 ## 7. 错误码速查
@@ -82,5 +83,7 @@
 |---|---|
 | 401 | 密钥无效/缺失，或使用 JWT（MCP 仅支持 API Key）→ 换用开启了 MCP 的 lb_sk_ 密钥 |
 | 403 | 未开启 MCP / 来源 IP 不在白名单 / 只读 Key 越权 / 从节点非集群写工具 → 开启 MCP 开关、放行来源 IP、换非只读 Key；集群运维对目标从节点本身调用、其余写操作对主节点调用 |
-| 参数错误 | 参数校验在 REST 侧执行，以 IsError + 文本返回（含具体 message）→ 读 message 修正重试；协议层暂不启用 `input_schema` 校验（不会产生 -32602），schema 仅作构参契约——先读 schema 再调用，不要猜字段名 |
+| 429 | 每 API Key 每分钟 120 次请求；同一来源 IP 另有每分钟 120 次匿名/认证失败预算（仅 401 计入，成功请求回滚，Key 之间互不占额；不是权限问题）→ 响应是 REST 形态而非 JSON-RPC error；按 `Retry-After` 秒数等待并指数退避后重试，不要立即重试 |
+| 参数错误 | 缺参/缺密钥/传输失败与 REST 业务错误均以 IsError + 文本返回（含具体 message）→ 读 message 修正重试；协议层暂不启用 `input_schema` 校验（不会产生 -32602），schema 仅作构参契约——先读 schema 再调用，不要猜字段名 |
 | IsError + 4xx/5xx 文本 | 内部 REST 返回的业务错误，响应体里有具体 message |
+| JSON-RPC -32603 | 仅内部不变量破坏（地址构造/序列化失败等），属服务端缺陷——请反馈维护者，不要重试 |

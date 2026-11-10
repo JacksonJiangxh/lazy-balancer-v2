@@ -6,9 +6,17 @@ import (
 	"time"
 )
 
-// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（U6a-5-4 收敛：
+// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（收敛
 // handlers 写侧与 middleware 读侧曾跨包双份定义——单侧改动会静默失配）。
+// 格式以字面 Z 结尾却不做时区转换：非 UTC 时间直接 Format 会把本地时刻
+// 标成 UTC（读侧 time.Parse 按字面 Z 解析，比较时刻漂移时区偏移量）。
 const RevokedTokenTimeFormat = "2006-01-02T15:04:05Z"
+
+// FormatRevokedTokenTime 是该格式的唯一格式化入口：先归一 UTC 再格式化。
+// 写侧/读侧一律经此函数产出比较用时间串，禁止直接 t.Format(RevokedTokenTimeFormat)。
+func FormatRevokedTokenTime(t time.Time) string {
+	return t.UTC().Format(RevokedTokenTimeFormat)
+}
 
 // User represents a user in the system
 type User struct {
@@ -22,6 +30,9 @@ type User struct {
 	LastLogin    sql.NullTime   `json:"last_login"`
 	// v2.3.0:认证来源(local/oidc)——票据登录跨节点透传、响应透出供前端区分
 	AuthProvider string `json:"auth_provider"`
+	// IsSetupAdmin 标记初始化创建的首个管理员（break-glass 入口）：不可删除/
+	// 禁用/降级，前端据此禁用对应操作。
+	IsSetupAdmin bool `json:"is_setup_admin"`
 }
 
 type UserResponse struct {
@@ -32,18 +43,26 @@ type UserResponse struct {
 	IsEnabled    bool       `json:"is_enabled"`
 	MFAEnabled   bool       `json:"mfa_enabled"`
 	AuthProvider string     `json:"auth_provider"`
+	IsSetupAdmin bool       `json:"is_setup_admin"`
 	CreatedAt    time.Time  `json:"created_at"`
 	LastLogin    *time.Time `json:"last_login"`
 }
 
-func NewUserResponse(user User) UserResponse {
+// NewUserResponse 构造用户响应。mfaEnabled 必须由调用方从 users.mfa_enabled
+// 读取后传入：将原本「构造后手工 response.MFAEnabled=…」
+// 的口径收敛为签名参数——历史上两次都因新增返回路径忘记
+// 补字段导致 mfa_enabled 恒 false（前端登录预检误报）。签名强制让遗漏在
+// 编译期失败，而不是静默返回错误值。
+func NewUserResponse(user User, mfaEnabled bool) UserResponse {
 	response := UserResponse{
 		ID:           user.ID,
 		Username:     user.Username,
 		Role:         user.Role,
 		IsEnabled:    user.IsEnabled,
+		MFAEnabled:   mfaEnabled,
 		CreatedAt:    user.CreatedAt,
 		AuthProvider: user.AuthProvider,
+		IsSetupAdmin: user.IsSetupAdmin,
 	}
 	if user.DisplayName.Valid {
 		response.DisplayName = &user.DisplayName.String
@@ -144,14 +163,24 @@ type LbRule struct {
 	// NTLM 兼容开关（2026-10-12）：1=按 NTLM 兼容形态渲染（保存门强制
 	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
 	NTLMCompatible     int `json:"ntlm_compatible"`
-	UpstreamForceHTTP1 int `json:"upstream_force_http1"`
+	UpstreamForceHTTP1 int `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
 	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
 	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
 	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
 	// 该路。0 值在写侧（CreateRule/UpdateRule）与渲染侧兜底 3000/30000
 	//（预算公式：(N−1)×race+timeout ≤ 60s，按 N=6 封顶设计，见 caddy.go）。
-	ChainRaceIntervalMS        int        `json:"chain_race_interval_ms"`
-	ChainRequestTimeoutMS      int        `json:"chain_request_timeout_ms"`
+	ChainRaceIntervalMS   int `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS int `json:"chain_request_timeout_ms"`
+	// 认证网关（forward_auth）：1=该规则全部请求先经认证网关校验（GET 子请求，
+	// 未认证返回网关响应、认证通过注入身份头后转发后端）。仅 HTTP 语义，TCP 行
+	// 恒 0；upstream=http(s)://host:port，uri=网关校验路径，copy_headers=认证
+	// 通过后拷入原请求的身份头清单（逗号分隔）。渲染消费全部四列：enabled=1
+	// 而 upstream 为空的带外行由启动迁移归零（uri/copy_headers 有确定默认，
+	// 启动回填）。
+	ForwardAuthEnabled         int        `json:"forward_auth_enabled"`
+	ForwardAuthUpstream        string     `json:"forward_auth_upstream"`
+	ForwardAuthURI             string     `json:"forward_auth_uri"`
+	ForwardAuthCopyHeaders     string     `json:"forward_auth_copy_headers"`
 	CustomRoutesEnabled        bool       `json:"custom_routes_enabled"`
 	ProxyDialTimeout           int        `json:"proxy_dial_timeout"`
 	ProxyResponseHeaderTimeout int        `json:"proxy_response_header_timeout"`
@@ -162,8 +191,8 @@ type LbRule struct {
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
 	Upstreams                  []Upstream `json:"upstreams"`
-	OriginDomain               string     `json:"origin_domain"`
-	// 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 OriginDomain。
+	HostHeader                 string     `json:"host_header"`
+	// 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 HostHeader。
 	HealthCheckHost string `json:"health_check_host"`
 	EnableTLS       bool   `json:"enable_tls"`
 	TLSSource       string `json:"tls_source"`
@@ -176,9 +205,8 @@ type LbRule struct {
 	// 与 manual 同列）；数据库是运行时唯一信任源，路径仅供看门狗检测外部更新。
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
 	TLSKeyPath  string `json:"tls_key_path,omitempty"`
-
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key
-	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」（F50-7）。
+	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」。
 	TLSKeySet       bool   `json:"tls_key_set,omitempty"`
 	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
 	EnableCompress  bool   `json:"enable_compress"`
@@ -229,12 +257,26 @@ type UpdateCAProviderRequest struct {
 	Enabled       *bool   `json:"enabled"`
 }
 
+// 威胁大屏中央视觉模式封闭枚举（列 global_config.threat_screen_mode）。
+// 三处消费同一列表：写侧校验（handlers/caddy.go 400 白名单）、从端快照
+// apply 归一（services/cluster_apply.go 非法值回默认）、读侧渲染。
+// 默认值单源 db.DefaultThreatScreenMode（= ThreatScreenModeMap）。
+const (
+	ThreatScreenModeMap   = "map"
+	ThreatScreenModeGlobe = "globe"
+)
+
+// IsValidThreatScreenMode 报告模式值是否属于封闭枚举。
+func IsValidThreatScreenMode(mode string) bool {
+	return mode == ThreatScreenModeMap || mode == ThreatScreenModeGlobe
+}
+
 // GlobalConfig represents global configuration
 type GlobalConfig struct {
-	ID                         int    `json:"id"`
-	CaddyConfig                string `json:"caddy_config"`
-	DNSProvider                string `json:"dns_provider"`
-	DNSCredentials             string `json:"dns_credentials"`
+	ID          int    `json:"id"`
+	CaddyConfig string `json:"caddy_config"`
+	// DNS 凭证正文不属于该响应模型：/config 面向全部登录用户，凭证只存
+	// certificate_configs。
 	ACMEEmail                  string `json:"acme_email"`
 	CertExpiryDays             int    `json:"cert_expiry_days"`
 	CertRenewalDays            int    `json:"cert_renewal_days"`
@@ -254,16 +296,18 @@ type GlobalConfig struct {
 	ProxyStreamTimeout         int    `json:"proxy_stream_timeout"`
 	ProxyFlushInterval         int    `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      int    `json:"proxy_stream_close_delay"`
-	ServerTokensHidden         bool   `json:"server_tokens_hidden"`
-	TaskLogSizeMB              int    `json:"task_log_size_mb"`
-	AuditLogSizeMB             int    `json:"audit_log_size_mb"`
-	RuntimeLogSizeMB           int    `json:"runtime_log_size_mb"`
-	AccessLogJSON              bool   `json:"access_log_json"`
-	AccessLogFormat            string `json:"access_log_format"`
-	AuditRetentionMonths       int    `json:"audit_retention_months"`
-	JWTExpireMinutes           int    `json:"jwt_expire_minutes"`
-	Timezone                   string `json:"timezone"`
-	GitHubProxyURL             string `json:"github_proxy_url"`
+	// 二态布尔（false=显示 / true=隐藏），与规则级 server_tokens_hidden 的
+	// 0/1/2 三态（0=随全局/1=隐藏/2=显示）语义不同型：全局无「随全局」态。
+	ServerTokensHidden   bool   `json:"server_tokens_hidden"`
+	TaskLogSizeMB        int    `json:"task_log_size_mb"`
+	AuditLogSizeMB       int    `json:"audit_log_size_mb"`
+	RuntimeLogSizeMB     int    `json:"runtime_log_size_mb"`
+	AccessLogJSON        bool   `json:"access_log_json"`
+	AccessLogFormat      string `json:"access_log_format"`
+	AuditRetentionMonths int    `json:"audit_retention_months"`
+	JWTExpireMinutes     int    `json:"jwt_expire_minutes"`
+	Timezone             string `json:"timezone"`
+	GitHubProxyURL       string `json:"github_proxy_url"`
 	// GitHubToken 可选 GITHUB_TOKEN（2026-09-25 用户裁定）：响应面永不回显
 	// 原文（json:"-"），仅 HasGitHubToken 显隐；写路径 UpdateConfigRequest。
 	GitHubToken         string `json:"-"`
@@ -272,6 +316,24 @@ type GlobalConfig struct {
 	MasterURL           string `json:"master_url"`
 	SyncInterval        int    `json:"sync_interval"`
 	DefaultCAProviderID int    `json:"default_ca_provider_id"`
+	// ServerMapLat/ServerMapLon 威胁大屏本站坐标（v3，node-local 列）：
+	// 0,0=未设置（前端回退地图视觉中心）。节点属性不随集群同步。
+	ServerMapLat float64 `json:"server_map_lat"`
+	ServerMapLon float64 `json:"server_map_lon"`
+	// ThreatScreenMode 威胁大屏中央视觉模式（v2.3.8）：map=360°地图+雷达扫掠 /
+	// globe=旋转地球+垂直扫描。缺省 db.DefaultThreatScreenMode。该列随集群
+	// 快照（ClusterBasicSettings）同步：从节点写入口被只读门拒绝，配置只能
+	// 由主节点下发。枚举校验单源见 IsValidThreatScreenMode。
+	ThreatScreenMode string `json:"threat_screen_mode"`
+	// ThreatTrafficSampleN 大屏逐请求光流采样：-1=自适应（内部从 1/1 起步，
+	// 按事件速率在 1/4/8 档与滞回切换）、0=关闭。全量档已退役（自适应低流量
+	// 等价全量）；固定 2..64/1 存量由启动迁移归一 -1。
+	ThreatTrafficSampleN int `json:"threat_traffic_sample_n"`
+	// SecurityEventsRetentionDays/RowCap 安全事件保留（v2.3.8 显式设置）：
+	// 写侧只接受 1-3650 天 / 1-1 亿行（旧「0=自动」语义已废除）；库内 0/NULL
+	// 属 legacy 形态，由启动迁移一次性归一。渲染/查询直读库值。
+	SecurityEventsRetentionDays int `json:"security_events_retention_days"`
+	SecurityEventsRowCap        int `json:"security_events_row_cap"`
 	// v2.1.8 MFA 全局开关（响应面）
 	MFAWriteGuard     bool `json:"mfa_write_guard"`
 	MFALockoutEnabled bool `json:"mfa_lockout_enabled"`
@@ -279,33 +341,34 @@ type GlobalConfig struct {
 	TrustedProxyEnabled bool   `json:"trusted_proxy_enabled"`
 	TrustedProxyRanges  string `json:"trusted_proxy_ranges"`
 	// 受信网段引用的 IP 地址列表 id（JSON 数组文本，2026-10-12）：与内联
-	// trusted_proxy_ranges 合并生效（渲染静态展开）。
+	// trusted_proxy_ranges 合并投影（2026-10-15 热路径化，tp.txt/lb_file）。
 	TrustedProxyRangeRefs string       `json:"trusted_proxy_range_refs"`
 	TrustedProxyHeaders   string       `json:"trusted_proxy_headers"`
 	TrustedProxyStrict    bool         `json:"trusted_proxy_strict"`
-	ClusterVersion        int          `json:"cluster_version"`
-	ClusterToken          string       `json:"-"`
-	RegistrationID        int          `json:"-"`
-	RegistrationSecret    string       `json:"-"`
-	AppliedVersion        int          `json:"applied_version"`
-	LastSyncError         string       `json:"last_sync_error"`
 	LastSync              JSONNullTime `json:"last_sync"`
 	UpdatedAt             JSONNullTime `json:"updated_at"`
 }
 
 // Upstream represents an upstream server
 type Upstream struct {
-	ID             int    `json:"id"`
-	RuleID         string `json:"rule_id"`
-	Host           string `json:"host"`
-	Port           int    `json:"port"`
-	Weight         int    `json:"weight"`
-	DynamicDNS     bool   `json:"dynamic_dns"` // 遗留死列，渲染勿消费（渲染只读规则级 DynamicDNS）
+	ID int `json:"id"`
+	// RuleID 仅服务端内部传递（DB 扫描/按规则分组），不进 JSON：上游所属规则
+	// 由外层规则对象（caddy_id）表达，响应回显 rule_id 是冗余键，且与 PathRule
+	// 的 json:"-" 口径一致。
+	RuleID string `json:"-"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+	Weight int    `json:"weight"`
+	// DynamicDNS 是 upstreams 表的废弃列：渲染只读规则级 DynamicDNS，写侧
+	// 恒落 0（值不再传播）。响应面已收敛（omitempty——恒 false 不下发，
+	// 防消费者据恒假值误判；导入/快照缺省即零值，双向兼容），新代码禁止
+	// 据此做任何判定。
+	DynamicDNS     bool   `json:"dynamic_dns,omitempty"`
 	Enabled        bool   `json:"enabled"`
 	Protocol       string `json:"protocol"`
 	MaxConnections int    `json:"max_connections"`
 	// 逐上游回源域名（2026-10-10）：非空时驱动该上游回源 Host 头与 HTTPS SNI
-	// （map 处理器晚绑定查表）；空=跟随规则级 OriginDomain/现状默认。
+	// （map 处理器晚绑定查表）；空=跟随规则级 HostHeader/现状默认。
 	OriginDomain string `json:"origin_domain,omitempty"`
 }
 
@@ -414,10 +477,17 @@ type CertJob struct {
 	UpdatedAt        JSONNullTime `json:"updated_at"`
 }
 
-// Request/Response types
+// LoginRequest 登录入参。username/password 补长度上限——
+// 此前仅 required，未认证请求可携带 ~64KiB「用户名」，失败登录按原文写入
+// audit_log（每次一行等大，限流 10/min/IP 可被分布式绕开，放大审计库）。
+// 上限与写入侧对齐：username=users.username 列宽 50；password 的 binding
+// max=72 按 Unicode rune 计数（validator 对 string 的计量口径），并非 bcrypt
+// 的 72 字节——多字节密码可携 >72 字节越过此门，但 bcrypt 比较阶段（x/crypto
+// 的 CompareHashAndPassword 不做字节截断）恒不匹配，登录表现为同形 401，
+// 不产生 500，故不前置字节级短路。
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Username string `json:"username" binding:"required,max=50"`
+	Password string `json:"password" binding:"required,max=72"`
 }
 
 type LoginResponse struct {
@@ -472,17 +542,18 @@ type CreateRuleRequest struct {
 	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
-	// NTLM 兼容开关（2026-10-12）：1=按 NTLM 兼容形态渲染（保存门强制
-	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
-	NTLMCompatible     int `json:"ntlm_compatible"`
-	UpstreamForceHTTP1 int `json:"upstream_force_http1"`
+	NTLMCompatible                int    `json:"ntlm_compatible"`      // 0=off, 1=NTLM 兼容形态（要求 strategy=cookie）
+	UpstreamForceHTTP1            int    `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
 	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
-	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
-	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
-	// 该路。0 值在写侧（CreateRule/UpdateRule）与渲染侧兜底 3000/30000
-	//（预算公式：(N−1)×race+timeout ≤ 60s，按 N=6 封顶设计，见 caddy.go）。
-	ChainRaceIntervalMS        int        `json:"chain_race_interval_ms"`
-	ChainRequestTimeoutMS      int        `json:"chain_request_timeout_ms"`
+	// 竞速间隔 / 单请求兜底截断（毫秒）；0=写侧/渲染侧按策略兜底 3000/30000。
+	ChainRaceIntervalMS   int `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS int `json:"chain_request_timeout_ms"`
+	// 认证网关四件套（仅 HTTP；enabled=1 时保存门强制 upstream 齐备，
+	// uri/copy_headers 空值由写侧回填确定默认）。
+	ForwardAuthEnabled         int        `json:"forward_auth_enabled"`
+	ForwardAuthUpstream        string     `json:"forward_auth_upstream"`
+	ForwardAuthURI             string     `json:"forward_auth_uri"`
+	ForwardAuthCopyHeaders     string     `json:"forward_auth_copy_headers"`
 	CustomRoutesEnabled        bool       `json:"custom_routes_enabled"`
 	ProxyDialTimeout           int        `json:"proxy_dial_timeout"`
 	ProxyResponseHeaderTimeout int        `json:"proxy_response_header_timeout"`
@@ -492,8 +563,8 @@ type CreateRuleRequest struct {
 	ProxyFlushInterval         int        `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
-	OriginDomain               string     `json:"origin_domain"`
-	// 健康检查域名：空=跟随 OriginDomain（省略与空串同义，创建语义）。
+	HostHeader                 string     `json:"host_header"`
+	// 健康检查域名：空=跟随 HostHeader（省略与空串同义，创建语义）。
 	HealthCheckHost string     `json:"health_check_host"`
 	Upstreams       []Upstream `json:"upstreams" binding:"required"`
 	EnableTLS       bool       `json:"enable_tls"`
@@ -504,9 +575,8 @@ type CreateRuleRequest struct {
 	TLSKey          string     `json:"tls_key"`
 	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
 	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
-	TLSCertPath string `json:"tls_cert_path"`
-	TLSKeyPath  string `json:"tls_key_path"`
-
+	TLSCertPath     string `json:"tls_cert_path"`
+	TLSKeyPath      string `json:"tls_key_path"`
 	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
 	EnableCompress  bool   `json:"enable_compress"`
 	CompressTypes   string `json:"compress_types"`
@@ -516,14 +586,33 @@ type CreateRuleRequest struct {
 	BlockPageStage1Status int `json:"block_page_stage1_status"`
 	BlockPageStage3ID     int `json:"block_page_stage3_id"`
 	BlockPageStage3Status int `json:"block_page_stage3_status"`
-	// LB-01：缺省（nil）=创建即启用（向后兼容历史调用方）；显式 false=创建为
+	// 缺省（nil）=创建即启用（向后兼容历史调用方）；显式 false=创建为
 	// 禁用（UI 复制向导按预览「禁用」态落库）。
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
+// UpdateRuleRequest 是部分更新（PUT = 提交即生效，未提交字段保留存量）的请求
+// 载体，清空语义只有两种形态，不得混用：
+//
+//  1. 三态字段（指针/集合）：省略（nil）=保留原值，显式零值=清空。指针字段
+//     如 Description/HostHeader/HealthCheckHost 等；集合字段 PathRules 用
+//     nil/空数组区分；Upstreams 省略=保留存量（空数组会被「至少一个启用的
+//     上游」写侧校验 400，不存在「清空上游」的合法形态）。
+//  2. 不可清空字段族（值类型，零值一律按「未提交」合并存量，见
+//     handlers.UpdateRule 的合并块）：Name、Protocol、Domain、ListenPort、
+//     Strategy、DnsFamily、HealthCheckInterval、HealthCheckTimeout、
+//     TLSSource、ACMEConfigID、TLSCert、TLSKey、TLSCertPath、TLSKeyPath、
+//     CompressTypes、ExpectedUpdatedAt。这些字段的保存终态要么必填、要么必须落在合法值域，
+//     「空」没有业务含义（端口/名称/域名/策略/健康检查间隔等）或由实体开关
+//     表达（关闭压缩用 EnableCompress、清除证书材料用切换 TLSSource——
+//     引用型证书路径列是摄取源记录，空串=保留存量路径）。
+//     API/MCP 客户端因此无法把它们清空——这是有意的契约，不是遗漏；
+//     清空语义登记由 models 包的
+//     TestUpdateRuleRequest_clearSemanticsRegisteredAndDocumented 守门，
+//     新增值类型字段若未决定语义（指针化或登记到本注释）即测试红。
 type UpdateRuleRequest struct {
 	Name string `json:"name"`
-	// 审计 M16：OriginDomain/Description/DnsServer/HealthCheckPath 指针化——
+	// HostHeader/Description/DnsServer/HealthCheckPath 指针化——
 	// 省略（nil）=保留原值，显式空串=清空；旧行为空串与省略无法区分。
 	Description         *string `json:"description"`
 	Protocol            string  `json:"protocol"`
@@ -537,16 +626,16 @@ type UpdateRuleRequest struct {
 	HealthCheckPath     *string `json:"health_check_path"`
 	HealthCheckInterval int     `json:"health_check_interval"`
 	HealthCheckTimeout  int     `json:"health_check_timeout"`
-	// LB41-1（M16 口径续）：健康检查双阈值指针化——省略（nil）=保留原值，
-	// 显式 0=落库 0（渲染侧 <=0 兜底默认 3/2，caddy.go）。此前非指针 int 无
-	// 合并，部分更新（如仅改名）把存量阈值静默重置为 0。
+	// 健康检查双阈值指针化——省略（nil）=保留原值。
+	// 显式 0 不再落库：写侧校验 400、启动迁移回填默认 3/2，渲染层直读库值
+	// 且无效值显性失败（无写死兜底）。
 	HealthCheckUnhealthyThreshold *int  `json:"health_check_unhealthy_threshold"`
 	HealthCheckHealthyThreshold   *int  `json:"health_check_healthy_threshold"`
 	EnableActiveHealthCheck       *bool `json:"enable_active_health_check"`
-	// LB-02（M16 口径续）：TCP 三字段指针化——省略（nil）=保留原值，显式 0=真实
-	// 零值落库（tcp_try_duration 0=不重试、tcp_try_interval 0=Caddy 默认间隔、
-	// tcp_health_check_port 0=跟随上游端口）。此前非指针 int 的「0=沿用存量」
-	// 合并使显式清零永不可达。
+	// TCP 字段指针化——省略（nil）=保留原值。
+	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 250
+	//（毫秒，单位与渲染输出 "250ms" 一致；DDL 与回填同取
+	// db.DefaultTCPTryInterval），tcp_health_check_port 0=跟随上游端口。
 	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
 	TCPProxyProtocol         *bool `json:"tcp_proxy_protocol"`
 	TCPTryDuration           *int  `json:"tcp_try_duration"`
@@ -557,10 +646,16 @@ type UpdateRuleRequest struct {
 	// NTLM 兼容开关：指针化——省略（nil）=保留原值，显式 0=关闭。
 	NTLMCompatible     *int `json:"ntlm_compatible"`
 	UpstreamForceHTTP1 *int `json:"upstream_force_http1"`
-	// 链式回退竞速参数（LB-02 口径）：指针化——省略（nil）=保留原值，
+	// 链式回退竞速参数（指针合并口径）：指针化——省略（nil）=保留原值，
 	// 显式 0=落库 0（写侧/渲染侧按 chain 策略兜底 3000/30000）。
-	ChainRaceIntervalMS        *int        `json:"chain_race_interval_ms"`
-	ChainRequestTimeoutMS      *int        `json:"chain_request_timeout_ms"`
+	ChainRaceIntervalMS   *int `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS *int `json:"chain_request_timeout_ms"`
+	// 认证网关四件套：指针化同 NTLM——省略（nil）=保留原值；upstream/
+	// uri/copy_headers 显式空串=清空（enabled=1 时保存门拒绝清空 upstream）。
+	ForwardAuthEnabled         *int        `json:"forward_auth_enabled"`
+	ForwardAuthUpstream        *string     `json:"forward_auth_upstream"`
+	ForwardAuthURI             *string     `json:"forward_auth_uri"`
+	ForwardAuthCopyHeaders     *string     `json:"forward_auth_copy_headers"`
 	CustomRoutesEnabled        *bool       `json:"custom_routes_enabled"`
 	ProxyDialTimeout           *int        `json:"proxy_dial_timeout"`
 	ProxyResponseHeaderTimeout *int        `json:"proxy_response_header_timeout"`
@@ -570,8 +665,8 @@ type UpdateRuleRequest struct {
 	ProxyFlushInterval         *int        `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      *int        `json:"proxy_stream_close_delay"`
 	PathRules                  *[]PathRule `json:"path_rules"`
-	OriginDomain               *string     `json:"origin_domain"`
-	// 健康检查域名：指针化同 OriginDomain——省略=保留原值，显式空串=清空。
+	HostHeader                 *string     `json:"host_header"`
+	// 健康检查域名：指针化同 HostHeader——省略=保留原值，显式空串=清空。
 	HealthCheckHost *string    `json:"health_check_host"`
 	Upstreams       []Upstream `json:"upstreams"`
 	EnableTLS       *bool      `json:"enable_tls"`
@@ -580,11 +675,10 @@ type UpdateRuleRequest struct {
 	CAProviderID    *int       `json:"ca_provider_id"`
 	TLSCert         string     `json:"tls_cert"`
 	TLSKey          string     `json:"tls_key"`
-	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
-	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
-	TLSCertPath string `json:"tls_cert_path"`
-	TLSKeyPath  string `json:"tls_key_path"`
-
+	// 引用型证书（tls_source="file"）：摄取源路径——内容保存时入库，
+	// 路径仅供看门狗检测外部更新（写侧解析，语义同 CreateRuleRequest）。
+	TLSCertPath     string `json:"tls_cert_path"`
+	TLSKeyPath      string `json:"tls_key_path"`
 	TLSHTTPRedirect *bool  `json:"tls_http_redirect"`
 	EnableCompress  *bool  `json:"enable_compress"`
 	CompressTypes   string `json:"compress_types"`
@@ -596,12 +690,19 @@ type UpdateRuleRequest struct {
 	BlockPageStage1Status *int `json:"block_page_stage1_status"`
 	BlockPageStage3ID     *int `json:"block_page_stage3_id"`
 	BlockPageStage3Status *int `json:"block_page_stage3_status"`
+	// ExpectedUpdatedAt 是可选乐观并发前置条件：客户端回传打开编辑表单时
+	// 看到的 updated_at（RFC3339 或库内平面 UTC 形态）。省略/空串=不校验
+	// （API/MCP 向后兼容）；提供且与事务内读到的库值不一致 → 409。
+	// 保护粒度为秒（updated_at 写侧 datetime('now')，比较前截断到秒）：
+	// 同一秒内他人已提交时版本值不变，本前置条件无法识别——跨秒的并发提交
+	// 才保证拦截；需要秒内严格性时须改用独立版本列（另行设计，非当前契约）。
+	ExpectedUpdatedAt string `json:"expected_updated_at"`
 }
 
 type UpdateConfigRequest struct {
-	Source                     string  `json:"source"`
-	DNSProvider                *string `json:"dns_provider"`
-	DNSCredentials             *string `json:"dns_credentials"`
+	Source string `json:"source"`
+	// global_config.dns_provider/dns_credentials 已退役（列由启动迁移删除）：
+	// 签发链唯一凭证来源是 certificate_configs；请求体携带旧键不会产生写入。
 	ACMEEmail                  *string `json:"acme_email"`
 	CertExpiryDays             *int    `json:"cert_expiry_days"`
 	CertRenewalDays            *int    `json:"cert_renewal_days"`
@@ -631,10 +732,22 @@ type UpdateConfigRequest struct {
 	JWTExpireMinutes           *int    `json:"jwt_expire_minutes"`
 	Timezone                   *string `json:"timezone"`
 	GitHubProxyURL             *string `json:"github_proxy_url"`
-	// GitHubToken 可选令牌三态（第 52 轮 P2-3 起）：nil=保持现值、空串=清除
+	// GitHubToken 可选令牌三态：nil=保持现值、空串=清除
 	// （唯一撤销路径）、非空=覆盖。响应面永不回显（GlobalConfig.GitHubToken json:"-"）。
 	GitHubToken         *string `json:"github_token"`
 	DefaultCAProviderID *int    `json:"default_ca_provider_id"`
+	// 威胁大屏本站坐标（v3）：nil=保持现值；写侧范围校验（纬度 ±90/经度 ±180）。
+	ServerMapLat *float64 `json:"server_map_lat"`
+	ServerMapLon *float64 `json:"server_map_lon"`
+	// 威胁大屏模式（v2.3.8）：nil=保持现值；仅允许 map/globe。
+	ThreatScreenMode *string `json:"threat_screen_mode"`
+	// 大屏逐请求光流采样：nil=保持现值；仅允许 -1=自适应、0=关闭。
+	// 全量与固定 2..64 已废除（存量由启动迁移归一 -1）。
+	ThreatTrafficSampleN *int `json:"threat_traffic_sample_n"`
+	// 安全事件保留（v2.3.8）：nil=保持现值；写侧只接受天数 1-3650、行数上限
+	// 1-1 亿（0=自动的旧语义已废除，0/NULL 仅作 legacy 库值由启动迁移归一）。
+	SecurityEventsRetentionDays *int `json:"security_events_retention_days"`
+	SecurityEventsRowCap        *int `json:"security_events_row_cap"`
 	// v2.1.8 MFA 全局开关（基础设置卡片，决策6）：默认均关。
 	MFAWriteGuard     *bool `json:"mfa_write_guard"`
 	MFALockoutEnabled *bool `json:"mfa_lockout_enabled"`
@@ -653,7 +766,10 @@ type CreateCertificateConfigRequest struct {
 	Name           string            `json:"name" binding:"required"`
 	DNSProvider    string            `json:"dns_provider" binding:"required"`
 	DNSCredentials map[string]string `json:"dns_credentials"`
-	Enabled        bool              `json:"enabled"`
+	// *bool 区分「未提交」与显式 false：省略 enabled 的 POST 按 true 创建
+	// （「配置默认可用」；UpdateCertificateConfigRequest 同字段已是 *bool）。
+	// 旧 bool 零值让脚本/MCP 通道漏带 enabled 时静默创建禁用配置。
+	Enabled *bool `json:"enabled"`
 }
 
 type UpdateCertificateConfigRequest struct {
@@ -682,17 +798,21 @@ type MetricsOverview struct {
 
 // SystemInfo contains system information
 type SystemInfo struct {
-	IPAddress     string            `json:"ip_address"`
-	Hostname      string            `json:"hostname"`
-	OSInfo        string            `json:"os_info"`
-	Kernel        string            `json:"kernel"`
-	Architecture  string            `json:"architecture"`
-	NetworkIPs    map[string]string `json:"network_ips"`
-	CaddyVersion  string            `json:"caddy_version"`
-	RunningStatus string            `json:"running_status"`
-	Uptime        int64             `json:"uptime"`
-	NodeMode      string            `json:"node_mode"`
-	Version       string            `json:"version"`
+	IPAddress    string            `json:"ip_address"`
+	Hostname     string            `json:"hostname"`
+	OSInfo       string            `json:"os_info"`
+	Kernel       string            `json:"kernel"`
+	Architecture string            `json:"architecture"`
+	NetworkIPs   map[string]string `json:"network_ips"`
+	CaddyVersion string            `json:"caddy_version"`
+	// RunningStatus 仅表示「面板进程可响应」恒为 running，不反映 Caddy admin
+	// 是否可达（Caddy 停摆时本字段仍为 running）。
+	RunningStatus string `json:"running_status"`
+	Uptime        int64  `json:"uptime"`
+	// NodeMode 三态：master / slave / unknown（unknown=角色查询失败或库未装配，
+	// 不得把查询失败静默呈现为 master 误导排障）。
+	NodeMode string `json:"node_mode"`
+	Version  string `json:"version"`
 }
 
 // SystemMetrics contains system resource usage
@@ -704,6 +824,17 @@ type SystemMetrics struct {
 	DiskTotal     uint64  `json:"disk_total"`
 	DiskUsed      uint64  `json:"disk_used"`
 	DiskPercent   float64 `json:"disk_percent"`
+	// 进程/线程配额：cgroup pids.current / pids.max（真正决定 fork 失败的一层，
+	// 按线程计数、含僵尸）。PidsMax=0 表示无限（pids.max 为 "max"）。
+	// NprocLimit 是 PID 1 的 RLIMIT_NPROC 软限（ulimit -u），0=未采集/无限；
+	// 它按宿主 UID 计数，仅作二级提示。
+	PidsCurrent int     `json:"pids_current"`
+	PidsMax     int     `json:"pids_max"`
+	NprocLimit  int     `json:"nproc_limit"`
+	PidsPercent float64 `json:"pids_percent"`
+	// Degraded 列出本次采集失败的分项（memory/disk/cpu/pids）——分项降级时
+	// 对应数值为 0，消费方据此区分「真的是 0」与「采集失败」。
+	Degraded []string `json:"degraded,omitempty"`
 }
 
 // RealtimeTraffic contains real-time network traffic data

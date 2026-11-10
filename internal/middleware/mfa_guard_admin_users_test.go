@@ -13,10 +13,10 @@ import (
 	jwt "github.com/golang-jwt/jwt/v5"
 )
 
-// S-1（2026-09-05 裁定）：管理员经 PUT /users/:id 与 POST /users/:id/reset-password
+// （2026-09-05 裁定）：管理员经 PUT /users/:id 与 POST /users/:id/reset-password
 // 重置任意用户（含本人）密码属重置操作、不验当前密码；唯一要求是 MFA 写保护
 // （mfa_write_guard）开启且操作者已启用 MFA 时须 MFA 验证码。两端点均为写方法、
-// 不在 readOnlyWriteRoutes/守卫豁免清单内，由 admin 组级 mfaStepUpGuard 覆盖（U7c-68-01
+// 不在 readOnlyWriteRoutes/守卫豁免清单内，由 admin 组级 mfaStepUpGuard 覆盖
 // 自 v1 级下沉）——本测试以真实 JWT 穿完整认证链钉住该契约：无 mfa_ts → 428；验码后的新 JWT → 200。
 func TestMFAStepUpGuard_protectsAdminUserPasswordEndpoints(t *testing.T) {
 	router := newMiddlewareTestRouter(t)
@@ -67,19 +67,36 @@ func TestMFAStepUpGuard_protectsAdminUserPasswordEndpoints(t *testing.T) {
 		t.Fatalf("POST /users/:id/reset-password without mfa_ts: got %d, want 428（管理员重置密码须 MFA 验证）", code)
 	}
 
-	// When/Then 2：验码后的新 JWT（mfa_ts 新鲜）→ 直通 handler → 200
-	if code := do(http.MethodPut, "/api/v1/users/102", tokenVerified, `{"display_name":"Guard"}`); code != http.StatusOK {
+	// When/Then 2：验码后的新 JWT（mfa_ts 新鲜）→ 直通 handler → 200。
+	// 空 body 的 200 只证明守卫放行——带 password 字段并断言 password_version
+	// 递增，才证明密码真的被改写（旧 JWT 由此失效）。
+	if code := do(http.MethodPut, "/api/v1/users/102", tokenVerified, `{"display_name":"Guard","password":"fresh-pass-1"}`); code != http.StatusOK {
 		t.Fatalf("PUT /users/:id with fresh mfa_ts: got %d, want 200", code)
 	}
-	if code := do(http.MethodPost, "/api/v1/users/102/reset-password", tokenVerified, `{"new_password":"fresh-pass-1"}`); code != http.StatusOK {
+	if got := userPasswordVersion(t, 102); got != 1 {
+		t.Fatalf("PUT /users/:id password 后 password_version=%d, want 1（密码必须真实写入）", got)
+	}
+	if code := do(http.MethodPost, "/api/v1/users/102/reset-password", tokenVerified, `{"new_password":"fresh-pass-2"}`); code != http.StatusOK {
 		t.Fatalf("POST /users/:id/reset-password with fresh mfa_ts: got %d, want 200", code)
+	}
+	if got := userPasswordVersion(t, 102); got != 2 {
+		t.Fatalf("reset-password 后 password_version=%d, want 2（重置必须使既有令牌失效）", got)
 	}
 }
 
-// U7c-68-01（第 68 轮审计）：admin 组端点的拒绝次序——非管理员（含 MFA 启用
+func userPasswordVersion(t *testing.T, userID int) int {
+	t.Helper()
+	var version int
+	if err := db.DB.QueryRow(`SELECT COALESCE(password_version,0) FROM users WHERE id=?`, userID).Scan(&version); err != nil {
+		t.Fatalf("read password_version of user %d: %v", userID, err)
+	}
+	return version
+}
+
+// admin 组端点的拒绝次序——非管理员（含 MFA 启用
 // 且 mfa_ts 过期者）打 admin 组端点必须先见 adminOnly 的 403 真因，而非
 // mfaStepUpGuard 的 428（此前守卫挂在 v1 级、先于组级 adminOnly 执行，用户
-// 输码重试后才见「需要管理员权限」——与 U7c-3 从节点 403 先于 428 同型）。
+// 输码重试后才见「需要管理员权限」——与从节点 403 先于 428 同型）。
 // 修复=链序：mfaStepUpGuard 从 v1 级下沉至 admin/business 两组级，admin 组内
 // adminOnly 先于 step-up。
 func TestMFAStepUpGuard_adminOnly403BeforeStepUp428(t *testing.T) {
@@ -112,13 +129,17 @@ func TestMFAStepUpGuard_adminOnly403BeforeStepUp428(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	// Then：403 admin_required（角色真因先于 step-up）
+	// Then：403 admin_required（角色真因先于 step-up）；必须同时核对响应
+	// 来源，避免 readOnlyGuard 错置到 adminOnly 之前时同样以 403 假绿。
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("non-admin POST /users: got %d, want 403（adminOnly 真因不得被 428 遮蔽）", rec.Code)
 	}
+	if body := rec.Body.String(); !strings.Contains(body, "需要管理员权限") || strings.Contains(body, "非管理员用户只读") {
+		t.Fatalf("non-admin POST /users: body=%s, want adminOnly 的拒绝真因", body)
+	}
 }
 
-// SYSMW-U2（第 69 轮 P3）：business 组守卫次序对称 U7c-68-01——非管理员打
+// business 组守卫次序对称 ——非管理员打
 // business 组管理写端点须先见 readOnlyGuard 的 403 角色真因，而非
 // mfaStepUpGuard 的 428（旧次序 step-up 在前：用户验码重试后才见
 // 「非管理员用户只读」，与 admin 组已修的误导链同型）。

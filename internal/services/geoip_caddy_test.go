@@ -14,14 +14,7 @@ import (
 
 func setupGeoipConfigTestDB(t *testing.T) {
 	t.Helper()
-	oldDB := db.DB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize database: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-		db.DB = oldDB
-	})
+	setupIsolatedDB(t)
 }
 
 func seedGeoipPolicy(t *testing.T, ruleCaddyID, countries, mode string) {
@@ -72,7 +65,7 @@ func handlerNamesAsString(t *testing.T, routeValue interface{}) string {
 }
 
 // wafHandlers 按链序收集 route 的全部 waf（coraza）处理器——链首可能含
-// X-LB-Rule-ID 注入等原生 headers 处理器（F3），定长索引访问须以 waf 维度
+// X-LB-Rule-ID 注入等原生 headers 处理器，定长索引访问须以 waf 维度
 // 定位而非链维度，避免注入/移除前置处理器时测试集体漂移。
 func wafHandlers(t *testing.T, routeValue interface{}) []map[string]interface{} {
 	t.Helper()
@@ -115,7 +108,7 @@ func TestBuildIPPrecheckDirectives_geoipChain(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, "lb_test"))
 	if directives == "" {
 		t.Fatal("pure-geoip policy must emit precheck directives (stage 1 owns geoip)")
 	}
@@ -146,7 +139,7 @@ func TestBuildIPPrecheckDirectives_geoipProvincesJoinedAlternation(t *testing.T)
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["广东省","北京市"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, "lb_test"))
 	want := `@rx ^(?:广东省(?:/.*)?|北京市(?:/.*)?)$`
 	if !strings.Contains(directives, want) {
 		t.Fatalf("precheck directives missing province alternation %q:\n%s", want, directives)
@@ -163,7 +156,7 @@ func TestBuildIPPrecheckDirectives_geoipDetectionPolicyStillDenies(t *testing.T)
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, "lb_test"))
 	starter := geoipRuleLine(t, directives)
 	if !strings.Contains(starter, `"id:800009,phase:1,deny,log,msg:'GeoIP 区域拦截',skipAfter:SECURITY_RULES_END,chain"`) {
 		t.Fatalf("detection policy geoip chain must deny in precheck:\n%s", starter)
@@ -183,7 +176,7 @@ func TestBuildIPPrecheckDirectives_geoipMultiPolicyOrderAndTrust(t *testing.T) {
 	p2 := &models.SecurityPolicy{
 		ID: 5, Mode: "blocking", GeoIPMode: "deny", GeoIPCountries: json.RawMessage(`["江苏"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, "lb_test"))
 	idx1 := strings.Index(directives, "id:800003,")
 	idx2 := strings.Index(directives, "id:800005,")
 	// 全局豁免钉（2026-09-20 裁定）：信任并集 DetectionOnly 必须先于全部 GeoIP
@@ -197,12 +190,18 @@ func TestBuildIPPrecheckDirectives_geoipMultiPolicyOrderAndTrust(t *testing.T) {
 		t.Fatalf("geoip chains must be ordered p1 < p2 < SecMarker:\n%s", directives)
 	}
 	// p1 信任续段：紧随其 X-LB-GeoIP-Loc 续段之后、p2 链之前。
-	locIdx := strings.Index(directives, ` SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none"`)
+	// 三段链：中段（GeoIP）必须带 chain 才能把信任续段纳入同一链——否则续段
+	// 退化为无动作顶层规则，链内自抑制不存在（引擎门禁测试钉住编译与行为）。
+	locIdx := strings.Index(directives, ` SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none,chain"`)
 	// v2.3.x：信任续段名单经 @ipListFast 文件投影（p%d-trust scope）。
 	trust := `SecRule REMOTE_ADDR "!@ipListFast `
 	trustIdx := strings.Index(directives, trust)
 	if locIdx < 0 || trustIdx < 0 || trustIdx < locIdx || trustIdx > idx2 {
-		t.Fatalf("p1 trust continuation must follow its X-LB-GeoIP-Loc segment and precede p2 chain:\n%s", directives)
+		t.Fatalf("p1 trust continuation must chain after its X-LB-GeoIP-Loc segment and precede p2 chain:\n%s", directives)
+	}
+	// p2 无信任续段：中段必须终止链（不得出现悬空 chain）。
+	if strings.Contains(directives[idx2:], `X-LB-GeoIP-Loc "@rx ^(?:江苏(?:/.*)?)$" "t:none,chain"`) {
+		t.Fatalf("p2 without trust continuation must terminate its chain:\n%s", directives)
 	}
 	if got := readRenderedIPList(t, directives[trustIdx:], "-trust"); got != "1.2.3.4/32\n" {
 		t.Fatalf("信任续段名单文件=%q, want 仅 1.2.3.4/32", got)
@@ -219,16 +218,17 @@ func TestBuildCorazaDirectives_geoipMovedToPrecheck(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	if got := mustDirectives(BuildCorazaDirectives(pure, nil, "", false, 0)); got != "" {
+	if got := mustDirectives(BuildCorazaDirectives(pure, nil, "", false, 0, "lb_test")); got != "" {
 		t.Fatalf("pure-geoip policy must emit no engine directives (geoip lives in precheck), got:\n%s", got)
 	}
 	blocking := &models.SecurityPolicy{
-		ID:             43,
-		Mode:           "blocking",
-		GeoIPMode:      "deny",
-		GeoIPCountries: json.RawMessage(`["海外"]`),
+		ID:               43,
+		Mode:             "blocking",
+		AnomalyThreshold: 5,
+		GeoIPMode:        "deny",
+		GeoIPCountries:   json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(blocking, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(blocking, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "id:8,") || strings.Contains(directives, "GeoIP 区域拦截") {
 		t.Fatalf("policy engine must not emit geoip rules anymore:\n%s", directives)
 	}
@@ -340,10 +340,14 @@ func TestGenerateSingleRuleCaddyConfig_geoip_previewIncludesPassRoute(t *testing
 }
 
 // TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus：拦截页归因后，
-// geoip 策略分得合成中断码 483（阶段码 481/482 固定后平移）——策略引擎段 deny
-// 中断经 483 归因路由按 block_status_code 渲染本策略拦截页；403 兜底路由
-// （host 限定）继续承接无法归因的中断（预检 GeoIP/IP ACL 合并段与无页策略），
-// 同页同码。
+// geoip 策略分得合成中断码 483（阶段码 481/482 固定后按策略平移）——本用例
+// 断言的 483 归因路由在 geoip-only（mode=off、无自定义规则/ACL/黑名单）形态
+// 下**不可达**：策略引擎段不发射（BuildCorazaDirectives 返回空串），阶段 1
+// 预检只产出 481。用户可见行为由 403 兜底路由承接（同页同码）；483 路由的
+// 真实可达性由 security_block_status_test.go 的
+// TestEngineTransaction_customOnlyBlockRuleLiftsInterruptionTo483 覆盖。
+// 403 兜底路由（host 限定）继续承接无法归因的中断（预检 GeoIP/IP ACL 合并段
+// 与无页策略），同页同码。
 func TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus(t *testing.T) {
 	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
@@ -378,7 +382,8 @@ func TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus(t *testing.T)
 	fallbackHandler := firstHandler(t, fallback)
 	assertEqual(t, fallbackHandler["status_code"], 451)
 	assertEqual(t, fallbackHandler["body"], "<html>geoip-block</html>")
-	// 归因：483 子句、无 host 键，策略段 deny（已抬码 483）实际命中此路由
+	// 归因：483 子句、无 host 键——路由形状在此形态下不可达（无引擎段抬码，
+	// 见上方用例注释），此处只钉路由存在性与渲染内容。
 	if _, hasHost := routeMatcher(t, attribution)["host"]; hasHost {
 		t.Fatalf("attribution route must not carry host matcher: %#v", routeMatcher(t, attribution))
 	}
@@ -409,19 +414,19 @@ func seedGeoipPolicyBound(t *testing.T, database *sql.DB, ruleCaddyID, countries
 // TestGeoipLocOperator_forms：算子编译的形态覆盖——海外字面、纯省附加
 // (?:/.*)?、省/市精确联值、allow 取反、QuoteMeta 防注入。
 func TestGeoipLocOperator_forms(t *testing.T) {
-	deny := geoipLocOperator([]string{"福建省", "广东省/深圳市", "海外"}, false)
+	deny := geoipLocOperator([]string{"福建省", "广东省/深圳市", "海外"}, false, nil)
 	if !strings.Contains(deny, `福建省(?:/.*)?`) || !strings.Contains(deny, `广东省/深圳市`) || !strings.Contains(deny, `海外`) {
 		t.Fatalf("operator missing entry forms: %s", deny)
 	}
 	if !strings.HasPrefix(deny, "@rx ^(?:") || !strings.HasSuffix(deny, ")$") {
 		t.Fatalf("operator must be anchored full-value match: %s", deny)
 	}
-	allow := geoipLocOperator([]string{"广东省"}, true)
+	allow := geoipLocOperator([]string{"广东省"}, true, nil)
 	if allow != "!@rx ^(?:广东省(?:/.*)?)$" {
 		t.Fatalf("allow mode must negate the whole match: %s", allow)
 	}
 	// 集群同步/历史行可携带绕过校验的元字符——QuoteMeta 中和（ReDoS/越权匹配）
-	evil := geoipLocOperator([]string{`EVIL(.*)`}, false)
+	evil := geoipLocOperator([]string{`EVIL(.*)`}, false, nil)
 	if !strings.Contains(evil, `EVIL\(\.\*\)`) {
 		t.Fatalf("metacharacters must be quoted: %s", evil)
 	}
@@ -434,7 +439,7 @@ func TestGeoipLocOperator_forms(t *testing.T) {
 func TestGeoipLocOperator_regexEquivalence(t *testing.T) {
 	compile := func(t *testing.T, countries []string, allowMode bool) *regexp.Regexp {
 		t.Helper()
-		op := geoipLocOperator(countries, allowMode)
+		op := geoipLocOperator(countries, allowMode, nil)
 		re, err := regexp.Compile(strings.TrimPrefix(strings.TrimPrefix(op, "!"), "@rx "))
 		if err != nil {
 			t.Fatalf("compile %q: %v", op, err)
@@ -478,10 +483,10 @@ func TestGeoipLocOperator_regexEquivalence(t *testing.T) {
 }
 
 // TestGeoipPrivateRanges_excludesPublicMappedIPv4 verifies the fail-open fix:
-// a public IPv4-mapped address (::ffff:8.8.8.8) must NOT match any private
+// a public address (::ffff:8.8.8.8) must NOT match any private
 // range, while mapped private (::ffff:192.168.1.1) and plain private
 // (192.168.1.1) addresses must. The prior ::ffff:0:0/96 entry matched the whole
-// mapped space and would have let public mapped clients bypass GeoIP blocking.
+// mapped space and would have let public mapped clients 绕过 GeoIP blocking.
 func TestGeoipPrivateRanges_excludesPublicMappedIPv4(t *testing.T) {
 	prefixes := make([]netip.Prefix, 0, len(geoipPrivateRanges))
 	for _, cidr := range geoipPrivateRanges {
@@ -518,11 +523,11 @@ func TestBuildCorazaDirectives_geoipModeOff_noEmission(t *testing.T) {
 		GeoIPMode:      "off",
 		GeoIPCountries: json.RawMessage(`["海外","广东省"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "GeoIP 区域拦截") || strings.Contains(directives, "id:8") {
 		t.Fatalf("geoip_mode=off must not emit geoip rules, got:\n%s", directives)
 	}
-	if precheck := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0)); strings.Contains(precheck, "GeoIP 区域拦截") || strings.Contains(precheck, "id:800042") {
+	if precheck := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, "lb_test")); strings.Contains(precheck, "GeoIP 区域拦截") || strings.Contains(precheck, "id:800042") {
 		t.Fatalf("geoip_mode=off must not emit precheck geoip chains, got:\n%s", precheck)
 	}
 }
@@ -542,10 +547,32 @@ func TestPolicyHasGeoIP_modeGate(t *testing.T) {
 	}
 }
 
+// TestPolicyHasGeoIP_nilPolicyIsSafeAndIgnored：nil 策略必须视为无地域控制
+// （与 geoipCountries 的 nil 安全、预检/信任并集循环的 `if p == nil { continue }`
+// 同口径），且 nil 元素混入预检渲染切片时不得 panic、不得影响其余策略发射。
+func TestPolicyHasGeoIP_nilPolicyIsSafeAndIgnored(t *testing.T) {
+	if PolicyHasGeoIP(nil) {
+		t.Fatal("nil policy must be inactive")
+	}
+	geo := &models.SecurityPolicy{
+		ID:             42,
+		Mode:           "blocking",
+		GeoIPMode:      "deny",
+		GeoIPCountries: json.RawMessage(`["海外"]`),
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{nil, geo}, "lb_test"))
+	if !strings.Contains(directives, "GeoIP 区域拦截") {
+		t.Fatalf("nil 元素不得吞掉同切片的 GeoIP 预检链，got:\n%s", directives)
+	}
+	if PolicyHasGeoIP(geo) != true {
+		t.Fatal("geo policy 应活跃（nil 守卫不得改变既有语义）")
+	}
+}
+
 // TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream：X-LB-GeoIP-* 是
 // caddygeoip→coraza 的进程内控制头，绝不允许透传上游后端。reverse_proxy 必须在
 // headers.request.delete 中剥离全部 6 个头；无条件剥离（不依赖安全策略绑定），
-// 同时拦截 geoip 关闭时客户端伪造同名头直达后端。与 OriginDomain set 并存。
+// 同时拦截 geoip 关闭时客户端伪造同名头直达后端。与 HostHeader set 并存。
 func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 	wantStrip := []string{
 		"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
@@ -561,7 +588,7 @@ func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 		{name: "with host header override", hostHeader: "api.example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := SingleRuleConfig{CaddyID: "lb_strip", Protocol: "http", ListenPort: 80, OriginDomain: tc.hostHeader}
+			rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_strip", Protocol: "http", ListenPort: 80, HostHeader: tc.hostHeader}
 			chain, err := buildHTTPHandleChain(rule, upstreams)
 			if err != nil {
 				t.Fatalf("buildHTTPHandleChain: %v", err)
@@ -609,10 +636,7 @@ func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 // 信任规则发射，信任 IP 仍记 CRS 检测事件；单测直构 struct 绕过 loader 掩盖）。
 // 本测试钉住 loader 携带三态门字段：whitelist_enabled / geoip_mode / refs。
 func TestLoadSecurityPolicyContext_carriesTriStateGateFields(t *testing.T) {
-	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_gate1','g','http','g.test',8081,1)`); err != nil {
 		t.Fatal(err)
 	}
@@ -641,8 +665,39 @@ func TestLoadSecurityPolicyContext_carriesTriStateGateFields(t *testing.T) {
 		t.Fatalf("GeoIPMode=%q, want off", p.GeoIPMode)
 	}
 	// refs-only 信任合并集仍应装载（数据在，仅被开关门压制）
-	// 第 57 轮 P5：合并集规范化为 CIDR 形（裸 IP → /32），匹配语义等价
+	// 合并集规范化为 CIDR 形（裸 IP → /32），匹配语义等价
 	if len(p.MergedWhitelist) != 1 || p.MergedWhitelist[0] != "198.51.100.7/32" {
 		t.Fatalf("MergedWhitelist=%v, want [198.51.100.7]", p.MergedWhitelist)
+	}
+}
+
+// 爬虫验证控制头（X-LB-Crawler-Verified/Spoof）由 caddygeoip
+// 在 coraza phase:1 之前注入并已消费，必须与 X-LB-GeoIP-* 同口径无条件剥离——
+// 无 GeoIP 策略绑定的规则（handler 不在场）下客户端伪造值绝不能直达上游。
+func TestRenderUpstreamStrip_crawlerHeaders(t *testing.T) {
+	upstreams := []UpstreamConfig{{Host: "127.0.0.1", Port: 8080, Weight: 1, Enabled: true}}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_crawlerstrip", Protocol: "http", ListenPort: 80}
+	chain, err := buildHTTPHandleChain(rule, upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	last, ok := chain[len(chain)-1].(map[string]interface{})
+	if !ok || last["handler"] != "reverse_proxy" {
+		t.Fatalf("last handler must be reverse_proxy, got %#v", chain[len(chain)-1])
+	}
+	headers := last["headers"].(map[string]interface{})
+	request := headers["request"].(map[string]interface{})
+	del, ok := request["delete"].([]string)
+	if !ok {
+		t.Fatalf("headers.request.delete must be []string, got %#v", request["delete"])
+	}
+	have := make(map[string]bool, len(del))
+	for _, h := range del {
+		have[h] = true
+	}
+	for _, h := range []string{"X-LB-Crawler-Verified", "X-LB-Crawler-Spoof"} {
+		if !have[h] {
+			t.Fatalf("headers.request.delete must contain %s, got %v", h, del)
+		}
 	}
 }

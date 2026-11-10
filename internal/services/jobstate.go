@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 const (
@@ -20,16 +22,11 @@ const (
 
 var (
 	ErrJobTransitionConflict = errors.New("certificate job status transition conflict")
-	allJobStatuses           = []string{
-		"queued", "pending", "processing", "creating_account", "creating_order", "order_created",
-		"cleanup_dns", "cleanup_warning", "presenting_dns", "waiting_propagation", "dns_propagated",
-		"accepting_challenge", "validating", "validated", "finalizing", "finalized", "downloading",
-		"downloaded", "issued", "failed", "waiting_ca", "disabled", "waiting_order_ready", "order_ready",
-		"waiting_order_valid", "order_valid",
-	}
-	jobStatusesExceptDisabled = withoutJobStatuses("disabled")
-	nonTerminalJobStatuses    = withoutJobStatuses("issued", "failed", "disabled")
-	jobLifecycleByStatus      = map[string]string{
+	// allJobStatuses 派生自 db.CertJobStatuses()（单源：cert_jobs 的
+	// CHECK 枚举与 DDL 由同一列表生成；services 依赖 db，反向不可行）。
+	allJobStatuses         = db.CertJobStatuses()
+	nonTerminalJobStatuses = withoutJobStatuses("issued", "failed", "disabled")
+	jobLifecycleByStatus   = map[string]string{
 		"queued":              JobLifecycleQueued,
 		"pending":             JobLifecycleActive,
 		"processing":          JobLifecycleActive,
@@ -59,11 +56,71 @@ var (
 	}
 )
 
+// deploymentLifecycleJobStatuses / DeploymentLifecycleJobStatusSQL 由
+// jobLifecycleByStatus 派生（JobLifecycle==downloaded 单源）——状态集新增时
+// 只改映射表，切片与 SQL IN 片段不再双份真源。消费方：transitionJob 的
+// from 集合、启动/补扫装载的 CAS 源态集、cluster_report 与 handlers 的 SQL IN
+// （跨包消费方无法触达切片，必须走导出的 SQL 片段）。
+var (
+	deploymentLifecycleJobStatuses = func() []string {
+		statuses := make([]string, 0, 3)
+		for status, lifecycle := range jobLifecycleByStatus {
+			if lifecycle == JobLifecycleDownloaded {
+				statuses = append(statuses, status)
+			}
+		}
+		sort.Strings(statuses)
+		return statuses
+	}()
+	// DeploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用（由同一切片派生，
+	// 非编译期常量——拼接点均为运行时字符串构造）。
+	DeploymentLifecycleJobStatusSQL = "'" + strings.Join(deploymentLifecycleJobStatuses, "','") + "'"
+	// deploymentCleanupJobStatuses 是部署生命周期中「仅剩 DNS 清理窗口」的子集：
+	// downloaded 之外的部署态行由补扫的时间窗/settle 分支单独处理（它们不带
+	// window 判据），cleanup_* 行则可能连窗口列都没写成功，必须无条件拾起。
+	deploymentCleanupJobStatuses = func() []string {
+		statuses := make([]string, 0, len(deploymentLifecycleJobStatuses))
+		for _, status := range deploymentLifecycleJobStatuses {
+			if status != "downloaded" {
+				statuses = append(statuses, status)
+			}
+		}
+		return statuses
+	}()
+	// DeploymentCleanupJobStatusSQL 同上，供补扫 cleanup 分支的 SQL IN 复用
+	// （该分支刻意不覆盖 downloaded——否则 downloaded 行会绕过窗口与沉降判据）。
+	DeploymentCleanupJobStatusSQL = "'" + strings.Join(deploymentCleanupJobStatuses, "','") + "'"
+	// deploymentPersistenceJobStatuses = 部署生命周期 + downloading：
+	// downloading 是唯一「ACME 证书字节已到手、但 downloaded 进度行未落库」的
+	// active 形态（issuer 的 stage 序列为 …finalized→waiting_order_valid→
+	// order_valid→downloading→downloaded），一次瞬时 DB 写失败就让行停在这里。
+	// 若部署链只用部署生命周期求值，失败回写首查 0 行提前返回：刚签发的材料
+	// 只存在内存、任务滞留 active 且无周期通道（补扫只收 downloaded/cleanup_*，
+	// 启动恢复只收非终态）。
+	// 其余 active 签发态刻意不在集合内：它们发生在证书字节到手之前，走到部署
+	// 失败回写的材料必然来自更早的尝试（并发 requeue/取消后的陈旧回调），把行
+	// 写回 downloaded 会越权改写正在进行的签发（见
+	// doesNotDowngradeOutsideDeployableLifecycle 契约）。queued/waiting_ca 同理
+	// 由队列/CA 退避链维护。
+	deploymentPersistenceJobStatuses = func() []string {
+		statuses := make([]string, 0, len(deploymentLifecycleJobStatuses)+1)
+		statuses = append(statuses, deploymentLifecycleJobStatuses...)
+		statuses = append(statuses, "downloading")
+		sort.Strings(statuses)
+		return statuses
+	}()
+)
+
 type jobTransitionExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
 type jobSQLExpression string
+
+// AllJobStatuses 返回 cert_jobs.status 规范枚举的副本（单一真源
+// 与 db.CertJobStatuses()/fresh DDL CHECK/迁移白名单同源）。调用方可安全修改
+// 返回值，不影响状态机。
+func AllJobStatuses() []string { return db.CertJobStatuses() }
 
 func withoutJobStatuses(excluded ...string) []string {
 	exclude := make(map[string]struct{}, len(excluded))
@@ -96,8 +153,8 @@ func JobIsTerminal(status string) bool {
 }
 
 // maxJobMessageBytes 限制写入 cert_jobs.message 的任务消息大小。CA 错误详情等外部
-// 文本可能无界嵌入错误链，而 message 列会同步到从节点并展示在 UI（Round 34
-// F-R34-3），各写入点（failJob/jobLogger.Log/deploymentFailed）统一截断。
+// 文本可能无界嵌入错误链，而 message 列会同步到从节点并展示在 UI（历史
+// 各写入点（failJob/jobLogger.Log/deploymentFailed）统一截断。
 const maxJobMessageBytes = 1024
 
 // truncateJobMessage 将任务消息截断到 maxJobMessageBytes 字节内，并回退到合法

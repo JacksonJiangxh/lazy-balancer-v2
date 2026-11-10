@@ -23,9 +23,11 @@ func GetDefaultCAProvider() (int, error) {
 }
 
 // IsCAProviderEnabled reports whether a CA provider with the given ID exists and is enabled.
+// 可空的 enabled 列按「禁用」归一：NULL（仅带外改库/旧备份可达）若直接
+// Scan(&bool) 会返回扫描错误，设置校验就只能回内部错误而不是「不存在或已禁用」。
 func IsCAProviderEnabled(id int) (bool, error) {
 	var enabled bool
-	err := DB.QueryRow("SELECT enabled FROM ca_providers WHERE id = ?", id).Scan(&enabled)
+	err := DB.QueryRow("SELECT COALESCE(enabled, 0) FROM ca_providers WHERE id = ?", id).Scan(&enabled)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}

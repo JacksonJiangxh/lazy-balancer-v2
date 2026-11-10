@@ -336,6 +336,7 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 | 2026-10-12 | **规则级改名收口**：`lb_rules.origin_domain` 补登记进 `newColumns`，新增 `migrateLbRuleHostHeaderToOriginDomain`（`host_header` → `origin_domain` 先搬后留）；重建 DDL/INSERT/SELECT、`normalizeRuleRowsForTransport`、`migrateTCPRuleDeadFields` 由 `host_header` 统一到 `origin_domain`（修复上一轮扫尾遗留的 `no such column` 缺陷） |
 | 2026-10-12 | 版本号对齐：`.cnb.yml` 巡检基线、构建按钮默认值、README 基线声明统一到 `v2.3.6-beta` |
 | 2026-10-13 | **追平上游 `v2.3.6` 正式版**（`9c759716`，23 提交 / 192 文件）：新增 `geoipnames` 共享表库、受信网段名单化、NTLM UI 归位、ACME 传播判据改造、第 72 轮 35 项审计修复、TLS 标签签发态实时可见、CRS v4.28.0；7 冲突文件按圈层规则解决，自维护能力（链式回退、引用型证书、端口换位）保留；版本口径八处统一到 `v2.3.6` |
+| 2026-11-10/11 | **追平上游 `v2.4.2` 正式版**（`0cd475ed`，309 提交 / 2070 文件；graft 桥接 + 标准三方合并，87 冲突 + 13 隐藏失配全量三路分类，详见 §十）：上游新模块 `caddyl4sec`（TCP 拦截提示）等新能力全量纳入；三项自维护能力函数级接线保全（链式回退 / 引用型证书 / 端口换位）；版本口径八处统一到 `v2.4.2`；前端测试 1597 项全绿。**更正**：2026-10-23 的 v2.3.8「追平」（`ffb394d3`）经核验为假追平——业务域取我们侧旧实现，丢弃上游 v2.3.6 之后新增的全部文件（autoban/crawler/web/tests 等 819 项），本轮以标准三方合并重做 |
 
 ---
 
@@ -483,3 +484,103 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 
 > 说明：本轮**未**逐条跑这三项的功能钉测（沙箱无 Caddy 运行态），只做编译/静态验证；
 > 行为级回归请以 CI 与真机为准。
+
+---
+
+## 十、v2.3.6 → v2.4.2（2026-11-10/11 · 追平正式版）
+
+> 本节承接 §九。上游在 `v2.3.6`（`9c759716`）之后推进 309 个提交到达 `v2.4.2`
+> 正式版。**更正一段历史**：2026-10-23 那轮「v2.3.8 追平」（`ffb394d3` + `272970aa`）
+> 经任务档案事实核验判为**假追平**——以「业务域取我们侧」为骨，取的是 v2.3.6
+> 时期的旧文件，把上游 v2.3.6 之后新增的全部文件整批丢弃（`internal/services/autoban.go`
+> 等 23 个 autoban 文件、`crawler_*` 等 28 个 crawler 文件、`internal/apikey/`、
+> `internal/atomicfile/`、`internal/netutil/`、`internal/retryafter/`、
+> `cmd/server/healthcheck.go`、`web/src` 89 个文件、`web/tests` 全部前端测试），
+> main 实际仍停留在 v2.3.6 基线。本轮弃用该手法，以标准三方合并重做。
+
+### 10.1 状态速览（实测）
+
+| 项 | 值 |
+|---|---|
+| 作骨（上游 tag） | `v2.4.2` = `0cd475ed`（树 `3a178b14`）；镜像轨 tip `bc87a28e` 与其逐字节一致（`git diff` 零输出） |
+| merge-base | `9c759716`（我们的 v2.3.6 正式版基线；与 `0cd475ed` **无共同祖先**，`git merge-base` 退出码 1） |
+| 上游推进 | 309 提交 / 2070 文件（`internal/db/db.go` +4968 行、`internal/services/caddy.go` +3248 行） |
+| 基线自洽性 | 我们 main 与上游 v2.3.6 的非测试 Go 生产文件集合完全一致（差异 140 文件 = 自研独占 A + 自维护补丁 M）→ 标准三方合并可行 |
+| 合并提交 | `bb05ecda`（双亲 `0155d18d` + `0cd475ed`，2092 路径，按 D6 单独计） |
+| 接线收口提交 | `3ec18c04`（45 文件 +1624/−168，pre-commit 实跑 `scripts/gate.sh` 放行） |
+| 合并冲突 | **87** 个文件（`git merge-tree --write-tree --merge-base=9c759716` 实测，merge tree `9e50f1ef`） |
+| 隐藏失配 | **13** 个（自动合并无冲突标记、却残留我方对上游已重构字段的旧引用） |
+
+### 10.2 合并手法（graft 桥接 + 标准三方合并）
+
+1. **graft 桥接 merge-base**：`9c759716` 是 main 祖先但**不是** `0cd475ed` 的祖先，
+   plain merge 会走空 base 垃圾冲突。实测手法：`git replace --graft 0cd475ed 9c759716`
+   临时桥接 → `git merge --no-commit --no-ff 0cd475ed`，实测 `git merge-base` =
+   `9c759716`、merge-tree 87 冲突与预检完全一致。graft 为本地临时 ref，**提交前已删除**，
+   不污染提交对象关系。
+2. **圈层策略**（A 上游独占直接吃 / B 自研独占直接保留 / C 同需求两实现逐个语义合并 /
+   D 上游大改 + 我方补丁，吃上游结构 + 回补）。
+3. **只解 87 冲突不够**：全量三路分类 694 个共同文件中 `both_changed` 97 个 =
+   87 冲突 + 13 隐藏失配。失配文件无冲突标记却引用上游已重构字段（典型
+   `internal/services/rule_transport_normalize.go` 的 `rule.OriginDomain`——上游把该字段
+   收敛到 upstream 级并从 `LbRule` 移除），只看冲突标记必漏。
+4. **并集陷阱（实测证伪一条捷径）**：69 个函数级冲突块机械取并集后 8 个文件
+   gofmt 报结构错误（上游对 db.go/caddy.go 做函数级重构，同一函数两版本各取一半
+   拼接即括号失衡）。**声明级（列清单/字段/import）可并集；函数级必须上游为骨 +
+   逐函数读上游新结构后挂回补丁**。
+
+### 10.3 冲突归类与决策（圈层 C/D 代表决策点）
+
+| 文件/域 | 圈层 | 决策 |
+|---|---|---|
+| `internal/db/db.go` | D/P0 | 吃上游 `newColumnsRegistry` 迁移通道结构，4 自维护列（`chain_race_interval_ms` / `chain_request_timeout_ms` / `tls_cert_path` / `tls_key_path`）登记进注册表；逐一对表全部死列清单（legacy 各族 + `deadColumnDrops` 11 项 + MFA/sync/certificate_configs 各两列）**零命中**——启动即补列、永不 DROP |
+| `internal/services/caddy.go` | D/P0 | 吃上游渲染链重构，`buildChainProxyConfig` 挂回 `buildHTTPHandleChain` 渲染链内 `strategy=="chain_fallback"` 分支（真实调用点，非死代码），由主渲染路径消费 |
+| `certstore.go` / `certificates.go` / `configwatchdog.go` | D | 吃上游结构，回补引用型证书摄取链（handler 校验 → `LoadReferencedCertificate`）与看门狗 `checkReferencedCertFiles()` 扫描 |
+| `internal/config/config.go` + `cmd/server/main.go` | D | 端口换位：`PANEL_PORT` / `HTTP_PORT` / `HTTPS_PORT` 解析 + `SetDefaultProxyPorts` boot 调用 + 兜底站/跳转自引用全链路 |
+| `web/src/views/Rules.vue` 等 | C | 以上游为骨挂回三能力 UI 面（31 块）：`chain_fallback` 策略卡与竞速参数、证书 `file` 模式、端口换位 watcher |
+| 叶模块 `trustedproxy_source` / `crawler_*` / `iplistfast` 族 | C | 上游 v2.4.2 已独立实现同能力且为我方**超集**（`ReportListUnavailable`、`ReadBoundedFile` 为上游新增）；逐符号核对：我方全部 func/type 符号在上游版中零缺失 → 取上游 = 并集，非任弃一侧 |
+| `docs/audit/2026-09-05/` 两文档 | modify/delete | 跟随上游删除 |
+| `web/tests/` 3 个契约测试（viewStateContracts / strategyLabels / rulesUi） | C | 语义等价适配：端口换位（跳转自环文案 80 → 动态默认口）与 `chain_fallback` 策略扩容的必然联动，断言语义未放宽 |
+
+### 10.4 上游本轮新增能力（一并吃进）
+
+- 新模块 `caddyl4sec/`（含 go.mod/go.sum，编译进 Caddy）：TCP 拦截提示 `block_notice`——
+  L4 断连前向客户端写「Connection blocked by <品牌名>」，文案单源 `l4_tcp_notice.go`
+- NTLM 兼容与「HTTPS 上游 + origin_domain」组合互斥门（误配 400 硬拒）
+- forward_auth 网关子请求剥离 `X-LB-*` 内部控制头；`X-LB-Protocol` 链首 set + 剥离
+- 自定义规则 `header_name` 头名限定（仅 `target=headers` 可携带）
+- OR 逻辑自定义规则发射单源化
+- 任务日志尾窗 off-by-one 修复；五处日志页统一 `useLogTailPolling`（自动滚底/后台暂停/迟到作废）
+- API/MCP 文档面口径修复（403 幽灵前缀、retry 错误码枚举补全、`rule_triggered` 8 类对齐）
+- `scripts/` 全套质量门（含 `scripts/tests/` selftest 环）；前端 `web/tests` 186 个测试文件补回
+
+### 10.5 验证（分支 `feat/TASK-2026-1110-01-upstream-v242`）
+
+- **作骨/存在性**：合并提交双亲即 A1 证据；`git ls-tree -r 0cd475ed` 共 2095 路径逐路径
+  存在性核对 **MISSING=0**（已固化为 `scripts/gate.sh` 机械门第 4 项，常开）。
+- **构建/静态**：`go build ./...` ×7 模块 + `go vet ./...` 全绿；冲突标记全仓零命中；
+  版本口径八处锚点（Dockerfile/compose×3/README×4/branding.ts/web_trigger）统一 `v2.4.2`
+  （`internal/config` 无硬编码版本，走 `APP_VERSION` env——与上游原文一致）。
+- **钉测**：`caddychain` 单测 ok；`TestBuildHTTPHandleChain_chainFallback_emitsChainProxy`、
+  `TestCreateRule_referencedCertFileIngestsContent`、`TestCheckReferencedCertFiles_*`、
+  `TestSetDefaultProxyPorts_*`、`TestGenerateCaddyConfig_defaultSiteFollowsHTTPPort` 全 PASS。
+- **前端**：`npm ci` + `vue-tsc --noEmit` 零错误 + `npm run build` EXIT=0 +
+  `npm test` **1597 pass / 0 fail**。
+- **D4 存量库冒烟**：以 `9c759716` 源码构建 v2.3.6 二进制生成 fixture 库 → 植入
+  `origin_domain` / `response_mode` 存量数据 → 新版启动：4 自维护列幂等补齐、
+  存量列丢失 = 0、存量行字段原值保留、无启动即 DROP。
+- **D1 失败集合基线比对**：`go test` 失败集合与上游 `0cd475ed` 原始检出逐条一致
+  （共 5 处，全部基线复现，无我侧独有失败；枚举更正见任务档案）。
+- **机械门**：`scripts/gate.sh`（build×7 / vet / 冲突标记 / 2095 路径存在性 / 版本锚点）
+  挂 `.git/hooks/pre-commit`，本轮两次提交均实跑放行。
+
+### 10.6 自维护三项能力：从「保留代码」到「接线可用」
+
+§九只能做到「代码整体保留」（P2 未完成，渲染链/UI 面未挂回）；本轮函数级接线后
+三项能力**真实可用**：
+
+- **链式回退 `chain_fallback`**：`caddychain/` 模块 + 渲染链 + DB 两列 + UI 竞速参数
+  （权重=优先级、竞速间隔/兜底超时）——多上游按权重组链、前路无响应到间隔即竞速下一路。
+- **引用型证书 `tls_source=file`**：保存时摄取证书文件内容入库，外部文件更新由看门狗自动同步。
+- **默认端口换位**：`HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 环境变量换掉 80/443/8000，
+  兜底站监听口与跳转自引用跟随；新增 `GET /system/ports` API 面。

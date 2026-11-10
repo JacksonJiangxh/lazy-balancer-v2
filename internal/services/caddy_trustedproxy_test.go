@@ -2,6 +2,8 @@ package services
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,6 +15,14 @@ func TestTrustedProxyRender_serversInjectedWhenEnabled(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
 	seedHTTPRuleForGeneration(t, database, "lb_tp", "tp.example.test", 8080)
+	// layer4 负断言需要真实 layer4 servers 才具备证伪力（无 TCP 规则时循环零次，
+	// 「不注入」断言恒真）。
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,strategy,enabled) VALUES ('lb_tp_tcp','lb_tp_tcp','tcp',19000,'weighted_round_robin',1)`); err != nil {
+		t.Fatalf("seed tcp rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tp_tcp','127.0.0.1',9000,1,1,'tcp')`); err != nil {
+		t.Fatalf("seed tcp upstream: %v", err)
+	}
 	if _, err := database.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_ranges='["203.0.113.0/24","198.51.100.7/32"]', trusted_proxy_headers='["CF-Connecting-IP","X-Forwarded-For"]', trusted_proxy_strict=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -36,12 +46,24 @@ func TestTrustedProxyRender_serversInjectedWhenEnabled(t *testing.T) {
 		if !ok {
 			t.Fatalf("server %s missing trusted_proxies: %#v", name, server)
 		}
-		if tp["source"] != "static" {
-			t.Fatalf("server %s trusted_proxies.source=%v, want static", name, tp["source"])
+		if tp["source"] != "lb_file" {
+			t.Fatalf("server %s trusted_proxies.source=%v, want lb_file（热路径投影源）", name, tp["source"])
 		}
-		ranges, _ := tp["ranges"].([]string)
-		if len(ranges) != 2 || ranges[0] != "203.0.113.0/24" || ranges[1] != "198.51.100.7/32" {
-			t.Fatalf("server %s ranges=%v", name, tp["ranges"])
+		path, _ := tp["path"].(string)
+		wantPath := filepath.Join(IPListDataDir, "tp.txt")
+		if path != wantPath {
+			t.Fatalf("server %s trusted_proxies.path=%v, want %s", name, tp["path"], wantPath)
+		}
+		// 投影文件须已按合并网段落盘（内联 ∪ 引用名单的渲染副作用）
+		raw, err := os.ReadFile(wantPath)
+		if err != nil {
+			t.Fatalf("读受信代理投影 %s: %v", wantPath, err)
+		}
+		content := string(raw)
+		for _, want := range []string{"203.0.113.0/24", "198.51.100.7/32"} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("投影内容=%q, want 含 %s", content, want)
+			}
 		}
 		if strict, ok := server["trusted_proxies_strict"]; !ok || strict != 1 {
 			t.Fatalf("server %s trusted_proxies_strict=%v, want 1", name, server["trusted_proxies_strict"])
@@ -52,11 +74,17 @@ func TestTrustedProxyRender_serversInjectedWhenEnabled(t *testing.T) {
 		}
 	}
 	// layer4/admin 不注入
-	if l4, ok := apps["layer4"]; ok {
-		for name, srv := range l4.(map[string]interface{})["servers"].(map[string]interface{}) {
-			if _, has := srv.(map[string]interface{})["trusted_proxies"]; has {
-				t.Fatalf("layer4 server %s must not carry trusted_proxies", name)
-			}
+	l4, ok := apps["layer4"]
+	if !ok {
+		t.Fatal("layer4 app missing——负断言的前置面为空")
+	}
+	l4Servers, ok := l4.(map[string]interface{})["servers"].(map[string]interface{})
+	if !ok || len(l4Servers) == 0 {
+		t.Fatalf("layer4 servers missing/empty——负断言的前置面为空: %#v", l4)
+	}
+	for name, srv := range l4Servers {
+		if _, has := srv.(map[string]interface{})["trusted_proxies"]; has {
+			t.Fatalf("layer4 server %s must not carry trusted_proxies", name)
 		}
 	}
 	if _, has := generated["admin"].(map[string]interface{})["trusted_proxies"]; has {
@@ -142,5 +170,36 @@ func TestRateLimitKeyIsClientIP(t *testing.T) {
 	}
 	if strings.Contains(string(wire), `{http.request.remote.host}`) {
 		t.Fatalf("rate limit must not key on socket IP:\n%s", wire)
+	}
+}
+
+// 启用但零有效网段（内联全非法/过宽、引用名单为空或全悬空）：渲染形态不变
+// （空投影文件 + lb_file 源，与既有行为逐字节一致），但必须随配置图携带降级
+// 说明——否则面板「已启用 CDN 真实 IP」与实际零网段信任不可区分（client_ip
+// 仍是 CDN 回源 IP，IP ACL/限流/GeoIP 全按它判定）。
+func TestTrustedProxyRender_enabledWithNoRangesCarriesDegradation(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedHTTPRuleForGeneration(t, database, "lb_tp_empty", "tp-empty.example.test", 8080)
+	if _, err := database.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_ranges='[]', trusted_proxy_range_refs='[]' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	generated := generateCaddyConfigFromStore(database)
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generation failed: %s", message)
+	}
+	degraded, _ := generated[caddyConfigDegradationKey].(string)
+	if !strings.Contains(degraded, "没有任何有效网段") {
+		t.Fatalf("启用但零网段必须携带降级说明, got %q", degraded)
+	}
+
+	// 正向控制：配置了一个有效网段时不得出现该降级说明（否则横幅恒亮，
+	// 用户会习惯性忽略）。
+	if _, err := database.Exec(`UPDATE global_config SET trusted_proxy_ranges='["203.0.113.0/24"]' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	generated = generateCaddyConfigFromStore(database)
+	if degraded, _ := generated[caddyConfigDegradationKey].(string); strings.Contains(degraded, "没有任何有效网段") {
+		t.Fatalf("有有效网段时不得报告零网段降级, got %q", degraded)
 	}
 }

@@ -10,6 +10,7 @@ package geoipnames
 import (
 	"regexp"
 	"strings"
+	"sync/atomic"
 )
 
 // CrawlerEngine 搜索引擎爬虫定义。UA/PTR/IP 段来源=各厂商官方文档
@@ -25,7 +26,8 @@ type CrawlerEngine struct {
 	ID string
 	// Name 中文展示名（策略向导勾选组）。
 	Name string
-	// UARegex 匹配（预编译，大小写不敏感）。
+	// UARegex 匹配（预编译，大小写不敏感）。只读：注册表共享同一 *Regexp，
+	// 禁止调用变异方法（Longest 等）——会改全局匹配语义。
 	UARegex *regexp.Regexp
 	// SpoofUARegex 是「伪装证据」的 UA 加严门：UA 只命中宽标记（厂商品牌串/
 	// 对话式标记，如裸 DeepSeek、ChatGPT-User）不足以单独判定伪装——这类
@@ -42,6 +44,9 @@ type CrawlerEngine struct {
 	// IPRanges 该引擎官方公布的 CIDR 段（Ruling：保留为**唯一权威
 	// 数据源**——运行期 360 验证走 crawler-ip-lists.json 快照，而快照内容由
 	// crawler_seed_parity_test 断言必须落在本字段声明的段内，二者不得分叉）。
+	// 消费面绑定 VerifyMethod：仅 iprange 引擎（当前只有 so360spider）读运行
+	// 快照名单判定；PTR 引擎名单快照仅作展示/存档，不参与验证（改动此处前先
+	// 确认验证器分支，避免把名单误当 PTR 引擎的判定依据）。
 	IPRanges []string
 }
 
@@ -134,15 +139,17 @@ var crawlerEngines = []CrawlerEngine{
 		Name:        "Anthropic Claude",
 		UARegex:     regexp.MustCompile(`(?i)ClaudeBot|Claude-SearchBot|Claude-User|Claude-Web|anthropic-ai`),
 		PTRSuffixes: []string{".anthropic.com", ".claude.ai"},
-		// Claude-Web 已停用、anthropic-ai 是通用 SDK/库标记：仅作 UA 匹配面
-		// （Verified 路径不受影响），伪装证据只认现行官方爬虫 token。
-		SpoofUARegex: regexp.MustCompile(`(?i)ClaudeBot|Claude-SearchBot|Claude-User`),
+		// Claude-User 是对话式标记，Claude-Web 已停用、anthropic-ai 是通用
+		// SDK/库标记：仅作 UA 匹配面，伪装证据只认现行官方爬虫 token。
+		SpoofUARegex: regexp.MustCompile(`(?i)ClaudeBot|Claude-SearchBot`),
 	},
 	{
 		ID:          "perplexitybot",
 		Name:        "Perplexity",
 		UARegex:     regexp.MustCompile(`(?i)PerplexityBot|Perplexity-User`),
 		PTRSuffixes: []string{".perplexity.ai", ".perplexity.com"},
+		// Perplexity-User 同样是对话式标记，不单独构成伪装证据。
+		SpoofUARegex: regexp.MustCompile(`(?i)PerplexityBot`),
 	},
 	{
 		ID:          "kimisearchbot",
@@ -175,13 +182,22 @@ func CrawlerSpoofEvidence(engineID, userAgent string) bool {
 	return false
 }
 
-// CrawlerEngines 返回引擎注册表的**深拷贝**（防调用方篡改全局）：结构体与
-// 其中的 PTRSuffixes/IPRanges 切片都重新分配——只复制结构体的浅拷贝会让
-// out[i].PTRSuffixes[j] = … 写穿到全局注册表。
+// CrawlerEngines 返回引擎注册表的**深拷贝**（防调用方篡改全局）：结构体、
+// PTRSuffixes/IPRanges 切片与两个正则都重新分配。正则虽通常只读，但暴露
+// Longest 等变异方法；共享指针会让调用方静默改写全局匹配语义。
+//
+// 需要匹配请优先用包内 MatchCrawlerEngine / crawlerUAPrefilter。
 func CrawlerEngines() []CrawlerEngine {
+	crawlerEnginesDeepCopyCallsForTest.Add(1)
 	out := make([]CrawlerEngine, len(crawlerEngines))
 	for i := range crawlerEngines {
 		out[i] = crawlerEngines[i]
+		if crawlerEngines[i].UARegex != nil {
+			out[i].UARegex = regexp.MustCompile(crawlerEngines[i].UARegex.String())
+		}
+		if crawlerEngines[i].SpoofUARegex != nil {
+			out[i].SpoofUARegex = regexp.MustCompile(crawlerEngines[i].SpoofUARegex.String())
+		}
 		if s := crawlerEngines[i].PTRSuffixes; s != nil {
 			out[i].PTRSuffixes = append([]string(nil), s...)
 		}
@@ -190,6 +206,31 @@ func CrawlerEngines() []CrawlerEngine {
 		}
 	}
 	return out
+}
+
+// testseam: 深拷贝路径调用计数（生产路径自增、仅供测试观测）：渲染热路径
+// 改用 CrawlerEngineIDs 后，任何渲染调用方回退到深拷贝都会在「渲染期零
+// 重编译」守卫上显形。
+var crawlerEnginesDeepCopyCallsForTest atomic.Int64
+
+// CrawlerEngineIDs 返回引擎注册表的只读 ID 视图（注册表顺序）：渲染侧仅需
+// ID 集合时用——与 CrawlerEngines 不同，不深拷贝结构体、不重编译任何正则
+// （CrawlerEngines 每次重建 15 个引擎的约 28 个 MustCompile，放进逐策略
+// 渲染循环即按策略数放大）。顺序与注册表一致：索引 i 与
+// encodeCrawlerExemptRuleID 的引擎序号语义不变。需要变异副本（正则/段列表）
+// 的调用方仍用 CrawlerEngines。
+func CrawlerEngineIDs() []string {
+	out := make([]string, len(crawlerEngines))
+	for i := range crawlerEngines {
+		out[i] = crawlerEngines[i].ID
+	}
+	return out
+}
+
+// CrawlerEnginesDeepCopyCallsForTest 返回深拷贝路径的累计调用次数（跨包
+// 测试观测消费；渲染期零深拷贝守卫的正/反例锚点）。
+func CrawlerEnginesDeepCopyCallsForTest() int64 {
+	return crawlerEnginesDeepCopyCallsForTest.Load()
 }
 
 // crawlerUAPrefilter 是全部引擎 UA 正则的合并交替式（init 时由注册表**单源**
@@ -213,8 +254,17 @@ func buildCrawlerUAPrefilter() *regexp.Regexp {
 	return regexp.MustCompile("(?i)" + strings.Join(patterns, "|"))
 }
 
+// crawlerUAMaxLen 是参与引擎匹配的 UA 长度上限：真实 UA 远小于此（注册表
+// 全部样例 <200B），超长 UA 只可能是攻击者在启用爬虫豁免的规则上灌入的
+// ~1MB 头部——合并交替正则是 O(len) 线性扫描，每请求成本随头部线性放大。
+// 超限一律判未命中（不豁免、不判伪装；安全方向=不因爬虫标记放行）。
+const crawlerUAMaxLen = 512
+
 // MatchCrawlerEngine UA → 引擎 ID（未命中返回空串）。
 func MatchCrawlerEngine(userAgent string) string {
+	if len(userAgent) > crawlerUAMaxLen {
+		return ""
+	}
 	// 预筛：绝大多数流量不是爬虫，单次合并匹配即可判定未命中。
 	if !crawlerUAPrefilter.MatchString(userAgent) {
 		return ""
@@ -284,6 +334,11 @@ func ValidCrawlerEngineID(id string) bool {
 	return false
 }
 
-// DefaultCrawlerEngines 向导默认勾选（主流 SEO 场景：Google/Bing/百度）。
-// 只读：消费方只做 json.Marshal/遍历，禁止修改本切片（全局单份）。
-var DefaultCrawlerEngines = []string{"googlebot", "bingbot", "baiduspider"}
+// DefaultCrawlerEngines 返回向导默认勾选集（主流 SEO 场景：
+// Google/Bing/百度）的新副本——默认值不对外暴露可变切片，消费方就地排序/追加
+// 不会污染全局默认。
+func DefaultCrawlerEngines() []string {
+	return append([]string(nil), defaultCrawlerEngines...)
+}
+
+var defaultCrawlerEngines = []string{"googlebot", "bingbot", "baiduspider"}

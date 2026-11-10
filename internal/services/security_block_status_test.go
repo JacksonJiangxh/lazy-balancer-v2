@@ -8,13 +8,14 @@ package services
 // 策略合成状态码。SecRuleUpdateActionById 949110 "deny,status:<syn>" 必须在
 // 引擎层真实抬码(interruption.Status==<syn>)——若引擎不支持(coraza 与
 // ModSecurity 行为差),fallback=CRS 中断走 403 兜底路由(计划 Assumptions 节)。
-// 这是引擎行为实证,非字符串断言(R-10)。
+// 这是引擎行为实证,非字符串断言。
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -58,18 +59,19 @@ func TestEngineBehavior_SecRuleUpdateActionByIdLiftsInterruptionStatus(t *testin
 func TestBuildCorazaDirectives_blockStatusLiftsDenyStatuses(t *testing.T) {
 	// Given：blocking 策略，deny ACL + 遗留黑名单 + GeoIP + 自定义拦截规则
 	policy := &models.SecurityPolicy{
-		Mode:           "blocking",
-		IPACLEnabled:   true,
-		IPACLMode:      "deny",
-		IPACLList:      `["203.0.113.0/24"]`,
-		IPBlacklist:    json.RawMessage(`["198.51.100.9"]`),
-		GeoIPMode:      "deny",
-		GeoIPCountries: json.RawMessage(`["海外"]`),
-		CustomRules:    json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		IPACLEnabled:     true,
+		IPACLMode:        "deny",
+		IPACLList:        `["203.0.113.0/24"]`,
+		IPBlacklist:      json.RawMessage(`["198.51.100.9"]`),
+		GeoIPMode:        "deny",
+		GeoIPCountries:   json.RawMessage(`["海外"]`),
+		CustomRules:      json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
 	}
 
 	// When：以合成码 481 渲染
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 481))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 481, "lb_test"))
 
 	// Then：三处 deny 全部抬码 481；GeoIP 不在策略引擎（预检承接）
 	for _, want := range []string{
@@ -92,20 +94,22 @@ func TestBuildCorazaDirectives_blockStatusLiftsDenyStatuses(t *testing.T) {
 // allow 模式（白名单外拒绝）同样抬码。
 func TestBuildCorazaDirectives_blockStatusLiftsAllowModeDeny(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:         "blocking",
-		IPACLEnabled: true,
-		IPACLMode:    "allow",
-		IPACLList:    `["198.51.100.7"]`,
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		IPACLEnabled:     true,
+		IPACLMode:        "allow",
+		IPACLList:        `["198.51.100.7"]`,
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 482))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 482, "lb_test"))
 	if !strings.Contains(directives, `id:2,phase:1,deny,status:482,log,msg:'IP 白名单拒绝'`) {
 		t.Fatalf("allow-mode deny must lift to 482:\n%s", directives)
 	}
 }
 
-// 多策略链式自排除形状：链首段（disruptive 仅在首段，SECLB33-1 引擎约束）抬码。
+// 多策略链式自排除形状：链首段（disruptive 仅在首段，引擎约束）抬码。
 func TestBuildCorazaDirectives_blockStatusLiftsChainedTrustExclusion(t *testing.T) {
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold:   5,
 		Mode:               "blocking",
 		IPACLEnabled:       true,
 		IPACLMode:          "deny",
@@ -113,7 +117,7 @@ func TestBuildCorazaDirectives_blockStatusLiftsChainedTrustExclusion(t *testing.
 		IPWhitelistEnabled: true,
 		IPWhitelist:        json.RawMessage(`["10.0.0.1"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", true, 481))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", true, 481, "lb_test"))
 	if !strings.Contains(directives, `id:2,phase:1,deny,status:481,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END,chain`) {
 		t.Fatalf("chained trust-exclusion head must lift to 481:\n%s", directives)
 	}
@@ -125,13 +129,14 @@ func TestBuildCorazaDirectives_blockStatusLiftsChainedTrustExclusion(t *testing.
 // 此处只补一条复合断言防回归。
 func TestBuildCorazaDirectives_blockStatusZeroKeepsLegacyShapes(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:         "blocking",
-		IPACLEnabled: true,
-		IPACLMode:    "deny",
-		IPACLList:    `["203.0.113.0/24"]`,
-		CustomRules:  json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		IPACLEnabled:     true,
+		IPACLMode:        "deny",
+		IPACLList:        `["203.0.113.0/24"]`,
+		CustomRules:      json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, `id:2,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝'`) {
 		t.Fatalf("blockStatus=0 must keep 403:\n%s", directives)
 	}
@@ -155,7 +160,7 @@ func TestBuildCorazaDirectives_blockStatusCRSLiftGatedOn949File(t *testing.T) {
 	useCRSDirectivesDir(t, dir)
 
 	// When：blocking 策略 + blockStatus=481
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking"}, nil, "", false, 481))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 481, "lb_test"))
 
 	// Then：抬码指令存在且位于最后一个 Include 行之后
 	const lift = `SecRuleUpdateActionById 949110 "deny,status:481"`
@@ -171,9 +176,47 @@ func TestBuildCorazaDirectives_blockStatusCRSLiftGatedOn949File(t *testing.T) {
 	emptyDir := t.TempDir()
 	useCRSDirectivesDir(t, emptyDir)
 	// When / Then：不发射抬码指令（949110 不会被注册，发射即编译失败）
-	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking"}, nil, "", false, 481))
+	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 481, "lb_test"))
 	if strings.Contains(directives, "SecRuleUpdateActionById") {
 		t.Fatalf("949 file missing must not emit CRS status lift:\n%s", directives)
+	}
+}
+
+// 483 归因路由的可达性实证：geoip-only + mode=off 策略没有任何引擎段能产出
+// 归因码（该路由存在但不可达，见
+// TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus 的注释）；真实
+// 可达形状是策略引擎段的 deny——这里用 custom_only + 启用 block 自定义规则跑
+// 真实 coraza 事务，断言 interruption.Status == 归因路由 matcher 的 483。
+func TestEngineTransaction_customOnlyBlockRuleLiftsInterruptionTo483(t *testing.T) {
+	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
+		Mode:             "custom_only",
+		CustomRules:      json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 483, "lb_test"))
+	var kept []string
+	for _, line := range strings.Split(directives, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "SecAuditLog ") || strings.HasPrefix(trimmed, "SecAuditLogType ") ||
+			strings.HasPrefix(trimmed, "Include ") || strings.HasPrefix(trimmed, "SecRuleUpdateActionById ") {
+			continue // 环境依赖行（同 compileForEngineGate 的过滤口径）
+		}
+		kept = append(kept, line)
+	}
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join(kept, "\n")))
+	if err != nil {
+		t.Fatalf("engine rejected rendered directives: %v\n%s", err, strings.Join(kept, "\n"))
+	}
+	tx := waf.NewTransaction()
+	defer func() { _ = tx.Close() }()
+	tx.ProcessConnection("10.0.0.1", 5555, "127.0.0.1", 80)
+	tx.ProcessURI("/admin/x", "GET", "HTTP/1.1")
+	it := tx.ProcessRequestHeaders()
+	if it == nil {
+		t.Fatalf("expected interruption from custom block rule:\n%s", strings.Join(kept, "\n"))
+	}
+	if it.Status != 483 {
+		t.Fatalf("interruption status=%d, want 483（策略段 deny 必须携带合成码，483 归因路由才可达）", it.Status)
 	}
 }
 
@@ -233,14 +276,27 @@ func TestLoadSecurityPolicyContext_policySyntheticCappedAt599(t *testing.T) {
 		t.Fatalf("loadSecurityPolicyContext: %v", err)
 	}
 
-	// Then：恰好 117 条策略获码（483..599），无越界码
+	// Then：恰好 117 条策略获码，且按 policy_id 升序依次得 483..599（顺序
+	// 必须钉住——合成码随 map 迭代顺序漂移会让路由/配置字节不稳定，破坏
+	// errSameConfig 短路；仅断言条数与区间的写法对去排序完全无感）。
 	if len(ctx.policySynthetic) != 117 {
 		t.Fatalf("synthetic entries=%d, want 117 (483..599)", len(ctx.policySynthetic))
 	}
-	for id, code := range ctx.policySynthetic {
-		if code < 483 || code > 599 {
-			t.Fatalf("policy %d synthetic=%d out of legal range", id, code)
+	ids := make([]int, 0, len(ctx.policySynthetic))
+	for id := range ctx.policySynthetic {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	for i, id := range ids {
+		if got, want := ctx.policySynthetic[id], blockPageSyntheticBase+i; got != want {
+			t.Fatalf("第 %d 个 policy_id=%d 合成码=%d, want %d（必须按 policy_id ASC 依次分配）", i+1, id, got, want)
 		}
+	}
+	if ctx.policySynthetic[ids[len(ids)-1]] != blockPageSyntheticMax {
+		t.Fatalf("末位合成码=%d, want 上限 %d", ctx.policySynthetic[ids[len(ids)-1]], blockPageSyntheticMax)
+	}
+	if _, ok := ctx.policySynthetic[ids[len(ids)-1]+1]; ok {
+		t.Fatal("第 118 个策略不得获码（上限 599 后回落不抬码）")
 	}
 }
 
@@ -359,14 +415,14 @@ func TestMultiPolicy_AttributionRoutes_PerPolicySyntheticCode(t *testing.T) {
 	if !strings.Contains(joined, "deny,status:484") {
 		t.Fatalf("p2 segment must lift deny to 484:\n%s", joined)
 	}
-	// GeoIP 已迁预检（id=800000+policyID 段）——预检 deny 不抬码（阶段 1 保持
-	// 403 兜底归因边界，合成码抬码仅限策略引擎段）。
+	// GeoIP 已迁预检（id=800000+policyID 段）——拦截页逐策略归因后，有页策略的
+	// GeoIP 链首同样抬合成码（与引擎段同一码：p2 → 484）。
 	geoipFound := false
 	for _, line := range strings.Split(joined, "\n") {
 		if strings.Contains(line, "msg:'GeoIP 区域拦截'") {
 			geoipFound = true
-			if strings.Contains(line, "status:") || !strings.Contains(line, fmt.Sprintf("id:%d,", 800000+p2)) {
-				t.Fatalf("precheck geoip chain must stay un-lifted at id %d:\n%s", 800000+p2, line)
+			if !strings.Contains(line, "status:484") || !strings.Contains(line, fmt.Sprintf("id:%d,", 800000+p2)) {
+				t.Fatalf("precheck geoip chain for paged policy p2 must lift 484 at id %d:\n%s", 800000+p2, line)
 			}
 		}
 	}

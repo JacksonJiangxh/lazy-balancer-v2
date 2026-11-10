@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -58,7 +57,7 @@ func TestCAProviderQueries_returns_credentials(t *testing.T) {
 }
 
 func TestCAProviderService_TestCAProviderWithContext_honors_parent_cancellation(t *testing.T) {
-	// 自有 DB 隔离（U4b-01）：不得隐式依赖前置测试泄漏的 db.DB 全局。
+	// 自有 DB 隔离：不得隐式依赖前置测试泄漏的 db.DB 全局。
 	newClusterTestService(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -82,9 +81,7 @@ func TestCAProviderService_TestCAProviderWithContext_cancels_while_query_waits(t
 	go func() {
 		result <- NewCAProviderService().TestCAProviderWithContext(ctx, 1)
 	}()
-	for database.Stats().WaitCount == 0 {
-		runtime.Gosched()
-	}
+	waitForCond(t, time.Second, func() bool { return database.Stats().WaitCount > 0 })
 	cancel()
 	select {
 	case err := <-result:
@@ -110,7 +107,7 @@ func TestCAProviderService_TestCAProviderWithContext_bounds_EAB_auto_provision_w
 		t.Fatalf("seed acme email: %v", err)
 	}
 
-	// N+13 H3-S：伪 ZeroSSL EAB 端点延迟响应，晚于注入的 100ms 时限。父 ctx
+	// 伪 ZeroSSL EAB 端点延迟响应，晚于注入的 100ms 时限。父 ctx
 	// 为 Background（永不取消），服务端不自败——若 EAB 自动获取未被独立超时
 	// 包裹（原实现仅 RegisterAccount 有 10s 界），本调用将阻塞至 30s HTTP
 	// 客户端兜底；唯一可能的快速取消源即子超时。
@@ -259,7 +256,7 @@ func TestCAProviderService_UpdateCAProvider_rejects_disabling_last_enabled(t *te
 	}
 }
 
-// CERT-N2（第 72 轮）：LE 凭证纯空白（如 "  "）通过空判定后原样落库，
+// LE 凭证纯空白（如 " "）通过空判定后原样落库，
 // 前端 parseCACredentials 对非空串走 JSON.parse 即抛错——归一为空串落库
 // （parseCACredentials 对空串走 falsy 分支）。
 func TestCAProviderService_UpdateCAProvider_normalizes_letsencrypt_whitespace_credentials(t *testing.T) {
@@ -310,7 +307,7 @@ func TestCAProviderService_UpdateCAProvider_normalizes_letsencrypt_whitespace_cr
 	}
 }
 
-// CERT-N1（第 72 轮）：UpdateCAProvider 返回事务内读到的旧行——handler 审计
+// UpdateCAProvider 返回事务内读到的旧行——handler 审计
 // changed 清单的比对基线不再依赖事务外预读（预读与事务提交之间的并发写入
 // 会让清单基于陈旧旧值，漏记/多记变更字段）。
 func TestCAProviderService_UpdateCAProvider_returns_in_transaction_old_row(t *testing.T) {
@@ -354,7 +351,7 @@ func TestCAProviderService_UpdateCAProvider_returns_in_transaction_old_row(t *te
 }
 
 func TestMaskEmail_multibyteLocalPartStaysValidUTF8(t *testing.T) {
-	// F49-P5-15（第 49 轮审计）：@ 前缀为多字节 UTF-8（如 CJK 邮箱本地部分）
+	// @ 前缀为多字节 UTF-8（如 CJK 邮箱本地部分）
 	// 时，按字节截断前两个「字符」会切在 rune 中间产出非法 UTF-8 残片——
 	if got := maskEmail("张小三abc@example.com"); got != "张小***@example.com" {
 		t.Fatalf("maskEmail(张小三abc@example.com)=%q, want 张小***@example.com（前两个 rune）", got)
@@ -369,7 +366,7 @@ func TestMaskEmail_multibyteLocalPartStaysValidUTF8(t *testing.T) {
 	}
 }
 
-// CERT-L1（第 69 轮）：「最后一个启用」守卫的语义矩阵钉测试。守卫已收敛为
+// 「最后一个启用」守卫的语义矩阵钉测试。守卫已收敛为
 // 原子条件 UPDATE（WHERE 子查询），逐形状钉住：放行形态/拦截形态/错误优先级/
 // 非禁用写不受守卫影响。
 func TestCAProviderService_UpdateCAProvider_lastEnabledGuard_matrix(t *testing.T) {
@@ -450,7 +447,7 @@ func TestCAProviderService_UpdateCAProvider_lastEnabledGuard_matrix(t *testing.T
 	}
 }
 
-// CERT-L1（第 69 轮）：并发禁用仅剩的两个启用提供商时，启用计数恒不为零——
+// 并发禁用仅剩的两个启用提供商时，启用计数恒不为零——
 // 一个禁用成功、另一个必须被守卫拒绝（ErrCAProviderLastEnabled），禁止静默
 // 击穿到「零启用」（该状态会让全部 ACME 签发/续签失败）。原子条件 UPDATE
 // 形态下该不变量由数据库在写锁内保证，本测试钉住端到端可观察结果。
@@ -503,5 +500,187 @@ func TestCAProviderService_UpdateCAProvider_concurrentDisable_neverReachesZeroEn
 		if enabledCount != 1 {
 			t.Fatalf("round %d: enabled count=%d, want exactly 1（守卫必须拦住第二个禁用）", round, enabledCount)
 		}
+	}
+}
+
+// ---- 回归钉 ----
+
+// 默认提供商禁用守卫必须有钉测——此前 ErrCAProviderDefault
+// 零测试引用，守卫读失败还 fail-open（静默跳过）。
+func TestUpdateCAProvider_rejects_disabling_default_provider(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var providerID int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET default_ca_provider_id=? WHERE id=1`, providerID); err != nil {
+		t.Fatalf("set default provider: %v", err)
+	}
+	disabled := false
+
+	// When
+	_, err := NewCAProviderService().UpdateCAProvider(providerID, models.UpdateCAProviderRequest{Enabled: &disabled})
+
+	// Then
+	if !errors.Is(err, ErrCAProviderDefault) {
+		t.Fatalf("disable default provider err=%v, want ErrCAProviderDefault", err)
+	}
+	var enabled bool
+	if err := database.QueryRow(`SELECT enabled FROM ca_providers WHERE id=?`, providerID).Scan(&enabled); err != nil {
+		t.Fatalf("read provider: %v", err)
+	}
+	if !enabled {
+		t.Fatal("default provider was disabled despite guard")
+	}
+}
+
+// global_config 行缺失（ErrNoRows）语义=未配置默认提供商——守卫
+// 不适用，禁用应放行（fail-closed 只针对读故障，不针对「无默认」这一合法态）。
+func TestUpdateCAProvider_missing_global_config_row_means_no_default(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var providerID int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	if _, err := database.Exec(`DELETE FROM global_config`); err != nil {
+		t.Fatalf("delete global_config: %v", err)
+	}
+	disabled := false
+
+	// When
+	_, err := NewCAProviderService().UpdateCAProvider(providerID, models.UpdateCAProviderRequest{Enabled: &disabled})
+
+	// Then
+	if err != nil {
+		t.Fatalf("disable provider without default row err=%v, want nil", err)
+	}
+}
+
+// 默认提供商守卫的读取故障必须 fail-closed（返回错误），不得静默
+// 跳过守卫——否则可禁用当前默认提供商，令 0 值引用规则静默改派。
+func TestUpdateCAProvider_default_guard_fails_closed_on_read_error(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var providerID int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE global_config RENAME TO global_config_broken`); err != nil {
+		t.Fatalf("rename global_config: %v", err)
+	}
+	disabled := false
+
+	// When
+	_, err := NewCAProviderService().UpdateCAProvider(providerID, models.UpdateCAProviderRequest{Enabled: &disabled})
+
+	// Then
+	if err == nil {
+		t.Fatal("disable provider with unreadable global_config returned nil, want fail-closed error")
+	}
+	var enabled bool
+	if err := database.QueryRow(`SELECT enabled FROM ca_providers WHERE id=?`, providerID).Scan(&enabled); err != nil {
+		t.Fatalf("read provider: %v", err)
+	}
+	if !enabled {
+		t.Fatal("provider was disabled despite fail-closed guard")
+	}
+}
+
+// EAB 落库后必须递增 caProviderConfigVersion，令队列缓存的 provider
+// 快照失效（否则积压任务继续持空 EAB，签发前重复请求 ZeroSSL API）。
+func TestAutoProvisionZeroSSLEAB_bumps_provider_config_version(t *testing.T) {
+	_, database := newClusterTestService(t)
+	result, err := database.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES ('eab-version','zerossl',?,'',1,1000,1)`, ZeroSSLDirectoryURL)
+	if err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	providerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read provider id: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET acme_email='admin@example.test' WHERE id=1`); err != nil {
+		t.Fatalf("seed acme email: %v", err)
+	}
+	oldURL := zerosslEABURL
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"eab_kid":"kid","eab_hmac_key":"hmac"}`))
+	}))
+	zerosslEABURL = server.URL
+	t.Cleanup(func() { zerosslEABURL = oldURL; server.Close() })
+	provider := models.CAProvider{ID: int(providerID), Provider: ProviderZeroSSL}
+	before := caProviderConfigVersion.Load()
+
+	// When
+	if err := AutoProvisionZeroSSLEAB(context.Background(), &provider); err != nil {
+		t.Fatalf("auto provision: %v", err)
+	}
+
+	// Then
+	if got := caProviderConfigVersion.Load(); got <= before {
+		t.Fatalf("config version=%d, want > %d（EAB 落库必须失效队列 provider 快照）", got, before)
+	}
+	var credentials string
+	if err := database.QueryRow(`SELECT COALESCE(credentials,'') FROM ca_providers WHERE id=?`, providerID).Scan(&credentials); err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	if !strings.Contains(credentials, "kid") {
+		t.Fatalf("credentials=%q, want persisted EAB", credentials)
+	}
+}
+
+// 凭证列不得被整行 UPDATE 无条件重写：TestCAProvider / 签发预检会在不持
+// caddyOpMu 的情况下自动申请并写入 ZeroSSL EAB，而前端「测试成功 → 用陈旧
+// 表单保存」或并发请求提交的凭证可能与库值语义相同（键序/空白差异）或更旧。
+// 请求值与事务内旧值语义相等时完全不触碰该列，真实修改（含清空）照常落库。
+func TestCAProviderService_UpdateCAProvider_preservesCredentialsWhenSemanticallyUnchanged(t *testing.T) {
+	// Given：库中凭证是带外写入的非规范 JSON（键序与请求不同）
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec("DELETE FROM ca_providers"); err != nil {
+		t.Fatalf("clear CA providers: %v", err)
+	}
+	const storedCredentials = `{ "eab_hmac_key" : "fresh-key", "eab_kid" : "fresh-kid" }`
+	result, err := database.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES ('eab','zerossl',?,?,1,1000,1)`, ZeroSSLDirectoryURL, storedCredentials)
+	if err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	providerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read provider id: %v", err)
+	}
+	service := NewCAProviderService()
+	newName := "renamed"
+	sameCredentials := `{"eab_kid":"fresh-kid","eab_hmac_key":"fresh-key"}`
+
+	// When：只改名称，凭证原样回传（语义相同、字节不同）
+	if _, err := service.UpdateCAProvider(int(providerID), models.UpdateCAProviderRequest{Name: &newName, Credentials: &sameCredentials}); err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+
+	// Then：凭证列保持原样（未被整行 UPDATE 重写），名称已更新
+	var stored, name string
+	if err := database.QueryRow("SELECT COALESCE(credentials,''), name FROM ca_providers WHERE id=?", providerID).Scan(&stored, &name); err != nil {
+		t.Fatalf("read provider: %v", err)
+	}
+	if stored != storedCredentials {
+		t.Fatalf("credentials=%q, want untouched %q（语义未变不得重写该列）", stored, storedCredentials)
+	}
+	if name != "renamed" {
+		t.Fatalf("name=%q, want renamed", name)
+	}
+
+	// When：真实修改 EAB（下一次测试/签发自动申请到的是新值）
+	nextCredentials := `{"eab_kid":"next-kid","eab_hmac_key":"next-key"}`
+	if _, err := service.UpdateCAProvider(int(providerID), models.UpdateCAProviderRequest{Credentials: &nextCredentials}); err != nil {
+		t.Fatalf("update credentials: %v", err)
+	}
+
+	// Then：真实修改必须落库（凭证列不能被门控成只读）
+	if err := database.QueryRow("SELECT COALESCE(credentials,'') FROM ca_providers WHERE id=?", providerID).Scan(&stored); err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	if stored != nextCredentials {
+		t.Fatalf("credentials=%q, want %q", stored, nextCredentials)
 	}
 }

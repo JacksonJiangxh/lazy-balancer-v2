@@ -1,6 +1,6 @@
 package services
 
-// F-L6-68-02（第 68 轮审计 P4，IP2Region 侧）：xdb 安装段（备份+rename，
+// xdb 安装段（备份+rename，
 // wafFileMu 互斥段内）与 security_ip2region_version 版本行/.version sidecar
 // 写入（此前在锁外 run() 成功路径）分离——写相位中段（xdb 已换、行/sidecar
 // 未写）导出侧（BuildWafFileBundle/BuildWafFileRef 读相位持同一锁）可打出
@@ -29,7 +29,7 @@ func TestIP2RegionUpdateManager_install_writes_version_state_inside_waf_file_loc
 	WafFileLock().Lock()
 	done := make(chan error, 1)
 	go func() {
-		done <- m.downloadAndInstall(context.Background(), "v3.1.0")
+		done <- m.downloadAndInstall(context.Background(), "v3.1.0", true, false)
 	}()
 	select {
 	case err := <-done:

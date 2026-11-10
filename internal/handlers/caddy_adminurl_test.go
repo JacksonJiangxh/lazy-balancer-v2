@@ -3,7 +3,9 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -13,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// D5-S3（N+11 轮）：GetCaddyConfig 与 ApplyConfigOnStartup 的就绪探针硬编码
+// GetCaddyConfig 与 ApplyConfigOnStartup 的就绪探针硬编码
 // http://localhost:2019/config/，忽略 cfg.CaddyAdminURL（GetCaddyStatus 已正确
 // 使用配置值）——自定义 admin 地址的部署下两者探测的是错误端点。两测试以
 // httptest 假 admin 端点断言「确实拨号了配置的 URL」。
@@ -22,10 +24,10 @@ import (
 
 func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	// Given 配置指向假 admin 端点（非默认 localhost:2019）
-	hit := false
+	var hit atomic.Bool
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/config/" {
-			hit = true
+			hit.Store(true)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"apps":{}}`))
 			return
@@ -35,6 +37,8 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	t.Cleanup(fake.Close)
 	h := &Handlers{cfg: &config.Config{CaddyAdminURL: fake.URL}}
 	router := gin.New()
+	// 原始运行配置读取已收敛为管理员语义（业务组路由 + handler 复核）。
+	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
 	router.GET("/config", h.GetCaddyConfig)
 
 	// When
@@ -45,12 +49,76 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
-	if !hit {
+	if !hit.Load() {
 		t.Fatalf("GetCaddyConfig 未拨号 cfg.CaddyAdminURL（%s）下的 GET /config/", fake.URL)
 	}
 }
 
-// L1-66-03：载入审计归因——手动重载（operator 非空）actor=操作者；启动/
+// admin 不可达的端点契约：GetCaddyConfig 与 GetRuleCaddyConfig/GetUpstreamHealth
+// 同口径返回 502（网关/上游不可达），500 留给「读到的字节解析失败/超限」。
+// 同一故障两套状态语义会让按 502 判定上游不可达的重试/熔断策略失效。
+func TestGetCaddyConfig_unreachableAdminReturnsBadGateway(t *testing.T) {
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: "http://127.0.0.1:1"}}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
+	router.GET("/config", h.GetCaddyConfig)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s, want 502", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "连接 Caddy 失败") {
+		t.Fatalf("message must name Caddy: %s", rec.Body.String())
+	}
+}
+
+// GetCaddyConfig 的 admin 响应体上限（32MB+1 探测，与 services 家族同口径）：
+// 超限必须报「超过 32MB 上限」的显式读取错误，而非静默截断后误报「解析失败」。
+func TestGetCaddyConfig_oversizeBodyReportedAsLimitNotParseFailure(t *testing.T) {
+	// Given 假 admin 端点返回 >32MB 的合法前缀 JSON 碎片（填充注释式重复键）
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// 32MB+1 探测：写出超过上限的字节流（重复空白即可，无需合法 JSON——
+		// 超限判定先于解析）。
+		chunk := []byte(strings.Repeat(" ", 4096))
+		var written int64
+		for written < 33<<20 {
+			n, err := w.Write(chunk)
+			written += int64(n)
+			// 客户端提前断开/写失败时 Write 返回 (0, err)——没有退出条件会让
+			// handler 永不返回，httptest 的 Close 随之阻塞（CI 偶发挂死）。
+			if err != nil || n == 0 {
+				break
+			}
+		}
+	}))
+	t.Cleanup(fake.Close)
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: fake.URL}}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
+	router.GET("/config", h.GetCaddyConfig)
+
+	// When
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+
+	// Then 500 且错误文案指认超限而非解析失败
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "超过 32MB 上限") {
+		t.Fatalf("超限必须报上限错误（不得误报解析失败）: %s", body)
+	}
+	if strings.Contains(body, "解析 Caddy 配置失败") {
+		t.Fatalf("超限不得误报为解析失败: %s", body)
+	}
+}
+
+// 载入审计归因——手动重载（operator 非空）actor=操作者；启动/
 // 自愈（空）actor=system。此前恒 system，且「触发源见任务运行历史」在
 // 历史无 operator 列时归因链落空（列同批修复）。
 func TestApplyConfigOnStartup_auditActorFollowsOperator(t *testing.T) {

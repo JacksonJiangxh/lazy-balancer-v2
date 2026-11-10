@@ -1,8 +1,8 @@
 package taskengine
 
-// 第 71 轮域 A（rows.Err 家族收敛，taskengine 侧）：
-//   - TASK-A3：History 迭代错误/Scan 失败须 warn 留痕（此前静默 continue）
-//   - LNK71-2：Stats24hHourlySeries 同族（与 services/certificates.go 的
+// 历史域 A（rows.Err 家族收敛，taskengine 侧）：
+//   History 迭代错误/Scan 失败须 warn 留痕（此前静默 continue）
+//   Stats24hHourlySeries 同族（与 services/certificates.go 的
 //     reconcileMissingCertFiles 正面对照——本文件两处为此前唯二漏网点）
 
 import (
@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -71,18 +72,49 @@ func (taskIterZeroRows) Columns() []string         { return []string{"c"} }
 func (taskIterZeroRows) Close() error              { return nil }
 func (taskIterZeroRows) Next([]driver.Value) error { return io.EOF }
 
-// captureEngineLog 捕获标准库日志（taskengine warn 落点——包内无 services
-// 依赖，经 "WARNING:" 前缀走 main.go applicationLogWriter 级别过滤）。
-func captureEngineLog(t *testing.T) *strings.Builder {
-	t.Helper()
-	var buf strings.Builder
-	old := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(old) })
-	return &buf
+// taskRowsQueryFailConnector 在 Query 阶段直接失败，与上面的迭代失败
+// 连接器互补：用于钉住 History/HourlySeries 的 rows, err := Query 分支。
+type taskRowsQueryFailConnector struct{}
+
+func (taskRowsQueryFailConnector) Connect(context.Context) (driver.Conn, error) {
+	return taskRowsQueryFailConn{}, nil
+}
+func (taskRowsQueryFailConnector) Driver() driver.Driver { return taskRowsIterFailDriver{} }
+
+type taskRowsQueryFailConn struct{ taskRowsIterFailConn }
+
+func (taskRowsQueryFailConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return nil, errors.New("注入的 task_runs 查询失败")
 }
 
-// TASK-A3（第 71 轮 P5）：History 循环 rows.Err() 未检查——迭代错误表现为
+type syncEngineLogBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncEngineLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncEngineLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// captureEngineLog 捕获标准库日志；异步引擎 goroutine 与断言可同时读写。
+func captureEngineLog(t *testing.T) *syncEngineLogBuffer {
+	t.Helper()
+	buf := &syncEngineLogBuffer{}
+	old := log.Writer()
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+	return buf
+}
+
+// History 循环 rows.Err() 未检查——迭代错误表现为
 // 「部分历史 + 静默」；Scan 失败同样静默 continue。修复：两者均 warn 留痕
 // （返回形状不变——历史页降级展示已读行，与 taskmonitor 读取侧容错一致）。
 func TestEngine_History_iterationErrorWarns(t *testing.T) {
@@ -104,8 +136,8 @@ func TestEngine_History_iterationErrorWarns(t *testing.T) {
 	}
 }
 
-// LNK71-2（第 71 轮 P5）：Stats24hHourlySeries 聚合循环 rows.Err() 未检查+
-// Scan 静默——TASK-1（第 70 轮）同批触碰未同步收敛。修复：warn 留痕，24 桶
+// Stats24hHourlySeries 聚合循环 rows.Err() 未检查+
+// Scan 静默——同批触碰未同步收敛。修复：warn 留痕，24 桶
 // 零填形状不变（图表降级为空序列，不崩不缺桶）。
 func TestEngine_Stats24hHourlySeries_iterationErrorWarns(t *testing.T) {
 	e := newTestEngine(t)
@@ -123,5 +155,34 @@ func TestEngine_Stats24hHourlySeries_iterationErrorWarns(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "24h") {
 		t.Fatalf("Stats24hHourlySeries 迭代错误须 warn 留痕, log=%q", buf.String())
+	}
+}
+
+func TestEngine_QueryErrorWarns(t *testing.T) {
+	e := newTestEngine(t)
+	tests := []struct {
+		name   string
+		invoke func() int
+		want   int
+	}{
+		{name: "History", invoke: func() int { return len(e.History("t-x", 20)) }, want: 0},
+		{name: "Stats24hHourlySeries", invoke: func() int { return len(e.Stats24hHourlySeries()) }, want: 24},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureEngineLog(t)
+			orig := db.DB
+			broken := sql.OpenDB(taskRowsQueryFailConnector{})
+			t.Cleanup(func() { _ = broken.Close() })
+			db.DB = broken
+			t.Cleanup(func() { db.DB = orig })
+
+			if got := tc.invoke(); got != tc.want {
+				t.Fatalf("查询失败后的返回形状大小=%d, want %d", got, tc.want)
+			}
+			if !strings.Contains(buf.String(), "查询失败") {
+				t.Fatalf("Query 错误必须 warn 留痕, log=%q", buf.String())
+			}
+		})
 	}
 }

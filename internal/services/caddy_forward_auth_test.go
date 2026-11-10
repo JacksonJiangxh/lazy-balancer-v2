@@ -1,0 +1,524 @@
+package services
+
+// 认证网关（forward_auth）渲染钉测 + NTLM 专用 transport 渲染钉测。
+//
+// forward_auth：Caddy 官方 forward_auth 指令的 JSON 展开形态
+// （与 Caddy 官方 forward_auth adapt 输出对齐：reverse_proxy + rewrite method=GET/uri +
+// headers 回传 X-Forwarded-Method/Uri + handle_response match status_code [2]
+// 逐头 delete+条件 set 拷贝；非 2xx 无匹配 handle_response 条目 → 网关响应
+// 原样回拷客户端）。链首插入（安全链之前）：未认证请求不进指标/安全链。
+//
+// NTLM transport：caddyserver/ntlm-transport v0.1.2（http_ntlm transport，
+// Provision 强制 Versions=["1.1"] + keep-alive，连接级协商亲和）——ntlm=1 时
+// transport.protocol 发射 http_ntlm 并省略 versions（模块强制，替代
+// force_http1 的 versions 字段）；ntlm=0 行为逐字节不变。
+
+import (
+	"strings"
+	"testing"
+)
+
+func forwardAuthRule() SingleRuleConfig {
+	rule := baseHTTPRule()
+	rule.ForwardAuthEnabled = 1
+	rule.ForwardAuthUpstream = "http://gw.internal:7000"
+	rule.ForwardAuthURI = "/api/authz/forward-auth"
+	rule.ForwardAuthCopyHeaders = "Remote-User,Remote-Groups,Remote-Email,Remote-Name"
+	return rule
+}
+
+// 消费侧防御归一：带外/旧数据里的非规范名（直改 DB、旧版本备份还原）在渲染
+// 前收敛为规范形——Caddy 响应头占位符注册键恒为规范形（Go http.Header），
+// 非规范名拼出的占位符 vars 查表恒 miss → 条件 set 永不执行（静默失注入）。
+// 写侧归一（handlers）已保证新数据规范，本层与其共用同一结论（零兜底契约
+// 不变：畸形仍显性报错）。
+func TestBuildHTTPHandleChain_forwardAuthCanonicalizesCopyHeaders(t *testing.T) {
+	rule := forwardAuthRule()
+	rule.ForwardAuthCopyHeaders = "remote-user,REMOTE-GROUPS"
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	assertForwardAuthCopyHeadersCanonical(t, chain)
+}
+
+// 空格分隔形态（「remote-user, remote-email」用户常见输入）渲染同结论：归一
+// 先逐项 TrimSpace 再 canonical 化——前导空格是非法 token 字节，不先剥离会让
+// CanonicalHeaderKey 原样返回、拼出的占位符键携带空白恒 miss（认证照常放行、
+// 身份头静默失注入）。带外/旧数据行由渲染侧归一自愈，本钉测与写侧归一同结论。
+func TestBuildHTTPHandleChain_forwardAuthCanonicalizesSpaceSeparatedCopyHeaders(t *testing.T) {
+	rule := forwardAuthRule()
+	rule.ForwardAuthCopyHeaders = " remote-user , REMOTE-GROUPS "
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	assertForwardAuthCopyHeadersCanonical(t, chain)
+}
+
+// CanonicalForwardAuthCopyHeaders 单源单元钉测：逐项 TrimSpace → canonical 化
+// → 剔除空项 → join。分隔空格与大小写混写都收敛到同一存储形态（写侧五面经
+// normalizeForwardAuthValues、渲染侧 buildForwardAuthHandler 共用本函数）；
+// 规范化后仍同头并存（判重交由写侧门 400 / 渲染侧消费前去重）；项内空白等
+// 非法 token 字节不洗白，仍由保存门/渲染门拒绝。
+func TestCanonicalForwardAuthCopyHeaders_normalizesSpaceForm(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"基线紧凑非规范名", "remote-user,REMOTE-GROUPS", "Remote-User,Remote-Groups"},
+		{"分隔空格与首尾空白剥离", " remote-user , Remote-Email ", "Remote-User,Remote-Email"},
+		{"规范化后同头并存", "Remote-User, remote-user", "Remote-User,Remote-User"},
+		{"空项剔除", "Remote-User,,Remote-Email", "Remote-User,Remote-Email"},
+		{"项内空白不洗白", "Remote User", "Remote User"},
+		{"全空清单归空", " , ", ""},
+		{"空串原样", "", ""},
+	}
+	for _, tc := range cases {
+		if got := CanonicalForwardAuthCopyHeaders(tc.in); got != tc.want {
+			t.Fatalf("%s: CanonicalForwardAuthCopyHeaders(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+// 带外/旧数据行的重复写法（同一头两种形态并存）渲染侧消费前收敛：去重后
+// 重复 delete/set 路由不再发射（占位符重复注册无行为增益、徒增配置体积）；
+// 写侧同形态输入由保存门 400 判重——渲染去重不豁免保存校验。
+func TestBuildForwardAuthHandler_dedupesCanonicalDuplicates(t *testing.T) {
+	rule := forwardAuthRule()
+	rule.ForwardAuthCopyHeaders = "Remote-User, remote-user"
+	handler, err := buildForwardAuthHandler(rule)
+	if err != nil {
+		t.Fatalf("buildForwardAuthHandler: %v", err)
+	}
+	entries, ok := handler["handle_response"].([]interface{})
+	if !ok || len(entries) != 1 {
+		t.Fatalf("handle_response = %#v", handler["handle_response"])
+	}
+	routes, ok := entries[0].(map[string]interface{})["routes"].([]interface{})
+	if !ok {
+		t.Fatalf("routes missing")
+	}
+	setCount, deleteCount := 0, 0
+	for _, raw := range routes {
+		route, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		handle, ok := route["handle"].([]interface{})
+		if !ok || len(handle) != 1 {
+			continue
+		}
+		h, ok := handle[0].(map[string]interface{})
+		if !ok || h["handler"] != "headers" {
+			continue
+		}
+		req, ok := h["request"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if set, ok := req["set"].(map[string]interface{}); ok {
+			if _, has := set["Remote-User"]; has {
+				setCount++
+			}
+		}
+		if del, ok := req["delete"].([]string); ok {
+			for _, name := range del {
+				if name == "Remote-User" {
+					deleteCount++
+				}
+			}
+		}
+	}
+	if setCount != 1 || deleteCount != 1 {
+		t.Fatalf("Remote-User 条件 set=%d/delete=%d, want 各 1（规范化重复消费前去重）", setCount, deleteCount)
+	}
+}
+
+// assertForwardAuthCopyHeadersCanonical 钉测链首网关处理器的逐头段形状：
+// vars 哑路由 + [delete 路由, 条件 set 路由]——全部头名键（delete 键、set 键、
+// 占位符名）必须是规范形。
+func assertForwardAuthCopyHeadersCanonical(t *testing.T, chain []interface{}) {
+	t.Helper()
+	head, ok := chain[0].(map[string]interface{})
+	if !ok || head["handler"] != "reverse_proxy" {
+		t.Fatalf("chain head = %#v, want forward_auth reverse_proxy", chain[0])
+	}
+	entries, ok := head["handle_response"].([]interface{})
+	if !ok || len(entries) != 1 {
+		t.Fatalf("handle_response = %#v", head["handle_response"])
+	}
+	entry, ok := entries[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("handle_response[0] = %#v", entries[0])
+	}
+	routes, ok := entry["routes"].([]interface{})
+	if !ok {
+		t.Fatalf("routes = %#v", entry["routes"])
+	}
+	// 逐头段形状：vars 哑路由 + [delete 路由, 条件 set 路由] —— 全部头名键
+	// （delete 键、set 键、占位符名）必须是规范形。
+	found := map[string]bool{}
+	for _, raw := range routes {
+		route, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		handle, ok := route["handle"].([]interface{})
+		if !ok || len(handle) != 1 {
+			continue
+		}
+		handler, ok := handle[0].(map[string]interface{})
+		if !ok || handler["handler"] != "headers" {
+			continue
+		}
+		req, ok := handler["request"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if del, ok := req["delete"].([]string); ok {
+			for _, name := range del {
+				found["delete:"+name] = true
+			}
+		}
+		if set, ok := req["set"].(map[string]interface{}); ok {
+			for name, placeholder := range set {
+				found["set:"+name] = true
+				vals, _ := placeholder.([]string)
+				if len(vals) == 1 {
+					found["placeholder:"+vals[0]] = true
+				}
+			}
+		}
+	}
+	for _, want := range []string{
+		"delete:Remote-User", "delete:Remote-Groups",
+		"set:Remote-User", "set:Remote-Groups",
+		"placeholder:{http.reverse_proxy.header.Remote-User}",
+		"placeholder:{http.reverse_proxy.header.Remote-Groups}",
+	} {
+		if !found[want] {
+			t.Fatalf("copy 路由缺规范形态 %q（got %v）——非规范名经引擎静默失注入", want, found)
+		}
+	}
+}
+
+// findHandler 在 handle 链中按 handler 名查找，返回（索引，处理器）。
+func findHandlerInHandleChain(t *testing.T, chain []interface{}, name string) (int, map[string]interface{}) {
+	t.Helper()
+	for i, raw := range chain {
+		handler, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if handler["handler"] == name {
+			return i, handler
+		}
+	}
+	t.Fatalf("handler %q not found in chain of %d handlers", name, len(chain))
+	return -1, nil
+}
+
+func TestBuildHTTPHandleChain_forwardAuthChainHead(t *testing.T) {
+	rule := forwardAuthRule()
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	if len(chain) == 0 {
+		t.Fatal("empty handle chain")
+	}
+	// 链首即网关子请求处理器（先于 X-LB-Rule-ID headers / 指标 / 安全链）。
+	head, ok := chain[0].(map[string]interface{})
+	if !ok || head["handler"] != "reverse_proxy" {
+		t.Fatalf("chain head = %#v, want forward_auth reverse_proxy", chain[0])
+	}
+
+	// rewrite：恒 GET + 网关校验路径。
+	rewrite, ok := head["rewrite"].(map[string]interface{})
+	if !ok || rewrite["method"] != "GET" || rewrite["uri"] != "/api/authz/forward-auth" {
+		t.Fatalf("rewrite = %#v, want method=GET uri=/api/authz/forward-auth", head["rewrite"])
+	}
+
+	// 回传原始方法与 URI（自身被改写前捕获）。
+	headers, ok := head["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers = %#v", head["headers"])
+	}
+	request, ok := headers["request"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers.request = %#v", headers["request"])
+	}
+	sets, ok := request["set"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers.request.set = %#v", request["set"])
+	}
+	if got := sets["X-Forwarded-Method"]; len(got.([]string)) != 1 || got.([]string)[0] != "{http.request.method}" {
+		t.Fatalf("X-Forwarded-Method = %#v", sets["X-Forwarded-Method"])
+	}
+	if got := sets["X-Forwarded-Uri"]; len(got.([]string)) != 1 || got.([]string)[0] != "{http.request.uri}" {
+		t.Fatalf("X-Forwarded-Uri = %#v", sets["X-Forwarded-Uri"])
+	}
+
+	// upstreams：网关 dial（默认端口按 scheme 补全场景见 HTTPS 用例）。
+	upstreams, ok := head["upstreams"].([]interface{})
+	if !ok || len(upstreams) != 1 {
+		t.Fatalf("upstreams = %#v", head["upstreams"])
+	}
+	dial := upstreams[0].(map[string]interface{})["dial"]
+	if dial != "gw.internal:7000" {
+		t.Fatalf("dial = %v, want gw.internal:7000", dial)
+	}
+
+	// handle_response：仅 2xx 条目；逐头 delete + 条件 set（与 caddy adapt
+	// 展开形态逐块一致——网关未回传的头不置空值）。
+	entries, ok := head["handle_response"].([]interface{})
+	if !ok || len(entries) != 1 {
+		t.Fatalf("handle_response = %#v", head["handle_response"])
+	}
+	entry, ok := entries[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("handle_response[0] = %#v", entries[0])
+	}
+	match, ok := entry["match"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("handle_response[0].match = %#v", entry["match"])
+	}
+	codes, ok := match["status_code"].([]int)
+	if !ok || len(codes) != 1 || codes[0] != 2 {
+		t.Fatalf("match.status_code = %#v, want [2]", match["status_code"])
+	}
+	routes, ok := entry["routes"].([]interface{})
+	if !ok {
+		t.Fatalf("handle_response[0].routes = %#v", entry["routes"])
+	}
+	// 每个身份头恰好一组 delete+条件 set（默认清单 4 头 → 8 条 + 前导 vars）。
+	if len(routes) != 1+2*4 {
+		t.Fatalf("routes len = %d, want %d（vars + 4 头×(delete+条件 set)）", len(routes), 1+2*4)
+	}
+	deleted, setWithMatch := 0, 0
+	for _, raw := range routes[1:] {
+		route := raw.(map[string]interface{})
+		handles := route["handle"].([]interface{})
+		handler := handles[0].(map[string]interface{})
+		if handler["handler"] != "headers" {
+			t.Fatalf("unexpected handler in copy routes: %#v", handler)
+		}
+		req := handler["request"].(map[string]interface{})
+		if _, hasDelete := req["delete"]; hasDelete {
+			deleted++
+			continue
+		}
+		// 条件 set：not vars {http.reverse_proxy.header.X} == ""（网关未回传
+		// 该头时不注入空值）。
+		matchers, ok := route["match"].([]interface{})
+		if !ok || len(matchers) != 1 {
+			t.Fatalf("set route missing not-empty matcher: %#v", route)
+		}
+		matcher := matchers[0].(map[string]interface{})
+		notList := matcher["not"].([]interface{})
+		varsMatcher := notList[0].(map[string]interface{})["vars"].(map[string]interface{})
+		for placeholder := range varsMatcher {
+			if !strings.HasPrefix(placeholder, "{http.reverse_proxy.header.") {
+				t.Fatalf("unexpected vars placeholder %q", placeholder)
+			}
+		}
+		setWithMatch++
+	}
+	if deleted != 4 || setWithMatch != 4 {
+		t.Fatalf("copy routes deleted=%d setWithMatch=%d, want 4/4", deleted, setWithMatch)
+	}
+}
+
+// TestBuildHTTPHandleChain_forwardAuthStripsInternalControlHeaders：网关子请求
+// 位于 handleChain 链首、先于链首 X-LB-* set 执行，reverse_proxy 会把客户端
+// 原始请求头复制进子请求——伪造的引擎内部控制头会原样直达认证网关。子请求
+// headers.request.delete 必须剥离全部引擎内部控制头，并与上游反向代理的
+// delete 清单同值（同一单源清单的两个消费面，防第二副本漂移）。
+func TestBuildHTTPHandleChain_forwardAuthStripsInternalControlHeaders(t *testing.T) {
+	rule := forwardAuthRule()
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	if len(chain) == 0 {
+		t.Fatal("empty handle chain")
+	}
+	extractDelete := func(face string, handler map[string]interface{}) map[string]bool {
+		t.Helper()
+		headers, ok := handler["headers"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s headers = %#v", face, handler["headers"])
+		}
+		request, ok := headers["request"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s headers.request = %#v", face, headers["request"])
+		}
+		del, ok := request["delete"].([]string)
+		if !ok {
+			t.Fatalf("%s headers.request.delete 必须是 []string, got %#v", face, request["delete"])
+		}
+		seen := make(map[string]bool, len(del))
+		for _, name := range del {
+			seen[name] = true
+		}
+		return seen
+	}
+	head, ok := chain[0].(map[string]interface{})
+	if !ok || head["handler"] != "reverse_proxy" {
+		t.Fatalf("chain head = %#v, want forward_auth reverse_proxy", chain[0])
+	}
+	tail, ok := chain[len(chain)-1].(map[string]interface{})
+	if !ok || tail["handler"] != "reverse_proxy" {
+		t.Fatalf("chain tail = %#v, want upstream reverse_proxy", chain[len(chain)-1])
+	}
+	subDelete := extractDelete("网关子请求", head)
+	upstreamDelete := extractDelete("上游反向代理", tail)
+	if len(subDelete) != len(upstreamDelete) {
+		t.Fatalf("网关子请求剥离清单 %v 与上游剥离清单 %v 不同值——单源契约破坏", subDelete, upstreamDelete)
+	}
+	for _, header := range lbInternalControlHeaders {
+		if !subDelete[header] {
+			t.Fatalf("网关子请求未剥离内部控制头 %s——客户端伪造值直达认证网关", header)
+		}
+		if !upstreamDelete[header] {
+			t.Fatalf("上游反向代理未剥离内部控制头 %s", header)
+		}
+		delete(subDelete, header)
+		delete(upstreamDelete, header)
+	}
+	if len(subDelete) != 0 || len(upstreamDelete) != 0 {
+		t.Fatalf("剥离清单存在单源之外条目：子请求残留 %v / 上游残留 %v", subDelete, upstreamDelete)
+	}
+}
+
+func TestBuildHTTPHandleChain_forwardAuthDisabled(t *testing.T) {
+	// 回归形状：enabled=0 链零变化（链首仍是 X-LB-Rule-ID headers）。
+	rule := baseHTTPRule()
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	if chain[0].(map[string]interface{})["handler"] == "reverse_proxy" {
+		t.Fatalf("disabled rule rendered forward_auth at chain head: %#v", chain[0])
+	}
+}
+
+func TestBuildHTTPHandleChain_forwardAuthMalformed(t *testing.T) {
+	// 畸形形状（带外脏行）：渲染显性失败（零兜底），错误进入
+	// generationFailure → 保存门/启动聚合门拦截。
+	cases := []struct {
+		name   string
+		mutate func(*SingleRuleConfig)
+	}{
+		{"upstream 缺失", func(r *SingleRuleConfig) { r.ForwardAuthUpstream = "" }},
+		{"upstream 无 scheme", func(r *SingleRuleConfig) { r.ForwardAuthUpstream = "gw.internal:7000" }},
+		{"upstream 非 http scheme", func(r *SingleRuleConfig) { r.ForwardAuthUpstream = "ftp://gw.internal:7000" }},
+		{"uri 缺失", func(r *SingleRuleConfig) { r.ForwardAuthURI = "" }},
+		{"uri 非 / 开头", func(r *SingleRuleConfig) { r.ForwardAuthURI = "api/verify" }},
+		{"uri 含 CRLF", func(r *SingleRuleConfig) { r.ForwardAuthURI = "/api/verify\r\nX-Injected: 1" }},
+		{"身份头清单为空", func(r *SingleRuleConfig) { r.ForwardAuthCopyHeaders = "" }},
+		{"身份头含内部空白", func(r *SingleRuleConfig) { r.ForwardAuthCopyHeaders = "Remote-User,Remote User,Remote-Email" }},
+		{"身份头含 CRLF", func(r *SingleRuleConfig) { r.ForwardAuthCopyHeaders = "Remote-User\r\nX: 1" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := forwardAuthRule()
+			tc.mutate(&rule)
+			if _, err := buildHTTPHandleChain(rule, rule.Upstreams); err == nil {
+				t.Fatalf("%s: expected render failure, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestBuildHTTPHandleChain_forwardAuthHTTPSGateway(t *testing.T) {
+	// https 网关：dial 默认端口 443 + transport 携带项目标准
+	// insecure_skip_verify（与上游 https 渲染同口径）。
+	rule := forwardAuthRule()
+	rule.ForwardAuthUpstream = "https://auth.example.test"
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	_, head := findHandlerInHandleChain(t, chain, "reverse_proxy")
+	upstreams := head["upstreams"].([]interface{})
+	if dial := upstreams[0].(map[string]interface{})["dial"]; dial != "auth.example.test:443" {
+		t.Fatalf("dial = %v, want auth.example.test:443", dial)
+	}
+	transport, ok := head["transport"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("https gateway missing transport: %#v", head)
+	}
+	tlsConfig, ok := transport["tls"].(map[string]interface{})
+	if !ok || tlsConfig["insecure_skip_verify"] != true {
+		t.Fatalf("transport.tls = %#v, want insecure_skip_verify", transport["tls"])
+	}
+}
+
+func TestBuildHTTPHandleChain_ntlmTransport(t *testing.T) {
+	// 目标形状：ntlm=1 → transport.protocol=http_ntlm（连接级协商亲和）；
+	// versions 省略（模块 Provision 强制 ["1.1"]，替代 force_http1 的 versions
+	// 字段）；keep_alive 沿接管形态 300s 正常发射（模块 keep-alive 语义兼容）。
+	rule := baseHTTPRule()
+	rule.NTLMCompatible = 1
+	rule.UpstreamForceHTTP1 = 1
+	rule.Upstreams[0].Protocol = "https"
+	rule.Upstreams[1].Protocol = "https"
+	rule.UpstreamKeepaliveTimeout = 300
+	rule.GlobalUpstreamKeepaliveTimeout = 120
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	_, proxy := findHandlerInHandleChain(t, chain, "reverse_proxy")
+	transport, ok := proxy["transport"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("ntlm rule missing transport: %#v", proxy)
+	}
+	if transport["protocol"] != "http_ntlm" {
+		t.Fatalf("transport.protocol = %v, want http_ntlm", transport["protocol"])
+	}
+	if _, hasVersions := transport["versions"]; hasVersions {
+		t.Fatalf("http_ntlm transport must not emit versions (module forces 1.1): %#v", transport)
+	}
+	keepAlive, ok := transport["keep_alive"].(map[string]interface{})
+	if !ok || keepAlive["idle_timeout"] != "300s" {
+		t.Fatalf("keep_alive = %#v, want idle_timeout 300s", transport["keep_alive"])
+	}
+}
+
+func TestBuildHTTPHandleChain_ntlmTransportRegression(t *testing.T) {
+	// 回归形状：ntlm=0 时 force_http1 的 versions 字段逐字节保持现状。
+	rule := baseHTTPRule()
+	rule.UpstreamForceHTTP1 = 1
+	rule.Upstreams[0].Protocol = "https"
+	rule.Upstreams[1].Protocol = "https"
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	_, proxy := findHandlerInHandleChain(t, chain, "reverse_proxy")
+	transport, ok := proxy["transport"].(map[string]interface{})
+	if !ok || transport["protocol"] != "http" {
+		t.Fatalf("transport = %#v, want protocol http", proxy["transport"])
+	}
+	versions, ok := transport["versions"].([]string)
+	if !ok || len(versions) != 1 || versions[0] != "1.1" {
+		t.Fatalf("versions = %#v, want [1.1]", transport["versions"])
+	}
+}
+
+func TestBuildHTTPHandleChain_ntlmTransportPlainHTTPUpstreams(t *testing.T) {
+	// NTLM 接管典型形态（明文 http 上游）：此前 needsTransport=false 无
+	// transport——ntlm=1 必须发射 http_ntlm transport（接管的核心语义）。
+	rule := baseHTTPRule()
+	rule.NTLMCompatible = 1
+	rule.UpstreamForceHTTP1 = 1
+	chain, err := buildHTTPHandleChain(rule, rule.Upstreams)
+	if err != nil {
+		t.Fatalf("buildHTTPHandleChain: %v", err)
+	}
+	_, proxy := findHandlerInHandleChain(t, chain, "reverse_proxy")
+	transport, ok := proxy["transport"].(map[string]interface{})
+	if !ok || transport["protocol"] != "http_ntlm" {
+		t.Fatalf("plain http upstreams missing http_ntlm transport: %#v", proxy["transport"])
+	}
+}

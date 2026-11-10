@@ -193,7 +193,12 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 
 	repl := caddy.NewReplacer()
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-	req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+	// caddyhttp.SetVar 只写入上下文里的 vars map（真实 Caddy 链恒有）：
+	// 测试需自备一份才能观察 geoip.* 变量形态。
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
 	req.RemoteAddr = "114.114.114.114:53981"
 	for name, value := range map[string]string{
 		"X-LB-GeoIP-Country":      "中国",
@@ -219,6 +224,14 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 		}
 		if got := downstream.Header.Get(name); got != "" {
 			t.Fatalf("spoofed header %s must be stripped without an xdb, got %q", name, got)
+		}
+	}
+	// 变量形态必须与「查询失败」分支同口径：4 个 geoip.* 变量全部置空串哨兵
+	// （只发 Loc 头会让流量统计桶读到未设置变量 → collecting=true 但恒零）。
+	for _, key := range []string{"geoip.country_name", "geoip.region", "geoip.province", "geoip.city"} {
+		v, ok := caddyhttp.GetVar(downstream.Context(), key).(string)
+		if !ok || v != "" {
+			t.Fatalf("%s must be set to the empty-string sentinel without an xdb, got %v (set=%v)", key, v, ok)
 		}
 	}
 }
@@ -366,11 +379,13 @@ func TestServeHTTP_overseasEmitsCountryName(t *testing.T) {
 	}
 }
 
-// TestGeoipLocFor_trimsChinaCountryColumn：国家列「中国」判定
-// TrimSpace 对称——树侧收集判定本就 Trim（ip2region.go），发射侧此前裸比较
-// （" 中国" 异形行走海外分支后 NormalizeCountry 折叠出「中国」串发射，匹配
-// 键恒不命中）。国内 → 省/省-市；海外 → 归一化国名；不可解析 → 哨兵。
-func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
+// TestGeoipLocFor_usesNormalizedCountryColumn：Loc 只消费**已归一**的国家列
+// （归一是 normalizeTrafficCountryKey 单源，由 parseGeoIPRegion 前置完成）——
+// 本函数不再二次 TrimSpace/NormalizeCountry。历史形态（两处各自归一）在新增
+// 国家异体时单侧漏改会让 X-LB-GeoIP-Country 与 X-LB-GeoIP-Loc 口径分裂；
+// 本用例按发射侧同口径归一后验证三态（国内 → 省/省-市；海外 → 归一化国名；
+// 不可解析 → 哨兵）。
+func TestGeoipLocFor_usesNormalizedCountryColumn(t *testing.T) {
 	cases := []struct{ country, province, city, want string }{
 		{"中国", "广东省", "深圳市", "广东省/深圳市"},
 		{"中国", "广东省", "", "广东省"},
@@ -382,8 +397,8 @@ func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
 		{"", "广东省", "", "海外"},
 	}
 	for _, tc := range cases {
-		if got := geoipLocFor(tc.country, tc.province, tc.city); got != tc.want {
-			t.Errorf("geoipLocFor(%q,%q,%q)=%q; want %q", tc.country, tc.province, tc.city, got, tc.want)
+		if got := geoipLocFor(normalizeTrafficCountryKey(tc.country), tc.province, tc.city); got != tc.want {
+			t.Errorf("geoipLocFor(normalize(%q),%q,%q)=%q; want %q", tc.country, tc.province, tc.city, got, tc.want)
 		}
 	}
 }
@@ -681,14 +696,15 @@ func TestNormalizeCity_autonomousPrefecture(t *testing.T) {
 	}
 }
 
-// TestSharedGeoIPSearcher_statFailureEvictsCachedEntry
-// stat 失败（xdb 更新 rename 窗口/文件被删）且缓存持有该路径条目时，条目
-// 必须驱逐——旧实例走既有 AfterFunc 延迟关闭（在途查询保护与换库路径一致）。
-// 不驱逐时旧 inode 实例永久占据缓存槽：stat 失败路径原样 return err 不碰
-// 缓存，文件以「同 modtime+size」形态恢复（rsync -a/touch -r 保时间戳重铺）
-// 时缓存命中判定通过，被删 inode 的旧库被无限期当有效数据服务（更新静默
-// 失效——恰是缓存条目要防的形态）。
-func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
+// TestSharedGeoIPSearcher_statFailureServesStaleAndForcesRebuild
+// stat 失败（xdb 更新 rename 窗口/文件被删）且缓存持有该路径条目时：本次
+// 仍返回该实例（fail-stale），并把条目标为「必须重建」。返回 error 会让
+// Provision 降级 pass-through，该次 reload 之后 geoip 全量判「海外」，
+// allow 模式规则等价全量拦截；而删条目会让同一次 reload 里第二个及之后的
+// geoip 规则实例拿不到缓存（同一配置内部行为不一致）。标记保证文件以
+// 「同 modtime+size」形态恢复（rsync -a/touch -r 保时间戳重铺）时下一次
+// Provision 必然重读重建，旧 inode 不会被无限期当有效数据服务。
+func TestSharedGeoIPSearcher_statFailureServesStaleAndForcesRebuild(t *testing.T) {
 	src := findTestXdb()
 	if src == "" {
 		t.Skip("no ip2region xdb available; place one under caddygeoip/testdata/ to run this test")
@@ -704,58 +720,97 @@ func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
 	}
 	oldDelay := geoipOldInstanceCloseDelay
 	geoipOldInstanceCloseDelay = 200 * time.Millisecond
-	t.Cleanup(func() { geoipOldInstanceCloseDelay = oldDelay })
+	t.Cleanup(func() {
+		geoipOldInstanceCloseDelay = oldDelay
+		geoipSharedMu.Lock()
+		delete(geoipSharedSearchers, path)
+		geoipSharedMu.Unlock()
+	})
 
 	// Given 缓存已持有该路径条目
-	first, err := sharedGeoIPSearcher(path)
+	first, err := sharedGeoIPSearcher(path, "")
 	if err != nil {
 		t.Fatalf("seed cache: %v", err)
+	}
+	origStat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat seed: %v", err)
 	}
 
 	// When 文件被移除（stat 失败）后再次解析
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sharedGeoIPSearcher(path); err == nil {
-		t.Fatal("stat failure must surface as error (provision degrades pass-through)")
+	served, err := sharedGeoIPSearcher(path, "")
+	if err != nil {
+		t.Fatalf("stat failure with a cached entry must serve it (fail-stale): %v", err)
+	}
+	if served != first {
+		t.Fatal("stat failure must hand back the cached instance for this call")
+	}
+	if _, err := served.Search("114.114.114.114"); err != nil {
+		t.Fatalf("本次 reload 必须能按旧库继续解析（fail-stale）: %v", err)
 	}
 
-	// Then 缓存条目已被驱逐（不 panic、不持旧 inode 占位）
+	// Then 条目保留且标记必须重建
 	geoipSharedMu.Lock()
-	_, stillCached := geoipSharedSearchers[path]
+	cached := geoipSharedSearchers[path+"\x00"]
 	geoipSharedMu.Unlock()
-	if stillCached {
-		t.Fatal("stat failure with cached entry must evict it (delayed close), not retain the stale-inode entry")
+	if cached == nil || !cached.needsRebuild {
+		t.Fatalf("stat 失败必须把条目标为「必须重建」: %#v", cached)
 	}
 
-	// And 旧实例在延迟窗口内仍可查（AfterFunc 在途保护），窗口过后被关闭
-	if _, err := first.Search("114.114.114.114"); err != nil {
-		t.Fatalf("延迟窗口内旧实例不得在役查询失败: %v", err)
+	// And 同一次 reload 里后续 geoip 规则实例（各调一次 Provision）仍拿到
+	// 同一 fail-stale 实例——不得只有首个规则免于全量拦截。
+	again, err := sharedGeoIPSearcher(path, "")
+	if err != nil {
+		t.Fatalf("后续 Provision 也必须拿到 fail-stale 实例: %v", err)
 	}
+	if again != first {
+		t.Fatal("后续 Provision 拿到的是另一个实例（同一配置内部行为不一致）")
+	}
+
+	// And 文件以「同 modtime+size」形态恢复后必须重建（不复用旧 inode）
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("restore xdb: %v", err)
+	}
+	if err := os.Chtimes(path, origStat.ModTime(), origStat.ModTime()); err != nil {
+		t.Fatalf("restore mtime: %v", err)
+	}
+	restored, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.ModTime().Equal(origStat.ModTime()) || restored.Size() != origStat.Size() {
+		t.Fatalf("夹具形态不一致: %v/%d vs %v/%d", restored.ModTime(), restored.Size(), origStat.ModTime(), origStat.Size())
+	}
+	second, err := sharedGeoIPSearcher(path, "")
+	if err != nil {
+		t.Fatalf("rebuild after restore: %v", err)
+	}
+	if second == first {
+		t.Fatal("标记为必须重建的条目不得复用旧实例（同 mtime+size 重铺形态）")
+	}
+	if region, err := second.Search("114.114.114.114"); err != nil || region == "" {
+		t.Fatalf("rebuilt instance must serve lookups: region=%q err=%v", region, err)
+	}
+	geoipSharedMu.Lock()
+	cached = geoipSharedSearchers[path+"\x00"]
+	geoipSharedMu.Unlock()
+	if cached == nil || cached.needsRebuild {
+		t.Fatalf("重建成功后必须清除「必须重建」标记: %#v", cached)
+	}
+
+	// And 被替换的旧实例在延迟窗口过后被关闭（换库路径，fd/vIndex 收敛）
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := first.Search("114.114.114.114"); err != nil {
 			break // pool closed
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("被驱逐旧实例在延迟窗口后仍未被 Close")
+			t.Fatal("被替换旧实例在延迟窗口后仍未被 Close")
 		}
 		time.Sleep(50 * time.Millisecond)
-	}
-
-	// And 文件恢复后重建全新实例（不复用被驱逐的旧实例）
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatalf("restore xdb: %v", err)
-	}
-	second, err := sharedGeoIPSearcher(path)
-	if err != nil {
-		t.Fatalf("rebuild after restore: %v", err)
-	}
-	if second == first {
-		t.Fatal("evicted entry must not be re-served; expect a freshly built instance")
-	}
-	if region, err := second.Search("114.114.114.114"); err != nil || region == "" {
-		t.Fatalf("rebuilt instance must serve lookups: region=%q err=%v", region, err)
 	}
 }
 
@@ -785,7 +840,7 @@ func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
 		geoipSharedMu.Unlock()
 	})
 
-	first, err := sharedGeoIPSearcher(path)
+	first, err := sharedGeoIPSearcher(path, "")
 	if err != nil {
 		t.Fatalf("seed cache: %v", err)
 	}
@@ -800,7 +855,7 @@ func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
 	if err := os.Rename(badPath, path); err != nil {
 		t.Fatal(err)
 	}
-	second, err := sharedGeoIPSearcher(path)
+	second, err := sharedGeoIPSearcher(path, "")
 	if err != nil {
 		t.Fatalf("rebuild failure must fail stale (nil error), got %v", err)
 	}
@@ -812,7 +867,7 @@ func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
 	}
 	// 缓存条目保留（文件修复后下一次 stat 变化仍会触发重建）。
 	geoipSharedMu.Lock()
-	cached := geoipSharedSearchers[path]
+	cached := geoipSharedSearchers[path+"\x00"]
 	geoipSharedMu.Unlock()
 	if cached == nil || cached.searcher != first {
 		t.Fatal("rebuild failure must not evict the cached entry")

@@ -2,7 +2,7 @@ package handlers
 
 import "testing"
 
-// 第 58 轮（用户裁定）：安全总览攻击类型分布支持按阶段展示（默认）——
+// 历史（用户裁定）：安全总览攻击类型分布支持按阶段展示（默认）——
 // stageCategorizeAttack 将事件归入与触发阶段一致的五桶：
 //
 //	信任名单 / IP 访问控制（黑白名单+地域+威胁库）/ WAF（CRS+自定义）/
@@ -16,13 +16,13 @@ func TestStageCategorizeAttack_buckets(t *testing.T) {
 		ruleMsg       string
 		want          string
 	}{
-		// 信任名单：id 3/12
+		// 信任名单：id 3/12 + id 5（绕过模式占位的同族 DetectionOnly 规则）
 		{"trust id 3", "3", "", "信任名单"},
+		{"trust bypass id 5", "5", "", "信任名单"},
 		{"trust id 12", "12", "", "信任名单"},
-		// IP 访问控制：黑白名单（2/4/5/7）+ 地域（8/8xxxxx）+ 威胁库（14）
+		// IP 访问控制：黑白名单（2/4/7）+ 地域（8/8xxxxx）+ 威胁库（14）
 		{"acl blacklist id 2", "2", "", "IP 访问控制"},
 		{"acl blacklist id 4", "4", "", "IP 访问控制"},
-		{"acl allow id 5", "5", "", "IP 访问控制"},
 		{"acl allow id 7", "7", "", "IP 访问控制"},
 		{"geo legacy id 8", "8", "", "IP 访问控制"},
 		{"geo precheck id", "800123", "", "IP 访问控制"},
@@ -38,10 +38,13 @@ func TestStageCategorizeAttack_buckets(t *testing.T) {
 		{"crs synthetic custom", "1000001", "旧版规则", "WAF"},
 		// 请求体异常：id 11
 		{"body id 11", "11", "", "请求体异常"},
+		// 限流：429 精确（与事件列表「限流」族/筛选/限流卡片同口径）
+		{"ratelimit 429", "429", "", "限流"},
+		{"ratelimit 429 with msg", "429", "请求过于频繁", "限流"},
 		// 其他
 		{"empty", "", "", "其他"},
-		{"unmatched", "123456", "something else", "其他"},
-		// SEC-R1（第 69 轮）收敛前语义钉：9 开头 CRS 段（含未列名前缀）整段归
+		{"custom rule six-digit id", "123456", "something else", "WAF"},
+		// 收敛前语义钉：9 开头 CRS 段（含未列名前缀）整段归
 		// WAF——即使 msg 命中 IP 黑白名单门也不 fall-through（概览视图相反，
 		// 见 TestCategorizeAttack_familyMapping 同 ID 用例）。
 		{"unlisted crs id with acl msg", "960100", "命中 IP 黑名单", "WAF"},

@@ -6,7 +6,7 @@
         <stop offset="1" stop-color="#2563eb" />
       </linearGradient>
     </defs>
-    <rect width="40" height="40" rx="9" :fill="`url(#${gradId})`" />
+    <rect width="40" height="40" rx="0" :fill="`url(#${gradId})`" />
     <g stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" fill="none" opacity="0.95">
       <path d="M12 20 C 17 20, 21 13, 26 11.5" />
       <path d="M12 20 L26 20" />
@@ -24,7 +24,7 @@ import { useId } from 'vue'
 
 withDefaults(defineProps<{ size?: number | string }>(), { size: 40 })
 
-// P5-23：字面量 id 在多实例页（如登录页+布局）会重复，useId 生成实例唯一 id
+// 字面量 id 在多实例页（如登录页+布局）会重复，useId 生成实例唯一 id
 const gradId = useId()
 </script>
 

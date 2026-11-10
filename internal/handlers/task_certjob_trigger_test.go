@@ -24,6 +24,8 @@ func TestTriggerSystemTask_certJobRowRetriesFailedJob(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
 		VALUES ('lb_trig','trig','http','trig.example.test',8080,1,1,'acme_dns');
@@ -47,11 +49,14 @@ func TestTriggerSystemTask_certJobRowRetriesFailedJob(t *testing.T) {
 	}
 }
 
-// Given：disabled 证书任务。When：触发。Then：429（退役任务不可重试——复用重试门）。
+// Given：disabled 证书任务。When：触发。Then：409（退役任务永久不可重试——复用重试门；
+// 永久条件不得用 429，SDK/前端会按限流语义退避轮询）。
 func TestTriggerSystemTask_certJobRowDisabledRejected(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
 		VALUES ('lb_dis','dis','http','dis.example.test',8080,1,1,'acme_dns');
@@ -64,7 +69,14 @@ func TestTriggerSystemTask_certJobRowDisabledRejected(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/system/tasks/cert-job:1/trigger", nil))
 
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("status=%d body=%s, want 429（已退役证书任务不能重试）", response.Code, response.Body.String())
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（已退役证书任务不能重试）", response.Code, response.Body.String())
+	}
+	// 与日志/历史入口共用 TrimSpace+ParseInt 口径：空白归一后的同一 ID
+	// 必须到达业务重试门，而不是在解析层提前 400。
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/system/tasks/cert-job:%201/trigger", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("trimmed ID status=%d body=%s, want 409", response.Code, response.Body.String())
 	}
 }

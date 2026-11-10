@@ -2,12 +2,15 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	sqlitedriver "github.com/glebarez/go-sqlite"
 
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
@@ -24,13 +28,13 @@ import (
 func TestListRules_uses_schema_defaults_when_nullable_columns_are_NULL(t *testing.T) {
 	// Given
 	handler := newRuleFeatureTestHandlers(t)
-	// Round 36 F-A: lb_rules.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
+	// lb_rules.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
 	simulateLegacyNullableLbRules(t, db.DB)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enabled)
 		VALUES ('lb_nulls','nullable','http',8080,NULL,NULL,NULL,NULL,NULL,NULL)`); err != nil {
 		t.Fatalf("seed nullable rule: %v", err)
 	}
-	// Round 35 F-1: upstreams.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
+	// upstreams.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
 	simulateLegacyNullableUpstreams(t, db.DB)
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_nulls','127.0.0.1',9000,1,NULL,'http')`); err != nil {
 		t.Fatalf("seed nullable upstream: %v", err)
@@ -43,10 +47,10 @@ func TestListRules_uses_schema_defaults_when_nullable_columns_are_NULL(t *testin
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules", nil))
 
 	// Then
-	// 注：health_check_timeout 的 NULL 回退原钉 5（schema 旧默认口径），LB-04
+	// 注：health_check_timeout 的 NULL 回退原钉 5（schema 旧默认口径），
 	//（用户裁定）已将读取/生成/渲染默认统一为 2（与写侧 CreateRule/校验副本
 	// 一致，见 rule_features.go lbRuleListColumns 与 services/caddy.go 渲染兜底）；
-	// 本期望随新契约更新，与 TestListRules_defaults_NULL_health_check_timeout_to_2 同口径。
+	// 本用例的期望值即该契约的唯一断言点（此前的交叉引用指向已不存在的用例，已删）。
 	if response.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -61,6 +65,8 @@ func TestUpdateRule_rejects_duplicate_domain_after_merging_existing_protocol(t *
 	// Given
 	handler := newRuleFeatureTestHandlers(t)
 	seedAuditRule(t, "lb_existing", "existing", "duplicate.example.test", 8080, true, "manual", false)
+	// 占用方须有启用上游（零启用上游规则不产生 host 路由、不占位）。
+	seedAuditUpstream(t, "lb_existing")
 	seedAuditRule(t, "lb_target", "target", "old.example.test", 8080, true, "manual", false)
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_target','127.0.0.1',9000,1,1,'http')`); err != nil {
 		t.Fatalf("seed target upstream: %v", err)
@@ -94,7 +100,7 @@ func TestRuleWrites_reject_overlapping_domain_lists(t *testing.T) {
 		path  string
 		body  string
 	}{
-		{name: "create", mount: func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) }, path: "/rules", body: `{"name":"overlap","protocol":"http","domain":"a.example.test, b.example.test","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`},
+		{name: "create", mount: func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) }, path: "/rules", body: `{"name":"overlap","protocol":"http","domain":"a.example.test, b.example.test","listen_port":8080,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`},
 		{name: "update", mount: func(router *gin.Engine, handler *Handlers) { router.PUT("/rules/:caddy_id", handler.UpdateRule) }, path: "/rules/lb_target", body: `{"domain":"a.example.test, b.example.test"}`},
 	}
 	for _, test := range tests {
@@ -102,6 +108,8 @@ func TestRuleWrites_reject_overlapping_domain_lists(t *testing.T) {
 			// Given
 			handler := newRuleFeatureTestHandlers(t)
 			seedAuditRule(t, "lb_existing", "existing", "b.example.test,c.example.test", 8080, true, "manual", false)
+			// 占用方须有启用上游（零启用上游的规则不产生 host 路由、不占位）。
+			seedAuditUpstream(t, "lb_existing")
 			if test.name == "update" {
 				seedAuditRule(t, "lb_target", "target", "old.example.test", 8080, true, "manual", false)
 				seedAuditUpstream(t, "lb_target")
@@ -147,7 +155,7 @@ func TestCreateRule_succeeds_when_domain_owned_by_disabled_rule(t *testing.T) {
 	}
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	body := strings.NewReader(`{"name":"new-rule","protocol":"http","domain":"occupied.example.test","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`)
+	body := strings.NewReader(`{"name":"new-rule","protocol":"http","domain":"occupied.example.test","listen_port":8080,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`)
 	request := httptest.NewRequest(http.MethodPost, "/rules", body)
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -258,7 +266,7 @@ func TestDeleteRule_removes_security_policy_bindings(t *testing.T) {
 
 func TestCreateRule_removes_rule_and_restores_Caddy_when_ACME_queue_is_unavailable(t *testing.T) {
 	// Given
-	handler, loadCalls, _ := newAuditRuleHandlers(t, 0)
+	handler, loadCalls, lastLoad := newAuditRuleHandlers(t, 0)
 	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('dns','dnspod','{"token":"x"}',1)`)
 	if err != nil {
 		t.Fatalf("seed certificate config: %v", err)
@@ -269,7 +277,7 @@ func TestCreateRule_removes_rule_and_restores_Caddy_when_ACME_queue_is_unavailab
 	}
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(fmt.Sprintf(`{"name":"acme-create","protocol":"http","domain":"create.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"ca_provider_id":1,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(fmt.Sprintf(`{"name":"acme-create","protocol":"http","domain":"create.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"ca_provider_id":1,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -284,14 +292,37 @@ func TestCreateRule_removes_rule_and_restores_Caddy_when_ACME_queue_is_unavailab
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE domain='create.example.test'").Scan(&count); err != nil {
 		t.Fatalf("read created rule: %v", err)
 	}
-	if count != 0 || loadCalls.Load() == 0 {
-		t.Fatalf("rule count=%d Caddy loads=%d, want zero change compensation", count, loadCalls.Load())
+	if count != 0 {
+		t.Fatalf("rule count=%d, want zero change compensation", count)
+	}
+	// 补偿必须是「候选已应用 → 回弹创建前快照」两段，而不是在应用前就早退：
+	// 至少 2 次 /load，且最后一次载荷是捕获的原运行配置（"old":true）。
+	if loadCalls.Load() < 2 {
+		t.Fatalf("Caddy loads=%d, want ≥2（候选应用 + 快照回弹）", loadCalls.Load())
+	}
+	if !strings.Contains(*lastLoad, `"old":true`) {
+		t.Fatalf("最后一次 /load 未回弹创建前快照: %.300s", *lastLoad)
+	}
+	// 子表不得残留：规则行随事务回滚消失后，upstreams/path_rules/
+	// security_policy_bindings/cert_jobs 的孤儿行会让导出/快照放大死数据。
+	for _, table := range []string{"upstreams", "path_rules", "security_policy_bindings", "cert_jobs"} {
+		var rows int
+		column := "rule_id"
+		if table == "security_policy_bindings" {
+			column = "rule_caddy_id"
+		}
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table + " WHERE COALESCE(" + column + ",'') NOT IN (SELECT caddy_id FROM lb_rules)").Scan(&rows); err != nil {
+			t.Fatalf("count orphan %s: %v", table, err)
+		}
+		if rows != 0 {
+			t.Fatalf("%s 残留孤儿行=%d, want 0（创建补偿必须连同子表一起回滚）", table, rows)
+		}
 	}
 }
 
 func TestEnableRule_restores_disabled_state_when_ACME_queue_is_unavailable(t *testing.T) {
 	// Given
-	handler, loadCalls, _ := newAuditRuleHandlers(t, 0)
+	handler, loadCalls, lastLoad := newAuditRuleHandlers(t, 0)
 	seedAuditRule(t, "lb_enable_acme", "enable", "enable.example.test", 8080, false, "acme_dns", true)
 	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=? WHERE caddy_id='lb_enable_acme'", seedR52CertificateConfig(t)); err != nil {
 		t.Fatalf("bind certificate config: %v", err)
@@ -311,8 +342,19 @@ func TestEnableRule_restores_disabled_state_when_ACME_queue_is_unavailable(t *te
 	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_enable_acme'").Scan(&enabled); err != nil {
 		t.Fatalf("read enabled state: %v", err)
 	}
-	if enabled || loadCalls.Load() == 0 {
-		t.Fatalf("enabled=%v Caddy loads=%d, want disabled with candidate apply", enabled, loadCalls.Load())
+	if enabled {
+		t.Fatal("enable write remained after failed compensation")
+	}
+	// 补偿形态：候选（含启用路由）已应用 → 回弹请求前快照；至少 2 次 /load。
+	if loadCalls.Load() < 2 {
+		t.Fatalf("Caddy loads=%d, want ≥2（候选应用 + 快照回弹）", loadCalls.Load())
+	}
+	if !strings.Contains(*lastLoad, `"old":true`) {
+		t.Fatalf("最后一次 /load 未回弹请求前快照: %.300s", *lastLoad)
+	}
+	// 禁用规则不得继续被服务：恢复载荷里不得出现该规则路由。
+	if strings.Contains(*lastLoad, "lb_enable_acme") {
+		t.Fatalf("恢复载荷仍含 lb_enable_acme 路由（禁用规则继续被服务）: %.300s", *lastLoad)
 	}
 }
 
@@ -329,6 +371,8 @@ func TestEnableRule_restores_cert_job_fields_when_requeue_fails(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	services.GetCAQueueManager().Stop()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
@@ -337,8 +381,9 @@ func TestEnableRule_restores_cert_job_fields_when_requeue_fails(t *testing.T) {
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_restore/enable", nil))
 
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("enable status=%d body=%s, want 500", response.Code, response.Body.String())
+	// 队列未运行（paused/stopped）→ 409 点名可操作原因，不再折成 500。
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "证书签发任务已停止") {
+		t.Fatalf("enable status=%d body=%s, want 409 queue-inactive", response.Code, response.Body.String())
 	}
 	var enabled bool
 	var status, message, errorCode string
@@ -414,19 +459,19 @@ func TestUpdateRule_reissues_when_default_CA_differs_from_latest_job_provider(t 
 		VALUES ('lb_default_ca_switch','switch.example.test','issued',?,?,datetime('now','+90 days'),?)`, certPEM, keyPEM, oldProviderID); err != nil {
 		t.Fatalf("seed historical certificate job: %v", err)
 	}
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
-	oldCreate := createOrRequeueCertJob
+	oldCreate := createOrRequeueCertJobVerified
 	enqueuedProvider := make(chan int, 1)
-	createOrRequeueCertJob = func(_ string, _ string, providerID int, _ *services.CAQueueManager) (int, error) {
+	createOrRequeueCertJobVerified = func(_ string, _ string, providerID int, _ *services.CAQueueManager) (int, bool, error) {
 		enqueuedProvider <- providerID
-		return 77, nil
+		return 77, true, nil
 	}
-	t.Cleanup(func() { createOrRequeueCertJob = oldCreate })
+	t.Cleanup(func() { createOrRequeueCertJobVerified = oldCreate })
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
 	request := httptest.NewRequest(http.MethodPut, "/rules/lb_default_ca_switch", strings.NewReader(`{"name":"after"}`))
@@ -460,6 +505,8 @@ func TestDeleteRule_returns_timeout_and_preserves_rule_when_worker_does_not_exit
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().PauseAndDrain()
 	oldTimeout := cancelRuleJobsTimeout
@@ -515,6 +562,58 @@ func TestDeleteRule_returns_timeout_and_preserves_rule_when_worker_does_not_exit
 	deadline = time.Now().Add(2 * time.Second)
 	for services.GetCAQueueManager().IsRuleBlocked("lb_delete_timeout") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+	if services.GetCAQueueManager().IsRuleBlocked("lb_delete_timeout") {
+		t.Fatal("rule block lease was not released after cancellation compensation")
+	}
+}
+
+func TestDeleteRule_retiredCertificateExecutionPreservesRuleAndCertFiles(t *testing.T) {
+	// Given：规则证书文件与一条退役队列中的滞行签发执行。
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_delete_retired", "delete-retired", "delete-retired.example.test", 8080, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_delete_retired")
+	if _, err := db.DB.Exec("INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (42,'lb_delete_retired','delete-retired.example.test','creating_order')"); err != nil {
+		t.Fatalf("seed certificate job: %v", err)
+	}
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	if err := services.WriteCertFiles("lb_delete_retired", "cert-material", "key-material"); err != nil {
+		t.Fatalf("write certificate pair: %v", err)
+	}
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	done := services.GetCAQueueManager().MarkRetiredJobRunningForTest("lb_delete_retired", 42)
+	t.Cleanup(func() { close(done) })
+	router := gin.New()
+	router.DELETE("/rules/:caddy_id", handler.DeleteRule)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/rules/lb_delete_retired", nil))
+
+	// Then：退役执行仍可见时拒绝删除，DB 行与私钥文件均不得被清理。
+	if response.Code != http.StatusConflict {
+		t.Errorf("delete status=%d body=%s, want 409 while retired execution is active", response.Code, response.Body.String())
+	}
+	var ruleCount, jobCount int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_delete_retired'").Scan(&ruleCount); err != nil {
+		t.Fatalf("count preserved rule: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_delete_retired'").Scan(&jobCount); err != nil {
+		t.Fatalf("count preserved jobs: %v", err)
+	}
+	if ruleCount != 1 || jobCount != 1 {
+		t.Fatalf("preserved rows rule=%d job=%d, want 1/1", ruleCount, jobCount)
+	}
+	certPath, keyPath := services.CertFilePaths("lb_delete_retired")
+	for path, want := range map[string]string{certPath: "cert-material", keyPath: "key-material"} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Errorf("certificate file %s=(%q,%v), want preserved %q", path, got, err, want)
+		}
 	}
 }
 
@@ -748,7 +847,7 @@ func TestRuleToggle_restores_original_state_when_Caddy_apply_fails(t *testing.T)
 			// When
 			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, test.path, nil))
 
-			// Then：配置被 Caddy 拒绝 → 400（裁定 2026-09-07 D2 统一映射）
+			// Then：配置被 Caddy 拒绝 → 400（裁定 2026-09-07 统一映射）
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("toggle status=%d body=%s", response.Code, response.Body.String())
 			}
@@ -774,12 +873,11 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 		assert func(*testing.T)
 	}{
 		{
-			name: "create", method: http.MethodPost, path: "/rules", body: `{"name":"candidate","protocol":"tcp","listen_port":19001,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
-			seed: func(t *testing.T) {
-				if _, err := db.DB.Exec(`CREATE TRIGGER block_create_compensation BEFORE DELETE ON lb_rules WHEN OLD.name='candidate' BEGIN SELECT RAISE(ABORT,'delete blocked'); END`); err != nil {
-					t.Fatalf("create compensation blocker: %v", err)
-				}
-			},
+			name: "create", method: http.MethodPost, path: "/rules", body: `{"name":"candidate","protocol":"tcp","listen_port":19001,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
+			// 此处原有补偿阻断触发器——apply 失败走 defer tx.Rollback
+			// （删除由回滚完成，不执行 removeCreatedRule），触发器永不触达。删除
+			// 死夹具；回滚终态断言不变。
+			seed:  func(*testing.T) {},
 			mount: func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) },
 			assert: func(t *testing.T) {
 				var count int
@@ -798,8 +896,8 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 				if _, err := db.DB.Exec("INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tx_update','127.0.0.1',9000,1,1,'tcp')"); err != nil {
 					t.Fatalf("seed TCP upstream: %v", err)
 				}
-				if _, err := db.DB.Exec(`UPDATE lb_rules SET protocol='tcp' WHERE caddy_id='lb_tx_update'; CREATE TRIGGER block_update_compensation BEFORE DELETE ON lb_rules WHEN OLD.name='candidate' BEGIN SELECT RAISE(ABORT,'delete blocked'); END`); err != nil {
-					t.Fatalf("prepare update compensation blocker: %v", err)
+				if _, err := db.DB.Exec(`UPDATE lb_rules SET protocol='tcp' WHERE caddy_id='lb_tx_update'`); err != nil {
+					t.Fatalf("prepare update rule: %v", err)
 				}
 			},
 			mount: func(router *gin.Engine, handler *Handlers) { router.PUT("/rules/:caddy_id", handler.UpdateRule) },
@@ -818,9 +916,8 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			seed: func(t *testing.T) {
 				seedAuditRule(t, "lb_tx_enable", "enable", "enable-tx.example.test", 8080, false, "manual", false)
 				seedAuditUpstream(t, "lb_tx_enable")
-				if _, err := db.DB.Exec(`CREATE TRIGGER block_enable_compensation BEFORE UPDATE ON lb_rules WHEN OLD.enabled=1 AND NEW.enabled=0 BEGIN SELECT RAISE(ABORT,'restore blocked'); END`); err != nil {
-					t.Fatalf("create enable compensation blocker: %v", err)
-				}
+				// 补偿发生在 commit 之后的失败分支，apply 失败在
+				// commit 前回滚——此触发器永不触达，删除死夹具。
 			},
 			mount: func(router *gin.Engine, handler *Handlers) {
 				router.POST("/rules/:caddy_id/enable", handler.EnableRule)
@@ -840,9 +937,7 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			seed: func(t *testing.T) {
 				seedAuditRule(t, "lb_tx_disable", "disable", "disable-tx.example.test", 8080, true, "manual", false)
 				seedAuditUpstream(t, "lb_tx_disable")
-				if _, err := db.DB.Exec(`CREATE TRIGGER block_disable_compensation BEFORE UPDATE ON lb_rules WHEN OLD.enabled=0 AND NEW.enabled=1 BEGIN SELECT RAISE(ABORT,'restore blocked'); END`); err != nil {
-					t.Fatalf("create disable compensation blocker: %v", err)
-				}
+				// 同上——补偿分支不可达，删除死夹具。
 			},
 			mount: func(router *gin.Engine, handler *Handlers) {
 				router.POST("/rules/:caddy_id/disable", handler.DisableRule)
@@ -862,10 +957,12 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 		t.Run(test.name, func(t *testing.T) {
 			// Given
 			var handler *Handlers
+			var loads *atomic.Int32
 			if test.name == "create" || test.name == "update" {
-				handler = newUpdateAuditRuleHandlers(t, "lb_tx_update", 1, false).handler
+				harness := newUpdateAuditRuleHandlers(t, "lb_tx_update", 1, false)
+				handler, loads = harness.handler, harness.loadCalls
 			} else {
-				handler, _, _ = newAuditRuleHandlers(t, 1)
+				handler, loads, _ = newAuditRuleHandlers(t, 1)
 			}
 			test.seed(t)
 			router := gin.New()
@@ -880,6 +977,11 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			// Then
 			if response.Code == http.StatusOK || response.Code == http.StatusCreated {
 				t.Fatalf("write unexpectedly succeeded: %s", response.Body.String())
+			}
+			// 必须真的走到 apply 才失败——0 次 /load 意味着失败发生在校验/
+			// 渲染阶段，回滚断言就失去了「应用到运行配置后回滚」的语义。
+			if loads.Load() == 0 {
+				t.Fatalf("Caddy loads=0, want ≥1（证明已尝试 apply 而非校验阶段早退）body=%s", response.Body.String())
 			}
 			test.assert(t)
 		})
@@ -919,9 +1021,7 @@ func TestDisableRule_returns_error_instead_of_panicking_when_cert_job_update_fai
 
 func TestUpdateRule_preserves_omitted_boolean_fields(t *testing.T) {
 	// Given
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_bool_keep", 0, false)
 	handler, currentConfig := harness.handler, harness.currentConfig
 	seedAuditRule(t, "lb_bool_keep", "before", "bool-keep.example.test", 8080, true, "manual", true)
@@ -929,7 +1029,7 @@ func TestUpdateRule_preserves_omitted_boolean_fields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate certificate: %v", err)
 	}
-	if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=?, dynamic_dns=1,enable_dns_server=1,enable_active_health_check=1,tcp_proxy_protocol=1,tls_http_redirect=1,enable_compress=1,log_enabled=1 WHERE caddy_id='lb_bool_keep'`, certPEM, keyPEM); err != nil {
+	if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=?, dynamic_dns=1,enable_dns_server=1,enable_active_health_check=1,tls_http_redirect=1,enable_compress=1,log_enabled=1 WHERE caddy_id='lb_bool_keep'`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed boolean fields: %v", err)
 	}
 	seedAuditUpstream(t, "lb_bool_keep")
@@ -946,13 +1046,13 @@ func TestUpdateRule_preserves_omitted_boolean_fields(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
 	}
-	var dynamicDNS, dnsServer, activeHealth, proxyProtocol, enableTLS, redirect, compress, enabled, logEnabled bool
-	if err := db.DB.QueryRow(`SELECT dynamic_dns,enable_dns_server,enable_active_health_check,tcp_proxy_protocol,enable_tls,tls_http_redirect,enable_compress,enabled,log_enabled FROM lb_rules WHERE caddy_id='lb_bool_keep'`).Scan(
-		&dynamicDNS, &dnsServer, &activeHealth, &proxyProtocol, &enableTLS, &redirect, &compress, &enabled, &logEnabled); err != nil {
+	var dynamicDNS, dnsServer, activeHealth, enableTLS, redirect, compress, enabled, logEnabled bool
+	if err := db.DB.QueryRow(`SELECT dynamic_dns,enable_dns_server,enable_active_health_check,enable_tls,tls_http_redirect,enable_compress,enabled,log_enabled FROM lb_rules WHERE caddy_id='lb_bool_keep'`).Scan(
+		&dynamicDNS, &dnsServer, &activeHealth, &enableTLS, &redirect, &compress, &enabled, &logEnabled); err != nil {
 		t.Fatalf("read booleans: %v", err)
 	}
-	if !dynamicDNS || !dnsServer || !activeHealth || !proxyProtocol || !enableTLS || !redirect || !compress || !enabled || !logEnabled {
-		t.Fatalf("omitted booleans changed: dynamic_dns=%v dns_server=%v active=%v proxy=%v tls=%v redirect=%v compress=%v enabled=%v log=%v", dynamicDNS, dnsServer, activeHealth, proxyProtocol, enableTLS, redirect, compress, enabled, logEnabled)
+	if !dynamicDNS || !dnsServer || !activeHealth || !enableTLS || !redirect || !compress || !enabled || !logEnabled {
+		t.Fatalf("omitted booleans changed: dynamic_dns=%v dns_server=%v active=%v tls=%v redirect=%v compress=%v enabled=%v log=%v", dynamicDNS, dnsServer, activeHealth, enableTLS, redirect, compress, enabled, logEnabled)
 	}
 	if !strings.Contains(currentConfig(), `"lb_bool_keep"`) {
 		t.Fatalf("Caddy config lost updated route: %s", currentConfig())
@@ -1063,52 +1163,192 @@ func TestUpdateRule_restores_database_and_Caddy_when_ACME_enqueue_fails(t *testi
 	}
 }
 
-func TestUpdateRule_cancels_job_before_restore_when_create_returns_jobID_and_error(t *testing.T) {
-	// Given
-	harness := newUpdateAuditRuleHandlers(t, "lb_acme_cancel", 0, false)
-	seedAuditRule(t, "lb_acme_cancel", "before", "cancel-old.example.test", 8080, true, "acme_dns", true)
-	seedAuditUpstream(t, "lb_acme_cancel")
-	var providerID int
-	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
-		t.Fatalf("read CA provider: %v", err)
+func TestUpdateRule_compensationCancelsOnlyJobChangedByCurrentAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		changed    bool
+		wantCancel bool
+	}{
+		{name: "existing job returned with error", changed: false, wantCancel: false},
+		{name: "job changed by current attempt", changed: true, wantCancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given：补偿入口拿到 jobID+error，但只有 changed=true 才属于本次写入。
+			harness := newUpdateAuditRuleHandlers(t, "lb_acme_cancel", 0, false)
+			seedAuditRule(t, "lb_acme_cancel", "before", "cancel-old.example.test", 8080, true, "acme_dns", true)
+			seedAuditUpstream(t, "lb_acme_cancel")
+			var providerID int
+			if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+				t.Fatalf("read CA provider: %v", err)
+			}
+			if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_acme_cancel'", seedR52CertificateConfig(t), providerID); err != nil {
+				t.Fatalf("set rule CA provider: %v", err)
+			}
+			services.ResetCAQueueManagerForTest()
+			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			services.GetCAQueueManager().Start()
+			startCertQueueDispatchForTest(t)
+			t.Cleanup(services.ResetCAQueueManagerForTest)
+			oldCreate := createOrRequeueCertJobVerified
+			oldCancel := cancelCertJob
+			createOrRequeueCertJobVerified = func(string, string, int, *services.CAQueueManager) (int, bool, error) {
+				return 77, tc.changed, errors.New("enqueue failed")
+			}
+			cancelled := make(chan int, 1)
+			cancelCertJob = func(jobID int) { cancelled <- jobID }
+			t.Cleanup(func() {
+				createOrRequeueCertJobVerified = oldCreate
+				cancelCertJob = oldCancel
+			})
+			router := gin.New()
+			router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
+			request := httptest.NewRequest(http.MethodPut, "/rules/lb_acme_cancel", strings.NewReader(`{"domain":"cancel-new.example.test"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			// When
+			router.ServeHTTP(response, request)
+
+			// Then
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			select {
+			case jobID := <-cancelled:
+				if !tc.wantCancel {
+					t.Fatalf("cancelled pre-existing job %d after changed=false error", jobID)
+				}
+				if jobID != 77 {
+					t.Fatalf("cancelled job=%d, want 77", jobID)
+				}
+			default:
+				if tc.wantCancel {
+					t.Fatal("job changed by current attempt was not cancelled before restore")
+				}
+			}
+		})
 	}
-	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_acme_cancel'", seedR52CertificateConfig(t), providerID); err != nil {
-		t.Fatalf("set rule CA provider: %v", err)
+}
+
+func TestEnableRule_rejectsExistingJobThatWasNotQueued(t *testing.T) {
+	// Given：任务处于 creating_order 且不在活动队列中；规则切换到另一 CA，
+	// EnableRule 会被强制到 Retry 分支，但 upsert 的状态白名单不会迁移该行。
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_enable_notqueued", "enable-notqueued", "enable-notqueued.example.test", 8080, false, "acme_dns", true)
+	seedAuditUpstream(t, "lb_enable_notqueued")
+	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'test-dns','dnspod','{}',1)`); err != nil {
+		t.Fatalf("seed certificate config: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO ca_providers (id,name,provider,directory_url,enabled) VALUES (2,'switched','letsencrypt','https://acme.test/directory',1)`); err != nil {
+		t.Fatalf("seed switched CA provider: %v", err)
+	}
+	var originalProviderID int
+	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE id<>2 AND enabled=1 ORDER BY id LIMIT 1").Scan(&originalProviderID); err != nil {
+		t.Fatalf("read original CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=1,ca_provider_id=2 WHERE caddy_id='lb_enable_notqueued'"); err != nil {
+		t.Fatalf("bind switched provider: %v", err)
+	}
+	if _, err := db.DB.Exec("INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES (77,'lb_enable_notqueued','enable-notqueued.example.test','creating_order',?)", originalProviderID); err != nil {
+		t.Fatalf("seed stranded job: %v", err)
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
-	oldCreate := createOrRequeueCertJob
-	oldCancel := cancelCertJob
-	createOrRequeueCertJob = func(string, string, int, *services.CAQueueManager) (int, error) {
-		return 77, errors.New("enqueue failed")
-	}
-	cancelled := make(chan int, 1)
-	cancelCertJob = func(jobID int) { cancelled <- jobID }
-	t.Cleanup(func() {
-		createOrRequeueCertJob = oldCreate
-		cancelCertJob = oldCancel
-	})
 	router := gin.New()
-	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
-	request := httptest.NewRequest(http.MethodPut, "/rules/lb_acme_cancel", strings.NewReader(`{"domain":"cancel-new.example.test"}`))
-	request.Header.Set("Content-Type", "application/json")
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
 	response := httptest.NewRecorder()
 
 	// When
-	router.ServeHTTP(response, request)
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_notqueued/enable", nil))
 
-	// Then
+	// Then：未真正入队不得返回成功；补偿恢复规则禁用与任务原状。
 	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		t.Fatalf("status=%d body=%s, want failure when existing job was not queued", response.Code, response.Body.String())
 	}
-	select {
-	case jobID := <-cancelled:
-		if jobID != 77 {
-			t.Fatalf("cancelled job=%d, want 77", jobID)
-		}
-	default:
-		t.Fatal("job was not cancelled before restore returned")
+	var enabled int
+	var jobStatus string
+	if err := db.DB.QueryRow("SELECT IIF(enabled IN ('1',1),1,0) FROM lb_rules WHERE caddy_id='lb_enable_notqueued'").Scan(&enabled); err != nil {
+		t.Fatalf("read restored rule: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=77").Scan(&jobStatus); err != nil {
+		t.Fatalf("read restored job: %v", err)
+	}
+	if enabled != 0 || jobStatus != "creating_order" {
+		t.Fatalf("restored enabled=%d job=%q, want disabled and original status", enabled, jobStatus)
+	}
+}
+
+func TestEnableRule_compensationCancelsOnlyJobChangedByCurrentAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		changed    bool
+		wantCancel bool
+	}{
+		{name: "existing job returned with error", changed: false, wantCancel: false},
+		{name: "job changed by current attempt", changed: true, wantCancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given：禁用规则持有一条 failed 任务，EnableRule 会走 Retry 入队。
+			handler, _, _ := newAuditRuleHandlers(t, 0)
+			seedAuditRule(t, "lb_enable_cancel", "enable-cancel", "enable-cancel.example.test", 8080, false, "acme_dns", true)
+			seedAuditUpstream(t, "lb_enable_cancel")
+			if _, err := db.DB.Exec(`INSERT OR REPLACE INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'test-dns','dnspod','{}',1)`); err != nil {
+				t.Fatalf("seed certificate config: %v", err)
+			}
+			var providerID int
+			if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+				t.Fatalf("read CA provider: %v", err)
+			}
+			if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=1,ca_provider_id=? WHERE caddy_id='lb_enable_cancel'", providerID); err != nil {
+				t.Fatalf("bind ACME provider: %v", err)
+			}
+			if _, err := db.DB.Exec("INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES (77,'lb_enable_cancel','enable-cancel.example.test','failed',?)", providerID); err != nil {
+				t.Fatalf("seed failed certificate job: %v", err)
+			}
+			services.ResetCAQueueManagerForTest()
+			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			services.GetCAQueueManager().Start()
+			startCertQueueDispatchForTest(t)
+			t.Cleanup(services.ResetCAQueueManagerForTest)
+			oldCreate := createOrRequeueCertJobVerified
+			oldCancel := cancelCertJob
+			createOrRequeueCertJobVerified = func(string, string, int, *services.CAQueueManager) (int, bool, error) {
+				return 77, tc.changed, errors.New("enqueue failed")
+			}
+			cancelled := make(chan int, 1)
+			cancelCertJob = func(jobID int) { cancelled <- jobID }
+			t.Cleanup(func() {
+				createOrRequeueCertJobVerified = oldCreate
+				cancelCertJob = oldCancel
+			})
+			router := gin.New()
+			router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+			response := httptest.NewRecorder()
+
+			// When
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_cancel/enable", nil))
+
+			// Then
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			select {
+			case jobID := <-cancelled:
+				if !tc.wantCancel {
+					t.Fatalf("cancelled pre-existing job %d after changed=false error", jobID)
+				}
+				if jobID != 77 {
+					t.Fatalf("cancelled job=%d, want 77", jobID)
+				}
+			default:
+				if tc.wantCancel {
+					t.Fatal("job changed by current attempt was not cancelled during enable compensation")
+				}
+			}
+		})
 	}
 }
 
@@ -1134,6 +1374,8 @@ func TestUpdateRule_migrates_cert_job_domain_inplace(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
@@ -1155,16 +1397,20 @@ func TestUpdateRule_migrates_cert_job_domain_inplace(t *testing.T) {
 	if ruleDomain != "new.example.test" {
 		t.Fatalf("rule domain=%q, want new.example.test", ruleDomain)
 	}
+	// 原谓词 `status NOT IN ('retired')` 是死条件——db 的
+	// CertJobStatuses 枚举无 retired 状态（全仓仅此测试出现该字面量），谓词
+	// 恒真，测试意图（只留一行）未被表达。改为按 rule_id 全量计数：本用例
+	// 目的就是「迁移就地进行、不留多余行」。
 	var jobCount int
-	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_acme_retire' AND status NOT IN ('retired')").Scan(&jobCount); err != nil {
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_acme_retire'").Scan(&jobCount); err != nil {
 		t.Fatalf("count cert jobs: %v", err)
 	}
 	if jobCount != 1 {
-		t.Fatalf("non-retired cert job count=%d, want 1 (domain should be migrated in-place)", jobCount)
+		t.Fatalf("cert job count=%d, want 1 (domain should be migrated in-place, no leftover rows)", jobCount)
 	}
 	var migratedJobID int
 	var migratedDomain string
-	if err := db.DB.QueryRow("SELECT id,domain FROM cert_jobs WHERE rule_id='lb_acme_retire' AND status NOT IN ('retired')").Scan(&migratedJobID, &migratedDomain); err != nil {
+	if err := db.DB.QueryRow("SELECT id,domain FROM cert_jobs WHERE rule_id='lb_acme_retire'").Scan(&migratedJobID, &migratedDomain); err != nil {
 		t.Fatalf("read migrated job: %v", err)
 	}
 	if migratedJobID != originalJobID {
@@ -1202,11 +1448,13 @@ func TestUpdateRule_serializes_snapshot_commit_apply_and_restore(t *testing.T) {
 		close(secondDone)
 	}()
 	harness.release()
-	<-firstDone
+	// 通道读取加超时——回归时这里会退化为包级测试超时，
+	// 丢失「卡在哪个同步点」的诊断。
+	waitTestChannel(t, firstDone, "首个 UpdateRule 完成")
 	// 第二个请求在第一个释放 caddyOpMu 后进入临界区（快照 GET 信号），
 	// 随后完成自己的应用——串行化 + 首个失败恢复快照的契约由下方断言锁定。
-	<-harness.secondValidation
-	<-secondDone
+	waitTestChannel(t, harness.secondValidation, "第二个请求进入 caddyOpMu 临界区")
+	waitTestChannel(t, secondDone, "第二个 UpdateRule 完成")
 
 	// Then
 	if firstResponse.Code == http.StatusOK || secondResponse.Code != http.StatusOK {
@@ -1246,6 +1494,79 @@ func TestEnableRule_writes_updated_by_with_current_user(t *testing.T) {
 	}
 	if !enabled || updatedBy != 42 {
 		t.Fatalf("enabled=%v updated_by=%d, want enabled with updated_by=42", enabled, updatedBy)
+	}
+}
+
+// 启用规则的 Caddy 应用失败分支必须落一条「启用失败」操作审计（规则端点
+// 为 Explicit 审计策略，中间件不兜底）——此前只有 HTTP 响应，运维无法追溯
+// 谁在何时启用哪条规则以及失败原因。
+func TestEnableRule_applyFailureRecordsSingleFailureAudit(t *testing.T) {
+	// Given：首次 /load 被 Caddy 拒绝（apply 失败），规则保持禁用。
+	handler, _, _ := newAuditRuleHandlers(t, 1)
+	seedAuditRule(t, "lb_enable_fail_audit", "enable-fail-audit", "enable-fail-audit.example.test", 8080, false, "manual", false)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+
+	// When
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_fail_audit/enable", nil))
+
+	// Then：400（配置被拒）+ 恰好一条失败审计
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	var failures int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='启用失败'`).Scan(&failures); err != nil {
+		t.Fatalf("count enable failure audits: %v", err)
+	}
+	if failures != 1 {
+		t.Fatalf("启用失败审计=%d, want 1", failures)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT COALESCE(detail,'') FROM audit_log WHERE action='启用失败'`).Scan(&detail); err != nil {
+		t.Fatalf("read enable failure audit: %v", err)
+	}
+	if !strings.Contains(detail, "应用失败") {
+		t.Fatalf("失败审计 detail=%q, want 点名 Caddy 应用失败", detail)
+	}
+	var enabled bool
+	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_enable_fail_audit'").Scan(&enabled); err != nil {
+		t.Fatalf("read rule state: %v", err)
+	}
+	if enabled {
+		t.Fatal("apply 失败必须回滚启用状态")
+	}
+}
+
+// 成功启用不得产生「启用失败」审计（成功路径应落「启用」审计）。防止失败
+// 审计被无条件写出、把正常操作误记为故障。
+func TestEnableRule_successWritesNoFailureAudit(t *testing.T) {
+	// Given：Caddy 正常应用，规则初始禁用。
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_enable_ok_audit", "enable-ok-audit", "enable-ok-audit.example.test", 8080, false, "manual", false)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+
+	// When
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_ok_audit/enable", nil))
+
+	// Then：200 + 零失败审计 + 一条启用审计
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var failures, success int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='启用失败'`).Scan(&failures); err != nil {
+		t.Fatalf("count enable failure audits: %v", err)
+	}
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='启用' AND detail LIKE '%lb_enable_ok_audit%'`).Scan(&success); err != nil {
+		t.Fatalf("count enable audits: %v", err)
+	}
+	if failures != 0 {
+		t.Fatalf("成功启用写出失败审计 %d 条", failures)
+	}
+	if success != 1 {
+		t.Fatalf("启用审计=%d, want 1", success)
 	}
 }
 
@@ -1379,7 +1700,7 @@ func newUpdateAuditRuleHandlers(t *testing.T, caddyID string, failedLoads int32,
 	harness.handler = &Handlers{
 		cfg:            cfg,
 		caddyService:   services.NewCaddyService(fakeCaddy.URL),
-		clusterService: services.NewClusterService(db.DB, nil, ""),
+		clusterService: services.NewClusterService(db.DB, ""),
 	}
 	harness.loadCalls = &loadCalls
 	harness.currentConfig = func() string {
@@ -1444,13 +1765,16 @@ func newAuditRuleHandlers(t *testing.T, failedLoads int32) (*Handlers, *atomic.I
 	return &Handlers{
 		cfg:            cfg,
 		caddyService:   services.NewCaddyService(fakeCaddy.URL),
-		clusterService: services.NewClusterService(db.DB, nil, ""),
+		clusterService: services.NewClusterService(db.DB, ""),
 	}, &loadCalls, &lastLoad
 }
 
 func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T) {
 	// Given：同一条规则上并发执行 Update/Delete/Create，旧锁序（DB 事务→caddyOpMu
 	// 与 caddyOpMu→DB 并存）会 AB-BA 循环等待；统一锁序后全部请求必须在超时内完成。
+	// Create 在导入窗口内会 409 fast-fail——先归因，避免前序用例的异步导入
+	// 把本用例伪装成锁序/业务回归。
+	assertNoConfigImportWindowLeak(t)
 	handler, _, _ := newAuditRuleHandlers(t, 0)
 	seedAuditRule(t, "lb_lockorder", "lock", "lock.example.test", 8080, true, "manual", false)
 	seedAuditUpstream(t, "lb_lockorder")
@@ -1460,9 +1784,22 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 	router.POST("/rules", handler.CreateRule)
 
 	done := make(chan struct{})
+	// 此前只断言「15s 内未死锁」+ `remaining > 2`（终态断言
+	// 过宽，且 Create 请求体缺 health_check_* 恒 400 → 根本未验证写成功）。
+	// 现按端点收集状态码并断言各自合法集（无 5xx/无未预期码），再断言终态
+	// 行数与被删/新建规则的存在性，既保留死锁门也证明并发写无丢失/异常。
+	var codesMu sync.Mutex
+	codes := map[string][]int{}
+	bodies := map[string][]string{}
+	record := func(kind string, code int, body string) {
+		codesMu.Lock()
+		codes[kind] = append(codes[kind], code)
+		bodies[kind] = append(bodies[kind], body)
+		codesMu.Unlock()
+	}
 	go func() {
 		var wg sync.WaitGroup
-		for i := 0; i < 4; i++ {
+		for i := range 4 {
 			wg.Add(1)
 			go func(n int) {
 				defer wg.Done()
@@ -1471,13 +1808,19 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 					body := strings.NewReader(`{"description":"u"}`)
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/rules/lb_lockorder", body))
+					record("update", recorder.Code, recorder.Body.String())
 				case 1:
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/rules/lb_lockorder", nil))
+					record("delete", recorder.Code, recorder.Body.String())
 				case 2:
-					body := strings.NewReader(`{"name":"newbie","protocol":"tcp","listen_port":19000,"upstreams":[{"host":"127.0.0.1","port":9001}]}`)
+					body := strings.NewReader(`{"name":"newbie","protocol":"tcp","listen_port":19000,
+						"health_check_interval":10,"health_check_timeout":2,
+						"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
+						"upstreams":[{"host":"127.0.0.1","port":9001,"weight":1,"enabled":true,"protocol":"tcp"}]}`)
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/rules", body))
+					record("create", recorder.Code, recorder.Body.String())
 				}
 			}(i)
 		}
@@ -1491,16 +1834,53 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 		t.Fatal("concurrent rule write endpoints deadlocked (lock order inversion)")
 	}
 
-	var remaining int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id IN ('lb_lockorder','lb_newbie') OR name='newbie'`).Scan(&remaining); err != nil {
-		t.Fatalf("read final rules: %v", err)
+	assertCodes := func(kind string, allowed ...int) {
+		t.Helper()
+		for _, code := range codes[kind] {
+			ok := false
+			for _, candidate := range allowed {
+				if code == candidate {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				idx := 0
+				for i, c := range codes[kind] {
+					if c == code {
+						idx = i
+						break
+					}
+				}
+				t.Fatalf("%s status=%d body=%s, want one of %v", kind, code, bodies[kind][idx], allowed)
+			}
+		}
 	}
-	if remaining > 2 {
-		t.Fatalf("unexpected rule count %d after concurrent writes", remaining)
+	assertCodes("update", http.StatusOK, http.StatusNotFound)
+	assertCodes("delete", http.StatusOK, http.StatusNotFound)
+	assertCodes("create", http.StatusCreated)
+	if len(codes["create"]) == 0 {
+		t.Fatal("create 端点未执行（夹具失靶）")
+	}
+
+	// 并发写无丢失：新建规则恰一行；lb_lockorder 至多一行（被删则零行）。
+	var created int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE name='newbie' AND protocol='tcp' AND listen_port=19000`).Scan(&created); err != nil {
+		t.Fatalf("count created rule: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created rule count=%d, want 1（并发创建丢失或被重复写入）", created)
+	}
+	var remaining int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_lockorder'`).Scan(&remaining); err != nil {
+		t.Fatalf("read remaining rule: %v", err)
+	}
+	if remaining > 1 {
+		t.Fatalf("lb_lockorder count=%d, want ≤1", remaining)
 	}
 }
 
-// N+12 用户裁决：删除/禁用在有 worker 正在执行签发时秒回 409 引导稍后重试，
+// 用户裁决：删除/禁用在有 worker 正在执行签发时秒回 409 引导稍后重试，
 // 替代悬挂最长 2 分钟的有界取消等待。仅拦「执行中」——queued 取消瞬时、
 // waiting_ca 冷却数小时均不拦（正确性仍由既有超时中止+回滚兜底）。
 func TestDeleteRule_returnsConflictWhenWorkerRunning(t *testing.T) {
@@ -1508,6 +1888,8 @@ func TestDeleteRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	seedAuditRule(t, "lb_del_running", "running", "running.example.test", 8081, true, "acme_dns", true)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().MarkJobRunningForTest("lb_del_running", 901)
 	router := gin.New()
@@ -1527,6 +1909,15 @@ func TestDeleteRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_del_running'`).Scan(&ruleCount); err != nil || ruleCount != 1 {
 		t.Fatalf("rule must be preserved on 409: count=%d err=%v", ruleCount, err)
 	}
+	// 删除被在途签发挡住属可用性动作，必须留痕（错误检查+细节跳转面）。
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='删除失败' AND resource='负载规则' AND detail LIKE '%lb_del_running%' AND detail LIKE '%证书签发任务%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read blocked delete audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("删除阻断 409 审计条数=%d, want 1", blockedAudits)
+	}
 }
 
 func TestDisableRule_returnsConflictWhenWorkerRunning(t *testing.T) {
@@ -1534,6 +1925,8 @@ func TestDisableRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	seedAuditRule(t, "lb_dis_running", "disrunning", "disrunning.example.test", 8082, true, "acme_dns", true)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().MarkJobRunningForTest("lb_dis_running", 902)
 	router := gin.New()
@@ -1549,6 +1942,14 @@ func TestDisableRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT IIF(enabled IN ('1',1),1,0) FROM lb_rules WHERE caddy_id='lb_dis_running'`).Scan(&enabled); err != nil || enabled != 1 {
 		t.Fatalf("rule must stay enabled on 409: enabled=%d err=%v", enabled, err)
 	}
+	var blockedAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='禁用失败' AND resource='负载规则' AND detail LIKE '%lb_dis_running%' AND detail LIKE '%证书签发任务%'`).Scan(&blockedAudits); err != nil {
+		t.Fatalf("read blocked disable audit: %v", err)
+	}
+	if blockedAudits != 1 {
+		t.Fatalf("禁用阻断 409 审计条数=%d, want 1", blockedAudits)
+	}
 }
 
 // 仅 queued（不在执行）的 DB 任务不得触发 409——删除走正常快速路径。
@@ -1560,6 +1961,8 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.DELETE("/rules/:caddy_id", handler.DeleteRule)
@@ -1567,7 +1970,7 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/rules/lb_del_queued", nil))
 
-	// NEW-4（第 73 轮 P5）：此前只排他断言非 409——成功态与规则删除终态无钉。
+	// 此前只排他断言非 409——成功态与规则删除终态无钉。
 	// 补 200 成功态 + 规则行确实删除（queued 任务走快速删除路径）。
 	if rec.Code != http.StatusOK {
 		t.Fatalf("queued-only job must allow fast delete: status=%d body=%s, want 200", rec.Code, rec.Body.String())
@@ -1581,19 +1984,19 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	}
 }
 
-// 审计 M16：origin_domain 指针化后「省略=保留原值、空串=清空」——空串必须
+// host_header 指针化后「省略=保留原值、空串=清空」——空串必须
 // 落库为空串，而非被合并逻辑吞回原值。
-func TestUpdateRule_empty_origin_domain_clears_value(t *testing.T) {
+func TestUpdateRule_empty_host_header_clears_value(t *testing.T) {
 	// Given
-	harness := newUpdateAuditRuleHandlers(t, "lb_clear_origin_domain", 0, false)
-	seedAuditRule(t, "lb_clear_origin_domain", "before", "clear.example.test", 8080, false, "manual", false)
-	seedAuditUpstream(t, "lb_clear_origin_domain")
-	if _, err := db.DB.Exec("UPDATE lb_rules SET origin_domain='backend.example.test' WHERE caddy_id='lb_clear_origin_domain'"); err != nil {
-		t.Fatalf("seed origin domain: %v", err)
+	harness := newUpdateAuditRuleHandlers(t, "lb_clear_host_header", 0, false)
+	seedAuditRule(t, "lb_clear_host_header", "before", "clear.example.test", 8080, false, "manual", false)
+	seedAuditUpstream(t, "lb_clear_host_header")
+	if _, err := db.DB.Exec("UPDATE lb_rules SET host_header='backend.example.test' WHERE caddy_id='lb_clear_host_header'"); err != nil {
+		t.Fatalf("seed host header: %v", err)
 	}
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
-	request := httptest.NewRequest(http.MethodPut, "/rules/lb_clear_origin_domain", strings.NewReader(`{"origin_domain":""}`))
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_clear_host_header", strings.NewReader(`{"host_header":""}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -1604,12 +2007,12 @@ func TestUpdateRule_empty_origin_domain_clears_value(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
-	var originDomain string
-	if err := db.DB.QueryRow("SELECT COALESCE(origin_domain,'') FROM lb_rules WHERE caddy_id='lb_clear_origin_domain'").Scan(&originDomain); err != nil {
-		t.Fatalf("read origin domain: %v", err)
+	var hostHeader string
+	if err := db.DB.QueryRow("SELECT COALESCE(host_header,'') FROM lb_rules WHERE caddy_id='lb_clear_host_header'").Scan(&hostHeader); err != nil {
+		t.Fatalf("read host header: %v", err)
 	}
-	if originDomain != "" {
-		t.Fatalf("origin_domain=%q, want empty string（空串=清空）", originDomain)
+	if hostHeader != "" {
+		t.Fatalf("host_header=%q, want empty string（空串=清空）", hostHeader)
 	}
 }
 
@@ -1635,7 +2038,7 @@ func TestRuleLifecycle_recordsReloadAuditAfterTransactionalApply(t *testing.T) {
 			mount:  func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) },
 			method: http.MethodPost,
 			path:   "/rules",
-			body:   `{"name":"reload-audit","protocol":"http","domain":"reload-audit.example.test","listen_port":8090,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
+			body:   `{"name":"reload-audit","protocol":"http","domain":"reload-audit.example.test","listen_port":8090,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
 			source: "创建规则",
 		},
 		{
@@ -1743,7 +2146,7 @@ func TestRuleSave_appliesExactlyOnce(t *testing.T) {
 			},
 			method: http.MethodPost,
 			path:   "/rules",
-			body:   `{"name":"single-apply","protocol":"http","domain":"single-apply.example.test","listen_port":8091,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
+			body:   `{"name":"single-apply","protocol":"http","domain":"single-apply.example.test","listen_port":8091,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
 		},
 		{
 			// 先创建使 http_8092 server 进入运行配置（旧探针对已存在 server 才
@@ -1762,7 +2165,7 @@ func TestRuleSave_appliesExactlyOnce(t *testing.T) {
 			// 判定点保持为一次真实最终应用。
 			body: `{"name":"after","listen_port":8093}`,
 			prep: func(t *testing.T, router *gin.Engine) string {
-				request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"prep","protocol":"http","domain":"single-apply.example.test","listen_port":8092,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+				request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"prep","protocol":"http","domain":"single-apply.example.test","listen_port":8092,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 				request.Header.Set("Content-Type", "application/json")
 				rec := httptest.NewRecorder()
 				router.ServeHTTP(rec, request)
@@ -1810,7 +2213,7 @@ func TestRuleSave_appliesExactlyOnce(t *testing.T) {
 	}
 }
 
-// CERT41-4(第 41 轮):手动 TLS 保存侧的证书质量警告——自签单张证书(系统根
+// 手动 TLS 保存侧的证书质量警告——自签单张证书(系统根
 // 不认可→链不完整)不阻断保存,但警告必须随该写操作的审计详情留痕(可观察
 func TestCreateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	// Given
@@ -1826,6 +2229,7 @@ func TestCreateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 		"name": "tls-warn", "protocol": "http", "domain": "tls-warn.example.test",
 		"listen_port": 8443, "enable_tls": true, "tls_source": "manual",
 		"tls_cert": certPEM, "tls_key": keyPEM,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	})
 	if err != nil {
@@ -1851,7 +2255,7 @@ func TestCreateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	}
 }
 
-// CERT41-4 更新方向:替换为自签单张证书同样留痕(不阻断)。
+// 更新方向:替换为自签单张证书同样留痕(不阻断)。
 func TestUpdateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	// Given：既有 manual-TLS 规则,本次更新替换证书材料为自签单张
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -1890,20 +2294,21 @@ func TestUpdateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	}
 }
 
-// CERT41-4 回归形状:链可信(注入测试根)且域名覆盖时不得误报——创建审计
+// 回归形状:链可信(注入测试根)且域名覆盖时不得误报——创建审计
 // 详情不含证书警告。
 func TestCreateRule_manualTLSTrustedChain_omitsCertWarningAudit(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
 	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
-	certPEM, keyPEM, roots := generateR41CAChain(t, []string{"tls-ok.example.test"})
-	injectR41Roots(t, roots)
+	certPEM, keyPEM, roots := generateTestCAChain(t, []string{"tls-ok.example.test"})
+	injectTestRoots(t, roots)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
 	payload, err := json.Marshal(map[string]any{
 		"name": "tls-ok", "protocol": "http", "domain": "tls-ok.example.test",
 		"listen_port": 8443, "enable_tls": true, "tls_source": "manual",
 		"tls_cert": certPEM, "tls_key": keyPEM,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	})
 	if err != nil {
@@ -1929,7 +2334,7 @@ func TestCreateRule_manualTLSTrustedChain_omitsCertWarningAudit(t *testing.T) {
 	}
 }
 
-// CERT41-4 畸形形状:TCP 规则携带 TLS 证书材料——材料随 TCP 归一(R69 C-N1)
+// 畸形形状:TCP 规则携带 TLS 证书材料——材料随 TCP 归一
 // 弃置,其质量警告不得随创建审计留痕(证书未落库,警告即误导)。
 func TestCreateRule_tcpTLSMaterialNormalized_omitsCertWarningAudit(t *testing.T) {
 	// Given
@@ -1945,6 +2350,7 @@ func TestCreateRule_tcpTLSMaterialNormalized_omitsCertWarningAudit(t *testing.T)
 		"name": "tcp-cert", "protocol": "tcp",
 		"listen_port": 8553, "enable_tls": true, "tls_source": "manual",
 		"tls_cert": certPEM, "tls_key": keyPEM,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	})
 	if err != nil {
@@ -1967,5 +2373,374 @@ func TestCreateRule_tcpTLSMaterialNormalized_omitsCertWarningAudit(t *testing.T)
 	}
 	if strings.Contains(detail, "证书警告") {
 		t.Fatalf("create audit detail=%q, TCP-normalized cert material must not warn", detail)
+	}
+}
+
+// waitTestChannel 等通道关闭，超时给出具名诊断（替代裸 <-ch 的包级超时）。
+func waitTestChannel(t *testing.T, ch <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("等待超时: %s", label)
+	}
+}
+
+func TestRuleCertCancellation_releasesCaddyOpLock(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string)
+	}{
+		{
+			name: "update leaving ACME",
+			setup: func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string) {
+				harness := newUpdateAuditRuleHandlers(t, "lb_cancel_lock_update", 0, false)
+				seedACMEManualSwitchFixture(t, "lb_cancel_lock_update", "cancel-lock-update.example.test", "failed")
+				router := gin.New()
+				router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
+				request := httptest.NewRequest(http.MethodPut, "/rules/lb_cancel_lock_update", strings.NewReader(`{"name":"after","enable_tls":false}`))
+				request.Header.Set("Content-Type", "application/json")
+				return harness.handler, router, request, "update"
+			},
+		},
+		{
+			name: "disable ACME rule",
+			setup: func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string) {
+				h, _, _ := newAuditRuleHandlers(t, 0)
+				seedAuditRule(t, "lb_cancel_lock_disable", "cancel-lock-disable", "cancel-lock-disable.example.test", 8080, true, "acme_dns", true)
+				seedAuditUpstream(t, "lb_cancel_lock_disable")
+				router := gin.New()
+				router.POST("/rules/:caddy_id/disable", h.DisableRule)
+				return h, router, httptest.NewRequest(http.MethodPost, "/rules/lb_cancel_lock_disable/disable", nil), "disable"
+			},
+		},
+		{
+			name: "delete rule",
+			setup: func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string) {
+				h, _, _ := newAuditRuleHandlers(t, 0)
+				seedAuditRule(t, "lb_cancel_lock_delete", "cancel-lock-delete", "cancel-lock-delete.example.test", 8080, true, "acme_dns", true)
+				seedAuditUpstream(t, "lb_cancel_lock_delete")
+				router := gin.New()
+				router.DELETE("/rules/:caddy_id", h.DeleteRule)
+				return h, router, httptest.NewRequest(http.MethodDelete, "/rules/lb_cancel_lock_delete", nil), "delete"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			services.ResetCAQueueManagerForTest()
+			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			services.GetCAQueueManager().Start()
+			startCertQueueDispatchForTest(t)
+			t.Cleanup(services.ResetCAQueueManagerForTest)
+			handler, router, request, label := tt.setup(t)
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			oldCancel := cancelRuleJobs
+			cancelRuleJobs = func(context.Context, *services.CAQueueManager, string) error {
+				entered <- struct{}{}
+				<-release
+				return nil
+			}
+			t.Cleanup(func() { cancelRuleJobs = oldCancel })
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				done <- response
+			}()
+			waitTestChannel(t, entered, label+" cancel entered")
+
+			// The global Caddy operation lock must be free during the bounded wait.
+			if !handler.caddyOpMu.TryLock() {
+				close(release)
+				<-done
+				t.Fatalf("%s held caddyOpMu while waiting for certificate cancellation", label)
+			}
+			handler.caddyOpMu.Unlock()
+			close(release)
+			response := <-done
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s status=%d body=%s, want 200", label, response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+// ---- 通用探针：真实 SQLite driver 的 Prepare 观测/故障注入 ----
+//
+// 与历史 certificateTxOrder 同款：包装器只嵌入 driver.Conn（接口），
+// 不提升 QueryerContext/ExecerContext 等可选接口，database/sql 因而回落到
+// Prepare 路径——语句级观测与故障注入都发生在同一处。
+
+type prepareProbe struct {
+	mu      sync.Mutex
+	queries []string
+	inTx    bool
+	fail    func(query string, inTx bool) error
+}
+
+func (p *prepareProbe) record(query string) error {
+	p.mu.Lock()
+	p.queries = append(p.queries, query)
+	inTx := p.inTx
+	fail := p.fail
+	p.mu.Unlock()
+	if fail != nil {
+		return fail(query, inTx)
+	}
+	return nil
+}
+
+func (p *prepareProbe) setInTx() {
+	p.mu.Lock()
+	p.inTx = true
+	p.mu.Unlock()
+}
+
+func (p *prepareProbe) count(substring string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, query := range p.queries {
+		if strings.Contains(query, substring) {
+			count++
+		}
+	}
+	return count
+}
+
+type prepareProbeConnector struct {
+	dsn   string
+	inner driver.Driver
+	probe *prepareProbe
+}
+
+func (c prepareProbeConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.inner.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &prepareProbeConn{Conn: conn, probe: c.probe}, nil
+}
+
+func (c prepareProbeConnector) Driver() driver.Driver { return c.inner }
+
+type prepareProbeConn struct {
+	driver.Conn
+	probe *prepareProbe
+}
+
+func (c *prepareProbeConn) Begin() (driver.Tx, error) {
+	c.probe.setInTx()
+	return c.Conn.Begin()
+}
+
+func (c *prepareProbeConn) Prepare(query string) (driver.Stmt, error) {
+	if err := c.probe.record(query); err != nil {
+		return nil, err
+	}
+	return c.Conn.Prepare(query)
+}
+
+// wrapHandlerDBWithProbe 用探针包装器指向当前测试库的同一文件（WAL 允许多
+// 句柄），并把 db.DB/SetDB 换成包装句柄；Cleanup 复位。
+func wrapHandlerDBWithProbe(t *testing.T, probe *prepareProbe) {
+	t.Helper()
+	var seq int
+	var name, file string
+	if err := db.DB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		t.Fatalf("read database path: %v", err)
+	}
+	if file == "" {
+		t.Fatal("测试库不是文件库，无法附加探针句柄")
+	}
+	previous := db.DB
+	wrapped := sql.OpenDB(prepareProbeConnector{
+		dsn:   file + "?_txlock=immediate&_pragma=busy_timeout(30000)",
+		inner: &sqlitedriver.Driver{},
+		probe: probe,
+	})
+	db.DB = wrapped
+	db.SetDB(wrapped)
+	t.Cleanup(func() {
+		_ = wrapped.Close()
+		db.DB = previous
+		db.SetDB(previous)
+	})
+}
+
+// 域名迁移前「最新任务行」查询遇到真实 DB 错误（非 ErrNoRows）时，
+// 必须回滚迁移事务并退役旧域任务——不得空提交留下 issued+PEM 行永驻。
+func TestUpdateRule_domainMigrationReadFailureRetiresOldJob(t *testing.T) {
+	harness := newUpdateAuditRuleHandlers(t, "lb_a87_migfail", 0, false)
+	seedAuditRule(t, "lb_a87_migfail", "migfail", "old-a87.example.test", 8086, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_a87_migfail")
+	var providerID int
+	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+		t.Fatalf("read CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_a87_migfail'", seedR52CertificateConfig(t), providerID); err != nil {
+		t.Fatalf("bind ACME references: %v", err)
+	}
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id,cert_pem,key_pem)
+		VALUES ('lb_a87_migfail','old-a87.example.test','issued',?,'CERT-PEM','KEY-PEM')`, providerID)
+	if err != nil {
+		t.Fatalf("seed certificate job: %v", err)
+	}
+	originalJobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+
+	probe := &prepareProbe{fail: func(query string, inTx bool) error {
+		if inTx && strings.Contains(query, "SELECT id FROM cert_jobs WHERE rule_id=? ORDER BY id DESC LIMIT 1") {
+			return errors.New("injected cert_jobs read failure")
+		}
+		return nil
+	}}
+	wrapHandlerDBWithProbe(t, probe)
+
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_migfail", strings.NewReader(`{"domain":"new-a87.example.test"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", originalJobID).Scan(&status); err != nil {
+		t.Fatalf("read original job: %v", err)
+	}
+	if status != "disabled" {
+		t.Fatalf("旧域任务状态=%q, want disabled（迁移读取失败必须退役旧行，否则 issued+PEM 永驻且 sweep 跳过）", status)
+	}
+	var ruleDomain string
+	if err := db.DB.QueryRow("SELECT domain FROM lb_rules WHERE caddy_id='lb_a87_migfail'").Scan(&ruleDomain); err != nil {
+		t.Fatalf("read rule domain: %v", err)
+	}
+	if ruleDomain != "new-a87.example.test" {
+		t.Fatalf("rule domain=%q, want new-a87.example.test", ruleDomain)
+	}
+}
+
+// PUT enabled=false 与 /disable 同语义——执行中签发必须前置 409，
+// 且不得把任务行翻成 disabled（用户以为已暂停而 worker 仍在跑）。
+func TestUpdateRule_disableWithRunningJobReturnsConflict(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	seedAuditRule(t, "lb_a87_running", "running", "running-a87.example.test", 8087, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_a87_running")
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=? WHERE caddy_id='lb_a87_running'", seedR52CertificateConfig(t)); err != nil {
+		t.Fatalf("bind ACME config: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem)
+		VALUES ('lb_a87_running','running-a87.example.test','issued','CERT-PEM','KEY-PEM')`); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	services.GetCAQueueManager().MarkJobRunningForTest("lb_a87_running", 4242)
+
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_running", strings.NewReader(`{"enabled":false}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	started := time.Now()
+	router.ServeHTTP(recorder, request)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("409 快路径耗时 %v", elapsed)
+	}
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（执行中签发与 /disable 同口径）", recorder.Code, recorder.Body.String())
+	}
+	var enabled int
+	var jobStatus string
+	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_a87_running'").Scan(&enabled); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE rule_id='lb_a87_running'").Scan(&jobStatus); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if enabled != 1 || jobStatus != "issued" {
+		t.Fatalf("enabled=%d job_status=%q, want 1/issued（409 分支零写入）", enabled, jobStatus)
+	}
+	// 被在途签发挡住的禁用尝试必须留痕（与 /disable、DELETE 同口径）：
+	// 后续追查「谁在何时尝试禁用、被什么挡住」时编辑入口不得缺席。
+	var auditRows int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%lb_a87_running%'`).Scan(&auditRows); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if auditRows != 1 {
+		t.Fatalf("PUT enabled=false 被 409 拦住时必须留 1 条失败审计, got %d", auditRows)
+	}
+}
+
+// /rules 响应的上游对象键集对账：Upstream.RuleID 为 json:"-"（冗余回显键，
+// 与 PathRule 口径一致；所属规则由外层 caddy_id 表达），本用例钉住响应键集，
+// 防止 rule_id 被无意加回或其他键被静默增删。
+func TestListRules_upstreamResponseKeySetOmitsRuleID(t *testing.T) {
+	// Given
+	handler := newRuleFeatureTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled) VALUES ('lb_upkeyset','keyset','http',8091,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_upkeyset','127.0.0.1',9000,1,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+	router := gin.New()
+	router.GET("/rules", handler.ListRules)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules", nil))
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(payload.Data) != 1 {
+		t.Fatalf("rules=%d, want 1: %s", len(payload.Data), response.Body.String())
+	}
+	rawUpstreams, ok := payload.Data[0]["upstreams"]
+	if !ok {
+		t.Fatalf("rule missing upstreams key: %s", response.Body.String())
+	}
+	var upstreams []map[string]json.RawMessage
+	if err := json.Unmarshal(rawUpstreams, &upstreams); err != nil {
+		t.Fatalf("decode upstreams: %v", err)
+	}
+	if len(upstreams) != 1 {
+		t.Fatalf("upstreams=%d, want 1: %s", len(upstreams), rawUpstreams)
+	}
+	// dynamic_dns/origin_domain 为 omitempty（零值不出场），不出现在键集。
+	want := map[string]bool{"id": true, "host": true, "port": true, "weight": true, "enabled": true, "protocol": true, "max_connections": true}
+	if len(upstreams[0]) != len(want) {
+		t.Fatalf("upstream response key count=%d, want %d: %s", len(upstreams[0]), len(want), rawUpstreams)
+	}
+	for key := range upstreams[0] {
+		if !want[key] {
+			t.Fatalf("unexpected upstream response key %q in %s", key, rawUpstreams)
+		}
 	}
 }

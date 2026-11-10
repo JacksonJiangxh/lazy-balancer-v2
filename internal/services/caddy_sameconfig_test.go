@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -84,5 +85,97 @@ func TestApplyConfig_failsOpenWhenRunningConfigUnreadable(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("/load 次数=%d, want 1（比对失败不阻断）", posts)
+	}
+}
+
+// Given：运行配置可读但与渲染产物不同（A≠B）。
+// Then：必须真 /load（不得误判同字节短路），也不是 errSameConfig。
+func TestApplyConfig_loadsWhenRunningConfigDiffers(t *testing.T) {
+	newClusterTestService(t)
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			_, _ = w.Write([]byte(`{"apps":{"http":{"servers":{}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/load":
+			posts++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	s := NewCaddyService(srv.URL)
+
+	err := s.GenerateAndApplyConfig()
+
+	if err != nil {
+		t.Fatalf("运行配置不同必须照常应用: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("/load 次数=%d, want 1（A≠B 时不得短路）", posts)
+	}
+}
+
+// Given：GET /config/ 返回 200 但载荷畸形 JSON。
+// Then：比对无法判定 → fail-open 照常 /load（不得因解析失败阻断写入）。
+func TestApplyConfig_failsOpenWhenRunningConfigMalformedJSON(t *testing.T) {
+	newClusterTestService(t)
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			_, _ = w.Write([]byte(`{"apps":`))
+		case r.Method == http.MethodPost && r.URL.Path == "/load":
+			posts++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	s := NewCaddyService(srv.URL)
+
+	err := s.GenerateAndApplyConfig()
+
+	if err != nil {
+		t.Fatalf("畸形运行配置应 fail-open 照常应用: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("/load 次数=%d, want 1（畸形 JSON 不得短路）", posts)
+	}
+}
+
+// 运行配置超过比对上限时必须 fail-open 照常 /load，并留下区别于普通读失败的
+// warn；不得把「无法比对」误当同配置，也不得无提示失去短路能力。
+func TestApplyConfig_loadsAndWarnsWhenRunningConfigTooLarge(t *testing.T) {
+	newClusterTestService(t)
+	logs := captureServiceLog(t)
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.Copy(w, &spaceFillReader{remaining: caddyAdminConfigMaxBytes + 1}); err != nil {
+				t.Errorf("stream oversized config: %v", err)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/load":
+			posts++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	s := NewCaddyService(srv.URL)
+
+	if err := s.GenerateAndApplyConfig(); err != nil {
+		t.Fatalf("超限运行配置应跳过短路照常应用: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("/load 次数=%d, want 1（超限不得误判同配置）", posts)
+	}
+	if got := logs.String(); !strings.Contains(got, "超过同字节比对上限") {
+		t.Fatalf("超限跳过短路必须留 warn: %q", got)
 	}
 }

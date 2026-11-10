@@ -7,10 +7,10 @@ import (
 	"lazy-balancer-v2/internal/mcpserver"
 )
 
-// TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线（R68 B-F7）：
+// TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线
 // 每个工具的 (method, path) 必须命中 SetupRouter 注册的真实路由——工具指向已
 // 改名/删除的路由只会在 Agent 调用时 404，编译期与既有测试均不可见（OpenAPI
-// 侧有同款绊线，MCP 侧此前为空白）。{param} 形态经 ginPathToOpenAPI 反向
+// 侧有同款绊线，MCP 侧此前为空白）。{param} 形态经 apipath.ToGin 反向
 // 归一为 Gin 的 :param 后比对。
 func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	router := newAPIDocTestRouter(t)
@@ -21,7 +21,7 @@ func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	missing := 0
 	specs := mcpserver.ListToolSpecs()
 	for _, spec := range specs {
-		ginPath := openAPIToGinPath(spec.Path)
+		ginPath := mcpserver.GinPathForTest(spec.Path)
 		if _, ok := registered[spec.Method+" "+ginPath]; !ok {
 			t.Errorf("工具 %s 指向未注册路由 %s %s——REST 路由已改名/删除而工具规格未同步", spec.Name, spec.Method, spec.Path)
 			missing++
@@ -32,29 +32,22 @@ func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	}
 }
 
-// openAPIToGinPath 将 {param} 形态还原为 Gin 的 :param（ginPathToOpenAPI 反函数）。
-func openAPIToGinPath(path string) string {
-	var b strings.Builder
-	for i := 0; i < len(path); i++ {
-		switch path[i] {
-		case '{':
-			b.WriteByte(':')
-		case '}':
-		default:
-			b.WriteByte(path[i])
-		}
-	}
-	return b.String()
-}
-
-// mcpUncoveredRoutes：注册但无 MCP 工具覆盖的路由的显式豁免清单（F12-b，
+// mcpUncoveredRoutes：注册但无 MCP 工具覆盖的路由的显式豁免清单
 // 2026-09 审计）。此前 parity 绊线只验「工具→路由」单向，新 REST 路由落地时
 // 无机制迫使决策者考虑 MCP 暴露——本清单 + 双向断言补上：新增无工具路由必须
 // 在此登记豁免理由（或补工具）；清单项不再注册时测试同样报错，防清单腐化。
 var mcpUncoveredRoutes = map[string]string{
-	// —— IP 快捷弹框处置（第 57 轮新增：前端弹框专用；Agent 侧 get_ip_list →
-	//    update_ip_list 全量写回可达成移除，专用工具冗余）——
-	"POST /api/v1/security/ip-lists/:id/remove-ip": "IP 快捷弹框移除处置端点：从地址列表移除单条 IP；Agent 可用 get_ip_list+update_ip_list 组合等价完成",
+	// —— 威胁大屏（前端全屏可视化专用；Agent 侧 get_security_overview +
+	//    list_security_events 已覆盖同等数据面，专用工具冗余）——
+	"GET /api/v1/security/overview/threat-screen":              "威胁大屏聚合（24h 总量/拦截率/限流/活跃源/国家计数 Top5）：前端全屏可视化数据源；Agent 可用 get_security_overview/list_security_events 等价获取",
+	"GET /api/v1/security/events/feed":                         "威胁大屏增量事件流（since_id 游标）：大屏 3 秒轮询专用形态；Agent 可用 list_security_events 按时间倒序等价查询",
+	"GET /api/v1/security/events/toast-summary":                "威胁大屏攻击弹框精确聚合：按游标扫描全部新安全事件并 aggregate，前端弹框专用；Agent 可用 list_security_events 自行聚合",
+	"GET /api/v1/security/overview/threat-screen/attack-flow":  "威胁大屏攻击光流内存环形缓冲：采样态势可视化专用；安全事件日志仍可用 list_security_events 查询",
+	"GET /api/v1/security/overview/threat-screen/traffic":      "大屏实时流量快照代理（Caddy admin 计数器）：光流可视化专用 1-2s 轮询数据源；Agent 无消费场景",
+	"POST /api/v1/security/overview/threat-screen/collector":   "大屏流量采集租约申请/续租：浏览器生命周期内部动作，Agent 无 UI 会话场景且不应远程控制采集开关",
+	"GET /api/v1/security/overview/threat-screen/events":       "大屏逐请求正常流量增量事件流：前端光流可视化专用，Agent 无消费场景",
+	"DELETE /api/v1/security/overview/threat-screen/collector": "大屏流量采集租约释放：浏览器生命周期内部动作，Agent 无 UI 会话场景",
+	// —— IP 快捷弹框处置：remove-ip 已有 remove_ip_from_list 工具覆盖——
 	// —— 认证 / 会话 / MFA（JWT 会话专属；MCP 仅 API Key，无用户会话概念）——
 	"GET /api/v1/auth/setup":               "首次初始化探测：用户表为空时返回 needs_setup=true，前端引导创建首个管理员",
 	"POST /api/v1/auth/setup":              "首次初始化：创建首个管理员账号，用户表非空后 403",
@@ -90,7 +83,7 @@ var mcpUncoveredRoutes = map[string]string{
 	"POST /api/v1/certificates/jobs/current":           "批量便捷端点：一次查最多 200 个 rule_id 的当前任务，供面板规则列表轮询任务状态；Agent 用 list_cert_jobs 按 rule_id 过滤",
 	"POST /api/v1/security/policies/batch-bind":        "UI 批量便利端点：规则列表多选批量绑定（单事务单渲染）；绑定原语已被 set_rule_security_policies（PUT /security/rules/:caddy_id/policies）覆盖，Agent 逐规则调用即可",
 	"POST /api/v1/security/policies/:id/bindings/bulk": "UI 批量便利端点：策略保存/绑定弹框的 bind+unbind 批量形态（单事务单渲染）；Agent 用 set_rule_security_policies 逐规则设置完整绑定集即可达成同等结果",
-	"POST /api/v1/rules/batch-block-pages":             "API/MCP 批量便利端点：规则列表多选批量设置阶段拦截页（单事务单渲染）；阶段页字段属规则载荷，原语已被 update_rule（PUT /rules/:caddy_id 的 4 个阶段页字段）覆盖",
+	"POST /api/v1/rules/batch-block-pages":             "API 批量便利端点（面板未消费，保留供外部自动化；R4 历史裁定：已发布稳定版公开 API 面不删）：规则列表多选批量设置阶段拦截页（单事务单渲染）；阶段页字段属规则载荷，原语已被 update_rule（PUT /rules/:caddy_id 的 4 个阶段页字段）覆盖，Agent 逐规则调用即可",
 	"POST /api/v1/security/policies/:id/split":         "UI 批量便利端点：混合策略一键拆分迁移（复合操作）；原语已被 create_security_policy / set_rule_security_policies / delete_security_policy 覆盖，Agent 可逐步完成同等迁移",
 	// —— OIDC 认证集成(v2.3.0):浏览器跳转/回调链路,Agent 无消费场景;
 	// 配置管理属低频管理面板操作(测试连接为发现探测,面板专用) ——
@@ -122,29 +115,48 @@ var mcpUncoveredRoutes = map[string]string{
 	"GET /api/v1/security/events/count":         "IP 弹框上下文查询(近 N 天单 IP 事件计数),轻量专用端点;MCP 场景用 list_security_events 的 ip 过滤+total 覆盖同等信息",
 	"GET /api/v1/system/tasks/stats-24h-series": "面板「近 24 小时执行」时间序列图专用聚合（task_runs 分小时桶）；Agent 查任务状态用 list_system_tasks/get_system_task_history 覆盖同等信息",
 	"GET /api/v1/system/ports":                  "部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT）只读探测，前端向导默认值与保留端口判定用；属部署环境常量，无 Agent 操作语义",
-	// —— 威胁情报库（v2.3.x）：内置只读源的面板管理面（与 CRS/IP2Region 更新
-	//    端点同类——后者本就无 MCP 工具），MCP 后续按需补工具 ——
+	// —— 威胁情报库（v2.3.x）：内置只读源的面板管理面。CRS/IP2Region 同族端点
+	//    已有 toggle/trigger 工具覆盖，威胁库按面板低频操作口径未补工具（能力面
+	//    不一致为已知状态，如需 Agent 侧管理再按需补） ——
 	"GET /api/v1/security/threat-lib":             "威胁库源列表与条目合计数（面板规则集卡片数据源）",
 	"PUT /api/v1/security/threat-lib/auto-update": "威胁库自动更新总闸（低频管理面板操作）",
 	"PUT /api/v1/security/threat-lib/:id/flags":   "威胁库逐源更新开关（低频管理面板操作）",
-	"POST /api/v1/security/threat-lib/update":     "手动更新威胁库（低频管理面板操作；与 CRS/IP2Region 更新端点同族未覆盖）",
+	"POST /api/v1/security/threat-lib/update":     "手动更新威胁库（低频管理面板操作；CRS/IP2Region 同族端点已有工具，本族按面板低频口径未补）",
+	// 自动封禁：面板状态卡/配置弹框专用面 ——
+	"GET /api/v1/security/autoban":             "自动封禁六项配置读（面板配置弹框数据源）",
+	"PUT /api/v1/security/autoban":             "自动封禁配置写（低频管理面板操作；保存联动调度启停）",
+	"GET /api/v1/security/autoban/status":      "自动封禁运行态/今日封禁/观察建议聚合（面板状态卡轮询数据源）",
+	"GET /api/v1/security/ip-lists/:id/export": "名单 TXT 导出下载（文本附件下载，面板地址列表页操作）",
 	// —— 规则库定时调度（v2.3.x）：三库排程设置为低频管理面板操作 ——
 	"PUT /api/v1/security/crs/schedule":             "CRS 定时更新排程（低频管理面板操作）",
 	"PUT /api/v1/security/ip2region/schedule":       "IP2Region 定时更新排程（低频管理面板操作）",
 	"PUT /api/v1/security/threat-lib/schedule":      "威胁库定时更新排程（低频管理面板操作）",
 	"GET /api/v1/security/threat-lib/update/status": "威胁库更新任务状态（面板更新弹框轮询数据源）",
 	"GET /api/v1/security/threat-lib/update/logs":   "威胁库更新日志（面板更新弹框日志流）",
+	// —— 爬虫地址库（v2.3.8）：内置只读源的面板管理面。CRS/IP2Region 同族端点
+	//    已有 toggle/trigger 工具而本族未补——能力面不一致为已知状态，按「面板
+	//    低频操作」口径维持豁免；如需 Agent 侧管理爬虫库再按需补工具 ——
+	"GET /api/v1/security/crawler-lib":               "爬虫地址库源列表与条目合计数（面板规则库卡片数据源）",
+	"PUT /api/v1/security/crawler-lib/auto-update":   "爬虫地址库自动更新总闸（低频管理面板操作；CRS/IP2Region 同族已有工具，本族按低频口径未补）",
+	"PUT /api/v1/security/crawler-lib/schedule":      "爬虫地址库定时更新排程（低频管理面板操作）",
+	"PUT /api/v1/security/crawler-lib/:id/flags":     "爬虫地址库逐源更新开关（低频管理面板操作）",
+	"POST /api/v1/security/crawler-lib/update":       "手动更新爬虫地址库（低频管理面板操作；CRS/IP2Region 同族已有工具，本族按低频口径未补）",
+	"GET /api/v1/security/crawler-lib/update/status": "爬虫地址库更新任务状态（面板更新弹框轮询数据源）",
+	"GET /api/v1/security/crawler-lib/update/logs":   "爬虫地址库更新任务日志（面板更新弹框日志流）",
+	// —— 集群节点站点坐标：主节点节点列表专用，不走 MCP ——
+	"PUT /api/v1/cluster/nodes/:id/site": "主节点为指定从节点配置大屏站点坐标（集群节点管理 UI 专用；MCP 集群工具不承载节点本地展示配置）",
 	// —— MCP 自身镜像端点 ——
 	"POST /api/v1/mcp":             "MCP Streamable HTTP JSON-RPC 端点本身：工具调用的入口即 MCP 协议，不是可经 MCP 转发的 REST 操作",
 	"GET /api/v1/mcp/tools":        "MCP 自身镜像端点：OpenAPI 形态的工具清单，供外部集成方发现工具",
 	"GET /api/v1/mcp/ops-playbook": "MCP 自身镜像端点：注入 MCP system prompt 的运维手册文本",
-}
+
+	"PUT /api/v1/security/ip2region/v6-enabled": "IP 地理库 IPv6 开关为面板 UI 专用运维操作（数据源配置态，非告警/巡检场景；Agent 无消费场景）"}
 
 func TestMCPUncoveredRoutes_areExplicitlyExempted(t *testing.T) {
 	router := newAPIDocTestRouter(t)
 	covered := make(map[string]struct{})
 	for _, spec := range mcpserver.ListToolSpecs() {
-		covered[spec.Method+" "+openAPIToGinPath(spec.Path)] = struct{}{}
+		covered[spec.Method+" "+mcpserver.GinPathForTest(spec.Path)] = struct{}{}
 	}
 	registered := make(map[string]struct{}, len(router.Routes()))
 	for _, route := range router.Routes() {
@@ -164,6 +176,9 @@ func TestMCPUncoveredRoutes_areExplicitlyExempted(t *testing.T) {
 	for key := range mcpUncoveredRoutes {
 		if _, ok := registered[key]; !ok {
 			t.Errorf("豁免清单项 %s 不是已注册路由——路由已删除/改名，清单需同步", key)
+		}
+		if _, ok := covered[key]; ok {
+			t.Errorf("豁免清单项 %s 已被 MCP 工具覆盖——豁免已失效，请从 mcpUncoveredRoutes 移除（清单只许登记未覆盖路由）", key)
 		}
 	}
 }

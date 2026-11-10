@@ -1,11 +1,12 @@
+# 出厂引导配置：只声明 admin 接口与 metrics 采集，不绑定任何对外监听端口。
+# 对外端口（含无规则时的落地页）一律由数据库渲染的配置接管——GenerateCaddyConfig
+# 恒会生成 80 端口的落地站与各规则服务器。启动期在这里写固定 listen 地址会让
+# 该端口被占用时 caddy run 直接退出，监督器陷入重启循环（面板存活但 Caddy 永不
+# 可用）；保持引导配置无 listener 则端口冲突只体现为后续配置应用失败的显性报错。
 {
-    admin 127.0.0.1:2019
-    metrics {
-        per_host
-        observe_catchall_hosts
-    }
-}
-
-:80 {
-    respond "Lazy Balancer V2 is running!" 200
+	admin 127.0.0.1:2019
+	metrics {
+		per_host
+		observe_catchall_hosts
+	}
 }

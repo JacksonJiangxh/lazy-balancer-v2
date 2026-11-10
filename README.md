@@ -1,129 +1,102 @@
-# Lazy Balancer V2 · 自维护分支
+# Lazy Balancer V2
 
 [English](README.en.md) | 简体中文
 
-> **这不是上游官方仓库。** 这里是 [v55448330/lazy-balancer-v2](https://github.com/v55448330/lazy-balancer-v2)
-> 的一个 **fork 自维护版本**：在上游基础上叠加我们自己的修复与增强，
-> 并按自己的节奏同步上游版本。
-
 基于 **Caddy v2.11** 的可视化负载均衡管理平台，内置 WAF 安全防护，单容器交付。
 
-## 这个仓库是什么
+## 功能一览
 
-一句话：**上游的容器级能力 + 我们踩过的坑的修复。**
-
-我们实际在生产里用这套东西，遇到问题就改，改完留在这个仓库。因此它和上游的
-关系是「同源、有分叉、定期回流」：
-
-| | 上游 | 本仓库 |
-|---|---|---|
-| 定位 | 官方发布 | 生产自用 + 定制 |
-| 版本节奏 | 官方 tag | 跟官方 tag，我们自己的改动随时发 |
-| 分支 | `master` | `master-dev`（开发主线）、`master`（上游镜像轨） |
-| 镜像 | Docker Hub `v55448330/...` | `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest` |
-| 反馈 | 上游 issue | 本仓库 issue |
-
-### 分支说明
-
-| 分支 | 位置 | 作用 |
-|---|---|---|
-| `master-dev` | 本仓库默认分支 | **开发主线。** 上游基线 + 我们的全部改动，日常都提交到这里 |
-| `master` | 本仓库 | **上游镜像轨。** 由 GitHub Actions 自动同步上游 release，逐字节等于上游某个 tag，**不含任何我们的改动，请勿在此分支开发** |
-
-> 为什么 `master` 要单独留一条干净的轨：这样「比上游差了什么」永远只有一个
-> 参照物，不会被我们自己的改动污染。巡检任务也是靠它来判断版本差距的。
+| 功能 | 说明 |
+|---|---|
+| 负载均衡 | HTTP/HTTPS/TCP 四层代理，多种策略，健康检查，路径路由 |
+| WAF 防护 | OWASP CRS + 自定义规则 + IP 控制 + 地域拦截 + 限流 |
+| 爬虫豁免 | UA+反向 DNS/官方 IP 段验证真实搜索引擎与 AI 爬虫，豁免地域拦截；官方爬虫地址库定时更新 |
+| 免费证书 | ACME 自动签发（DNS-01），自动续签 |
+| 主从集群 | 增量同步，防篡改签名，从节点只读，一键提升 |
+| 监控告警 | 流量/延迟 P50-99，上游健康，安全事件总览 |
+| MCP 服务 | AI 代理可经 MCP 工具操作全部主要功能（工具清单以运行时 `tools/list` 为准） |
+| 自动备份 | 按日/周/月定时备份配置到服务器 backup 目录，支持一键还原 |
 
 ## 快速开始
 
+**Linux（推荐，host 网络）**：
+
 ```bash
 docker run -d --name lazy-balancer --network host \
+  --restart unless-stopped \
+  --pids-limit=4096 \
+  --ulimit nproc=4096:4096 \
   --ulimit nofile=1048576:1048576 \
+  --stop-timeout 30 \
   -v $(pwd)/data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
   -v $(pwd)/backup:/app/backup \
-  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
+  v55448330/lazy-balancer-v2:latest
 ```
 
-挂载说明：`/app/data` 数据库与配置（必选）、`/app/certs` 证书与私钥（必选）、
-`/app/backup` 自动备份落盘目录（必选——不挂载则容器重建后备份文件丢失）、
-`/app/logs` 日志（推荐）、`/app/waf` 规则库与 GeoIP（推荐）。
+**Docker Desktop（macOS/Windows，bridge 网络 + 端口映射）**：
+
+```bash
+docker run -d --name lazy-balancer \
+  --restart unless-stopped \
+  --pids-limit=4096 \
+  --ulimit nproc=4096:4096 \
+  --ulimit nofile=1048576:1048576 \
+  --stop-timeout 30 \
+  -p 8000:8000 -p 80:80 -p 443:443 -p 443:443/udp \
+  -v lb-data:/app/data -v $(pwd)/certs:/app/certs \
+  -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
+  -v $(pwd)/backup:/app/backup \
+  v55448330/lazy-balancer-v2:latest
+```
+
+> 镜像标签:`latest` 指向最近一次**稳定版**(无通道后缀);测试版标签带 `-beta` 后缀(形如 `:v2.4.2-beta`),需要尝鲜或复现问题时请显式指定该标签。
+>
+> **容器初始化**：新镜像已内置 init 进程（回收健康检查等被遗弃的子进程），并改用二进制自带健康检查，无需再加 `--init`。若固定使用更早的镜像，请务必追加 `--init`。启动示例已默认 `--pids-limit=4096`（cgroup PID 配额，按线程计数）并同时设置 `--ulimit nproc=4096:4096`（容器内 `RLIMIT_NPROC`）；两者只作用于容器，宿主系统 ulimit 无需修改，实际可创建任务数取较低者。可按部署规模调整。
+
+> **停止宽限期**：面板的优雅关停链最多花 25 秒（在途 HTTP 请求、Caddy 排水、任务排空与日志刷盘）。Docker 默认停止宽限只有 10 秒，第 10 秒即 SIGKILL，故 `docker run` 示例带 `--stop-timeout 30`（compose 已内置 `stop_grace_period: 30s`）；自行编排（systemd/Swarm/k8s）时请保证停止宽限 ≥25 秒。
+
+挂载说明:`/app/data` 数据库、配置与 IP 归属地库(必选——IP2Region xdb 实际位于 `/app/data/ip2region.xdb`,随数据卷持久化)、`/app/certs` 证书与私钥(必选)、`/app/backup` 自动备份落盘目录(必选——不挂载则容器重建后备份文件丢失)、`/app/logs` 日志(推荐)、`/app/waf` WAF/CRS 规则库(推荐)。
+
+> host 网络模式仅推荐在 Linux 宿主使用。Docker Desktop 的 host 网络支持依版本/设置而异，请用上面的 `-p` 命令，并将 `/app/data` 放在 named volume(`lb-data`)；bind mount 经 FUSE 共享层有 SQLite WAL 丢页风险(Linux 宿主 bind mount 无此问题)。仓库 `docker-compose.yml` 的主节点固定 host 网络，仅适用于 Linux 开发/部署场景。
 
 打开 `http://localhost:8000` 进入管理面板。首次访问进入初始化向导，无默认凭据。
 
-> Docker Desktop（macOS/Windows）用户：`/app/data` 推荐 named volume
-> （`-v lb-data:/app/data`）；bind mount 经 FUSE 共享层有 SQLite WAL 丢页风险
-> （Linux 宿主 bind mount 无此问题）。
-
-> 宿主机 80/443/8000 被占用时，用 `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 换位
-> （host 网络下即换监听口）。详见[部署指南](docs/deployment.zh-CN.md)。
-> 存量规则端口不会被自动改写，需手动逐条修改后保存。
-
 <details>
-<summary>Docker Compose / 从源码构建</summary>
+<summary>Docker Compose / 构建源码</summary>
 
 ```bash
-# Docker Compose —— compose 文件里的 image 已指向我们自维护的镜像
+# 1) 前端产物（镜像构建的必选前置：Dockerfile 只 COPY 预构建的 web/dist；
+#    仅运行官方镜像可跳过本步）。需要 Node.js ≥ 22.18：`npm test` 用
+#    node --test 直跑 .ts，依赖该版本起的默认 type stripping；见
+#    web/package.json 的 engines 字段
+#    用 `npm ci`（而不是 `npm install`）：前者严格按 package-lock.json 装，
+#    不会就地改写锁文件导致依赖解析漂移。
+cd web && npm ci && npm run build && cd ..
+
+#    产出自证：dist 是预构建产物，陈旧 dist 会被盲目 COPY 进镜像（界面版本号
+#    来自后端，看不出来）。构建完比对戳与当前提交，不一致说明产物过期：
+git rev-parse HEAD && cat web/dist/build-info.json
+
+# 2) Docker Compose（Linux；主节点为 host 网络）
+#    注意通道：仓库里的 docker-compose.yml 钉的是当前开发线的测试通道 tag
+#    （形如 vX.Y.Z-beta，与 Dockerfile 的 VERSION 同步校验）。要稳定版请改用
+#    上面示例里的 `:latest` 标签，或把两处 image 改成对应的稳定版 tag。
 docker compose up -d
 
-# 从源码构建
-# 前端由 Dockerfile 内的 node 构建阶段产出，无需先本地 npm build
+# 3) 或直接构建并推送镜像：VERSION=正式版本号（面板展示口径）；镜像 tag 可带
+#    -beta 通道后缀——两者刻意不同，判定口径「tag 去掉通道后缀 == APP_VERSION」
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=v2.3.8 \
+  --build-arg VERSION=v2.4.2 \
   --provenance=false --sbom=false \
-  -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest --push .
+  -t v55448330/lazy-balancer-v2:v2.4.2-beta --push .   # 测试通道；稳定版当前为 v2.4.2
 ```
-
-镜像由内部流水线构建发布（`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2`）：双架构
-原生构建 → 真容器探活 → 打 `latest` 与版本号两个 manifest。
-
-> 官方 Docker Hub 的 `v55448330/lazy-balancer-v2` 是**上游**的镜像，
-> 不含我们的改动，请勿在本仓库的部署流程里引用它。
 </details>
-
-## 我们相对上游改了什么
-
-**当前上游基线：`v2.3.8`（`d65578fc`，v2.3.8 正式版）。**
-上游这一段的迭代已全部吃进：威胁大屏（2D 地图 + 3D 地球双视图、光流三档聚合、
-自适应采样与采集租约）、WAF 触发自动封禁（阈值计数模型，含观察模式与名单联动）、
-地域拦截海外细化到国家、爬虫豁免（UA + 反向 DNS/官方 IP 段双跳验证，官方爬虫
-地址库定时更新）、厂商爬虫 `.fast` 预编译地址库、安全事件独立保留与流量采样随
-集群同步、全项目多轮审计修复全量落地；
-再往前 `v2.3.6`/`v2.3.7` 的 Caddy v2.11.7、Go 1.26.9、coraza v3.8.1、NTLM 兼容
-开关、`geoipnames` 共享表库、受信网段名单化（`trusted_proxy_range_refs`）、ACME
-传播判据改造等一并保留；逐条对账见[上游合并清单](docs/upstream-merge.zh-CN.md)。
-
-下表只列「人话版」的**我们独有**能力（上游没有的部分）：
-
-| 改动 | 说明 |
-|---|---|
-| 链式回退负载策略 | 一路后端全挂/全 404 时按配置回退到下一组，且不透传后端错误报文 |
-| 引用型证书摄取入库 | `tls_source=file` 改为保存时读取 PEM 入库，DB 成为唯一信任源；外部文件变更由看门狗回写并热重载 |
-| 端口换位 | `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 三个环境变量正式换位，只影响默认语义，不动存量规则 |
-| 引用证书更新放行 | 修掉更新规则时引用证书文件来源被误拦的问题 |
-| 上游版本巡检 | 定时检查上游新 release，发现即开 Issue 提醒 |
-
-## 同步上游的方式
-
-三道闸，各管一段：
-
-1. **GitHub Actions**（`sync-upstream-master.yml`）
-   每 6 小时查一次上游 tag（只认 `v<major>.<minor>.<patch>` 形态的版本级 tag），
-   有新 tag 就把它的提交同步到本仓库的 `master`。
-   需要仓库 Secret `UPSTREAM_SYNC_TOKEN`（PAT，含 repo 权限）。
-
-2. **版本巡检**
-   定时任务比对上游最新版本与维护基线，出现新版本即开 Issue 通知。
-   同一版本只开一条，不会刷屏。
-
-3. **人工合并**
-   收到 Issue 后按[上游合并清单](docs/upstream-merge.zh-CN.md)走一遍：
-   出清单 → 拍板 → 改代码 → 更新基线 → 关 Issue。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [上游合并清单](docs/upstream-merge.zh-CN.md) | 与上游的差异对账、待决策项、合并顺序 |
 | [部署指南](docs/deployment.zh-CN.md) | 挂载目录、环境变量、端口、生产参数 |
 | [安全配置](docs/security.zh-CN.md) | WAF 策略、IP 控制、事件采集、规则更新 |
 | [集群管理](docs/cluster.zh-CN.md) | 主从架构、MFA、安全模型、升级须知 |
@@ -132,30 +105,15 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 | [API 文档](docs/api.zh-CN.md) | REST 端点概览、认证、错误码 |
 | [MCP 文档](docs/mcp.zh-CN.md) | AI 代理接入、工具权限、工作流示例 |
 
-## 功能一览
+## 交流群
 
-| 功能 | 说明 |
-|---|---|
-| 负载均衡 | HTTP/HTTPS/TCP 四层代理，多种策略，健康检查，路径路由 |
-| WAF 防护 | OWASP CRS + 自定义规则 + IP 控制 + 地域拦截 + 限流 |
-| 免费证书 | ACME 自动签发（DNS-01），自动续签 |
-| 主从集群 | 增量同步，防篡改签名，从节点只读，一键提升 |
-| 监控告警 | 流量/延迟 P50-99，上游健康，安全事件总览 |
-| MCP 服务 | AI 代理可通过工具操作全部功能 |
-| 自动备份 | 按日/周/月定时备份配置，支持一键还原 |
+<div align="center">
 
-## 变更日志
+**LazyBalancer 交流群** · 群号：**303410331**
 
-我们自己的迭代按时间倒序记在这里。上游的版本变更请直接看上游 release。
+<img src="docs/qq-group-qr.webp" alt="QQ 交流群" width="240">
 
-| 日期 | 内容 |
-|---|---|
-| 2026-10-23 | **追平上游 `v2.3.8` 正式版**（`d65578fc`，90 提交 / 300 文件）：吃进威胁大屏（2D 地图 + 3D 地球、光流三档聚合、自适应采样与采集租约）、WAF 触发自动封禁（阈值计数模型 + 观察模式）、地域拦截海外细化到国家、爬虫豁免（UA + 反向 DNS/官方 IP 段双跳）与官方爬虫地址库定时更新、厂商爬虫 `.fast` 预编译地址库、安全事件独立保留与采样随集群同步、全项目多轮审计；`geoipnames`/`wafiplist`/`caddygeoip` 以上游为骨（耗时侧车退役，改走审计行 `lb_timing` 内嵌），自维护三项能力（链式回退、引用型证书摄取入库、端口换位）原样保留；Dockerfile 取上游层序（BUILDPLATFORM 交叉编译 + 显式 COPY 清单）并补回 `caddychain` 与前端构建阶段 |
-| 2026-10-13 | **追平上游 `v2.3.6` 正式版**（`9c759716`，23 提交 / 192 文件）：新增 `geoipnames` 零依赖共享表库（xcaddy `--with` 与 `replace` 双保险）、受信网段名单化 `trusted_proxy_range_refs`、NTLM 开关 UI 归位「路由与后端兼容」区、ACME 传播判据改造、多轮审计修复、规则列表 TLS 标签签发态实时可见、CRS v4.28.0；版本口径统一到 `v2.3.6`（取消 beta 后缀）；7 个冲突文件按圈层规则解决，自维护能力（链式回退、引用型证书、端口换位）原样保留 |
-| 2026-10-12 | **追平上游 `v2.3.5` 之后的 11 个未打标签提交**（至 `v2.3.6-beta` / `c617664b`）：Caddy v2.11.7 流式转发回归修复、Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2（10 项 CVE）、coraza v3.8.1 安全修复、新增规则级 NTLM 兼容开关、审计修复、task-engine 状态列方案 A——一次安全/回归级升级；自维护能力（链式回退、引用型证书、端口换位）与规则级 `origin_domain` 口径原样保留 |
-| 2026-10-11 | **合入上游 v2.3.5**（`98c607ac`）：逐上游回源域名改吃上游 `origin_domain` + 原生 `map`，静态响应改吃上游 `response_mode` 三值——自研 `host_header` / `action=respond` 两套实现退役，存量数据自动双向迁移；保留链式回退、引用型证书摄取入库、端口换位三项自维护能力 |
-| 2026-10-11 | 清理仓库内与内部开发平台相关的描述（页脚链接、CI 章节、迁移说明），公开面统一指向本仓库 |
-| 2026-10-11 | 端口换位补齐默认口漏网点；引用证书摄取入库；链式回退策略；新增 GitHub Actions 上游同步与版本巡检；重写 README；`docker-compose` 引用改为自维护镜像 |
+</div>
 
 ## 技术栈
 
@@ -163,9 +121,4 @@ Go 1.26 · Gin · SQLite · Caddy v2.11 · Coraza v3 · OWASP CRS v4 · Vue 3 ·
 
 ## License
 
-上游采用 [Apache License 2.0](LICENSE)。本仓库同样遵循该协议。
-
-按 Apache-2.0 的约定，我们对上游代码的修改已在本仓库的提交历史与
-[上游合并清单](docs/upstream-merge.zh-CN.md)中逐项标注来源与改动内容。
-本仓库**移除了上游 README 中的交流群二维码与群号**（那是上游的社区入口，
-不是本仓库的），并保留上游的 LICENSE 与版权声明不变。
+[Apache License 2.0](LICENSE)

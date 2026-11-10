@@ -5,7 +5,11 @@ package caddygeoip
 //     非 安全中断 的已处理请求）——进程级常驻内存，国名桶硬上限 512（满员
 //     只丢新键，已有键继续计数），随进程生命周期，无文件/无 goroutine。
 //   - 暴露：TrafficStatsAdmin 实现 caddy.AdminRouter——GET /lb/traffic-stats
-//     请求到达时序列化当前快照（无常驻写者/无激活信号；页面异常关闭零残留）。
+//     请求到达时序列化当前快照。计数**只在采集租约有效期间推进**
+//     （traffic_lease.go 的租约激活门 + TTL 自清；blocked_counter 热路径在
+//     无租约时只做一次 atomic load 即返回），快照的 collecting 字段披露租约
+//     当前是否有效——否则「累计不变」与「无流量」不可区分。无常驻写者：
+//     页面异常关闭后租约按 TTL 自清，零残留。
 //   - QPS 保险丝：单秒请求计数超过 fuseQPSPerSecond 时进入 1/N 抽样（N=8，
 //     每 N 个请求计 1 次×N 还原），翻秒且上一秒计数低于阈值 1/4 时回落 N=1。
 //     误差口径披露：抽样期估计量=真值±N（相位偏移 <N 的 floor 量化截断，
@@ -17,8 +21,9 @@ package caddygeoip
 //   - 统计边界：计数由链尾 lb_security_blocked_counter 执行；国名只来自
 //     geoip2region 的服务端变量。未启用地域能力的规则没有该变量，因此不产生
 //     国名桶；大屏流量卡不是全站请求总量。
-//   - 注册语义：admin 路由进程级注册一次（reload 期新旧实例并存，同路径
-//     二次注册会 panic；路由无实例状态——读全局计数器，实例无关）。
+//   - 注册语义：admin 服务每次（重）启动都重建 mux 并实例化全部 admin.api
+//     模块，路由由新 mux 重新注册——本模块无实例状态（只读全局计数器），
+//     reload 不存在「同路径重复注册」问题。
 
 import (
 	"encoding/json"
@@ -102,6 +107,10 @@ func trafficCountryKeyValid(country string) bool {
 	return true
 }
 
+// trafficCountryDropped 记录因满员被丢弃的新国名键累计数（可观测面：
+// 大屏少计不再无声——满员时 countries 桶缺该国家而快照无任何信号）。
+var trafficCountryDropped atomic.Uint64
+
 func trafficEntryFor(country string) *trafficEntry {
 	trafficMu.RLock()
 	e := trafficCountries[country]
@@ -110,16 +119,23 @@ func trafficEntryFor(country string) *trafficEntry {
 		return e
 	}
 	trafficMu.Lock()
-	defer trafficMu.Unlock()
 	if e = trafficCountries[country]; e == nil {
 		// 硬上限兜底：即使未来新增其他调用源，也不能让国家键无界增长。
 		// 满员只丢新键，已有国家继续精确计数。
 		if len(trafficCountries) >= trafficCountryLimit {
+			trafficMu.Unlock()
+			trafficCountryDropped.Add(1)
+			// 首报即记 + 窗口抑制（复用快照加载族的节流实现）：满员是持续态，
+			// 不节流会按请求速率刷屏；状态变化不需要区分，永久满员只需一条/分钟。
+			crawlerSnapshotLogfThrottled("traffic-countries", "full",
+				"traffic stats country bucket full (limit %d), new country %q dropped (dropped_total=%d)",
+				trafficCountryLimit, country, trafficCountryDropped.Load())
 			return nil
 		}
 		e = &trafficEntry{}
 		trafficCountries[country] = e
 	}
+	trafficMu.Unlock()
 	return e
 }
 
@@ -180,10 +196,11 @@ func trafficRecord(country string, attack bool) {
 	}
 }
 
-// trafficSnapshotJSON 序列化当前快照：{"countries":{...},"sample_n":N}——
+// trafficSnapshotJSON 序列化当前快照：{"countries":{...},"sample_n":N,"collecting":bool}——
 // countries 键=原始国名（app 侧翻译中文），值=累计计数（自进程启动）。
-// 采集是否活跃由 app 侧合成的 available 表达（按 admin 可达性判定），本快照
-// 不发射采集开关状态——发而不用的字段会误导调用方把它当开关真源。
+// 计数只在采集租约有效期间推进（无租约时 blocked_counter 热路径直接返回），
+// 因此必须发射 collecting：否则「累计不变」与「无流量」不可区分（available
+// 只表示 admin 可达）。字段语义=采集租约当前是否有效。
 func trafficSnapshotJSON() []byte {
 	trafficMu.RLock()
 	defer trafficMu.RUnlock()
@@ -208,6 +225,12 @@ func trafficSnapshotJSON() []byte {
 	}
 	b = append(b, `},"sample_n":`...)
 	b = appendUint(b, uint64(trafficSampleN.Load()))
+	b = append(b, `,"collecting":`...)
+	if trafficCollectorActive() {
+		b = append(b, "true"...)
+	} else {
+		b = append(b, "false"...)
+	}
 	b = append(b, '}')
 	return b
 }

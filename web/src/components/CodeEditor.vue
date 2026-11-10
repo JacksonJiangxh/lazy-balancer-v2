@@ -5,6 +5,8 @@
       class="code-editor-input"
       :value="modelValue"
       :placeholder="placeholder"
+      :aria-label="ariaLabel || undefined"
+      :readonly="readonly || undefined"
       spellcheck="false"
       @input="onInput"
       @scroll="onScroll"
@@ -13,28 +15,37 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { highlightCode } from '@/utils/highlight'
+import { ref } from 'vue'
+import { useDebouncedHighlight } from '@/composables/useDebouncedHighlight'
 
 const props = withDefaults(defineProps<{
   readonly modelValue: string
   readonly language: string
   readonly placeholder?: string
   readonly height?: string
-}>(), { placeholder: '', height: '520px' })
+  /** 可访问名：placeholder 不是合法替代（读屏不读占位符为名称），
+   *  每个消费方必须提供业务语义名。 */
+  readonly ariaLabel?: string
+  /** 只读：请求在途等场景冻结内容编辑（textarea 只读，不再产生 update 事件）。 */
+  readonly readonly?: boolean
+}>(), { placeholder: '', height: '520px', ariaLabel: '', readonly: false })
 
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 
 const preRef = ref<HTMLElement | null>(null)
 
-const highlighted = computed(() => {
-  const html = highlightCode(props.modelValue, props.language)
-  // Keep the highlight layer in sync height-wise when content ends with a newline.
-  return props.modelValue.endsWith('\n') ? html + '<br>' : html
-})
+// textarea 的文字是透明的（color: transparent），屏幕上可见文本全部来自高亮层。
+// 因此高亮层必须同时承担「即时回显」：键入/首帧先写入转义纯文本，Prism 全文
+// 高亮再按防抖结果覆盖——否则字符要等到下一轮防抖（最长 500ms）才出现。
+// 管线（转义首帧 + 160/500ms 防抖 + 尾换行补齐）与 SyntaxHighlight 同一单源；
+// trailingBreak 让高亮层与相邻 textarea 逐行对齐。
+const { highlighted, setSyncedRaw } = useDebouncedHighlight(() => props.modelValue, () => props.language, { trailingBreak: true })
 
 const onInput = (e: Event) => {
-  emit('update:modelValue', (e.target as HTMLTextAreaElement).value)
+  const value = (e.target as HTMLTextAreaElement).value
+  // 同步纯文本兜底：防抖高亮尚未落地时，键入字符也必须立刻可见。
+  setSyncedRaw(value)
+  emit('update:modelValue', value)
 }
 
 const onScroll = (e: Event) => {

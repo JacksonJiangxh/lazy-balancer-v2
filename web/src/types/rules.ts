@@ -7,7 +7,8 @@ export interface Upstream {
   host: string
   port: number
   weight: number
-  dynamic_dns: boolean
+  // 废弃列（写侧恒 0，渲染只读规则级 dynamic_dns）；响应面已 omitempty 收敛，键可能缺席
+  dynamic_dns?: boolean
   enabled: boolean
   protocol: UpstreamProtocol
   max_connections: number
@@ -28,15 +29,16 @@ export interface PathRuleUpstream {
 }
 
 // 流程弹框「路由分发」行（RuleFlowTarget.pathRules 元素，渲染投影形状）：上游仅
-// 携带主机/端口/启用位，健康态由弹框按 upstreamHealth 快照同逻辑映射
+// 携带主机/端口/启用位，健康态由弹框按 upstreamHealth 快照同逻辑映射。
+// response_mode 非空 = 静态返回/301 跳转（不转发上游）。
 export interface RuleFlowPathRule {
   path: string
   match_type: string
-  upstreams: Array<{ host: string; port: number; enabled: boolean }>
+  upstreams: Array<{ host: string; port: number; enabled: boolean }> | null
+  response_mode?: '' | 'static' | 'redirect'
+  response_status?: number
+  redirect_to?: string
 }
-
-// 路径规则处理方式：proxy=反向代理到上游（默认）；respond=由本程序直接返回静态响应
-export type PathRuleAction = 'proxy' | 'respond'
 
 export interface PathRule {
   id?: number
@@ -98,6 +100,14 @@ export interface Rule extends ProxyTimeoutConfig {
   // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
   chain_race_interval_ms: number
   chain_request_timeout_ms: number
+  // 认证网关（forward_auth）：1=全部请求先经网关校验（仅 HTTP 规则）
+  forward_auth_enabled: number
+  // 网关地址 http(s)://host:port
+  forward_auth_upstream: string
+  // 网关校验路径（默认 /api/authz/forward-auth）
+  forward_auth_uri: string
+  // 认证通过后拷入原请求的身份头清单（逗号分隔）
+  forward_auth_copy_headers: string
   host_header: string
   // 健康检查域名：主动健康检查 probe 的 Host 头；空=跟随 host_header
   health_check_host?: string
@@ -112,7 +122,7 @@ export interface Rule extends ProxyTimeoutConfig {
   // （内容保存时入库，数据库是运行时唯一信任源）
   tls_cert_path?: string
   tls_key_path?: string
-  // F50-7：GetRule 对只读 Key/非管理员掩码 tls_key 时的「已有隐藏私钥」标记
+  // GetRule 对只读 Key/非管理员掩码 tls_key 时的「已有隐藏私钥」标记
   tls_key_set?: boolean
   tls_http_redirect: boolean
   enable_compress: boolean
@@ -121,6 +131,8 @@ export interface Rule extends ProxyTimeoutConfig {
   log_enabled: boolean
   custom_routes_enabled: boolean
   path_rules: PathRule[]
+  // 规则级阶段拦截页覆盖 4 字段已退役（触发归因裁定）：后端保留列停用，
+  // 响应仍可能携带——类型保留仅为读取容忍，前端不再消费/提交。
   block_page_stage1_id: number
   block_page_stage1_status: number
   block_page_stage3_id: number
@@ -160,6 +172,11 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
   chain_race_interval_ms: number
   chain_request_timeout_ms: number
+  // 认证网关四件套（仅 HTTP；enabled=1 时 upstream 必填）
+  forward_auth_enabled: number
+  forward_auth_upstream: string
+  forward_auth_uri: string
+  forward_auth_copy_headers: string
   custom_routes_enabled: boolean
   path_rules: PathRule[]
   host_header: string
@@ -189,6 +206,10 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   | 'upstream_force_http1'
   | 'chain_race_interval_ms'
   | 'chain_request_timeout_ms'
+  | 'forward_auth_enabled'
+  | 'forward_auth_upstream'
+  | 'forward_auth_uri'
+  | 'forward_auth_copy_headers'
   | 'custom_routes_enabled'
   | 'tcp_proxy_protocol'
   | keyof ProxyTimeoutConfig
@@ -205,6 +226,11 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   // 链式回退竞速参数：可选——省略=保留原值（后端 *int 合并语义）
   chain_race_interval_ms?: number
   chain_request_timeout_ms?: number
+  // 认证网关四件套：省略=保留原值（后端指针合并语义）；显式空串=清空
+  forward_auth_enabled?: number
+  forward_auth_upstream?: string
+  forward_auth_uri?: string
+  forward_auth_copy_headers?: string
   custom_routes_enabled?: boolean
   tcp_proxy_protocol: boolean
   proxy_dial_timeout?: number
@@ -216,11 +242,7 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   proxy_stream_close_delay?: number
   path_rules?: PathRule[]
   ca_provider_id?: number
-  // 阶段拦截页（规则级覆盖层）：可选——省略=保留原值（后端 *int 合并语义），
-  // 显式 0=清除覆盖（跟随策略）；status ∈ {0,400,401,403,404,503}
-  block_page_stage1_id?: number
-  block_page_stage1_status?: number
-  block_page_stage3_id?: number
-  block_page_stage3_status?: number
   enabled: boolean
+  // 乐观并发前置条件：编辑向导回传打开时的 updated_at；省略=不校验。
+  expected_updated_at?: string
 }

@@ -12,12 +12,12 @@
     <el-form label-width="120px" class="settings-form" :disabled="readOnly">
       <el-form-item v-for="item in syncSwitchItems" :key="item.key" :label="item.label">
         <el-switch
-          :model-value="item.key === 'sync_users' ? true : status[item.key]"
-          :disabled="item.key === 'sync_users'"
+          :model-value="item.locked ? true : status[item.key]"
+          :disabled="readOnly || item.locked === true"
           :loading="settingsLoading"
           @change="(v: string | number | boolean) => handleSwitchChange(item.key, v)"
         />
-        <span class="form-tip-inline" :title="item.tip">{{ item.tip }}</span>
+        <span class="form-tip-inline switch-tip-nowrap" :title="item.tip">{{ item.tip }}</span>
         <FieldHelpIcon :content="syncSwitchFreezeHint" />
       </el-form-item>
     </el-form>
@@ -34,28 +34,22 @@
       </div>
     </template>
 
-    <el-table :data="nodes" row-key="id" v-loading="loading" stripe :header-cell-style="{ background: 'var(--bg-secondary)' }" empty-text="">
-      <el-table-column prop="name" label="名称" min-width="130" />
-      <el-table-column label="地址" min-width="200" show-overflow-tooltip>
+    <!-- el-table 的 data 只接受可变数组；这里只读投影（组件不会写回），断言仅抹平 readonly 修饰 -->
+      <el-table :data="nodes as ClusterNodeWithSyncError[]" row-key="id" v-loading="loading" stripe :header-cell-style="{ background: 'var(--bg-secondary)' }" empty-text="">
+      <el-table-column prop="name" label="名称" min-width="90" show-overflow-tooltip />
+      <el-table-column label="地址" min-width="130" show-overflow-tooltip>
         <template #default="{ row }"><span class="mono-value">{{ row.ip_address }}:{{ row.port }}</span></template>
       </el-table-column>
-      <el-table-column label="访问地址" min-width="220" show-overflow-tooltip>
+      <el-table-column label="状态" width="70" align="center" class-name="node-status-col">
         <template #default="{ row }">
-          <el-link class="access-url-link" type="primary" :disabled="readOnly || accessUrlSaving" @click="$emit('edit-access-url', row)">
-            {{ row.access_url || '-' }}
-          </el-link>
-        </template>
-      </el-table-column>
-      <el-table-column label="状态" width="110" align="center" class-name="node-status-col">
-        <template #default="{ row }">
-          <el-tooltip v-if="versionIncompatibilityError(row)" :content="versionIncompatibilityError(row)" placement="top">
+          <el-tooltip v-if="versionIncompatibilityError(row as ClusterNodeWithSyncError)" :content="versionIncompatibilityError(row as ClusterNodeWithSyncError)" placement="top">
             <el-tag type="danger" size="small">版本不兼容</el-tag>
           </el-tooltip>
-          <!-- v2.3.0:状态 hover 展示从节点规则库版本(跟随主节点同步,用户裁定) -->
-          <el-tooltip v-else-if="row.health?.crs_version || row.health?.ip2region_version" placement="top">
+          <!-- 状态 hover 展示从节点四个规则库版本（跟随主节点同步，名称与
+               规则库列表严格一致；缺失显示「—」） -->
+          <el-tooltip v-else-if="nodeLibraryVersions(row as ClusterNodeWithSyncError)" placement="top">
             <template #content>
-              <div>CRS：{{ row.health?.crs_version || '—' }}</div>
-              <div>IP2Region：{{ row.health?.ip2region_version || '—' }}</div>
+              <div v-for="item in nodeLibraryVersions(row as ClusterNodeWithSyncError)" :key="item.label">{{ item.label }}：{{ item.version }}</div>
             </template>
             <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
           </el-tooltip>
@@ -63,24 +57,24 @@
           <div v-if="row.status === 'offline'" class="offline-duration">离线 {{ offlineDuration(row.last_seen) }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="配置版本" min-width="170">
+      <el-table-column label="配置版本" min-width="110">
         <template #default="{ row }">
           <el-popover v-if="row.section_sync?.length" placement="top" trigger="hover" :width="460" :show-after="150" :popper-options="popperViewportSafe">
             <template #reference>
               <div class="version-cell">
                 <span class="version-nums">{{ row.reported_version }}<template v-if="row.reported_version < row.current_version"> → {{ row.current_version }}</template></span>
-                <!-- UI(第 20 轮用户裁定):合并状态标签消除换行——分区滞后优先
+                <!-- UI(用户裁定):合并状态标签消除换行——分区滞后优先
                      (节级哈希不一致蕴含版本待同步,hover 明细见 popover 分区列表);
                      两者同现时不再双标签叠行,单标签+数字紧凑呈现。 -->
-                <el-tag v-if="laggingSectionCount(row) > 0" type="warning" size="small" effect="plain">分区滞后 {{ laggingSectionCount(row) }}</el-tag>
+                <el-tag v-if="laggingSectionCount(row as ClusterNodeWithSyncError) > 0" type="warning" size="small" effect="plain">分区滞后 {{ laggingSectionCount(row as ClusterNodeWithSyncError) }}</el-tag>
                 <el-tag v-else-if="row.reported_version < row.current_version" type="warning" size="small" effect="plain">待同步</el-tag>
                 <el-tag v-else-if="row.reported_version === row.current_version" type="success" size="small" effect="plain">已同步</el-tag>
-                <!-- F8:reported>current 罕见形态(主版本回退)——不误显已同步 -->
+                <!-- reported>current 罕见形态(主版本回退)——不误显已同步-->
                 <el-tag v-else type="info" size="small" effect="plain">版本异常</el-tag>
               </div>
             </template>
             <div class="section-sync-panel">
-              <div class="section-sync-title">分区同步状态</div>
+              <div class="popover-title">分区同步状态</div>
               <div v-for="section in row.section_sync" :key="section.section" class="section-sync-row">
                 <div class="section-sync-head">
                   <span class="section-sync-label">{{ section.label }}</span>
@@ -98,13 +92,13 @@
             <span class="version-nums">{{ row.reported_version }}<template v-if="row.reported_version < row.current_version"> → {{ row.current_version }}</template></span>
             <el-tag v-if="row.reported_version < row.current_version" type="warning" size="small" effect="plain">待同步</el-tag>
             <el-tag v-else-if="row.reported_version === row.current_version" type="success" size="small" effect="plain">已同步</el-tag>
-            <!-- F8:reported>current 罕见形态(主版本回退)——不误显已同步 -->
+            <!-- reported>current 罕见形态(主版本回退)——不误显已同步-->
             <el-tag v-else type="info" size="small" effect="plain">版本异常</el-tag>
             <span v-if="row.is_approved" class="section-sync-stale">暂无分区上报</span>
           </div>
         </template>
       </el-table-column>
-      <el-table-column label="健康" width="90" align="center">
+      <el-table-column v-if="showHealthColumn" label="健康" width="64" align="center">
         <template #default="{ row }">
           <el-tooltip v-if="row.health" :content="healthSummary(row.health)" placement="top">
             <el-tag :type="row.health.caddy_ok ? 'success' : 'danger'" size="small">
@@ -114,20 +108,21 @@
           <span v-else class="form-tip-line">暂无</span>
         </template>
       </el-table-column>
-      <el-table-column label="最后上报时间" min-width="170">
+      <el-table-column v-if="showLastSeenColumn" label="最后上报时间" min-width="130">
         <template #default="{ row }">{{ formatDate(row.last_seen) || '-' }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="200" :fixed="operationColumnFixed" align="center">
+      <el-table-column label="操作" width="190" :fixed="operationColumnFixed" align="center">
         <template #default="{ row }">
           <template v-if="row.status === 'pending' || !row.is_approved">
-            <el-button link type="primary" size="small" :loading="pendingNodeId === row.id" :disabled="readOnly || pendingNodeId !== null" @click="$emit('approve', row)">确认</el-button>
-            <el-button link type="danger" size="small" :disabled="readOnly || pendingNodeId !== null" @click="$emit('reject', row)">拒绝</el-button>
+            <el-button link type="primary" size="small" :loading="pendingNodeId === row.id" :disabled="readOnly || pendingNodeId !== null" @click="$emit('approve', row as ClusterNodeWithSyncError)">确认</el-button>
+            <el-button link type="danger" size="small" :disabled="readOnly || pendingNodeId !== null" @click="$emit('reject', row as ClusterNodeWithSyncError)">拒绝</el-button>
           </template>
           <template v-else>
             <div class="op-buttons">
-              <el-button v-if="!readOnly" link type="primary" size="small" :loading="loginNodeId === row.id" :disabled="row.status !== 'online' || loginNodeId !== null" @click="$emit('login', row)">登录</el-button>
-              <el-button v-if="!readOnly && row.status === 'online'" link type="warning" size="small" @click="$emit('service-control', row)">服务</el-button>
-              <el-button link type="danger" size="small" :loading="pendingNodeId === row.id" :disabled="readOnly || pendingNodeId !== null" @click="$emit('remove', row)">删除</el-button>
+              <el-button v-if="!readOnly" link type="primary" size="small" @click="$emit('edit-config', row as ClusterNodeWithSyncError)">配置</el-button>
+              <el-button v-if="!readOnly" link type="primary" size="small" :loading="loginNodeId === row.id" :disabled="row.status !== 'online' || loginNodeId !== null" @click="$emit('login', row as ClusterNodeWithSyncError)">登录</el-button>
+              <el-button v-if="!readOnly && row.status === 'online'" link type="warning" size="small" @click="$emit('service-control', row as ClusterNodeWithSyncError)">服务</el-button>
+              <el-button link type="danger" size="small" :loading="pendingNodeId === row.id" :disabled="readOnly || pendingNodeId !== null" @click="$emit('remove', row as ClusterNodeWithSyncError)">删除</el-button>
             </div>
           </template>
         </template>
@@ -141,6 +136,7 @@
 import { computed } from 'vue'
 import { useWindowSize } from '@vueuse/core'
 import { formatDate } from '@/utils/date'
+import { CLUSTER_SYNC_SWITCHES } from '@/utils/clusterSyncSwitches'
 import { popperViewportSafe } from '@/utils/popper'
 import { List, Setting } from '@element-plus/icons-vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
@@ -155,7 +151,6 @@ const props = defineProps<{
   readonly settingsLoading: boolean
   readonly pendingNodeId: number | null
   readonly loginNodeId: number | null
-  readonly accessUrlSaving: boolean
   readonly readOnly: boolean
 }>()
 
@@ -167,22 +162,18 @@ const emit = defineEmits<{
   (event: 'remove', node: ClusterNode): void
   (event: 'login', node: ClusterNode): void
   (event: 'service-control', node: ClusterNode): void
-  (event: 'edit-access-url', node: ClusterNode): void
+  (event: 'edit-config', node: ClusterNode): void
 }>()
 
 const { width: viewportWidth } = useWindowSize()
 const operationColumnFixed = computed<'right' | false>(() => viewportWidth.value > 1440 ? 'right' : false)
-const syncSwitchItems = [
-  // (三分类合并:全局配置并入系统数据节)确保系统基本运行的数据不可禁用同步。
-  // 2026-09-19 文案整理:「证书文件随负载规则开关同步」属 rules 开关管辖
-  // (R64 A-N5),不在本行尾注。
-  { key: 'sync_users', label: '系统数据', tip: '用户账号、API 密钥、ACME 配置与全局设置（恒同步，不可禁用）' },
-  // 证书任务行与证书文件随本开关(R64 A-N5):关闭时从节点保留本地规则,
-  // 其证书行/文件不按主节点快照删改。
-  { key: 'sync_rules', label: '负载均衡规则', tip: '规则、上游、路径规则与证书任务（证书文件随本开关同步）' },
-  // 三分类合并:规则库文件差量通道并入安全防护开关(单开关统策略行与文件)。
-  { key: 'sync_security', label: '安全防护', tip: '安全策略、自定义规则与 CRS/IP2Region 规则库（文件哈希一致时跳过传输）' },
-] as const
+// 窄屏优先保留业务列，隐藏健康/最后上报，避免水平滚动。
+const showHealthColumn = computed(() => viewportWidth.value >= 1380)
+const showLastSeenColumn = computed(() => viewportWidth.value >= 1580)
+// 三分类单源 utils/clusterSyncSwitches（父级确认文案同源）；行内注释记录的
+// 合并裁定（全局配置并入系统数据、证书文件随 rules 开关、文件差量并入安全
+// 防护）随单源一并保留。
+const syncSwitchItems = CLUSTER_SYNC_SWITCHES
 
 const syncSwitchFreezeHint = '关闭后从节点保留最近一次同步内容，不自动删除'
 
@@ -206,6 +197,23 @@ const statusLabel = (status: ClusterNodeStatus): string => {
 const healthSummary = (health: ClusterHealth): string => {
   const summary = `Caddy ${health.caddy_ok ? '正常' : '异常'} · 规则 ${health.rules_count} · 30 天内到期 ${health.certs_expiring_30d}`
   return health.last_sync_error ? `${summary} · ${health.last_sync_error}` : summary
+}
+
+// 规则库版本行——名称与 SecurityRules 规则库列表严格一致（单源语义：
+// CRS 规则库 / IP 地理库 / 威胁情报库 / 爬虫地址库），缺失显示「—」。
+const NODE_LIBRARY_FIELDS = [
+  { label: 'CRS 规则库', key: 'crs_version' },
+  { label: 'IP 地理库', key: 'ip2region_version' },
+  { label: '威胁情报库', key: 'threat_version' },
+  { label: '爬虫地址库', key: 'crawler_version' },
+] as const satisfies readonly { readonly label: string; readonly key: keyof ClusterHealth }[]
+
+const nodeLibraryVersions = (node: ClusterNodeWithSyncError): { label: string; version: string }[] | null => {
+  const health = node.health
+  if (!health) return null
+  const rows = NODE_LIBRARY_FIELDS.map(({ label, key }) => ({ label, version: health[key] || '—' }))
+  // 四个版本全缺失时不挂 tooltip（与服务端未上报版本同形，避免空 tooltip）
+  return rows.some(row => row.version !== '—') ? rows : null
 }
 
 const offlineDuration = (lastSeen: string | null | undefined): string => {
@@ -247,7 +255,7 @@ const versionIncompatibilityError = (node: ClusterNodeWithSyncError): string => 
 </script>
 
 <style scoped>
-/* SYSRENDER33-2(第 33 轮审计,P2)+ 2026-09-17 用户实证修正:原豁免覆盖
+/* + 2026-09-17 用户实证修正:原豁免覆盖
    全表所有含标签列(配置版本/健康同被压成块级,单行标签失去垂直居中)。
    精确化为「仅状态列且离线时长存在时」才块级叠行——在线(单标签)与
    配置版本/健康列回全局 inline-flex 居中规则。 */
@@ -258,20 +266,18 @@ const versionIncompatibilityError = (node: ClusterNodeWithSyncError): string => 
 .card-tip { font-size: 12px; color: #9ca3af; white-space: nowrap; flex-shrink: 0; }
 .settings-form :deep(.el-form-item__label) { white-space: nowrap; }
 .settings-form :deep(.el-form-item__content) { flex-wrap: nowrap; }
-.settings-form .form-tip-inline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+/* 不换行截断由本页专用修饰类承载——全局 .form-tip-inline 不得在 scoped 中重定义。 */
+.settings-form .switch-tip-nowrap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-primary); }
 .mono-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.access-url-link { display: inline-flex; max-width: 100%; vertical-align: middle; }
-.access-url-link :deep(.el-link__inner) { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .version-cell { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; min-width: 0; }
 .version-cell-wrap { flex-wrap: wrap; }
-/* F3(第 20.5 轮):stale 分支三元素可超 170px——该分支恢复 wrap,主分支
+/* stale 分支三元素可超 170px——该分支恢复 wrap,主分支
    (两元素版本号+标签)保持 nowrap 消除换行。 */
 .version-nums { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .offline-duration { font-size: 12px; color: #9ca3af; margin-top: 2px; }
 .section-sync-stale { font-size: 12px; color: #9ca3af; }
 .section-sync-panel { display: flex; flex-direction: column; gap: 6px; }
-.section-sync-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .section-sync-row { display: flex; flex-direction: column; gap: 2px; font-size: 12px; padding: 4px 0; }
 .section-sync-row + .section-sync-row { border-top: 1px dashed var(--el-border-color-lighter); }
 .section-sync-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

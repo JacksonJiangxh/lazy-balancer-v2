@@ -1,11 +1,11 @@
 package handlers
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
@@ -20,6 +20,8 @@ func initBrandingTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 同步复位 currentDB，后台循环不得持有已关闭测试库
+		db.SetDB(oldDB)
 	})
 }
 
@@ -51,7 +53,7 @@ func TestRenderDefaultBlockPage_substitutes_app_name_and_footer_text(t *testing.
 	}
 }
 
-// 2026-09-25 用户裁定（推翻 D5 KNOWN-GAP-1 全宽裁定）：默认拦截页改浅色精美
+// 2026-09-25 用户裁定（推翻既往全宽裁定）：默认拦截页改浅色精美
 // 风，内容卡片限宽居中、不占满页面宽度。锁定限宽 token 与精美化形状
 // （SVG 徽章 + 403 胶囊），防止回退到全宽或纯文字布局。
 func TestRenderDefaultBlockPage_card_width_capped_and_centered(t *testing.T) {
@@ -88,7 +90,7 @@ func TestRenderDefaultBlockPage_omits_footer_text_line_when_empty(t *testing.T) 
 	if !strings.Contains(html, `Powered by <span class="name">Acme</span>`) {
 		t.Errorf("rendered page missing powered-by line:\n%s", html)
 	}
-	if strings.Count(html, "<br>") != 1 || !strings.Contains(html, `href="https://github.com/xzydm/lazy-balancer-v2"`) {
+	if strings.Count(html, "<br>") != 1 || !strings.Contains(html, `href="https://github.com/v55448330/lazy-balancer-v2"`) {
 		t.Errorf("rendered page should contain exactly one line break (repo link only) when footer text is empty:\n%s", html)
 	}
 }
@@ -136,7 +138,7 @@ func TestSeedDefaultBlockPage_uses_default_branding_when_file_missing(t *testing
 	if !strings.Contains(content, defaultBranding.AppName) || !strings.Contains(content, strings.Split(defaultBranding.FooterText, " · ")[0]) {
 		t.Errorf("default block page missing default branding:\n%s", content)
 	}
-	if !strings.Contains(content, `href="https://github.com/xzydm/lazy-balancer-v2"`) {
+	if !strings.Contains(content, `href="https://github.com/v55448330/lazy-balancer-v2"`) {
 		t.Errorf("default block page footer missing repo link:\n%s", content)
 	}
 	if content == before {
@@ -307,7 +309,7 @@ func TestLoadBrandingConfig_memorySnapshotDetectsFileChange(t *testing.T) {
 	}
 
 	// 删除(运行期瞬态窗口):保旧值(2026-09-11 裁定——重启重建负责重置,
-	// SL7-4;半截写/删除同属「文件暂不可用」,不闪回默认)。
+	// ;半截写/删除同属「文件暂不可用」,不闪回默认)。
 	os.Remove(path)
 	if cfg := loadBrandingConfig(dir); cfg.AppName != "Beta" {
 		t.Fatalf("after remove: app_name=%q, want keep-last-good Beta", cfg.AppName)
@@ -395,9 +397,7 @@ func resetBrandingStore() {
 	brandingStore.mu.Lock()
 	brandingStore.loaded = false
 	brandingStore.cfg = brandingConfig{}
-	brandingStore.dataDir = ""
-	brandingStore.modTime = time.Time{}
-	brandingStore.size = 0
+	brandingStore.stamp = brandingFileStamp{}
 	brandingStore.mu.Unlock()
 }
 
@@ -493,5 +493,190 @@ func TestBrandingHotReload_touchNoChurn(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("unchanged content must not log reload, got %d", n)
+	}
+}
+
+// 公开无鉴权 GetBranding 端点的失败分支不再每请求重读+记日志——
+// 60s 探测/日志限流；文件恢复后下一次访问立即读到新值（last-known-good 不变）。
+func TestLoadBrandingConfig_failureProbeThrottledAndRecovers(t *testing.T) {
+	resetBrandingStore()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "branding.json")
+	if err := os.WriteFile(path, []byte(`{"app_name":"甲"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := loadBrandingConfig(dir); cfg.AppName != "甲" {
+		t.Fatalf("boot load app_name=%q", cfg.AppName)
+	}
+
+	oldWriter := log.Writer()
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	failureLogs := func() int { return strings.Count(buf.String(), "branding: 文件暂不可解析") }
+
+	// 半截写：连续 10 次调用只允许一条失败留痕。
+	st, _ := os.Stat(path)
+	if err := os.WriteFile(path, []byte(`{"app_name":"乙"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForDistinctMtime(t, path, st.ModTime())
+	for range 10 {
+		if cfg := loadBrandingConfig(dir); cfg.AppName != "甲" {
+			t.Fatalf("半截写必须保 last-known-good, got %q", cfg.AppName)
+		}
+	}
+	if got := failureLogs(); got != 1 {
+		t.Fatalf("半截写失败日志=%d 条, want 1（60s 限流）: %q", got, buf.String())
+	}
+
+	// 恢复完整：下一次调用立即读到新值。
+	st2, _ := os.Stat(path)
+	if err := os.WriteFile(path, []byte(`{"app_name":"丙"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForDistinctMtime(t, path, st2.ModTime())
+	if cfg := loadBrandingConfig(dir); cfg.AppName != "丙" {
+		t.Fatalf("恢复后必须立即读到新值, got %q", cfg.AppName)
+	}
+
+	// 删除窗口：60s 内不重复探测/留痕；重建文件后立即收敛。
+	buf.Reset()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	for range 10 {
+		if cfg := loadBrandingConfig(dir); cfg.AppName != "丙" {
+			t.Fatalf("删除窗口必须保 last-known-good, got %q", cfg.AppName)
+		}
+	}
+	if got := failureLogs(); got != 1 {
+		t.Fatalf("删除窗口失败日志=%d 条, want 1（探测缓存）: %q", got, buf.String())
+	}
+	if err := os.WriteFile(path, []byte(`{"app_name":"丁"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := loadBrandingConfig(dir); cfg.AppName != "丁" {
+		t.Fatalf("重建文件后必须立即读到新值, got %q", cfg.AppName)
+	}
+}
+
+// 内置页 id 被自定义页占用时，播种 UPDATE 不得改写该行
+// （INSERT OR IGNORE 冲突后原实现仍按 id 改写自定义内容/标志）。
+func TestSeedDefaultBlockPage_skipsWhenBuiltinIDOccupiedByCustomPage(t *testing.T) {
+	initBrandingTestDB(t)
+	dataDir := t.TempDir()
+	if _, err := db.DB.Exec(`DELETE FROM security_block_pages WHERE id=9001`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_block_pages (id, name, description, content, is_default, is_builtin) VALUES (9001, '我的自定义页', '自定义描述', '<html>custom</html>', 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWriter := log.Writer()
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	if _, err := SeedDefaultBlockPage(dataDir); err != nil {
+		t.Fatalf("SeedDefaultBlockPage: %v", err)
+	}
+
+	var name, description, content string
+	var builtin bool
+	if err := db.DB.QueryRow(`SELECT name, COALESCE(description,''), COALESCE(content,''), COALESCE(is_builtin,0) FROM security_block_pages WHERE id=9001`).Scan(&name, &description, &content, &builtin); err != nil {
+		t.Fatal(err)
+	}
+	if name != "我的自定义页" || description != "自定义描述" || content != "<html>custom</html>" || builtin {
+		t.Fatalf("自定义页被改写: name=%q desc=%q content=%q builtin=%v", name, description, content, builtin)
+	}
+	if !strings.Contains(buf.String(), "已被自定义页面占用") {
+		t.Fatalf("id 占用须 warn 点名: %q", buf.String())
+	}
+}
+
+// branding.json 的变化判据必须单源：内存快照热重载与幂等同步门此前各写一套
+// stat/指纹实现（store 用 modTime+size，同步门用另一份字符串指纹），改一侧
+// 判据另一侧与测试都不会发现。守卫=源码中只允许 statBrandingFile 一处 os.Stat。
+func TestBrandingFileChangeDetection_singleStatSource(t *testing.T) {
+	src, err := os.ReadFile("branding.go")
+	if err != nil {
+		t.Fatalf("read branding.go: %v", err)
+	}
+	if got := strings.Count(string(src), "os.Stat("); got != 1 {
+		t.Fatalf("branding.go 中 os.Stat( 出现 %d 次, want 1（变化判据须单源 statBrandingFile，其余入口复用其观测结果）", got)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "branding.json")
+	if err := os.WriteFile(path, []byte(`{"app_name":"甲"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stamp := statBrandingFile(dir)
+	if !stamp.statOK || stamp.fingerprint() == "" {
+		t.Fatalf("stamp=%+v, want 有效观测与指纹", stamp)
+	}
+	// 同步门记录的指纹必须就是同一观测的指纹，不得另算一套（改一侧判据时另一侧
+	// 不会跟随的根因）。
+	resetBrandingSyncGateForTest()
+	t.Cleanup(resetBrandingSyncGateForTest)
+	if !brandingSyncGateAllow(dir) {
+		t.Fatal("首次观测后同步门应放行一轮")
+	}
+	brandingSyncMu.Lock()
+	gateFingerprint := brandingSyncFingerprint
+	brandingSyncMu.Unlock()
+	if gateFingerprint != stamp.fingerprint() {
+		t.Fatalf("同步门指纹=%q, store 观测指纹=%q, want 单源", gateFingerprint, stamp.fingerprint())
+	}
+	if statBrandingFile(filepath.Join(dir, "missing")).fingerprint() != "" {
+		t.Fatal("stat 失败时指纹必须为空串（调用方跳过本轮）")
+	}
+}
+
+// stat 成功但不可解析（半截写/手工写坏）时，store 必须记住这次观测到的形态：
+// 否则公开无鉴权 GET /branding 每个请求都重读全文并重新解析。文件随后真正变化
+// （mtime 更新）时仍须立即收敛到新内容。
+func TestLoadBrandingConfig_unparsableFileRecordsObservedStat(t *testing.T) {
+	resetBrandingStore()
+	t.Cleanup(resetBrandingStore)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "branding.json")
+	if err := os.WriteFile(path, []byte(`{"app_name":"甲"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := loadBrandingConfig(dir); cfg.AppName != "甲" {
+		t.Fatalf("boot load app_name=%q, want 甲", cfg.AppName)
+	}
+
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"app_name":`), 0o644); err != nil { // 整体 JSON 非法
+		t.Fatal(err)
+	}
+	waitForDistinctMtime(t, path, st.ModTime())
+	if cfg := loadBrandingConfig(dir); cfg.AppName != "甲" {
+		t.Fatalf("不可解析时必须保 last-known-good, got %q", cfg.AppName)
+	}
+	observed := statBrandingFile(dir)
+	brandingStore.mu.RLock()
+	recorded := brandingStore.stamp
+	brandingStore.mu.RUnlock()
+	if !recorded.sameOnDisk(observed) {
+		t.Fatalf("store 记录的形态=%+v 与文件当前形态=%+v 不一致：不可解析的文件会被每请求重读", recorded, observed)
+	}
+
+	// 文件真正变化（内容修好且 mtime 更新）→ 立即收敛。
+	st2, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"app_name":"丙"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForDistinctMtime(t, path, st2.ModTime())
+	if cfg := loadBrandingConfig(dir); cfg.AppName != "丙" {
+		t.Fatalf("恢复完整后必须立即读到新值, got %q", cfg.AppName)
 	}
 }

@@ -17,6 +17,34 @@ import (
 // 自动绑定（规则默认仍跟随默认 403 页）。本组测试钉住：builtin 行门禁、渲染形状、
 // 播种与自愈（内容漂移/标志丢失均归位库存）。
 
+func TestRenderBlockPageShell_usesSquareCornersForAllBuiltinPages(t *testing.T) {
+	cfg := brandingConfig{AppName: "Acme"}
+	for _, variant := range []string{"default", "ratelimit", "maintenance"} {
+		page := renderBlockPageShell(cfg, blockPageSpecs[variant])
+		for _, rounded := range []string{
+			"border-radius: 22px", "border-radius: 24px", "border-radius: 32px",
+			"border-radius: 999px", "border-radius: 0 0 4px 4px",
+		} {
+			if strings.Contains(page, rounded) {
+				t.Errorf("%s 仍含圆角声明 %q", variant, rounded)
+			}
+		}
+		for _, selector := range []string{".card {", ".card::before", ".badge-ring", ".badge-halo", ".chip {"} {
+			idx := strings.Index(page, selector)
+			if idx < 0 {
+				t.Fatalf("%s 缺少样式选择器 %s", variant, selector)
+			}
+			end := strings.Index(page[idx:], "}")
+			if end < 0 || !strings.Contains(page[idx:idx+end], "border-radius: 0") {
+				t.Errorf("%s 的 %s 未改为直角", variant, selector)
+			}
+		}
+		if !strings.Contains(page, ".blob { position: absolute; border-radius: 50%;") {
+			t.Errorf("%s 的环境光斑应保持圆形装饰", variant)
+		}
+	}
+}
+
 func TestRenderBuiltinBlockPage_variants(t *testing.T) {
 	// Given
 	cfg := brandingConfig{AppName: "Acme", FooterText: "© 2026 Acme"}
@@ -53,7 +81,7 @@ func TestSeedDefaultBlockPage_seedsAndRepairsBuiltinPages(t *testing.T) {
 		t.Fatalf("内置限流页未随 schema 播种: %v", err)
 	}
 	if !ratelimitBuiltin || !strings.Contains(ratelimitContent, "429 Too Many Requests") || !strings.Contains(ratelimitContent, "min(560px") {
-		t.Fatalf("F63-B5d-1: builtin 429 page missing or content wrong (builtin=%v)", ratelimitBuiltin)
+		t.Fatalf("builtin 429 page missing or content wrong (builtin=%v)", ratelimitBuiltin)
 	}
 	if err := db.DB.QueryRow(`SELECT COALESCE(is_builtin,0) FROM security_block_pages WHERE id=9002`).Scan(&maintenanceBuiltin); err != nil || !maintenanceBuiltin {
 		t.Fatalf("内置维护页未随 schema 播种: builtin=%v err=%v", maintenanceBuiltin, err)
@@ -80,9 +108,9 @@ func TestSeedDefaultBlockPage_seedsAndRepairsBuiltinPages(t *testing.T) {
 }
 
 func TestSeedDefaultBlockPage_repairsBuiltinPagesWithNullColumns(t *testing.T) {
-	// Given 带外改库把内置备选页 content/description 置 NULL——SYS-U2（第 69 轮）：
+	// Given 带外改库把内置备选页 content/description 置 NULL——
 	// 自愈 UPDATE 的裸 != 比较对 NULL 不命中（NULL != ? 为 NULL），漂移行永不归位；
-	// 与 :510 默认页第 61 轮 P3 修复同口径，须 COALESCE 同防。
+	// 与:510 默认页修复同口径，须 COALESCE 同防。
 	initBrandingTestDB(t)
 	dataDir := t.TempDir()
 	if _, err := db.DB.Exec(`UPDATE security_block_pages SET content=NULL, description=NULL WHERE id=9001`); err != nil {
@@ -157,4 +185,89 @@ func TestDeleteSecurityBlockPage_rejectsBuiltinPage(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_block_pages WHERE id=?`, pageID).Scan(&pages); err != nil || pages != 1 {
 		t.Fatalf("内置页被删除: rows=%d err=%v", pages, err)
 	}
+}
+
+// 内置页双表一致性：blockPageSpecs（渲染规格）与 builtinBlockPageIdentities
+// （播种身份）必须双向对齐——只加 spec 不加 identity 会静默不播种，identity
+// 指向不存在的 variant 会渲染空串写入内容库存页。两者均无编译期约束，由本
+// 用例做机器门禁。
+func TestBuiltinBlockPageSpecsAndIdentitiesStayInSync(t *testing.T) {
+	variants := make(map[string]bool, len(builtinBlockPageIdentities))
+	for _, bp := range builtinBlockPageIdentities {
+		if _, ok := blockPageSpecs[bp.variant]; !ok {
+			t.Errorf("内置页 %d（%s）的 variant %q 不在 blockPageSpecs 中（会渲染空内容）", bp.id, bp.name, bp.variant)
+		}
+		if variants[bp.variant] {
+			t.Errorf("内置页 variant %q 重复登记（播种 id 冲突/重复行）", bp.variant)
+		}
+		variants[bp.variant] = true
+	}
+	for variant := range blockPageSpecs {
+		if variant == "default" {
+			continue // 默认 403 页由 is_default=1 行承载，不是内置备选页
+		}
+		if !variants[variant] {
+			t.Errorf("blockPageSpecs 的 variant %q 没有对应的内置页身份（永不播种）", variant)
+		}
+	}
+}
+
+// API 不接受 is_builtin 与显式 id：INSERT 列清单不含这两列，静默丢弃会让调用方
+// 以为「已创建内置页/指定了 id」，实际落普通行（伪造内置页本需备份导入门）。
+// 与 is_default 同口径：显式拒绝并点名原因。
+func TestCreateSecurityBlockPage_rejectsBuiltinAndExplicitID(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newBlockPageContentTypeRouter(t)
+	before := countBlockPages(t)
+
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantText string
+	}{
+		{"builtin", `{"name":"伪内置页","content":"x","is_builtin":true}`, "内置拦截页由系统管理"},
+		{"explicit-id", `{"name":"指定ID页","content":"x","id":42}`, "拦截页 ID 由系统分配"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := blockPageRequest(t, router, http.MethodPost, "/security/block-pages", tc.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantText) {
+				t.Fatalf("body=%s, want 含 %q", rec.Body.String(), tc.wantText)
+			}
+			if after := countBlockPages(t); after != before {
+				t.Fatalf("拒绝路径落库了行：before=%d after=%d", before, after)
+			}
+		})
+	}
+	var builtinRows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_block_pages WHERE is_builtin=1`).Scan(&builtinRows); err != nil {
+		t.Fatal(err)
+	}
+	if builtinRows == 0 {
+		t.Fatal("夹具失效：内置页应有播种行")
+	}
+
+	// 回归形状：普通创建仍 200 且落普通行
+	rec := blockPageRequest(t, router, http.MethodPost, "/security/block-pages", `{"name":"普通页","content":"x"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("normal create status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var isBuiltin bool
+	if err := db.DB.QueryRow(`SELECT COALESCE(is_builtin,0) FROM security_block_pages WHERE name='普通页'`).Scan(&isBuiltin); err != nil {
+		t.Fatal(err)
+	}
+	if isBuiltin {
+		t.Fatal("普通创建不得落 is_builtin=1")
+	}
+}
+
+func countBlockPages(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_block_pages`).Scan(&n); err != nil {
+		t.Fatalf("count block pages: %v", err)
+	}
+	return n
 }

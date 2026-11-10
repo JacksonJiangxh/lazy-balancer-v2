@@ -254,11 +254,11 @@ func TestIPListFileState_statThrottleTickIsMonotonic(t *testing.T) {
 
 // 钩子此前零消费方（注释声称「渲染日志已覆盖」不成立）——运行期名单被删/
 // 写坏时按旧集合无限期判定且无任何日志。默认实现须写 stderr 日志；同路径
-// 上报按 StaleServeLogInterval 节流；恢复成功后清除节流记录（再故障即时上报）。
+// 上报按 staleServeLogInterval 节流；恢复成功后清除节流记录（再故障即时上报）。
 func TestStaleServe_reportThrottledPerPathAndResetOnRecovery(t *testing.T) {
-	oldInterval := StaleServeLogInterval
+	oldInterval := staleServeLogInterval
 	oldHook := OnStaleServe
-	StaleServeLogInterval = time.Hour
+	staleServeLogInterval = time.Hour
 	var calls []string
 	OnStaleServe = func(path string, err error) {
 		if err == nil {
@@ -269,7 +269,7 @@ func TestStaleServe_reportThrottledPerPathAndResetOnRecovery(t *testing.T) {
 	oldStat := StatCheckInterval
 	StatCheckInterval = 0
 	t.Cleanup(func() {
-		StaleServeLogInterval = oldInterval
+		staleServeLogInterval = oldInterval
 		OnStaleServe = oldHook
 		StatCheckInterval = oldStat
 	})

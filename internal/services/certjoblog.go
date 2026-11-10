@@ -3,11 +3,11 @@ package services
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,15 +15,15 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// B3（第 65 轮后裁定）：证书任务日志并入任务日志体系——挂靠
+// 证书任务日志并入任务日志体系——挂靠
 // {任务日志目录}/certjobs/（与 tasks/*.log 同根：大小上限共用
 // task_log_size_mb、保留清理由 log-cleanup housekeeping 统一扫描）。
-// U1-66-03≡L1-66-02：目录**惰性求值**——taskengine.LogDir() 注入恒晚于包
+// 目录**惰性求值**——taskengine.LogDir() 注入恒晚于包
 // 初始化，曾以包级 IIFE 固化致生产恒回退 /app/logs 根（脱离 housekeeping
 // 清理面）。LogDir 未注入（测试环境）回退 /app/logs。
 const legacyCertJobLogRoot = "/app/logs"
 
-// certJobLogMigrated 旧目录一次性迁移门（U1-66-03）：SetLogDir 后首次
+// certJobLogMigrated 旧目录一次性迁移门：SetLogDir 后首次
 // 使用时把固化期写入旧根的 certjob-*.log（含轮转代 .1-.5/.gz）搬入新目录。
 // atomic 而非 sync.Once：测试可复位重放（Once 值拷贝触发 vet noCopy）。
 var certJobLogMigrated atomic.Bool
@@ -42,10 +42,22 @@ func CertJobLogDir() string {
 	return target
 }
 
+// certJobLogMigrateLink 是旧目录迁移的落位原语（测试缝：var 而非直接调用，
+// 供用例模拟「并发写者在落位前抢建同名文件」的竞态窗口）。os.Link 在目标已
+// 存在时返回 EEXIST——这为「迁移落位」与「写侧创建同名文件」提供了原子仲裁点：
+// 不再有 Stat→Rename 的 check-then-act 窗口。
+var certJobLogMigrateLink = os.Link
+
 // migrateLegacyCertJobLogs 一次性迁移：源=任务日志目录的父目录（容器内即
-// /app/logs——tasks 的宿主根，pre-B3 与固化期 certjob-* 的实际落点）。
-// best-effort：扫描/搬移失败记日志继续（旧文件残留无害——读侧已切新目录，
-// 清理面按新目录扫描）；目标同名文件已存在视为新数据，跳过不覆盖。
+// /app/logs——tasks 的宿主根，与固化期 certjob-* 的实际落点）。
+// 扫描/搬移失败记日志继续（旧文件残留无害——读侧已切新目录，
+// 清理面按新目录扫描）。
+//
+// 落位用链接而非 rename：写侧以 O_CREATE|O_APPEND 创建目标文件，rename 会在
+// 「目标不存在」判定之后无条件覆盖——写者在这两步之间建好并写入的行被旧文件
+// 整体顶掉（丢行）。os.Link 的 EEXIST 即「新数据已落位（或写者正在写）」，
+// 迁移让位跳过，旧文件留在原处等下次启动再试（此时目标已存在，仍跳过）；
+// 链接成功后再删源文件，数据不经过复制（同一 inode）。
 func migrateLegacyCertJobLogs(legacyRoot, target string) {
 	entries, err := os.ReadDir(legacyRoot)
 	if err != nil {
@@ -65,11 +77,19 @@ func migrateLegacyCertJobLogs(legacyRoot, target string) {
 			}
 		}
 		dst := filepath.Join(target, name)
-		if _, err := os.Stat(dst); err == nil {
-			continue // 新目录已有同名文件（升级后已写入）——不覆盖
+		source := filepath.Join(legacyRoot, name)
+		// 原子落位（见上）：EEXIST = 新数据/并发写者已建同名文件，让位不覆盖。
+		if linkErr := certJobLogMigrateLink(source, dst); linkErr != nil {
+			if errors.Is(linkErr, os.ErrExist) {
+				continue // 新目录已有同名文件（升级后已写入/写者占用）——不覆盖
+			}
+			certJobLogWarnf("cert job log: migrate legacy %s failed: %v", name, linkErr)
+			continue
 		}
-		if err := os.Rename(filepath.Join(legacyRoot, name), dst); err != nil {
-			certJobLogWarnf("cert job log: migrate legacy %s failed: %v", name, err)
+		if removeErr := os.Remove(source); removeErr != nil {
+			// 数据已在目标（同一 inode 的硬链接），源文件残留仅多一份目录项；
+			// 下次启动因目标已存在而跳过——不影响正确性，必须留痕。
+			certJobLogWarnf("cert job log: remove migrated legacy %s failed: %v", name, removeErr)
 			continue
 		}
 		moved++
@@ -80,6 +100,12 @@ func migrateLegacyCertJobLogs(legacyRoot, target string) {
 }
 
 const maxRotatedFiles = 5
+
+// CertJobLogMaxRotatedFiles 导出证书任务日志写侧的保留份数契约
+// handlers 的 logRotatedBackups 与展示层必须与写侧同源——此前
+// 靠测试读取本文件源码文本（`const maxRotatedFiles = 5`）钉住，改注释/加类型
+// 声明即误红，且第三个 writer 出现时漏验。导出 getter 让契约以数值断言。
+func CertJobLogMaxRotatedFiles() int { return maxRotatedFiles }
 
 // certJobLogWarnf 是轮转失败告警的测试接缝（var 而非直接 log.Printf，镜像
 // finalizeTimeout 等先例：测试捕获告警调用，生产代码不得改写）。
@@ -92,16 +118,21 @@ type CertJobFileLogger struct {
 	ruleID string
 }
 
-// certJobLogWriteLocks 按 ruleID 串行化写与轮转（C-11，2026-09-05 证书域审计
+// certJobLogWriteLocks 按 ruleID 串行化写与轮转（2026-09-05 证书域审计
 // 裁定）：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog*），实例级
 // 锁防不了跨实例并发轮转的 check-then-rename 交错——两个实例同时越过大小阈值
 // 时，后者的 os.Rename(path, path+".1") 会覆盖前者刚轮转出的 .1，丢一整代
-// 历史。键空间以 ruleID 为界（规则量级），无需回收。
-var certJobLogWriteLocks sync.Map // ruleID -> *sync.Mutex
+// 历史。条目随最后持有者释放回收（refCountedLockTable）：规则可反复创建/删除，
+// 只增不删的表会按历史规则总数无界增长。
+//
+// 键口径 = certJobLogFileComponent(ruleID)：housekeeping
+// 从文件名反解 ruleID，只能拿到已编码的主体；若写侧用原始值取锁，写与清理会持
+// 不同互斥量，轮转/删除交错可覆盖 .1 代或删除未过期代。旧实现用剔除非法字符的
+// 主体（sanitizePathComponent），不可逆致 `lb.dot` 与 `lbdot` 共文件共锁。
+var certJobLogWriteLocks refCountedLockTable // file component -> entry
 
-func lockCertJobLog(ruleID string) *sync.Mutex {
-	lock, _ := certJobLogWriteLocks.LoadOrStore(ruleID, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+func lockCertJobLog(ruleID string) *refCountedLock {
+	return certJobLogWriteLocks.acquire(certJobLogFileComponent(ruleID))
 }
 
 // NewCertJobFileLogger creates a logger bound to a specific rule.
@@ -111,63 +142,20 @@ func NewCertJobFileLogger(ruleID string) *CertJobFileLogger {
 
 // CertJobLogPath returns the log file path for the given rule ID.
 func CertJobLogPath(ruleID string) string {
-	return filepath.Join(CertJobLogDir(), fmt.Sprintf("certjob-%s.log", sanitizePathComponent(ruleID)))
+	return filepath.Join(CertJobLogDir(), fmt.Sprintf("certjob-%s.log", certJobLogFileComponent(ruleID)))
 }
 
-func sanitizePathComponent(value string) string {
-	out := make([]rune, 0, len(value))
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-			out = append(out, r)
-		}
-	}
-	return string(out)
-}
-
-// Round 35 I-17: 缓存 task_log_size_mb 配置，避免每条日志写入都查 DB。
-// 缓存有效期 5 分钟，过期后下一次调用触发刷新。
-var (
-	certJobLogSizeCached     atomic.Int64
-	certJobLogSizeCachedAt   atomic.Int64
-	certJobLogSizeCacheTTLNs = int64(5 * time.Minute)
-	certJobLogSizeRefreshMu  sync.Mutex
-)
-
-func getTaskLogSizeBytes() int64 {
-	// SVC-F2（第 73 轮）：未初始化库回退默认 10MB，不得 nil deref（当前
-	// 不可达；与同包多数配置读取 helper 的 db.DB==nil 守卫口径一致）。
-	if db.DB == nil {
-		return 10 * 1024 * 1024
-	}
-	now := time.Now().UnixNano()
-	cachedAt := certJobLogSizeCachedAt.Load()
-	if cachedAt != 0 && now-cachedAt < certJobLogSizeCacheTTLNs {
-		return certJobLogSizeCached.Load()
-	}
-	certJobLogSizeRefreshMu.Lock()
-	defer certJobLogSizeRefreshMu.Unlock()
-	// Double-check after acquiring lock to avoid thundering herd.
-	if cachedAt = certJobLogSizeCachedAt.Load(); cachedAt != 0 && time.Now().UnixNano()-cachedAt < certJobLogSizeCacheTTLNs {
-		return certJobLogSizeCached.Load()
-	}
-	var sizeMB int
-	if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
-		// B431-1(第 43 轮):读取失败静默降级 10MB 曾无痕——留 warn 含 err
-		// 便于排查配置漂移(与下方 sizeMB<=0 的防御同口径)。
-		Logf("warn", "读取证书任务日志大小配置失败,按 10MB 降级: %v", err)
-		sizeMB = 10
-	}
-	if sizeMB <= 0 {
-		sizeMB = 10
-	}
-	bytes := int64(sizeMB) * 1024 * 1024
-	certJobLogSizeCached.Store(bytes)
-	certJobLogSizeCachedAt.Store(now)
-	return bytes
+// certJobLogFileComponent 证书任务日志文件名主体：与规则访问日志同构的可逆编码
+// （encodeFileComponent）。字母表内 ID 原样保留（既有文件命名零变化）；
+// 带点等存量 ID 编码为 "%"+hex，使 `lb.dot`/`lbdot` 落不同文件与不同写锁
+// （旧剔除实现让二者共文件：签发日志跨规则混写、保留期清理互相删除）。
+// 反解见 logrotate.certJobLogRuleIDFromName（旧文件名仍可解析）。
+func certJobLogFileComponent(ruleID string) string {
+	return encodeFileComponent(ruleID)
 }
 
 func (l *CertJobFileLogger) write(level, stage, message string) {
-	// C-11：跨实例按 ruleID 串行化（见 certJobLogWriteLocks 注释）。
+	// 跨实例按 ruleID 串行化（见 certJobLogWriteLocks 注释）。
 	unlock := lockCertJobLog(l.ruleID)
 	unlock.Lock()
 	defer unlock.Unlock()
@@ -175,21 +163,17 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 	path := CertJobLogPath(l.ruleID)
 
 	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
-	line := fmt.Sprintf("%s [%s] %s - %s\n", timestamp, level, stage, message)
+	// 产物是「一行一条」的文本日志：消息里的 CR/LF（多行错误串/Caddy 响应体）
+	// 必须先归一为单行，再按截断预算裁剪——与任务日志同源（任务日志目录下
+	// 的另一条写路径），否则单次写入会在文件里伪造出无前缀的独立行。
+	line := taskengine.TruncateTaskLogLine(taskengine.SanitizeTaskLogLine(
+		fmt.Sprintf("%s [%s] %s - %s", timestamp, level, stage, message))) + "\n"
 
-	// L1-P4-1（第 67 轮）：轮转判定计入待写入行——size+len(line) 超阈即在写入
-	// 前轮转，磁盘上活动文件恒 ≤ 上限。log-cleanup housekeeping（tasks/ 主流水，
-	// taskLogsHousekeeping）对超阈文件做「rename → .1」单代覆盖式轮转：此前本
-	// 写入侧仅在 size≥阈值时轮转，追加把活动文件推过阈值后、下一次写入前的窗
-	// 口内，housekeeping 节拍会把活动文件 rename 覆盖既有 .1（5 代链最新一代
-	// 整代丢失）。活动文件恒 ≤ 上限后 housekeeping 尺寸分支永不命中证书任务
-	// 日志，轮转唯一负责方归本写入侧（5 代移位），双轨覆盖窗口根除；
-	// housekeeping 的保留期清理语义不变。
-	if info, err := os.Stat(path); err == nil && info.Size()+int64(len(line)) > getTaskLogSizeBytes() {
-		// 轮转失败不再吞没（C-11）：留痕告警后继续追加，维持原写入可用性。
-		if err := rotateCertJobLogFiles(path); err != nil {
-			certJobLogWarnf("cert job log: rotate %s failed: %v", path, err)
-		}
+	// 轮转判定计入待写入行——size+len(line) 超阈即在写入
+	// 前轮转，磁盘上活动文件恒 ≤ 上限。尺寸滚动唯一负责方为本写入侧（5 代移位），
+	// log-cleanup 仅负责保留期清理，不再参与尺寸轮转。
+	if _, err := taskengine.RotateTaskLogBeforeWrite(path, int64(len(line)), maxRotatedFiles); err != nil {
+		certJobLogWarnf("cert job log: rotate %s failed: %v", path, err)
 	}
 
 	if err := os.MkdirAll(CertJobLogDir(), 0755); err != nil {
@@ -202,30 +186,19 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 		Logf("error", "cert job log: failed to open %s: %v", path, err)
 		return
 	}
-	defer f.Close()
-
-	fmt.Fprint(f, line)
+	writeCertJobLogLine(f, path, line)
 }
 
-// rotateCertJobLogFiles 把 current 逐代下移到 .1（.1→.2 … .4→.5，删除旧 .5）。
-// 缺失的中间代（备份不足 maxRotatedFiles 份时的常态）按 IsNotExist 静默跳过；
-// 其余错误收集上抛，由调用方留痕——此前全部丢弃，坏轮转零迹可循（C-11）。
-func rotateCertJobLogFiles(path string) error {
-	var errs []error
-	if err := os.Remove(fmt.Sprintf("%s.%d", path, maxRotatedFiles)); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("remove %s.%d: %w", filepath.Base(path), maxRotatedFiles, err))
+// writeCertJobLogLine 写一行并关闭，写/关闭错误经 Logf 留痕（磁盘配额
+// 耗尽/只读降级时 OpenFile 可成功而后续写入失败，此前两类错误被静默吞没，
+// 日志与 cert_jobs 状态分叉且无告警）。不改变签发结果。
+func writeCertJobLogLine(dst io.WriteCloser, path, line string) {
+	if _, err := fmt.Fprint(dst, line); err != nil {
+		Logf("error", "cert job log: write %s failed: %v", path, err)
 	}
-	for i := maxRotatedFiles - 1; i >= 1; i-- {
-		oldPath := fmt.Sprintf("%s.%d", path, i)
-		newPath := fmt.Sprintf("%s.%d", path, i+1)
-		if err := os.Rename(oldPath, newPath); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, fmt.Errorf("shift %s.%d: %w", filepath.Base(path), i, err))
-		}
+	if err := dst.Close(); err != nil {
+		Logf("warn", "cert job log: close %s failed: %v", path, err)
 	}
-	if err := os.Rename(path, path+".1"); err != nil {
-		errs = append(errs, fmt.Errorf("rotate current %s: %w", filepath.Base(path), err))
-	}
-	return errors.Join(errs...)
 }
 
 // Log implements the acme.Logger interface (info level).
@@ -253,17 +226,28 @@ func WriteCertJobLogByRule(ruleID, level, stage, message string) {
 }
 
 func RemoveCertJobLogFiles(ruleID string) error {
-	// Cert-新1(第 2 轮审计):持写锁——写路径 C-11 串行化写与轮转,但删除路径
+	// Cert-新1:持写锁——写路径串行化写与轮转,但删除路径
 	// 此前无锁:删除时在途签发 goroutine 尾部日志重建孤儿文件(certjob-<rule>.log)。
-	lockCertJobLog(ruleID).Lock()
-	defer lockCertJobLog(ruleID).Unlock()
+	// 文件名主体已改为可逆编码；旧实现剔除非法字符产出的历史文件
+	// （如 `lb.dot` → certjob-lbdot.log）与新文件名不同，此处不顺手删除——
+	// 旧名与「剔除后同名的另一条规则」（lbdot）无法区分，误删会清掉他人日志。
+	// 历史文件由保留期清理（taskLogsHousekeeping 可解析旧名）自然淘汰。
+	lock := lockCertJobLog(ruleID)
+	lock.Lock()
+	defer lock.Unlock()
 	path := CertJobLogPath(ruleID)
+	// 仓内轮转只做 rename（rotateTaskLogFile 不压缩），但 logstats 读侧承认
+	// 外部 logrotate 留下的整文件 gzip 归档形态（<base>.gz）；删除规则时
+	// 连历史压缩代（.N.gz）一并清理，否则残留孤儿文件只能靠保留期兜底。
+	candidates := make([]string, 0, 2*maxRotatedFiles+2)
+	candidates = append(candidates, path, path+".gz")
+	for index := 1; index <= maxRotatedFiles; index++ {
+		candidates = append(candidates,
+			fmt.Sprintf("%s.%d", path, index),
+			fmt.Sprintf("%s.%d.gz", path, index))
+	}
 	var cleanupErrors []error
-	for index := 0; index <= maxRotatedFiles; index++ {
-		candidate := path
-		if index > 0 {
-			candidate = fmt.Sprintf("%s.%d", path, index)
-		}
+	for _, candidate := range candidates {
 		if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("删除证书任务日志 %s: %w", candidate, err))
 		}

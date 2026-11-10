@@ -47,35 +47,38 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 	if err := json.Unmarshal(unpackExportBody(t, exportResponse.Body.Bytes()), &exportPayload); err != nil {
 		t.Fatalf("decode export: %v", err)
 	}
-	tables := exportPayload["tables"].(map[string]any)
-	pathRows := tables["path_rules"].([]any)
+	tables, ok := exportPayload["tables"].(map[string]any)
+	if !ok {
+		t.Fatalf("export tables 形态异常: %T", exportPayload["tables"])
+	}
+	pathRows, ok := tables["path_rules"].([]any)
+	if !ok {
+		t.Fatalf("export path_rules 形态异常: %T", tables["path_rules"])
+	}
 	if len(pathRows) != 1 {
 		t.Fatalf("export path_rules rows=%d, want 1", len(pathRows))
 	}
 	// 旧版本备份形态：首行剥掉 upstream_path 键，再造一行显式 null
-	firstRow := pathRows[0].(map[string]any)
+	firstRow, ok := pathRows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("export path_rules 行形态异常: %T", pathRows[0])
+	}
 	delete(firstRow, "upstream_path")
 	pathRows = append(pathRows, map[string]any{
 		"rule_id": "lb_uplegacy", "sort_order": 1, "match_type": "exact", "path": "/health", "upstream_path": nil,
 	})
 	tables["path_rules"] = pathRows
 
-	// 与导入侧同构重算校验和（sha256 over {tables, config} 重编组）
+	// 与导入侧同一单源重算校验和（导出为 v3：覆盖 meta+sections+tables+config）
 	remarshaled, err := json.Marshal(exportPayload)
 	if err != nil {
 		t.Fatalf("encode mutated backup: %v", err)
 	}
-	var rebackup struct {
-		Tables map[string][]map[string]any `json:"tables"`
-		Config map[string]any              `json:"config"`
-	}
+	var rebackup configBackup
 	if err := json.Unmarshal(remarshaled, &rebackup); err != nil {
 		t.Fatalf("decode mutated backup: %v", err)
 	}
-	checksumPayload, err := json.Marshal(struct {
-		Tables map[string][]map[string]any `json:"tables"`
-		Config map[string]any              `json:"config"`
-	}{rebackup.Tables, rebackup.Config})
+	checksumPayload, err := configBackupChecksumPayload(rebackup)
 	if err != nil {
 		t.Fatalf("encode checksum payload: %v", err)
 	}
@@ -112,5 +115,42 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 	}
 	if nullRowPath != "" {
 		t.Fatalf("explicit-null row upstream_path=%q, want empty", nullRowPath)
+	}
+}
+
+// 携带 lb_rules 但 upstreams/path_rules 缺席的截断备份会让 live upstream/path
+// 行指向已被整体替换的规则（渲染不可见、集群快照原样 dump、极小概率 id 复用
+// 误挂）——导入事务内按导入后视图幂等剪枝。
+
+func TestRulesOnlyImportPrunesOrphanUpstreamAndPathRows(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	a3SeedLiveAdmin(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled)
+		VALUES ('lb_orphan','orphan','http','orphan.example.test',18081,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_orphan','127.0.0.1',9100,1,1,'http')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path) VALUES ('lb_orphan',0,'prefix','/api','')`); err != nil {
+		t.Fatal(err)
+	}
+	// 截断备份形态：携带 lb_rules 但 upstreams/path_rules 缺席。
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"rules"}, Tables: map[string][]map[string]any{
+		"lb_rules": {{"caddy_id": "lb_new", "name": "new", "protocol": "http", "domain": "new.example.test", "listen_port": 80, "enabled": 1}},
+	}, Config: nil})
+
+	rec := postBackupImport(t, h, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	for _, table := range []string{"upstreams", "path_rules"} {
+		var orphans int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM ` + table + ` WHERE rule_id='lb_orphan'`).Scan(&orphans); err != nil {
+			t.Fatal(err)
+		}
+		if orphans != 0 {
+			t.Fatalf("%s 孤儿行=%d, want 0（规则已被整体替换）", table, orphans)
+		}
 	}
 }

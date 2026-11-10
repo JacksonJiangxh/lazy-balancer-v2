@@ -9,8 +9,8 @@
                 <el-icon class="title-icon"><Monitor /></el-icon>
                 <span>系统概览</span>
               </div>
-              <el-tag :type="isSlave ? 'warning' : 'success'" size="small" effect="plain">
-                {{ isSlave ? '从节点' : '主节点' }}
+              <el-tag :type="nodeModeTagType" size="small" effect="plain">
+                {{ nodeModeLabel }}
               </el-tag>
             </div>
           </template>
@@ -46,24 +46,43 @@
               <div class="card-title">
                 <el-icon class="title-icon caddy-icon"><Cpu /></el-icon>
                 <span>Caddy 服务状态</span>
-                <el-tooltip v-if="caddyApplyError" placement="bottom" :content="caddyApplyError">
+                <el-tooltip v-if="caddyApplyError && !caddyStatusUnavailable" placement="bottom" :content="caddyApplyError">
                   <el-tag type="danger" size="small" effect="plain" style="margin-left: 8px">配置应用失败</el-tag>
+                </el-tooltip>
+                <!-- 审计项：后台数据类重载（证书部署/CRS/IP库/威胁库/自动封禁）失败
+                     独立横幅——库已更新但运行配置未收敛，与写路径「保存失败」区分。 -->
+                <el-tooltip v-if="caddyBackgroundApplyError && !caddyStatusUnavailable" placement="bottom" :content="caddyBackgroundApplyError" :popper-style="{ maxWidth: '420px' }">
+                  <el-tag type="warning" size="small" effect="plain" style="margin-left: 8px">后台重载失败</el-tag>
                 </el-tooltip>
               </div>
               <div class="header-actions">
-                <el-tag 
-                  :type="caddyStatus === 'running' ? 'success' : caddyStatus === 'stopped' ? 'danger' : 'info'" 
-                  size="small" 
+                <el-tag v-if="caddyStatusUnavailable" type="info" size="small" effect="plain">状态采集失败</el-tag>
+                <el-tag
+                  v-else
+                  :type="caddyStatus === 'running' ? 'success' : caddyStatus === 'stopped' ? 'danger' : 'info'"
+                  size="small"
                   effect="plain"
-                  :class="['status-tag', caddyStatus]"
+                  :class="['status-tag', caddyStatusClass]"
                 >
                   {{ caddyStatus === 'running' ? (caddyPid !== '0' && caddyPid !== '' ? `运行中 ${caddyPid}` : '运行中') : caddyStatus === 'stopped' ? '已停止' : '未知' }}
                 </el-tag>
-                <el-tag v-if="configConsistent === 'true'" type="success" size="small" effect="plain">配置正常</el-tag>
-                <el-tooltip v-else-if="configConsistent === 'false'" placement="bottom" :content="configDrift" :popper-style="{ maxWidth: '360px' }">
+                <!-- 审计项：从节点不执行独立的配置一致性检查（配置由主节点快照
+                     下发），此前沿用主节点口径显示「配置正常」= 从未执行过的检查。
+                     从节点改为「主节点权威」声明，主节点保持一致性横幅。
+                     角色未知窗口（nodeMode===null：/config 首拉失败或 15s 重试期）
+                     同样不得宣告「配置正常」——此时 configConsistent 是上一轮/
+                     默认值，展示层必须 fail-closed 声明角色未知。 -->
+                <el-tooltip v-if="authStore.isSlaveNode" placement="bottom" content="从节点配置由主节点快照下发，本机不执行独立一致性检查" :popper-style="{ maxWidth: '360px' }">
+                  <el-tag type="info" size="small" effect="plain">主节点权威</el-tag>
+                </el-tooltip>
+                <el-tooltip v-else-if="nodeModeRole === 'unknown'" placement="bottom" content="节点角色尚未确认（配置拉取中或失败），暂不判定配置一致性" :popper-style="{ maxWidth: '360px' }">
+                  <el-tag type="info" size="small" effect="plain">角色未知</el-tag>
+                </el-tooltip>
+                <el-tag v-else-if="configConsistent === 'true' && !caddyStatusUnavailable" type="success" size="small" effect="plain">配置正常</el-tag>
+                <el-tooltip v-else-if="configConsistent === 'false' && !caddyStatusUnavailable" placement="bottom" :content="configDrift" :popper-style="{ maxWidth: '360px' }">
                   <el-tag type="danger" size="small" effect="plain">配置异常</el-tag>
                 </el-tooltip>
-                <div v-if="authStore.readOnlyReason === null" class="caddy-actions">
+                <div v-if="authStore.readOnlyReason === null && !caddyStatusUnavailable" class="caddy-actions">
                   <el-button v-if="caddyStatus === 'running'" type="warning" size="small" @click="controlCaddy('restart')" :loading="caddyLoading">
                     重启
                   </el-button>
@@ -84,8 +103,8 @@
                   <el-icon><Document /></el-icon>
                 </div>
                 <div class="stat-content">
-                  <div class="stat-value">{{ caddyMetricsUnavailable ? '采集失败' : caddyMetrics ? caddyMetrics.requests_total.toLocaleString() : '-' }}</div>
-                  <div class="stat-label">总请求数</div>
+                  <div class="stat-value">{{ caddyMetricsUnavailable ? '采集失败' : caddyMetrics ? formatInt(caddyMetrics.requests_total) : '-' }}</div>
+                  <div class="stat-label" :title="METRIC_RELOAD_RESET_NOTE">总请求数</div>
                 </div>
               </div>
             </el-col>
@@ -175,41 +194,65 @@
           </template>
           <el-skeleton v-if="initialLoading" :rows="2" animated />
           <div v-else-if="systemMetricsUnavailable" class="collection-state">采集失败</div>
-          <el-row v-else-if="systemMetrics" :gutter="32">
-            <el-col :span="8">
+          <template v-else-if="systemMetrics">
+            <div v-if="degradedSystemParts.size" class="info-note-bar">
+              <span class="info-note-desc">部分指标采集失败：{{ degradedSystemLabels.join('、') }}</span>
+              <span>（仅展示其余可用指标；该项数值不代表真实用量）</span>
+            </div>
+            <div class="resource-grid">
               <div class="resource-item">
                 <div class="resource-header">
                   <span class="resource-label">CPU 使用率</span>
-                  <span class="resource-value text-blue">{{ systemMetrics.cpu_percent.toFixed(1) }}%</span>
+                  <span class="resource-value text-blue">
+                    {{ degradedSystemParts.has('cpu') ? '采集失败' : `${systemMetrics.cpu_percent.toFixed(1)}%` }}
+                  </span>
                 </div>
-                <el-progress :percentage="Math.min(systemMetrics.cpu_percent, 100)" :stroke-width="6" color="#3b82f6" :show-text="false" />
+                <el-progress v-if="cpuProgressPercent !== null" :percentage="cpuProgressPercent" :stroke-width="6" color="#3b82f6" :show-text="false" />
               </div>
-            </el-col>
-            <el-col :span="8">
               <div class="resource-item">
                 <div class="resource-header">
                   <span class="resource-label">内存使用</span>
                   <span class="resource-value text-purple">
-                    {{ formatBytes(systemMetrics.memory_used) }}
-                    <span class="resource-total">/ {{ formatBytes(systemMetrics.memory_total) }}</span>
+                    <template v-if="degradedSystemParts.has('memory')">采集失败</template>
+                    <template v-else>
+                      {{ formatBytes(systemMetrics.memory_used) }}
+                      <span class="resource-total">/ {{ formatBytes(systemMetrics.memory_total) }}</span>
+                    </template>
                   </span>
                 </div>
-                <el-progress :percentage="Math.min(systemMetrics.memory_percent, 100)" :stroke-width="6" color="#8b5cf6" :show-text="false" />
+                <el-progress v-if="memoryProgressPercent !== null" :percentage="memoryProgressPercent" :stroke-width="6" color="#8b5cf6" :show-text="false" />
               </div>
-            </el-col>
-            <el-col :span="8">
               <div class="resource-item">
                 <div class="resource-header">
                   <span class="resource-label">磁盘使用</span>
                   <span class="resource-value text-cyan">
-                    {{ formatBytes(systemMetrics.disk_used) }}
-                    <span class="resource-total">/ {{ formatBytes(systemMetrics.disk_total) }}</span>
+                    <template v-if="degradedSystemParts.has('disk')">采集失败</template>
+                    <template v-else>
+                      {{ formatBytes(systemMetrics.disk_used) }}
+                      <span class="resource-total">/ {{ formatBytes(systemMetrics.disk_total) }}</span>
+                    </template>
                   </span>
                 </div>
-                <el-progress :percentage="Math.min(systemMetrics.disk_percent, 100)" :stroke-width="6" color="#06b6d4" :show-text="false" />
+                <el-progress v-if="diskProgressPercent !== null" :percentage="diskProgressPercent" :stroke-width="6" color="#06b6d4" :show-text="false" />
               </div>
-            </el-col>
-          </el-row>
+              <div class="resource-item">
+                <div class="resource-header">
+                  <span class="resource-label-group">
+                    <span class="resource-label">进程配额</span>
+                    <FieldHelpIcon :content="pidsTooltip" />
+                  </span>
+                  <span class="resource-value-group">
+                    <template v-if="degradedSystemParts.has('pids')">采集失败</template>
+                    <template v-else>
+                      <span class="resource-value" :class="pidsValueClass">{{ pidsUsageParts.current }}</span>
+                      <span class="resource-total">/ {{ pidsUsageParts.maxPart }}<template v-if="systemMetrics.pids_max > 0"> ({{ pidsPercentLabel(systemMetrics.pids_percent) }}%)</template></span>
+                    </template>
+                  </span>
+                </div>
+                <el-progress v-if="pidsProgressPercentValue !== null" :percentage="pidsProgressPercentValue" :stroke-width="6" :color="pidsProgressColor" :show-text="false" />
+              </div>
+            </div>
+          </template>
           <div v-else class="collection-state">-</div>
         </el-card>
       </el-col>
@@ -227,8 +270,9 @@
             </div>
           </template>
           <el-skeleton v-if="initialLoading" :rows="4" animated class="chart-skeleton" />
-          <div v-else-if="trafficUnavailable" class="chart-container collection-state">采集失败</div>
+          <div v-else-if="trafficUnavailable && trafficTimestamps.length === 0" class="chart-container collection-state">采集失败</div>
           <div v-else class="chart-container">
+            <div v-if="trafficUnavailable" class="chart-stale-hint">采集失败：展示上次结果</div>
             <v-chart :option="trafficChartOption" autoresize />
           </div>
         </el-card>
@@ -244,8 +288,9 @@
             </div>
           </template>
           <el-skeleton v-if="initialLoading" :rows="4" animated class="chart-skeleton" />
-          <div v-else-if="connectionsUnavailable" class="chart-container collection-state">采集失败</div>
+          <div v-else-if="connectionsUnavailable && connTimestamps.length === 0" class="chart-container collection-state">采集失败</div>
           <div v-else class="chart-container">
+            <div v-if="connectionsUnavailable" class="chart-stale-hint">采集失败：展示上次结果</div>
             <v-chart :option="connChartOption" autoresize />
           </div>
         </el-card>
@@ -262,11 +307,15 @@
                 <span>负载均衡规则</span>
               </div>
               <div class="card-header-actions">
+                <!-- 刷新失败但有缓存时必须明示陈旧：表格仍渲染上一次结果，与
+                     新鲜的指标列混排，不提示会被误读为当前真实规则集 -->
+                <el-tag v-if="rulesUnavailable && rules.length > 0" type="warning" size="small" effect="plain" title="规则列表刷新失败，当前展示上次拉取的结果">规则列表刷新失败：展示上次结果</el-tag>
+                <el-tag v-if="ruleMetricsEpochLabel" class="epoch-tag" type="info" size="small" effect="plain" :title="METRIC_RELOAD_RESET_NOTE">{{ ruleMetricsEpochLabel }}</el-tag>
                 <el-radio-group v-model="rankBy" size="small" aria-label="规则排序方式">
                   <el-radio-button value="requests">按请求数</el-radio-button>
                   <el-radio-button value="bytes">按流量</el-radio-button>
                 </el-radio-group>
-                <span class="rules-count" title="规则数量">{{ rules.length }}</span>
+                <span class="rules-count" :title="`共 ${rules.length} 条规则；本卡展示请求数/流量前 10 条 + 指标采集失败行（零流量规则不进入排行）`">{{ rules.length }}</span>
               </div>
             </div>
           </template>
@@ -278,22 +327,22 @@
             stripe
             :header-cell-style="{ background: '#f9fafb' }"
           >
-            <!-- R72 二十八次宽度二调（用户实测 458/230 失调）：min-width 弹性列按
+            <!-- 宽度二调（用户实测 458/230 失调）：min-width 弹性列按
                  值比例分配剩余空间（260:130 把 2/3 剩余给了状态码列）——改固定 width
                  才能精确控制比例；名称列取 280（内容列），右端空白由表格自然留白。 -->
             <el-table-column prop="name" label="规则名称" min-width="300" show-overflow-tooltip>
               <template #default="{ row }">
-                <!-- R72 二十八次：长规则名省略号 + 悬浮全文（列宽 100→130 用户反馈调整）。 -->
-                <!-- R72 二十八次审计 F1：省略号样式必须放在 slot 内层 span——el-link 根是
+                <!-- 长规则名省略号 + 悬浮全文（列宽 100→130 用户反馈调整）。-->
+                <!-- 省略号样式必须放在 slot 内层 span——el-link 根是
                      inline-flex，text 直接内容在 .el-link__inner flex item 里，根上的
                      text-overflow 不会渲染 …（flex 容器无自有行盒），只硬裁切。 -->
-                <el-link type="primary" underline="never" role="button" tabindex="0" :title="row.name" @click.prevent="openRuleHistory(row)" @keydown.enter.prevent="openRuleHistory(row)" @keydown.space.prevent="openRuleHistory(row)"><span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ row.name }}</span></el-link>
+                <AccessibleLink type="primary" underline="never" :title="row.name" @click="openRuleHistory(row as Rule)"><span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ row.name }}</span></AccessibleLink>
               </template>
             </el-table-column>
             <el-table-column label="协议" width="85">
               <template #default="{ row }">
-                <el-tag :type="getRuleProtocolTagType(row)" size="small" effect="plain">
-                  {{ getRuleProtocolLabel(row) }}
+                <el-tag :type="getRuleProtocolTagType(row as Rule)" size="small" effect="plain">
+                  {{ getRuleProtocolLabel(row as Rule) }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -312,17 +361,19 @@
             </el-table-column>
             <el-table-column label="请求数" width="110">
               <template #default="{ row }">
-                <span class="text-primary" :title="isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-'">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-' }}</span>
+                <span class="text-primary" :title="ruleMetricCellTitle({ disabled: isRuleDisabled(row as Rule), unavailable: !!ruleMetricsUnavailable[row.caddy_id], tcp: row.protocol === 'tcp', value: ruleRequestsTotalText(row.caddy_id) })">{{ isRuleDisabled(row as Rule) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleRequestsTotalText(row.caddy_id) }}</span>
               </template>
             </el-table-column>
-            <!-- R72 二十八次初版 310 过宽（用户反馈）→ 260：常见量级（万级以内）
-                 四 badge 单行 ~230px 舒适；极端大数字（百万级）由 flex-wrap 换行
-                 兜底（badge 自身 nowrap，不出现数字内折）。
-                 第 48 轮（用户反馈）：入站/出站流量列 90→100（字节量级数字易被截），
-                 差额从状态码列 380→360 划出（badge 单行 ~230px 仍有充足余量）。 -->
+            <!-- 初版 310 过宽（用户反馈）→ 260：常见量级（万级以内）
+                 五 badge（2xx/3xx/4xx/5xx/Block）单行 ~290px 舒适；计数升到
+                 百万级时由 .status-codes 的 flex-wrap 换行兜底（badge 自身
+                 nowrap，不出现数字内折）——不得改回 nowrap + overflow:hidden：
+                 那会把末尾 Block 静默裁掉，让「有拦截」看起来是「无拦截」。
+                 历史（用户反馈）：入站/出站流量列 90→100（字节量级数字易被截），
+                 差额从状态码列 380→360 划出。 -->
             <el-table-column label="状态码" width="360">
               <template #default="{ row }">
-                <span v-if="isRuleDisabled(row)" class="text-secondary">已禁用</span>
+                <span v-if="isRuleDisabled(row as Rule)" class="text-secondary">已禁用</span>
                 <div v-else-if="row.protocol === 'tcp'" class="text-secondary">-</div>
                 <span v-else-if="ruleMetricsUnavailable[row.caddy_id]" class="text-secondary">采集失败</span>
                 <div v-else-if="hasRuleRequests(row.caddy_id)" class="status-codes">
@@ -337,7 +388,7 @@
             </el-table-column>
             <el-table-column label="入站流量" width="100">
               <template #default="{ row }">
-                <span v-if="isRuleDisabled(row)" class="text-secondary">已禁用</span>
+                <span v-if="isRuleDisabled(row as Rule)" class="text-secondary">已禁用</span>
                 <span v-else-if="row.protocol === 'tcp'" class="text-secondary">-</span>
                 <span v-else-if="ruleMetricsUnavailable[row.caddy_id]" class="text-secondary">采集失败</span>
                 <span v-else class="text-secondary">{{ ruleMetrics[row.caddy_id] ? formatBytes(ruleMetrics[row.caddy_id].bytes_in) : '-' }}</span>
@@ -345,7 +396,7 @@
             </el-table-column>
             <el-table-column label="出站流量" width="100">
               <template #default="{ row }">
-                <span v-if="isRuleDisabled(row)" class="text-secondary">已禁用</span>
+                <span v-if="isRuleDisabled(row as Rule)" class="text-secondary">已禁用</span>
                 <span v-else-if="row.protocol === 'tcp'" class="text-secondary">-</span>
                 <span v-else-if="ruleMetricsUnavailable[row.caddy_id]" class="text-secondary">采集失败</span>
                 <span v-else class="text-secondary">{{ ruleMetrics[row.caddy_id] ? formatBytes(ruleMetrics[row.caddy_id].bytes_out) : '-' }}</span>
@@ -353,7 +404,7 @@
             </el-table-column>
             <el-table-column label="处理中" width="70">
               <template #default="{ row }">
-                <span class="text-secondary">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_in_flight ?? '-' }}</span>
+                <span class="text-secondary" :title="ruleMetricCellTitle({ disabled: isRuleDisabled(row as Rule), unavailable: !!ruleMetricsUnavailable[row.caddy_id], tcp: row.protocol === 'tcp', value: String(ruleMetrics[row.caddy_id]?.requests_in_flight ?? '-') })">{{ isRuleDisabled(row as Rule) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_in_flight ?? '-' }}</span>
               </template>
             </el-table-column>
             <el-table-column label="健康状态" width="80">
@@ -375,11 +426,7 @@
 
     <el-dialog v-model="ruleHistoryVisible" width="min(900px, 92vw)" destroy-on-close class="history-dialog">
       <template #header>
-        <div class="dialog-title">
-          <el-icon class="dialog-title-icon"><TrendCharts /></el-icon>
-          <span class="dialog-title-main">历史统计</span>
-          <el-text type="info" size="small" class="dialog-title-sub">{{ ruleHistoryRule?.name }} · {{ ruleHistoryRule ? getRuleProtocolLabel(ruleHistoryRule) : '' }} · :{{ ruleHistoryRule?.listen_port }}</el-text>
-        </div>
+        <DialogHeader :icon="TrendCharts" title="历史统计" :subtitle="`${ruleHistoryRule?.name || ''} · ${ruleHistoryRule ? getRuleProtocolLabel(ruleHistoryRule) : ''} · :${ruleHistoryRule?.listen_port}`" />
       </template>
       <div class="history-toolbar">
         <el-radio-group v-model="ruleHistoryRange" size="small" aria-label="历史统计时间范围" @change="fetchRuleHistory">
@@ -391,27 +438,29 @@
       </div>
       <el-empty v-if="ruleHistoryUnsupported" description="TCP 规则暂无历史流量统计（四层代理无流量计数指标）" :image-size="60" />
       <template v-else>
-        <el-empty v-if="!ruleHistoryLoading && ruleHistoryRows.length === 0" description="该时间范围内暂无数据" :image-size="60" />
-        <div v-else v-loading="ruleHistoryLoading">
-          <el-card shadow="never" class="history-card">
-            <template #header>
-              <div class="history-card-header">
-                <el-icon><Odometer /></el-icon>
-                <span>请求数与状态码</span>
-              </div>
-            </template>
-            <v-chart :option="ruleRequestsChartOption" autoresize style="height: 260px;" />
-          </el-card>
-          <el-card shadow="never" class="history-card">
-            <template #header>
-              <div class="history-card-header">
-                <el-icon><DataLine /></el-icon>
-                <span>流量（入站 / 出站）</span>
-              </div>
-            </template>
-            <v-chart :option="ruleBytesChartOption" autoresize style="height: 260px;" />
-          </el-card>
-        </div>
+        <!-- 加载失败 ≠ 该时间范围无数据——失败态与空态分文案（同页
+             「采集失败 ≠ 无数据」固化口径），并提供重试。-->
+        <el-alert v-if="ruleHistoryError" type="error" :closable="false" show-icon class="polling-error-alert error-banner history-error-alert">
+          <template #title>
+            <div class="polling-error-title">
+              <span>历史统计加载失败：图表为空不代表该时间范围没有流量</span>
+              <el-button link type="danger" @click="fetchRuleHistory">立即重试</el-button>
+            </div>
+          </template>
+        </el-alert>
+        <template v-else>
+          <el-empty v-if="!ruleHistoryLoading && ruleHistoryDeltas.deltas.length === 0" description="该时间范围内暂无数据" :image-size="60" />
+          <div v-else v-loading="ruleHistoryLoading">
+            <section class="dialog-panel history-card">
+              <DialogSectionHeader title="请求数与状态码" />
+              <v-chart :option="ruleRequestsChartOption" autoresize style="height: 260px;" />
+            </section>
+            <section class="dialog-panel history-card">
+              <DialogSectionHeader title="流量（入站 / 出站）" />
+              <v-chart :option="ruleBytesChartOption" autoresize style="height: 260px;" />
+            </section>
+          </div>
+        </template>
       </template>
     </el-dialog>
   </div>
@@ -419,25 +468,35 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { formatDate, formatChartTimeInConfigTz } from '@/utils/date'
+import { formatDate, formatChartTimeInConfigTz, formatEpochStatLabel } from '@/utils/date'
 import { getStrategyLabel } from '@/utils/strategyLabels'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import '@/utils/echarts' // 统一注册（副作用，全站单点）
 import type { EChartsOption, LineSeriesOption, TooltipComponentFormatterCallbackParams } from 'echarts'
 import VChart from 'vue-echarts'
 import { useAuthStore } from '@/stores/auth'
-import { request, formatBytes, mfaAwareSuccess } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
+import { formatInt } from '@/utils/formatInt'
 import { ElMessageBox } from 'element-plus'
 import { Monitor, Cpu, Document, Loading, CircleCheck, Odometer, TrendCharts, DataLine, List } from '@element-plus/icons-vue'
 import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMetrics, HostMetrics, MetricsOverview } from '@/types'
+import DialogHeader from '@/components/DialogHeader.vue'
+import DialogSectionHeader from '@/components/DialogSectionHeader.vue'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { httpStatusColors } from '@/utils/chartTheme'
+import { resolveNodeRole } from '@/utils/nodeRole'
+import { buildRuleMetricsUnavailable, METRIC_RELOAD_RESET_NOTE, ruleMetricCellTitle } from '@/utils/dashboardMetrics'
+import { degradedMetricLabels, degradedMetricParts, metricProgressPercent, pidsPercentLabel, pidsProgressPercent, pidsTooltipText, pidsUsageLabel, pidsValueTone } from '@/utils/systemMetrics'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
+import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 
 
 const authStore = useAuthStore()
 
 const formatUptime = (seconds?: number): string => {
-  if (!seconds || seconds < 0) return '-'
+  // 0 秒是合法运行时长（刚启动）：仅缺失/负数才显示「-」，否则会被读成「无数据」。
+  if (seconds == null || seconds < 0) return '-'
   const d = Math.floor(seconds / 86400)
   const h = Math.floor((seconds % 86400) / 3600)
   const m = Math.floor((seconds % 3600) / 60)
@@ -453,8 +512,22 @@ const systemInfo = ref<SystemInfo | null>(null)
 const systemInfoUnavailable = ref(false)
 const systemMetrics = ref<SystemMetrics | null>(null)
 const caddyMetrics = ref<CaddyMetrics | null>(null)
+// ruleMetricsEpochSeconds 规则指标统计起点（/metrics/dashboard 透传，Unix 秒；
+// 0/缺失=引擎端无序列，隐藏「统计自」显示——防御旧后端）。
+const ruleMetricsEpochSeconds = ref(0)
+const ruleMetricsEpochLabel = computed(() => {
+  if (!ruleMetricsEpochSeconds.value) return ''
+  // 经 utils/date 配置时区单源入口（同卡图表轴同一钟面；同日 HH:MM、
+  // 跨日 MM-DD HH:MM）。
+  return `统计自 ${formatEpochStatLabel(ruleMetricsEpochSeconds.value, Date.now())}（上次配置重载）`
+})
 const caddyStatus = ref('unknown')
+// /caddy/status 失败显性标记（与 systemInfoUnavailable 等 8 项同构）——
+// 缺它时状态标签/配置一致性/应用失败横幅全部静默陈旧（「运行中/配置正常」
+// 可能是上一轮残值，而真实 Caddy 已停或配置已漂移）。
+const caddyStatusUnavailable = ref(false)
 const caddyApplyError = ref('')
+const caddyBackgroundApplyError = ref('')
 const caddyPid = ref('0')
 const configConsistent = ref('')
 const configDrift = ref('')
@@ -465,6 +538,12 @@ interface DashboardRuleMetrics extends RuleMetrics {
 }
 const ruleMetrics = ref<Record<string, DashboardRuleMetrics>>({})
 const ruleMetricsUnavailable = ref<Record<string, boolean>>({})
+// 规则请求数列文案（单元格与 hover title 同源）：缺采集 → '-'，千分位走
+// formatInt 单源（原来两处内联 `?.toLocaleString() ?? '-'`）。
+const ruleRequestsTotalText = (caddyId: string): string => {
+  const total = ruleMetrics.value[caddyId]?.requests_total
+  return typeof total === 'number' ? formatInt(total) : '-'
+}
 const rankBy = ref<'requests' | 'bytes'>('requests')
 type RuleHealth = 'unknown' | 'unhealthy' | 'degraded' | 'healthy'
 const ruleHealth = ref<Record<string, RuleHealth>>({})
@@ -472,6 +551,37 @@ const ruleHealthUnavailable = ref(false)
 const hostMetrics = ref<HostMetrics[] | null>(null)
 const overview = ref<MetricsOverview | null>(null)
 const systemMetricsUnavailable = ref(false)
+// 分项降级（后端 degraded 契约）：失败分项显示「采集失败」而非零值——
+// CPU 单点故障时内存/磁盘仍照常展示，只有失败项标注不可用。
+const degradedSystemParts = computed(() => degradedMetricParts(systemMetrics.value?.degraded))
+const degradedSystemLabels = computed(() => degradedMetricLabels(systemMetrics.value?.degraded))
+const pidsToneValue = computed(() => pidsValueTone(systemMetrics.value?.pids_percent ?? 0, degradedSystemParts.value.has('pids')))
+const pidsValueClass = computed(() => ({
+  'text-green': pidsToneValue.value === 'normal',
+  'text-amber': pidsToneValue.value === 'warning',
+  'text-red': pidsToneValue.value === 'critical',
+}))
+const cpuProgressPercent = computed(() => metricProgressPercent(systemMetrics.value?.cpu_percent ?? 0, degradedSystemParts.value.has('cpu')))
+const memoryProgressPercent = computed(() => metricProgressPercent(systemMetrics.value?.memory_percent ?? 0, degradedSystemParts.value.has('memory')))
+const diskProgressPercent = computed(() => metricProgressPercent(systemMetrics.value?.disk_percent ?? 0, degradedSystemParts.value.has('disk')))
+const pidsProgressPercentValue = computed(() => pidsProgressPercent(systemMetrics.value?.pids_percent ?? 0, systemMetrics.value?.pids_max ?? 0, degradedSystemParts.value.has('pids')))
+// 「已用 / 上限」文案单源 pidsUsageLabel：上限 0→「不限」与负值夹取都由该函数
+// 持有（原模板内联 `max > 0 ? max : '不限'` 双份文案且丢负值夹取）。返回串按
+// ' / ' 拆回两段维持「当前值着色 / 总量灰化」的双 span 视觉。
+const pidsUsageParts = computed(() => {
+  const [current = '', maxPart = ''] = pidsUsageLabel(systemMetrics.value?.pids_current ?? 0, systemMetrics.value?.pids_max ?? 0).split(' / ')
+  return { current, maxPart }
+})
+const pidsTooltip = computed(() => pidsTooltipText(systemMetrics.value?.nproc_limit ?? 0))
+const pidsProgressColor = computed(() => {
+  if (pidsToneValue.value === 'critical') return '#ef4444'
+  if (pidsToneValue.value === 'warning') return '#f59e0b'
+  return '#10b981'
+})
+// 「已落地」与「可用」分离：/rules 可能先于 /metrics/dashboard 落地，
+// 此时不能把「指标尚未到达」当成「采集失败」——首轮逐规则列会全部闪「采集失败」。
+// landed 只在 dashboard 响应成功/失败后置位；未落地前一律视为「无结论」。
+const dashboardMetricsLanded = ref(false)
 const caddyMetricsUnavailable = ref(false)
 const hostMetricsUnavailable = ref(false)
 const overviewUnavailable = ref(false)
@@ -487,7 +597,18 @@ const connEstablishedHistory = ref<number[]>([])
 const connTimeWaitHistory = ref<number[]>([])
 const connTimestamps = ref<number[]>([])
 
-const isSlave = computed(() => authStore.nodeMode === 'slave')
+// 节点角色三态（fail-closed 展示）——nodeMode 为 null（/config 首拉失败
+// 或 15s 重试窗口内）时不显示「主节点」：同页写控件按 readOnlyReason（含
+// 'unknown'）隐藏，展示层不能反向宣告「主节点」误导运维。
+// 三态派生的判据单源在 utils/nodeRole（行为用例穷举 master/slave/null/undefined）
+const nodeRoleView = computed(() => resolveNodeRole(authStore.nodeMode))
+const nodeModeRole = computed(() => nodeRoleView.value.role)
+const nodeModeLabel = computed(() => nodeRoleView.value.label)
+const nodeModeTagType = computed(() => nodeRoleView.value.tagType)
+
+// caddyStatus 取值 running/stopped/unknown，样式类须映射——原先直接拼
+// caddyStatus 使 `.status-tag.info`（未知态灰底）零命中。
+const caddyStatusClass = computed(() => caddyStatus.value === 'running' ? 'running' : caddyStatus.value === 'stopped' ? 'stopped' : 'info')
 
 interface RuleHistoryRow {
   timestamp: string
@@ -523,6 +644,8 @@ interface DashboardMetricsResponse {
   hosts: HostMetrics[]
   overview: MetricsOverview
   rules: Record<string, DashboardRuleMetrics>
+  /** 统计起点（lb_rule_metrics Provision Unix 秒）；0/缺失=引擎端无序列，隐藏统计起点显示 */
+  rule_metrics_epoch_seconds?: number
 }
 
 interface UpstreamHealth {
@@ -540,6 +663,8 @@ const ruleHistoryRows = ref<RuleHistoryRow[]>([])
 const ruleHistoryBucketSeconds = ref(0)
 const ruleHistoryLoading = ref(false)
 const ruleHistoryUnsupported = ref(false)
+// 请求失败必须与「该时间范围内暂无数据」区分（否则取证/排障会被误导）。
+const ruleHistoryError = ref('')
 
 const openRuleHistory = (rule: Rule) => {
   ruleHistoryRule.value = rule
@@ -555,6 +680,7 @@ const fetchRuleHistory = async () => {
   const seq = ++ruleHistorySeq
   ruleHistoryLoading.value = true
   ruleHistoryUnsupported.value = false
+  ruleHistoryError.value = ''
   ruleHistoryRows.value = []
   ruleHistoryBucketSeconds.value = 0
   try {
@@ -574,6 +700,7 @@ const fetchRuleHistory = async () => {
     if (!disposed && seq === ruleHistorySeq) {
       console.error('Failed to fetch rule history:', error)
       ruleHistoryRows.value = []
+      ruleHistoryError.value = error instanceof Error ? error.message : '历史统计请求失败'
     }
   } finally {
     if (!disposed && seq === ruleHistorySeq) {
@@ -596,7 +723,7 @@ const diffCounters = (previous: RuleHistoryRow, current: RuleHistoryRow): RuleHi
     requests: current.requests_total - previous.requests_total,
     status2xx: current.requests_2xx - previous.requests_2xx,
     status3xx: current.requests_3xx - previous.requests_3xx,
-    // F4(第 29 轮审计):历史图 4xx 与实时表同口径扣除 Block(钳制 ≥0)——
+    // 历史图 4xx 与实时表同口径扣除 Block(钳制 ≥0)——
     // 存储双列(当次裁定),展示面不再双计。
     status4xx: Math.max(0, (current.requests_4xx - previous.requests_4xx) - (current.requests_blocked - previous.requests_blocked)),
     status5xx: current.requests_5xx - previous.requests_5xx,
@@ -613,7 +740,7 @@ const ruleHistoryDeltas = computed(() => {
     const previous = ruleHistoryRows.value[index - 1]
     const current = ruleHistoryRows.value[index]
     if (!previous || !current) continue
-    // 缺 timestamp 的行给空标签而非抛 TypeError（S-02）：formatDate 恒返回 string，
+    // 缺 timestamp 的行给空标签而非抛 TypeError：formatDate 恒返回 string，
     // 原 `?.slice(5,16) || current.timestamp.slice(5,16)` 在行缺 timestamp 时触发 undefined.slice。
     labels.push(current.timestamp ? (formatDate(current.timestamp).slice(5, 16) || '') : '')
     deltas.push(diffCounters(previous, current))
@@ -653,17 +780,35 @@ const ruleRankValue = (caddyId: string): number => {
   return rankBy.value === 'requests' ? (metrics.requests_total ?? 0) : (metrics.bytes_in ?? 0) + (metrics.bytes_out ?? 0)
 }
 
-const rankableRules = computed(() =>
-  rules.value
-    .filter((rule) => ruleRankValue(rule.caddy_id) > 0)
-    .sort((a, b) => ruleRankValue(b.caddy_id) - ruleRankValue(a.caddy_id)),
-)
+const rankableRules = computed(() => {
+  // 单条规则指标缺失时 ruleRankValue=0 会被「>0」过滤掉，外观等同
+  // 「无流量」且逐列「采集失败」分支永不渲染。
+  // 采集失败的行必须可见——排在正常行之后，保持「故障 ≠ 无数据」口径。
+  const ranked = rules.value.filter((rule) =>
+    ruleRankValue(rule.caddy_id) > 0 || ruleMetricsUnavailable.value[rule.caddy_id] === true,
+  )
+  return ranked.sort((a, b) => {
+    const aUnavailable = ruleMetricsUnavailable.value[a.caddy_id] === true
+    const bUnavailable = ruleMetricsUnavailable.value[b.caddy_id] === true
+    if (aUnavailable !== bUnavailable) return aUnavailable ? 1 : -1
+    return ruleRankValue(b.caddy_id) - ruleRankValue(a.caddy_id)
+  })
+})
 
-const sortedRules = computed(() => rankableRules.value.slice(0, 10))
+const sortedRules = computed(() => {
+  // 失败行不占排行榜的 10 个名额——前 10 按指标排，失败行全部追加在
+  // 末尾。否则 10 条有流量规则会把失败行挤出 slice，故障再次静默消失。
+  const ranked = rankableRules.value.filter((rule) => ruleMetricsUnavailable.value[rule.caddy_id] !== true)
+  const failed = rankableRules.value.filter((rule) => ruleMetricsUnavailable.value[rule.caddy_id] === true)
+  return [...ranked.slice(0, 10), ...failed]
+})
 
 const rulesEmptyText = computed(() => {
   if (rulesUnavailable.value) return '采集失败'
   if (rules.value.length === 0) return '暂无负载均衡规则'
+  // 指标采集失败 ≠ 无流量——失败口径与页面其它「采集失败」一致，
+  // 不再把采集故障误报为「暂无请求/流量数据」。
+  if (caddyMetricsUnavailable.value) return '采集失败'
   return rankBy.value === 'bytes' ? '暂无流量数据' : '暂无请求数据'
 })
 
@@ -680,7 +825,7 @@ const ipList = computed(() => {
   return Object.entries(ips).map(([iface, ip]) => ({ iface, ip }))
 })
 
-// FE40-D1-2：策略文案映射提取至 utils/strategyLabels（死键 round_robin 已删）。
+// 策略文案映射提取至 utils/strategyLabels（死键 round_robin 已删）。
 
 const getRuleProtocolLabel = (rule: Rule): 'HTTP' | 'HTTPS' | 'TCP' => {
   if (rule.protocol === 'tcp') return 'TCP'
@@ -691,6 +836,10 @@ const getRuleProtocolTagType = (rule: Rule): 'primary' | 'success' | 'warning' =
   if (rule.protocol === 'tcp') return 'warning'
   return rule.enable_tls ? 'success' : 'primary'
 }
+
+// /metrics/realtime 的 bytes_in/bytes_out 是每秒速率；图表必须按速率口径显示，
+// 与同页「请求速率 /s」一致，避免把 1.2 MB/s 读成上一轮新增 1.2 MB。
+const formatTrafficRate = (value: number): string => `${formatBytes(value)}/s`
 
 const trafficChartOption = computed<EChartsOption>(() => ({
   tooltip: { 
@@ -703,7 +852,7 @@ const trafficChartOption = computed<EChartsOption>(() => ({
       let result = `${items[0]?.name ?? ''}<br/>`
       items.forEach((item) => {
         const value = typeof item.value === 'number' ? item.value : Number(item.value ?? 0)
-        result += `${item.marker} ${item.seriesName}: ${formatBytes(value)}<br/>`
+        result += `${item.marker} ${item.seriesName}: ${formatTrafficRate(value)}<br/>`
       })
       return result
     }
@@ -719,7 +868,7 @@ const trafficChartOption = computed<EChartsOption>(() => ({
   yAxis: { 
     type: 'value', 
     axisLine: { show: false },
-    axisLabel: { fontSize: 10, color: '#9ca3af', formatter: (v: number) => formatBytes(v) },
+    axisLabel: { fontSize: 10, color: '#9ca3af', formatter: formatTrafficRate },
     splitLine: { lineStyle: { color: '#f3f4f6' } }
   },
   series: [
@@ -754,16 +903,72 @@ let statusRefreshTimer: number | null = null
 let statusConfirmTimer: number | null = null
 let disposed = false
 let fetchAllDataPromise: Promise<void> | null = null
-let isFetchingRuleHealth = false
+let ruleHealthInFlight = false
+// 在途期间到达的新版本需求：收尾补跑。原布尔门直接丢弃新需求，而旧响应又因
+// 版本守卫被丢弃 → 新规则集整轮拿不到健康结论（健康列按 caddy_id 沿用上一版本
+// 映射，且无陈旧提示）。只保留最新一次需求（同版本重复无意义）。
+let pendingRuleHealth: { readonly rules: Rule[]; readonly version: number } | null = null
 let rulesVersion = 0
 
-const fetchAllData = (): Promise<void> => {
+// 慢车道（15s，与规则页健康列同口径）：/rules 是全量规则 + upstreams hydrate，
+// /config/health 依赖它派生列——原随 5s 主轮询每轮拉取（3 倍频）。门户首页
+// 常驻且可多标签页叠加，这两项是无采样意义的重复负载；采样曲线类端点
+// （realtime/connections/metrics）仍 5s。
+const SLOW_LANE_INTERVAL_MS = 15000
+let lastSlowLaneAt = 0
+const slowLaneDue = (): boolean => Date.now() - lastSlowLaneAt >= SLOW_LANE_INTERVAL_MS
+
+// /rules 与 /config/health 都是慢车道：必须脱离轮询数组 fire-and-forget，否则
+// 大规则集/DB 抖动（最长 30s）会让同一轮资源、曲线与 Caddy 状态全部延后。
+let rulesSlowLaneInFlight = false
+let pendingSlowLane = false
+const fetchRulesSlowLane = (roundSignal?: AbortSignal): void => {
+  if (disposed) return
+  if (rulesSlowLaneInFlight) {
+    // 在途期间只保留一个补跑需求；窗口时间不得提前推进，否则本次刷新会被
+    // 直接吃掉并再等待一个完整周期。补跑使用页级 signal，不继承已结束轮次。
+    pendingSlowLane = true
+    return
+  }
+  rulesSlowLaneInFlight = true
+  lastSlowLaneAt = Date.now()
+  void request.get('/rules', { signal: roundSignal ?? dashboardPolling.signal, silent: true }).then((res) => {
+    if (disposed) return
+    if (!res.data) {
+      rulesUnavailable.value = true
+      return
+    }
+    rules.value = res.data || []
+    rulesUnavailable.value = false
+    // 指标尚未落地时不写映射：false 在本 helper 中表示「明确采集失败」，
+    // 不是「尚无结论」。等 /metrics/dashboard 到达后由它重建映射。
+    if (dashboardMetricsLanded.value) {
+      ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, ruleMetrics.value, dashboardMetricsLanded.value && !caddyMetricsUnavailable.value)
+    }
+    const version = ++rulesVersion
+    const currentRules = rules.value
+    // 健康查询同属慢车道；版本守卫与 ruleHealthInFlight/pending 保证迟到响应
+    // 不写回、更新版本补跑，函数内部自带 try/catch。
+    void fetchRuleHealth(currentRules, version, roundSignal)
+  }).catch(() => { if (!disposed) rulesUnavailable.value = true }).finally(() => {
+    rulesSlowLaneInFlight = false
+    if (!pendingSlowLane || disposed) return
+    pendingSlowLane = false
+    fetchRulesSlowLane()
+  })
+}
+
+const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return Promise.resolve()
   if (fetchAllDataPromise) return fetchAllDataPromise
 
-  // FE43-7(第 43 轮):删除手造 Authorization 头——api.ts 请求拦截器对全部
+  // 删除手造 Authorization 头——api.ts 请求拦截器对全部
   // 同域相对路径请求统一从 localStorage 注入同一 token(api.ts:186-196)。
-  const config = { signal: dashboardPolling.signal, silent: true }
+  // 轮询轮次传入本轮 signal（pause/stop 可取消在途请求）；手动刷新（Caddy
+  // 操作后的补偿刷新）无轮次可用，回落页级永久 signal（随卸载终止）。
+  const config = { signal: roundSignal ?? dashboardPolling.signal, silent: true }
+  const slowLane = slowLaneDue()
+  if (slowLane) fetchRulesSlowLane(roundSignal)
   fetchAllDataPromise = Promise.allSettled([
     request.get('/system/info', config).then((res) => {
       if (disposed) return
@@ -798,51 +1003,34 @@ const fetchAllData = (): Promise<void> => {
     }).catch(() => { if (!disposed) trafficUnavailable.value = true }),
     request.get<APIResponse<DashboardMetricsResponse>>('/metrics/dashboard', config).then((res) => {
       if (disposed) return
+      dashboardMetricsLanded.value = true
       const data = res.data
       if (!data) {
         caddyMetricsUnavailable.value = true
         hostMetricsUnavailable.value = true
         overviewUnavailable.value = true
+        ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
         return
       }
       caddyMetrics.value = data.global
       hostMetrics.value = data.hosts
       overview.value = data.overview
       ruleMetrics.value = data.rules
-      ruleMetricsUnavailable.value = Object.fromEntries(rules.value.map((rule) => [rule.caddy_id, rule.enabled && data.rules[rule.caddy_id] === undefined]))
+      ruleMetricsEpochSeconds.value = data.rule_metrics_epoch_seconds ?? 0
+      ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, data.rules, true)
       caddyMetricsUnavailable.value = false
       hostMetricsUnavailable.value = false
       overviewUnavailable.value = false
     }).catch(() => {
       if (disposed) return
+      dashboardMetricsLanded.value = true
       caddyMetricsUnavailable.value = true
       hostMetricsUnavailable.value = true
       overviewUnavailable.value = true
-      // Round 36 I-4: 移除 rulesUnavailable.value = true（与 /rules then 竞态）。
+      // 移除 rulesUnavailable.value = true（与 /rules then 竞态）。
       // rulesUnavailable 由 /rules 自己的 then/catch 管理，避免双 setter 竞态。
-      ruleMetricsUnavailable.value = Object.fromEntries(rules.value.map((rule) => [rule.caddy_id, rule.enabled]))
+      ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
     }),
-    request.get('/rules', config).then(async (res) => {
-      if (disposed) return
-      if (!res.data) {
-        rulesUnavailable.value = true
-        return
-      }
-      rules.value = res.data || []
-      rulesUnavailable.value = false
-      // FE18-5+SR19-1/2(第 19 轮修正):/rules 落地后按同一谓词重建映射——
-      // 仅当 metrics 成功态(caddyMetricsUnavailable=false 保证 ruleMetrics
-      // 是新鲜数据)时重建;失败序(metrics 先败→rules 后到)不触碰,
-      // 保留 metrics 分支已写入的全真「采集失败」映射(此前用陈旧
-      // ruleMetrics 判第三段会抹掉它)。原两析取(初始 {} 恒真/keys>0)在
-      // 主场景恒死,修复无效,已删。
-      if (!caddyMetricsUnavailable.value) {
-        ruleMetricsUnavailable.value = Object.fromEntries(rules.value.map((rule) => [rule.caddy_id, rule.enabled && ruleMetrics.value?.[rule.caddy_id] === undefined]))
-      }
-      const version = ++rulesVersion
-      const currentRules = rules.value
-       await fetchRuleHealth(currentRules, version)
-     }).catch(() => { if (!disposed) rulesUnavailable.value = true }),
     request.get('/metrics/connections', config).then((res) => {
       if (disposed) return
       if (!res.data) {
@@ -861,11 +1049,15 @@ const fetchAllData = (): Promise<void> => {
       if (res.data) {
         caddyStatus.value = res.data.status || 'unknown'
         caddyApplyError.value = res.data.apply_error || ''
+        caddyBackgroundApplyError.value = res.data.background_apply_error || ''
         caddyPid.value = res.data.pid || '0'
         configConsistent.value = res.data.config_consistent || ''
         configDrift.value = res.data.config_drift || ''
+        caddyStatusUnavailable.value = false
+      } else {
+        caddyStatusUnavailable.value = true
       }
-    }),
+    }).catch(() => { if (!disposed) caddyStatusUnavailable.value = true }),
   ]).then(() => undefined).finally(() => {
     if (!disposed) initialLoading.value = false
     fetchAllDataPromise = null
@@ -874,14 +1066,19 @@ const fetchAllData = (): Promise<void> => {
   return fetchAllDataPromise
 }
 
-const fetchRuleHealth = async (currentRules: Rule[], version: number) => {
-  if (disposed || currentRules.length === 0 || isFetchingRuleHealth) return
-  isFetchingRuleHealth = true
+const fetchRuleHealth = async (currentRules: Rule[], version: number, roundSignal?: AbortSignal) => {
+  if (disposed || currentRules.length === 0) return
+  if (ruleHealthInFlight) {
+    // 在途：记下更新的版本供收尾补跑（旧版本已被取代，不排队）
+    if (!pendingRuleHealth || pendingRuleHealth.version < version) pendingRuleHealth = { rules: currentRules, version }
+    return
+  }
+  ruleHealthInFlight = true
   try {
-    const res = await request.get<APIResponse<HealthResponse>>('/config/health', { signal: dashboardPolling.signal, silent: true })
+    const res = await request.get<APIResponse<HealthResponse>>('/config/health', { signal: roundSignal ?? dashboardPolling.signal, silent: true })
     if (disposed || version !== rulesVersion) return
     const healthData = res.data || {}
-    // F62-24(第 62 轮):healthData 是 {server: {hostPort: health}} 嵌套——
+    // healthData 是 {server: {hostPort: health}} 嵌套——
     // 预展平为 Map<hostPort, health>一次遍历,消除 rule×upstream×server 三重
     // 嵌套扫描(原每上游遍历全部 server 健康组,15s 轮询全量执行)。
     const healthByHostPort = new Map<string, NonNullable<HealthResponse[string]>[string]>()
@@ -925,19 +1122,30 @@ const fetchRuleHealth = async (currentRules: Rule[], version: number) => {
       ruleHealthUnavailable.value = false
     }
   } catch (e) {
-    // R66 D-N6：与成功分支同款版本守卫——跨版本在途失败不污染新版本规则集的
+    // 与成功分支同款版本守卫——跨版本在途失败不污染新版本规则集的
     // 健康列（短暂全「-」误判）。
     if (!disposed && version === rulesVersion) {
       ruleHealthUnavailable.value = true
       console.error('Failed to fetch rule health:', e)
     }
   } finally {
-    isFetchingRuleHealth = false
+    ruleHealthInFlight = false
+    const pending = pendingRuleHealth
+    pendingRuleHealth = null
+    // 同一版本无需重跑（在途那轮已覆盖该版本）；补跑不携旧轮次的 signal——
+    // 上一轮可能已被 pause/stop 或后续轮次 abort，回落页级永久 signal。
+    if (pending && !disposed && pending.version !== version) {
+      await fetchRuleHealth(pending.rules, pending.version)
+    }
   }
 }
 
 const controlCaddy = async (action: 'start' | 'stop' | 'restart') => {
   if (authStore.readOnlyReason !== null) return
+  // 占位先于确认（同 TaskMonitor/ClusterSettings 范式）：确认框悬挂期同样没有门，
+  // 双击或「重启→停止」连点会叠加两次写请求，最终服务状态取决于返回顺序。
+  if (caddyLoading.value) return
+  caddyLoading.value = true
   
   const actionText = { start: '启动', stop: '停止', restart: '重启' }[action]
   const actionDesc = {
@@ -954,7 +1162,6 @@ const controlCaddy = async (action: 'start' | 'stop' | 'restart') => {
     })
     if (disposed) return
     
-    caddyLoading.value = true
     await request.post(`/caddy/${action}`, undefined, { signal: dashboardPolling.signal })
     if (disposed) return
     
@@ -992,7 +1199,7 @@ const controlCaddy = async (action: 'start' | 'stop' | 'restart') => {
   }
 }
 
-const dashboardPolling = usePollingTask(async () => fetchAllData(), {
+const dashboardPolling = usePollingTask(async (task) => fetchAllData(task.signal), {
   interval: 5000,
   onError: (error) => console.error('Failed to poll dashboard:', error),
 })
@@ -1014,12 +1221,25 @@ onUnmounted(() => {
 <style scoped>
 .dashboard { max-width: 1500px; margin: 0 auto; }
 
-
-
 .card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  /* 窄屏下 actions 行（警告标签+统计起点+排序+计数）放不下时整体换行，
+     而不是压缩组件造成错位；row-gap 保持换行后的行距。 */
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+
+/* 统计起点标签文字较长：禁换行禁收缩——保证与同行排序按钮/计数垂直居中
+   且不出现内部两行的错位形态；放不下时由 .card-header 的 wrap 兜底整行下移。
+   高度锁定 22px：本版 el-tag--small 渲染 20px，而同行 el-radio-button--small
+   为 22px——等高后三组件（标签/排序/计数）视觉齐平（盒中心本已对齐，
+   实测 2026-11）。 */
+.epoch-tag {
+  white-space: nowrap;
+  flex-shrink: 0;
+  height: 22px;
 }
 
 .card-header-actions {
@@ -1103,14 +1323,31 @@ onUnmounted(() => {
 .stat-value { font-size: 20px; font-weight: 600; color: #111827; line-height: 1.2; }
 .stat-label { font-size: 12px; color: #6b7280; margin-top: 2px; }
 
-.resource-item { padding: 4px 0; }
-.resource-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-.resource-label { color: #4b5563; font-size: 13px; }
-.resource-value { font-size: 14px; font-weight: 500; }
+.resource-grid {
+  display: grid;
+  /* 四列等宽 + minmax(0,1fr)：数值不换行时压缩间距而不是折行 */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 24px;
+}
+.resource-item { padding: 4px 0; min-width: 0; }
+.resource-header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 10px; white-space: nowrap; }
+.resource-label-group { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.resource-label { color: #4b5563; font-size: 13px; white-space: nowrap; }
+.resource-value-group { display: inline-flex; align-items: baseline; gap: 2px; white-space: nowrap; }
+.resource-value { font-size: 14px; font-weight: 500; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .text-blue { color: #3b82f6; }
 .text-purple { color: #8b5cf6; }
 .text-cyan { color: #0891b2; }
+.text-green { color: #059669; }
+.text-amber { color: #d97706; }
+.text-red { color: #dc2626; }
 .resource-total { font-size: 12px; color: #9ca3af; font-weight: 400; }
+@media (max-width: 1280px) {
+  .resource-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+  .resource-grid { grid-template-columns: minmax(0, 1fr); }
+}
 
 .chart-card :deep(.el-card__body) { height: 240px; padding: 16px; box-sizing: border-box; }
 .chart-container { height: 200px; }
@@ -1122,10 +1359,9 @@ onUnmounted(() => {
 
 .status-codes {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   justify-content: flex-start;
   gap: 4px;
-  overflow: hidden;
 }
 .status-code {
   font-size: 10px;
@@ -1140,17 +1376,7 @@ onUnmounted(() => {
 .status-4xx { background: #fffbeb; color: #d97706; }
 .status-5xx { background: #fef2f2; color: #dc2626; }
 .status-blocked { background: #f3e8ff; color: #7c3aed; }
-.dialog-title { display: inline-flex; align-items: center; white-space: nowrap; overflow: hidden; }
-.dialog-title > * { line-height: 1; }
-.dialog-title-icon { font-size: 20px; color: var(--el-color-primary); flex-shrink: 0; margin-right: 12px; }
-.dialog-title-main { font-size: 16px; font-weight: 600; color: #111827; margin-right: 16px; }
-.dialog-title-sub { overflow: hidden; text-overflow: ellipsis; line-height: 1; padding-top: 3px; }
 .history-toolbar { display: flex; justify-content: flex-end; margin-top: 8px; padding-bottom: 16px; border-bottom: 1px solid var(--border-lighter); margin-bottom: 20px; }
-.history-card { margin-bottom: 24px; border: 1px solid var(--border-lighter); border-radius: 8px; }
-.history-card:last-child { margin-bottom: 0; }
-.history-card :deep(.el-card__header) { padding: 8px 14px; background: #f9fafb; }
-.history-card :deep(.el-card__body) { padding: 10px 14px; }
-.history-card-header { display: flex; align-items: center; font-size: 14px; font-weight: 600; color: #374151; line-height: 1; }
-.history-card-header .el-icon { color: var(--el-color-primary); font-size: 16px; margin-right: 8px; }
+.history-error-alert { margin-bottom: 16px; }
 
 </style>

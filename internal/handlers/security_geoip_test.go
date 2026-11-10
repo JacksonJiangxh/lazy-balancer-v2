@@ -12,7 +12,7 @@ import (
 // TestCreateSecurityPolicy_geoipColumnsRoundTrip verifies that geoip_countries
 // and geoip_mode are persisted on create and returned by GetSecurityPolicy.
 func TestCreateSecurityPolicy_geoipColumnsRoundTrip(t *testing.T) {
-	// R72 二十七次 N5：地域条目（含海外）现要求 IP 库已装载——注入 live 省份
+	// 地域条目（含海外）现要求 IP 库已装载——注入 live 省份
 	// 模拟 xdb 在位（生产由 InitIP2Region 装载驱动）。
 	services.SetIP2RegionLiveProvincesForTest([]string{"海外", "广东省", "北京市"})
 	t.Cleanup(func() { services.SetIP2RegionLiveProvincesForTest(nil) })
@@ -51,8 +51,10 @@ func TestCreateSecurityPolicy_geoipColumnsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCreateSecurityPolicy_geoipDefaults verifies that omitted geoip fields
-// default to an empty list and deny mode.
+// TestCreateSecurityPolicy_geoipDefaults：省略 geoip 字段时名单落空、mode 落 off
+// （门：非 off + 空名单 = 「宣称启用但零强制」→ 400；缺省未显式
+// 启用地域控制的创建因此归 off，与渲染端「条目非空才发射」等价）。
+// 下方 TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected 钉住显式形态 400。
 func TestCreateSecurityPolicy_geoipDefaults(t *testing.T) {
 	// Given a fresh database and a policy payload without geoip fields
 	setupSecurityPolicyTestDB(t)
@@ -75,8 +77,26 @@ func TestCreateSecurityPolicy_geoipDefaults(t *testing.T) {
 	if got := resp.Data.Policy["geoip_countries"]; got != "[]" {
 		t.Fatalf("geoip_countries=%q, want []", got)
 	}
-	if got := resp.Data.Policy["geoip_mode"]; got != "deny" {
-		t.Fatalf("geoip_mode=%q, want deny", got)
+	if got := resp.Data.Policy["geoip_mode"]; got != "off" {
+		t.Fatalf("geoip_mode=%q, want off（空名单缺省不得宣称启用）", got)
+	}
+}
+
+// TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected：显式 deny/allow +
+// 空名单必须 400（形态：落库后宣称仅允许所选地域但零发射）。
+func TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	recorder := postJSON(t, router, "/security/policies", map[string]any{
+		"name":            "空名单策略",
+		"geoip_mode":      "allow",
+		"geoip_countries": "[]",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("mode=allow status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "区域名单不能为空") {
+		t.Fatalf("mode=allow body=%s, want 空名单门文案", recorder.Body.String())
 	}
 }
 
@@ -105,7 +125,7 @@ func TestUpdateSecurityPolicy_geoipMode_validatesEnum(t *testing.T) {
 // TestListSecurityPolicies_geoipSummary verifies the summary list exposes the
 // geoip fields.
 func TestListSecurityPolicies_geoipSummary(t *testing.T) {
-	// R72 二十七次 N5：地域条目（含海外）现要求 IP 库已装载——注入 live 省份
+	// 地域条目（含海外）现要求 IP 库已装载——注入 live 省份
 	// 模拟 xdb 在位（生产由 InitIP2Region 装载驱动）。
 	services.SetIP2RegionLiveProvincesForTest([]string{"海外", "广东省", "北京市"})
 	t.Cleanup(func() { services.SetIP2RegionLiveProvincesForTest(nil) })
@@ -135,10 +155,21 @@ func TestListSecurityPolicies_geoipSummary(t *testing.T) {
 	if len(resp.Data) == 0 {
 		t.Fatal("list is empty")
 	}
-	if got := resp.Data[0]["geoip_countries"]; got != `["海外"]` {
+	// 按名字定位目标行：依赖 Data[0] 会在夹具新增行/排序变化时读到别的策略。
+	var row map[string]any
+	for _, candidate := range resp.Data {
+		if name, _ := candidate["name"].(string); name == "摘要地理" {
+			row = candidate
+			break
+		}
+	}
+	if row == nil {
+		t.Fatalf("列表缺少「摘要地理」策略: %s", recorder.Body.String())
+	}
+	if got := row["geoip_countries"]; got != `["海外"]` {
 		t.Fatalf("summary geoip_countries=%q, want [\"海外\"]", got)
 	}
-	if got := resp.Data[0]["geoip_mode"]; got != "allow" {
+	if got := row["geoip_mode"]; got != "allow" {
 		t.Fatalf("summary geoip_mode=%q, want allow", got)
 	}
 }

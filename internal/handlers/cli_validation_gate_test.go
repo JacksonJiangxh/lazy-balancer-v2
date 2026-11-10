@@ -32,7 +32,7 @@ func TestRuleWrite_cliRejectionBlocksCommit(t *testing.T) {
 
 	// When
 	rec := httptest.NewRecorder()
-	body := `{"name":"cli-gate","protocol":"http","domain":"cli-gate.example.test","listen_port":8093,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+	body := `{"name":"cli-gate","protocol":"http","domain":"cli-gate.example.test","listen_port":8093,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
@@ -51,6 +51,14 @@ func TestRuleWrite_cliRejectionBlocksCommit(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("cli-rejected rule committed rows=%d, want 0", count)
 	}
+	// 规则路由均为 Explicit（中间件不兜底），apply 失败必须留痕。
+	var auditCount int
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action='创建失败' AND resource='负载规则' AND detail LIKE '%coraza: invalid directive%'").Scan(&auditCount); err != nil {
+		t.Fatalf("count rule failure audit: %v", err)
+	}
+	if auditCount == 0 {
+		t.Fatalf("规则 apply 失败零审计（Explicit 策略下运维无法追溯）")
+	}
 }
 
 func TestRuleWrite_cliUnavailableFailsOpen(t *testing.T) {
@@ -64,7 +72,7 @@ func TestRuleWrite_cliUnavailableFailsOpen(t *testing.T) {
 
 	// When
 	rec := httptest.NewRecorder()
-	body := `{"name":"cli-open","protocol":"http","domain":"cli-open.example.test","listen_port":8094,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+	body := `{"name":"cli-open","protocol":"http","domain":"cli-open.example.test","listen_port":8094,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
@@ -144,9 +152,10 @@ func TestImportConfigBackup_cliRejectionAbortsImport(t *testing.T) {
 	h.caddyService.SetCLIValidatorForTest(func(rendered []byte) error {
 		return errors.New("cli: import render rejected")
 	})
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip_lists": {{"id": 1, "name": "cli-abort-list", "entries": "[]"}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 
@@ -171,7 +180,8 @@ func TestImportConfigBackup_cliRejectionAbortsImport(t *testing.T) {
 
 // 乱填保障闭环（2026-09-06 补充裁定）：CLI 校验器不可用 + admin 传输失败 =
 // 配置未经任何 Caddy 级校验且无法应用——此情形下不得退化提交（无法排除
-// 坏配置），必须回滚并明确报错；服务与运行配置不受影响。
+// 坏配置），必须回滚并明确报错。传输错误可能发生在 Caddy 已
+// 应用候选之后，分支必须回滚到已提交视图运行配置并持久化失败横幅。
 func TestSecurityWrite_unvalidatedApplyFailsClosed(t *testing.T) {
 	// Given：CLI 校验器不可用 + Caddy 管理接口不可达
 	setupSecurityPolicyTestDB(t)
@@ -179,7 +189,7 @@ func TestSecurityWrite_unvalidatedApplyFailsClosed(t *testing.T) {
 	url := closed.URL
 	closed.Close()
 	handler, _, _ := newAuditRuleHandlers(t, 0)
-	handler.caddyService = services.NewCaddyService(url) // LBH-B-R3（第 69 轮）：零增值包装内联（不可达由死 URL 提供）
+	handler.caddyService = services.NewCaddyService(url) // 零增值包装内联（不可达由死 URL 提供）
 	handler.caddyService.SetCLIValidatorForTest(func(rendered []byte) error {
 		return services.ErrCLIValidatorUnavailable
 	})
@@ -206,7 +216,7 @@ func TestSecurityWrite_unvalidatedApplyFailsClosed(t *testing.T) {
 	}
 }
 
-// 裁定 2026-09-07 D2：规则×5 apply 错误统一映射——配置拒绝→400（中文），
+// 裁定 2026-09-07：规则×5 apply 错误统一映射——配置拒绝→400（中文），
 // ErrUnvalidatedApply/传输失败→500；DisableRule 文案中文化。
 func TestRuleWrites_applyErrorStatusMapping(t *testing.T) {
 	tests := []struct {
@@ -220,9 +230,9 @@ func TestRuleWrites_applyErrorStatusMapping(t *testing.T) {
 		wantMsg  string
 	}{
 		{name: "create 拒绝400", seed: func() {}, mount: func(r *gin.Engine, h *Handlers) { r.POST("/rules", h.CreateRule) }, method: http.MethodPost, path: "/rules",
-			body: `{"name":"d2","protocol":"http","domain":"d2.example.test","listen_port":8095,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: true, wantMsg: "规则未创建"},
+			body: `{"name":"d2","protocol":"http","domain":"d2.example.test","listen_port":8095,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: true, wantMsg: "规则未创建"},
 		{name: "create 传输500", seed: func() {}, mount: func(r *gin.Engine, h *Handlers) { r.POST("/rules", h.CreateRule) }, method: http.MethodPost, path: "/rules",
-			body: `{"name":"d2t","protocol":"http","domain":"d2t.example.test","listen_port":8096,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: false, wantMsg: "规则未创建"},
+			body: `{"name":"d2t","protocol":"http","domain":"d2t.example.test","listen_port":8096,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: false, wantMsg: "规则未创建"},
 		{name: "update 拒绝400", seed: func() {
 			seedAuditRule(t, "lb_d2", "before", "d2u.example.test", 8097, true, "manual", false)
 			seedAuditUpstream(t, "lb_d2")

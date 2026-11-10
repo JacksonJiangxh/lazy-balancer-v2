@@ -1,9 +1,9 @@
 package services
 
-// 第 47 轮 F-47-15：预检层「信任名单 DetectionOnly 全局豁免」此前只有字符串顺序钉
+// 预检层「信任名单 DetectionOnly 全局豁免」此前只有字符串顺序钉
 // （geoip_caddy_test.go:189-194）与编译钉（enginegate）——「只记录不拦」是运行级
 // 语义（phase:1 的 ctl:ruleEngine=DetectionOnly 必须对同相位的后续 GeoIP deny 链
-// 生效），字符串/编译测试看不出来。本测试用真实 coraza 事务（R-10：引擎行为实证）
+// 生效），字符串/编译测试看不出来。本测试用真实 coraza 事务
 // 钉住三条：①信任 IP 经 id:12 后海外 GeoIP deny 不拦（放行）；②非信任海外 IP 被
 // deny 中断；③非信任境内 IP 不命中（形状回归）。
 
@@ -22,8 +22,10 @@ func newPrecheckBehaviorWAF(t *testing.T, directives string) coraza.WAF {
 	var kept []string
 	for _, line := range strings.Split(directives, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "SecAuditLog ") {
-			continue // 审计日志路径在开发/CI 不存在（非被测对象）
+		if strings.HasPrefix(trimmed, "SecAuditLog ") || strings.HasPrefix(trimmed, "SecAuditLogType ") {
+			// 审计日志路径在开发/CI 不存在（非被测对象）；lbfile 写插件仅在
+			// Caddy 二进制内注册（caddygeoip 端到端钉测）。
+			continue
 		}
 		if strings.HasPrefix(trimmed, "SecAuditEngine ") {
 			kept = append(kept, "SecAuditEngine Off") // 同上：本测试只关心中断与否
@@ -54,7 +56,7 @@ func TestEngineBehavior_PrecheckTrustDetectionOnlyExemptsGeoIPDeny(t *testing.T)
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{stage0, geoip}, 403))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{stage0, geoip}, "lb_test"))
 	if !strings.Contains(directives, "id:12,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly") {
 		t.Fatalf("预检未发射阶段 0 保留检测 id:12:\n%s", directives)
 	}

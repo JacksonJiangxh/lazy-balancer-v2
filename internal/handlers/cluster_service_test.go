@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -31,6 +32,7 @@ func setupClusterServiceControlDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	gin.SetMode(gin.TestMode)
 }
@@ -49,7 +51,7 @@ func seedControlNode(t *testing.T, clusterToken string, extra map[string]any) in
 // issueControlTicketOnTestDB 在测试库上以主节点身份签发票据，随后切换为从节点身份。
 func issueControlTicketOnTestDB(t *testing.T, nodeID int, clusterToken, action string) string {
 	t.Helper()
-	service := services.NewClusterService(db.DB, nil, "")
+	service := services.NewClusterService(db.DB, "")
 	issued, err := service.IssueServiceControlTicket(context.Background(), nodeID, action, time.Now())
 	if err != nil {
 		t.Fatalf("issue control ticket: %v", err)
@@ -65,7 +67,11 @@ func becomeSlave(t *testing.T, nodeID int, clusterToken string) {
 }
 
 func postServiceControl(router *gin.Engine, action, ticket string) *httptest.ResponseRecorder {
-	body, _ := json.Marshal(models.ClusterServiceControlRequest{Action: action, Ticket: ticket})
+	return postServiceControlWithOperator(router, action, ticket, "")
+}
+
+func postServiceControlWithOperator(router *gin.Engine, action, ticket, operator string) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(models.ClusterServiceControlRequest{Action: action, Ticket: ticket, Operator: operator})
 	request := httptest.NewRequest(http.MethodPost, "/service-control", strings.NewReader(string(body)))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
@@ -74,7 +80,7 @@ func postServiceControl(router *gin.Engine, action, ticket string) *httptest.Res
 }
 
 func newSlaveTestHandler(cfg *config.Config) (*Handlers, *gin.Engine) {
-	handler := &Handlers{cfg: cfg, clusterService: services.NewClusterService(db.DB, nil, ""), caddyService: services.NewCaddyService(cfg.CaddyAdminURL)}
+	handler := &Handlers{cfg: cfg, clusterService: services.NewClusterService(db.DB, ""), caddyService: services.NewCaddyService(cfg.CaddyAdminURL)}
 	router := gin.New()
 	router.POST("/service-control", handler.ClusterServiceControl)
 	return handler, router
@@ -164,10 +170,19 @@ func TestClusterServiceControl_caddy_failure_returns_500(t *testing.T) {
 	becomeSlave(t, 21, clusterToken)
 	_, router := newSlaveTestHandler(&config.Config{CaddyAdminURL: "http://127.0.0.1:1"})
 
-	for _, ticket := range []string{startTicket, stopTicket, restartTicket} {
-		response := postServiceControl(router, mustActionForTicket(t, ticket), ticket)
-		if response.Code != http.StatusInternalServerError {
-			t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	// 停止按事实分类：测试环境无 Caddy（admin 不可达且无进程）= 已停止 → 200；
+	// 启动/重启沿用 `caddy run` 失败 → 500。
+	for _, tc := range []struct {
+		ticket string
+		want   int
+	}{
+		{startTicket, http.StatusInternalServerError},
+		{stopTicket, http.StatusOK},
+		{restartTicket, http.StatusInternalServerError},
+	} {
+		response := postServiceControl(router, mustActionForTicket(t, tc.ticket), tc.ticket)
+		if response.Code != tc.want {
+			t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), tc.want)
 		}
 	}
 	details := auditDetailsServiceControlRows(t)
@@ -205,7 +220,7 @@ func TestClusterServiceControl_restart_app_delays_exit(t *testing.T) {
 	clusterServiceExitDelay = 50 * time.Millisecond
 	defer func() { clusterServiceExit, clusterServiceExitDelay = originalExit, originalDelay }()
 
-	response := postServiceControl(router, models.ClusterServiceActionRestartApp, ticket)
+	response := postServiceControlWithOperator(router, models.ClusterServiceActionRestartApp, ticket, "alice")
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "服务正在重启") {
 		t.Fatalf("status=%d body=%s, want 200 restarting", response.Code, response.Body.String())
 	}
@@ -219,6 +234,14 @@ func TestClusterServiceControl_restart_app_delays_exit(t *testing.T) {
 	if len(details) == 0 || !strings.Contains(details[0], "操作：restart_app") {
 		t.Fatalf("audit details=%v, want restart_app row", details)
 	}
+	// restart_app 与 caddy 分支同口径记录主节点侧实际操作人。
+	var username string
+	if err := db.AuditDB.QueryRow("SELECT username FROM audit_log WHERE action='服务控制' AND resource='节点服务' ORDER BY id DESC LIMIT 1").Scan(&username); err != nil {
+		t.Fatalf("read restart_app audit username: %v", err)
+	}
+	if username != "alice" {
+		t.Fatalf("restart_app audit username=%q, want operator %q", username, "alice")
+	}
 }
 
 func TestClusterServiceControl_rejects_invalid_action(t *testing.T) {
@@ -230,7 +253,7 @@ func TestClusterServiceControl_rejects_invalid_action(t *testing.T) {
 	}
 }
 
-// CLUSTER-3（第 72 轮审计）：解析失败分支的审计动作不得留空段——
+// 解析失败分支的审计动作不得留空段——
 // ShouldBindJSON 失败时 Action 多为零值，此前审计详情落「操作：」空值，
 // 无法区分「动作未知的畸形请求」与记录缺陷。空串以占位符显式留痕。
 func TestClusterServiceControl_parseFailureAuditsPlaceholderAction(t *testing.T) {
@@ -305,7 +328,7 @@ func TestClusterServiceControl_rejects_replay(t *testing.T) {
 
 func newMasterTestRouter(t *testing.T) *gin.Engine {
 	t.Helper()
-	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}, clusterService: services.NewClusterService(db.DB, nil, "")}
+	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}, clusterService: services.NewClusterService(db.DB, "")}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("username", "admin")
@@ -441,6 +464,23 @@ func TestControlClusterNodeService_rejects_bad_requests(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("bad node id status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
 	}
+
+	// 三条失败早退各留一条「失败」审计（此前零审计）。
+	details := auditDetailsServiceControlRows(t)
+	if len(details) != 3 {
+		t.Fatalf("audit details=%v, want one failure row per rejected request", details)
+	}
+	joined := strings.Join(details, "\n")
+	for _, fragment := range []string{"动作：explode（不支持）", "节点 999", "签发票据失败", "节点 abc", "节点编号无效"} {
+		if !strings.Contains(joined, fragment) {
+			t.Errorf("rejection audit missing %q: %v", fragment, details)
+		}
+	}
+	for _, detail := range details {
+		if !strings.Contains(detail, "结果：失败") {
+			t.Errorf("rejection audit lacks failure result: %q", detail)
+		}
+	}
 }
 
 func TestControlClusterNodeService_requires_master(t *testing.T) {
@@ -476,11 +516,11 @@ func TestControlClusterNodeService_ignores_APIKey_readonly_annotation(t *testing
 	}
 }
 
-// F63-B3-1(第 63 轮审计):从端审计操作人传递钉测试——主端 currentUsername
+// 从端审计操作人传递钉测试——主端 currentUsername
 // 经 ClusterServiceControlRequest.Operator → 从端 recordClusterServiceControlAuditBy
 // 落 audit_log.username,防旧主节点降级为「主节点」匿名的回归无护栏。
 func TestClusterServiceControlOperatorTransfer(t *testing.T) {
-	// F64 升级为端到端钉(原弱钉仅测字段零/非零——同义反复):
+	// 升级为端到端钉(原弱钉仅测字段零/非零——同义反复)
 	// ①验证 recordClusterServiceControlAuditBy 在 operator 非空时
 	//   将 operator 作为 audit username 落库
 	// ②operator 空串时回退「主节点」
@@ -518,5 +558,51 @@ func TestClusterServiceControlOperatorTransfer(t *testing.T) {
 	}
 	if username2 != "主节点" {
 		t.Fatalf("audit username=%q, want %q (empty operator fallback broken)", username2, "主节点")
+	}
+}
+
+// 从节点响应读取与同族读端点一致：limit+1 探测读取，超限显式报错——把截断
+// 体交给 JSON 解析只会得到「unexpected end of JSON input」，掩盖真实原因。
+func TestCallClusterServiceControl_rejectsOversizedSlaveResponse(t *testing.T) {
+	setupClusterServiceControlDB(t)
+	oversized := strings.Repeat("a", int(clusterServiceControlMaxBytes)+1)
+	slave := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(oversized))
+	}))
+	t.Cleanup(slave.Close)
+	oldFactory := clusterServiceControlClientFactory
+	clusterServiceControlClientFactory = func(string) *http.Client { return &http.Client{} }
+	t.Cleanup(func() { clusterServiceControlClientFactory = oldFactory })
+	h := &Handlers{cfg: &config.Config{}}
+
+	_, err := h.callClusterServiceControl(context.Background(), slave.URL, models.ClusterServiceActionStopCaddy, "ticket", "admin")
+	if err == nil {
+		t.Fatal("超限响应必须返回错误")
+	}
+	if !strings.Contains(err.Error(), "读取上限") {
+		t.Fatalf("err=%v, want 含「读取上限」的显式超限错误（不得以 JSON 解析失败掩盖）", err)
+	}
+}
+
+// 票据校验失败的细分哨兵必须能翻成审计可读原因：运维据此区分「票据已使用
+// （重放）」与「签名错误（节点集群凭证不一致，需重新注册）」等不同补救路径。
+func TestServiceControlTicketFailureReason_mapsSentinels(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"签名错误", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlSignature), "签名错误"},
+		{"已过期", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlExpired), "已过期"},
+		{"已使用", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlReplay), "已使用"},
+		{"仅通用无效", services.ErrInvalidServiceControlTicket, "无效"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serviceControlTicketFailureReason(tc.err); got != tc.want {
+				t.Fatalf("reason=%q, want %q", got, tc.want)
+			}
+		})
 	}
 }

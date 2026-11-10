@@ -1,8 +1,8 @@
 package handlers
 
-// SYS37-1(第 37 轮审计,P2):MFA 自助写端点(禁用/重绑确认)在 mfa_write_guard
+// MFA 自助写端点(禁用/重绑确认)在 mfa_write_guard
 // 开启时的 428 流程结构性必 401——守卫/verify-step 已消费 TOTP 时间片,前端
-// 自动重试带同码,handler 无条件再验 → 同片重放拒绝。R73(MFAResetByAdmin)
+// 自动重试带同码,handler 无条件再验 → 同片重放拒绝。(MFAResetByAdmin)
 // 已裁定同形为 bug 并以 mfa_stepup_verified 标记修复,本测试钉住自助两端点
 // 的同款标记优先行为(机器身份无标记→本层验码保持)。
 
@@ -17,7 +17,8 @@ import (
 )
 
 // mfaSelfServiceRouter 模拟 JWT 用户(user_id=1)经守卫后的自助端点;
-// guardMarker=true 时注入 mfa_stepup_verified(生产由 mfaStepUpGuard 放行路径置)。
+// guardMarker=true 时注入 mfa_stepup_verified + 验码年龄 0s(生产由
+// mfaStepUpGuard 放行路径同时置两键;拆除/重绑的免验另要求年龄 ≤15s 窄窗)。
 func mfaSelfServiceRouter(h *Handlers, guardMarker bool) *gin.Engine {
 	router := gin.New()
 	wrap := func(handler gin.HandlerFunc) gin.HandlerFunc {
@@ -27,6 +28,7 @@ func mfaSelfServiceRouter(h *Handlers, guardMarker bool) *gin.Engine {
 			c.Set("auth_type", "jwt")
 			if guardMarker {
 				c.Set("mfa_stepup_verified", true)
+				c.Set("mfa_stepup_seconds_ago", int64(0))
 			}
 			handler(c)
 		}
@@ -44,7 +46,7 @@ func postMfaSelfService(router *gin.Engine, path, body string) *httptest.Respons
 	return rec
 }
 
-// 场景 1(SYS37-1 主形):守卫验码放行后(标记在),禁用不带码必须成功——
+// 场景 1:守卫验码放行后(标记在),禁用不带码必须成功——
 // 修复前:401 验证码错误(同片互斥)。
 func TestMFADisable_guardMarker_skipsCodeCheck(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -86,7 +88,7 @@ func TestMFADisable_noMarker_stillRequiresCode(t *testing.T) {
 	}
 }
 
-// 场景 3(SYS37-1 同形同 handler):重绑确认(MFASetup 的 mfaEnabled 分支)
+// 场景 3:重绑确认(MFASetup 的 mfaEnabled 分支)
 // 在标记路径不验码——返回新密钥候选(200),修复前 401。
 func TestMFASetup_rebindGuardMarker_skipsCodeCheck(t *testing.T) {
 	h := newBackupTestHandlers(t)

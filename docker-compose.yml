@@ -1,5 +1,5 @@
-# INFRA-R2（第 69 轮）：主从共用配置锚点——logging/ulimits/healthcheck 三处
-# 逐字重复收敛为单份（双份维护改一侧忘另一侧即分叉）。
+# 主从共用配置锚点——logging/ulimits/healthcheck 三处逐字重复收敛为单份
+#（双份维护改一侧忘另一侧即分叉）。
 x-common-logging: &common-logging
   driver: json-file
   options:
@@ -11,37 +11,49 @@ x-common-ulimits: &common-ulimits
   nofile:
     soft: 1048576
     hard: 1048576
+  # 进程/线程上限：容器内 RLIMIT_NPROC（ulimit -u）；与下方 pids_limit
+  # 取较低值生效。宿主系统 ulimit 无需修改。
+  nproc:
+    soft: 4096
+    hard: 4096
 x-common-healthcheck: &common-healthcheck
-  # 探针须模式无关：面板默认强制 HTTPS（明文 HTTP 得 301），而 admin_tls 关闭时
-  # 又只有明文可用；镜像内无 curl（仅构建期临时安装后 apk del），busybox wget
-  # 的 --no-check-certificate 经实证可完成自签 TLS 探测（第 47 轮 F-47-30）。
-  test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health"]
+  # 与镜像 HEALTHCHECK 同一实现：二进制自带子命令（exec 形式，零 shell）。
+  # 旧 CMD-SHELL 形态每 30s 派生 sh + HTTP 客户端子进程，在 PID 1 不回收孤儿
+  # 的容器里会持续累积僵尸并打满 cgroup pids 配额（生产实证）。
+  # 语义：HTTPS 先行 → 明文回落，只认第一跳 200、不跟随跳转。
+  # 端口同镜像：容器内面板口恒为 8000（entrypoint 不传 -config，数据库/文件里的
+  # port 只对裸机自定义启动生效）；改探针端口须与 Dockerfile HEALTHCHECK 同步。
+  test: ["CMD", "/usr/local/bin/lazy-balancer", "--healthcheck"]
   interval: 30s
   timeout: 5s
   retries: 3
+  # 与镜像 HEALTHCHECK --start-period=90s 对齐（compose healthcheck 会整体替换
+  # 镜像定义）：冷启动含 CRS 种子/证书物化/启动回放，30s 宽限在慢盘下必然
+  # 探针失败，容器在预期启动窗口内误显 unhealthy。
   start_period: 90s
 
 services:
-  # 主从两个容器共用同一镜像。
-  #
-  # 镜像引用的是**我们自己维护的那份**：本仓库的流水线构建后发布到
-  # docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2。刻意不指向上游的
-  # v55448330/lazy-balancer-v2——那个 tag 随上游发版往前跑，会把我们的定制
-  # 改动悄悄换成上游原版，出现「代码是我们改的、跑的是上游」的版本错乱。
-  # 上游镜像仅作对照参考，请勿在此文件里引用。
-  #
+  # 主从两个容器共用同一镜像（image 标签与 Docker Hub 推送的一致）。
   # 本地开发迭代时执行：docker compose build lazy-balancer && docker compose up -d
-  # （build 段仍然就地构建，即当前工作区代码；image 只是给不 build 的场景兜底）
+  #
+  # 平台口径：主节点固定 network_mode: host，仅适用于 Linux 宿主。
+  # Docker Desktop（macOS/Windows）的 host 网络支持依版本/设置而异，默认请按
+  # README「快速开始」的 Docker Desktop 命令（bridge + -p 8000/80/443/443-udp
+  # + named volume）启动，而非直接 docker compose up。
   lazy-balancer:
-    image: docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
+    image: v55448330/lazy-balancer-v2:v2.4.2
     logging: *common-logging
     build:
       context: .
       args:
-        # FE-8/INFRA-4（第 73 轮登记）：版本号三处硬编码之一（另两处
-        # Dockerfile ARG VERSION、web/src/utils/branding.ts appVersion 回退值）。
-        # 发版检查单已固化进 lazy-balancer-release 技能步骤 2——仅登记防漏 bump。
-        VERSION: v2.3.8
+        # 版本号硬编码点之一（本行即 compose build.args.VERSION）。全仓其余
+        # 位置=Dockerfile ARG VERSION、本文件两处 image tag、README 两版
+        # docker build 示例（--build-arg VERSION 与镜像 tag）、
+        # web/src/utils/branding.ts 的 appVersion 回退值；发布时另需 buildx
+        # --build-arg 显式传参。以上各处须同步递增。
+        # VERSION=正式版本号（v2.4.2，镜像内 APP_VERSION 同口径）；beta 通道见 v2.4.2-beta
+        # 测试通道在 image tag 上加 -beta 后缀。
+        VERSION: v2.4.2
     container_name: lazy-balancer
     network_mode: host
     # Port mapping is not used with host network; Caddy binds directly to host ports.
@@ -55,29 +67,27 @@ services:
     environment:
       - NODE_NAME=master
       - LOG_FILE=/app/logs/lazy-balancer.log
-      # —— 端口换位（80/443/8000 被占用时改这里）——
-      # host 网络下这是 Caddy/面板的「实际监听口」，不是端口转发：改 HTTP_PORT=8080
-      # 后 80 不再被本容器监听。只影响默认语义（新建规则向导默认值、兜底站与
-      # HTTP→HTTPS 跳转落点、80/443 保留端口判定）；存量规则 listen_port 是持久化
-      # 数据，不会被自动迁移——需手动逐条改成新端口后保存。详见 docs/deployment.zh-CN.md
-      - HTTP_PORT=80
-      - HTTPS_PORT=443
-      - PANEL_PORT=8000
     restart: unless-stopped
-    # INFRA-U5（第 69 轮）：PID1 退出前 POST Caddy admin /stop 排水在途连接，
+    # 面板进程退出前 POST Caddy admin /stop 排水在途连接，
     # grace period 覆盖 HTTP ≤10s Shutdown + Caddy 排水窗口。
     stop_grace_period: 30s
     healthcheck: *common-healthcheck
     ulimits: *common-ulimits
+    # PID 配额（按线程计数）默认 4096：面板 + Caddy + 定时任务在高连接场景
+    # 下线程数可达数百，Docker 默认值偏紧；配额打满时容器内无法 fork。
+    pids_limit: 4096
 
   # 从节点测试实例：bridge 网络，仅将容器 8000 映射到宿主机 8001，避免与主节点(host 网络)端口冲突
-  # 主节点地址注册时填写: http://host.docker.internal:8000
+  # 注册主节点地址时填 http://host.docker.internal:8000——下方 extra_hosts 把该主机名
+  # 解析到宿主网关，Linux 宿主（本文件唯一支持的平台）同样可达，不再依赖 Docker
+  # Desktop 的默认注入。Docker < 20.10 不认 host-gateway 时，改填宿主 LAN 地址，
+  # 例如 http://192.168.1.10:8000（host 网络下主节点直接监听宿主端口）。
   lazy-balancer-slave:
-    # 同主节点：引用我们自维护的镜像，不跟上游 tag 走
-    image: docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
+    image: v55448330/lazy-balancer-v2:v2.4.2
     logging: *common-logging
     container_name: lazy-balancer-slave
-    # host.docker.internal 在 Linux 上不由 Docker 自动注入，显式经 host-gateway 映射
+    # 宿主网关别名：bridge 网络内解析 host.docker.internal 到宿主，Linux 宿主
+    # 需要它（Docker Desktop 才默认提供），注册主节点地址依赖该主机名。
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -93,10 +103,8 @@ services:
     environment:
       - NODE_NAME=slave-test
       - LOG_FILE=/app/logs/lazy-balancer.log
-      # 从节点测试实例的面板口固定 8000（bridge 网络映射 8001:8000），不跟随
-      # HTTP_PORT/HTTPS_PORT——那是代理口，本实例不承载代理流量。
-      - PANEL_PORT=8000
     ulimits: *common-ulimits
+    pids_limit: 4096
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck: *common-healthcheck

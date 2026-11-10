@@ -1,6 +1,6 @@
 package handlers
 
-// LBS-A-L1（第 69 轮 P1）：HTTP 规则混合 http/https 上游池在 Caddy 无逐上游
+// HTTP 规则混合 http/https 上游池在 Caddy 无逐上游
 // 协议概念（shouldUseTLS 传输级+except_ports 例外表，v2.11.6 httptransport.go:
 // 674-680）——任一 https 上游使池级 TLS 传输生效，http 上游明文打 TLS 端口
 // 静默全灭 502。保存/导入侧显式拒绝混布（用户裁定修法①）。
@@ -38,7 +38,7 @@ func TestRulePayload_rejectsMixedHttpHttpsUpstreamPool(t *testing.T) {
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`{"name":"mixpool-%d","protocol":"http","domain":"mix-%d.test","listen_port":%d,"upstreams":%s}`,
+			body := fmt.Sprintf(`{"name":"mixpool-%d","protocol":"http","domain":"mix-%d.test","listen_port":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":%s}`,
 				i, i, 19300+i, tc.upstreams)
 			req := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
@@ -54,13 +54,13 @@ func TestRulePayload_rejectsMixedHttpHttpsUpstreamPool(t *testing.T) {
 	}
 }
 
-// 备份侧同门（R62 C3-F2 同位）：手造备份带混布池须 400。
+// 备份侧同门：手造备份带混布池须 400。
 func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	tables := map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "lb_mixbak", "protocol": "http"}},
 		"upstreams": {
-			{"rule_id": "lb_mixbak", "protocol": "http", "enabled": true},
-			{"rule_id": "lb_mixbak", "protocol": "https", "enabled": true},
+			{"rule_id": "lb_mixbak", "host": "10.0.0.1", "port": 8080, "weight": 1, "protocol": "http", "enabled": true},
+			{"rule_id": "lb_mixbak", "host": "10.0.0.2", "port": 8443, "weight": 1, "protocol": "https", "enabled": true},
 		},
 	}
 	err := validateBackupRuleReferences(tables)
@@ -69,7 +69,7 @@ func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	}
 }
 
-// 同族（路径规则自定义上游池，R-12 收敛面）：路径级自定义上游混布同样拒绝。
+// 同族（路径规则自定义上游池，收敛面）：路径级自定义上游混布同样拒绝。
 func TestRulePayload_rejectsMixedPathRuleUpstreamPool(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -89,9 +89,9 @@ func TestRulePayload_rejectsMixedPathRuleUpstreamPool(t *testing.T) {
 	}
 }
 
-// LBH-A-1（第 70 轮 P2）：混布门收敛三链——存量混布行（69 轮修复前落库/
-// 直改 DB）不得经启用/复制静默投入运行，启动聚合校验须点名告警。保存门与
-// v2 导入链已拦新数据（上方两测试）；此前启用链/聚合校验/复制链零检查。
+// 混布门收敛三链——存量混布行（直改 DB 或更早版本落库）不得经启用/复制
+// 静默投入运行，启动聚合校验须点名告警。保存门与 v2 导入链已拦新数据
+//（上方两测试）；启用链/聚合校验/复制链此前零检查。
 
 func seedMixedStoredRule(t *testing.T, id string, enabled bool) {
 	t.Helper()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -13,20 +14,43 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+
+	"lazy-balancer-v2/wafiplist"
 )
+
+// ResetCrawlerVerifyCacheForTest 清缓存+换 resolver（测试专用；测试缝只存在于
+// _test.go——生产符号表不得出现只有测试消费的入口）。
+func ResetCrawlerVerifyCacheForTest(r crawlerDNSResolver) {
+	crawlerCacheMu.Lock()
+	crawlerCache = make(map[string]crawlerVerifyCache)
+	crawlerCachePruneVisitsForTest = 0
+	crawlerCacheMu.Unlock()
+	// 文件快照缓存同样属于跨用例状态：前一用例若有成功的 10min TTL 快照，
+	// 后续用例改写 crawlerIPListFile 后仍会命中旧路径快照（shuffle 下随机红）。
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap = nil
+	crawlerFileCacheMu.Unlock()
+	if r != nil {
+		crawlerVerifyResolver = r
+	} else {
+		crawlerVerifyResolver = &netResolver{}
+	}
+}
 
 // fakeResolver 可编程 DNS 替身：PTR 与正向结果按表返回。
 type fakeResolver struct {
-	mu      sync.Mutex
-	ptr     map[string][]string // ip → PTR names（含尾点模拟 LookupAddr）
-	host    map[string][]string // name → addrs
-	ptrErr  map[string]error
-	hostErr map[string]error
+	mu        sync.Mutex
+	ptr       map[string][]string // ip → PTR names（含尾点模拟 LookupAddr）
+	host      map[string][]string // name → addrs
+	ptrErr    map[string]error
+	hostErr   map[string]error
+	ptrLookup int
 }
 
 func (f *fakeResolver) LookupAddr(_ context.Context, addr string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ptrLookup++
 	if err, ok := f.ptrErr[addr]; ok {
 		return nil, err
 	}
@@ -158,6 +182,27 @@ func TestVerifyCrawler_transientFailuresNotCached(t *testing.T) {
 	})
 }
 
+func TestVerifyCrawler_nxdomainIsCachedSpoof(t *testing.T) {
+	const ip = "203.0.113.80"
+	resolver := &fakeResolver{ptrErr: map[string]error{
+		ip: &net.DNSError{Err: "no such host", Name: ip, IsNotFound: true},
+	}}
+	ResetCrawlerVerifyCacheForTest(resolver)
+
+	if got := VerifyCrawler(ip, "googlebot"); got != CrawlerVerdictSpoof {
+		t.Fatalf("NXDOMAIN must be a deterministic spoof, got %v", got)
+	}
+	if got := VerifyCrawler(ip, "googlebot"); got != CrawlerVerdictSpoof {
+		t.Fatalf("cached NXDOMAIN verdict=%v, want spoof", got)
+	}
+	resolver.mu.Lock()
+	lookups := resolver.ptrLookup
+	resolver.mu.Unlock()
+	if lookups != 1 {
+		t.Fatalf("PTR lookups=%d, want 1（第二次必须命中负缓存）", lookups)
+	}
+}
+
 func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
 	const newIP = "34.100.1.1"
 	newResolver := func() *fakeResolver {
@@ -222,6 +267,38 @@ func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
 		}
 		if newExists {
 			t.Fatal("a full live cache must skip the new key rather than evict verified crawlers")
+		}
+	})
+
+	t.Run("full cache evicts a live negative to admit a new conclusion", func(t *testing.T) {
+		ResetCrawlerVerifyCacheForTest(newResolver())
+		oldMax := crawlerCacheMax
+		crawlerCacheMax = 2
+		t.Cleanup(func() { crawlerCacheMax = oldMax })
+		now := time.Now()
+		crawlerCacheMu.Lock()
+		// 一个正结论 + 一个负结论：负结论可被回收，正结论必须保留。
+		crawlerCache["keep-pos|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
+		crawlerCache["stale-neg|googlebot"] = crawlerVerifyCache{ok: false, expires: now.Add(5 * time.Minute)}
+		crawlerCacheMu.Unlock()
+
+		if got := VerifyCrawler(newIP, "googlebot"); got != CrawlerVerdictSpoof {
+			t.Fatalf("test input must produce a deterministic negative, got %v", got)
+		}
+		crawlerCacheMu.Lock()
+		keep, keepExists := crawlerCache["keep-pos|googlebot"]
+		_, negExists := crawlerCache["stale-neg|googlebot"]
+		_, newExists := crawlerCache[newIP+"|googlebot"]
+		size := len(crawlerCache)
+		crawlerCacheMu.Unlock()
+		if !keepExists || !keep.ok {
+			t.Fatal("positive conclusion must never be evicted at capacity")
+		}
+		if negExists {
+			t.Fatal("a live negative conclusion may be evicted to admit a new conclusion")
+		}
+		if !newExists || size != 2 {
+			t.Fatalf("after negative eviction size=%d newCached=%v, want size=2 and new result cached", size, newExists)
 		}
 	})
 }
@@ -307,6 +384,7 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	t.Cleanup(func() {
 		crawlerIPListFile = oldFile
 		crawlerIPListRetryInterval = oldRetry
+		resetCrawlerIPRangeCacheForTest()
 	})
 	resetCrawlerIPRangeCacheForTest()
 
@@ -367,6 +445,32 @@ func TestVerifyCrawlerIPRange_invalidAddrNoPanic(t *testing.T) {
 }
 
 // 地址归一化（Unmap/zone），方向 fail-closed ----
+
+// Given: DNS 表只登记 v4 规范形态，4in6 映射形态无 PTR 记录
+// When: 先用 v4 形态验证命中缓存，再用同主机的 4in6 文本形态查询
+// Then: 必须复用同一条缓存（键归一），不得重新解析落到「无 PTR」的确定否定
+// （键取原始串时同一地址拆成两条条目、各跑一次 DNS，且可被同机两种形态
+// 额外占用缓存槽与 DNS 配额）。
+func TestVerifyCrawler_cacheKeyUnifiesV4MappedForms(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptr: map[string][]string{
+			"66.249.66.1": {"crawl-66-249-66-1.googlebot.com."},
+		},
+		host: map[string][]string{
+			"crawl-66-249-66-1.googlebot.com": {"66.249.66.1"},
+		},
+	})
+	if got := VerifyCrawler("66.249.66.1", "googlebot"); got != CrawlerVerdictVerified {
+		t.Fatalf("v4 形态验证=%v, want Verified", got)
+	}
+	if got := VerifyCrawler("::ffff:66.249.66.1", "googlebot"); got != CrawlerVerdictVerified {
+		t.Fatalf("4in6 同主机形态=%v, want Verified（缓存键必须 Unmap 归一，DNS 表里没有映射形态条目）", got)
+	}
+	// 回归形状：不可解析输入仍 fail-closed（键沿用原串不影响结论）。
+	if got := VerifyCrawler("not-an-ip", "googlebot"); got != CrawlerVerdictSpoof {
+		t.Fatalf("不可解析输入=%v, want Spoof", got)
+	}
+}
 
 // Given: 客户端 IP 为 4in6 映射形态，PTR 属引擎官方域，正向回验返回 v4 规范串
 // When: 双跳验证
@@ -477,6 +581,31 @@ func TestCrawlerIPRangeSnapshot_sizeGateAndBadCIDRs(t *testing.T) {
 			t.Fatal("有效段必须仍可命中")
 		}
 	})
+
+	t.Run("仅坏CIDR不豁免且告警方向正确", func(t *testing.T) {
+		crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+		resetCrawlerIPRangeCacheForTest()
+		t.Cleanup(resetCrawlerIPRangeCacheForTest)
+		oldLogf := crawlerSnapshotLogf
+		var warnings []string
+		crawlerSnapshotLogf = func(format string, args ...any) {
+			warnings = append(warnings, fmt.Sprintf(format, args...))
+		}
+		t.Cleanup(func() { crawlerSnapshotLogf = oldLogf })
+		if err := os.WriteFile(crawlerIPListFile, []byte(`{"so360spider":["not-a-cidr","42.236.9.0/33"]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if snap := loadCrawlerIPRangeSnapshot(); snap.ok {
+			t.Fatal("仅含坏 CIDR 的快照必须按不可用处理")
+		}
+		if ipRangeVerified("42.236.8.1", "so360spider") {
+			t.Fatal("坏 CIDR 不得授予爬虫豁免")
+		}
+		joined := strings.Join(warnings, "\n")
+		if !strings.Contains(joined, "grant no crawler exemption") || strings.Contains(joined, "fail-open") {
+			t.Fatalf("坏 CIDR 告警方向错误: %q", joined)
+		}
+	})
 }
 
 // 并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新
@@ -573,6 +702,70 @@ func TestCrawlerIPRangeSnapshot_pathChangeRejectsInflightRead(t *testing.T) {
 	}
 }
 
+// 包级单值路径是 last-writer-wins：非默认 → 另一值的切换必须留痕（节流
+// WARN，多 handler 潜在漂移可观测）；默认值 → 配置值的首次落定是正常启动
+// 形态，静默；同值重复 Provision（一次 reload 逐规则调用）不得重置缓存、
+// 不得发告警。
+func TestSetCrawlerIPListFilePath_driftWarnsOnlyOnRealSwitch(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldInterval := crawlerPathDriftThrottle.interval
+	crawlerPathDriftThrottle.interval = time.Hour // 长窗口：本用例只发生一次真实切换
+	t.Cleanup(func() {
+		crawlerPathDriftThrottle.interval = oldInterval
+		crawlerPathDriftThrottle.reset()
+		setCrawlerIPListFilePath(oldFile)
+		resetCrawlerIPRangeCacheForTest()
+	})
+	setCrawlerIPListFilePath(defaultCrawlerIPListFile)
+	crawlerPathDriftThrottle.reset()
+	resetCrawlerIPRangeCacheForTest()
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap = &crawlerIPRangeSnapshot{ok: true}
+	crawlerFileCacheMu.Unlock()
+
+	pathA := filepath.Join(t.TempDir(), "a-crawler.json")
+	pathB := filepath.Join(t.TempDir(), "b-crawler.json")
+
+	// 默认 → 自定义 A：正常启动形态，不发告警；但快照缓存必须重置。
+	setCrawlerIPListFilePath(pathA)
+	crawlerPathDriftThrottle.mu.Lock()
+	driftRecords := len(crawlerPathDriftThrottle.seen)
+	crawlerPathDriftThrottle.mu.Unlock()
+	if driftRecords != 0 {
+		t.Fatalf("默认值首落配置值不得告警，记录 %d 条", driftRecords)
+	}
+	crawlerFileCacheMu.Lock()
+	cleared := crawlerFileCacheSnap == nil
+	crawlerFileCacheMu.Unlock()
+	if !cleared {
+		t.Fatal("路径变化必须重置快照缓存")
+	}
+
+	// 非默认 A → 另一值 B：潜在 last-writer-wins 漂移，必须留痕。
+	setCrawlerIPListFilePath(pathB)
+	crawlerPathDriftThrottle.mu.Lock()
+	_, driftLogged := crawlerPathDriftThrottle.seen["path-drift"]
+	crawlerPathDriftThrottle.mu.Unlock()
+	if !driftLogged {
+		t.Fatal("非默认路径切换必须记录节流告警（last-writer-wins 漂移可观测）")
+	}
+
+	// 同值重复 Provision：不重置缓存、不新增告警记录。
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap = &crawlerIPRangeSnapshot{ok: true}
+	crawlerFileCacheMu.Unlock()
+	setCrawlerIPListFilePath(pathB)
+	crawlerPathDriftThrottle.mu.Lock()
+	driftRecords = len(crawlerPathDriftThrottle.seen)
+	crawlerPathDriftThrottle.mu.Unlock()
+	crawlerFileCacheMu.Lock()
+	kept := crawlerFileCacheSnap != nil
+	crawlerFileCacheMu.Unlock()
+	if driftRecords != 1 || !kept {
+		t.Fatalf("同值重复 Provision 不得告警/重置缓存：records=%d kept=%v", driftRecords, kept)
+	}
+}
+
 // 渲染侧经 crawler_ip_list_file 配置键下发根服务派生路径——
 // 自定义 data_dir 部署下根服务把运行快照写到 <data_dir>/crawler-ip-lists.json，
 // 插件若不消费配置键会恒读 /app/data/crawler-ip-lists.json（读侧分叉，360 类
@@ -664,5 +857,304 @@ func TestVerifyCrawlerIPRange_snapshotUnavailableIsTransient(t *testing.T) {
 	}
 	if got := VerifyCrawler("42.236.16.1", "so360spider"); got != CrawlerVerdictSpoof {
 		t.Fatalf("outside official range verdict=%v, want spoof", got)
+	}
+}
+
+// resetCrawlerSnapshotLogThrottleForTest 复位告警节流状态与发射计数。
+func resetCrawlerSnapshotLogThrottleForTest() {
+	crawlerSnapshotThrottle.reset()
+	crawlerSnapshotLogCallsForTest.Store(0)
+}
+
+// 读侧有界代际读（与 wafiplist 名单加载器共用同一原语）：stat 与读之间的
+// 原位改写（追加/截断/同尺寸改写）读到的是混合字节，不得当作一代快照落定。
+func TestCrawlerIPRangeSnapshot_rewriteDuringReadFailsClosed(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldRead := crawlerReadBoundedFile
+	oldInterval := crawlerSnapshotThrottle.interval
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerReadBoundedFile = oldRead
+		crawlerSnapshotThrottle.interval = oldInterval
+		resetCrawlerIPRangeCacheForTest()
+		resetCrawlerSnapshotLogThrottleForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	crawlerSnapshotThrottle.interval = 0
+	resetCrawlerIPRangeCacheForTest()
+	resetCrawlerSnapshotLogThrottleForTest()
+
+	crawlerReadBoundedFile = func(string, int64) ([]byte, os.FileInfo, error) {
+		return nil, nil, wafiplist.ErrFileRewriteDuringRead
+	}
+	snap := loadCrawlerIPRangeSnapshot()
+	if snap.ok {
+		t.Fatal("读期间被改写必须 fail-closed（混合字节不得当作一代内容）")
+	}
+	if len(snap.prefixes) != 0 {
+		t.Fatalf("被拒绝的读取不得产出豁免段: %v", snap.prefixes)
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 1 {
+		t.Fatalf("改写告警 %d 条, want 1（必须可见）", got)
+	}
+}
+
+// 持久异常形态（超限文件等）按「路径+原因」节流；成功快照落定后清除记录，
+// 再次故障立即可见——不能把日志洪峰当天，也不能把复发故障静默吞掉。
+func TestCrawlerIPRangeSnapshot_anomalyLogThrottled(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldRetry := crawlerIPListRetryInterval
+	oldInterval := crawlerSnapshotThrottle.interval
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerIPListRetryInterval = oldRetry
+		crawlerSnapshotThrottle.interval = oldInterval
+		resetCrawlerIPRangeCacheForTest()
+		resetCrawlerSnapshotLogThrottleForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	crawlerIPListRetryInterval = 0 // 失败快照每轮重读（模拟 10s 重试的放大形态）
+	crawlerSnapshotThrottle.interval = time.Minute
+	resetCrawlerIPRangeCacheForTest()
+	resetCrawlerSnapshotLogThrottleForTest()
+
+	oversized := `{"so360spider":["42.236.8.0/21"]}` + strings.Repeat(" ", crawlerIPListMaxBytes)
+	writeSnapshot := func(payload string) {
+		t.Helper()
+		if err := os.WriteFile(crawlerIPListFile, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSnapshot(oversized)
+	for i := 0; i < 3; i++ {
+		if loadCrawlerIPRangeSnapshot().ok {
+			t.Fatal("超限快照必须 fail-closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 1 {
+		t.Fatalf("超限告警 %d 条, want 1（同路径同原因按时间窗节流）", got)
+	}
+
+	// 恢复合法快照 → 清除节流记录
+	writeSnapshot(`{"so360spider":["42.236.8.0/21"]}`)
+	if !loadCrawlerIPRangeSnapshot().ok {
+		t.Fatal("合法快照应可用（前置条件）")
+	}
+	// 再次超限（强制越过成功快照的完整重载间隔）
+	writeSnapshot(oversized)
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap.loadedAt = time.Now().Add(-time.Hour)
+	crawlerFileCacheMu.Unlock()
+	if loadCrawlerIPRangeSnapshot().ok {
+		t.Fatal("再次超限必须 fail-closed")
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 2 {
+		t.Fatalf("恢复后再次故障必须立即重新告警, got %d want 2", got)
+	}
+}
+
+// 加载期聚合为「升序不相交」前缀集：判定期二分查找（与 @ipListFast 同构）
+// 的正确性依赖该不变量；未聚合的线性扫描在大段集下是每请求 O(n)。
+func TestCrawlerIPRangeSnapshot_aggregatesSortedDisjoint(t *testing.T) {
+	oldFile := crawlerIPListFile
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		resetCrawlerIPRangeCacheForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	payload := `{"so360spider":["42.236.9.0/24","42.236.8.0/24","42.236.8.0/22","2408:4000:8000::/33","2408:4000::/33"]}`
+	if err := os.WriteFile(crawlerIPListFile, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetCrawlerIPRangeCacheForTest()
+
+	snap := loadCrawlerIPRangeSnapshot()
+	if !snap.ok {
+		t.Fatal("合法快照应可用")
+	}
+	entries := snap.prefixes["so360spider"]
+	// 兄弟段归并 + 被更宽段覆盖剔除：同一并集收敛为两条。
+	want := []string{"42.236.8.0/22", "2408:4000::/32"}
+	if len(entries) != len(want) {
+		t.Fatalf("聚合结果=%v, want %v", entries, want)
+	}
+	for i := range want {
+		if entries[i].String() != want[i] {
+			t.Fatalf("聚合结果[%d]=%s, want %s（全量: %v）", i, entries[i], want[i], entries)
+		}
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i-1].Addr().Compare(entries[i].Addr()) >= 0 {
+			t.Fatalf("前缀集未升序: %v", entries)
+		}
+		if entries[i-1].Contains(entries[i].Addr()) || entries[i].Contains(entries[i-1].Addr()) {
+			t.Fatalf("前缀集存在嵌套/重叠（二分失效）: %v", entries)
+		}
+	}
+	// 二分命中面：并集语义不变（归并只合并兄弟段，不放大覆盖）
+	for _, hit := range []string{"42.236.8.1", "42.236.9.77", "2408:4000:8000::1"} {
+		if !ipRangeVerified(hit, "so360spider") {
+			t.Fatalf("%s 应命中官方段", hit)
+		}
+	}
+	for _, miss := range []string{"42.236.16.1", "2408:4001::1"} {
+		if ipRangeVerified(miss, "so360spider") {
+			t.Fatalf("%s 在段外不得命中", miss)
+		}
+	}
+}
+
+// 快照「不可用」必须可观测：缺失（冷启动正常形态）保持静默，但权限/目录等
+// 读错误与内容不可解析（空文件/半截 JSON/非对象 JSON）都是 360 豁免静默失效
+// 的真实形态，必须留痕（本模块自订「不可用必须可见」不变量）。
+func TestCrawlerIPRangeSnapshot_unavailableReasonsAreLogged(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldRead := crawlerReadBoundedFile
+	oldInterval := crawlerSnapshotThrottle.interval
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerReadBoundedFile = oldRead
+		crawlerSnapshotThrottle.interval = oldInterval
+		resetCrawlerIPRangeCacheForTest()
+		resetCrawlerSnapshotLogThrottleForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	// 非零节流间隔：记录「路径|原因」键，用例据此区分三类不可用原因。
+	crawlerSnapshotThrottle.interval = time.Hour
+
+	cases := []struct {
+		name   string
+		read   func(string, int64) ([]byte, os.FileInfo, error)
+		reason string
+	}{
+		{
+			name: "read-error",
+			read: func(string, int64) ([]byte, os.FileInfo, error) {
+				return nil, nil, os.ErrPermission
+			},
+			reason: "read",
+		},
+		{
+			name: "empty",
+			read: func(string, int64) ([]byte, os.FileInfo, error) {
+				info, err := os.Stat(crawlerIPListFile)
+				if err != nil {
+					if werr := os.WriteFile(crawlerIPListFile, nil, 0o600); werr != nil {
+						t.Fatal(werr)
+					}
+					info, err = os.Stat(crawlerIPListFile)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				return []byte{}, info, nil
+			},
+			reason: "empty",
+		},
+		{
+			name: "invalid-json",
+			read: func(string, int64) ([]byte, os.FileInfo, error) {
+				if err := os.WriteFile(crawlerIPListFile, []byte(`[]`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				info, err := os.Stat(crawlerIPListFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []byte(`[]`), info, nil
+			},
+			reason: "parse",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crawlerReadBoundedFile = tc.read
+			resetCrawlerIPRangeCacheForTest()
+			resetCrawlerSnapshotLogThrottleForTest()
+			snap := loadCrawlerIPRangeSnapshot()
+			if snap.ok {
+				t.Fatalf("%s：不可用快照必须 fail-closed", tc.name)
+			}
+			if got := crawlerSnapshotLogCallsForTest.Load(); got != 1 {
+				t.Fatalf("%s：不可用原因必须留痕，告警 %d 条, want 1", tc.name, got)
+			}
+			crawlerSnapshotThrottle.mu.Lock()
+			_, logged := crawlerSnapshotThrottle.seen[crawlerIPListFile+"|"+tc.reason]
+			crawlerSnapshotThrottle.mu.Unlock()
+			if !logged {
+				t.Fatalf("%s：告警原因须为 %q，实际未记录", tc.name, tc.reason)
+			}
+		})
+	}
+
+	// 冷启动缺失形态保持静默：Caddy 可能先于根服务生成快照。
+	crawlerReadBoundedFile = func(string, int64) ([]byte, os.FileInfo, error) {
+		return nil, nil, os.ErrNotExist
+	}
+	resetCrawlerIPRangeCacheForTest()
+	resetCrawlerSnapshotLogThrottleForTest()
+	if snap := loadCrawlerIPRangeSnapshot(); snap.ok {
+		t.Fatal("缺失快照必须 fail-closed")
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 0 {
+		t.Fatalf("冷启动缺失形态不得告警，实际 %d 条", got)
+	}
+}
+
+// 快照内容不可用（null/{}/全坏条目）不得把 ok 置真：判定侧对空集返回瞬态，
+// 若 ok=true 则 10 分钟缓存期内所有引擎验证恒瞬态，且诊断被成功路径的
+// clearCrawlerSnapshotLogs 抹掉（豁免整体静默失效）。
+func TestParsePayload_emptySnapshotIsUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"null", "null", false},
+		{"empty object", "{}", false},
+		{"engine with empty list", `{"360":[]}`, false},
+		{"all cidrs unparsable", `{"360":["not-a-cidr","1.2.3.4/99"]}`, false},
+		{"one usable prefix", `{"360":["203.0.113.0/24"]}`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &crawlerIPRangeSnapshot{filePath: "snapshot.json", prefixes: map[string][]netip.Prefix{}}
+			if got := s.parsePayload([]byte(c.raw)); got != c.want {
+				t.Fatalf("parsePayload(%s)=%v, want %v", c.raw, got, c.want)
+			}
+		})
+	}
+}
+
+// 快照条目解析必须与判定侧同口径（复用 wafiplist.ParseIPEntry 单源）：
+// 裸 netip.ParsePrefix 会把 4in6 映射段（::ffff:a.b.c.d/104）装进 v6 集，而
+// 查询侧 Unmap 后恒为 v4 地址 → 该段「加载成功、运行永不命中」（真爬虫被拦
+// + 伪伪装事件，快照侧零告警）；裸 IP 条目则被当坏 CIDR 丢弃。
+func TestCrawlerIPRangeSnapshot_parses4in6AndBareIPEntries(t *testing.T) {
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	if err := os.WriteFile(crawlerIPListFile, []byte(`{"so360spider":["::ffff:42.236.8.0/120"],"gptbot":["1.2.3.4"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetCrawlerIPRangeCacheForTest()
+
+	// 4in6 条目归一为 42.236.8.0/24：v4 与 4in6 两种查询形态都必须命中。
+	if !ipRangeVerified("42.236.8.1", "so360spider") {
+		t.Fatal("4in6 段条目应归一为 v4 并命中 v4 查询（裸 ParsePrefix 会静默永不命中）")
+	}
+	if !ipRangeVerified("::ffff:42.236.8.9", "so360spider") {
+		t.Fatal("4in6 段条目应命中 4in6 查询形态")
+	}
+	if ipRangeVerified("42.236.9.1", "so360spider") {
+		t.Fatal("归一后的段外地址不得命中")
+	}
+	// 裸 IP 条目按 /32 生效，而不是计入坏 CIDR 丢弃。
+	if !ipRangeVerified("1.2.3.4", "gptbot") {
+		t.Fatal("裸 IP 条目应补 /32 生效")
+	}
+	if ipRangeVerified("1.2.3.5", "gptbot") {
+		t.Fatal("裸 IP 条目不得放大成整段命中")
 	}
 }

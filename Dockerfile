@@ -1,7 +1,7 @@
 # 编译阶段固定在构建机架构执行（--platform=$BUILDPLATFORM）：buildx 多架构构建
 # 不会为目标架构起 QEMU 跑 Go 工具链（跨架构编译慢数倍）。产物架构由下方
 # GOOS/GOARCH 显式指定；CGO_ENABLED=0 使交叉编译无需目标架构的 C 工具链。
-FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS xcaddy-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS xcaddy-builder
 RUN apk add --no-cache git
 # GOPROXY 逗号多级回退：阿里云 404/410 时依次回落 goproxy.cn、直连；
 # 校验不符类瞬态错误由下方 xcaddy build 的重试循环兜底
@@ -12,9 +12,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
 WORKDIR /app
 
-# GOTOOLCHAIN=auto（本阶段有意保留）：xcaddy 在临时主模块里按 Caddy 声明的
-# go 指令构建，Caddy 升级到更高 Go 要求时由工具链自动拉取；backend 阶段则收紧
-# 为 local（见该阶段 ENV）——镜像内的 Go 二进制只由基础镜像声明的工具链产出。
+# GOTOOLCHAIN=auto（本阶段仅作显式诊断兜底）：xcaddy 在临时主模块里按 Caddy
+# 声明的 go 指令构建；若 Caddy 提高到更高 Go 要求，auto 会拉取新工具链，而下方
+# go1.27.3 精确断言会立即拒绝产物。此时必须同步 bump 基础镜像与断言，不得把
+# 自动升级静默带入镜像；backend 阶段用 local 执行同一精确版本契约。
 ENV GOTOOLCHAIN=auto
 # 代理不在此声明：Docker 预定义 HTTP_PROXY/HTTPS_PROXY 等构建参数，经
 # --build-arg 传入后自动注入每条 RUN 的环境，无需 ARG 声明（声明了却不引用
@@ -36,6 +37,7 @@ COPY caddychain/ caddychain/
 COPY caddydeps/ caddydeps/
 COPY wafiplist/ wafiplist/
 COPY geoipnames/ geoipnames/
+COPY caddyl4sec/ caddyl4sec/
 # 双缓存挂载（模块+编译缓存）按 builder 持久（lazy-builder GC 48h）：
 # 根治冷缓存全量重编 42 分钟——命中缓存后增量编译只需数分钟。
 # 3 次重试兜底镜像源偶发供应与 sum.golang.org 校验不符的比特
@@ -47,16 +49,27 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   set -e; \
   built=0; \
   for attempt in 1 2 3; do \
-    if xcaddy build v2.11.7 \
+    # 逐次切换代理链：镜像源比特与 sum.golang.org 不符时（如 pebble v2.10.1
+    # 被镜像缓存旧比特），同链重试无效——第 2 次走官方 proxy.golang.org，
+    # 第 3 次直连 GitHub（源仓库现行为准，sumdb 校验兜底不变）。
+    case $attempt in \
+      1) export GOPROXY="https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct";; \
+      2) export GOPROXY="https://proxy.golang.org,direct";; \
+      3) export GOPROXY="direct";; \
+    esac; \
+    if xcaddy build v2.11.9 \
       --with github.com/mholt/caddy-l4@v0.1.2 \
       --with github.com/caddyserver/transform-encoder@ba4124974830222da7f12a091cf11ddf4d49363f \
       --with github.com/mholt/caddy-ratelimit@v0.1.0 \
+      --with github.com/caddyserver/ntlm-transport@v0.1.2 \
+      --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0 \
       --with github.com/corazawaf/coraza-caddy/v2@v2.6.2 \
       --with lazy-balancer-v2/caddygeoip=./caddygeoip \
       --with lazy-balancer-v2/caddychain=./caddychain \
       --with lazy-balancer-v2/caddydeps=./caddydeps \
       --with lazy-balancer-v2/wafiplist=./wafiplist \
-      --with lazy-balancer-v2/geoipnames=./geoipnames; then \
+      --with lazy-balancer-v2/geoipnames=./geoipnames \
+      --with lazy-balancer-v2/caddyl4sec=./caddyl4sec; then \
       built=1; break; \
     fi; \
     echo ">>> xcaddy build 第 ${attempt}/3 次失败，10s 后重试" >&2; \
@@ -65,9 +78,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   [ "$built" -eq 1 ] || { echo ">>> xcaddy build 3 次全部失败" >&2; exit 1; }; \
   [ -f /app/caddy ] || { echo ">>> 构建成功但 /app/caddy 未生成" >&2; exit 1; }
 # 构建期断言：镜像扫描要求的最低依赖版本未被 MVS 抬升到位则直接失败
-# （版本下限：grpc>=v1.83.2、otel>=v1.45、x/net>=v0.58、x/crypto>=v0.56、
-#  cel.dev/cel-go>=v0.32.0——Caddy v2.11.7 上游同值，caddydeps 钉同版防传递
-#  抬偏；注意模块路径是 cel.dev/cel-go，github.com/google/cel-go 是另一个
+# （版本下限：grpc>=v1.83.2、otel>=v1.45、x/net>=v0.62、x/crypto>=v0.58、
+#  go-jose/v4>=v4.1.6、cel.dev/cel-go>=v0.32.0、go-chi/chi/v5>=v5.4.0、klauspost/compress>=v1.20.2（CVE 修复版本）——
+#  Caddy v2.11.7+ 上游对 grpc/cel-go 同值、otel 更高；x/net/x/crypto/go-jose
+#  三条是漏洞修复下限（上游传递图更低），由 caddydeps floor 主动抬升；
+#  注意模块路径是 cel.dev/cel-go，github.com/google/cel-go 是另一个
 #  模块路径，钉旧路径不参与 MVS）；go version -m 各列以 TAB 分隔，用 awk 的 ge()
 #  做逐段数值化语义比较，不设上限，依赖升到大版本也不会误报。
 #  ge() 的局部变量必须以多余形参声明，否则会覆盖主循环的 i 导致漏检；
@@ -76,12 +91,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #  分段归属依赖 coraza tx.ID 长度=16，MVS 抬升次版本可能静默改变该假设，故按
 #  [v3.8.1, v3.9) 区间断言（ge(v,"v3.8.1") && !ge(v,"v3.9.0")）——此处刻意设
 #  上限，升级需同步复核 blocked_counter.go 的 len(ID)==16 判定与本断言。
+#  归因：模块表由 BEGIN 段一次登记（改阈值只改这一处），END 段逐项打印
+#  「>>> 依赖下限不满足: <模块> 需要 <阈值>（实际 <版本>）」到 stderr 后再非零
+#  退出——构建日志直接指出失败项，无需人工解析阈值表；模块整体从依赖图消失
+#  时实际值报「未出现在依赖图中」（同样判失败）。
 RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
-    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0"); else if ($i == "github.com/corazawaf/coraza/v3") ok6 = (ge($(i+1), "v3.8.1") && !ge($(i+1), "v3.9.0")) } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5 && ok6) ? 0 : 1 }' /tmp/caddy-mods.txt
+    grep -q 'go1.27.3' /tmp/caddy-mods.txt || { echo ">>> Caddy 未使用 go1.27.3 构建" >&2; exit 1; }; \
+    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } BEGIN { n = split("github.com/klauspost/compress v1.20.2;google.golang.org/grpc v1.83.2;go.opentelemetry.io/otel v1.45.0;go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0;go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0;go.opentelemetry.io/otel/metric v1.45.0;go.opentelemetry.io/otel/trace v1.45.0;golang.org/x/net v0.62.0;golang.org/x/crypto v0.58.0;github.com/go-jose/go-jose/v4 v4.1.6;cel.dev/cel-go v0.32.0;github.com/corazawaf/coraza/v3 v3.8.1;github.com/go-chi/chi/v5 v5.4.0", spec, ";"); for (k = 1; k <= n; k++) { split(spec[k], pair, " "); mods[k] = pair[1]; floor[mods[k]] = pair[2] } } { for (i = 1; i < NF; i++) { if (floor[$i] != "") { ver[$i] = $(i+1); ok[$i] = ge($(i+1), floor[$i]); if ($i == "github.com/corazawaf/coraza/v3" && ge($(i+1), "v3.9.0")) ok[$i] = 0 } } } END { rc = 0; for (k = 1; k <= n; k++) { m = mods[k]; if (ok[m] != 1) { rc = 1; want = ">= " floor[m]; if (m == "github.com/corazawaf/coraza/v3") want = want " 且 < v3.9.0"; actual = (ver[m] == "") ? "未出现在依赖图中" : ver[m]; print ">>> 依赖下限不满足: " m " 需要 " want "（实际 " actual "）" > "/dev/stderr" } } exit rc }' /tmp/caddy-mods.txt
 
 # Build Go backend
 # 与 xcaddy-builder 阶段同理：编译在构建机架构执行，产物平台由 GOOS/GOARCH 指定。
-FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS backend
 WORKDIR /app
 # 交叉编译目标（buildx 预定义参数；无 buildx 时 TARGETARCH 为空则回落构建机架构）
 ARG TARGETOS=linux
@@ -109,6 +129,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   set -e; \
   dl=0; \
   for attempt in 1 2 3; do \
+    # 逐次切换代理链（镜像源比特与 sum.golang.org 不符时同链重试无效）\
+    case $attempt in \
+      1) export GOPROXY="https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct";; \
+      2) export GOPROXY="https://proxy.golang.org,direct";; \
+      3) export GOPROXY="direct";; \
+    esac; \
     if go mod download; then \
       dl=1; break; \
     fi; \
@@ -120,12 +146,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # 内容，整目录复制会让任意一处非 Go 变更 bust 本层与随后的 Go 编译层。
 # go.mod/go.sum 已在上方下载层复制（本阶段内，同在清单范围），此处不再重复。
 # 清单必须覆盖 go list 派生到的全部顶层 Go 目录（cmd/internal/caddygeoip/
-# caddydeps/wafiplist/geoipnames）——scripts/check-dockerfile-copy-manifest.sh
-# 按 backend 阶段切块比对清单与 git 跟踪的顶层 Go 目录，新增顶层 Go 目录必须
-# 同步本行。
-# 注意：geoipnames/ 既是 xcaddy 阶段 --with 载体，也是 backend 阶段 go.mod replace
-# 的本地模块源，两阶段都要 COPY；上方 xcaddy 块同样不得漏（漏则 xcaddy 报
-# "replacement directory /app/<dir> does not exist"，caddychain 曾踩过）。
+# caddydeps/wafiplist/geoipnames/caddyl4sec）——scripts/check-dockerfile-copy-manifest.sh
+# 按 backend 阶段切块，比对清单与受控 + 未跟踪（未被 .gitignore 忽略）的顶层
+# Go 目录，与 test-all 同口径；新增顶层 Go 目录必须同步本行。
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY caddygeoip/ ./caddygeoip/
@@ -133,6 +156,7 @@ COPY caddychain/ ./caddychain/
 COPY caddydeps/ ./caddydeps/
 COPY wafiplist/ ./wafiplist/
 COPY geoipnames/ ./geoipnames/
+COPY caddyl4sec/ ./caddyl4sec/
 COPY config/ ./config/
 WORKDIR /app/cmd/server
 # 双缓存挂载（模块+编译缓存，lazy-builder GC 48h）：增量编译只重编改动包；
@@ -143,39 +167,17 @@ WORKDIR /app/cmd/server
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-$(go env GOARCH)}" \
-    go build -trimpath -ldflags="-s -w" -o lazy-balancer
-
-# 前端构建阶段：把 `cd web && npm run build` 下沉进镜像构建，源码 checkout
-# 后一条 docker build 即可出镜像，CI 与本地都不再有「先手工产 web/dist」的隐式前置。
-# Node 22 是硬要求（web/package.json 钉 vite ^8 + vue-tsc ^3）。
-FROM node:22-alpine AS web-builder
-WORKDIR /app
-COPY web/package.json web/package-lock.json ./web/
-RUN --mount=type=cache,target=/root/.npm \
-    cd /app/web && npm ci --no-audit --no-fund
-COPY web ./web
-# npm run build = vue-tsc --noEmit && vite build（类型检查 + 产出 /app/web/dist）
-RUN --mount=type=cache,target=/root/.npm \
-    cd /app/web && npm run build
+    go build -trimpath -ldflags="-s -w" -o lazy-balancer && \
+    go version -m lazy-balancer | grep -q 'go1.27.3' || { echo ">>> 后端二进制未使用 go1.27.3 构建" >&2; exit 1; }
 
 # Final image
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-# 版本号硬编码点：本文件 ARG VERSION、docker-compose.yml 两处 image tag 与
-# build.args.VERSION、README 两版 docker build 示例（--build-arg VERSION 与
-# 镜像 tag）、web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
-# buildx --build-arg 显式传参。以上各处须同步递增（config.go 的 APP_VERSION
-# 未注入时显示 unknown，不参与硬编码）。
-#
-# 双轨口径（有意设计，非分叉）：`VERSION`
-# 恒为**正式版本号**（如 v2.3.8，面板/`/api/v1/branding` 展示口径）；镜像
-# 正式版 tag 与 VERSION 相同；beta 通道才给 tag 加 `-beta` 后缀。二者刻意不同，
-# 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
-# README 两版示例、docker-compose.yml、branding/config 回退与发布检查单。
-ARG VERSION=v2.3.8
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+# 版本号注入（ARG VERSION + ENV APP_VERSION）刻意放在下方 CRS/xdb 下载层之后
+# ——见该层前的层序说明。此处不得放 ENV：版本号每次发版必变，提前注入会让
+# 之后所有外网下载层缓存失效。
 # 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给本阶段下载步骤
 # （CRS/ip2region 钉版下载）：Docker 预定义代理参数传入后自动注入 RUN 环境，
 # 无需 ARG 声明；未传参时为空值，行为不变。
-ENV APP_VERSION=${VERSION}
 # 安全修复：显式钉版 openssl=3.5.9-r0（CVE 修复版）——openssl 经 curl 的
 # libssl3/libcrypto3 依赖隐式装入，钉版保证镜像可复现且不携带旧版；
 # 升级源超出此版本时构建会失败提示，届时同步更新钉版值。
@@ -183,7 +185,15 @@ ENV APP_VERSION=${VERSION}
 # useradd/usermod/groupadd 等调用，镜像内无消费方。
 # zlib 钉版 1.3.2-r1：alpine 3.24.2 基础镜像快照携带 r0，r1 为上游安全修复——
 # 沿 openssl 钉版先例显式升级（sqlite 依赖隐式装入 zlib）。
-RUN apk add --no-cache ca-certificates sqlite tzdata openssl=3.5.9-r0 zlib=1.3.2-r1
+# 安全修复（CVE 扫描）：musl 1.2.6-r6 目前只存在于 alpine edge 仓库——3.24
+# 分支最新仍为 r3。这里只对 musl/musl-utils 两个包指定 edge 仓库并精确钉版，
+# 基础系统（busybox/apk/openssl/zlib）仍来自 3.24.3；实测仅这两个包升级，
+# apk 正常运行。edge 若移除 r6，构建在此显性失败（不会静默用回 r3）。
+RUN apk add --no-cache ca-certificates sqlite tzdata tini openssl=3.5.9-r0 zlib=1.3.2-r1 && \
+    apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/main \
+      musl=1.2.6-r6 musl-utils=1.2.6-r6 && \
+    apk list -I | grep -Eq '^musl-1\.2\.6-r6 ' && \
+    apk list -I | grep -Eq '^musl-utils-1\.2\.6-r6 '
 WORKDIR /app
 
 # —— 层序：慢变 + 外网层前移 ——
@@ -218,7 +228,8 @@ RUN mkdir -p /app/data /app/logs /app/certs /app/waf/crs /app/waf/audit
 RUN crs_version=v4.28.0; \
     crs_sha256=d8acc96f25ad07c8e3a595a23c797324f6d77e59ddf9e26e90dd95ebd2e676ce; \
     xdb_sha256=6307a9696f5711f84bcb8b25f07894de68a64a0ed4a1cc7e990562dd3084f210; \
-    n=0; until apk add --no-cache curl; do \
+    xdb_v6_sha256=5b93da35ac28bc316dccc54a758381f7a874ae0461dd51ff5df5e34815586f11; \
+    n=0; until apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/main zlib=1.4-r0 curl; do \
       n=$((n+1)); \
       if [ "$n" -ge 3 ]; then echo ">>> apk add curl 3 次失败" >&2; exit 1; fi; \
       echo ">>> apk add curl 第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
@@ -241,8 +252,15 @@ RUN crs_version=v4.28.0; \
                 curl -sfL -o /app/waf.dist/ip2region.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb") && \
                echo "${xdb_sha256}  /app/waf.dist/ip2region.xdb" | sha256sum -c -; do \
       n=$((n+1)); \
-      if [ "$n" -ge 3 ]; then echo ">>> ip2region xdb 下载/校验 3 次失败" >&2; exit 1; fi; \
-      echo ">>> ip2region xdb 下载/校验第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
+      if [ "$n" -ge 3 ]; then echo ">>> ip2region v4 xdb 下载/校验 3 次失败" >&2; exit 1; fi; \
+      echo ">>> ip2region v4 xdb 第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
+    done && \
+    n=0; until (curl -sfL -o /app/waf.dist/ip2region_v6.xdb "https://ghfast.top/https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v6.xdb" || \
+                curl -sfL -o /app/waf.dist/ip2region_v6.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v6.xdb") && \
+               echo "${xdb_v6_sha256}  /app/waf.dist/ip2region_v6.xdb" | sha256sum -c -; do \
+      n=$((n+1)); \
+      if [ "$n" -ge 3 ]; then echo ">>> ip2region v6 xdb 下载/校验 3 次失败" >&2; exit 1; fi; \
+      echo ">>> ip2region v6 xdb 第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
     done && \
     apk del curl
 
@@ -251,10 +269,28 @@ RUN crs_version=v4.28.0; \
 # 同时是镜像资产与 services 的离线回退），此处 COPY 必须指向嵌入路径。
 COPY geoipnames/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.json
 
+# 版本号硬编码点：本文件 ARG VERSION、docker-compose.yml 两处 image tag 与
+# build.args.VERSION、README 两版 docker build 示例（--build-arg VERSION 与
+# 镜像 tag）、web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
+# buildx --build-arg 显式传参。以上各处须同步递增（config.go 的 APP_VERSION
+# 未注入时显示 unknown，不参与硬编码）。
+#
+# 双轨口径（有意设计，非分叉）：`VERSION`
+# 恒为**正式版本号**（如 v2.3.9，面板/`/api/v1/branding` 展示口径）；镜像
+# 正式版 tag 与 VERSION 相同；beta 通道才给 tag 加 `-beta` 后缀。二者刻意不同，
+# 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
+# README 两版示例、docker-compose.yml、branding/config 回退与发布检查单。
+#
+# 位置约束：ARG/ENV 必须停在上方 CRS/xdb 下载层之后。VERSION 每次发版必变，
+# 提前注入会让 apk 与三条外网下载全部缓存失效（见上方层序说明）——移动前
+# 先确认没有更早的层消费它（当前仅 ENV 自身与运行期二进制消费）。
+ARG VERSION=v2.4.2
+ENV APP_VERSION=${VERSION}
+
 # 以下各层只随各自产物变化：CRS/xdb 层已在上方固化，不受影响。
 COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy
 COPY --from=backend /app/cmd/server/lazy-balancer /usr/local/bin/lazy-balancer
-COPY --from=web-builder /app/web/dist /app/ui
+COPY web/dist /app/ui
 # Apache-2.0 §4(a)：随分发（镜像）提供许可证副本。
 COPY LICENSE /app/LICENSE
 
@@ -267,15 +303,29 @@ COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # 443/udp = HTTP/3（QUIC）——Caddy 默认启用，EXPOSE 需一并声明。
-# 探针顺序 HTTPS 先行，与 docker-compose.yml 的共享锚点同序：面板 HTTPS 开启
-# 是常态，明文先行会先吃一次 302 再失败；反向在明文模式下只多一次握手失败即
-# 回落，成本对称而常态更快收敛。镜像内无 curl（构建期临时安装后 apk del），
-# busybox wget 的 --no-check-certificate 经实证可完成自签 TLS 探测。
-# 探针端口固定 8000：容器内 entrypoint 不透传 -config，config.go 的 port 只对
-# 裸机自定义启动生效；若未来支持容器内改端口，探针须改为读环境变量。
+# 探针使用二进制自带子命令（exec 形式，零 shell）：不派生 sh/客户端子进程。
+# 旧形态在 PID 1 不回收孤儿的容器里每 30s 泄漏子进程（生产实证：十余小时
+# 堆到 2252 个僵尸 ssl_client，打满 cgroup pids 配额，容器内连 cat 都无法 fork）。
+# 语义不变：HTTPS 先行（管理 TLS 是常态）→ 失败回落明文；只认第一跳 200、
+# 不跟随跳转（避免把登录页 200 误判为健康）。探针使用二进制自带子命令。
+# 端口固定 8000，与容器启动参数无关：entrypoint 会透传 `docker run` 的显式参数，
+# 但用 -config 改 port 会让本探针打错端口（Docker DNS/健康状态误判）。
+# zlib 锁 edge 仓库 1.4-r0（CVE 修复版本；3.24-stable 尚为 1.3.2——zlib 仅链接
+# musl，edge 包在 stable 基座可用；版本钉死保证可重现），见下方 apk add 一行。
+# 无关：entrypoint 会透传 `docker run` 的显式参数，但用 -config 改 port 会让本探针
+# 打错端口（Docker DNS/健康状态误判），容器形态请不要改面板端口。
+# 两段尝试各 2s，合计小于 --timeout=5s。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health || exit 1
+  CMD ["/usr/local/bin/lazy-balancer", "--healthcheck"]
 
 EXPOSE 80 443 443/udp 8000
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+# Go 运行时 GC 调优（2026-11-05 实测）：2 核打满的反代场景下 GC 占用显著 CPU——
+# GOGC=300 放宽回收目标（内存换 CPU，2C2G 反代 QPS +9%）；GOMEMLIMIT 兜住
+# 软上限防内存失控（实测峰值 ~180MB，离 1500MiB 上限极远）。
+ENV GOGC=300 \
+    GOMEMLIMIT=1500MiB
+
+# tini 作为 PID 1：回收任何被遗弃的子进程（健康检查/运维 exec/入口脚本），
+# 不再依赖部署方记得加 --init。信号由 tini 转发给入口脚本与面板进程。
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]

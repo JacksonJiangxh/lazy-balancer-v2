@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 第 47 轮 F-47-10：path_rules 写入必须保留未变更行的身份与时间戳。
+// path_rules 写入必须保留未变更行的身份与时间戳。
 //
 // 修复前 replacePathRulesTx 恒 DELETE 全删 + INSERT：任何规则编辑（含纯改名）
 // 都会重置该规则全部路径规则的 id/created_at/updated_at，并恒触发行级触发器
@@ -217,7 +217,7 @@ func TestUpdateRule_pathRules_preserveIdentityAndTimestamps(t *testing.T) {
 	}
 }
 
-// LBH-A-U3（第 69 轮 P3）：churn 钉补新列——直返五列必须参与内容比较。
+// churn 钉补新列——直返五列必须参与内容比较。
 // 仅改 response_body → 原地 UPDATE（保 id/created_at，updated_at 刷新）；
 // 同值回传 → 零写入（哨兵时间戳原样）。若内容比较回归剔除 response_* 列，
 // 两形状同时失守（变更静默不落库 / 同值误刷新）。

@@ -16,9 +16,9 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// T2（v2.2.0 多策略绑定）：一规则绑多策略的 RED 测试。
-// 覆盖：POST additive（SC-BIND-02）、PUT 原子替换（SC-BIND-01，max8/单 ID/审计/
-// 排序）、DELETE 精确 unbind（SC-BIND-03）、GET 数组有序（SC-GET-01/02）。
+// （v2.2.0 多策略绑定）：一规则绑多策略的 RED 测试。
+// 覆盖：POST additive、PUT 原子替换（max8/单 ID/审计/
+// 排序）、DELETE 精确 unbind、GET 数组有序。
 // 上限 2026-09-21 用户裁定 5→8（maxBindingsPerRule）。
 
 func newMultiPolicyRouter(t *testing.T) *gin.Engine {
@@ -37,6 +37,7 @@ func newMultiPolicyRouter(t *testing.T) *gin.Engine {
 	router.PUT("/security/rules/:caddy_id/policies", h.SetRuleSecurityPolicies)
 	router.GET("/security/rules/:caddy_id/policy", h.GetSecurityPolicyBindings)
 	router.GET("/security/bindings", h.GetAllSecurityBindings)
+	router.POST("/security/policies/:id/bindings/bulk", h.BulkUpdatePolicyBindings)
 	return router
 }
 
@@ -74,20 +75,13 @@ func createMultiPolicy(t *testing.T, router *gin.Engine, name string) int {
 
 func putMultiJSON(t *testing.T, router *gin.Engine, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()
-	raw, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("marshal body: %v", err)
-	}
-	recorder := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(recorder, req)
-	return recorder
+	// 与 putJSON 同实现，保留具名包装以免本文件 30+ 调用点全部改名。
+	return putJSON(t, router, path, body)
 }
 
 func queryBoundPolicyIDs(t *testing.T, caddyID string) []int {
 	t.Helper()
-	rows, err := db.DB.Query("SELECT policy_id FROM security_policy_bindings WHERE rule_caddy_id=? ORDER BY policy_id ASC", caddyID)
+	rows, err := db.DB.Query("SELECT policy_id FROM security_policy_bindings WHERE rule_caddy_id=? ORDER BY rank ASC, policy_id ASC", caddyID)
 	if err != nil {
 		t.Fatalf("query bound policies: %v", err)
 	}
@@ -115,7 +109,7 @@ func assertIDSlice(t *testing.T, got []int, want []int) {
 	}
 }
 
-// SC-BIND-02：POST bind 改为 additive——绑定 A 后再绑 B，A 必须保留。
+// POST bind 改为 additive——绑定 A 后再绑 B，A 必须保留。
 func TestBindRuleToPolicy_additivePreservesSiblingBindings(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -130,16 +124,14 @@ func TestBindRuleToPolicy_additivePreservesSiblingBindings(t *testing.T) {
 		t.Fatalf("bind B status=%d body=%s", r.Code, r.Body.String())
 	}
 
-	got := queryBoundPolicyIDs(t, "lb_mp_add")
-	want := []int{policyA, policyB}
-	if policyB < policyA {
-		want = []int{policyB, policyA}
-	}
-	assertIDSlice(t, got, want)
+	// 绑定顺序（2026-11 用户裁定）：additive 追加到链末——与策略 id 大小无关，
+	// 先绑 A 后绑 B → 执行序 [A, B]。
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_add"), []int{policyA, policyB})
 }
 
-// SC-BIND-01：PUT 原子替换 + 按序返回（写入 [3,1,2]，DB 按 policy_id ASC 读出 [1,2,3]）。
-func TestSetRuleSecurityPolicies_replacesAtomicallyOrderedASC(t *testing.T) {
+// PUT 原子替换 + 请求序即执行序（写入 [3,1,2] → 读出 [3,1,2]；2026-11 用户
+// 裁定：绑定顺序由请求序承载 rank，不再是 policy_id ASC）。
+func TestSetRuleSecurityPolicies_replacesAtomicallyPreservingRequestOrder(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
 	seedHTTPRule(t, "lb_mp_put")
@@ -147,14 +139,13 @@ func TestSetRuleSecurityPolicies_replacesAtomicallyOrderedASC(t *testing.T) {
 	p2 := createMultiPolicy(t, router, "策略2")
 	p3 := createMultiPolicy(t, router, "策略3")
 
-	// 以乱序 [p3,p1,p2] 提交，服务端按 INSERT 顺序写入；读回按 policy_id ASC。
+	// 以 [p3,p1,p2] 提交：请求序写入 rank 1..N，读回保持同序。
 	recorder := putMultiJSON(t, router, "/security/rules/lb_mp_put/policies", map[string]any{"policy_ids": []int{p3, p1, p2}})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("PUT status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}
 
-	sorted := []int{p1, p2, p3}
-	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_put"), sorted)
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_put"), []int{p3, p1, p2})
 
 	// 再次 PUT [p2] 原子替换：删除旧三行，仅留 p2。
 	recorder = putMultiJSON(t, router, "/security/rules/lb_mp_put/policies", map[string]any{"policy_ids": []int{p2}})
@@ -164,7 +155,7 @@ func TestSetRuleSecurityPolicies_replacesAtomicallyOrderedASC(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_put"), []int{p2})
 }
 
-// SC-BIND-01：超过 8 条策略 → 400「最多绑定 8 条策略」（2026-09-21 上限 5→8）。
+// 超过 8 条策略 → 400「最多绑定 8 条策略」（2026-09-21 上限 5→8）。
 func TestSetRuleSecurityPolicies_rejectsMoreThanEight(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -185,7 +176,7 @@ func TestSetRuleSecurityPolicies_rejectsMoreThanEight(t *testing.T) {
 	}
 }
 
-// SC-BIND-01 上限边界：恰好 8 条唯一策略 → 200（2026-09-21 上限 5→8）。
+// 上限边界：恰好 8 条唯一策略 → 200（2026-09-21 上限 5→8）。
 func TestSetRuleSecurityPolicies_acceptsExactlyEight(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -201,7 +192,7 @@ func TestSetRuleSecurityPolicies_acceptsExactlyEight(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_cap8"), ids)
 }
 
-// SC-BIND-01 边界（B-I2）：上限判定须先去重——8 条唯一策略携带一个重复 id
+// 边界：上限判定须先去重——8 条唯一策略携带一个重复 id
 // （9 元素数组）不得因原始数组长度 9 误判超限；写入结果为去重后的 8 行。
 func TestSetRuleSecurityPolicies_dedupsBeforeMaxCheck(t *testing.T) {
 	// Given 8 条策略与一条 HTTP 规则
@@ -254,7 +245,7 @@ func TestSetRuleSecurityPolicies_eightTypedPoliciesAccepted(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_typed"), ids)
 }
 
-// SC-BIND-01：单元素 policy_ids 向后兼容（PUT [1] 与 POST bind 等价行为）。
+// 单元素 policy_ids 向后兼容（PUT [1] 与 POST bind 等价行为）。
 func TestSetRuleSecurityPolicies_singleIDBackwardsCompatible(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -305,7 +296,7 @@ func TestSetRuleSecurityPolicies_rejectsNonHTTPRule(t *testing.T) {
 	}
 }
 
-// SC-BIND-03：DELETE unbind 精确删一行——[A,B] 解绑 A 后只剩 B。
+// DELETE unbind 精确删一行——[A,B] 解绑 A 后只剩 B。
 func TestUnbindRuleFromPolicy_removesOnlyTargetRow(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -323,7 +314,7 @@ func TestUnbindRuleFromPolicy_removesOnlyTargetRow(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_unbind"), []int{policyB})
 }
 
-// SC-GET-01：GET /security/rules/:caddy_id/policy 返回 []policy 按 id ASC。
+// GET /security/rules/:caddy_id/policy 返回 []policy 按绑定执行序（rank ASC=PUT 请求序）。
 func TestGetSecurityPolicyBindings_returnsOrderedArray(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -354,11 +345,12 @@ func TestGetSecurityPolicyBindings_returnsOrderedArray(t *testing.T) {
 	if len(resp.Data) != 3 {
 		t.Fatalf("GET data len=%d, want 3 (array)", len(resp.Data))
 	}
+	// 绑定顺序（2026-11 用户裁定）：GET 按请求序（rank）返回。
 	got := []int{resp.Data[0].ID, resp.Data[1].ID, resp.Data[2].ID}
-	assertIDSlice(t, got, []int{p1, p2, p3})
+	assertIDSlice(t, got, []int{p3, p1, p2})
 }
 
-// SC-GET-01 边界：规则无绑定时返回空数组（不是 null 单对象）。
+// 边界：规则无绑定时返回空数组（不是 null 单对象）。
 func TestGetSecurityPolicyBindings_emptyArrayWhenNoBindings(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -385,7 +377,7 @@ func TestGetSecurityPolicyBindings_emptyArrayWhenNoBindings(t *testing.T) {
 	}
 }
 
-// SC-GET-02：GET /security/bindings 返回 map[string][]BindingInfo 按 policy_id ASC。
+// GET /security/bindings 返回 map[string][]BindingInfo，数组按绑定执行序（rank ASC=PUT 请求序）。
 func TestGetAllSecurityBindings_returnsArrayPerRule(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -420,16 +412,17 @@ func TestGetAllSecurityBindings_returnsArrayPerRule(t *testing.T) {
 	if len(resp.Data["lb_mp_all_a"]) != 2 {
 		t.Fatalf("lb_mp_all_a bindings len=%d, want 2", len(resp.Data["lb_mp_all_a"]))
 	}
-	if resp.Data["lb_mp_all_a"][0].PolicyID != p1 || resp.Data["lb_mp_all_a"][1].PolicyID != p3 {
-		t.Fatalf("lb_mp_all_a order=[%d,%d], want [%d,%d] ASC",
-			resp.Data["lb_mp_all_a"][0].PolicyID, resp.Data["lb_mp_all_a"][1].PolicyID, p1, p3)
+	// 绑定顺序（2026-11）：map 数组按执行序（rank=PUT 请求序）返回。
+	if resp.Data["lb_mp_all_a"][0].PolicyID != p3 || resp.Data["lb_mp_all_a"][1].PolicyID != p1 {
+		t.Fatalf("lb_mp_all_a order=[%d,%d], want [%d,%d]（请求序）",
+			resp.Data["lb_mp_all_a"][0].PolicyID, resp.Data["lb_mp_all_a"][1].PolicyID, p3, p1)
 	}
 	if len(resp.Data["lb_mp_all_b"]) != 1 || resp.Data["lb_mp_all_b"][0].PolicyID != p2 {
 		t.Fatalf("lb_mp_all_b bindings=%+v, want single %d", resp.Data["lb_mp_all_b"], p2)
 	}
 }
 
-// SC-BIND-01：PUT 替换写审计日志（action=更新 / resource=安全策略 / detail 含规则与策略列表）。
+// PUT 替换写审计日志（action=更新 / resource=安全策略 / detail 含规则与策略列表）。
 func TestSetRuleSecurityPolicies_writesAuditLog(t *testing.T) {
 	// Given 一条 HTTP 规则与两条策略
 	setupSecurityPolicyTestDB(t)
@@ -458,7 +451,7 @@ func TestSetRuleSecurityPolicies_writesAuditLog(t *testing.T) {
 	}
 }
 
-// SC-BIND-01 契约补全：PUT 空数组 policy_ids=[] = 解除该规则全部绑定——
+// 契约补全：PUT 空数组 policy_ids=[] = 解除该规则全部绑定——
 // 200 + GET 空数组 + DB 0 行 + 审计日志（与 apidocs/MCP schema 的空数组语义对齐）。
 func TestSetRuleSecurityPolicies_emptyArrayUnbindsAll(t *testing.T) {
 	// Given 规则已绑定两条策略
@@ -524,7 +517,7 @@ func TestSetRuleSecurityPolicies_emptyArrayUnbindsAll(t *testing.T) {
 	}
 }
 
-// 排序边界：POST additive 乱序绑定（先绑高 id 再绑低 id），两个 GET 端点仍按 policy_id ASC 返回。
+// 排序边界：POST additive 乱序绑定（先绑高 id 再绑低 id），两个 GET 端点按绑定执行序（rank ASC=请求序）返回。
 func TestBindRuleToPolicy_outOfOrderBindStillReadsASC(t *testing.T) {
 	// Given 两条策略（pLow < pHigh，按创建序天然成立）
 	setupSecurityPolicyTestDB(t)
@@ -544,7 +537,7 @@ func TestBindRuleToPolicy_outOfOrderBindStillReadsASC(t *testing.T) {
 		t.Fatalf("bind low status=%d body=%s", r.Code, r.Body.String())
 	}
 
-	// Then GET /security/rules/:caddy_id/policy 按 policy_id ASC
+	// Then GET /security/rules/:caddy_id/policy 按绑定执行序（rank ASC=请求序）
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/security/rules/lb_mp_ooo/policy", nil)
 	router.ServeHTTP(recorder, req)
@@ -560,11 +553,13 @@ func TestBindRuleToPolicy_outOfOrderBindStillReadsASC(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &ruleResp); err != nil {
 		t.Fatalf("parse GET response %s: %v", recorder.Body.String(), err)
 	}
-	if len(ruleResp.Data) != 2 || ruleResp.Data[0].ID != pLow || ruleResp.Data[1].ID != pHigh {
-		t.Fatalf("GET policy ids=%+v, want [%d,%d] ASC", ruleResp.Data, pLow, pHigh)
+	// 绑定顺序（2026-11 用户裁定）：GET 按 rank 返回——先绑的在前，与 id 大小
+	// 无关（本用例先绑 pHigh 后绑 pLow）。
+	if len(ruleResp.Data) != 2 || ruleResp.Data[0].ID != pHigh || ruleResp.Data[1].ID != pLow {
+		t.Fatalf("GET policy ids=%+v, want [%d,%d]（绑定请求序）", ruleResp.Data, pHigh, pLow)
 	}
 
-	// And GET /security/bindings 同样 ASC
+	// And GET /security/bindings 同样按 rank（绑定请求序）
 	recorder = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/security/bindings", nil)
 	router.ServeHTTP(recorder, req)
@@ -580,13 +575,14 @@ func TestBindRuleToPolicy_outOfOrderBindStillReadsASC(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &allResp); err != nil {
 		t.Fatalf("parse GET /security/bindings response %s: %v", recorder.Body.String(), err)
 	}
+	// 绑定顺序（2026-11）：additive 追加到链末，map 按 rank 返回 [pHigh, pLow]。
 	got := allResp.Data["lb_mp_ooo"]
-	if len(got) != 2 || got[0].PolicyID != pLow || got[1].PolicyID != pHigh {
-		t.Fatalf("GET /security/bindings ids=%+v, want [%d,%d] ASC", got, pLow, pHigh)
+	if len(got) != 2 || got[0].PolicyID != pHigh || got[1].PolicyID != pLow {
+		t.Fatalf("GET /security/bindings ids=%+v, want [%d,%d]（绑定请求序）", got, pHigh, pLow)
 	}
 }
 
-// SC-GET-01 实现口径：GET /security/rules/:caddy_id/policy 仅返回 enabled=1 的策略
+// 实现口径：GET /security/rules/:caddy_id/policy 仅返回 enabled=1 的策略
 // （handler 逐条 SELECT ... WHERE id=? AND enabled=1，禁用的绑定项被跳过）。
 func TestGetSecurityPolicyBindings_skipsDisabledPolicies(t *testing.T) {
 	// Given 规则绑定两条策略，其中一条随后被禁用
@@ -625,7 +621,7 @@ func TestGetSecurityPolicyBindings_skipsDisabledPolicies(t *testing.T) {
 	}
 }
 
-// SC-CAS-01：删除策略仅清该策略的绑定行——同规则上兄弟策略的绑定保留。
+// 删除策略仅清该策略的绑定行——同规则上兄弟策略的绑定保留。
 func TestDeleteSecurityPolicy_preservesSiblingPolicyBindingsOnSameRules(t *testing.T) {
 	// Given 两条规则各自绑定策略 X 与 Y
 	setupSecurityPolicyTestDB(t)
@@ -651,7 +647,7 @@ func TestDeleteSecurityPolicy_preservesSiblingPolicyBindingsOnSameRules(t *testi
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_cas_b"), []int{policyY})
 }
 
-// SC-CAS-02：删除 LB 规则仅清该规则的绑定行——同策略上兄弟规则的绑定保留。
+// 删除 LB 规则仅清该规则的绑定行——同策略上兄弟规则的绑定保留。
 func TestDeleteRule_preservesOtherRulesBindingsOnSamePolicy(t *testing.T) {
 	// Given 两条规则绑定同一策略
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -687,7 +683,7 @@ func TestDeleteRule_preservesOtherRulesBindingsOnSamePolicy(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_del_b"), []int{int(policyID)})
 }
 
-// 绑定上限（B-I1，2026-09-21 上限 5→8）：POST additive 与 PUT 同上限——第 8 条
+// 绑定上限（2026-09-21 上限 5→8）：POST additive 与 PUT 同上限——第 8 条
 // （新策略对）照常 200；规则绑满 8 条后 POST 第 9 条 → 400「最多绑定 8 条策略」；
 // 重绑已存在的 (rule,policy) 对保持幂等 200（INSERT OR IGNORE 不产生新行）。
 func TestBindRuleToPolicy_postAdditiveCapAtEight(t *testing.T) {
@@ -737,7 +733,7 @@ func TestBindRuleToPolicy_postAdditiveCapAtEight(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_cap"), all)
 }
 
-// SC-GET-02 扩展（D-I1）：GET /security/bindings 每绑定携带 block_page_id——前端
+// 扩展：GET /security/bindings 每绑定携带 block_page_id——前端
 // 据此计算「首个启用且配置了拦截页面的策略」，与后端生成口径（首个 enabled 且
 // block_page_id>0）一致，前导策略 block_page_id=0 时不得误判。
 func TestGetAllSecurityBindings_includesBlockPageID(t *testing.T) {
@@ -785,7 +781,7 @@ func TestGetAllSecurityBindings_includesBlockPageID(t *testing.T) {
 	}
 }
 
-// SC-GET-02 扩展（拦截页归因）：GET /security/bindings 每绑定携带
+// GET /security/bindings 每绑定携带
 // block_status_code（NULL/0 归一为 403）——前端冲突提示与 Rules 页锁形弹框
 // 据此展示「<页名>(状态码 XXX)」，与后端生成口径（BlockStatusCode 0→403）一致。
 func TestGetAllSecurityBindings_includesBlockStatusCode(t *testing.T) {
@@ -836,7 +832,7 @@ func TestGetAllSecurityBindings_includesBlockStatusCode(t *testing.T) {
 	}
 }
 
-// A-I2 硬化（GetAllSecurityBindings）：绑定 JOIN 的 p.block_page_id 可空——
+// 硬化（GetAllSecurityBindings）：绑定 JOIN 的 p.block_page_id 可空——
 // 带外编辑/备份恢复/集群继承产生 NULL 时，修复前行 Scan 报错被 continue 静默
 // 跳过，绑定从 UI 地图中消失；修复后 COALESCE 归一化为 0，绑定照常返回。
 func TestGetAllSecurityBindings_toleratesNullBlockPageID(t *testing.T) {
@@ -879,7 +875,7 @@ func TestGetAllSecurityBindings_toleratesNullBlockPageID(t *testing.T) {
 	}
 	entries := resp.Data["lb_null_bpid"]
 	if len(entries) != 1 {
-		t.Fatalf("NULL block_page_id 不得静默丢绑定（A-I2）: bindings=%+v, want 1 entry", resp.Data)
+		t.Fatalf("NULL block_page_id 不得静默丢绑定: bindings=%+v, want 1 entry", resp.Data)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].BlockPageID != 0 {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d block_page_id=0", entries[0], policyID)
@@ -924,7 +920,7 @@ func bindPolicyToRule(t *testing.T, caddyID string, policyID int64) {
 	}
 }
 
-// I-3 硬化（GetAllSecurityBindings）：p.mode 可空——修复前仅 block_page_id 有
+// 硬化（GetAllSecurityBindings）：p.mode 可空——修复前仅 block_page_id 有
 // COALESCE，NULL mode 触发 Scan 报错被跳过（绑定从 UI 地图消失），而生成路径
 // 按 COALESCE(mode,'off') 口径正常应用该策略。
 func TestGetAllSecurityBindings_toleratesNullMode(t *testing.T) {
@@ -947,14 +943,14 @@ func TestGetAllSecurityBindings_toleratesNullMode(t *testing.T) {
 
 	// Then 绑定照常返回，mode 归一化为 'off'
 	if len(entries) != 1 {
-		t.Fatalf("NULL mode 不得静默丢绑定（I-3）: bindings=%+v, want 1 entry", entries)
+		t.Fatalf("NULL mode 不得静默丢绑定: bindings=%+v, want 1 entry", entries)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].Mode != "off" {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d mode=off", entries[0], policyID)
 	}
 }
 
-// I-3 硬化（GetAllSecurityBindings）：p.rate_limit_enabled 可空——NULL 同样
+// 硬化（GetAllSecurityBindings）：p.rate_limit_enabled 可空——NULL 同样
 // 不得丢绑定，归一化为 false（与生成投影 COALESCE(rate_limit_enabled,0) 一致）。
 func TestGetAllSecurityBindings_toleratesNullRateLimitEnabled(t *testing.T) {
 	// Given 一条绑定到 rate_limit_enabled 为 NULL 策略的规则
@@ -977,14 +973,14 @@ func TestGetAllSecurityBindings_toleratesNullRateLimitEnabled(t *testing.T) {
 
 	// Then 绑定照常返回，rate_limit_enabled 归一化为 false
 	if len(entries) != 1 {
-		t.Fatalf("NULL rate_limit_enabled 不得静默丢绑定（I-3）: bindings=%+v, want 1 entry", entries)
+		t.Fatalf("NULL rate_limit_enabled 不得静默丢绑定: bindings=%+v, want 1 entry", entries)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].RateLimit {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d rate_limit_enabled=false", entries[0], policyID)
 	}
 }
 
-// I-3 硬化（GetAllSecurityBindings）：p.enabled 可空——生成路径以
+// 硬化（GetAllSecurityBindings）：p.enabled 可空——生成路径以
 // WHERE enabled=1 把 NULL 当禁用，UI 标签必须与后端行为一致：
 // COALESCE(p.enabled,0) 呈现禁用态，绑定行本身仍可见。
 func TestGetAllSecurityBindings_nullEnabledReadsDisabled(t *testing.T) {
@@ -1007,22 +1003,23 @@ func TestGetAllSecurityBindings_nullEnabledReadsDisabled(t *testing.T) {
 
 	// Then 绑定照常返回，enabled 归一化为 false（与生成口径一致）
 	if len(entries) != 1 {
-		t.Fatalf("NULL enabled 不得静默丢绑定（I-3）: bindings=%+v, want 1 entry", entries)
+		t.Fatalf("NULL enabled 不得静默丢绑定: bindings=%+v, want 1 entry", entries)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].Enabled {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d enabled=false（NULL 按禁用呈现）", entries[0], policyID)
 	}
 }
 
-// D-K1：策略列表摘要携带 crs_rule_groups——前端向导的跨策略重复告警直接消费摘要，
+// 策略列表摘要携带 crs_rule_groups——前端向导的跨策略重复告警直接消费摘要，
 // 不再对每条启用策略 N+1 拉取详情。
 func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 	// Given 一条配置 CRS 规则组 ["42","43"] 的策略
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
 	if r := postJSON(t, router, "/security/policies", map[string]any{
 		"name": "带组策略", "mode": "blocking", "enabled": true,
-		"crs_rule_groups": `["42","43"]`,
+		"crs_rule_groups": `["20","42"]`,
 	}); r.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%s", r.Code, r.Body.String())
 	}
@@ -1047,7 +1044,262 @@ func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 	if len(resp.Data) != 1 {
 		t.Fatalf("summaries=%+v, want 1 policy", resp.Data)
 	}
-	if string(resp.Data[0].CRSRuleGroups) != `["42","43"]` {
-		t.Fatalf("crs_rule_groups=%s, want %s", resp.Data[0].CRSRuleGroups, `["42","43"]`)
+	if string(resp.Data[0].CRSRuleGroups) != `["20","42"]` {
+		t.Fatalf("crs_rule_groups=%s, want %s", resp.Data[0].CRSRuleGroups, `["20","42"]`)
+	}
+}
+
+// 审计详情必须记录**去重后**的绑定集合。提交
+// [1,1,2] 时库内终态为 [1,2]，此前审计串用原始 req.PolicyIDs 生成
+// 「[1,1,2]」——取证时无法从审计还原最终绑定集。修复=归一次、写入与审计共用。
+func TestSetRuleSecurityPolicies_auditUsesDeduplicatedSet(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_hc07")
+	first := createMultiPolicy(t, router, "hc07-first")
+	second := createMultiPolicy(t, router, "hc07-second")
+
+	recorder := putMultiJSON(t, router, "/security/rules/lb_hc07/policies", map[string]any{
+		"policy_ids": []int{first, first, second},
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_hc07"), []int{first, second})
+
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT COALESCE(detail,'') FROM audit_log WHERE action='更新' AND resource='安全策略' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	dup := fmt.Sprintf("[%d,%d,%d]", first, first, second)
+	want := fmt.Sprintf("[%d,%d]", first, second)
+	if strings.Contains(detail, dup) {
+		t.Fatalf("audit detail=%q 仍含原始重复集合 %s（应记录去重后终态）", detail, dup)
+	}
+	if !strings.Contains(detail, want) {
+		t.Fatalf("audit detail=%q, want containing %s", detail, want)
+	}
+}
+
+// 无变更的解绑不得写「已解除」审计（审计真实性）：重复/并发解绑保持 200
+// 幂等，但 changed=false、不落审计、不触发配置应用。
+func TestUnbindRuleFromPolicy_noChangeSkipsAudit(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_mp_unbind_nochange")
+	policyA := createMultiPolicy(t, router, "策略A")
+	if r := putMultiJSON(t, router, "/security/rules/lb_mp_unbind_nochange/policies", map[string]any{"policy_ids": []int{policyA}}); r.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", r.Code, r.Body.String())
+	}
+	unbindAudits := func() int {
+		t.Helper()
+		var n int
+		if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%解除规则%'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	path := "/security/policies/" + strconv.Itoa(policyA) + "/bind/lb_mp_unbind_nochange"
+
+	before := unbindAudits()
+	if rec := deleteRequest(t, router, path); rec.Code != http.StatusOK {
+		t.Fatalf("首次解绑 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	afterFirst := unbindAudits()
+	if afterFirst != before+1 {
+		t.Fatalf("真实变更必须写审计，before=%d after=%d", before, afterFirst)
+	}
+
+	rec := deleteRequest(t, router, path)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("重复解绑须保持 200 幂等，status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Changed bool `json:"changed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response %s: %v", rec.Body.String(), err)
+	}
+	if resp.Data.Changed {
+		t.Fatalf("无变更时 changed 必须为 false: %s", rec.Body.String())
+	}
+	if got := unbindAudits(); got != afterFirst {
+		t.Fatalf("无变更不得写「已解除」审计，before=%d after=%d", afterFirst, got)
+	}
+}
+
+// PUT rank → GET /security/bindings 顺序往返（2026-11 绑定顺序）：map 值数组
+// 必须按执行序（rank）返回，否则 FE 唯一 map 源会丢弃顺序、向导重开即回退
+// policy_id 序（用户读作「顺序无法保存」）。
+func TestGetAllSecurityBindings_rankOrderRoundtrip(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_mp_map")
+	p1 := createMultiPolicy(t, router, "策略1")
+	p2 := createMultiPolicy(t, router, "策略2")
+	p3 := createMultiPolicy(t, router, "策略3")
+	if r := putMultiJSON(t, router, "/security/rules/lb_mp_map/policies", map[string]any{"policy_ids": []int{p3, p1, p2}}); r.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", r.Code, r.Body.String())
+	}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/security/bindings", nil)
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /security/bindings status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data map[string][]struct {
+			PolicyID int `json:"policy_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse bindings map: %v", err)
+	}
+	bindings := resp.Data["lb_mp_map"]
+	if len(bindings) != 3 {
+		t.Fatalf("bindings=%v, want 3", bindings)
+	}
+	got := []int{bindings[0].PolicyID, bindings[1].PolicyID, bindings[2].PolicyID}
+	assertIDSlice(t, got, []int{p3, p1, p2})
+}
+
+// bulk orders：单事务批量应用绑定顺序（一次渲染）；幂等 unchanged；单规则
+// 校验失败进 skipped 不整体拒绝；与 bind 冲突 400。
+func TestBulkUpdatePolicyBindings_ordersApplyAndIdempotent(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_mp_orders")
+	p1 := createMultiPolicy(t, router, "策略1")
+	p2 := createMultiPolicy(t, router, "策略2")
+	p3 := createMultiPolicy(t, router, "策略3")
+	if r := putMultiJSON(t, router, "/security/rules/lb_mp_orders/policies", map[string]any{"policy_ids": []int{p1, p2, p3}}); r.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", r.Code, r.Body.String())
+	}
+
+	// When：orders 把 p3 提到最前
+	rec := postJSON(t, router, "/security/policies/"+strconv.Itoa(p3)+"/bindings/bulk",
+		map[string]any{"orders": map[string]any{"lb_mp_orders": []int{p3, p1, p2}}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bulk orders status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Ordered   int `json:"ordered"`
+			Unchanged int `json:"unchanged"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse bulk response %s: %v", rec.Body.String(), err)
+	}
+	if resp.Data.Ordered != 1 {
+		t.Fatalf("ordered=%d, want 1", resp.Data.Ordered)
+	}
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_orders"), []int{p3, p1, p2})
+
+	// 幂等：同序重复提交 → unchanged=1、ordered=0（零写入）。
+	rec = postJSON(t, router, "/security/policies/"+strconv.Itoa(p3)+"/bindings/bulk",
+		map[string]any{"orders": map[string]any{"lb_mp_orders": []int{p3, p1, p2}}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("idempotent bulk status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	resp = struct {
+		Code int `json:"code"`
+		Data struct {
+			Ordered   int `json:"ordered"`
+			Unchanged int `json:"unchanged"`
+		} `json:"data"`
+	}{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse idempotent response: %v", err)
+	}
+	if resp.Data.Ordered != 0 || resp.Data.Unchanged != 1 {
+		t.Fatalf("ordered=%d unchanged=%d, want 0/1", resp.Data.Ordered, resp.Data.Unchanged)
+	}
+
+	// 单规则校验失败（引用不存在策略）→ skipped、HTTP 200，不影响其余。
+	rec = postJSON(t, router, "/security/policies/"+strconv.Itoa(p3)+"/bindings/bulk",
+		map[string]any{"orders": map[string]any{"lb_ghost": []int{999999, 1}}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("skipped-path bulk status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "skipped") {
+		t.Fatalf("skipped entry missing: %s", rec.Body.String())
+	}
+
+	// 同规则同时出现在 bind 与 orders → 400。
+	rec = postJSON(t, router, "/security/policies/"+strconv.Itoa(p3)+"/bindings/bulk",
+		map[string]any{"bind": []string{"lb_mp_orders"}, "orders": map[string]any{"lb_mp_orders": []int{p3, p1, p2}}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("conflict status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+// bulk orders 此前审计只记「顺序应用 N 条」计数，
+// 各规则终态顺序不可取证——单规则 PUT 端点一直全序留痕（「设置规则 X 的安全
+// 策略为 [..]」），bulk 必须对齐形态。钉测：orders 应用后审计 detail 必须含
+// 规则 id 与完整有序 policy 序列（规则×顺序），响应 Data 同步携带 orders 明细。
+func TestBulkUpdatePolicyBindings_ordersAuditCarriesRuleSequences(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_ord_a")
+	seedHTTPRule(t, "lb_ord_b")
+	p1 := createMultiPolicy(t, router, "策略1")
+	p2 := createMultiPolicy(t, router, "策略2")
+	p3 := createMultiPolicy(t, router, "策略3")
+	if r := putMultiJSON(t, router, "/security/rules/lb_ord_a/policies", map[string]any{"policy_ids": []int{p1, p2, p3}}); r.Code != http.StatusOK {
+		t.Fatalf("PUT lb_ord_a status=%d body=%s", r.Code, r.Body.String())
+	}
+	if r := putMultiJSON(t, router, "/security/rules/lb_ord_b/policies", map[string]any{"policy_ids": []int{p2, p1}}); r.Code != http.StatusOK {
+		t.Fatalf("PUT lb_ord_b status=%d body=%s", r.Code, r.Body.String())
+	}
+
+	rec := postJSON(t, router, "/security/policies/"+strconv.Itoa(p2)+"/bindings/bulk",
+		map[string]any{"orders": map[string]any{
+			"lb_ord_a": []int{p3, p1, p2},
+			"lb_ord_b": []int{p1, p2},
+		}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bulk orders status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Ordered int `json:"ordered"`
+			Orders  []struct {
+				RuleID    string `json:"rule_id"`
+				PolicyIDs []int  `json:"policy_ids"`
+			} `json:"orders"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse bulk response %s: %v", rec.Body.String(), err)
+	}
+	if resp.Data.Ordered != 2 {
+		t.Fatalf("ordered=%d, want 2", resp.Data.Ordered)
+	}
+	if len(resp.Data.Orders) != 2 {
+		t.Fatalf("Data.orders=%v, want 2 条规则×顺序明细", resp.Data.Orders)
+	}
+	ordersByRule := map[string][]int{}
+	for _, applied := range resp.Data.Orders {
+		ordersByRule[applied.RuleID] = applied.PolicyIDs
+	}
+	assertIDSlice(t, ordersByRule["lb_ord_a"], []int{p3, p1, p2})
+	assertIDSlice(t, ordersByRule["lb_ord_b"], []int{p1, p2})
+
+	detail := latestAuditDetail(t, "更新", "安全策略")
+	for _, want := range []string{
+		fmt.Sprintf("lb_ord_a→[%d,%d,%d]", p3, p1, p2),
+		fmt.Sprintf("lb_ord_b→[%d,%d]", p1, p2),
+	} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("审计 detail=%q, want 含 %q（规则×全量有序序列留痕）", detail, want)
+		}
 	}
 }

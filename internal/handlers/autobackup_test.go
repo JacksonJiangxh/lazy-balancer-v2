@@ -34,21 +34,37 @@ func newAutoBackupTestHandlers(t *testing.T) *Handlers {
 	return h
 }
 
-// wireAutoBackupEngineForTest B2（第 65 轮后裁定）：/auto-backup/run 经引擎
+// wireAutoBackupEngineForTest：/auto-backup/run 经引擎
 // RunSync——测试环境装配引擎+执行器（镜像 main.go 注入形态）。
 func wireAutoBackupEngineForTest(t *testing.T, h *Handlers) {
 	t.Helper()
-	services.SetAutoBackupExecutor(func(trigger, operator string, engineRunID int64) error {
-		_, err := h.RunAutoBackupOnce(trigger, operator, engineRunID)
+	services.SetAutoBackupExecutor(func(ctx context.Context, trigger, operator string, engineRunID int64) error {
+		_, err := h.RunAutoBackupOnce(ctx, trigger, operator, engineRunID)
 		return err
 	})
-	if services.TaskEngine() == nil {
+	// 判据与 initTaskEngineForTest 同源：nil 或已停止都必须重建。只判 nil 时
+	// 会拿到前一用例停掉但未清全局指针的引擎，端点回 503「任务引擎已停止」。
+	if te := services.TaskEngine(); te == nil || te.IsStopped() {
 		services.InitTaskEngine("", t.TempDir()+"/app.log")
 	}
 	t.Cleanup(func() {
 		services.StopTaskEngine()
 		services.SetAutoBackupExecutor(nil)
 	})
+}
+
+// waitForAutoBackupCondition 轮询等待后台备份/审计落行（异步触发后，
+// 响应返回时后台任务可能尚未完成）。
+func waitForAutoBackupCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("后台备份未在超时内完成")
 }
 
 func countAutoBackupAudit(t *testing.T, action string) int {
@@ -58,6 +74,16 @@ func countAutoBackupAudit(t *testing.T, action string) int {
 		t.Fatalf("count audit rows: %v", err)
 	}
 	return count
+}
+
+// autoBackupAuditDetail 返回该动作最近一条审计的 detail（失败面复盘断言用）。
+func autoBackupAuditDetail(t *testing.T, action string) string {
+	t.Helper()
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT COALESCE(detail,'') FROM audit_log WHERE action=? ORDER BY id DESC LIMIT 1`, action).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail for %q: %v", action, err)
+	}
+	return detail
 }
 
 func autoBackupRows(t *testing.T, where string, args ...any) []map[string]any {
@@ -80,6 +106,31 @@ func autoBackupRows(t *testing.T, where string, args ...any) []map[string]any {
 	return out
 }
 
+// engineRunID<=0 属绕过引擎的非法调用：必须显性报错且不写 task_runs
+// （legacy RecordRunStart/Finish 直写旁路已删除——task_runs 唯一写方=引擎）。
+func TestRunAutoBackupOnce_missingEngineRunIDRejectedWithoutTaskRuns(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+
+	_, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 0)
+	if err == nil || !strings.Contains(err.Error(), "engineRunID") {
+		t.Fatalf("err=%v, want engineRunID 缺失显性错误", err)
+	}
+	var runs int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id='auto-backup'`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 {
+		t.Fatalf("task_runs auto-backup 行数=%d, want 0（直写旁路不得复活）", runs)
+	}
+	var backups int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups`).Scan(&backups); err != nil {
+		t.Fatal(err)
+	}
+	if backups != 0 {
+		t.Fatalf("auto_backups 行数=%d, want 0（拒绝发生在任何写之前）", backups)
+	}
+}
+
 func TestRunAutoBackupOnce_successWritesFileRowAndAudit(t *testing.T) {
 	// Given: 主节点测试实例 + 可写备份目录
 	h := newAutoBackupTestHandlers(t)
@@ -88,7 +139,7 @@ func TestRunAutoBackupOnce_successWritesFileRowAndAudit(t *testing.T) {
 	}
 
 	// When
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 
@@ -101,7 +152,7 @@ func TestRunAutoBackupOnce_successWritesFileRowAndAudit(t *testing.T) {
 	if err != nil || info.Size() == 0 {
 		t.Fatalf("backup file stat err=%v size=%d, want non-empty", err, info.Size())
 	}
-	// 行:success + 真实大小 + 全 3 分类(三分类合并后的默认全选)+ 摘要非空
+	// 行:success + 真实大小 + 全 4 分类(默认全选，含节点拓扑)+ 摘要非空
 	rows := autoBackupRows(t, "WHERE trigger_type='manual'")
 	if len(rows) != 1 {
 		t.Fatalf("manual rows=%d, want 1", len(rows))
@@ -114,8 +165,8 @@ func TestRunAutoBackupOnce_successWritesFileRowAndAudit(t *testing.T) {
 		t.Fatalf("size_bytes=%v, want %d", row["size_bytes"], info.Size())
 	}
 	var sections []string
-	if err := json.Unmarshal([]byte(row["sections"].(string)), &sections); err != nil || len(sections) != 3 || sections[0] != "users" || sections[1] != "rules" || sections[2] != "security" {
-		t.Fatalf("sections=%q err=%v, want [users rules security]", row["sections"], err)
+	if err := json.Unmarshal([]byte(row["sections"].(string)), &sections); err != nil || len(sections) != 4 || sections[0] != "users" || sections[1] != "rules" || sections[2] != "security" || sections[3] != "cluster" {
+		t.Fatalf("sections=%q err=%v, want [users rules security cluster]", row["sections"], err)
 	}
 	if row["message"] == "" {
 		t.Fatal("message 为空, want 各表行数摘要")
@@ -132,7 +183,7 @@ func TestRunAutoBackupOnce_recordsRealAppVersion(t *testing.T) {
 	h.cfg.Version = "v9.9.9-test"
 
 	// When
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 
@@ -164,7 +215,7 @@ func TestRunAutoBackupOnce_failureRecordsFailedRowAndAudit(t *testing.T) {
 	h.cfg.BackupDir = blocked
 
 	// When
-	_, err := h.RunAutoBackupOnce("schedule", "system", 0)
+	_, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 1)
 
 	// Then: 返回错误 + failed 行 + 自动备份审计(失败留痕)
 	if err == nil {
@@ -179,6 +230,89 @@ func TestRunAutoBackupOnce_failureRecordsFailedRowAndAudit(t *testing.T) {
 	}
 	if got := countAutoBackupAudit(t, "备份失败"); got != 1 {
 		t.Fatalf("备份失败 audit rows=%d, want 1", got)
+	}
+}
+
+// 原子写已完成 rename、仅父目录 fsync 失败时，最终文件已经存在；写失败
+// 收尾必须删除它，连续调度不得积累没有数据库行的敏感备份。
+func TestRunAutoBackupOnce_writeFailureRemovesFinalFile(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	oldWrite := autoBackupWriteFile
+	autoBackupWriteFile = func(path string, payload []byte) error {
+		if err := os.WriteFile(path, payload, 0o600); err != nil {
+			return err
+		}
+		return errors.New("parent directory fsync failed")
+	}
+	t.Cleanup(func() { autoBackupWriteFile = oldWrite })
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 1); err == nil || !strings.Contains(err.Error(), "fsync") {
+			t.Fatalf("attempt %d error=%v, want injected fsync failure", attempt, err)
+		}
+		matches, err := filepath.Glob(filepath.Join(h.cfg.BackupDir, "*.lbbak"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("attempt %d 遗留无行备份文件: %v", attempt, matches)
+		}
+	}
+	if rows := autoBackupRows(t, "WHERE status='failed'"); len(rows) != 2 {
+		t.Fatalf("failed rows=%d, want 2（失败行仍须留痕）", len(rows))
+	}
+}
+
+func TestRunAutoBackupOnce_cancelCleanupFailureLogsFilename(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	oldWrite := autoBackupWriteFile
+	autoBackupWriteFile = func(path string, payload []byte) error {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(path, "payload"), payload, 0o600); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	t.Cleanup(func() { autoBackupWriteFile = oldWrite })
+	logs := captureLog(t)
+
+	_, err := h.RunAutoBackupOnce(ctx, "schedule", "system", 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled", err)
+	}
+	if !strings.Contains(logs.String(), "取消后清理最终文件") || !strings.Contains(logs.String(), ".lbbak") {
+		t.Fatalf("取消后删除失败必须 warn 并点名文件，logs=%q", logs.String())
+	}
+	if got := countAutoBackupAudit(t, "备份失败"); got != 0 {
+		t.Fatalf("取消路径失败审计=%d, want 0", got)
+	}
+}
+
+func TestRunAutoBackupOnce_rowFailureCleanupFailureLogsFilename(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	oldWrite := autoBackupWriteFile
+	autoBackupWriteFile = func(path string, payload []byte) error {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(path, "payload"), payload, 0o600)
+	}
+	t.Cleanup(func() { autoBackupWriteFile = oldWrite })
+	if _, err := db.DB.Exec(`DROP TABLE auto_backups`); err != nil {
+		t.Fatalf("force backup row insert failure: %v", err)
+	}
+	logs := captureLog(t)
+
+	_, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 1)
+	if err == nil || !strings.Contains(err.Error(), "备份记录写入失败") {
+		t.Fatalf("err=%v, want row insertion failure", err)
+	}
+	if !strings.Contains(logs.String(), "落行失败后清理最终文件") || !strings.Contains(logs.String(), ".lbbak") {
+		t.Fatalf("落行失败后删除失败必须 warn 并点名文件，logs=%q", logs.String())
 	}
 }
 
@@ -203,11 +337,15 @@ func TestPruneAutoBackups_trimsSuccessByKeepAndFailedAtTwenty(t *testing.T) {
 	}
 
 	// When
-	pruneAutoBackups(dir, 2, 20)
+	pruneAutoBackups(context.Background(), dir, 2, 20)
 
 	// Then: success 仅留最新 2 个(文件+行同删)
-	if rows := autoBackupRows(t, "WHERE status='success' ORDER BY created_at DESC"); len(rows) != 2 {
+	rows := autoBackupRows(t, "WHERE status='success' ORDER BY created_at DESC")
+	if len(rows) != 2 {
 		t.Fatalf("success rows after prune=%d, want 2", len(rows))
+	}
+	if rows[0]["filename"] != "lbbak-auto-prune5.lbbak" || rows[1]["filename"] != "lbbak-auto-prune4.lbbak" {
+		t.Fatalf("裁剪方向错误：幸存行=%v/%v，want 最新 prune5/prune4", rows[0]["filename"], rows[1]["filename"])
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "lbbak-auto-prune*.lbbak"))
 	if len(matches) != 2 {
@@ -244,6 +382,7 @@ func TestUpdateAutoBackupSettings_validationMatrix(t *testing.T) {
 		{name: "unknown frequency", body: `{"enabled":true,"frequency":"hourly","time":"02:30","day":3,"keep":5,"sections":["users","rules"]}`},
 		{name: "empty frequency", body: `{"enabled":true,"frequency":"","time":"02:30","day":3,"keep":5,"sections":["users","rules"]}`},
 		{name: "missing frequency", body: `{"enabled":true,"time":"02:30","day":3,"keep":5,"sections":["users","rules"]}`},
+		{name: "daily missing day", body: `{"enabled":true,"frequency":"daily","time":"03:00","keep":5,"sections":["users","rules"]}`},
 		{name: "time missing leading zero", body: `{"enabled":true,"frequency":"daily","time":"2:30","day":1,"keep":5,"sections":["users","rules"]}`},
 		{name: "time hour overflow", body: `{"enabled":true,"frequency":"daily","time":"24:00","day":1,"keep":5,"sections":["users","rules"]}`},
 		{name: "time minute overflow", body: `{"enabled":true,"frequency":"daily","time":"03:60","day":1,"keep":5,"sections":["users","rules"]}`},
@@ -279,6 +418,63 @@ func TestUpdateAutoBackupSettings_validationMatrix(t *testing.T) {
 	}
 }
 
+func TestUpdateAutoBackupSettings_commitFailureUsesSharedSeam(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	forceCommitFailure(t)
+	body := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5,"sections":["users"]}`
+	response := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", body, h.UpdateAutoBackupSettings)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want injected commit failure 500", response.Code, response.Body.String())
+	}
+	var keep int
+	if err := db.DB.QueryRow(`SELECT auto_backup_keep FROM global_config WHERE id=1`).Scan(&keep); err != nil {
+		t.Fatal(err)
+	}
+	if keep != autoBackupKeepDefault {
+		t.Fatalf("提交失败后 keep=%d, want unchanged default %d", keep, autoBackupKeepDefault)
+	}
+}
+
+// 超 16 KiB 请求体必须按 413 归因：此前 ShouldBindJSON 任一错误统一 400
+// 「请求格式不正确」，把体积问题伪装成 JSON 语法问题（与同族端点 413 口径
+// 分裂，客户端无法统一按「请求过大」处理）。
+func TestUpdateAutoBackupSettings_oversizedBodyReturns413(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	// 填充必须落在 JSON 值内部：尾部空白在解析完对象后不再读取，不会触发
+	// 体积上限。
+	body := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5,"sections":["users"],"pad":"` +
+		strings.Repeat("A", 17<<10) + `"}`
+	response := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", body, h.UpdateAutoBackupSettings)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "16 KiB") {
+		t.Fatalf("body=%s, want 点名 16 KiB 上限", response.Body.String())
+	}
+}
+
+// 「缺少必填字段」文案必须与实际的 nil 判断一致：sections 非指针、缺键即空
+// 切片，走独立的「备份范围不能为空」归因——把它写进必填清单会让客户端按文案
+// 排查错方向。
+func TestUpdateAutoBackupSettings_missingFieldMessagesAttributeCorrectly(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	missingSections := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5}`
+	response := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", missingSections, h.UpdateAutoBackupSettings)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "备份范围不能为空") {
+		t.Fatalf("status=%d body=%s, want 400 备份范围不能为空", response.Code, response.Body.String())
+	}
+
+	h2 := newAutoBackupTestHandlers(t)
+	missingKeep := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"sections":["users"]}`
+	response = serveAutoBackupJSON(t, h2, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", missingKeep, h2.UpdateAutoBackupSettings)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "sections") {
+		t.Fatalf("body=%s, 缺少必填字段文案不得把 sections 计入（缺键走另一条归因）", response.Body.String())
+	}
+}
+
 // 保留份数上限收紧为 30 后,升级前保存的越界存量值(31-100)读侧必须回退
 // 安全默认 7——prune 消费回退值,不得沿用越界保留。
 func TestLoadAutoBackupKeepSetting_outOfRangeFallsBack(t *testing.T) {
@@ -287,21 +483,21 @@ func TestLoadAutoBackupKeepSetting_outOfRangeFallsBack(t *testing.T) {
 		if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_keep=? WHERE id=1`, stored); err != nil {
 			t.Fatal(err)
 		}
-		if got := loadAutoBackupKeepSetting(); got != 7 {
-			t.Fatalf("stored keep=%d loaded=%d, want fallback 7", stored, got)
+		if got, known := loadAutoBackupKeepSetting(context.Background()); !known || got != 7 {
+			t.Fatalf("stored keep=%d loaded=%d known=%v, want fallback 7 (known)", stored, got, known)
 		}
 	}
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_keep=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	if got := loadAutoBackupKeepSetting(); got != 30 {
-		t.Fatalf("stored keep=30 loaded=%d, want 30", got)
+	if got, known := loadAutoBackupKeepSetting(context.Background()); !known || got != 30 {
+		t.Fatalf("stored keep=30 loaded=%d known=%v, want 30 (known)", got, known)
 	}
 }
 
 // 三分类合并(2026-09-19 用户裁定):legacy sections 键(global_config→users、
 // waf_files→security)在保存与读取双侧归一——旧值不再因「仅全局配置」被拒,
-// 重存后落库值即收敛为当前三分类。
+// 重存后落库值即收敛为当前分类键（现为 users/rules/security/cluster 四分类）。
 func TestUpdateAutoBackupSettings_normalizesLegacySectionKeys(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	body := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5,"sections":["global_config","waf_files","rules","users"]}`
@@ -320,13 +516,16 @@ func TestUpdateAutoBackupSettings_normalizesLegacySectionKeys(t *testing.T) {
 }
 
 // 存量行旧 JSON(升级前保存的 5 键)读出即归一——调度器/导出器消费的是当前
-// 三分类口径,无需迁移存量行。
+// 分类口径,无需迁移存量行。
 func TestLoadAutoBackupSectionsSetting_normalizesLegacyKeys(t *testing.T) {
 	newAutoBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections='["users","global_config","rules","waf_files","security"]' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	got := loadAutoBackupSectionsSetting()
+	got, err := loadAutoBackupSectionsSetting(context.Background())
+	if err != nil {
+		t.Fatalf("load legacy sections: %v", err)
+	}
 	want := []string{"users", "rules", "security"}
 	if len(got) != len(want) {
 		t.Fatalf("loaded sections=%v, want %v", got, want)
@@ -335,6 +534,130 @@ func TestLoadAutoBackupSectionsSetting_normalizesLegacyKeys(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("loaded sections=%v, want %v", got, want)
 		}
+	}
+}
+
+func TestRunAutoBackupOnce_rejectsDamagedSections(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections='{broken' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := h.RunAutoBackupOnce(context.Background(), "manual", "tester", 1)
+
+	if err == nil || !strings.Contains(err.Error(), "备份范围") {
+		t.Fatalf("RunAutoBackupOnce err=%v, want damaged-sections error", err)
+	}
+	var failed, succeeded int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE status='failed' AND message LIKE '%备份范围%'`).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE status='success'`).Scan(&succeeded); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 1 || succeeded != 0 {
+		t.Fatalf("backup rows failed=%d success=%d, want 1/0", failed, succeeded)
+	}
+	if countAutoBackupAudit(t, "备份失败") == 0 {
+		t.Fatal("damaged sections must leave a failure audit")
+	}
+}
+
+func TestRunAutoBackupOnce_reportsSectionsReadFailure(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`DROP TABLE global_config`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 1)
+
+	if err == nil || !strings.Contains(err.Error(), "读取备份范围") {
+		t.Fatalf("RunAutoBackupOnce err=%v, want sections read failure", err)
+	}
+}
+
+// Given 引擎在「读取备份范围」窗口取消（角色降级/停止）。
+// When RunAutoBackupOnce 返回。
+// Then 按取消返回（context.Canceled），零 failed 行、零「备份失败」审计、零文件
+// ——读取阶段与构建/写盘的取消口径必须同形，取消不是备份失败。
+func TestRunAutoBackupOnce_cancelDuringSectionsReadLeavesNoFailedRowOrAudit(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	failedAuditsBefore := countAutoBackupAudit(t, "备份失败")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	previousHook := autoBackupBeforeSectionsReadHook
+	autoBackupBeforeSectionsReadHook = func() { cancel() }
+	t.Cleanup(func() { autoBackupBeforeSectionsReadHook = previousHook })
+
+	_, err := h.RunAutoBackupOnce(ctx, "manual", "admin", 1)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled（读取阶段取消按取消返回）", err)
+	}
+	var rows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups`).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("auto_backups rows=%d, want 0（取消不得落 failed 行）", rows)
+	}
+	if got := countAutoBackupAudit(t, "备份失败"); got != failedAuditsBefore {
+		t.Fatalf("备份失败审计 %d→%d，取消不得记备份失败", failedAuditsBefore, got)
+	}
+	entries, readErr := os.ReadDir(h.cfg.BackupDir)
+	if readErr != nil {
+		t.Fatalf("read backup dir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("备份目录残留 %d 个文件，取消不得留下任何文件", len(entries))
+	}
+}
+
+// Given 备份表被写坏到超过列表窗口（1 条 success 在最旧 + 250 条更新 failed）。
+// When 读设置端点。
+// Then 列表不超过窗口上限并标记 truncated，且 last_success_at 仍取真实最近
+// success 行（不得因窗口截断而误报 null）。
+func TestAutoBackupSettings_limitsListAndKeepsLastSuccessBeyondWindow(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	const successCreatedAt = "2026-01-01 00:00:00"
+	if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename,status,size_bytes,sections,trigger_type,message,app_version,created_at)
+		VALUES ('old-success.lbbak','success',1,'[]','manual','','','` + successCreatedAt + `')`); err != nil {
+		t.Fatalf("seed success row: %v", err)
+	}
+	for i := range 250 {
+		if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename,status,size_bytes,sections,trigger_type,message,app_version,created_at)
+			VALUES (?, 'failed', 0, '[]', 'schedule', '模拟失败', '', ?)`,
+			fmt.Sprintf("failed-%03d.lbbak", i), fmt.Sprintf("2026-02-01 00:00:%02d", i%60)); err != nil {
+			t.Fatalf("seed failed row %d: %v", i, err)
+		}
+	}
+
+	response := serveAutoBackupJSON(t, h, http.MethodGet, "/settings/auto-backup", "/settings/auto-backup", "", h.AutoBackupSettings)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Backups          []json.RawMessage `json:"backups"`
+			BackupsTruncated bool              `json:"backups_truncated"`
+			LastSuccessAt    *string           `json:"last_success_at"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v body=%s", err, response.Body.String())
+	}
+	if len(body.Data.Backups) != autoBackupListLimit {
+		t.Fatalf("backups=%d, want %d（列表必须按窗口上限截断）", len(body.Data.Backups), autoBackupListLimit)
+	}
+	if !body.Data.BackupsTruncated {
+		t.Fatal("backups_truncated=false，超窗口时必须显式标记截断")
+	}
+	if body.Data.LastSuccessAt == nil {
+		t.Fatal("last_success_at=null，want 最近一次 success 行（不得因列表截断误报 null）")
+	}
+	if *body.Data.LastSuccessAt != successCreatedAt {
+		t.Fatalf("last_success_at=%q, want %q", *body.Data.LastSuccessAt, successCreatedAt)
 	}
 }
 
@@ -383,6 +706,46 @@ func TestUpdateAutoBackupSettings_enableSetsWatermarkNotImmediateRun(t *testing.
 	}
 }
 
+func TestUpdateAutoBackupSettings_businessToggleSyncsEngineLoop(t *testing.T) {
+	// Given：引擎以业务关闭态启动，auto-backup 调度同步关闭。
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	wireAutoBackupEngineForTest(t, h)
+	te := services.TaskEngine()
+	loopOn := func() bool {
+		for _, meta := range te.DescribeAll() {
+			if meta.ID == "auto-backup" {
+				return meta.LoopOn
+			}
+		}
+		t.Fatal("auto-backup 未注册")
+		return false
+	}
+	if loopOn() {
+		t.Fatal("前置态错误：业务关闭时调度应关闭")
+	}
+
+	// When：经设置页启用，再经设置页关闭。
+	enable := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["users","rules","security"]}`
+	if resp := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", enable, h.UpdateAutoBackupSettings); resp.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	// Then：off→on 立即 StartLoop，不需要重启。
+	if !loopOn() {
+		t.Error("设置页启用后 auto-backup LoopOn=false，定时备份将无法运行")
+	}
+	disable := `{"enabled":false,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["users","rules","security"]}`
+	if resp := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", disable, h.UpdateAutoBackupSettings); resp.Code != http.StatusOK {
+		t.Fatalf("disable status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	// And：on→off 立即 StopLoop，展示与业务实态一致。
+	if loopOn() {
+		t.Error("设置页关闭后 auto-backup LoopOn=true，调度展示与业务实态分叉")
+	}
+}
+
 func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	// Given: 两行备份(created_at 递增)
@@ -420,7 +783,7 @@ func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	d := payload.Data
-	if !d.Enabled || d.Frequency != "weekly" || d.Time != "04:30" || d.Day != 6 || d.Keep != 9 || len(d.Sections) != 3 {
+	if !d.Enabled || d.Frequency != "weekly" || d.Time != "04:30" || d.Day != 6 || d.Keep != 9 || len(d.Sections) != 4 {
 		t.Fatalf("settings=(%v,%s,%s,%d,%d,%v)", d.Enabled, d.Frequency, d.Time, d.Day, d.Keep, d.Sections)
 	}
 	if len(d.Backups) != 2 || d.Backups[0].Filename != "lbbak-auto-list2.lbbak" {
@@ -428,7 +791,7 @@ func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 	}
 }
 
-// SYS-F1（第 72 轮 P4）：GET /settings/auto-backup 的 last_run 此前恒 null——
+// GET /settings/auto-backup 的 last_run 此前恒 null——
 // auto_backup_last_run 扫描进 sql.NullString 后零消费（lastRunValue 零赋值）。
 // 钉：库中有水位线时响应面回传同值；库中 NULL 时保持 null 形态（不写空串）。
 func TestAutoBackupSettings_returnsLastRun(t *testing.T) {
@@ -479,25 +842,19 @@ func TestRunAutoBackupNow_endpointRunsAndRespondsRow(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	wireAutoBackupEngineForTest(t, h)
 	response := serveAutoBackupJSON(t, h, http.MethodPost, "/auto-backup/run", "/auto-backup/run", "", h.RunAutoBackupNow)
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	// 异步接受（202）+ 后台执行，结果落 auto_backups。
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s, want 202", response.Code, response.Body.String())
 	}
-	var payload struct {
-		Data struct {
-			ID       int64  `json:"id"`
-			Status   string `json:"status"`
-			Filename string `json:"filename"`
-		} `json:"data"`
+	var filename, status string
+	waitForAutoBackupCondition(t, 10*time.Second, func() bool {
+		err := db.DB.QueryRow(`SELECT filename, status FROM auto_backups WHERE trigger_type='manual' ORDER BY id DESC LIMIT 1`).Scan(&filename, &status)
+		return err == nil && status == "success"
+	})
+	if !strings.HasPrefix(filename, "lbbak-manual-") {
+		t.Fatalf("filename=%q, want lbbak-manual- 前缀", filename)
 	}
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Data.ID == 0 || payload.Data.Status != "success" || !strings.HasPrefix(payload.Data.Filename, "lbbak-manual-") {
-		t.Fatalf("data=%+v, want 新增 success 行", payload.Data)
-	}
-	if got := countAutoBackupAudit(t, "手动备份"); got != 1 {
-		t.Fatalf("手动备份 audit rows=%d, want 1", got)
-	}
+	waitForAutoBackupCondition(t, 5*time.Second, func() bool { return countAutoBackupAudit(t, "手动备份") == 1 })
 }
 
 func TestDeleteAutoBackup_removesFileAndRow(t *testing.T) {
@@ -535,8 +892,70 @@ func TestDeleteAutoBackup_removesFileAndRow(t *testing.T) {
 	}
 }
 
+func TestDeleteAutoBackup_fileFailureKeepsRowAndWithholdsSuccessAudit(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	name := "lbbak-manual-delete-blocked.lbbak"
+	path := filepath.Join(h.cfg.BackupDir, name)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "child"), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, trigger_type) VALUES (?, 'success', 'manual')`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+
+	response := serveAutoBackupJSON(t, h, http.MethodDelete, "/auto-backup/:id", fmt.Sprintf("/auto-backup/%d", id), "", h.DeleteAutoBackup)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（文件删除失败不得报成功）", response.Code, response.Body.String())
+	}
+	if rows := autoBackupRows(t, "WHERE id=?", id); len(rows) != 1 {
+		t.Fatalf("文件删除失败后行必须保留供重试: %v", rows)
+	}
+	if got := countAutoBackupAudit(t, "备份删除"); got != 0 {
+		t.Fatalf("失败路径成功审计=%d, want 0", got)
+	}
+	// 失败面必须留痕：删除族与还原/下载同口径，单个失败分支恰一条「删除失败」，
+	// detail 携带备份 id 与文件名供按文件复盘。
+	if got := countAutoBackupAudit(t, "删除失败"); got != 1 {
+		t.Fatalf("删除失败审计=%d, want 1（失败分支必须经 failAutoBackupAccess 留痕）", got)
+	}
+	detail := autoBackupAuditDetail(t, "删除失败")
+	for _, want := range []string{fmt.Sprintf("#%d", id), name} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("删除失败 detail=%q, want 含 %q", detail, want)
+		}
+	}
+}
+
+func TestDeleteAutoBackup_missingFileStillRemovesRow(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	name := "lbbak-manual-already-missing.lbbak"
+	res, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, trigger_type) VALUES (?, 'success', 'manual')`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+
+	response := serveAutoBackupJSON(t, h, http.MethodDelete, "/auto-backup/:id", fmt.Sprintf("/auto-backup/%d", id), "", h.DeleteAutoBackup)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（ErrNotExist 应容忍）", response.Code, response.Body.String())
+	}
+	if rows := autoBackupRows(t, "WHERE id=?", id); len(rows) != 0 {
+		t.Fatalf("文件已缺失时行仍应删除: %v", rows)
+	}
+	if got := countAutoBackupAudit(t, "备份删除"); got != 1 {
+		t.Fatalf("成功审计=%d, want 1", got)
+	}
+}
+
 func TestDeleteAutoBackup_dbFailureReturns500(t *testing.T) {
-	// Given 主节点 + auto_backups 表不可用（DB 故障形态）——SYS-U3（第 69 轮）：
+	// Given 主节点 + auto_backups 表不可用（DB 故障形态）——
 	// DB 故障与「备份不存在」不得混同为 404（排障方向误导）；ErrNoRows 404、
 	// 其余响亮 500（dbQueryNotFound 分判，与 GetCurrentUser/requireAutoBackupMaster
 	// 已立先例同口径）。
@@ -626,7 +1045,7 @@ func TestRestoreAutoBackup_restoresBackedUpState(t *testing.T) {
 	if _, err := db.DB.Exec("INSERT INTO upstreams (rule_id,host,port,weight,enabled) VALUES ('lb_restore','127.0.0.1',9000,1,1)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
 		t.Fatalf("run backup: %v", err)
 	}
 	var id int64
@@ -706,22 +1125,22 @@ func TestAutoBackupEndpoints_rejectSlaveNode(t *testing.T) {
 func TestRunAutoBackupOnce_concurrentRunRejected(t *testing.T) {
 	// TryLock 并发守卫:执行中再次触发直接报错,不排队
 	h := newAutoBackupTestHandlers(t)
-	services.SetAutoBackupExecutor(func(trigger, operator string, engineRunID int64) error {
-		_, err := h.RunAutoBackupOnce(trigger, operator, engineRunID)
+	services.SetAutoBackupExecutor(func(ctx context.Context, trigger, operator string, engineRunID int64) error {
+		_, err := h.RunAutoBackupOnce(ctx, trigger, operator, engineRunID)
 		return err
 	})
 	t.Cleanup(func() { services.SetAutoBackupExecutor(nil) })
 	if !autoBackupRunMu.TryLock() {
 		t.Fatal("前置锁定失败")
 	}
-	_, err := h.RunAutoBackupOnce("manual", "system", 0)
+	_, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1)
 	autoBackupRunMu.Unlock()
 	if err == nil || !strings.Contains(err.Error(), "正在执行") {
 		t.Fatalf("err=%v, want 已有任务执行中报错", err)
 	}
 }
 
-// SYS41-1(第 41 轮审计):RunAutoBackupOnce 成功落行后必须接线内务裁剪——
+// RunAutoBackupOnce 成功落行后必须接线内务裁剪——
 // keep=1 时连续两次执行仅保留最新 1 个 success(文件+行同删);failed 行按
 // autoBackupFailedRowsKeep=20 上限保留(前端文案「失败记录另保留最近 20 条」)。
 func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
@@ -738,11 +1157,16 @@ func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
 	}
 
 	// When: keep=1 下连跑两次(同秒冲突由文件名 -2 后缀消化)
-	if _, err := h.RunAutoBackupOnce("schedule", "system", 0); err != nil {
+	firstRun, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 1)
+	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if _, err := h.RunAutoBackupOnce("schedule", "system", 0); err != nil {
+	secondRun, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 1)
+	if err != nil {
 		t.Fatalf("second run: %v", err)
+	}
+	if firstRun.Filename == "" || secondRun.Filename == "" {
+		t.Fatalf("filename 缺失: first=%q second=%q", firstRun.Filename, secondRun.Filename)
 	}
 
 	// Then: 仅最新 1 个 success 行与文件幸存
@@ -755,6 +1179,15 @@ func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
 	if err != nil || len(matches) != 1 || filepath.Base(matches[0]) != survivor {
 		t.Fatalf("success files=%v err=%v, want exactly survivor %s", matches, err, survivor)
 	}
+	// 幸存者必须是「第二次执行」产出的那个文件，而不是较旧的首轮。
+	// 不钉 "-2" 后缀：两轮是否落在同一秒取决于运行机器负载（全量包测试下
+	// 跨秒是常态），按后缀断言会变成时间相关的假红；这里按执行序等价判定。
+	if survivor != secondRun.Filename {
+		t.Fatalf("keep=1 幸存者=%q, want 第二次执行产出 %q（首轮为 %q）", survivor, secondRun.Filename, firstRun.Filename)
+	}
+	if survivor == firstRun.Filename {
+		t.Fatalf("keep=1 幸存者回落到首轮文件 %q（应保留最新一次）", survivor)
+	}
 	// failed 行按 20 上限一并裁剪
 	var failed int
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE status='failed'`).Scan(&failed); err != nil {
@@ -763,9 +1196,18 @@ func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
 	if failed != 20 {
 		t.Fatalf("failed rows=%d, want 20(autoBackupFailedRowsKeep)", failed)
 	}
+	var newestFailed, oldestFailed int
+	if err := db.DB.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM auto_backups WHERE filename='lbbak-auto-stale-fail0.lbbak'),
+		(SELECT COUNT(*) FROM auto_backups WHERE filename='lbbak-auto-stale-fail20.lbbak')`).Scan(&newestFailed, &oldestFailed); err != nil {
+		t.Fatal(err)
+	}
+	if newestFailed != 1 || oldestFailed != 0 {
+		t.Fatalf("failed 裁剪方向错误：最新 fail0=%d 最旧 fail20=%d, want 1/0", newestFailed, oldestFailed)
+	}
 }
 
-// SYSB43-1(第 43 轮):裁剪时文件删除失败(非 ErrNotExist)必须保留 DB 行
+// 裁剪时文件删除失败(非 ErrNotExist)必须保留 DB 行
 // 下轮重试——此前行随 warn 一并删除,残留文件成孤儿永不再裁剪。
 func TestPruneAutoBackups_fileRemovalOutcomes(t *testing.T) {
 	// Given:三个 success 行——同名非空目录(Remove 返回 ENOTEMPTY)/文件缺失/
@@ -791,13 +1233,13 @@ func TestPruneAutoBackups_fileRemovalOutcomes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, filename := range []string{blocked, missing, normal} {
-		if _, err := insertAutoBackupRow(filename, "success", 128, `["users"]`, "manual", "", "v9.9.9-test"); err != nil {
+		if _, err := insertAutoBackupRow(context.Background(), filename, "success", 128, `["users"]`, "manual", "", "v9.9.9-test"); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// When
-	pruneAutoBackups(dir, 0, 20)
+	pruneAutoBackups(context.Background(), dir, 0, 20)
 
 	// Then:删除失败的行保留下轮重试;缺失/正常删除的行照常清除
 	if rows := autoBackupRows(t, "WHERE filename=?", blocked); len(rows) != 1 {
@@ -829,26 +1271,52 @@ func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/auto-backup/run", nil)
 	router.ServeHTTP(response, request)
 
-	// Then: 200 且「手动备份」审计行操作人为 operator-zhang(修复前恒 system)
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	// Then: 202 接受且后台完成后「手动备份」审计行操作人为 operator-zhang
+	// （修复前恒 system；自此响应先返回，审计行需等待后台执行）。
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s, want 202", response.Code, response.Body.String())
 	}
 	var username string
-	if err := db.AuditDB.QueryRow(`SELECT username FROM audit_log WHERE action='手动备份' ORDER BY id DESC LIMIT 1`).Scan(&username); err != nil {
-		t.Fatalf("query audit: %v", err)
-	}
+	waitForAutoBackupCondition(t, 10*time.Second, func() bool {
+		return db.AuditDB.QueryRow(`SELECT username FROM audit_log WHERE action='手动备份' ORDER BY id DESC LIMIT 1`).Scan(&username) == nil
+	})
 	if username != "operator-zhang" {
 		t.Fatalf("手动备份 audit username=%q, want operator-zhang(调度路径才记 system)", username)
 	}
 }
 
-// U7b-F3（第 66 轮审计）：备份目录含私钥/凭证明文文件，目录权限必须 0700
+// Given 全局引擎被前一用例停成「已停止但非 nil」（只停实例、未清全局指针）。
+// When 装配自动备份执行器并调用 /auto-backup/run。
+// Then 装配必须重建引擎并受理（202）——判据只判 nil 时端点回 503
+// 「任务引擎已停止」，全包运行结果随测试顺序变化。
+func TestWireAutoBackupEngineForTest_replacesStoppedEngine(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	services.InitTaskEngine("", t.TempDir()+"/app.log").Stop()
+	if te := services.TaskEngine(); te == nil || !te.IsStopped() {
+		t.Fatal("前置态不成立：全局引擎应为 stopped 非 nil")
+	}
+	wireAutoBackupEngineForTest(t, h)
+	if te := services.TaskEngine(); te == nil || te.IsStopped() {
+		t.Fatal("装配必须替换已停止的全局引擎（否则 TriggerTaskAsync 恒 ErrEngineStopped）")
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/auto-backup/run", h.RunAutoBackupNow)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/auto-backup/run", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s, want 202（不得沿用已停止引擎）", response.Code, response.Body.String())
+	}
+}
+
+// 备份目录含私钥/凭证明文文件，目录权限必须 0700
 // （MkdirAll 建目录时生效；指向已存在目录时为 no-op，故指向不存在的子目录）。
 func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	h.cfg.BackupDir = filepath.Join(t.TempDir(), "backup-nested")
 
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 	info, err := os.Stat(h.cfg.BackupDir)
@@ -862,7 +1330,7 @@ func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
 
 // backupListFailingConnector：global_config 设置行查询成功返回缺省值，
 // auto_backups 列表查询「语句成功、迭代即失败」——注入 AutoBackupSettings
-// 备份列表循环的 rows.Err() 故障（R71-⑫，R36/R37 口径）。
+// 备份列表循环的 rows.Err() 故障。
 type backupListFailingConnector struct{}
 
 func (backupListFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -901,7 +1369,7 @@ func (backupListFailingConn) QueryContext(_ context.Context, query string, _ []d
 type backupSettingsRow struct{ done bool }
 
 func (r *backupSettingsRow) Columns() []string {
-	return []string{"enabled", "frequency", "time", "day", "keep", "sections", "last_run"}
+	return []string{"enabled", "frequency", "time", "day", "keep", "sections", "last_run", "last_success_at"}
 }
 
 func (r *backupSettingsRow) Close() error { return nil }
@@ -911,7 +1379,7 @@ func (r *backupSettingsRow) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 	r.done = true
-	row := []driver.Value{int64(0), "daily", "03:00", int64(1), int64(7), nil, nil}
+	row := []driver.Value{int64(0), "daily", "03:00", int64(1), int64(7), nil, nil, nil}
 	copy(dest, row)
 	return nil
 }
@@ -948,5 +1416,217 @@ func TestAutoBackupSettings_backupListIterationFailureReturns500(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "读取备份列表失败") {
 		t.Fatalf("body=%s, want explicit backup-list failure message", response.Body.String())
+	}
+}
+
+// 手动触发必须异步——慢备份（>60s 桩）不阻塞响应；
+// 双击/并发触发 409。修复前同步 RunSync 在 main.go WriteTimeout(60s) 下
+// 会被截断客户端连接，且第二个请求排队等待。
+func TestRunAutoBackupNow_asyncReturnsBeforeSlowBackupCompletes(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	wireAutoBackupEngineForTest(t, h)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	services.SetAutoBackupExecutor(func(ctx context.Context, trigger, operator string, engineRunID int64) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	})
+	t.Cleanup(func() { services.SetAutoBackupExecutor(nil) })
+
+	begin := time.Now()
+	response := serveAutoBackupJSON(t, h, http.MethodPost, "/auto-backup/run", "/auto-backup/run", "", h.RunAutoBackupNow)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s, want 202", response.Code, response.Body.String())
+	}
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("慢备份不得阻塞响应, elapsed=%s", elapsed)
+	}
+
+	// 后台任务已启动（引擎 Run 进入桩）。
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("后台备份未启动")
+	}
+
+	// 双击：执行中再次触发 → 409（不排队）。
+	second := serveAutoBackupJSON(t, h, http.MethodPost, "/auto-backup/run", "/auto-backup/run", "", h.RunAutoBackupNow)
+	if second.Code != http.StatusConflict {
+		close(release)
+		t.Fatalf("second status=%d body=%s, want 409", second.Code, second.Body.String())
+	}
+
+	close(release)
+	var status string
+	waitForAutoBackupCondition(t, 10*time.Second, func() bool {
+		return db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='auto-backup' AND trigger='manual' ORDER BY id DESC LIMIT 1`).Scan(&status) == nil && status == "success"
+	})
+}
+
+// 非 NotExist 的 Stat 故障不得被文件名分配器吞掉。
+func TestNextAutoBackupFilename_statFailureIsNotAvailable(t *testing.T) {
+	// Given 一个普通文件冒充备份目录；Stat 其子路径返回 ENOTDIR，而非
+	// ErrNotExist。该故障不得被当作「文件名可用」继续走到后续 Rename。
+	newAutoBackupTestHandlers(t)
+	notDirectory := filepath.Join(t.TempDir(), "regular-file")
+	if err := os.WriteFile(notDirectory, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+
+	// When/Then 非 NotExist 的 Stat 错误必须 fail-visible。
+	if _, err := nextAutoBackupFilename(context.Background(), notDirectory, "auto", now); err == nil || !strings.Contains(err.Error(), "检查备份文件名") {
+		t.Fatalf("err=%v, want explicit stat failure", err)
+	}
+}
+
+// 文件名分配器在 200 个变体全冲突时必须报错，
+// 不得回退到基础名（可能已存在）——否则写盘会覆盖既有备份。
+func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+	base := "lbbak-auto-" + now.Format("20060102-150405")
+
+	name, err := nextAutoBackupFilename(context.Background(), h.cfg.BackupDir, "auto", now)
+	if err != nil {
+		t.Fatalf("empty dir must allocate: %v", err)
+	}
+	if name != base+".lbbak" {
+		t.Fatalf("name=%q, want %q", name, base+".lbbak")
+	}
+
+	for i := 0; i < 200; i++ {
+		candidate := base + ".lbbak"
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d.lbbak", base, i+1)
+		}
+		if err := os.WriteFile(filepath.Join(h.cfg.BackupDir, candidate), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := nextAutoBackupFilename(context.Background(), h.cfg.BackupDir, "auto", now); err == nil {
+		t.Fatal("exhausted variants must return error instead of reusing an existing name")
+	}
+}
+
+func TestNextAutoBackupFilename_skipsFilenameReservedByDatabaseRow(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+	base := "lbbak-auto-" + now.Format("20060102-150405")
+	if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename,status,trigger_type) VALUES (?,'success','schedule')`, base+".lbbak"); err != nil {
+		t.Fatal(err)
+	}
+	name, err := nextAutoBackupFilename(context.Background(), h.cfg.BackupDir, "auto", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != base+"-2.lbbak" {
+		t.Fatalf("DB 行已占名但文件缺失时 name=%q, want %q（不得让两行共享一份文件）", name, base+"-2.lbbak")
+	}
+}
+
+// 注释承诺「取消不落 failed 行」，但写盘阶段
+// （services.WriteAutoBackupFileSynced 无 ctx）出错时直接走 fail() —— 取消 +
+// 写盘错误同时发生会落 failed 行与「备份失败」审计，而 task_runs 记 cancelled。
+// 写盘错误归一 helper：ctx 已取消时必须按取消返回（与 同口径）。
+func TestWriteAutoBackupPayload_canceledContextReturnsCancelError(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "missing-subdir", "x.lbbak")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := writeAutoBackupPayload(ctx, target, []byte("payload")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消态写盘错误=%v, want context.Canceled（不得落入 failed 行/失败审计）", err)
+	}
+
+	// 未取消时同一写盘错误必须原样上抛（错误归一不得吞掉真实磁盘故障）。
+	if err := writeAutoBackupPayload(context.Background(), target, []byte("payload")); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("未取消写盘错误=%v, want 真实写盘错误（非取消）", err)
+	}
+}
+
+// 行内 sections 损坏必须在列表披露：静默退化为空数组会把「范围未知」展示成
+// 「该备份不含任何分类」（与设置读侧对同一列显式报错的口径分叉）。
+func TestAutoBackupSettings_disclosesCorruptedRowSections(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, trigger_type, sections) VALUES ('lbbak-corrupt.lbbak','success','schedule','{not-json')`); err != nil {
+		t.Fatalf("seed corrupted row: %v", err)
+	}
+
+	response := serveAutoBackupJSON(t, h, http.MethodGet, "/settings/auto-backup", "/settings/auto-backup", "", h.AutoBackupSettings)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Backups []struct {
+				Filename      string   `json:"filename"`
+				Sections      []string `json:"sections"`
+				SectionsError string   `json:"sections_error"`
+			} `json:"backups"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Data.Backups) != 1 || payload.Data.Backups[0].Filename != "lbbak-corrupt.lbbak" {
+		t.Fatalf("backups=%+v, want 仅损坏行", payload.Data.Backups)
+	}
+	row := payload.Data.Backups[0]
+	if row.SectionsError == "" {
+		t.Fatal("损坏的 sections 必须披露 sections_error（不得静默为空数组）")
+	}
+	if len(row.Sections) != 0 {
+		t.Fatalf("sections=%v, want 空数组（键集沿用）", row.Sections)
+	}
+}
+
+// 还原/下载/删除三端点在 BackupDir 为相对路径时必须 fail-fast 500 且不产生任何
+// 文件操作（此前它们直接 filepath.Join —— 相对目录会在进程 CWD 下解析同名
+// 文件，误删/误读非备份目录文件；写路径已有同口径入口守卫）。
+func TestAutoBackupFileEndpoints_rejectRelativeBackupDir(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	name := "lbbak-manual-relative.lbbak"
+	res, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, trigger_type) VALUES (?, 'success', 'manual')`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	// CWD 下放一个同名文件：守卫失效时删除端点会把它删掉。
+	cwdFile, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(cwdFile, name)
+	if err := os.WriteFile(target, []byte("must-survive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(target) })
+	h.cfg.BackupDir = "relative-backup-dir"
+
+	cases := []struct {
+		name   string
+		method string
+		route  string
+		path   string
+		serve  func(*gin.Context)
+	}{
+		{"还原", http.MethodPost, "/auto-backup/:id/restore", fmt.Sprintf("/auto-backup/%d/restore", id), h.RestoreAutoBackup},
+		{"下载", http.MethodGet, "/auto-backup/:id/download", fmt.Sprintf("/auto-backup/%d/download", id), h.DownloadAutoBackup},
+		{"删除", http.MethodDelete, "/auto-backup/:id", fmt.Sprintf("/auto-backup/%d", id), h.DeleteAutoBackup},
+	}
+	for _, test := range cases {
+		response := serveAutoBackupJSON(t, h, test.method, test.route, test.path, "", test.serve)
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "备份目录无效") {
+			t.Fatalf("%s: status=%d body=%s, want 500 备份目录无效", test.name, response.Code, response.Body.String())
+		}
+	}
+	// 相对目录期间不得有任何文件被删除/读取失败副作用——行与 CWD 文件仍在。
+	if rows := autoBackupRows(t, "WHERE id=?", id); len(rows) != 1 {
+		t.Fatalf("行被提前删除: %v", rows)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "must-survive" {
+		t.Fatalf("CWD 同名文件被误操作: data=%q err=%v", string(data), err)
 	}
 }

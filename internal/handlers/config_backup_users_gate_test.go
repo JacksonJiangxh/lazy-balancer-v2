@@ -1,47 +1,32 @@
 package handlers
 
-// 第 66 轮审计修复——L6-66-01（v2 备份 users 键存在但空数组→校验期硬拒，
-// 键缺席的分类导出形态不受影响）与 L6-66-03（预览端镜像导入侧单侧 WAF
+// （v2 备份 users 键存在但空数组→校验期硬拒，
+// 键缺席的分类导出形态不受影响）与 （预览端镜像导入侧单侧 WAF
 // 文件缺失建模：剔对应版本表+告警）。
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/gin-gonic/gin"
-
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
 
-func postUsersGateImport(t *testing.T, h *Handlers, body string) *httptest.ResponseRecorder {
-	t.Helper()
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.POST("/config/import", h.ImportConfigBackup)
-	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(body))
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, request)
-	return response
-}
-
-// ── L6-66-01 ──
+// ── 回归钉 ──
 
 // Given v2 备份 users 键存在但为空数组（合法导出永不产出该形态，仅手造/损坏）。
 // When 导入。
 // Then 校验期 400 且错误文案点名「users 表为空，导入将清空全部账户」。
 func TestImportConfigBackup_rejects_empty_users_array_with_dedicated_message(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := r41BackupJSON(t, nil, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: nil, Tables: map[string][]map[string]any{
 		"users": {},
-	}, nil)
+	}, Config: nil})
 
-	response := postUsersGateImport(t, h, body)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", body)
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
@@ -56,11 +41,11 @@ func TestImportConfigBackup_rejects_empty_users_array_with_dedicated_message(t *
 // Then valid=false 且错误文案与导入一致（此前预览显示「用户 0 个」仍 valid=true）。
 func TestValidateConfigImport_rejects_empty_users_array(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := r41BackupJSON(t, nil, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: nil, Tables: map[string][]map[string]any{
 		"users": {},
-	}, nil)
+	}, Config: nil})
 
-	got := r41PostValidate(t, h, body)
+	got := postValidateString(t, h, body)
 
 	if got.Valid {
 		t.Fatalf("users 空表备份预览必须 valid=false，got %+v", got)
@@ -76,12 +61,12 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (9,'local-keeper','hash','admin',1)`); err != nil {
 		t.Fatalf("seed local keeper: %v", err)
 	}
-	body := r41BackupJSON(t, nil, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: nil, Tables: map[string][]map[string]any{
 		"lb_rules":  {{"caddy_id": "lb_nousers", "name": "no-users", "protocol": "http", "domain": "nousers.example.test", "listen_port": 8081, "enabled": 1}},
 		"upstreams": {{"rule_id": "lb_nousers", "host": "127.0.0.1", "port": 9001, "weight": 1, "enabled": 1}},
-	}, nil)
+	}, Config: nil})
 
-	response := postUsersGateImport(t, h, body)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", body)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("users 键缺席（分类导出）必须照常导入: %d %s", response.Code, response.Body.String())
@@ -95,7 +80,7 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 	}
 }
 
-// ── L6-66-03：预览镜像导入侧单侧 WAF 文件缺失建模 ──
+// 预览镜像导入侧单侧 WAF 文件缺失建模
 
 // Given lbbak 备份只携带 xdb（无 CRS 文件），config.json 含两个版本表。
 // When 预览。
@@ -103,7 +88,7 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 // （此前预览计数含两表且无警告，与导入侧实际落库分叉）。
 func TestValidateConfigImport_single_side_missing_crs_skips_table_and_warns(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	backupJSON := completeBackupJSON(t, nil)
+	backupJSON := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true})
 	body := buildTestLbbak(t, backupJSON, []byte("XDB-ONLY-PAYLOAD"))
 
 	rec := postLbbakValidate(t, h, body, "")
@@ -150,7 +135,7 @@ func TestValidateConfigImport_single_side_missing_xdb_skips_table_and_warns(t *t
 	if bundle == nil || len(bundle.CRSTarGz) == 0 || bundle.Xdb != nil {
 		t.Fatalf("仅 CRS bundle 构建失败: %+v", bundle)
 	}
-	backupJSON := completeBackupJSON(t, nil)
+	backupJSON := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true})
 	body, err := buildLbbakPayload([]byte(backupJSON), bundle)
 	if err != nil {
 		t.Fatalf("buildLbbakPayload: %v", err)

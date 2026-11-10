@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,6 +13,7 @@ import (
 	"errors"
 	"math/big"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +42,7 @@ tcp        0      0 10.0.0.1:443           10.0.0.2:50008         TIME_WAIT`
 }
 
 func TestParseNetDevTotals_sums_default_route_interface_only(t *testing.T) {
+	withIsolatedGlobal(t)
 	original := systemMetricsReadFile
 	systemMetricsReadFile = func(path string) ([]byte, error) {
 		if path == "/proc/net/route" {
@@ -55,7 +59,7 @@ func TestParseNetDevTotals_sums_default_route_interface_only(t *testing.T) {
  wlan0: 5000 1 0 0 0 0 0 0 6000 1 0 0 0 0 0 0
    br-app: 7000 1 0 0 0 0 0 0 8000 1 0 0 0 0 0 0`
 
-	bytesIn, bytesOut, err := parseNetDevTotals(fixture)
+	bytesIn, bytesOut, _, err := parseNetDevTotals(fixture)
 	if err != nil {
 		t.Fatalf("parse net dev fixture: %v", err)
 	}
@@ -65,6 +69,7 @@ func TestParseNetDevTotals_sums_default_route_interface_only(t *testing.T) {
 }
 
 func TestParseNetDevTotals_falls_back_to_physical_interfaces_when_no_default_route(t *testing.T) {
+	withIsolatedGlobal(t)
 	// Given：容器 netns 无默认路由（Docker Desktop 场景），仅有子网路由
 	original := systemMetricsReadFile
 	systemMetricsReadFile = func(path string) ([]byte, error) {
@@ -83,7 +88,7 @@ func TestParseNetDevTotals_falls_back_to_physical_interfaces_when_no_default_rou
    br-abc: 7000 1 0 0 0 0 0 0 8000 1 0 0 0 0 0 0`
 
 	// When
-	bytesIn, bytesOut, err := parseNetDevTotals(fixture)
+	bytesIn, bytesOut, _, err := parseNetDevTotals(fixture)
 
 	// Then：只统计 eth0，虚拟叠加层不重复计入
 	if err != nil {
@@ -94,37 +99,131 @@ func TestParseNetDevTotals_falls_back_to_physical_interfaces_when_no_default_rou
 	}
 }
 
-func TestGetSystemMetrics_returns_error_when_meminfo_read_fails(t *testing.T) {
-	original := systemMetricsReadFile
-	systemMetricsReadFile = func(string) ([]byte, error) { return nil, errors.New("permission denied") }
-	t.Cleanup(func() { systemMetricsReadFile = original })
-
-	metrics, err := getSystemMetrics()
-	if err == nil || !strings.Contains(err.Error(), "读取系统内存指标失败") {
-		t.Fatalf("metrics=%#v error=%v, want explicit memory error", metrics, err)
-	}
-}
-
-func TestGetSystemMetrics_returns_error_when_df_output_is_invalid(t *testing.T) {
+// 分项降级契约：内存采集失败只让 memory 从结果里缺席（Degraded 披露），
+// 不得连带丢失磁盘/CPU——排障窗口里 CPU 单点故障曾让整卡数据消失。
+func TestGetSystemMetrics_memoryFailureDegradesWithoutLosingOtherParts(t *testing.T) {
+	withIsolatedGlobal(t)
 	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
-	systemMetricsReadFile = func(string) ([]byte, error) {
-		return []byte("MemTotal: 1000 kB\nMemAvailable: 400 kB\n"), nil
+	resetDiskUsageCacheForTest(t)
+	resetCPUSampleStateForTest(t)
+	systemMetricsReadFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/meminfo":
+			return nil, errors.New("permission denied")
+		case "/proc/stat":
+			return []byte("cpu 100 0 0 100 0\n"), nil
+		default:
+			return originalReadFile(path)
+		}
 	}
-	systemMetricsDFCommand = func() *exec.Cmd { return exec.Command("sh", "-c", "printf invalid") }
+	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "printf 'Filesystem 1B-blocks Used Available Use%% Mounted on\n/dev/x 1000 250 750 25%% /\n'")
+	}
 	t.Cleanup(func() {
 		systemMetricsReadFile = originalReadFile
 		systemMetricsDFCommand = originalDFCommand
 	})
 
 	metrics, err := getSystemMetrics()
-	if err == nil || !strings.Contains(err.Error(), "解析系统磁盘指标失败") {
-		t.Fatalf("metrics=%#v error=%v, want explicit disk parse error", metrics, err)
+	if err != nil {
+		t.Fatalf("仅内存失败不得让整次采集失败: %v", err)
+	}
+	if !slices.Contains(metrics.Degraded, "memory") {
+		t.Fatalf("degraded=%v, want 含 memory", metrics.Degraded)
+	}
+	if metrics.MemoryTotal != 0 || metrics.MemoryPercent != 0 {
+		t.Fatalf("内存指标=%+v, want 零值（失败分项不伪造数据）", metrics)
+	}
+	if metrics.DiskTotal != 1000 || metrics.DiskUsed != 250 {
+		t.Fatalf("磁盘指标=%d/%d, want 1000/250（内存失败不得连带丢失）", metrics.DiskTotal, metrics.DiskUsed)
+	}
+	for _, part := range metrics.Degraded {
+		if part == "disk" {
+			t.Fatalf("degraded=%v, 磁盘采集成功不得标记失败", metrics.Degraded)
+		}
+	}
+}
+
+// 磁盘解析失败同样只降级该项。
+func TestGetSystemMetrics_diskFailureDegradesWithoutLosingOtherParts(t *testing.T) {
+	withIsolatedGlobal(t)
+	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
+	resetDiskUsageCacheForTest(t)
+	resetCPUSampleStateForTest(t)
+	systemMetricsReadFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/meminfo":
+			return []byte("MemTotal: 1000 kB\nMemAvailable: 400 kB\n"), nil
+		case "/proc/stat":
+			return []byte("cpu 100 0 0 100 0\n"), nil
+		default:
+			return originalReadFile(path)
+		}
+	}
+	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "printf invalid")
+	}
+	t.Cleanup(func() {
+		systemMetricsReadFile = originalReadFile
+		systemMetricsDFCommand = originalDFCommand
+	})
+
+	metrics, err := getSystemMetrics()
+	if err != nil {
+		t.Fatalf("仅磁盘失败不得让整次采集失败: %v", err)
+	}
+	if !slices.Contains(metrics.Degraded, "disk") {
+		t.Fatalf("degraded=%v, want 含 disk", metrics.Degraded)
+	}
+	if metrics.DiskTotal != 0 || metrics.DiskPercent != 0 {
+		t.Fatalf("磁盘指标=%+v, want 零值（失败分项不伪造数据）", metrics)
+	}
+	if metrics.MemoryTotal == 0 {
+		t.Fatalf("内存指标缺失：磁盘失败不得连带丢失 healthy 分项")
+	}
+	for _, part := range metrics.Degraded {
+		if part == "memory" {
+			t.Fatalf("degraded=%v, 内存采集成功不得标记失败", metrics.Degraded)
+		}
+	}
+}
+
+// 三项全失败才失败（此时确实无可展示数据）。
+func TestGetSystemMetrics_allPartsFailingReturnsError(t *testing.T) {
+	withIsolatedGlobal(t)
+	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
+	resetDiskUsageCacheForTest(t)
+	resetCPUSampleStateForTest(t)
+	systemMetricsReadFile = func(string) ([]byte, error) { return nil, errors.New("unavailable") }
+	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exit 3")
+	}
+	t.Cleanup(func() {
+		systemMetricsReadFile = originalReadFile
+		systemMetricsDFCommand = originalDFCommand
+	})
+
+	metrics, err := getSystemMetrics()
+	if err == nil {
+		t.Fatal("三项全失败必须返回 error（后端不得以全零冒充健康）")
+	}
+	if want := []string{"memory", "disk", "cpu", "pids"}; !slices.Equal(metrics.Degraded, want) {
+		t.Fatalf("degraded=%v, want deterministic order %v", metrics.Degraded, want)
+	}
+	for _, fragment := range []string{"内存", "磁盘", "CPU"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("error=%q, want 含 %q（逐项点名失败原因）", err.Error(), fragment)
+		}
 	}
 }
 
 func TestGetConnectionStats_returns_netstat_error(t *testing.T) {
+	withIsolatedGlobal(t)
 	original := netstatCommand
-	netstatCommand = func() *exec.Cmd { return exec.Command("sh", "-c", "exit 17") }
+	resetConnectionStatsCacheForTest(t)
+	netstatCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exit 17")
+	}
 	t.Cleanup(func() { netstatCommand = original })
 	_, err := getConnectionStats()
 	if err == nil || !strings.Contains(err.Error(), "netstat -tan") {
@@ -134,6 +233,13 @@ func TestGetConnectionStats_returns_netstat_error(t *testing.T) {
 
 // generateTestCert creates a test certificate and key pair
 func generateTestCert(domain string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
+	return generateTestCertWithNames(domain, []string{domain}, notBefore, notAfter)
+}
+
+// generateTestCertWithNames 生成 CN 与 SAN 可分离的证书。域名展示口径是
+// 「SAN[0] 优先、CN 兜底」，夹具若把两者设成同值，删掉 SAN 覆盖分支也测不出，
+// 故必须能构造 CN≠SAN（或只有 CN 无 SAN）的证书。
+func generateTestCertWithNames(commonName string, dnsNames []string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
 	// Generate RSA key
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -144,9 +250,9 @@ func generateTestCert(domain string, notBefore, notAfter time.Time) (certPEM, ke
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
-			CommonName: domain,
+			CommonName: commonName,
 		},
-		DNSNames:              []string{domain},
+		DNSNames:              dnsNames,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
@@ -154,7 +260,7 @@ func generateTestCert(domain string, notBefore, notAfter time.Time) (certPEM, ke
 		BasicConstraintsValid: true,
 	}
 
-	// Self-sign the certificate
+	// the certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
 		return "", "", err
@@ -224,6 +330,41 @@ func generateECDSACert(domain string, notBefore, notAfter time.Time) (certPEM, k
 	return certPEM, keyPEM, nil
 }
 
+// generateEd25519Cert creates an Ed25519 certificate（内部 CA/自签
+// 常用密钥类型，tls.X509KeyPair 与 Caddy 均支持）。
+func generateEd25519Cert(domain string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: domain,
+		},
+		DNSNames:              []string{domain},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, priv)
+	if err != nil {
+		return "", "", err
+	}
+
+	certPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return "", "", err
+	}
+	keyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}))
+	return certPEM, keyPEM, nil
+}
+
 func TestParseTLSCertificate(t *testing.T) {
 	now := time.Now()
 
@@ -272,14 +413,25 @@ func TestParseTLSCertificate(t *testing.T) {
 			wantErr:     false,
 		},
 		{
+			// 只断言本包自有的错误文案（"invalid certificate
+			// or key pair"），不钉 Go 标准库 crypto/tls 的措辞——小版本改写错误串
+			// 不得误红，也不得让「配对检测坏了」与「引擎文案变了」混为一谈。
 			name:        "mismatched cert and key",
 			wantErr:     true,
-			errContains: "private key does not match public key",
+			errContains: "invalid certificate or key pair",
 		},
 		{
 			name:       "valid ECDSA certificate",
 			wantValid:  true,
 			wantDomain: "ecdsa.example.com",
+			wantErr:    false,
+		},
+		{
+			// Ed25519 手动证书此前被公钥类型白名单硬拒
+			// （"unsupported public key type in certificate"）——面板比引擎更窄。
+			name:       "valid Ed25519 certificate",
+			wantValid:  true,
+			wantDomain: "ed25519.example.com",
 			wantErr:    false,
 		},
 	}
@@ -316,6 +468,11 @@ func TestParseTLSCertificate(t *testing.T) {
 				certPEM, keyPEM, err = generateECDSACert("ecdsa.example.com", now.Add(-1*time.Hour), now.Add(24*time.Hour))
 				if err != nil {
 					t.Fatalf("failed to generate ECDSA cert: %v", err)
+				}
+			case "valid Ed25519 certificate":
+				certPEM, keyPEM, err = generateEd25519Cert("ed25519.example.com", now.Add(-1*time.Hour), now.Add(24*time.Hour))
+				if err != nil {
+					t.Fatalf("failed to generate Ed25519 cert: %v", err)
 				}
 			}
 
@@ -363,7 +520,10 @@ func TestParseTLSCertificate(t *testing.T) {
 
 func TestParseTLSCertificate_ExtractsSANs(t *testing.T) {
 	now := time.Now()
-	certPEM, keyPEM, err := generateTestCert("san.example.com", now.Add(-1*time.Hour), now.Add(24*time.Hour))
+	// CN 与 SAN 必须不同值：同值时「SAN 优先」与「CN 兜底」两种实现都绿，
+	// 该分支删掉也测不出来。
+	const sanDomain = "san.example.com"
+	certPEM, keyPEM, err := generateTestCertWithNames("cn-only.example.com", []string{sanDomain}, now.Add(-1*time.Hour), now.Add(24*time.Hour))
 	if err != nil {
 		t.Fatalf("failed to generate test cert: %v", err)
 	}
@@ -373,8 +533,27 @@ func TestParseTLSCertificate_ExtractsSANs(t *testing.T) {
 		t.Fatalf("parseTLSCertificate() error = %v", err)
 	}
 
-	if info.Domain != "san.example.com" {
-		t.Errorf("parseTLSCertificate() Domain = %v, want san.example.com", info.Domain)
+	if info.Domain != sanDomain {
+		t.Errorf("parseTLSCertificate() Domain = %v, want %v（SAN[0] 优先于 CN）", info.Domain, sanDomain)
+	}
+}
+
+// 无 SAN 只有 CN 时回落 CN——覆盖「SAN 优先」的另一方向，保证两者都不丢。
+func TestParseTLSCertificate_fallsBackToCommonNameWithoutSAN(t *testing.T) {
+	now := time.Now()
+	const cnDomain = "cn-fallback.example.com"
+	certPEM, keyPEM, err := generateTestCertWithNames(cnDomain, nil, now.Add(-1*time.Hour), now.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	info, err := parseTLSCertificate(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("parseTLSCertificate() error = %v", err)
+	}
+
+	if info.Domain != cnDomain {
+		t.Errorf("parseTLSCertificate() Domain = %v, want %v（无 SAN 时回落 CN）", info.Domain, cnDomain)
 	}
 }
 
@@ -478,16 +657,24 @@ func TestParseCPUSnapshot_includes_idle_and_iowait(t *testing.T) {
 }
 
 func TestGetCPUPercent_serializes_sample_read_with_baseline_update(t *testing.T) {
+	withIsolatedGlobal(t)
+	// 关闭采样窗口：本用例钉的是「采样读与基线更新串行」，需要每次调用都读样本。
+	disableCPUSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
 	lastCPUStats.mu.Lock()
-	originalSnapshot := lastCPUStats.snapshot
+	originalSnapshot, originalSampledAt, originalHasValue, originalPercent :=
+		lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent
 	lastCPUStats.snapshot = cpuSnapshot{total: 100, idle: 50}
 	lastCPUStats.mu.Unlock()
 	t.Cleanup(func() {
 		systemMetricsReadFile = originalReader
 		lastCPUStats.mu.Lock()
-		lastCPUStats.snapshot = originalSnapshot
+		// 全字段复位（不只 snapshot）：getCPUPercent 同时推进 sampledAt/hasValue/
+		// percent，只还原 snapshot 会在 suite 终态留下「有值基线」——固定声明序下
+		// 被后续用例的 reset 掩盖，-shuffle 下判为全局态泄漏。
+		lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent =
+			originalSnapshot, originalSampledAt, originalHasValue, originalPercent
 		lastCPUStats.mu.Unlock()
 	})
 	firstRead := make(chan struct{})
@@ -523,12 +710,10 @@ func TestGetCPUPercent_serializes_sample_read_with_baseline_update(t *testing.T)
 		_, err := getCPUPercent()
 		errorsCh <- err
 	}()
-	select {
-	case <-secondRead:
-		close(releaseFirst)
-	case <-time.After(100 * time.Millisecond):
-		close(releaseFirst)
-	}
+	// 第二次采样在入口锁处阻塞（读+算+写基线整段持锁），只可能在
+	// releaseFirst 之后才 close(secondRead)——原 select 的 secondRead 分支不可达，
+	// 恒空转 100ms。此处直接释放即可；串行化由「持锁贯穿读样本」实现。
+	close(releaseFirst)
 	firstErr, secondErr := <-errorsCh, <-errorsCh
 
 	// Then
@@ -544,10 +729,13 @@ func TestGetCPUPercent_serializes_sample_read_with_baseline_update(t *testing.T)
 }
 
 func TestGetCPUPercent_rebaselines_after_counter_rollback(t *testing.T) {
+	withIsolatedGlobal(t)
+	disableCPUSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
 	lastCPUStats.mu.Lock()
-	originalSnapshot := lastCPUStats.snapshot
+	originalSnapshot, originalSampledAt, originalHasValue, originalPercent :=
+		lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent
 	lastCPUStats.snapshot = cpuSnapshot{total: 100, idle: 50}
 	lastCPUStats.mu.Unlock()
 	samples := [][]byte{
@@ -566,7 +754,9 @@ func TestGetCPUPercent_rebaselines_after_counter_rollback(t *testing.T) {
 	t.Cleanup(func() {
 		systemMetricsReadFile = originalReader
 		lastCPUStats.mu.Lock()
-		lastCPUStats.snapshot = originalSnapshot
+		// 同上：采样缓存的全部字段都要复位，否则 suite 终态残留有值基线。
+		lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent =
+			originalSnapshot, originalSampledAt, originalHasValue, originalPercent
 		lastCPUStats.mu.Unlock()
 	})
 
@@ -584,18 +774,16 @@ func TestGetCPUPercent_rebaselines_after_counter_rollback(t *testing.T) {
 }
 
 func TestGetRealtimeTraffic_serializes_sample_read_with_baseline_update(t *testing.T) {
+	withIsolatedGlobal(t)
+	// 关闭采样窗口：本用例钉的是「采样读与基线更新串行」，需要每次调用都读样本。
+	disableNetSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
+	captureLastNetStatsForTest(t)
 	lastNetStats.mu.Lock()
-	originalBytesIn, originalBytesOut, originalTime := lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.time
 	lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.time = 100, 200, time.Now().Add(-time.Second)
 	lastNetStats.mu.Unlock()
-	t.Cleanup(func() {
-		systemMetricsReadFile = originalReader
-		lastNetStats.mu.Lock()
-		lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.time = originalBytesIn, originalBytesOut, originalTime
-		lastNetStats.mu.Unlock()
-	})
+	t.Cleanup(func() { systemMetricsReadFile = originalReader })
 	firstRead := make(chan struct{})
 	secondRead := make(chan struct{})
 	releaseFirst := make(chan struct{})
@@ -640,12 +828,10 @@ func TestGetRealtimeTraffic_serializes_sample_read_with_baseline_update(t *testi
 		_, err := getRealtimeTraffic()
 		errorsCh <- err
 	}()
-	select {
-	case <-secondRead:
-		close(releaseFirst)
-	case <-time.After(100 * time.Millisecond):
-		close(releaseFirst)
-	}
+	// 第二次采样在入口锁处阻塞（读+算+写基线整段持锁），只可能在
+	// releaseFirst 之后才 close(secondRead)——原 select 的 secondRead 分支不可达，
+	// 恒空转 100ms。此处直接释放即可；串行化由「持锁贯穿读样本」实现。
+	close(releaseFirst)
 	firstErr, secondErr := <-errorsCh, <-errorsCh
 
 	// Then
@@ -661,10 +847,12 @@ func TestGetRealtimeTraffic_serializes_sample_read_with_baseline_update(t *testi
 }
 
 func TestGetRealtimeTraffic_rebaselines_after_counter_rollback(t *testing.T) {
+	withIsolatedGlobal(t)
+	disableNetSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
+	captureLastNetStatsForTest(t)
 	lastNetStats.mu.Lock()
-	originalBytesIn, originalBytesOut, originalTime := lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.time
 	lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.time = 1000, 2000, time.Now().Add(-5*time.Second)
 	lastNetStats.mu.Unlock()
 	systemMetricsReadFile = func(path string) ([]byte, error) {
@@ -677,12 +865,7 @@ func TestGetRealtimeTraffic_rebaselines_after_counter_rollback(t *testing.T) {
 			return nil, errors.New("unexpected path: " + path)
 		}
 	}
-	t.Cleanup(func() {
-		systemMetricsReadFile = originalReader
-		lastNetStats.mu.Lock()
-		lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.time = originalBytesIn, originalBytesOut, originalTime
-		lastNetStats.mu.Unlock()
-	})
+	t.Cleanup(func() { systemMetricsReadFile = originalReader })
 
 	// When
 	traffic, err := getRealtimeTraffic()
@@ -748,5 +931,118 @@ func TestParseRuleMetricsFromPrometheus_normalizes_configured_hosts(t *testing.T
 				t.Fatalf("requests_total=%v, want 5", metrics["requests_total"])
 			}
 		})
+	}
+}
+
+// CPU 采样错误不得被 1s 采样窗口缓存成「正常的 0%」：错误轮之后的下一个请求
+// 必须重新采样并继续报错（Degraded 不覆盖 cpu，0% 会被误读为负载骤降）。
+func TestGetCPUPercent_errorIsNotCachedBySampleWindow(t *testing.T) {
+	withIsolatedGlobal(t)
+	oldWindow := cpuSampleWindow
+	cpuSampleWindow = time.Minute
+	t.Cleanup(func() { cpuSampleWindow = oldWindow })
+
+	lastCPUStats.mu.Lock()
+	oldSnapshot, oldSampledAt, oldHasValue, oldPercent := lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent
+	lastCPUStats.snapshot = cpuSnapshot{total: 1000, idle: 300}
+	lastCPUStats.sampledAt = time.Now().Add(-5 * time.Minute)
+	lastCPUStats.hasValue = true
+	lastCPUStats.percent = 7
+	lastCPUStats.mu.Unlock()
+	t.Cleanup(func() {
+		lastCPUStats.mu.Lock()
+		lastCPUStats.snapshot, lastCPUStats.sampledAt, lastCPUStats.hasValue, lastCPUStats.percent = oldSnapshot, oldSampledAt, oldHasValue, oldPercent
+		lastCPUStats.mu.Unlock()
+	})
+
+	// 两轮样本的 idle 增量都大于总量增量（个别字段计数回退的畸形样本）。
+	samples := []string{
+		"cpu  200 0 490 320 0 0 0 0 0 0\n",
+		"cpu  200 0 470 350 0 0 0 0 0 0\n",
+	}
+	call := 0
+	oldReadFile := systemMetricsReadFile
+	systemMetricsReadFile = func(string) ([]byte, error) {
+		s := samples[call]
+		if call < len(samples)-1 {
+			call++
+		}
+		return []byte(s), nil
+	}
+	t.Cleanup(func() { systemMetricsReadFile = oldReadFile })
+
+	for round := 1; round <= len(samples); round++ {
+		if _, err := getCPUPercent(); err == nil {
+			t.Fatalf("第 %d 轮采样应报错（错误样本不得被采样窗口缓存成 0%%）", round)
+		}
+	}
+}
+
+// Prometheus 正文允许 NaN/±Inf，但样本值转 int64 对非有限值是实现相关的（会输出
+// 荒谬负数计数）：非有限样本必须跳过；全部无效时与「无有效样本」同口径报错。
+func TestParsePrometheusSamples_skipsNonFiniteValues(t *testing.T) {
+	body := strings.Join([]string{
+		"# HELP caddy_http_requests_total total",
+		`caddy_http_requests_total{host="a"} 5`,
+		"unused_gauge NaN",
+		"unused_inf +Inf",
+		"unused_neg_inf -Inf",
+	}, "\n")
+	samples, err := parsePrometheusSamples(body)
+	if err != nil {
+		t.Fatalf("parsePrometheusSamples: %v", err)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("samples=%+v, want 仅有限值样本", samples)
+	}
+	if samples[0].name != `caddy_http_requests_total{host="a"}` || samples[0].value != 5 {
+		t.Fatalf("sample=%+v, want 有限值样本原样保留", samples[0])
+	}
+	if _, err := parsePrometheusSamples("unused_gauge NaN\n"); err == nil {
+		t.Fatal("全部样本非有限值时应报错（与正文无有效样本同口径）")
+	}
+}
+
+// 超长设备名让 df 折行时仍必须取到总量/已用列（此前固定取第 2 行把设备名当
+// 数字列，磁盘分项整体降级）。
+func TestParseDFOutput_toleratesWrappedDeviceName(t *testing.T) {
+	wrapped := "Filesystem 1B-blocks Used Available Use% Mounted on\n" +
+		"/dev/disk/by-uuid/0123456789abcdef0123456789abcdef\n" +
+		"1000 750 250 75% /\n"
+	if total, used, ok := parseDFOutput(wrapped); !ok || total != 1000 || used != 750 {
+		t.Fatalf("parseDFOutput(wrapped)=(%d,%d,%v), want (1000,750,true)", total, used, ok)
+	}
+	if _, _, ok := parseDFOutput("Filesystem 1B-blocks Used Available Use% Mounted on\n"); ok {
+		t.Fatal("无数据行时不得返回成功")
+	}
+}
+
+// exposition 标签值合法可含空格（`host="a b"`）：按空白切字段会把值切成残片并
+// 让整段正文报错。行取值必须与 services 采集链同源（引号感知），无标签块的行
+// 仍按字段切分。
+func TestParsePrometheusSamples_toleratesSpaceInLabelValue(t *testing.T) {
+	body := strings.Join([]string{
+		`# HELP caddy_http_requests_total total`,
+		`caddy_http_requests_total{host="a b"} 5`,
+		`caddy_http_response_size_bytes_sum{host="a b",handler="x y"} 1024`,
+		`caddy_http_requests_total 7`,
+	}, "\n")
+
+	samples, err := parsePrometheusSamples(body)
+	if err != nil {
+		t.Fatalf("parsePrometheusSamples: %v", err)
+	}
+	want := []prometheusSample{
+		{name: `caddy_http_requests_total{host="a b"}`, value: 5},
+		{name: `caddy_http_response_size_bytes_sum{host="a b",handler="x y"}`, value: 1024},
+		{name: "caddy_http_requests_total", value: 7},
+	}
+	if len(samples) != len(want) {
+		t.Fatalf("samples=%+v, want %+v", samples, want)
+	}
+	for i := range want {
+		if samples[i] != want[i] {
+			t.Fatalf("samples[%d]=%+v, want %+v", i, samples[i], want[i])
+		}
 	}
 }

@@ -1,0 +1,198 @@
+package services
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/corazawaf/coraza/v3/types"
+	"lazy-balancer-v2/geoipnames"
+	"lazy-balancer-v2/internal/models"
+)
+
+// TestBuildIPPrecheckDirectives_renderDoesNotRecompileCrawlerEngines 钉渲染
+// 热路径零深拷贝：CrawlerEngines 每次深拷贝并重编译全部引擎正则（约 28 次
+// MustCompile），逐策略调用即按策略数放大。渲染侧只需 ID 集合，必须走
+// CrawlerEngineIDs 只读视图——回退到深拷贝路径时本守卫显形。正例对照证明
+// 计数缝本身有效。
+func TestBuildIPPrecheckDirectives_renderDoesNotRecompileCrawlerEngines(t *testing.T) {
+	exempt := func(id int) *models.SecurityPolicy {
+		return &models.SecurityPolicy{
+			ID: id, Mode: "blocking", Enabled: true,
+			GeoIPMode:           "deny",
+			GeoIPCountries:      json.RawMessage(`["海外"]`),
+			GeoIPCrawlerExempt:  true,
+			GeoIPCrawlerEngines: json.RawMessage(`["googlebot","baiduspider"]`),
+			IPWhitelistEnabled:  true,
+		}
+	}
+	policies := []*models.SecurityPolicy{exempt(7), exempt(8), exempt(9)}
+
+	before := geoipnames.CrawlerEnginesDeepCopyCallsForTest()
+	if _, err := buildIPPrecheckDirectives(policies, "lb_render_guard"); err != nil {
+		t.Fatalf("buildIPPrecheckDirectives: %v", err)
+	}
+	if after := geoipnames.CrawlerEnginesDeepCopyCallsForTest(); after != before {
+		t.Fatalf("渲染 %d 条策略期间 CrawlerEngines 被调用 %d 次——渲染热路径必须用 CrawlerEngineIDs 只读视图（零重编译）", len(policies), after-before)
+	}
+
+	// 正例对照：深拷贝路径计数有效（+1），守卫不是空转。
+	_ = geoipnames.CrawlerEngines()
+	if after := geoipnames.CrawlerEnginesDeepCopyCallsForTest(); after != before+1 {
+		t.Fatalf("深拷贝计数缝失效：before=%d after=%d", before, after)
+	}
+}
+
+// TestBuildIPPrecheckDirectives_crawlerExemption 两形态（v2.3.8 爬虫豁免）：
+// 开启豁免+勾选引擎 → 逐引擎 ctl 放行规则 + 伪装事件规则；
+// 关闭豁免 → 无任何 X-LB-Crawler 规则。
+func TestBuildIPPrecheckDirectives_crawlerExemption(t *testing.T) {
+	on := &models.SecurityPolicy{
+		ID: 7, Mode: "blocking", Enabled: true,
+		GeoIPMode:           "deny",
+		GeoIPCountries:      json.RawMessage(`["海外"]`),
+		GeoIPCrawlerExempt:  true,
+		GeoIPCrawlerEngines: json.RawMessage(`["googlebot","baiduspider"]`),
+		IPWhitelistEnabled:  true,
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{on}, "lb_crawler"))
+	// 勾选引擎逐条 ctl 放行
+	for _, engine := range []string{"googlebot", "baiduspider"} {
+		want := `X-LB-Crawler-Verified "@streq ` + engine + `"`
+		if !strings.Contains(directives, want) {
+			t.Errorf("directives missing engine %s exemption rule:\n%s", engine, directives)
+		}
+	}
+	// 未勾选引擎不得出现
+	if strings.Contains(directives, `@streq bingbot`) {
+		t.Errorf("未勾选引擎 bingbot 不应发射:\n%s", directives)
+	}
+	// 伪装事件规则（UA 声称引擎但 PTR 验证失败）
+	if !strings.Contains(directives, "X-LB-Crawler-Spoof") || !strings.Contains(directives, "搜索引擎爬虫伪装") {
+		t.Errorf("directives missing spoof event rule:\n%s", directives)
+	}
+	// ctl 指向本策略 GeoIP 链 id（800000+policyID）
+	if !strings.Contains(directives, "ctl:ruleRemoveById=800007") {
+		t.Errorf("ctl must target geoip chain id 800007:\n%s", directives)
+	}
+
+	// 关闭形态：零爬虫规则（含 GeoIP 仍启用的策略）
+	off := &models.SecurityPolicy{
+		ID: 8, Mode: "blocking", Enabled: true,
+		GeoIPMode:          "deny",
+		GeoIPCountries:     json.RawMessage(`["海外"]`),
+		IPWhitelistEnabled: true,
+	}
+	directivesOff := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{off}, "lb_off"))
+	if strings.Contains(directivesOff, "X-LB-Crawler") {
+		t.Errorf("豁免关闭时不得有任何爬虫规则:\n%s", directivesOff)
+	}
+	// GeoIP 主体链仍在（豁免不改变地域拦截本体）
+	if !strings.Contains(directivesOff, "GeoIP 区域拦截") {
+		t.Errorf("GeoIP 主体链缺失:\n%s", directivesOff)
+	}
+}
+
+// TestBuildIPPrecheckDirectives_crawlerExemptionEmptyEnginesAllEngines：
+// 豁免开启但 engines 空/非法 JSON → 全部引擎（向后兼容形态）。
+func TestBuildIPPrecheckDirectives_crawlerExemptionEmptyEnginesAllEngines(t *testing.T) {
+	p := &models.SecurityPolicy{
+		ID: 9, Mode: "blocking", Enabled: true,
+		GeoIPMode:          "deny",
+		GeoIPCountries:     json.RawMessage(`["海外"]`),
+		GeoIPCrawlerExempt: true,
+		IPWhitelistEnabled: true,
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p}, "lb_x"))
+	for _, engine := range []string{"googlebot", "bingbot", "gptbot", "so360spider"} {
+		if !strings.Contains(directives, `@streq `+engine) {
+			t.Errorf("空 engines 应发射全部引擎（含 %s）:\n%s", engine, directives)
+		}
+	}
+}
+
+// TestEngineGate_crawlerExemptionDirectives：爬虫豁免/伪装规则的
+// 真实渲染产物必须被同版 coraza 引擎编译接受（字符串断言不构成验证终点）。
+func TestEngineGate_crawlerExemptionDirectives(t *testing.T) {
+	p := &models.SecurityPolicy{
+		ID: 3, Mode: "blocking", Enabled: true,
+		GeoIPMode:           "deny",
+		GeoIPCountries:      json.RawMessage(`["海外"]`),
+		GeoIPCrawlerExempt:  true,
+		GeoIPCrawlerEngines: json.RawMessage(`["googlebot","so360spider"]`),
+		IPWhitelistEnabled:  true,
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p}, "lb_gate"))
+	compileForEngineGate(t, directives)
+}
+
+// TestEngineGate_crawlerPassLogDetectedAction（v2.3.8）：豁免规则须为
+// pass,log（检测动作事件完整落库），非 pass,nolog。
+func TestEngineGate_crawlerPassLogDetectedAction(t *testing.T) {
+	p := &models.SecurityPolicy{
+		ID: 3, Mode: "blocking", Enabled: true,
+		GeoIPMode:           "deny",
+		GeoIPCountries:      json.RawMessage(`["海外"]`),
+		GeoIPCrawlerExempt:  true,
+		GeoIPCrawlerEngines: json.RawMessage(`["googlebot"]`),
+		IPWhitelistEnabled:  true,
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p}, "lb_gate"))
+	if strings.Contains(directives, "pass,nolog") {
+		t.Errorf("豁免规则不得为 pass,nolog（须落检测事件）:\n%s", directives)
+	}
+	if !strings.Contains(directives, "pass,log") || !strings.Contains(directives, "搜索引擎爬虫放行（已验证）") {
+		t.Errorf("豁免规则缺 pass,log + 放行 msg:\n%s", directives)
+	}
+	compileForEngineGate(t, directives)
+}
+
+// 伪装规则条件收敛到「本策略已勾选引擎」——头值携带引擎 ID
+// （与 Verified 对称），未勾选引擎的验证失败不得被本策略 deny。
+func TestGeoIPCrawlerSpoof_scopedToSelectedEngines(t *testing.T) {
+	policy := &models.SecurityPolicy{
+		ID:                  7,
+		Name:                "scoped",
+		Mode:                "off",
+		PolicyType:          models.PolicyTypeStage1,
+		GeoIPMode:           "deny",
+		GeoIPCountries:      json.RawMessage(`["CN"]`),
+		GeoIPCrawlerExempt:  true,
+		GeoIPCrawlerEngines: json.RawMessage(`["googlebot"]`),
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, "lb_scoped"))
+	if !strings.Contains(directives, `@rx ^(?:googlebot)$`) {
+		t.Fatalf("spoof rule must match only the selected engine:\n%s", directives)
+	}
+	if strings.Contains(directives, `@eq 1`) {
+		t.Fatalf("global @eq 1 spoof rule must be gone:\n%s", directives)
+	}
+	compileForEngineGate(t, directives)
+
+	waf := newPrecheckBehaviorWAF(t, directives)
+	run := func(spoof string) *types.Interruption {
+		tx := waf.NewTransaction()
+		defer func() { _ = tx.Close() }()
+		tx.ProcessConnection("198.51.100.7", 12345, "127.0.0.1", 443)
+		tx.ProcessURI("/", "GET", "HTTP/1.1")
+		tx.AddRequestHeader("X-LB-GeoIP-Loc", "中国")
+		tx.AddRequestHeader("X-LB-Crawler-Spoof", spoof)
+		return tx.ProcessRequestHeaders()
+	}
+	if it := run("googlebot"); it == nil {
+		t.Fatal("selected engine spoof must still be denied")
+	}
+	if it := run("bingbot"); it != nil {
+		t.Fatalf("unselected engine spoof must not be denied by this policy (status=%d)", it.Status)
+	}
+}
+
+// 渲染侧输出 crawler_exempt 门控字段（与绑定策略同源）。
+func TestBuildGeoipHandler_emitsCrawlerGate(t *testing.T) {
+	if h := buildGeoipHandler(true); h["crawler_exempt"] != true {
+		t.Fatalf("crawler_exempt=true must be emitted, got %#v", h)
+	}
+	if h := buildGeoipHandler(false); h["crawler_exempt"] != false {
+		t.Fatalf("crawler_exempt=false must be explicit, got %#v", h)
+	}
+}

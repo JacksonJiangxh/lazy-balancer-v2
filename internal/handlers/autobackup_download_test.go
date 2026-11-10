@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -13,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// U7b-F1（第 66 轮）：备份下载 Stat→FileAttachment 的 TOCTOU（备份完成
+// 备份下载 Stat→FileAttachment 的 TOCTOU（备份完成
 // prune 掉在下载文件→Stat 过打开失败 panic/500+审计先于交付虚记）。
 // 修复=句柄先行（os.Open 成功后才审计+流式交付）。竞态形态不可确定性
 // 注入——以下为交付形状基线钉+缺失文件回归钉（结构修复见实现）。
@@ -36,7 +39,7 @@ func TestDownloadAutoBackup_streamsFileAndAuditsAfterOpen(t *testing.T) {
 	router := gin.New()
 	router.GET("/api/v1/auto-backup/:id/download", h.DownloadAutoBackup)
 
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 	rows := autoBackupRows(t, "WHERE trigger_type='manual'")
@@ -64,14 +67,15 @@ func TestDownloadAutoBackup_streamsFileAndAuditsAfterOpen(t *testing.T) {
 
 // Given 行在而文件已消失（prune 竞态后形态）。
 // When GET download。
-// Then 404 且**不落下载审计**（任何打开失败路径均无虚记审计）。
-func TestDownloadAutoBackup_missingFileNoAudit(t *testing.T) {
+// Then 404 且**不落成功交付审计**（虚记交付），但必须落恰一条「下载失败」
+// 拒绝审计——下载是敏感文件交付，被拒尝试同样要能复盘「谁在何时试过」。
+func TestDownloadAutoBackup_missingFileAuditsRejectionNotDelivery(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.GET("/api/v1/auto-backup/:id/download", h.DownloadAutoBackup)
 
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 	rows := autoBackupRows(t, "WHERE trigger_type='manual'")
@@ -86,6 +90,41 @@ func TestDownloadAutoBackup_missingFileNoAudit(t *testing.T) {
 		t.Fatalf("missing file status=%d, want 404", rec.Code)
 	}
 	if n := downloadAuditCount(t); n != 0 {
-		t.Fatalf("缺失文件下载审计行=%d, want 0", n)
+		t.Fatalf("缺失文件下载成功审计行=%d, want 0（未交付不得记成功）", n)
+	}
+	failures := restoreRejectionAuditRows(t, "下载失败")
+	if len(failures) != 1 {
+		t.Fatalf("下载失败 审计行=%d, want 1", len(failures))
+	}
+	if filename := rows[0]["filename"].(string); !strings.Contains(failures[0], filename) {
+		t.Fatalf("审计 detail=%q 必须含备份文件名 %q", failures[0], filename)
+	}
+}
+
+type interruptedDownloadWriter struct {
+	*httptest.ResponseRecorder
+	err error
+}
+
+func (w *interruptedDownloadWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestDownloadAutoBackupDoesNotAuditSuccessWhenDeliveryFails(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/auto-backup/:id/download", h.DownloadAutoBackup)
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 1); err != nil {
+		t.Fatalf("RunAutoBackupOnce: %v", err)
+	}
+	rows := autoBackupRows(t, "WHERE trigger_type='manual'")
+	if len(rows) != 1 {
+		t.Fatalf("manual rows=%d, want 1", len(rows))
+	}
+	id := rows[0]["id"].(int64)
+	before := downloadAuditCount(t)
+	rec := &interruptedDownloadWriter{ResponseRecorder: httptest.NewRecorder(), err: errors.New("client disconnected")}
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/auto-backup/%d/download", id), nil))
+	if got := downloadAuditCount(t); got != before {
+		t.Fatalf("successful delivery audits before=%d after=%d, want unchanged", before, got)
 	}
 }

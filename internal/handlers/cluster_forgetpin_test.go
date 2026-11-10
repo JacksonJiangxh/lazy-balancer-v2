@@ -18,7 +18,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 2026-09-06 二轮 C-3：主节点侧按节点 pin 重置端点——主节点 + 存在节点 → 200
+// 2026-09-06：主节点侧按节点 pin 重置端点——主节点 + 存在节点 → 200
 // 且仅删除该节点 pin 文件；从节点调用 → 403（requireMaster 门）；节点不存在 →
 // 404。与从节点侧 forget-pins 端点（TestGetClusterWafFiles_demotedMasterForbidden
 // 同搭建模式）对称。
@@ -47,7 +47,7 @@ func TestForgetClusterNodePin_removesTargetPinAndGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &Handlers{
-		clusterService: services.NewClusterService(db.DB, nil, ""),
+		clusterService: services.NewClusterService(db.DB, ""),
 		syncService:    services.NewSyncService(db.DB, &config.Config{DataDir: dataDir}, nil),
 	}
 	router := gin.New()

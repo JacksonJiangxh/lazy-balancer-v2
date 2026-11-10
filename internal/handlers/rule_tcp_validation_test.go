@@ -1,11 +1,12 @@
 package handlers
 
-// U3-4(第 45 轮审计修复)：TCP 三字段（tcp_health_check_port/tcp_try_duration/
+// TCP 三字段（tcp_health_check_port/tcp_try_duration/
 // tcp_try_interval）此前无负值校验，渲染侧静默钳制（caddy.go 3503-3522）——
 // 保存前拒绝显式负值。代理超时族的 -1 哨兵（proxy_flush_interval=-1=立即刷新）
 // 仅属 http 侧，TCP 三字段无哨兵语义，负值一律拒。
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -21,21 +22,27 @@ func TestValidateRuleFeatures_rejectsNegativeTcpFields(t *testing.T) {
 		}
 	}
 
-	// 目标形状：三字段各自 -1 → 拒绝
+	// 目标形状：三字段各自 -1 → 拒绝，且文案点名对应字段族
+	//（只断 err != nil 无法区分「被正确字段的校验拒绝」与「被别的规则误拦」）。
 	negativeCases := []struct {
-		name   string
-		mutate func(*ruleFeatureInput)
+		name      string
+		mutate    func(*ruleFeatureInput)
+		wantError string
 	}{
-		{"tcp_health_check_port", func(i *ruleFeatureInput) { i.TCPHealthCheckPort = -1 }},
-		{"tcp_try_duration", func(i *ruleFeatureInput) { i.TCPTryDuration = -1 }},
-		{"tcp_try_interval", func(i *ruleFeatureInput) { i.TCPTryInterval = -1 }},
+		{"tcp_health_check_port", func(i *ruleFeatureInput) { i.TCPHealthCheckPort = -1 }, "健康检查端口"},
+		{"tcp_try_duration", func(i *ruleFeatureInput) { i.TCPTryDuration = -1 }, "重试时长/间隔"},
+		{"tcp_try_interval", func(i *ruleFeatureInput) { i.TCPTryInterval = -1 }, "重试时长/间隔"},
 	}
 	for _, tc := range negativeCases {
 		t.Run(tc.name, func(t *testing.T) {
 			input := base()
 			tc.mutate(&input)
-			if err := validateRuleFeatures(input); err == nil {
+			err := validateRuleFeatures(input)
+			if err == nil {
 				t.Fatalf("negative %s must be rejected, got nil error", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("negative %s error=%q, want 含 %q", tc.name, err, tc.wantError)
 			}
 		})
 	}
@@ -65,7 +72,7 @@ func TestValidateRuleFeatures_rejectsNegativeTcpFields(t *testing.T) {
 	}
 }
 
-// U4-P4-1（第 67 轮审计，P4）：TCP 规则 enable_dns_server/dns_server 落库恒
+// TCP 规则 enable_dns_server/dns_server 落库恒
 // 无效——渲染路径永不消费且无告警，对照 dynamic_dns 有保存侧 400+渲染告警
 // 双保险，DNS 服务发现两字段保存侧拒绝清单漏列。与 TCP+dynamic_dns 同门：
 // 字段属 HTTP 语义（L4 无 resolver 消费），协议切换零值化已覆盖迁移路径，

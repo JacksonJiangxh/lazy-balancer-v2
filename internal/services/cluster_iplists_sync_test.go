@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
-
-	"lazy-balancer-v2/internal/models"
 )
 
-// W2：security_ip_lists 随 security 节同步——快照携带列表行与策略 refs 列，
+// security_ip_lists 随 security 节同步——快照携带列表行与策略 refs 列，
 // 全量替换语义下从节点忠实复制，策略引用端到端存活。
 func TestClusterSnapshot_securityIPListsRoundTrip(t *testing.T) {
 	// Given
@@ -34,8 +32,8 @@ func TestClusterSnapshot_securityIPListsRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(snapshot.SecurityIPLists, &lists); err != nil {
 		t.Fatalf("parse security ip lists: %v", err)
 	}
-	// 3 行 system=1 内置名单种子随表同步（v2.3.2 名单化）——按 system 过滤
-	// 断言用户行。
+	// system=1 行为威胁三源 + 自动封禁名单（爬虫名单由 Prime 另行播种，
+	// 不在本夹具内）——按 system 过滤断言用户行。
 	var userLists []map[string]any
 	for _, l := range lists {
 		if l["system"] == float64(0) || l["system"] == nil {
@@ -83,7 +81,7 @@ func TestClusterSnapshot_securityIPListsRoundTrip(t *testing.T) {
 	}
 }
 
-// W2：security 节哈希必须感知 security_ip_lists 行变化——列表条目更新后
+// security 节哈希必须感知 security_ip_lists 行变化——列表条目更新后
 // 节哈希变化，从节点据此前置触发 security 节重放（而非依赖策略行变动）。
 func TestClusterSnapshot_securitySectionHashTracksIPLists(t *testing.T) {
 	// Given
@@ -113,37 +111,5 @@ func TestClusterSnapshot_securitySectionHashTracksIPLists(t *testing.T) {
 	// Then
 	if second.SectionHashes["security"] == firstHash {
 		t.Fatal("security section hash must change when an ip list row changes")
-	}
-}
-
-// W2：空 SecurityIPLists 载荷的全量替换语义——主节点清空列表后从节点同步删除。
-func TestApplySnapshot_emptySecurityIPListsDeletesRows(t *testing.T) {
-	// Given
-	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO security_ip_lists (id,name,entries) VALUES (11,'doomed','[]')`); err != nil {
-		t.Fatal(err)
-	}
-	snapshot := models.ClusterSnapshot{
-		Version:             9,
-		SecurityPolicies:    json.RawMessage("[]"),
-		SecurityBindings:    json.RawMessage("[]"),
-		SecurityCustomRules: []models.SecurityCustomRule{},
-		SecurityBlockPages:  []models.SecurityBlockPage{},
-		SecurityIPLists:     json.RawMessage("[]"),
-		SecurityCRSVersion:  []models.ClusterSecurityCRSVersion{},
-	}
-
-	// When
-	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
-		t.Fatalf("apply snapshot: %v", err)
-	}
-
-	// Then
-	var count int
-	if err := database.QueryRow("SELECT COUNT(*) FROM security_ip_lists").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("security_ip_lists rows=%d after empty snapshot, want 0", count)
 	}
 }

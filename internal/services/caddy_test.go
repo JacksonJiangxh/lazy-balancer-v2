@@ -99,6 +99,30 @@ func TestGenerateCaddyConfig_upstream_scan_error_returns_generation_failure(t *t
 	}
 }
 
+func TestGenerateCaddyConfig_defaultsNullStrategy(t *testing.T) {
+	// Given an enabled legacy row whose nullable strategy was never backfilled.
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_null_strategy", false)
+	if _, err := database.Exec("UPDATE lb_rules SET strategy=NULL WHERE caddy_id='lb_null_strategy'"); err != nil {
+		t.Fatalf("seed null strategy: %v", err)
+	}
+
+	// When rendering the complete configuration.
+	generated := generateCaddyConfigFromStore(database)
+
+	// Then the row uses the schema default instead of poisoning the whole render.
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("null strategy blocked config generation: %s", message)
+	}
+	routes := httpRoutesFromServer(t, generated, "http_8080")
+	proxy := reverseProxyHandler(t, routes[0])
+	loadBalancing := mustMap(t, proxy["load_balancing"], "load balancing")
+	selection := mustMap(t, loadBalancing["selection_policy"], "selection policy")
+	if selection["policy"] != "weighted_round_robin" {
+		t.Fatalf("selection policy=%v, want weighted_round_robin", selection["policy"])
+	}
+}
+
 func TestGenerateCaddyConfig_ignores_malformed_upstream_for_disabled_rule(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
@@ -192,7 +216,7 @@ func TestGenerateCaddyConfig_fail_closed_errors_do_not_call_load(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, want: "decode path upstreams"},
-		// Round 32 F-3: 原用例以 path_rules 空数组 upstreams_json='[]' 触发
+		// 原用例以 path_rules 空数组 upstreams_json='[]' 触发
 		// "generate HTTP routes" 失败——该场景现按修复语义回退主上游（与 nil 同口径，
 		// 见 TestGenerateSingleRuleCaddyConfig_pathRuleEmptyUpstreamArray_...），
 		// 改用 dynamic-DNS 双上游维持 fail-closed 校验覆盖。
@@ -331,9 +355,12 @@ func TestGenerateSingleRuleCaddyConfig_CustomPathRules_ordersAndSelectsUpstreams
 }
 
 func TestGenerateCaddyConfig_propagatesCertificateMaterializationFailure(t *testing.T) {
-	// Given
+	// Given 合法 PEM + 逃逸规则编号：错误只可能来自路径逃逸拒绝分支
+	// （密钥对校验在前，非法 PEM 会让 ID 分支永不执行）。
+	certDir := useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('../invalid','invalid cert','http','example.com',443,'weighted_round_robin','',1,'manual','new-cert','new-key')`); err != nil {
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('../invalid','invalid cert','http','example.com',443,'weighted_round_robin','',1,'manual',?,?)`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed invalid certificate rule: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('../invalid','127.0.0.1',8080,1,1,'http')`); err != nil {
@@ -349,8 +376,15 @@ func TestGenerateCaddyConfig_propagatesCertificateMaterializationFailure(t *test
 	err := NewCaddyService(server.URL).ApplyConfig(GenerateCaddyConfig())
 
 	// Then
-	if err == nil || !strings.Contains(err.Error(), "invalid") {
-		t.Fatalf("expected materialization error for invalid rule ID, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "非法的规则编号") {
+		t.Fatalf("expected invalid rule ID rejection, got %v", err)
+	}
+	entries, readErr := os.ReadDir(certDir)
+	if readErr != nil {
+		t.Fatalf("read certificate directory: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid rule ID materialized %d files: %v", len(entries), entries)
 	}
 	if requests != 0 {
 		t.Fatalf("Caddy received %d requests after certificate materialization failed", requests)
@@ -433,13 +467,13 @@ func TestGenerateCaddyConfig_does_not_select_single_domain_certificate_after_dom
 }
 
 func TestGenerateCaddyConfig_restoresCertificateSnapshotWhenMaterializationFails(t *testing.T) {
-	// Given
-	oldCertDir := certDir
-	certDir = t.TempDir()
-	t.Cleanup(func() { certDir = oldCertDir })
+	// Given 真实密钥对（非法 PEM 会在写盘前被拒，快照恒空 → 恢复分支零执行），
+	// 第二对私钥的临时路径被目录占位 → 第一对已写盘后失败。
+	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
 	for _, ruleID := range []string{"a-valid", "z-fail"} {
-		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES (?,?, 'http','example.com',443,'weighted_round_robin','',1,'manual','new-cert','new-key')`, ruleID, ruleID); err != nil {
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES (?,?, 'http','example.com',443,'weighted_round_robin','',1,'manual',?,?)`, ruleID, ruleID, certPEM, keyPEM); err != nil {
 			t.Fatalf("seed certificate rule %s: %v", ruleID, err)
 		}
 		if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES (?,'127.0.0.1',8080,1,1,'http')`, ruleID); err != nil {
@@ -484,10 +518,11 @@ func TestGenerateCaddyConfig_restoresCertificateSnapshotWhenMaterializationFails
 }
 
 func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
-	// Given
+	// Given 真实密钥对：物化先写盘（快照非空），/load 被拒后 defer 必须恢复。
 	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('lb-rejected','rejected cert','http','example.com',443,'weighted_round_robin','',1,'manual','new-cert','new-key')`); err != nil {
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('lb-rejected','rejected cert','http','example.com',443,'weighted_round_robin','',1,'manual',?,?)`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed certificate rule: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb-rejected','127.0.0.1',8080,1,1,'http')`); err != nil {
@@ -500,8 +535,14 @@ func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
 	if err := os.WriteFile(keyPath, []byte("old-key"), 0600); err != nil {
 		t.Fatalf("seed old key: %v", err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		http.Error(writer, "load rejected", http.StatusBadRequest)
+	loadRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/load" {
+			loadRequests++
+			http.Error(writer, "load rejected", http.StatusBadRequest)
+			return
+		}
+		http.NotFound(writer, request)
 	}))
 	defer server.Close()
 
@@ -511,6 +552,9 @@ func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
 	// Then
 	if err == nil {
 		t.Fatal("Caddy load rejection reported success")
+	}
+	if loadRequests != 1 {
+		t.Fatalf("Caddy /load received %d requests, want 1 (apply rejection branch)", loadRequests)
 	}
 	cert, certErr := os.ReadFile(certPath)
 	if certErr != nil {
@@ -525,10 +569,9 @@ func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
 }
 
 func TestGenerateSingleRuleCaddyConfig_tagsEveryOwnedAuxiliaryRoute(t *testing.T) {
-	// Given
+	// Given（单规则形态仅服务预检，不插 HTTP→HTTPS 跳转分支——跳转由全量
+	// 渲染 redirectRoutes 统一生成；辅助路由打钉覆盖路径路由形态）
 	rule := baseHTTPRule()
-	rule.EnableTLS = true
-	rule.TLSHTTPRedirect = true
 	rule.CustomRoutesEnabled = true
 	rule.PathRules = []PathRuleConfig{{SortOrder: 10, MatchType: "prefix", Path: "/api/"}}
 
@@ -536,7 +579,7 @@ func TestGenerateSingleRuleCaddyConfig_tagsEveryOwnedAuxiliaryRoute(t *testing.T
 	routes := renderedHTTPRoutes(t, GenerateSingleRuleCaddyConfig(rule))
 
 	// Then
-	assertRouteIDs(t, routes, []string{"rule-http_redirect", "rule-http_path_0", "rule-http"})
+	assertRouteIDs(t, routes, []string{"rule-http_path_0", "rule-http"})
 }
 
 func TestGenerateHTTPRouteObjects_tagsEveryOwnedAuxiliaryRoute(t *testing.T) {
@@ -578,8 +621,13 @@ func TestDecodePathUpstreams_preservesHTTPSProtocol_andDefaultsEmptyProtocol(t *
 
 func TestBuildTCPProxyRoute_omitsActivePort_withoutExplicitOverride(t *testing.T) {
 	// Given
+	// 库值唯一真相批 1+2：健康检查族为值型列，构造即带有效值（0 值渲染报错）。
 	rule := SingleRuleConfig{
 		CaddyID: "rule-tcp", Protocol: "tcp", EnableActiveHealthCheck: true,
+		HealthCheckInterval:           10,
+		HealthCheckTimeout:            2,
+		HealthCheckUnhealthyThreshold: 3,
+		HealthCheckHealthyThreshold:   2,
 		Upstreams: []UpstreamConfig{
 			{Host: "10.0.0.10", Port: 3306, Enabled: true},
 			{Host: "10.0.0.11", Port: 3307, Enabled: true},
@@ -587,7 +635,10 @@ func TestBuildTCPProxyRoute_omitsActivePort_withoutExplicitOverride(t *testing.T
 	}
 
 	// When
-	route := buildTCPProxyRoute(rule)
+	route, routeErr := buildTCPProxyRoute(rule)
+	if routeErr != nil {
+		t.Fatalf("buildTCPProxyRoute: %v", routeErr)
+	}
 
 	// Then
 	proxy := firstHandler(t, route)
@@ -598,7 +649,11 @@ func TestBuildTCPProxyRoute_omitsActivePort_withoutExplicitOverride(t *testing.T
 	}
 
 	rule.TCPHealthCheckPort = 13306
-	active = mustMap(t, mustMap(t, firstHandler(t, buildTCPProxyRoute(rule))["health_checks"], "health checks")["active"], "active health check")
+	portRoute, portRouteErr := buildTCPProxyRoute(rule)
+	if portRouteErr != nil {
+		t.Fatalf("buildTCPProxyRoute with port: %v", portRouteErr)
+	}
+	active = mustMap(t, mustMap(t, firstHandler(t, portRoute)["health_checks"], "health checks")["active"], "active health check")
 	assertEqual(t, active["port"], 13306)
 }
 
@@ -656,6 +711,13 @@ func baseHTTPRule() SingleRuleConfig {
 		Domain:     "example.com, www.example.com",
 		ListenPort: 80,
 		Strategy:   "weighted_round_robin",
+		// 库值唯一真相批 1+2：健康检查族为值型列，渲染直读零兜底——测试规则
+		// 构造即带库态有效值（0 值渲染显性报错）。
+		HealthCheckInterval:           10,
+		HealthCheckTimeout:            2,
+		HealthCheckUnhealthyThreshold: 3,
+		HealthCheckHealthyThreshold:   2,
+		GlobalRequestBodyMaxSizeMB:    128,
 		Upstreams: []UpstreamConfig{
 			{Host: "10.0.0.10", Port: 8080, Weight: 2, Protocol: "http", Enabled: true},
 			{Host: "10.0.0.11", Port: 8080, Weight: 4, Protocol: "http", Enabled: true},
@@ -743,32 +805,6 @@ func assertEqual(t *testing.T, got, want interface{}) {
 	}
 }
 
-func runningDefaultRoute() map[string]interface{} {
-	return map[string]interface{}{
-		"handle": []interface{}{map[string]interface{}{
-			"handler": "static_response",
-			"body":    "Lazy Balancer V2 is running!",
-		}},
-	}
-}
-
-func testHTTPConfig(routes []interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"apps": map[string]interface{}{
-			"http": map[string]interface{}{
-				"servers": map[string]interface{}{
-					"http_80": map[string]interface{}{"routes": routes},
-				},
-			},
-		},
-	}
-}
-
-func httpRoutesFromConfig(t *testing.T, config map[string]interface{}) []interface{} {
-	t.Helper()
-	return httpRoutesFromServer(t, config, "http_80")
-}
-
 func httpRoutesFromServer(t *testing.T, config map[string]interface{}, serverName string) []interface{} {
 	t.Helper()
 	apps := mustMap(t, config["apps"], "apps")
@@ -832,39 +868,6 @@ func TestGenerateRouteObject_dynamicDNS_emitsResolverInsideDynamicUpstreams(t *t
 	assertEqual(t, resolver["addresses"], []string{"10.0.0.53:53"})
 }
 
-func TestGenerateSingleRuleCaddyConfig_httpsRedirect_includesNonStandardListenPort(t *testing.T) {
-	// Given
-	rule := baseHTTPRule()
-	rule.EnableTLS = true
-	rule.TLSHTTPRedirect = true
-	rule.ListenPort = 8443
-
-	// When
-	config := GenerateSingleRuleCaddyConfig(rule)
-
-	// Then
-	routes := httpRoutesFromServer(t, config, "http_8443")
-	response := firstHandler(t, routes[0])
-	if response["handler"] != "static_response" || response["status_code"] != 301 {
-		t.Fatalf("unexpected redirect handler: %#v", response)
-	}
-	headers := mustMap(t, response["headers"], "redirect headers")
-	// Location 使用 {http.request.host} 占位符：static_response 的 headers 会经过
-	// Caddy replacer 替换（v2.11.4 modules/caddyhttp/staticresp.go），
-	// 多域名规则（本例 example.com + www.example.com）访问任一域名都跳回该域名，
-	// 而不是被劫持到首个域名；非 443 监听端口追加端口后缀。
-	assertEqual(t, headers["Location"], []string{"https://{http.request.host}:8443{http.request.uri}"})
-
-	// When the rule listens on the default HTTPS port
-	rule.ListenPort = 443
-	config = GenerateSingleRuleCaddyConfig(rule)
-
-	// Then the port is omitted
-	routes = httpRoutesFromServer(t, config, "http_443")
-	headers = mustMap(t, firstHandler(t, routes[0])["headers"], "redirect headers")
-	assertEqual(t, headers["Location"], []string{"https://{http.request.host}{http.request.uri}"})
-}
-
 func TestGenerateCaddyConfig_httpsRedirect_includesNonStandardListenPort(t *testing.T) {
 	// Given
 	useTemporaryCertDir(t)
@@ -921,27 +924,6 @@ func TestGenerateCaddyConfig_httpsRedirect_multiDomainUsesRequestHostPlaceholder
 	}
 	headers := mustMap(t, response["headers"], "redirect headers")
 	assertEqual(t, headers["Location"], []string{"https://{http.request.host}{http.request.uri}"})
-}
-
-func TestGenerateSingleRuleCaddyConfig_httpsRedirect_multiDomainUsesRequestHostPlaceholder(t *testing.T) {
-	// Given
-	rule := baseHTTPRule()
-	rule.Domain = "a.example.test, b.example.test"
-	rule.EnableTLS = true
-	rule.TLSHTTPRedirect = true
-	rule.ListenPort = 8443
-
-	// When
-	config := GenerateSingleRuleCaddyConfig(rule)
-
-	// Then: 非 443 监听端口追加端口后缀，且不固定为首个域名
-	routes := httpRoutesFromServer(t, config, "http_8443")
-	response := firstHandler(t, routes[0])
-	if response["handler"] != "static_response" || response["status_code"] != 301 {
-		t.Fatalf("unexpected redirect handler: %#v", response)
-	}
-	headers := mustMap(t, response["headers"], "redirect headers")
-	assertEqual(t, headers["Location"], []string{"https://{http.request.host}:8443{http.request.uri}"})
 }
 
 func TestGenerateSingleRuleCaddyConfig_serverTokensHiddenDefersServerHeaderDelete(t *testing.T) {
@@ -1114,13 +1096,18 @@ func TestGenerateRouteObject_placesWafHandlerFirst_whenBlockingPolicyBound(t *te
 		t.Fatalf("generate routes: %v", err)
 	}
 	names := handlerChainNames(t, routes[0])
-	// F3：链首是 X-LB-Rule-ID 注入（headers），waf 紧随其后
+	// 链首是 X-LB-Rule-ID 注入（headers），waf 紧随其后
 	if names[0] != "headers" {
 		t.Fatalf("chain head=%q, want headers (X-LB-Rule-ID inject) in %v", names[0], names)
 	}
-	// 新-1(第 3 轮审计):request_body 限额前移至 waf 之前(coraza 读体无界)
+	// 新-1:request_body 限额前移至 waf 之前(coraza 读体无界)
 	bodyIndex := indexOfHandler(names, "request_body")
 	wafIndex := indexOfHandler(names, "waf")
+	// 两个 handler 都在场是顺序断言的前提：request_body 整体消失时
+	// 「-1 > wafIndex」恒假，顺序断言会静默通过（性质主体消失反而变绿）。
+	if bodyIndex < 0 || wafIndex < 0 {
+		t.Fatalf("request_body/waf 必须同时在链中: chain %v", names)
+	}
 	if bodyIndex > wafIndex {
 		t.Fatalf("request_body must precede waf (coraza read-body DoS guard): chain %v", names)
 	}
@@ -1155,6 +1142,8 @@ func TestGenerateRouteObject_rendersWafDetectionOnlyDirectives_whenDetectionPoli
 }
 
 func TestGenerateRouteObject_omitsWafHandler_whenBoundPolicyDisabled(t *testing.T) {
+	// 缺库降级下任何策略都不会发射 waf——不桩库时本用例对门控零保护。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "rule-http", "http")
@@ -1174,6 +1163,8 @@ func TestGenerateRouteObject_omitsWafHandler_whenBoundPolicyDisabled(t *testing.
 }
 
 func TestGenerateRouteObject_omitsWafHandler_whenRuleHasNoPolicyBinding(t *testing.T) {
+	// 缺库降级下 waf 恒缺席，桩库后本用例才真正验证「无绑定不发射」。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "rule-http", "http")
@@ -1195,6 +1186,8 @@ func TestGenerateRouteObject_omitsWafHandler_whenRuleHasNoPolicyBinding(t *testi
 }
 
 func TestGenerateSingleRuleCaddyConfig_omitsWafHandler_whenRuleIsTCP(t *testing.T) {
+	// 缺库降级下 waf 恒缺席；桩库后「TCP 链不发射 waf」才具备证伪力。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "rule-tcp", "tcp")
@@ -1220,8 +1213,11 @@ func TestGenerateSingleRuleCaddyConfig_omitsWafHandler_whenRuleIsTCP(t *testing.
 }
 
 // TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders asserts that
-// GenerateSingleRuleCaddyConfig delegates to the production builders so its
-// per-rule routes are byte-identical to generateHTTPRouteObjects / buildTCPServer.
+// GenerateSingleRuleCaddyConfig delegates to the production builders and that
+// its per-rule routes carry independent, hand-written expectations (selection
+// policy / weights / health checks) plus a full-render (DB → generateCaddyConfig)
+// byte comparison. The pure delegation comparison alone can only detect the
+// delegation link being removed——两侧同源同参时任何渲染回归都同步漂移仍绿。
 func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T) {
 	strategies := []string{"weighted_round_robin", "least_conn", "ip_hash", "cookie", "random", "first"}
 
@@ -1240,7 +1236,7 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 						}}
 					}
 					if withExtras {
-						rule.OriginDomain = "backend.internal"
+						rule.HostHeader = "backend.internal"
 						rule.HealthCheckInterval = 30
 						rule.EnableActiveHealthCheck = true
 						rule.HealthCheckPath = "/healthz"
@@ -1256,6 +1252,35 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 						want[i] = r
 					}
 					assertEqual(t, gotRoutes, want)
+
+					// 独立期望（不经过生成器）：策略直映射、权重 gcd 约分、
+					// 被动熔断窗口 = 间隔×3、主动检查路径直读。
+					proxy := findChainHandler(t, ruleMainRoute(t, gotRoutes, rule.CaddyID), "reverse_proxy")
+					if proxy == nil {
+						t.Fatalf("reverse_proxy handler missing for rule route: %v", gotRoutes)
+					}
+					loadBalancing := mustMap(t, proxy["load_balancing"], "load_balancing")
+					selectionPolicy := mustMap(t, loadBalancing["selection_policy"], "selection_policy")
+					if got := selectionPolicy["policy"]; got != strategy {
+						t.Fatalf("selection policy=%v, want %s", got, strategy)
+					}
+					if strategy == "weighted_round_robin" {
+						// 上游权重 2/4 → gcd 约分 1/2。
+						if got := fmt.Sprint(selectionPolicy["weights"]); got != "[1 2]" {
+							t.Fatalf("weights=%s, want [1 2]（gcd 约分）", got)
+						}
+					}
+					healthChecks := mustMap(t, proxy["health_checks"], "health_checks")
+					passive := mustMap(t, healthChecks["passive"], "passive")
+					if got, wantDuration := passive["fail_duration"], fmt.Sprintf("%ds", rule.HealthCheckInterval*3); got != wantDuration {
+						t.Fatalf("passive fail_duration=%v, want %s", got, wantDuration)
+					}
+					if withExtras {
+						active := mustMap(t, healthChecks["active"], "active")
+						if got := active["uri"]; got != rule.HealthCheckPath {
+							t.Fatalf("active health check uri=%v, want %s", got, rule.HealthCheckPath)
+						}
+					}
 				})
 			}
 		}
@@ -1263,18 +1288,101 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 		t.Run("tcp/"+strategy, func(t *testing.T) {
 			rule := SingleRuleConfig{
 				CaddyID: "rule-tcp", Protocol: "tcp", ListenPort: 3306, Strategy: strategy,
-				Upstreams: []UpstreamConfig{{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true}},
+				HealthCheckInterval:           10,
+				HealthCheckTimeout:            2,
+				HealthCheckUnhealthyThreshold: 3,
+				HealthCheckHealthyThreshold:   2,
+				Upstreams: []UpstreamConfig{
+					{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true},
+					{Host: "10.0.0.11", Port: 3306, Weight: 1, Enabled: true},
+				},
 			}
 			config := GenerateSingleRuleCaddyConfig(rule)
 			apps := mustMap(t, config["apps"], "apps")
 			layer4 := mustMap(t, apps["layer4"], "layer4 app")
 			servers := mustMap(t, layer4["servers"], "layer4 servers")
-			assertEqual(t, servers["tcp_3306"], buildTCPServer(rule))
+			wantServer, serverErr := buildTCPServer(rule)
+			if serverErr != nil {
+				t.Fatalf("buildTCPServer: %v", serverErr)
+			}
+			assertEqual(t, servers["tcp_3306"], wantServer)
+			// 独立期望：TCP 选择策略同样直映射。
+			routes, ok := mustMap(t, servers["tcp_3306"], "tcp server")["routes"].([]interface{})
+			if !ok || len(routes) == 0 {
+				t.Fatalf("tcp server routes missing: %#v", servers["tcp_3306"])
+			}
+			proxy := findChainHandler(t, routes[0], "proxy")
+			if proxy == nil {
+				t.Fatalf("layer4 proxy handler missing: %#v", routes[0])
+			}
+			loadBalancing := mustMap(t, proxy["load_balancing"], "load_balancing")
+			selection := mustMap(t, loadBalancing["selection"], "selection")
+			wantPolicy := strategy
+			if strategy == "cookie" {
+				// layer4 无 cookie 策略：渲染回落 weighted_round_robin（如实映射）。
+				wantPolicy = "weighted_round_robin"
+			}
+			if got := selection["policy"]; got != wantPolicy {
+				t.Fatalf("tcp selection policy=%v, want %s", got, wantPolicy)
+			}
 		})
 	}
+
+	// 全量渲染路径（DB → generateCaddyConfigFromStore）与单规则预览的字节对照：
+	// 覆盖委托比较看不到的组装差异（服务选择/发布集/证书门）。
+	t.Run("full render parity", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		rule := baseHTTPRule()
+		rule.Strategy = "least_conn"
+		rule.ListenPort = 8099
+		if _, err := database.Exec(`INSERT INTO lb_rules
+			(caddy_id, name, protocol, domain, listen_port, strategy, enabled,
+			 health_check_interval, health_check_timeout, health_check_unhealthy_threshold, health_check_healthy_threshold)
+			VALUES (?, ?, 'http', ?, ?, 'least_conn', 1, 10, 2, 3, 2)`,
+			rule.CaddyID, rule.CaddyID, rule.Domain, rule.ListenPort); err != nil {
+			t.Fatalf("seed rule: %v", err)
+		}
+		for _, upstream := range rule.Upstreams {
+			if _, err := database.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, enabled, protocol) VALUES (?, ?, ?, ?, 1, 'http')`,
+				rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight); err != nil {
+				t.Fatalf("seed upstream: %v", err)
+			}
+		}
+		full := generateCaddyConfigFromStore(database)
+		var filtered []interface{}
+		for _, routeValue := range httpRoutesFromServer(t, full, "http_8099") {
+			id, _ := mustMap(t, routeValue, "route")["@id"].(string)
+			if RouteIDBelongsToRule(id, rule.CaddyID) {
+				filtered = append(filtered, routeValue)
+			}
+		}
+		if len(filtered) == 0 {
+			t.Fatal("全量渲染未生成该规则路由——对照面为空")
+		}
+		single := httpRoutesFromServer(t, GenerateSingleRuleCaddyConfig(rule), "http_8099")
+		assertEqual(t, filtered, single)
+	})
+}
+
+// ruleMainRoute 在路由列表中按 @id 精确取主规则路由（规则路由可能伴随
+// 跳转/路径/归因兄弟路由）。
+func ruleMainRoute(t *testing.T, routes []interface{}, ruleID string) interface{} {
+	t.Helper()
+	ids := make([]string, 0, len(routes))
+	for _, routeValue := range routes {
+		id, _ := mustMap(t, routeValue, "route")["@id"].(string)
+		ids = append(ids, id)
+		if id == ruleID {
+			return routeValue
+		}
+	}
+	t.Fatalf("route %q not found: %v", ruleID, ids)
+	return nil
 }
 
 func TestBuildWafHandler_nilMatrix(t *testing.T) {
+	// 生产链的安全段受缺库降级门控，断言渲染前先桩库可用。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "waf-http-blocking", "http")
@@ -1305,39 +1413,78 @@ func TestBuildWafHandler_nilMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// When（Round 34 F-6: buildWafHandler 已删，协议门控在生产调用点，
-			// 测试复刻调用点语义：仅 http 规则经 WithPolicy 变体构建）
-			var protocol string
-			if err := database.QueryRow(`SELECT protocol FROM lb_rules WHERE caddy_id=?`, tc.caddyID).Scan(&protocol); err != nil || protocol != "http" {
-				protocol = "tcp"
-			}
-			handler, wafErr := buildWafHandlerWithPolicy(tc.caddyID, GetSecurityPolicyForRule(tc.caddyID), nil, "", false, 0, 0, nil)
-			if wafErr != nil {
-				t.Fatalf("buildWafHandlerWithPolicy(%q) err=%v", tc.caddyID, wafErr)
-			}
-			if protocol != "http" {
-				handler = nil
+			// When：走生产构建路径（协议门控/策略绑定/可见性判定全在生产代码里，
+			// 不在测试中复刻——此前自建门副本会掩盖生产门裂化）。
+			var handler map[string]interface{}
+			switch tc.caddyID {
+			case "waf-tcp":
+				// TCP 规则由 TCP 构建路径出配置（生产从不调用 WAF 构建器）。
+				rule := SingleRuleConfig{
+					CaddyID: "waf-tcp", Protocol: "tcp", ListenPort: 3306, Strategy: "weighted_round_robin",
+					HealthCheckInterval: 10, HealthCheckTimeout: 2,
+					HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2,
+					Upstreams: []UpstreamConfig{{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true}},
+				}
+				server, tcpErr := buildTCPServer(rule)
+				if tcpErr != nil {
+					t.Fatalf("buildTCPServer: %v", tcpErr)
+				}
+				raw, marshalErr := json.Marshal(server)
+				if marshalErr != nil {
+					t.Fatalf("marshal tcp server: %v", marshalErr)
+				}
+				if strings.Contains(string(raw), `"handler":"waf"`) {
+					t.Fatalf("TCP 构建路径不得发射 waf handler: %s", raw)
+				}
+				return
+			default:
+				rule := baseHTTPRule()
+				rule.CaddyID = tc.caddyID
+				chain, chainErr := buildHTTPHandleChain(rule, rule.Upstreams)
+				if chainErr != nil {
+					t.Fatalf("buildHTTPHandleChain(%q): %v", tc.caddyID, chainErr)
+				}
+				handler = findHandlerRecursive(chain, "waf")
 			}
 
 			// Then
 			if !tc.wantWaf {
 				if handler != nil {
-					t.Fatalf("buildWafHandlerWithPolicy(%q, policy)=%#v, want nil", tc.caddyID, handler)
+					t.Fatalf("生产链(%q) 发射了 waf handler，want nil: %#v", tc.caddyID, handler)
 				}
 				return
 			}
 			if handler == nil {
-				t.Fatalf("buildWafHandlerWithPolicy(%q, policy)=nil, want waf handler", tc.caddyID)
-			}
-			if handler["handler"] != "waf" {
-				t.Fatalf("handler name=%#v, want waf", handler["handler"])
+				t.Fatalf("生产链(%q) 缺 waf handler，want waf", tc.caddyID)
 			}
 			directives, _ := handler["directives"].(string)
 			if !strings.Contains(directives, tc.directive) {
-				t.Fatalf("directives=%q, want substring %q", directives, tc.directive)
+				t.Fatalf("directives 不含 %q:\n%s", tc.directive, directives)
 			}
 		})
 	}
+}
+
+// findHandlerRecursive 在构建产物（含 subroute 嵌套）中查找首个指定 handler 名。
+func findHandlerRecursive(value interface{}, name string) map[string]interface{} {
+	switch node := value.(type) {
+	case map[string]interface{}:
+		if node["handler"] == name {
+			return node
+		}
+		for _, child := range node {
+			if found := findHandlerRecursive(child, name); found != nil {
+				return found
+			}
+		}
+	case []interface{}:
+		for _, child := range node {
+			if found := findHandlerRecursive(child, name); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
 }
 
 func seedBoundSecurityPolicyWithRateLimit(t *testing.T, database *sql.DB, ruleCaddyID, mode string, rps, burst int) int {
@@ -1856,7 +2003,7 @@ func TestBuildCorazaDirectives_emitsAclExclusionsThresholdAndBlockStatus(t *test
 		t.Fatalf("exclusions/block page not loaded: excluded=%s block_page_id=%d", policy.CRSExcludedRules, policy.BlockPageID)
 	}
 
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	for _, want := range []string{
 		"@ipListFast ",
 		"SecRuleRemoveById 942100",
@@ -1889,7 +2036,7 @@ func TestBuildCorazaDirectives_allowModeDeniesNonListedIPs(t *testing.T) {
 		t.Fatalf("bind allow policy: %v", err)
 	}
 
-	directives := mustDirectives(BuildCorazaDirectives(GetSecurityPolicyForRule("lb_allow"), nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(GetSecurityPolicyForRule("lb_allow"), nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, `!@ipListFast `) {
 		t.Fatalf("allow mode must deny non-listed IPs via negated match:\n%s", directives)
 	}
@@ -1903,15 +2050,16 @@ func TestBuildCorazaDirectives_allowModeDeniesNonListedIPs(t *testing.T) {
 
 func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["9"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["9"]`),
 		CustomRules: json.RawMessage(`[{"id":7,"name":"链式验证","enabled":true,"action":"block","conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/admin"},` +
 			`{"target":"args","operator":"contains","pattern":"debug=1"},` +
 			`{"target":"user_agent","operator":"contains","pattern":"sqlmap"}]` +
 			`}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	lines := strings.Split(directives, "\n")
 	var chainLines []string
 	for _, line := range lines {
@@ -1930,10 +2078,10 @@ func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *t
 	if !strings.Contains(chainLines[0], "id:10007") || !strings.Contains(chainLines[0], "deny") || !strings.Contains(chainLines[0], ",chain") {
 		t.Fatalf("starter must carry id+disruptive+chain: %s", chainLines[0])
 	}
-	// N15-F1：多条件链的 setvar 挪到末条——起始条命中而后续条件未命中时
+	// 多条件链的 setvar 挪到末条——起始条命中而后续条件未命中时
 	// coraza 已执行起始条非破坏性动作，起始条携带 setvar 会泄漏幽灵异常分。
 	if strings.Contains(chainLines[0], "setvar:") {
-		t.Fatalf("starter must not carry setvar (leaks on failed chain, N15-F1): %s", chainLines[0])
+		t.Fatalf("starter must not carry setvar (leaks on failed chain, 历史修复): %s", chainLines[0])
 	}
 	for i, line := range chainLines[1:] {
 		if strings.Contains(line, "deny") || strings.Contains(line, "msg:") || strings.Contains(line, "id:") {
@@ -1947,7 +2095,7 @@ func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *t
 		t.Fatalf("final rule must not carry chain: %s", chainLines[2])
 	}
 	if !strings.Contains(chainLines[2], "setvar:tx.inbound_anomaly_score_pl1=+0") {
-		t.Fatalf("final rule must carry the setvar tail (N15-F1): %s", chainLines[2])
+		t.Fatalf("final rule must carry the setvar tail (历史修复): %s", chainLines[2])
 	}
 }
 
@@ -2007,7 +2155,7 @@ func TestGenerateCaddyConfig_skips_redirect_route_when_same_domain_port80_rule_e
 	})
 }
 
-// R63 C-N2：DynamicDNS + weighted_round_robin 不再发射 weights=[1]——Caddy 的
+// DynamicDNS + weighted_round_robin 不再发射 weights=[1]——Caddy 的
 // WeightedRoundRobinSelection 对 len(Weights)<2 早退恒选 pool[0]（不做可用性
 // 检查），流量被钉死在解析列表首个 IP、其余 A 记录零流量，首 IP 宕机时
 // try_duration 内重试全撞同一 IP 后 502。改发内建 random（按 Available() 过滤
@@ -2043,9 +2191,9 @@ func TestGenerateSingleRuleCaddyConfig_dynamicDNS_selectionPolicy(t *testing.T) 
 }
 
 func TestApplyConfig_forceReloadHeader(t *testing.T) {
-	// R72 二十五次：数据类更新（xdb/CRS/证书文件）不改变配置 JSON，Caddy 对字节
+	// 数据类更新（xdb/CRS/证书文件）不改变配置 JSON，Caddy 对字节
 	// 相同的 /load 短路跳过 provision（errSameConfig）——force 变体必须带
-	// Cache-Control: must-revalidate 绕过短路；常规 apply 不得带（避免无谓的
+	// must-revalidate 绕过短路；常规 apply 不得带（避免无谓的
 	// 全量重载开销）。
 	var loads int
 	var lastCacheControl string
@@ -2082,8 +2230,8 @@ func TestApplyConfig_forceReloadHeader(t *testing.T) {
 }
 
 func TestApplyConfig_autoForceOnCertSnapshot(t *testing.T) {
-	// R72 二十六次 W1-1：生成期 MaterializeCertPairs 写盘了证书文件（快照非空）
-	// 时即使调用方走常规 ApplyConfig 也必须自动带 Cache-Control: must-revalidate
+	// 生成期 MaterializeCertPairs 写盘了证书文件（快照非空）
+	// 时即使调用方走常规 ApplyConfig 也必须自动带: must-revalidate
 	// ——证书路径确定性意味着重传证书不改变 JSON，不强制会被 errSameConfig
 	// 短路（旧证书继续服务）。快照为空时不得强制（避免冗余全量重载）。
 	var lastCacheControl string
@@ -2117,7 +2265,7 @@ func TestApplyConfig_autoForceOnCertSnapshot(t *testing.T) {
 }
 
 func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
-	// R72 二十七次补正：301 Location 必须携带 {http.request.uri}（path+query）——
+	// 补正：301 Location 必须携带 {http.request.uri}（path+query）——
 	// v2.1.11 首发时该修复因实施脚本断言中止丢失且无测试兜底，发布信息与代码
 	// 不一致。本断言锁定占位符在位，防止再次静默丢失。
 	for _, port := range []int{443, 8443} {
@@ -2131,13 +2279,17 @@ func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
 	}
 }
 
-// SLB9-1(第 9 轮审计):80/443 同样整体禁用 autoHTTPS——disable_certificates
+// 80/443 同样整体禁用 autoHTTPS——disable_certificates
 // 下引擎仍恒向 http_80 追加被项目落地页遮蔽的 catch-all 308(死路由+
 // superfluous WriteHeader 日志噪音+未来 terminal 化后盲导 443 的地雷);
 // 跳转完全由项目自有 redirectRoutes 管理(TLSHTTPRedirect,任意端口)。
 func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
+	// 443 规则只在证书可用时进入发布集（无证书整条不发布），故物化真实密钥对，
+	// 使 http_80 与 http_443 两个 server 同时在场参与断言。
+	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enable_tls,tls_source,enabled) VALUES ('lb-autohttps','autohttps','http','example.com',443,'weighted_round_robin',1,'manual',1)`); err != nil {
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enable_tls,tls_source,tls_cert,tls_key,enabled) VALUES ('lb-autohttps','autohttps','http','example.com',443,'weighted_round_robin',1,'manual',?,?,1)`, certPEM, keyPEM); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb-autohttps','127.0.0.1',8080,1,1,'http')`); err != nil {
@@ -2148,6 +2300,11 @@ func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
 		t.Fatalf("generate: %s", message)
 	}
 	servers := config["apps"].(map[string]interface{})["http"].(map[string]interface{})["servers"].(map[string]interface{})
+	for _, required := range []string{"http_80", "http_443"} {
+		if _, exists := servers[required]; !exists {
+			t.Fatalf("server %s missing: 断言前置不成立（servers=%v）", required, servers)
+		}
+	}
 	for name, sv := range servers {
 		server, ok := sv.(map[string]interface{})
 		if !ok {
@@ -2158,7 +2315,7 @@ func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
 			continue
 		}
 		if ah["disable"] != true {
-			t.Errorf("server %s automatic_https=%v, want disable:true (SLB9-1: 死路由消除)", name, ah)
+			t.Errorf("server %s automatic_https=%v, want disable:true (历史问题: 死路由消除)", name, ah)
 		}
 	}
 }
@@ -2199,7 +2356,7 @@ func TestGenerateCaddyConfig_wafNamespaceExcludedFromServerLog(t *testing.T) {
 
 // Given 后台 Force 重载与 handler 写路径（原 caddyOpMu——现共享 CaddyOpLock）。
 // When 两类写者并发。
-// Then 全程互斥（L5-01：曾后台仅持 s.mu，apply→commit 边界混合态窗口——
+// Then 全程互斥（曾后台仅持 s.mu，apply→commit 边界混合态窗口——
 // 此处钉「同一把锁」的结构事实：Force 持锁期间 handler 侧锁必须等待）。
 func TestCaddyOpLockSharedBetweenForceAndHandlers(t *testing.T) {
 	acquired := make(chan struct{})
@@ -2232,8 +2389,8 @@ func TestCaddyOpLockSharedBetweenForceAndHandlers(t *testing.T) {
 	}
 }
 
-// LBS-A-2（第 70 轮 P4；LBS/LBH-7 第 73 轮跨包单源）：ExtractMetricLabel
-// 边界感知收敛（LB40-6 精确键匹配）——裸子串匹配会把 peer_upstream 等
+// ExtractMetricLabel
+// 边界感知收敛——裸子串匹配会把 peer_upstream 等
 // 前缀兄弟标签的值误归到 upstream（现实标签集暂无前缀兄弟，防御性收敛）。
 func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 	sibling := `caddy_reverse_proxy_upstreams_healthy{peer_upstream="10.0.0.1:80",upstream="10.0.0.2:80"} 1`
@@ -2254,5 +2411,134 @@ func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 	unterminated := `caddy_reverse_proxy_upstreams_healthy{upstream="10.0.0.4`
 	if got := ExtractMetricLabel(unterminated, "upstream"); got != "" {
 		t.Fatalf("值未闭合应返回空串: %q", got)
+	}
+}
+
+// ---- 回归钉 ----
+
+// 候选装载阶段必须预解析 Leaf（disabled 候选除外），供
+// selectCertificate 走快路径并供过期回退复用。
+func TestACMECertCandidatesForRule_preparses_leaf(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedRuleWithCAProvider(t, "lb_leaf", "leaf.example.test", 0)
+	certPEM, keyPEM := matchingCertificatePair(t, "leaf.example.test")
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES
+		('lb_leaf','leaf.example.test','issued',?,?),
+		('lb_leaf','disabled.leaf.example.test','disabled',?,?)`, certPEM, keyPEM, certPEM, keyPEM); err != nil {
+		t.Fatalf("seed jobs: %v", err)
+	}
+
+	// When
+	candidates := acmeCertCandidatesForRule(database, "lb_leaf")
+
+	// Then
+	if len(candidates) != 2 {
+		t.Fatalf("candidates=%d, want 2", len(candidates))
+	}
+	for _, candidate := range candidates {
+		if candidate.Status == "disabled" {
+			if candidate.Leaf != nil {
+				t.Fatal("disabled candidate must skip leaf pre-parse")
+			}
+			continue
+		}
+		if candidate.Leaf == nil {
+			t.Fatal("issued candidate leaf not pre-parsed")
+		}
+		if candidate.Leaf.Subject.CommonName != "leaf.example.test" {
+			t.Fatalf("leaf CN=%q, want leaf.example.test", candidate.Leaf.Subject.CommonName)
+		}
+	}
+}
+
+// 健康聚合单飞必须 panic 安全：聚合内部 panic 若直接冲出，healthInflight
+// 永久驻留 → 所有后续调用阻塞在 <-call.done 上（健康面板永久悬挂、无法自愈）。
+func TestUpstreamHealthSingleflight_panicDoesNotStrandInflight(t *testing.T) {
+	s := NewCaddyService("http://127.0.0.1:1")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("panic 必须向首个调用方传播")
+		}
+		// panic 之后单飞槽位必须已释放：下一次调用发起新的聚合并返回值。
+		// 超时判定用 goroutine：旧实现（槽位未清）会让该调用永久阻塞，测试
+		// 必须显式失败而不是挂到全局超时。
+		type result struct {
+			health map[string]map[string]*UpstreamHealthDetail
+			err    error
+		}
+		done := make(chan result, 1)
+		go func() {
+			health, err := s.aggregateUpstreamHealthWithSingleflight(func() (map[string]map[string]*UpstreamHealthDetail, error) {
+				return map[string]map[string]*UpstreamHealthDetail{"srv": {"1.2.3.4:80": {Healthy: true}}}, nil
+			})
+			done <- result{health, err}
+		}()
+		select {
+		case got := <-done:
+			if got.err != nil {
+				t.Fatalf("post-panic call err=%v", got.err)
+			}
+			if got.health["srv"]["1.2.3.4:80"] == nil || !got.health["srv"]["1.2.3.4:80"].Healthy {
+				t.Fatalf("post-panic aggregate=%+v", got.health)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("panic 后单飞槽位仍被占用（后续调用永久阻塞）")
+		}
+	}()
+	s.aggregateUpstreamHealthWithSingleflight(func() (map[string]map[string]*UpstreamHealthDetail, error) {
+		panic("boom")
+	})
+}
+
+// 全局链钉测试：global_config.server_tokens_hidden=1（全局
+// TRUE）→ 全量渲染为规则发射 deferred Server 删除 headers handler。规则级
+// 覆盖（0/1/2）已有 TestGenerateSingleRuleCaddyConfig_serverTokensHidden*
+// 钉，本测试钉「全局列 → resolveRuleOverrides → handler 发射」链路本身。
+func TestGenerateCaddyConfig_globalServerTokensHiddenEmitsDeleteHandler(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_server_tokens", false)
+	if _, err := database.Exec("UPDATE global_config SET server_tokens_hidden=1 WHERE id=1"); err != nil {
+		t.Fatalf("set global server_tokens_hidden: %v", err)
+	}
+
+	generated := generateCaddyConfigFromStore(database)
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("config generation failed: %s", message)
+	}
+
+	routes := httpRoutesFromServer(t, generated, "http_8080")
+	hasServerDelete := func(routes []interface{}) bool {
+		for _, routeValue := range routes {
+			route := mustMap(t, routeValue, "route")
+			handlers, ok := route["handle"].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, handlerValue := range handlers {
+				handler := mustMap(t, handlerValue, "handler")
+				if handler["handler"] != "headers" {
+					continue
+				}
+				response := mustMap(t, handler["response"], "headers response ops")
+				if response["deferred"] == true {
+					if deletes, ok := response["delete"].([]string); ok && len(deletes) == 1 && deletes[0] == "Server" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	if !hasServerDelete(routes) {
+		t.Fatalf("global server_tokens_hidden=1 must emit deferred Server delete handler: %#v", routes)
+	}
+
+	// 负对照：全局关闭时不得发射该 handler（防恒真钉测）。
+	if _, err := database.Exec("UPDATE global_config SET server_tokens_hidden=0 WHERE id=1"); err != nil {
+		t.Fatalf("clear global server_tokens_hidden: %v", err)
+	}
+	generatedOff := generateCaddyConfigFromStore(database)
+	if hasServerDelete(httpRoutesFromServer(t, generatedOff, "http_8080")) {
+		t.Fatal("global server_tokens_hidden=0 must not emit Server delete handler")
 	}
 }

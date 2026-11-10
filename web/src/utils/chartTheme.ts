@@ -3,24 +3,18 @@
 
 const chartPalette = {
   primary: '#4f8cff',
-  violet: '#8b5cf6',
-  amber: '#fbbf24',
   red: '#f87171',
   slate: '#9aa0b5',
-  dim: '#62687f',
 } as const
 
 /** 状态 → 色（任务监控/安全总览共用语义色）——键=TaskStatus 实际产出值
- * （running/idle/queued/failed/cancelled/disabled/stopped；passive/no_runs
- * 曾为零产出死条目，U1-66-08 清理） */
+ * （running/idle/failed 三态）。已删除的零产出死键：cancelled/stopped/queued/
+ * disabled（stopped/disabled/queued 已退役；cancelled 仅存在于 task_runs 的
+ * result 字段，不是状态列）与 passive/no_runs（曾为零产出死条目）。*/
 export const statusColor: Record<string, string> = {
   running: chartPalette.primary,
   idle: chartPalette.slate,
-  queued: chartPalette.amber,
   failed: chartPalette.red,
-  cancelled: chartPalette.violet,
-  disabled: chartPalette.dim,
-  stopped: chartPalette.dim,
 }
 
 /** HTTP 状态码序列色（Dashboard 流量图既有语义色收编——零视觉变更，单一来源） */

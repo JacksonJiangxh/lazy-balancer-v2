@@ -13,12 +13,13 @@ import (
 func TestImportBackup_policyTypeInferredForLegacyRows(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_policies": {
 			{"id": 9, "name": "imp-acl", "mode": "off", "ip_acl_enabled": 1, "ip_acl_mode": "deny", "ip_acl_list": `["203.0.113.0/24"]`, "enabled": 1},
 			{"id": 10, "name": "imp-typed", "mode": "blocking", "policy_type": "stage3", "enabled": 1},
 		},
-	})
+	}, EmptyConfigIfNil: true})
+
 	rec := postJSONImport(t, g, backup)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import: %d %s", rec.Code, rec.Body.String())

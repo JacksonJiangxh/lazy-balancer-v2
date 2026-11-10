@@ -7,128 +7,27 @@ import (
 	"testing"
 )
 
-func automationPolicyFixture(marker string, subjects ...string) map[string]interface{} {
-	subjectList := make([]interface{}, 0, len(subjects))
-	for _, subject := range subjects {
-		subjectList = append(subjectList, subject)
-	}
-	return map[string]interface{}{
-		"subjects": subjectList,
-		"issuer":   map[string]interface{}{"module": marker},
-	}
-}
-
-func automationGlobalPolicyFixture(marker string) map[string]interface{} {
-	return map[string]interface{}{
-		"issuer": map[string]interface{}{"module": marker},
-	}
-}
-
-func automationConfigWithPolicies(policies ...interface{}) map[string]interface{} {
-	return map[string]interface{}{
+// 生产渲染（全量生成）从不产出
+// tls.automation（证书由应用层任务管理），旧实现扫描该段的分支恒不可达且
+// 让配置查看响应携带恒空字段。此处钉住：即使运行配置被外部注入 automation
+// 段，context 也不再声明/返回 automation_policies。
+func TestBuildRuleCaddyContext_doesNotExposeDeadAutomationPolicies(t *testing.T) {
+	fullConfig := map[string]interface{}{
 		"apps": map[string]interface{}{
 			"tls": map[string]interface{}{
 				"automation": map[string]interface{}{
-					"policies": policies,
+					"policies": []interface{}{
+						map[string]interface{}{"subjects": []interface{}{"example.com"}},
+					},
 				},
 			},
 		},
 	}
-}
 
-func automationPolicyModules(t *testing.T, result map[string]interface{}) []string {
-	t.Helper()
-	raw, ok := result["automation_policies"].([]interface{})
-	if !ok {
-		t.Fatalf("automation_policies type = %T, want []interface{}", result["automation_policies"])
-	}
-	if raw == nil {
-		t.Fatal("automation_policies is nil, want initialized empty slice")
-	}
-	modules := make([]string, 0, len(raw))
-	for _, policyVal := range raw {
-		policy, _ := policyVal.(map[string]interface{})
-		issuer, _ := policy["issuer"].(map[string]interface{})
-		module, _ := issuer["module"].(string)
-		modules = append(modules, module)
-	}
-	return modules
-}
+	result := buildRuleCaddyContext(fullConfig, "lb_testrule")
 
-func TestBuildRuleCaddyContext_AutomationPoliciesScopedToRuleDomains(t *testing.T) {
-	tests := []struct {
-		name        string
-		domain      string
-		policies    []interface{}
-		wantModules []string
-	}{
-		{
-			name:   "policy with subjects matching rule domains is kept",
-			domain: "example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "example.com"),
-			},
-			wantModules: []string{"acme"},
-		},
-		{
-			name:   "policy matching any of several canonicalized rule domains is kept",
-			domain: "Example.com, www.example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "www.example.com"),
-			},
-			wantModules: []string{"acme"},
-		},
-		{
-			name:   "policy with non-matching subjects is dropped",
-			domain: "example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "other.com"),
-			},
-			wantModules: []string{},
-		},
-		{
-			name:   "policy without subjects field is dropped",
-			domain: "example.com",
-			policies: []interface{}{
-				automationGlobalPolicyFixture("internal"),
-			},
-			wantModules: []string{},
-		},
-		{
-			name:   "empty rule domain yields empty non-nil policies",
-			domain: "",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "example.com"),
-			},
-			wantModules: []string{},
-		},
-		{
-			name:   "mixed policies keep only domain matches",
-			domain: "example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "example.com"),
-				automationPolicyFixture("zerossl", "other.com"),
-				automationGlobalPolicyFixture("internal"),
-				automationPolicyFixture("empty"),
-			},
-			wantModules: []string{"acme"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Given: a full Caddy config whose TLS app holds the case's automation policies
-			fullConfig := automationConfigWithPolicies(tt.policies...)
-
-			// When
-			result := buildRuleCaddyContext(fullConfig, "lb_testrule", 443, tt.domain)
-
-			// Then
-			gotModules := automationPolicyModules(t, result)
-			if !reflect.DeepEqual(gotModules, tt.wantModules) {
-				t.Fatalf("automation policy modules = %v, want %v", gotModules, tt.wantModules)
-			}
-		})
+	if _, exists := result["automation_policies"]; exists {
+		t.Fatalf("automation_policies=%v, want field removed（生产渲染无该段）", result["automation_policies"])
 	}
 }
 
@@ -151,16 +50,22 @@ func tlsConnPolicyFixture(anyTag []string, sni ...string) map[string]interface{}
 	return policy
 }
 
-func tlsConnPoliciesConfigFixture(caddyID string, policies []interface{}) map[string]interface{} {
+func tlsConnPoliciesConfigFixture(caddyID string, hosts []string, policies []interface{}) map[string]interface{} {
+	route := map[string]interface{}{"@id": caddyID}
+	if len(hosts) > 0 {
+		hostValues := make([]interface{}, 0, len(hosts))
+		for _, host := range hosts {
+			hostValues = append(hostValues, host)
+		}
+		route["match"] = []interface{}{map[string]interface{}{"host": hostValues}}
+	}
 	return map[string]interface{}{
 		"apps": map[string]interface{}{
 			"http": map[string]interface{}{
 				"servers": map[string]interface{}{
 					"srv0": map[string]interface{}{
-						"listen": []interface{}{":443"},
-						"routes": []interface{}{
-							map[string]interface{}{"@id": caddyID},
-						},
+						"listen":                  []interface{}{":443"},
+						"routes":                  []interface{}{route},
 						"tls_connection_policies": policies,
 					},
 				},
@@ -205,50 +110,50 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 	tests := []struct {
 		name             string
 		caddyID          string
-		domain           string
+		serverHosts      []string
 		policies         []interface{}
 		wantFingerprints []string
 	}{
 		{
-			name:    "entry whose any_tag contains the rule caddy id is kept",
-			caddyID: "lb_rule1",
-			domain:  "other-rule-domain.com",
+			name:        "entry whose any_tag contains the rule caddy id is kept",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"other-rule-domain.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_rule1"}, "go029.com"),
 			},
 			wantFingerprints: []string{"tag=lb_rule1,sni=go029.com"},
 		},
 		{
-			name:    "entry tagged with a different rule id is dropped",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "entry tagged with a different rule id is dropped",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_otherrule"}),
 			},
 			wantFingerprints: []string{},
 		},
 		{
-			name:    "entry without any_tag but sni intersecting rule domains is kept",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "entry without any_tag but sni intersecting the running server hosts is kept",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture(nil, "www.go029.com", "go029.com"),
 			},
 			wantFingerprints: []string{"sni=www.go029.com,sni=go029.com"},
 		},
 		{
-			name:    "entry with neither any_tag nor sni match is dropped",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "entry with neither any_tag nor sni match is dropped",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_otherrule"}, "unrelated.com"),
 			},
 			wantFingerprints: []string{},
 		},
 		{
-			name:    "server context and top level carry the same filtered set",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "server context and top level carry the same filtered set",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_rule1"}, "go029.com"),
 				tlsConnPolicyFixture([]string{"lb_otherrule"}, "ry029.com"),
@@ -256,24 +161,34 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 			wantFingerprints: []string{"tag=lb_rule1,sni=go029.com"},
 		},
 		{
-			name:    "rule with no matching entries gets empty non-nil policies",
-			caddyID: "lb_rule1",
-			domain:  "go029.com",
+			name:        "rule with no matching entries gets empty non-nil policies",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"go029.com"},
 			policies: []interface{}{
 				tlsConnPolicyFixture([]string{"lb_otherrule"}, "ry029.com"),
 				tlsConnPolicyFixture(nil, "quanyi.go029.com"),
 			},
 			wantFingerprints: []string{},
 		},
+		{
+			name:        "stale library domain never widens the running-config scope",
+			caddyID:     "lb_rule1",
+			serverHosts: []string{"new.example.test"},
+			policies: []interface{}{
+				tlsConnPolicyFixture(nil, "old.example.test"),
+				tlsConnPolicyFixture(nil, "new.example.test"),
+			},
+			wantFingerprints: []string{"sni=new.example.test"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given: an http server hosting the rule's route plus policies from sibling rules
-			fullConfig := tlsConnPoliciesConfigFixture(tt.caddyID, tt.policies)
+			fullConfig := tlsConnPoliciesConfigFixture(tt.caddyID, tt.serverHosts, tt.policies)
 
 			// When
-			result := buildRuleCaddyContext(fullConfig, tt.caddyID, 443, tt.domain)
+			result := buildRuleCaddyContext(fullConfig, tt.caddyID)
 
 			// Then: both the top-level array and the server context carry the rule-scoped set
 			gotTop := tlsConnPolicyFingerprints(t, result["tls_connection_policies"])
@@ -290,5 +205,86 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 				t.Fatalf("server tls_connection_policies = %v, want %v", gotServer, tt.wantFingerprints)
 			}
 		})
+	}
+}
+
+// 同一 @id 出现在多个 server（外部写入/历史漂移）时，配置查看框的
+// server_context 必须确定性选定（排序后首个命中），不得随 map 序遍历漂移。
+func TestBuildRuleCaddyContext_deterministicServerSelection(t *testing.T) {
+	fullConfig := map[string]interface{}{
+		"apps": map[string]interface{}{
+			"http": map[string]interface{}{
+				"servers": map[string]interface{}{
+					"srv_b": map[string]interface{}{
+						"listen": []interface{}{":9000"},
+						"routes": []interface{}{map[string]interface{}{"@id": "lb_drift"}},
+					},
+					"srv_a": map[string]interface{}{
+						"listen": []interface{}{":8000"},
+						"routes": []interface{}{map[string]interface{}{"@id": "lb_drift"}},
+					},
+				},
+			},
+		},
+	}
+	for i := range 30 {
+		result := buildRuleCaddyContext(fullConfig, "lb_drift")
+		server, ok := result["server"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("iteration %d: server context missing", i)
+		}
+		if name := server["server_name"]; name != "srv_a" {
+			t.Fatalf("iteration %d: server_name=%v, want srv_a（排序后首个命中，确定性）", i, name)
+		}
+	}
+}
+
+// 配置查看框的 routes 跨 server 收集顺序必须确定（主路由 + 跳转路由分处两个
+// server 的常见形态）：map 序遍历会让同一份运行配置在两次请求间给出不同顺序。
+func TestRuleCaddyRoutes_deterministicAcrossServerIteration(t *testing.T) {
+	fullConfig := map[string]interface{}{
+		"apps": map[string]interface{}{
+			"http": map[string]interface{}{
+				"servers": map[string]interface{}{
+					"srv_redirect": map[string]interface{}{
+						"listen": []interface{}{":80"},
+						"routes": []interface{}{map[string]interface{}{"@id": "lb_order_redirect"}},
+					},
+					"srv_main": map[string]interface{}{
+						"listen": []interface{}{":443"},
+						"routes": []interface{}{
+							map[string]interface{}{"@id": "lb_order"},
+							map[string]interface{}{"@id": "lb_order_path_1"},
+						},
+					},
+				},
+			},
+		},
+	}
+	var baseline []interface{}
+	for i := range 30 {
+		main, routes := ruleCaddyRoutes(fullConfig, "lb_order")
+		if main == nil || main["@id"] != "lb_order" {
+			t.Fatalf("iteration %d: main route missing", i)
+		}
+		if len(routes) != 3 {
+			t.Fatalf("iteration %d: routes=%d, want 3", i, len(routes))
+		}
+		got := make([]string, 0, len(routes))
+		for _, raw := range routes {
+			route, _ := raw.(map[string]interface{})
+			got = append(got, fmt.Sprint(route["@id"]))
+		}
+		want := []string{"lb_order", "lb_order_path_1", "lb_order_redirect"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("iteration %d: routes order=%v, want %v（server 名排序后逐个收集）", i, got, want)
+		}
+		if i == 0 {
+			baseline = routes
+			continue
+		}
+		if !reflect.DeepEqual(baseline, routes) {
+			t.Fatalf("iteration %d: routes 跨调用不一致（顺序漂移）", i)
+		}
 	}
 }

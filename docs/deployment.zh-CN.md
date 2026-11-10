@@ -7,7 +7,7 @@
 | `/app/data` | 业务/审计/指标数据库、ACME 账户密钥 | **是** |
 | `/app/certs` | 证书与私钥 | **是** |
 | `/app/logs` | 应用日志、Caddy 日志、按规则访问日志 | 推荐 |
-| `/app/waf` | CRS 规则树（IP2Region xdb 实际位于 `/app/data/ip2region.xdb`，随数据卷持久化；Coraza 审计日志在 `/app/logs/waf-audit`） | 推荐 |
+| `/app/waf` | CRS 规则树（IP2Region xdb 实际位于 `/app/data/ip2region.xdb`，随数据卷持久化；旧版 Coraza 审计日志在 `/app/logs/waf-audit`，B 形态下仅作兜底） | 推荐 |
 | `/app/backup` | 自动备份落盘目录（不挂载则容器重建后备份文件丢失） | **是** |
 | `/app/config` | 启动期最小 Caddyfile（admin 监听等）；运行配置恒由数据库渲染覆盖，手改不持久 | 可选 |
 
@@ -19,7 +19,7 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `JWT_SECRET` | 自动生成 | JWT 签名密钥；生产建议显式设置 |
+| `JWT_SECRET` | 自动生成 | JWT 签名密钥；生产建议显式设置。显式设置时必须 **≥32 字节且至少含 8 个不同字节**（高熵随机串，例如 `openssl rand -hex 32`）——不满足时启动日志以「强度不足」告警但**不阻断启动**（运维显式输入不自动替换，避免已签发令牌静默全失效）；弱密钥可被离线爆破，JWT 与 OIDC state 均可被伪造。不设置时自动生成并持久化到数据目录 |
 | `LOG_FILE` | `/app/logs/lazy-balancer.log` | 运行日志文件路径（恒启用，LOG_FILE 仅覆盖路径） |
 | `NODE_NAME` | `node-1` | 集群注册的默认节点名 |
 | `BACKUP_DIR` | `data_dir` 同级 `backup`（容器 `/app/backup`） | 自动备份落盘目录 |
@@ -36,16 +36,54 @@
 | 自定义 | TCP 规则监听端口 |
 
 > Linux 推荐 `--network host`。macOS/Windows 用 `-p 8000:8000 -p 80:80 -p 443:443 -p 443:443/udp`（UDP 为 HTTP/3 必需）。
+>
+> **容器配置用环境变量**（上表）。`docker run <镜像> -config <路径>` 之类的显式参数会被入口脚本透传给面板进程（早期镜像会静默丢弃参数），但容器内侧面板端口固定 8000——用 `-config` 改 `port` 会让内置健康检查打错端口，容器形态请勿改面板端口。
 
 ## 生产参数
 
-**文件描述符**是唯一必需项（已内置在 compose 中）：
+**文件描述符**是必需项（已内置在 compose 中）：
 
 ```bash
 --ulimit nofile=1048576:1048576
 ```
 
+**进程/线程配额**建议同时设置两层（compose 已内置）：
+
+```bash
+--ulimit nproc=4096:4096   # 容器内 RLIMIT_NPROC（ulimit -u）
+--pids-limit=4096          # cgroup pids.max（按线程计数）
+```
+
+两层作用域不同：`nproc` 是进程级 rlimit，`pids_limit` 是容器 cgroup 硬上限；实际可创建的任务数取较低者。**两者只作用于容器，宿主系统 ulimit 不需要修改**。
+
+**停止宽限期**（优雅关停）：面板关停链的最坏路径预算为 25 秒（HTTP 在途请求 → Caddy 排水 → 威胁大屏停止 → 任务引擎排空 → metrics/时区/日志轮转收尾 → ACME 收尾）。Docker 默认停止宽限只有 10 秒，第 10 秒即 SIGKILL：在途代理连接被硬断（`docker events` 里 `die` 的 `exitCode=137`）、`task_runs` 可能滞留在 `running`、日志尾部丢失。因此裸 `docker run` 必须带 `--stop-timeout 30`（compose 文件已内置 `stop_grace_period: 30s`）；systemd/Kubernetes 等自管编排请配置等效的 ≥25 秒停止宽限。
+
 内核级调优（sysctl）均为可选——默认值已生产就绪，完整指南见 [生产调优](production-tuning.zh-CN.md)。
+
+## 安全事件采集（IPC + 兜底补采）
+
+当前镜像的安全事件采集使用 **IPC 主路径 + fallback spool**：
+
+```text
+Caddy 审计写侧 → Unix socket → 面板入库（DB commit 后 ack）
+                      └─ 失败/超时/未确认 → /app/data/security-events-spool
+                                                  ↓
+                                          现有采集任务补采 → 删除已提交文件
+```
+
+- IPC socket：`/app/data/security-events.sock`（仅本机；权限 0600）
+- 兜底目录：`/app/data/security-events-spool`（正常应为空）
+- 正常事件只写 `lazy-balancer-metrics.db` 的 `security_events`，不再保留全量 WAF 审计文件；
+- IPC/DB 失败的事件进入 spool，采集任务补采，**DB commit 成功后才删除**；
+- 补采完成后 spool 为空；事件日志页的“缓存 N 条”即为待补采条目数；
+- 成功事件以 metrics DB 为权威，请配置数据库备份；spool 建议一并纳入备份；
+- 自定义 `data_dir` 部署需保证 Caddy 与面板共享同一数据卷，并用
+  `LB_SECURITY_EVENTS_IPC_SOCKET` / `LB_SECURITY_EVENTS_SPOOL_DIR` /
+  `LB_SECURITY_EVENTS_L4_SPOOL_DIR` 显式覆盖时保持一致（第三项为 L4 兜底事件
+  spool，缺失时写侧落默认路径、面板永不扫描）；
+- 旧版 `audit.log` 会在升级后继续消费存量，消费完成后不再新增；该文件由安全事件摄取链路管理，日志清理任务不再轮转/截断它。
+
+详见 `docs/security.zh-CN.md`。
 
 ## 品牌定制
 
@@ -65,7 +103,7 @@
 ## 配置备份
 
 - **导出**：系统信息 → 配置备份（.lbbak 备份包，tar.gz，含配置/凭证与证书；勾选安全防护分类含规则库文件）。可按四个分类选择性导出：**系统数据**（用户/密钥/证书配置，含全局配置）、**负载规则**（规则/上游/路径/证书任务）、**安全防护**（策略/自定义规则/拦截页/名单/规则库版本）、**节点拓扑**（从节点列表与站点坐标，含节点令牌哈希——灾备后旧令牌仍可认证，备份文件需同等加密保管）
-- **导入**：校验失败零写入；v2 备份需 ≥ v2.1.2 导出。可按分类导入，未选分类保持现状；勾选「节点拓扑」会整体替换从节点列表——备份中不再存在的节点，其证书指纹钉与分区上报缓存一并清除，备份中无令牌的节点恢复为待审批（需在节点页重新注册/审批）
+- **导入**：校验失败零写入；v2 备份需 ≥ v2.1.2 导出。可按分类导入，未选分类保持现状；勾选「节点拓扑」会整体替换从节点列表——备份中不再存在的节点，其证书指纹钉与分区上报缓存一并清除，备份中无令牌的节点恢复为待审批（需在节点页重新注册/审批）。导入失败（含事务提交前被 Caddy 拒绝）时整体回滚：数据库与规则库文件（CRS 规则树、IP2Region 库、威胁名单）一并回到导入前状态，界面会明确提示是否已回退；回退失败会显性告警并写入审计，请按提示重新导入或触发规则库更新收敛
 - **v1 迁移**：选择 nginx 版备份自动转换
 
 ## 四道合法性关卡
@@ -93,9 +131,17 @@
 
 ## 重启语义与容器策略
 
-面板的“重启服务”、启用面板 HTTPS、集群 `restart_app` 都会让 PID1 退出。裸 `docker run` 必须带 `--restart unless-stopped`（compose 已内置 `restart: unless-stopped`），否则容器不会自动拉起，面板与代理流量会同时停摆。裸机 systemd 部署需配置等效的自动重启策略。
+面板的“重启服务”、启用面板 HTTPS、集群 `restart_app` 都会让面板进程退出，作为 PID 1 的 tini 随后退出，容器因此停止。裸 `docker run` 必须带 `--restart unless-stopped`（compose 已内置 `restart: unless-stopped`），否则容器不会自动拉起，面板与代理流量会同时停摆。裸机 systemd 部署需配置等效的自动重启策略。
 
-## Caddy 2.11.6+ 行为变化（当前镜像 2.11.7，升级前须知）
+**PID 1 与子进程回收**：当前镜像以 tini 作为 PID 1，健康检查也由二进制子命令完成（不派生 shell/客户端进程），被遗弃的子进程会被自动回收，部署时无需额外加 `--init`。若固定使用更早镜像，容器内 PID 1 是面板进程且不回收孤儿，请务必追加 `--init`。启动示例默认设置 `--pids-limit=4096`（cgroup PID 配额按线程计数），可按部署规模调整。诊断命令：`cat /sys/fs/cgroup/pids.current`、`/sys/fs/cgroup/pids.max`、`/sys/fs/cgroup/pids.events`（`max` 计数即历史撞线次数）。
+
+## Caddy 2.11.6+ 行为变化（当前镜像 2.11.9，升级前须知）
+
+以下为底层 Caddy 升级到 v2.11.6 后的默认行为变化与后续版本增量（当前镜像已包含 2.11.6→2.11.9 全部增量）。仓库自身渲染面不受影响（已核验零引用），但**用户自建数据面**需要注意：
+
+- **（v2.11.8 安全加固）异常 Host 值的请求直接拒绝**：Host 值含点段（如 `example.com..`）或斜杠的请求现在会被服务端拒绝（此前这类请求可能绕过路径类防护）——正常域名解析场景不受影响。
+- **（v2.11.8 修复）HTTP/2 慢上传不再 502**：经反向代理的大体量 HTTP/2 上传（如 WebDAV、文件上传）此前偶发 502，已修复。
+- **（v2.11.8 修复）压缩 ETag 匹配**：启用压缩的规则对带 ETag 请求的匹配行为修正。
 
 以下为底层 Caddy 升级到 v2.11.6 后的默认行为变化。仓库自身渲染面不受影响（已核验零引用），但**用户自建数据面**需要注意：
 

@@ -1,9 +1,11 @@
 package services
 
-// Round 62 第三批钉：cert-job 终态计数 / 常驻族 started_at+loop_on /
+// 历史 第三批钉：cert-job 终态计数 / 常驻族 started_at+loop_on /
 // 更新日志同源（三端点读任务日志文件）。
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,15 +18,17 @@ import (
 // When collectCertJobRows。
 // Then issued 行 Success24h=1、failed 行 Fail24h=1（终态映射——签发成功应成功+1）。
 func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
-	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	setupIsolatedDB(t)
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r1','a.test','issued',?)`, now)
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r2','b.test','failed',?)`, now)
-	rows := collectCertJobRows()
+	// 种子写入错误不得丢弃——静默失败会让整条断言链
+	// 在空表上「通过」。
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r1','a.test','issued',?)`, now); err != nil {
+		t.Fatalf("seed issued row: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r2','b.test','failed',?)`, now); err != nil {
+		t.Fatalf("seed failed row: %v", err)
+	}
+	rows, _ := collectCertJobRows()
 	byDomain := map[string]TaskInfo{}
 	for _, r := range rows {
 		byDomain[strings.TrimPrefix(r.Name, "ACME 签发 · ")] = r
@@ -82,7 +86,7 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 	}
 }
 
-// U1-66-06：从未运行的常驻任务 StartedAt 置零值——UI「常驻 · 启动于」已有
+// 从未运行的常驻任务 StartedAt 置零值——UI「常驻 · 启动于」已有
 // '—' 兜底；不再回退引擎进程启动时刻（=uptime 语义，与「空闲」状态矛盾）。
 func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -96,7 +100,7 @@ func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
 		got[ti.ID] = ti
 	}
 	tn := got["t-never"]
-	if tn.Kind != TaskKindDaemon {
+	if tn.Kind != taskengine.KindDaemon {
 		t.Fatalf("应为常驻族, got %s", tn.Kind)
 	}
 	if tn.StartedAt != "" {
@@ -109,15 +113,20 @@ func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
 // Then 物化行不进任务监控动态行（非签发任务——从节点禁签发，2026-10-01
 // 用户裁定：幽灵行不得因同步时刻新鲜而显示）。
 func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
-	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	setupIsolatedDB(t)
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r1','ghost.test','issued','从主节点同步，源任务状态：issued',?)`, now)
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r2','real.test','issued','',?)`, now)
-	rows := collectCertJobRows()
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r1','ghost.test','issued','从主节点同步，源任务状态：issued',?)`, now); err != nil {
+		t.Fatalf("seed ghost row: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r2','real.test','issued','',?)`, now); err != nil {
+		t.Fatalf("seed real row: %v", err)
+	}
+	// 镜像行过滤绑定「本节点当前为从节点」——物化行只在从节点存在，
+	// 主节点（promote 后）这些行归本节点，必须可见（见 mirrorFilterOnlyOnSlave）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("set slave role: %v", err)
+	}
+	rows, truncated := collectCertJobRows()
 	for _, r := range rows {
 		if strings.Contains(r.Name, "ghost.test") {
 			t.Fatal("物化行（从主节点同步）不应出现在任务监控动态行")
@@ -132,9 +141,31 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 	if !found {
 		t.Fatal("真实签发行应保留显示")
 	}
-	// U1-P3-2：LIMIT 100（第 100 新行仍显示——20 截断回归钉）
-	if len(rows) > 100 {
-		t.Fatalf("上限 100, got %d", len(rows))
+	if truncated {
+		t.Fatal("两行结果不得标记截断")
+	}
+}
+
+func TestCollectCertJobRows_truncationProbeAtHundredRows(t *testing.T) {
+	setupIsolatedDB(t)
+	insert := func(i int) {
+		t.Helper()
+		if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,created_at,updated_at) VALUES (?,?, 'issued', ?, ?)`,
+			fmt.Sprintf("r%03d", i), fmt.Sprintf("%03d.example", i), i, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range certJobRowsLimit {
+		insert(i)
+	}
+	rows, truncated := collectCertJobRows()
+	if len(rows) != certJobRowsLimit || truncated {
+		t.Fatalf("恰好 100 行: len=%d truncated=%v, want 100/false", len(rows), truncated)
+	}
+	insert(certJobRowsLimit)
+	rows, truncated = collectCertJobRows()
+	if len(rows) != certJobRowsLimit || !truncated {
+		t.Fatalf("101 行: len=%d truncated=%v, want 100/true（LIMIT 20 回归必须红）", len(rows), truncated)
 	}
 }
 
@@ -143,14 +174,12 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 // Then 行存在即显示（2026-10-01 用户裁定——无状态/时间过滤）；但 24h 计数
 // 归零（超窗不计数）。
 func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
-	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	setupIsolatedDB(t)
 	old := time.Now().UTC().AddDate(0, 0, -3).Format("2006-01-02 15:04:05")
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r9','old.test','issued',?)`, old)
-	rows := collectCertJobRows()
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r9','old.test','issued',?)`, old); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
+	rows, _ := collectCertJobRows()
 	found := false
 	for _, r := range rows {
 		if strings.Contains(r.Name, "old.test") {
@@ -162,5 +191,62 @@ func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("超 1 天的 issued 行仍应显示（存在即显示）")
+	}
+}
+
+// 读库失败的回退值不得写入缓存——DB 瞬时不可用时任务日志此前按
+// 10MB 滚动并钉死整个 5 分钟窗口（审计侧同职责缓存已按「失败不缓存」实现）。
+func TestGetTaskLogSizeBytes_readFailureNotCached(t *testing.T) {
+	initServicesDB(t)
+	t.Cleanup(InvalidateTaskLogSizeCache)
+	if _, err := db.DB.Exec(`UPDATE global_config SET task_log_size_mb=20 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	InvalidateTaskLogSizeCache()
+
+	// 读库失败形态（表暂时不可用）——回退 10MB 当轮生效，不得进缓存
+	if _, err := db.DB.Exec(`ALTER TABLE global_config RENAME TO global_config_v87_to06`); err != nil {
+		t.Fatal(err)
+	}
+	if got := getTaskLogSizeBytes(context.Background()); got != 10<<20 {
+		t.Fatalf("读库失败降级=%d, want 10MB", got)
+	}
+	if _, err := db.DB.Exec(`ALTER TABLE global_config_v87_to06 RENAME TO global_config`); err != nil {
+		t.Fatal(err)
+	}
+	if got := getTaskLogSizeBytes(context.Background()); got != 20<<20 {
+		t.Fatalf("读库恢复后阈值=%d, want 20MB（失败的 10MB 回退值被缓存钉死整窗口）", got)
+	}
+}
+
+// 任务日志尺寸读失败必须按状态转换去重：该求值在每次任务日志写入前发生，
+// 主库持续故障时裸 warn 会按写入行数洪泛（与审计日志尺寸侧口径漂移）。
+func TestGetTaskLogSizeBytes_readFailureLoggedOnceAndRecovers(t *testing.T) {
+	initServicesDB(t)
+	t.Cleanup(InvalidateTaskLogSizeCache)
+	isolateMetricsState(t)
+	InvalidateTaskLogSizeCache()
+
+	if _, err := db.DB.Exec(`ALTER TABLE global_config RENAME TO global_config_tasklog_size_bak`); err != nil {
+		t.Fatal(err)
+	}
+	out := captureLogf(t)
+	if got := getTaskLogSizeBytes(context.Background()); got != 10<<20 {
+		t.Fatalf("读库失败降级=%d, want 10MB", got)
+	}
+	if got := getTaskLogSizeBytes(context.Background()); got != 10<<20 {
+		t.Fatalf("读库失败降级=%d, want 10MB", got)
+	}
+	if n := strings.Count(out.String(), "读取任务日志大小配置失败"); n != 1 {
+		t.Fatalf("连续读失败留痕次数=%d, want 1（状态转换去重）: %q", n, out.String())
+	}
+
+	if _, err := db.DB.Exec(`ALTER TABLE global_config_tasklog_size_bak RENAME TO global_config`); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	_ = getTaskLogSizeBytes(context.Background())
+	if !strings.Contains(out.String(), "读取任务日志大小配置已恢复") {
+		t.Fatalf("恢复后必须补一条恢复留痕: %q", out.String())
 	}
 }

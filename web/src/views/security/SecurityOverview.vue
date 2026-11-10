@@ -8,117 +8,124 @@
         </h2>
         <p class="page-desc">安全防护统计概览</p>
       </div>
+      <el-button type="primary" plain @click="openThreatScreen">
+        <el-icon style="margin-right: 6px"><Monitor /></el-icon>
+        威胁大屏
+      </el-button>
     </div>
 
     <el-alert
       v-if="overviewError"
-      title="安全总览数据加载失败，请稍后刷新"
       type="error"
       show-icon
       :closable="false"
-      class="mb-5 error-banner"
-    />
+      class="polling-error-alert error-banner"
+    >
+      <template #title>
+        <div class="polling-error-title">
+          <span>安全总览数据加载失败</span>
+          <el-button link type="danger" :loading="reloading" @click="reloadAll">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
 
-    <el-row :gutter="20" class="mb-5">
-      <el-col :xs="24" :md="12">
-        <el-card shadow="always" class="overview-card">
-          <template #header>
-            <div class="card-header">
-              <div class="card-title">
-                <el-icon class="title-icon"><TrendCharts /></el-icon>
-                <span>防护概览</span>
-              </div>
+    <!-- 采集健康位（任务已停/连续失败/审计写侧降级）：判据与文案与事件列表/大屏同源 -->
+    <div v-if="ingestionWarning" class="info-note-bar">
+      <span class="info-note-desc">{{ ingestionWarning }}</span>
+    </div>
+
+    <!-- 运行状态条：防护三 KPI（拦截/检测/正常请求）等分栅格 + 规则库四状态合并单面板。
+         每列四行同构：标签 / 今日主数值 / 昨日对比 / 协议拆分（防御式：缺字段行隐藏）。 -->
+    <div class="mb-5"><el-card shadow="always" class="overview-card status-strip-card">
+      <template #header>
+        <div class="card-header">
+          <div class="card-title">
+            <el-icon class="title-icon"><Stopwatch /></el-icon>
+            <span>防护运行状态</span>
+          </div>
+        </div>
+      </template>
+      <div class="status-strip">
+        <div class="status-guard">
+          <div class="guard-item">
+            <div class="strip-label">
+              拦截
+              <el-tooltip :content="todayCountTip" placement="top">
+                <el-icon><InfoFilled /></el-icon>
+              </el-tooltip>
             </div>
-          </template>
-          <!-- 等宽布局:弃用 el-col span(5+5+5+5+4 末卡窄 20%),flex 五卡严格等宽,
-               同时满足前三卡一组/后两卡一组统一宽度的要求。 -->
-          <div class="stat-row">
-            <div class="stat-col">
-              <div class="stat-box stat-box--danger">
-                <div class="stat-box__icon"><el-icon><CircleClose /></el-icon></div>
-                <div class="stat-box__body">
-                  <div class="stat-box__value">{{ overview.today_blocked }}</div>
-                  <div class="stat-box__label">今日拦截</div>
-                </div>
-              </div>
-            </div>
-            <div class="stat-col">
-              <div class="stat-box stat-box--warning">
-                <div class="stat-box__icon"><el-icon><Warning /></el-icon></div>
-                <div class="stat-box__body">
-                  <div class="stat-box__value">{{ overview.today_detected }}</div>
-                  <div class="stat-box__label">今日检测</div>
-                </div>
-              </div>
-            </div>
-            <div class="stat-col">
-              <div class="stat-box stat-box--primary">
-                <div class="stat-box__icon"><el-icon><Lock /></el-icon></div>
-                <div class="stat-box__body">
-                  <div class="stat-box__value">{{ overview.active_policies }}</div>
-                  <div class="stat-box__label">活跃策略</div>
-                </div>
-              </div>
+            <div class="strip-value is-danger">{{ fmtStatNum(overview.today_blocked) }}</div>
+            <div v-if="yesterdayBlocked !== null" class="strip-sub"><span class="strip-sub-label">昨日</span> {{ fmtStatNum(yesterdayBlocked) }}</div>
+            <!-- 协议拆分（L4 阶段 0/1 披露，今日口径）：HTTP = 合计 − TCP；响应缺字段或 TCP=0 时隐藏 -->
+            <div v-if="todayBlockedSplit" class="strip-sub">
+              <span class="proto-split-item"><i class="proto-dot proto-dot--http"></i><span class="proto-split-label">HTTP</span><span class="strip-sub-num">{{ fmtStatNum(todayBlockedSplit.http) }}</span></span><span class="proto-split-item proto-split-item--tcp"><i class="proto-dot proto-dot--tcp"></i><span class="proto-split-label">TCP</span><span class="strip-sub-num">{{ fmtStatNum(todayBlockedSplit.tcp) }}</span></span>
             </div>
           </div>
-        </el-card>
-      </el-col>
-      <el-col :xs="24" :md="12">
-        <el-card shadow="always" class="overview-card">
-          <template #header>
-            <div class="card-header">
-              <div class="card-title">
-                <el-icon class="title-icon"><Files /></el-icon>
-                <span>规则库状态</span>
-              </div>
-            </div>
-          </template>
-          <div class="stat-row">
-            <div class="stat-col">
-              <div class="stat-box" :class="overview.crs_available === false ? 'stat-box--danger' : 'stat-box--success'">
-                <div class="stat-box__icon"><el-icon><Files /></el-icon></div>
-                <div class="stat-box__body">
-                  <div class="stat-box__value">{{ overview.crs_available === false ? '未安装' : overview.crs_version }}</div>
-                  <div class="stat-box__label">CRS 规则集</div>
-                  <!-- 库文件缺失优先于更新状态（缺库降级口径，2026-09-24 裁定） -->
-                  <!-- disable-transitions：异步数据到达时标签实例新建会重播 EP
-                       zoom-in-center（先漂后归位，2026-09-25 用户反馈修复，Dashboard 判例同款） -->
-                  <el-tag v-if="overview.crs_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>缺失</el-tag>
-                  <el-tag v-else-if="overview.update_status" :type="statusTagType(overview.update_status)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(overview.update_status) }}</el-tag>
-                </div>
-              </div>
-            </div>
-            <div class="stat-col">
-              <div class="stat-box" :class="overview.ip2region_available === false ? 'stat-box--danger' : 'stat-box--success'">
-                <div class="stat-box__icon"><el-icon><Location /></el-icon></div>
-                <div class="stat-box__body">
-                  <div class="stat-box__value">{{ overview.ip2region_available === false || ip2regionVersion === 'unknown' ? '未安装' : ip2regionVersion === 'bundled' ? '内置版本' : ip2regionVersion }}</div>
-                  <div class="stat-box__label">IP 地理库</div>
-                  <el-tag v-if="ip2regionError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
-                  <el-tag v-else-if="overview.ip2region_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>缺失</el-tag>
-                  <el-tag v-else-if="ip2regionVersion === 'unknown'" type="info" size="small" effect="plain" style="margin-top: 4px" disable-transitions>未安装</el-tag>
-                  <el-tag v-else-if="ip2regionStatus" :type="statusTagType(ip2regionStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(ip2regionStatus) }}</el-tag>
-                </div>
-              </div>
-            </div>
-            <div class="stat-col">
-              <div class="stat-box stat-box--success">
-                <div class="stat-box__icon"><el-icon><Aim /></el-icon></div>
-                <div class="stat-box__body">
-                  <div class="stat-box__value">{{ threatLatestVersion || '未更新' }}</div>
-                  <div class="stat-box__label">威胁情报库</div>
-                  <el-tag v-if="threatError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
-                  <el-tag v-else-if="threatStatus" :type="statusTagType(threatStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(threatStatus) }}</el-tag>
-                </div>
-              </div>
+          <div class="strip-divider"></div>
+          <div class="guard-item">
+            <div class="strip-label">检测</div>
+            <div class="strip-value is-warning">{{ fmtStatNum(overview.today_detected) }}</div>
+            <div v-if="yesterdayDetected !== null" class="strip-sub"><span class="strip-sub-label">昨日</span> {{ fmtStatNum(yesterdayDetected) }}</div>
+            <!-- 协议拆分：TCP 检测来自信任检测（trust_detect） logged 事件——可能产生数据就如实显示；
+                 字段缺失（旧后端）整行隐藏。HTTP = 合计 − TCP（负值钳 0） -->
+            <div v-if="todayDetectedSplit" class="strip-sub">
+              <span class="proto-split-item"><i class="proto-dot proto-dot--http"></i><span class="proto-split-label">HTTP</span><span class="strip-sub-num">{{ fmtStatNum(todayDetectedSplit.http) }}</span></span><span class="proto-split-item proto-split-item--tcp"><i class="proto-dot proto-dot--tcp"></i><span class="proto-split-label">TCP</span><span class="strip-sub-num">{{ fmtStatNum(todayDetectedSplit.tcp) }}</span></span>
             </div>
           </div>
-        </el-card>
-      </el-col>
-    </el-row>
+          <div class="strip-divider"></div>
+          <div class="guard-item">
+            <div class="strip-label">正常请求
+              <el-tooltip content="成功代理的流量：HTTP=总请求−拦截−检测放行；TCP=全部放行连接（含信任名单 IP 的保留检测流量，计入正常列）" placement="top">
+                <el-icon><InfoFilled /></el-icon>
+              </el-tooltip>
+            </div>
+            <div class="strip-value">{{ fmtStatNum(overview.normal_today) }}</div>
+            <div v-if="normalYesterday !== null" class="strip-sub"><span class="strip-sub-label">昨日</span> {{ fmtStatNum(normalYesterday) }}</div>
+            <!-- 字段缺失（旧后端）整行隐藏 -->
+            <div v-if="normalTodaySplit" class="strip-sub">
+              <span class="proto-split-item"><i class="proto-dot proto-dot--http"></i><span class="proto-split-label">HTTP</span><span class="strip-sub-num">{{ fmtStatNum(normalTodaySplit.http) }}</span></span><span class="proto-split-item proto-split-item--tcp"><i class="proto-dot proto-dot--tcp"></i><span class="proto-split-label">TCP</span><span class="strip-sub-num">{{ fmtStatNum(normalTodaySplit.tcp) }}</span></span>
+            </div>
+          </div>
+        </div>
+        <div class="status-lib">
+          <div class="lib-row">
+            <i class="status-dot" :class="overview.crs_available === false ? 'is-down' : 'is-up'"></i>
+            <span class="lib-name">CRS 规则集</span>
+            <span class="lib-ver">{{ overview.crs_available === false ? '未安装' : overview.crs_version }}</span>
+            <el-tag v-if="overview.crs_available === false" type="danger" size="small" effect="plain" disable-transitions>未安装</el-tag>
+            <el-tag v-else-if="overview.update_status" :type="libraryStatusTagType(overview.update_status)" size="small" effect="plain" disable-transitions>{{ libraryStatusLabel(overview.update_status) }}</el-tag>
+          </div>
+          <div class="lib-row">
+            <i class="status-dot" :class="overview.ip2region_available === false || ip2regionError ? 'is-down' : 'is-up'"></i>
+            <span class="lib-name">IP 地理库</span>
+            <span class="lib-ver">{{ overview.ip2region_available === false || ip2regionVersion === 'unknown' ? '未安装' : ip2regionVersion === 'bundled' ? '内置版本' : ip2regionVersion }}</span>
+            <el-tag v-if="ip2regionError" type="danger" size="small" effect="plain" disable-transitions>加载失败</el-tag>
+            <el-tag v-else-if="overview.ip2region_available === false" type="danger" size="small" effect="plain" disable-transitions>未安装</el-tag>
+            <el-tag v-else-if="ip2regionVersion === 'unknown'" type="info" size="small" effect="plain" disable-transitions>未安装</el-tag>
+            <el-tag v-else-if="ip2regionStatus" :type="libraryStatusTagType(ip2regionStatus)" size="small" effect="plain" disable-transitions>{{ libraryStatusLabel(ip2regionStatus) }}</el-tag>
+          </div>
+          <div class="lib-row">
+            <i class="status-dot" :class="threatError ? 'is-down' : 'is-up'"></i>
+            <span class="lib-name">威胁情报库</span>
+            <span class="lib-ver">{{ threatError ? '—' : (threatLatestVersion || '未更新') }}</span>
+            <el-tag v-if="threatError" type="danger" size="small" effect="plain" disable-transitions>加载失败</el-tag>
+            <el-tag v-else-if="threatStatus" :type="libraryStatusTagType(threatStatus)" size="small" effect="plain" disable-transitions>{{ libraryStatusLabel(threatStatus) }}</el-tag>
+          </div>
+          <div class="lib-row">
+            <i class="status-dot" :class="crawlerError ? 'is-down' : 'is-up'"></i>
+            <span class="lib-name">爬虫地址库</span>
+            <span class="lib-ver">{{ crawlerError ? '—' : (crawlerLatestVersion || '未更新') }}</span>
+            <el-tag v-if="crawlerError" type="danger" size="small" effect="plain" disable-transitions>加载失败</el-tag>
+            <el-tag v-else-if="crawlerStatus" :type="libraryStatusTagType(crawlerStatus)" size="small" effect="plain" disable-transitions>{{ libraryStatusLabel(crawlerStatus) }}</el-tag>
+          </div>
+        </div>
+      </div>
+    </el-card>
+    </div>
 
-    <el-row :gutter="20" class="mb-5">
-      <el-col :span="16">
+
+    <el-row :gutter="20" class="mb-5 charts-row">
+      <el-col :xs="24" :md="16">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
@@ -134,14 +141,14 @@
           </div>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :xs="24" :md="8">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
               <div class="card-title">
                 <el-icon class="title-icon"><PieChart /></el-icon>
                 <span>攻击类型分布（近 7 天）</span>
-                <el-checkbox v-model="attackByStage" size="small" style="margin-left: 12px">按阶段展示</el-checkbox>
+                <el-checkbox v-model="attackByStage" size="small" class="header-checkbox">按阶段展示</el-checkbox>
               </div>
             </div>
           </template>
@@ -154,7 +161,7 @@
     </el-row>
 
     <el-row :gutter="20" class="mb-5 events-row">
-      <el-col :span="16">
+      <el-col :xs="24" :md="16">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
@@ -162,19 +169,32 @@
                 <el-icon class="title-icon"><Warning /></el-icon>
                 <span>最近拦截事件</span>
               </div>
-              <el-link type="primary" @click="goToEvents">查看全部</el-link>
+              <AccessibleLink type="primary" @click="goToEvents">查看全部</AccessibleLink>
             </div>
           </template>
-          <el-alert v-if="blockedEventsError" title="最近拦截事件加载失败" type="error" show-icon :closable="false" class="error-banner" />
-          <el-table v-else :data="blockedEvents" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
+          <el-alert v-if="blockedEventsError" type="error" show-icon :closable="false" class="error-banner">
+            <template #title>
+              <div class="polling-error-title">
+                <span>最近拦截事件加载失败</span>
+                <el-button link type="danger" :loading="reloading" @click="reloadAll">立即重试</el-button>
+              </div>
+            </template>
+          </el-alert>
+          <el-table v-else :data="blockedEvents" stripe :header-cell-style="{ background: '#f9fafb', textAlign: 'left' }" :cell-style="{ textAlign: 'left' }" empty-text="">
             <template #empty><el-empty description="暂无拦截事件" :image-size="60" /></template>
             <el-table-column prop="event_time" label="时间" width="170" :formatter="(row: SecurityEvent) => formatDate(row.event_time)" />
             <el-table-column label="来源 IP" min-width="150">
               <template #default="{ row }">
-                <IPLocationAction :ip="row.client_ip" :location="row.ip_location" :rule-caddy-id="row.rule_caddy_id" />
+              <IPLocationAction :ip="row.client_ip" :location="row.ip_location" />
               </template>
             </el-table-column>
-            <el-table-column label="规则" min-width="160" show-overflow-tooltip>
+            <el-table-column label="协议" width="80">
+              <template #default="{ row }">
+                <el-tag v-if="row.event_type === 'tcp'" size="small" effect="plain" class="proto-tcp-tag event-proto-tag">TCP</el-tag>
+                <el-tag v-else size="small" effect="plain" type="primary" class="event-proto-tag">HTTP</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="规则" min-width="150" show-overflow-tooltip>
               <template #default="{ row }">{{ row.rule_name || row.rule_caddy_id || '—' }}</template>
             </el-table-column>
             <el-table-column label="策略" min-width="140" show-overflow-tooltip>
@@ -183,7 +203,7 @@
           </el-table>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :xs="24" :md="8">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
@@ -196,7 +216,14 @@
             </el-tooltip>
             </div>
           </template>
-          <el-alert v-if="rateLimitError" title="限流拦截数据加载失败" type="error" show-icon :closable="false" class="error-banner" />
+          <el-alert v-if="rateLimitError" type="error" show-icon :closable="false" class="error-banner">
+            <template #title>
+              <div class="polling-error-title">
+                <span>限流拦截数据加载失败</span>
+                <el-button link type="danger" :loading="reloading" @click="reloadAll">立即重试</el-button>
+              </div>
+            </template>
+          </el-alert>
           <template v-else>
             <div class="rate-limit-total">
               <span class="stat-label">累计拦截</span>
@@ -225,20 +252,29 @@
       </template>
       <el-table :data="overview.top_ips" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
         <template #empty><el-empty description="暂无数据" :image-size="60" /></template>
-        <el-table-column label="IP 地址" min-width="200">
+        <el-table-column label="IP 地址" min-width="160">
           <template #default="{ row }">
             <IPLocationAction :ip="row.ip" :location="row.ip_location" />
           </template>
         </el-table-column>
-        <el-table-column prop="blocked" label="拦截" width="80" align="center">
+        <el-table-column prop="blocked" label="拦截" width="100" align="center">
           <template #default="{ row }"><el-tag type="danger" size="small" effect="plain">{{ row.blocked }}</el-tag></template>
         </el-table-column>
-        <el-table-column prop="detected" label="检测" width="80" align="center">
+        <el-table-column prop="detected" label="检测" width="100" align="center">
           <template #default="{ row }"><el-tag type="warning" size="small" effect="plain">{{ row.detected }}</el-tag></template>
         </el-table-column>
-        <el-table-column label="攻击类型" min-width="180" show-overflow-tooltip>
+        <el-table-column prop="recent_10m" label="近10分钟" width="120" align="center">
+          <template #default="{ row }"><span style="color:#059669;font-weight:600">{{ row.recent_10m }}</span> 次</template>
+        </el-table-column>
+        <el-table-column prop="recent_1h" label="近1小时" width="128" align="center">
+          <template #default="{ row }"><span style="color:#059669;font-weight:600">{{ row.recent_1h }}</span> 次</template>
+        </el-table-column>
+        <el-table-column prop="recent_24h" label="近24小时" width="110" align="center">
+          <template #default="{ row }"><span style="color:#059669;font-weight:600">{{ row.recent_24h }}</span> 次</template>
+        </el-table-column>
+        <el-table-column label="攻击类型" min-width="140" show-overflow-tooltip>
           <template #default="{ row }">
-            <span>{{ topIpAttackLabel(row) }}</span>
+            <span>{{ topIpAttackLabel(row as TopIP) }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="last_time" label="最后攻击" width="170" :formatter="(row: TopIP) => formatDate(row.last_time)" />
@@ -249,85 +285,107 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { Aim, DataAnalysis, TrendCharts, PieChart, Location, Warning, Odometer, CircleClose, Lock, Files } from '@element-plus/icons-vue'
+import { DataAnalysis, TrendCharts, PieChart, Location, Warning, Odometer, Monitor, InfoFilled, Stopwatch } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
+import { useAuthStore } from '@/stores/auth'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { formatDate } from '@/utils/date'
-import { compareVersion } from '@/utils/securityStages'
+import { pageUrl } from '@/utils/deepLink'
+import { libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources, type LibrarySourceRow } from '@/utils/securityLibraries'
 import '@/utils/echarts' // 统一注册（副作用，全站单点）
 import VChart from 'vue-echarts'
 import type { APIResponse } from '@/types'
 import { securityActionColors } from '@/utils/chartTheme'
+import { normalizeRateLimitBlocks, type RateLimitBlocks } from '@/utils/rateLimitBlocks'
+import { ingestionWarningMessage, type IngestionHealth } from '@/utils/ingestionHealth'
 
 
 interface TrendPoint { date: string; blocked: number; detected: number }
-interface TopIP { ip: string; ip_location: string; blocked: number; detected: number; last_time: string; attack_type: string; attack_type_stage?: string
+interface TopIP { ip: string; ip_location: string; blocked: number; detected: number; recent_10m: number; recent_1h: number; recent_24h: number; last_time: string; attack_type: string; attack_type_stage?: string
 }
 interface AttackType { name: string; value: number }
-interface Overview { today_blocked: number; today_detected: number; active_policies: number; crs_version: string; crs_available?: boolean; ip2region_available?: boolean; update_status?: string; trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[] }
-interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
-interface RateLimitBlockHost { host: string; count: number }
-interface RateLimitBlocks { total: number; hosts: RateLimitBlockHost[] }
-
-type TagType = 'success' | 'warning' | 'danger' | 'info'
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case 'idle':
-    case 'success':
-      return '已最新'
-    case 'checking':
-      return '检查中'
-    case 'downloading':
-      return '下载中'
-    case 'installing':
-      return '安装中'
-    case 'running':
-      return '更新中'
-    case 'reloading':
-      return '重载中'
-    case 'failed':
-      return '更新失败'
-    default:
-      return status
-  }
+interface Overview {
+  today_blocked: number; today_detected: number; active_policies: number; crs_version: string
+  crs_available?: boolean; ip2region_available?: boolean; update_status?: string
+  trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[]
+  raw_coverage_from?: string; backfill_incomplete?: boolean
+  // 三 KPI 栏契约字段（昨日对比 + 正常请求，防御式消费：旧后端缺字段 → 对应行隐藏）
+  yesterday_blocked?: number; yesterday_blocked_tcp?: number
+  yesterday_detected?: number; yesterday_detected_tcp?: number
+  normal_today?: number; normal_today_http?: number; normal_today_tcp?: number
+  normal_yesterday?: number; normal_yesterday_http?: number; normal_yesterday_tcp?: number
+  // 今日拦截的 TCP（L4 断连）份额：旧后端缺失 → 协议拆分行整行隐藏（防御式）。
+  // 原始表直算（不走 rollup——rollup 无 event_type 维度），极端量级下行帽裁剪可能少计。
+  today_blocked_tcp?: number
+  // 今日检测的 TCP（L4 信任检测 logged）份额：语义同 today_blocked_tcp（防御旧后端）。
+  today_detected_tcp?: number
+  // includes_reserved：后端口径披露——true=今日计数回退原始表直算（含私网/保留
+  // 地址事件）；false=走分钟 rollup 与大屏同口径（不含私网）。tooltip 按此切换文案
+  includes_reserved?: boolean
+  // ingestion：与事件列表同源的采集健康位（见 utils/ingestionHealth）
+  ingestion?: IngestionHealth
 }
-
-function statusTagType(status: string): TagType {
-  switch (status) {
-    case 'idle':
-    case 'success':
-      return 'success'
-    case 'checking':
-    case 'downloading':
-    case 'installing':
-    case 'running':
-    case 'reloading':
-      return 'warning'
-    case 'failed':
-      return 'danger'
-    default:
-      return 'info'
-  }
-}
+interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string; event_type?: string }
 
 const attackByStage = ref(true)
 
-// Top 10 攻击类型列与分布图「按阶段展示」勾选联动（第 59 轮微调）：勾选时把
+// Top 10 攻击类型列与分布图「按阶段展示」勾选联动（微调）：勾选时把
 // 具体 family（joinDistinctFamilies 产物）映射到阶段五桶去重展示，取消勾选
 // 恢复具体分类文本——与分布图同口径（后端 stageCategorizeAttack 的 family 版）。
-// F62-8:阶段视图直接消费后端 attack_type_stage(后端 stageCategorizeAttack
+// 阶段视图直接消费后端 attack_type_stage(后端 stageCategorizeAttack
 // 单源产出)——原前端 familyToStage 硬编码映射已删,后端新增 family 不再静默落「其他」
 const topIpAttackLabel = (row: TopIP): string => {
   if (!attackByStage.value) return row.attack_type || '—'
   return row.attack_type_stage || '—'
 }
-const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [] })
+const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [], raw_coverage_from: '', backfill_incomplete: false })
+
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板
-// 误当「无攻击」，用户目标与 R35 D2 的后端显式报错对齐（R36 F1）。
+// 误当「无攻击」，用户目标与 后端显式报错对齐。
 const overviewError = ref(false)
+const ingestionWarning = computed(() => ingestionWarningMessage(overview.value.ingestion))
+// 今日拦截协议拆分：TCP 份额缺失（旧后端）/为 0 时 null → 整行隐藏；
+// 统计数值千分位（7 位数在 20px 卡内不破版式）
+const fmtStatNum = (n: number | undefined): string => (typeof n === 'number' ? n.toLocaleString('en-US') : '—')
 
+// today_blocked 是全协议合计，HTTP = 合计 − TCP（负值钳 0，防 rollup 滞后瞬间为负）
+const todayBlockedSplit = computed<{ http: number; tcp: number } | null>(() => {
+  const tcp = overview.value.today_blocked_tcp
+  // 字段存在即显示（TCP=0 也显示，与检测/正常请求列 lockstep）；缺失=旧后端隐藏
+  if (typeof tcp !== 'number' || !Number.isFinite(tcp)) return null
+  return { http: Math.max(0, overview.value.today_blocked - tcp), tcp }
+})
+
+// today_detected 是全协议合计（含 TCP 信任检测 logged），HTTP = 合计 − TCP
+//（负值钳 0）；字段存在即显示（TCP=0 也显示——可能产生数据就如实显示），
+// 缺失=旧后端隐藏
+const todayDetectedSplit = computed<{ http: number; tcp: number } | null>(() => {
+  const tcp = overview.value.today_detected_tcp
+  if (typeof tcp !== 'number' || !Number.isFinite(tcp)) return null
+  return { http: Math.max(0, overview.value.today_detected - tcp), tcp }
+})
+
+// 昨日对比行共用门（三列 lockstep）：数值字段缺失/非有限数 → null（行隐藏，防御旧后端）
+const statOrNull = (v: number | undefined): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null
+const yesterdayBlocked = computed(() => statOrNull(overview.value.yesterday_blocked))
+const yesterdayDetected = computed(() => statOrNull(overview.value.yesterday_detected))
+const normalYesterday = computed(() => statOrNull(overview.value.normal_yesterday))
+
+// 正常请求协议拆分：HTTP/TCP 两字段齐备才显示（字段缺失整行隐藏，防御旧后端）
+const normalTodaySplit = computed<{ http: number; tcp: number } | null>(() => {
+  const http = overview.value.normal_today_http
+  const tcp = overview.value.normal_today_tcp
+  if (typeof http !== 'number' || !Number.isFinite(http)) return null
+  if (typeof tcp !== 'number' || !Number.isFinite(tcp)) return null
+  return { http, tcp }
+})
+const crawlerCountingNote = '；已验证爬虫放行流量计入检测放行（logged）、不计入正常请求列'
+const todayCountTip = computed(() => overview.value.includes_reserved
+  ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' + crawlerCountingNote
+  : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，含当前分钟截至最近一次汇总的事件（滞后约 1 分钟）' + crawlerCountingNote)
 const trendChartOption = computed(() => {
   const dates = overview.value.trend.map(t => t.date)
   const blocked = overview.value.trend.map(t => t.blocked)
@@ -365,14 +423,14 @@ const fetchData = async () => {
     }
   } catch {
     // 后端 500（如 metrics 库故障）不再静默吞掉：置错误状态展示提示条，
-    // 全零面板不再冒充「无攻击」（R36 F1）。
+    // 全零面板不再冒充「无攻击」。
     overviewError.value = true
   }
 }
 
 const blockedEvents = ref<SecurityEvent[]>([])
 // 面板级错误态：请求失败时面板内显示「加载失败」，不再静默降级为「暂无」，
-// 与 overviewError 的 R36 F1 口径一致（R37 S4）。
+// 与 overviewError 的口径一致。
 const blockedEventsError = ref(false)
 
 const fetchBlockedEvents = async () => {
@@ -386,7 +444,7 @@ const fetchBlockedEvents = async () => {
   }
 }
 
-const goToEvents = () => { window.open('/?page=security-events', '_blank') }
+const goToEvents = () => { window.open(pageUrl('security-events'), '_blank') }
 
 const rateLimitBlocks = ref<RateLimitBlocks>({ total: 0, hosts: [] })
 const rateLimitError = ref(false)
@@ -396,8 +454,8 @@ const ip2regionError = ref(false)
 
 const fetchRateLimitBlocks = async () => {
   try {
-    const res = await request.get<APIResponse<RateLimitBlocks>>('/security/rate-limit-blocks')
-    if (res.data) rateLimitBlocks.value = res.data
+    const res = await request.get<APIResponse<unknown>>('/security/rate-limit-blocks')
+    rateLimitBlocks.value = normalizeRateLimitBlocks(res.data)
     rateLimitError.value = false
   } catch {
     rateLimitError.value = true
@@ -417,94 +475,145 @@ const fetchIP2RegionInfo = async () => {
   }
 }
 
-// 威胁情报库 stat（v2.3.x）：合并生效条数 + 最近版本（各源 version 最大者）。
+// 威胁情报库 stat（v2.3.x）：最近版本（各源 version 最大者）+ 运行状态。
+// total_entries 未展示（「合并生效条数」口径需后端去重统计，当前仅版本可呈现）。
 const threatLatestVersion = ref('')
-const threatRunning = ref(false)
 const threatError = ref(false)
-// 聚合三源状态（与 CRS/IP 库框的常驻状态 tag 同构）：更新中>失败>成功>未更新。
-// U9-8：running 为威胁库专用词（「更新中」）——不再借用 reloading（「重载中」
-// 是 Caddy 配置重载语义，威胁库更新过程不重载配置）
-const threatStatus = computed(() => {
-  if (threatRunning.value) return 'running'
-  if (threatSourcesStatus.value === 'failed') return 'failed'
-  if (threatLatestVersion.value) return 'success'
-  return ''
-})
-const threatSourcesStatus = ref('')
+// 状态由单一聚合源产出（utils/securityLibraries.summarizeLibrarySources）——
+// 与「规则集」页同口径；空源/无版本为 never（未更新），不再返回 '' 静默无标签。
+const threatStatus = ref('')
 const fetchThreatLib = async () => {
   try {
-    const res = await request.get<APIResponse<{ sources: { version: string; update_status: string }[]; total_entries?: number }>>('/security/threat-lib')
-    threatLatestVersion.value = (res.data?.sources || []).map(s => s.version).filter(Boolean).sort(compareVersion).pop() || ''
-    threatRunning.value = (res.data?.sources || []).some(s => s.update_status === 'running')
-    const statuses = (res.data?.sources || []).map(s => s.update_status)
-    // running 优先于 failed：与 SecurityRules libRows 聚合同口径
-    threatSourcesStatus.value = statuses.some(x => x === 'running') ? '' : (statuses.some(x => x === 'failed') ? 'failed' : '')
+    const res = await request.get<APIResponse<{ sources: LibrarySourceRow[]; total_entries?: number }>>('/security/threat-lib')
+    const summary = summarizeLibrarySources(res.data?.sources || [], formatDate)
+    threatLatestVersion.value = summary.latestVersion
+    threatStatus.value = summary.status
     threatError.value = false
   } catch {
     threatError.value = true
   }
 }
 
-onMounted(() => { fetchData(); fetchBlockedEvents(); fetchRateLimitBlocks(); fetchIP2RegionInfo(); fetchThreatLib() })
+// 爬虫地址库 stat：与威胁情报库同口径，但读独立端点/独立任务状态。
+const crawlerLatestVersion = ref('')
+const crawlerError = ref(false)
+const crawlerStatus = ref('')
+const fetchCrawlerLib = async () => {
+  try {
+    const res = await request.get<APIResponse<{ sources: LibrarySourceRow[]; total_entries?: number }>>('/security/crawler-lib')
+    const summary = summarizeLibrarySources(res.data?.sources || [], formatDate)
+    crawlerLatestVersion.value = summary.latestVersion
+    crawlerStatus.value = summary.status
+    crawlerError.value = false
+  } catch {
+    crawlerError.value = true
+  }
+}
+
+const authStore = useAuthStore()
+// 威胁大屏入口：全屏页面（App.vue 独立分支渲染，页内 ESC/按钮退出）
+const openThreatScreen = (): void => {
+  authStore.setCurrentPage('threat-screen')
+}
+
+// 六路数据一次拉齐；失败后页面此前只提供整页刷新这一个恢复入口（瞬态 5xx 后
+// 面板长期不可用）。横幅的「立即重试」走同一路径，reloading 兼作并发门——
+// 连续点击不会叠发六组请求。
+const reloading = ref(false)
+const reloadAll = async (): Promise<void> => {
+  if (reloading.value) return
+  reloading.value = true
+  try {
+    await Promise.all([
+      fetchData(),
+      fetchBlockedEvents(),
+      fetchRateLimitBlocks(),
+      fetchIP2RegionInfo(),
+      fetchThreatLib(),
+      fetchCrawlerLib(),
+    ])
+  } finally {
+    reloading.value = false
+  }
+}
+
+onMounted(() => { void reloadAll() })
 </script>
 
 <style scoped>
+/* 统一卡体系：全页 el-card 一律直角细边、无投影、卡头 14px/600、body 18×24。
+ * 状态条与图表/事件/Top10 卡共用同一容器观感（用户裁定彻底重设计）。 */
+.overview-card.el-card,
+.el-card { --el-card-border-color: #ebeef5; --el-card-border-radius: 0; }
+.status-strip-card.el-card { border: 1px solid #ebeef5; }
+.card-header { display: flex; align-items: center; justify-content: space-between; }
+.card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; }
 /* 等宽统计卡行:flex 五列严格等宽(原 el-col 5/5/5/5/4 末卡窄 20%) */
 .overview-card { height: 100%; }
-.stat-row { display: flex; gap: 16px; }
-.stat-col { flex: 1 1 0; min-width: 0; }
-@media (max-width: 1200px) {
-  .stat-row { flex-wrap: wrap; }
-  .stat-col { flex: 1 1 30%; }
-}
-@media (max-width: 768px) {
-  .stat-col { flex: 1 1 100%; }
-}
-.rate-limit-hint { flex-shrink: 0; }
-.card-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: nowrap; gap: 8px; }
-.card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; }
-/* 卡片标题图标 16px；页头图标走全局 .title-icon（20px，2026-09-25 用户裁定
-   与其他安全页面对齐——原裸 .title-icon 覆盖把页头图标也压成 16px 致
-   page-desc 28px 缩进与标题文字错位） */
-.card-title .title-icon { font-size: 16px; color: #3b82f6; }
-
-.stat-box {
-  min-height: 108px;
+/* 左右分区：左=防护三 KPI（横排大数值，竖分隔线），右=规则库竖清单。
+ * 两种信息各自形态，不再互相挤压。 */
+.status-strip { display: flex; align-items: stretch; }
+.status-guard { flex: 1 1 auto; display: flex; align-items: stretch; min-width: 0; }
+.guard-item {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 2px 28px 0;
   display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 16px;
-  border-radius: 8px;
-  border: 1px solid #f0f0f0;
-  height: 100%;
-  box-sizing: border-box;
-  transition: border-color 0.2s;
+  flex-direction: column;
+  align-items: flex-start;
 }
-.stat-box:hover { border-color: #d0d0d0; }
-.stat-box__icon {
-  flex-shrink: 0;
-  width: 40px;
-  height: 40px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 20px;
+.guard-item:first-child { padding-left: 0; }
+.strip-divider { width: 1px; background: #f0f0f0; margin: 0 32px; flex-shrink: 0; }
+.strip-label { font-size: 13px; font-weight: 600; color: var(--text-secondary); display: flex; align-items: center; }
+.strip-value {
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.25;
+  margin-top: 6px;
+  letter-spacing: 0.3px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: #303133;
 }
-.stat-box__body { flex: 1; min-width: 0; }
-.stat-box__value { font-size: 20px; font-weight: 700; line-height: 1.3; }
-.stat-box__label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
-
-.stat-box--danger .stat-box__icon { background: #fef0f0; color: #f56c6c; }
-.stat-box--danger .stat-box__value { color: #f56c6c; }
-.stat-box--warning .stat-box__icon { background: #fdf6ec; color: #e6a23c; }
-.stat-box--warning .stat-box__value { color: #e6a23c; }
-.stat-box--primary .stat-box__icon { background: #ecf5ff; color: #409eff; }
-.stat-box--primary .stat-box__value { color: #409eff; }
-.stat-box--success .stat-box__icon { background: #f0f9eb; color: #67c23a; }
-.stat-box--success .stat-box__value { color: #67c23a; }
+.strip-value.is-danger { color: #f56c6c; }
+.strip-value.is-warning { color: #e6a23c; }
+.strip-sub { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.strip-sub .proto-split-item--tcp { margin-left: 10px; }
+.strip-sub-num { color: var(--text-secondary); }
+.strip-sub:first-of-type { margin-top: 2px; }
+.strip-sub + .strip-sub { margin-top: 4px; }
+.proto-split-label { font-weight: 700; }
+/* 「昨日」文案加粗（用户裁定）：数值保持常规粗细，仅标签词加重提升对比 */
+.strip-sub-label { font-weight: 700; }
+.proto-split-item { display: inline-flex; align-items: center; gap: 4px; }
+.proto-dot { width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
+.proto-dot--http { background: #409eff; }
+.proto-dot--tcp { background: #0e7490; }
+.status-lib { flex: 0 0 430px; border-left: 1px solid #f0f0f0; padding-left: 32px; display: flex; flex-direction: column; justify-content: center; gap: 10px; }
+.lib-row { display: flex; align-items: center; gap: 8px; font-size: 13px; min-width: 0; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.status-dot.is-up { background: #67c23a; }
+.status-dot.is-down { background: #f56c6c; }
+.lib-name { color: var(--text-secondary); flex-shrink: 0; }
+.lib-ver { font-weight: 600; color: #303133; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.lib-row .el-tag { margin-left: auto; flex-shrink: 0; }
+@media (max-width: 1500px) {
+  .guard-item { padding: 4px 20px 0; }
+  .strip-divider { margin: 0 20px; }
+  .strip-value { font-size: 22px; }
+  .status-lib { flex-basis: 360px; padding-left: 20px; }
+}
+@media (max-width: 1400px) {
+  .status-strip { flex-direction: column; gap: 20px; }
+  .status-lib { border-left: none; padding-left: 0; flex-basis: auto; }
+}
 
 .chart-container { height: 260px; }
+/* 趋势与攻击类型分布同行：两卡 height:100% 拉伸等高（el-col flex 拉伸）。 */
+.charts-row .el-card { height: 100%; }
+/* 卡头「按阶段展示」checkbox 行内紧凑：高度钉到卡头标题行，不撑高卡头
+   （同行等高后，卡头高度差会把两卡内容区顶得参差）。 */
+.header-checkbox { height: 20px; margin-left: 12px; }
 .events-row .el-card { height: 100%; }
 .rate-limit-total { display: flex; align-items: baseline; justify-content: space-between; padding: 0 4px 10px; }
 .rate-limit-total .stat-label { font-size: 13px; color: var(--text-secondary); margin-bottom: 0; }

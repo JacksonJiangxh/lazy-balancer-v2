@@ -88,9 +88,12 @@ func AggregateParsedPrefixes(parsed []netip.Prefix) []netip.Prefix {
 	return merged
 }
 
-// AggregateIPEntries 同 AggregatePrefixes，字符串进出（渲染层形态）；
-// 不可解析条目原样透传在末尾（不静默削弱安全名单——引擎层对坏条目
-// fail-closed）。逐条目只解析一次。
+// AggregateIPEntries 同 AggregatePrefixes，字符串进出（渲染层形态）；不可解析
+// 条目原样透传在末尾（不静默削弱安全名单）。透传的方向语义不对称：引擎对坏行
+// 严格解析失败 → 匹配器 fail-stale，无缓存时按未命中——deny 名单=不拦、
+// allow 名单（否定算子）=全拒。因此渲染侧的威胁库文本在读取阶段已按下载口径
+// 剔除坏行（services.usableThreatTextEntries）；其他调用方传入坏行须自行承担
+// 该方向差异。逐条目只解析一次。
 func AggregateIPEntries(entries []string) []string {
 	var passthrough []string
 	parsed := make([]netip.Prefix, 0, len(entries))

@@ -2,7 +2,7 @@ package services
 
 // 规则三面同构不变量（2026-10-11 用户裁定「如果没有就都应该没有，同步后就
 // 应该一致」）：主端导出 → 从端应用落库 → 从端重建导出，rules 节哈希必须相等。
-// 第 69 轮事故根因即两处平行手写归一块不同构（导出侧漏七字段），从端重建哈希
+// 历史事故根因即两处平行手写归一块不同构（导出侧漏七字段），从端重建哈希
 // ≠主端快照哈希 → drifted 落本地口径 → 面板「分区滞后」304 稳态永不自愈。
 
 import (
@@ -14,7 +14,7 @@ import (
 
 func seedTCPDeadRow(t *testing.T) {
 	t.Helper()
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,origin_domain,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,created_at,updated_at)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,host_header,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,created_at,updated_at)
 		VALUES ('lb_iso','同构','tcp',9997,'dead.example.com','/hc',1,'gzip',128,30,1,'2026-01-01T00:00:00Z','2026-01-02 03:04:05')`); err != nil {
 		t.Fatal(err)
 	}
@@ -37,10 +37,10 @@ func TestSnapshotRules_exportNormalizesTCPDeadFields(t *testing.T) {
 			continue
 		}
 		found = true
-		if r.OriginDomain != "" || r.HealthCheckPath != "" || r.EnableCompress || r.CompressTypes != "" ||
+		if r.HostHeader != "" || r.HealthCheckPath != "" || r.EnableCompress || r.CompressTypes != "" ||
 			r.RequestBodyMaxSizeMB != 0 || r.UpstreamKeepaliveTimeout != 0 || r.ServerTokensHidden != 0 {
 			t.Fatalf("导出侧 TCP 死值未归零：host=%q hc=%q compress=%v types=%q body=%d ka=%d tokens=%d",
-				r.OriginDomain, r.HealthCheckPath, r.EnableCompress, r.CompressTypes, r.RequestBodyMaxSizeMB, r.UpstreamKeepaliveTimeout, r.ServerTokensHidden)
+				r.HostHeader, r.HealthCheckPath, r.EnableCompress, r.CompressTypes, r.RequestBodyMaxSizeMB, r.UpstreamKeepaliveTimeout, r.ServerTokensHidden)
 		}
 	}
 	if !found {

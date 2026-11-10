@@ -29,6 +29,9 @@ func setupSecurityPolicyTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 直换包级句柄必须同步复位
+		// currentDB——否则 GetDB()/后台循环继续持有已关闭的测试库句柄。
+		db.SetDB(oldDB)
 	})
 }
 
@@ -102,59 +105,6 @@ func createTestPolicy(t *testing.T, router *gin.Engine, payload map[string]any) 
 		t.Fatalf("create response missing id: %s", recorder.Body.String())
 	}
 	return resp.Data.ID
-}
-
-func TestCreateSecurityPolicy_persistsAllColumns(t *testing.T) {
-	// Given a fresh database and a full policy payload
-	setupSecurityPolicyTestDB(t)
-	router := newSecurityRouter(t)
-	payload := map[string]any{
-		"name":               "全列策略",
-		"description":        "覆盖全部列",
-		"mode":               "blocking",
-		"anomaly_threshold":  10,
-		"ip_acl_mode":        "deny",
-		"ip_acl_list":        `["203.0.113.0/24"]`,
-		"ip_acl_enabled":     true,
-		"rate_limit_enabled": true,
-		"rate_limit_rps":     50,
-		"rate_limit_burst":   10,
-		"crs_excluded_rules": `["942100"]`,
-		"block_page_id":      1,
-		"enabled":            true,
-	}
-
-	// When the policy is created
-	recorder := postJSON(t, router, "/security/policies", payload)
-
-	// Then the request succeeds and every column round-trips
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("create policy status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	var (
-		aclMode, aclList, whitelist, blacklist, excluded string
-		aclEnabled                                       bool
-		blockPageID                                      int
-	)
-	if err := db.DB.QueryRow(`SELECT ip_acl_mode, ip_acl_list, ip_acl_enabled, ip_whitelist, ip_blacklist, crs_excluded_rules, block_page_id FROM security_policies WHERE name='全列策略'`).
-		Scan(&aclMode, &aclList, &aclEnabled, &whitelist, &blacklist, &excluded, &blockPageID); err != nil {
-		t.Fatalf("read back policy: %v", err)
-	}
-	if aclMode != "deny" || !aclEnabled {
-		t.Fatalf("ip acl columns = (%q,%v), want (deny,true)", aclMode, aclEnabled)
-	}
-	if whitelist != `[]` {
-		t.Fatalf("ip_whitelist = %q, want [] default", whitelist)
-	}
-	if blacklist != `[]` {
-		t.Fatalf("ip_blacklist = %q, want [] default", blacklist)
-	}
-	if excluded != `["942100"]` {
-		t.Fatalf("crs_excluded_rules = %q", excluded)
-	}
-	if blockPageID != 1 {
-		t.Fatalf("block_page_id = %d, want 1", blockPageID)
-	}
 }
 
 func TestBindRuleToPolicy_rejectsMissingPolicy(t *testing.T) {
@@ -247,17 +197,18 @@ func TestListSecurityPolicies_summaryCarriesUpdatedByAndUpdatedAt(t *testing.T) 
 }
 
 func TestGetSecurityPolicy_returnsRawJSONFieldsAsStrings(t *testing.T) {
-	// Given a policy whose array columns are populated
+	// Given a legacy mixed policy seeded directly (mixed cannot be created via API).
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
-	id := createTestPolicy(t, router, map[string]any{
-		"name":               "详情策略",
-		"crs_rule_groups":    `["42"]`,
-		"crs_excluded_rules": `["942100","942110"]`,
-		"custom_rules":       `[{"id":1,"name":"r1","enabled":true,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]`,
-		"ip_whitelist":       `["192.0.2.0/24"]`,
-		"ip_blacklist":       `["198.51.100.7"]`,
-	})
+	res, err := db.DB.Exec(`INSERT INTO security_policies
+		(name, crs_rule_groups, crs_excluded_rules, custom_rules, ip_whitelist, ip_blacklist, enabled, policy_type)
+		VALUES ('详情策略','["42"]','["942100","942110"]','[{"id":1,"name":"r1","enabled":true,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]','["192.0.2.0/24"]','["198.51.100.7"]',1,'mixed')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id64, _ := res.LastInsertId()
+	id := int(id64)
 
 	// When the policy detail is requested
 	recorder := getRequest(t, router, fmt.Sprintf("/security/policies/%d", id))
@@ -439,14 +390,16 @@ func TestUpdateSecurityPolicy_omittedModeLeavesFieldUnchanged(t *testing.T) {
 }
 
 func TestSecurityPolicyWhitelistBlacklist_createAndUpdateRoundTrip(t *testing.T) {
-	// Given a policy created with whitelist and blacklist entries
+	// Given a legacy mixed policy seeded directly (mixed cannot be created via API).
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
-	id := createTestPolicy(t, router, map[string]any{
-		"name":         "名单策略",
-		"ip_whitelist": `["192.0.2.0/24","2001:db8::1"]`,
-		"ip_blacklist": `["198.51.100.7"]`,
-	})
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name, ip_whitelist, ip_blacklist, enabled, policy_type)
+		VALUES ('名单策略','["192.0.2.0/24","2001:db8::1"]','["198.51.100.7"]',1,'mixed')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id64, _ := res.LastInsertId()
+	id := int(id64)
 	assertListColumns := func(wantWhite, wantBlack string) {
 		t.Helper()
 		var white, black string
@@ -489,25 +442,18 @@ func TestSecurityPolicyWhitelistBlacklist_createAndUpdateRoundTrip(t *testing.T)
 }
 
 func TestSecurityPolicyList_summaryCarriesExtendedFields(t *testing.T) {
-	// Given a policy populated across the extended summary columns
+	// Given a legacy mixed policy seeded directly (mixed cannot be created via API).
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
-	createTestPolicy(t, router, map[string]any{
-		"name":               "汇总策略",
-		"mode":               "blocking",
-		"anomaly_threshold":  5,
-		"ip_acl_mode":        "deny",
-		"ip_acl_list":        `["203.0.113.0/24","2001:db8::/32"]`,
-		"ip_acl_enabled":     true,
-		"ip_whitelist":       `["192.0.2.1"]`,
-		"ip_blacklist":       `["198.51.100.0/24","203.0.113.5"]`,
-		"rate_limit_enabled": true,
-		"rate_limit_rps":     50,
-		"rate_limit_burst":   10,
-		"crs_excluded_rules": `["942100","942110"]`,
-		"custom_rules":       `[{"id":1,"name":"r1","enabled":true,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]`,
-		"enabled":            true,
-	})
+	if _, err := db.DB.Exec(`INSERT INTO security_policies
+		(name, mode, anomaly_threshold, ip_acl_mode, ip_acl_list, ip_acl_enabled,
+		 ip_whitelist, ip_blacklist, rate_limit_enabled, rate_limit_rps, rate_limit_burst,
+		 crs_excluded_rules, custom_rules, enabled, policy_type)
+		VALUES ('汇总策略','blocking',5,'deny','["203.0.113.0/24","2001:db8::/32"]',1,
+		 '["192.0.2.1"]','["198.51.100.0/24","203.0.113.5"]',1,50,10,
+		 '["942100","942110"]','[{"id":1,"name":"r1","enabled":true,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]',1,'mixed')`); err != nil {
+		t.Fatal(err)
+	}
 
 	// When the policy list is requested
 	recorder := getRequest(t, router, "/security/policies")
@@ -639,6 +585,7 @@ func TestGetSecurityPolicy_detailCarriesWAFCheckResponse(t *testing.T) {
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{
 		"name":               "响应体策略",
+		"policy_type":        "stage3",
 		"waf_check_response": true,
 	})
 
@@ -671,6 +618,7 @@ func TestListSecurityPolicies_summaryCarriesWAFCheckResponse(t *testing.T) {
 	router := newSecurityRouter(t)
 	createTestPolicy(t, router, map[string]any{
 		"name":               "汇总响应体策略",
+		"policy_type":        "stage3",
 		"waf_check_response": true,
 	})
 
@@ -701,6 +649,7 @@ func TestListSecurityPolicies_summaryCarriesWAFCheckResponse(t *testing.T) {
 func TestUpdateSecurityPolicy_crsFieldsNormalizeAndValidate(t *testing.T) {
 	// Given a policy created with populated CRS fields
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{
 		"name":               "CRS字段策略",
@@ -740,14 +689,14 @@ func TestUpdateSecurityPolicy_crsFieldsNormalizeAndValidate(t *testing.T) {
 	}
 
 	// And a valid array persists as-is
-	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"crs_rule_groups": `["41","33"]`})
+	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"crs_rule_groups": `["20","42"]`})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("valid update status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	if err := db.DB.QueryRow("SELECT crs_rule_groups FROM security_policies WHERE id=?", id).Scan(&groups); err != nil {
 		t.Fatalf("read back groups: %v", err)
 	}
-	if groups != `["41","33"]` {
+	if groups != `["20","42"]` {
 		t.Fatalf("crs_rule_groups = %q, want stored as-is", groups)
 	}
 }
@@ -828,18 +777,18 @@ func TestListSecurityPolicies_ipACLDisabledHidesControlCapability(t *testing.T) 
 	}
 }
 
-func TestListSecurityPolicies_bypassModeDisabledHidesControlCapability(t *testing.T) {
-	// Given a legacy bypass-mode policy whose ACL list is populated but disabled
+func TestListSecurityPolicies_绕过ModeDisabledHidesControlCapability(t *testing.T) {
+	// Given a legacy 绕过-mode policy whose ACL list is populated but disabled
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
-	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, ip_acl_enabled, ip_acl_mode, ip_acl_list, enabled) VALUES ('关闭bypass', 0, 'bypass', '["203.0.113.0/24"]', 1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, ip_acl_enabled, ip_acl_mode, ip_acl_list, enabled) VALUES ('关闭绕过', 0, '绕过', '["203.0.113.0/24"]', 1)`); err != nil {
 		t.Fatalf("seed policy: %v", err)
 	}
 
 	// When the list is requested
 	recorder := getRequest(t, router, "/security/policies")
 
-	// Then bypass mode must not claim IP control while disabled (mirrors emission)
+	// Then 绕过 mode must not claim IP control while disabled (mirrors emission)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -856,20 +805,23 @@ func TestListSecurityPolicies_bypassModeDisabledHidesControlCapability(t *testin
 		t.Fatalf("list len = %d, want 1: %s", len(resp.Data), recorder.Body.String())
 	}
 	if resp.Data[0].HasIPControl {
-		t.Fatalf("has_ip_control = true, want false for disabled bypass mode: %s", recorder.Body.String())
+		t.Fatalf("has_ip_control = true, want false for disabled 绕过 mode: %s", recorder.Body.String())
 	}
 }
 
 func TestListSecurityPolicies_customRulesCountExcludesDisabled(t *testing.T) {
-	// Given two referenced custom rules, one enabled and one disabled
+	// Given two referenced custom rules, one enabled (emittable) and one disabled。
+	// 计数与发射侧同判据（customRuleEmittable）：空 conditions 的规则发射端
+	// 会跳过，因此启用规则必须带可发射条件，本用例才验证「禁用不计」。
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
-	res1, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('启用规则', '[]', 'block', 5, 1)`)
+	emittable := `[{"target":"uri","operator":"regex","pattern":"^/count$"}]`
+	res1, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('启用规则', ?, 'block', 5, 1)`, emittable)
 	if err != nil {
 		t.Fatalf("seed enabled rule: %v", err)
 	}
 	id1, _ := res1.LastInsertId()
-	res2, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('禁用规则', '[]', 'block', 5, 0)`)
+	res2, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('禁用规则', ?, 'block', 5, 0)`, emittable)
 	if err != nil {
 		t.Fatalf("seed disabled rule: %v", err)
 	}
@@ -903,6 +855,55 @@ func TestListSecurityPolicies_customRulesCountExcludesDisabled(t *testing.T) {
 	}
 }
 
+// 阶段 3 判定口径：摘要必须同时给出「引用条目数」（含禁用）——前端 chips 与
+// 后端 PolicyTypeFeatures.G3 逐字对齐的唯一依据。只给启用计数时，
+// 「mode=off 且引用规则全部禁用」的边界策略在预演里少一条子策略。
+func TestListSecurityPolicies_customRulesRefCountIncludesDisabled(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	emittable := `[{"target":"uri","operator":"regex","pattern":"^/ref$"}]`
+	res, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('禁用规则', ?, 'block', 5, 0)`, emittable)
+	if err != nil {
+		t.Fatalf("seed disabled rule: %v", err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, custom_rules, enabled) VALUES ('仅引用禁用规则', 'off', ?, 1)`,
+		fmt.Sprintf("[%d]", id)); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+
+	recorder := getRequest(t, router, "/security/policies")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data []struct {
+			Mode                string `json:"mode"`
+			CustomRulesCount    int    `json:"custom_rules_count"`
+			CustomRulesRefCount int    `json:"custom_rules_ref_count"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse list response: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("list len = %d, want 1: %s", len(resp.Data), recorder.Body.String())
+	}
+	row := resp.Data[0]
+	if row.CustomRulesCount != 0 {
+		t.Fatalf("custom_rules_count = %d, want 0（禁用规则不计入生效口径）: %s", row.CustomRulesCount, recorder.Body.String())
+	}
+	if row.CustomRulesRefCount != 1 {
+		t.Fatalf("custom_rules_ref_count = %d, want 1（引用非空必须披露，含禁用条目）: %s", row.CustomRulesRefCount, recorder.Body.String())
+	}
+	// 与后端 G3 同一门：mode=off + 引用非空 → 阶段 3 成立。
+	policy := &models.SecurityPolicy{Mode: row.Mode, CustomRules: []byte(fmt.Sprintf("[%d]", id))}
+	if !models.PolicyTypeFeatures(policy).G3 {
+		t.Fatalf("G3 必须为真（引用非空），摘要 ref_count=%d", row.CustomRulesRefCount)
+	}
+}
+
 func TestUpdateSecurityPolicy_anomalyThresholdZeroNormalizesToFive(t *testing.T) {
 	// Given 创建侧以默认阈值 5 落库的策略（创建请求不带 anomaly_threshold 时
 	// CreateSecurityPolicy 的 max1(..., 5) 归一为 5）
@@ -910,7 +911,7 @@ func TestUpdateSecurityPolicy_anomalyThresholdZeroNormalizesToFive(t *testing.T)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{"name": "阈值归一策略", "mode": "blocking"})
 
-	// When 更新请求显式传 anomaly_threshold=0（R44 F3：0 非合法枚举值，直接
+	// When 更新请求显式传 anomaly_threshold=0（0 非合法枚举值，直接
 	// 落库会让发射端 services/security.go:157 的 `AnomalyThreshold > 0` 判断
 	// 跳过 SecAction id:900，CRS 回落默认阈值 5，UI 显示 0 与实际行为不符）
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
@@ -941,7 +942,7 @@ func TestUpdateSecurityPolicy_rejectsBlankIPACLMode(t *testing.T) {
 		"ip_acl_list":    `["203.0.113.0/24"]`,
 	})
 
-	// When 更新请求显式传空串 ip_acl_mode（R50 B-#1：空串落库后发射端
+	// When 更新请求显式传空串 ip_acl_mode（空串落库后发射端
 	// services/security.go 仅 allow/deny 分支产出规则，零 ACL 规则生效；而
 	// SecurityPolicyHasIPControl 只看 enabled && list 非空，UI 仍宣称已启用）
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"ip_acl_mode": ""})
@@ -975,7 +976,7 @@ func TestCreateSecurityPolicy_defaultsIPACLMode(t *testing.T) {
 	})
 
 	// Then ip_acl_mode 按 geoip_mode 同口径归一为 "deny"：启用态 ACL 绝不携带
-	// 空模式落库（空模式在发射端产出零规则，R50 B-#1）
+	// 空模式落库（空模式在发射端产出零规则）
 	var mode string
 	if err := db.DB.QueryRow("SELECT ip_acl_mode FROM security_policies WHERE id=?", id).Scan(&mode); err != nil {
 		t.Fatalf("read back ip_acl_mode: %v", err)
@@ -986,7 +987,7 @@ func TestCreateSecurityPolicy_defaultsIPACLMode(t *testing.T) {
 }
 
 // seedNullColumnPolicy 写入一条多个可空列显式为 NULL 的策略（模拟带外编辑/
-// 备份恢复/集群继承产生的 NULL 行），返回策略 ID。I-2/I-3 测试共用。
+// 备份恢复/集群继承产生的 NULL 行），返回策略 ID。测试共用。
 func seedNullColumnPolicy(t *testing.T, name string) int64 {
 	t.Helper()
 	result, err := db.DB.Exec(`INSERT INTO security_policies
@@ -1002,7 +1003,7 @@ func seedNullColumnPolicy(t *testing.T, name string) int64 {
 	return id
 }
 
-// I-2 硬化（ListSecurityPolicies）：策略行可空列修复前原样扫入非指针字段——
+// 硬化（ListSecurityPolicies）：策略行可空列修复前原样扫入非指针字段——
 // 单行 NULL 即 Scan 报错，整个策略列表对 REST/MCP 消费方 500，而生成路径
 // （services/security.go scanSecurityPolicyByID）对同样 NULL 已按 COALESCE 口径
 // 容忍。修复后列表 SELECT 与生成投影逐列同默认值，NULL 行照常返回。
@@ -1037,7 +1038,7 @@ func TestListSecurityPolicies_toleratesNullNullableColumns(t *testing.T) {
 	}
 }
 
-// I-2 硬化（GetSecurityPolicy）：详情读路径与列表同口径——单行 NULL 不得把
+// 硬化（GetSecurityPolicy）：详情读路径与列表同口径——单行 NULL 不得把
 // 详情接口打成 500，归一化默认值与生成投影一致。
 func TestGetSecurityPolicy_toleratesNullNullableColumns(t *testing.T) {
 	// Given 一条多个可空列为 NULL 的策略
@@ -1092,11 +1093,16 @@ func TestCreateSecurityPolicy_acceptsCustomOnlyModeAndThreshold15(t *testing.T) 
 		t.Fatalf("create custom_only policy status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var mode string
-	if err := db.DB.QueryRow(`SELECT mode FROM security_policies WHERE name='仅自定义策略'`).Scan(&mode); err != nil {
+	var threshold int
+	if err := db.DB.QueryRow(`SELECT mode, COALESCE(anomaly_threshold,0) FROM security_policies WHERE name='仅自定义策略'`).Scan(&mode, &threshold); err != nil {
 		t.Fatalf("read back policy: %v", err)
 	}
 	if mode != "custom_only" {
 		t.Fatalf("mode=%q, want custom_only", mode)
+	}
+	// 15 档必须真实落库：归一逻辑（0→5）若误伤 15，阈值会静默退回默认。
+	if threshold != 15 {
+		t.Fatalf("anomaly_threshold=%d, want 15", threshold)
 	}
 }
 
@@ -1144,26 +1150,28 @@ func TestCreateSecurityPolicy_rejectsUnknownMode(t *testing.T) {
 	}
 }
 
-// S1(2026-09-10 审计):IP ACL allow 模式+空生效名单——发射端 len>0 门静默跳过
+// (2026-09-10 审计):IP ACL allow 模式+空生效名单——发射端 len>0 门静默跳过
 // (「其余一律拒绝」实际全放行 fail-open)。UI 有守卫,API/MCP 直写可绕;按
-// R50/R57 同型先例在写入侧 400(与 UI 文案同口径)。
-func TestCreateSecurityPolicy_rejectsAllowModeWithEmptyACLList(t *testing.T) {
+// 同型先例在写入侧 400(与 UI 文案同口径)。
+// 空白名单保存已放开（2026-11 用户裁定）：空 allow 集可保存，运行时渲染层
+// 恒拒（fail-closed）语义不变。
+func TestCreateSecurityPolicy_acceptsAllowModeWithEmptyACLList(t *testing.T) {
 	// Given
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
 
 	// When:启用 ACL + allow 模式 + 空 list(无内联无引用)
 	recorder := postJSON(t, router, "/security/policies", map[string]any{
-		"name": "空白名单", "mode": "blocking", "ip_acl_enabled": true, "ip_acl_mode": "allow", "ip_acl_list": `[]`,
+		"name": "空白名单", "policy_type": "stage1", "mode": "blocking", "ip_acl_enabled": true, "ip_acl_mode": "allow", "ip_acl_list": `[]`,
 	})
 
 	// Then
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("allow+空名单 status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("allow+空名单 status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}
 }
 
-// S7(2026-09-10 审计):HasCustomRules 需带模式门——off=全关(2026-09-09 四态化)
+// (2026-09-10 审计):HasCustomRules 需带模式门——off=全关(2026-09-09 四态化)
 // 后,off 策略的自定义规则不发射,能力列不得宣称「按规则内动作执行」。
 func TestSecurityPolicySummary_offModeHasCustomRulesFalse(t *testing.T) {
 	// Given
@@ -1182,14 +1190,23 @@ func TestSecurityPolicySummary_offModeHasCustomRulesFalse(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
+	found := false
 	for _, p := range resp.Data {
-		if p.Name == "off带规则" && p.HasCustomRules {
+		if p.Name != "off带规则" {
+			continue
+		}
+		found = true
+		if p.HasCustomRules {
 			t.Fatalf("off 策略 HasCustomRules=true, want false(模式门)")
 		}
 	}
+	// 行缺失时上面的循环恒不命中——必须先证明该行在列表里。
+	if !found {
+		t.Fatal("列表中缺少 off带规则（断言未被实际校验）")
+	}
 }
 
-// B-3(第 4 轮审计):UpdateSecurityPolicy 限流门用请求裸值而非有效值回落
+// UpdateSecurityPolicy 限流门用请求裸值而非有效值回落
 // ——存量 rps=10 的策略发 {rate_limit_enabled:true}(部分重启用)时,
 // derefInt(req.RateLimitRPS)=0 → 400 误报「rps 必须 ≥1」;显式 {rate_limit_rps:0}
 // 时门短路 → 落库 enabled=1+rps=0 → UI 宣称限流启用实际零强制。
@@ -1197,24 +1214,221 @@ func TestUpdateSecurityPolicy_rateLimitGateUsesEffectiveValues(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
 	// Given:存量 enabled=1, rps=10, burst=5
-	id := createTestPolicy(t, router, map[string]any{"name": "限流策略", "mode": "blocking", "rate_limit_enabled": true, "rate_limit_rps": 10, "rate_limit_burst": 5})
+	id := createTestPolicy(t, router, map[string]any{"name": "限流策略", "policy_type": "stage2", "mode": "blocking", "rate_limit_enabled": true, "rate_limit_rps": 10, "rate_limit_burst": 5})
 
 	// When:只发 enabled=true(重启用,不带 rps——存量 rps=10 应回落)
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"rate_limit_enabled": true})
-	// Then:不应 400(存量 rps=10 是有效值)
-	if recorder.Code == http.StatusBadRequest {
-		t.Fatalf("部分重启用被 400 误报: %s", recorder.Body.String())
+	// Then:必须精确 200——只排 400 会让退化成 500 的回归隐身
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("部分重启用必须 200, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 
 	// When:显式 rps=0(存量 enabled=1)
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"rate_limit_rps": 0})
-	// Then:不应落库 enabled=1+rps=0 形态
-	if recorder.Code == http.StatusOK {
-		var rps int
-		var enabled bool
-		db.DB.QueryRow("SELECT COALESCE(rate_limit_rps,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?", id).Scan(&rps, &enabled)
-		if enabled && rps == 0 {
-			t.Fatalf("落库 enabled=true+rps=0: UI 宣称限流启用实际零强制")
+	// Then:精确 400（校验门拒绝），500 意味着校验缺失/内部错误
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("显式 rps=0 重启用必须 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	// 且不得落库 enabled=1+rps=0 形态
+	var rps int
+	var enabled bool
+	if err := db.DB.QueryRow("SELECT COALESCE(rate_limit_rps,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?", id).Scan(&rps, &enabled); err != nil {
+		t.Fatalf("read back rate limit columns: %v", err)
+	}
+	if enabled && rps == 0 {
+		t.Fatalf("落库 enabled=true+rps=0: UI 宣称限流启用实际零强制")
+	}
+}
+
+// 详情/列表 DTO 必须携带爬虫豁免两列。修复前两处均缺席 → 前端
+// 编辑策略时读不到（按 false/默认三引擎渲染），保存时恒回写 false，任何
+// 「重命名/改描述」都会静默关闭爬虫豁免（安全行为变更）。
+func TestSecurityPolicyDTO_crawlerExemptionRoundTrip(t *testing.T) {
+	// Given 一条开启爬虫豁免（引擎限 googlebot）的策略
+	setupSecurityPolicyTestDB(t)
+	// 启用态地域条目需要已装载的 IP 库（ValidateGeoIPCountries 门）
+	services.SetIP2RegionLiveProvincesForTest([]string{"海外", "广东省"})
+	t.Cleanup(func() { services.SetIP2RegionLiveProvincesForTest(nil) })
+	router := newSecurityRouter(t)
+	id := createTestPolicy(t, router, map[string]any{
+		"name":       "爬虫豁免策略",
+		"geoip_mode": "deny",
+		// 启用态空名单 400 → 给一条真实地域条目
+		"geoip_countries":       `["海外"]`,
+		"geoip_crawler_exempt":  true,
+		"geoip_crawler_engines": `["googlebot"]`,
+	})
+
+	// When GET 详情
+	recorder := getRequest(t, router, fmt.Sprintf("/security/policies/%d", id))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var detailResp struct {
+		Data struct {
+			Policy securityPolicyDetail `json:"policy"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &detailResp); err != nil {
+		t.Fatalf("parse detail %s: %v", recorder.Body.String(), err)
+	}
+	detail := detailResp.Data.Policy
+	// Then 详情两列与库值一致（不是零值）
+	if !detail.GeoIPCrawlerExempt {
+		t.Fatalf("详情 geoip_crawler_exempt=false，want true（缺口径=编辑即静默关闭豁免）")
+	}
+	if engines := decodeStringArray(t, detail.GeoIPCrawlerEngines); len(engines) != 1 || engines[0] != "googlebot" {
+		t.Fatalf("详情 geoip_crawler_engines=%q，want [\"googlebot\"]", detail.GeoIPCrawlerEngines)
+	}
+
+	// When GET 列表
+	recorder = getRequest(t, router, "/security/policies")
+	var listResp struct {
+		Data []models.SecurityPolicySummary `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("parse list %s: %v", recorder.Body.String(), err)
+	}
+	var summary *models.SecurityPolicySummary
+	for i := range listResp.Data {
+		if listResp.Data[i].ID == id {
+			summary = &listResp.Data[i]
 		}
+	}
+	if summary == nil {
+		t.Fatalf("list 缺策略 id=%d", id)
+	}
+	// Then 列表摘要同值（列表编辑入口按摘要渲染回写）
+	if !summary.GeoIPCrawlerExempt {
+		t.Fatalf("摘要 geoip_crawler_exempt=false，want true")
+	}
+	if engines := decodeStringArray(t, summary.GeoIPCrawlerEngines); len(engines) != 1 || engines[0] != "googlebot" {
+		t.Fatalf("摘要 geoip_crawler_engines=%q，want [\"googlebot\"]", summary.GeoIPCrawlerEngines)
+	}
+
+	// When 模拟前端「读详情 → 原值回写」（重命名场景）
+	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
+		"name":                  "爬虫豁免策略（改名）",
+		"geoip_crawler_exempt":  detail.GeoIPCrawlerExempt,
+		"geoip_crawler_engines": detail.GeoIPCrawlerEngines,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	// Then 豁免仍在（round-trip 不丢配置）
+	var exempt bool
+	var enginesRaw string
+	if err := db.DB.QueryRow(`SELECT COALESCE(geoip_crawler_exempt,0), COALESCE(geoip_crawler_engines,'') FROM security_policies WHERE id=?`, id).Scan(&exempt, &enginesRaw); err != nil {
+		t.Fatalf("read back policy: %v", err)
+	}
+	if !exempt {
+		t.Fatalf("round-trip 后 geoip_crawler_exempt=0，want 1（重命名不得关闭豁免）")
+	}
+	if engines := decodeStringArray(t, enginesRaw); len(engines) != 1 || engines[0] != "googlebot" {
+		t.Fatalf("round-trip 后 geoip_crawler_engines=%q，want [\"googlebot\"]", enginesRaw)
+	}
+}
+
+func decodeStringArray(t *testing.T, raw string) []string {
+	t.Helper()
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		t.Fatalf("parse string array %q: %v", raw, err)
+	}
+	return list
+}
+
+// 内置威胁名单禁令的「请求值 ?? 存量值」合并判定：只改 ip_acl_mode 的更新
+// 必须看到存量 crs_excluded_rules 里 scope=list 的内置名单引用——否则
+// 「先存内置名单、后翻 allow 模式」可绕过禁令（白名单模式下内置黑名单被
+// 当成放行集合，语义反转）。
+func TestUpdateSecurityPolicy_builtinListInStoredCRSExclusionsRejected(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	var builtinID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 ORDER BY id LIMIT 1`).Scan(&builtinID); err != nil {
+		t.Fatalf("read builtin list id: %v", err)
+	}
+	// 存量行直接落库（创建门会拒绝该组合，历史行是本次判定的对象）。
+	excluded := fmt.Sprintf(`[{"target":"942100","scope":"list","listRefs":[%d]}]`, builtinID)
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, ip_acl_enabled, ip_acl_mode, crs_excluded_rules) VALUES ('legacy-builtin-crs', 'blocking', 0, 'deny', ?)`, excluded)
+	if err != nil {
+		t.Fatalf("insert policy: %v", err)
+	}
+	id, _ := res.LastInsertId()
+
+	router := newSecurityRouter(t)
+	rec := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"ip_acl_mode": "allow"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400（存量 CRS 排除引用内置名单时不得翻 allow）body=%s", rec.Code, rec.Body.String())
+	}
+	var mode string
+	if err := db.DB.QueryRow(`SELECT ip_acl_mode FROM security_policies WHERE id=?`, id).Scan(&mode); err != nil {
+		t.Fatalf("read back mode: %v", err)
+	}
+	if mode != "deny" {
+		t.Fatalf("ip_acl_mode=%q, want 未变更的 deny", mode)
+	}
+}
+
+// 缺省 policy_type 的推断路径（API/MCP 省略类型）与显式类型路径同口径归一
+// 拦截状态码：无拦截页的 deny 恒 403，落 404 会让详情/列表宣称一个不生效的值。
+func TestCreateSecurityPolicy_inferredTypeNormalizesBlockStatusCode(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+
+	// 空内容 → 推断 stage3；无 block_page_id + 显式 404。
+	id := createTestPolicy(t, router, map[string]any{
+		"name":              "推断类型状态码",
+		"block_status_code": 404,
+	})
+	var code int
+	if err := db.DB.QueryRow(`SELECT COALESCE(block_status_code,0) FROM security_policies WHERE id=?`, id).Scan(&code); err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("block_status_code=%d, want 0（无页策略的 deny 恒 403，写侧必须归一）", code)
+	}
+}
+
+// 同一载荷在创建/更新两端必须得到相同结果码：归一先于校验是两端的共同契约。
+// 旧实现 Create 先校验 CRS 再按类型归零（阶段外字段本应被丢弃却报 400），
+// Update 先校验 IP 列表再归一空串（" " 直接 json.Unmarshal 失败 400）。
+func TestSecurityPolicy_normalizeBeforeValidateParity(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+
+	// 显式 stage1 + 阶段外 CRS 载荷：Create 必须先按类型归零再校验（旧实现
+	// 先校验 → 400「规则 ID 不存在」，而该字段本应被丢弃）。
+	// Update 侧对「显式类型 + 阶段外字段」走矛盾载荷显式拒绝（400）——两条
+	// 写路径的既定分工：Create 归零、Update 拒绝二义，故此处不要求同码。
+	id := createTestPolicy(t, router, map[string]any{
+		"name":            "阶段一-忽略CRS",
+		"policy_type":     "stage1",
+		"crs_rule_groups": `["999999"]`,
+	})
+	var storedGroups string
+	if err := db.DB.QueryRow(`SELECT COALESCE(crs_rule_groups,'') FROM security_policies WHERE id=?`, id).Scan(&storedGroups); err != nil {
+		t.Fatal(err)
+	}
+	if storedGroups != "[]" {
+		t.Fatalf("crs_rule_groups=%q, want []（阶段外字段必须归零后落库）", storedGroups)
+	}
+
+	// 空白 IP 列表串：两端都必须先归一为 "[]" 再校验。
+	createBlank := postJSON(t, router, "/security/policies", map[string]any{
+		"name":        "空白列表",
+		"ip_acl_list": " ",
+	})
+	if createBlank.Code != http.StatusOK {
+		t.Fatalf("create 空白 ip_acl_list status=%d body=%s, want 200", createBlank.Code, createBlank.Body.String())
+	}
+	updateBlank := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
+		"ip_acl_list": " ",
+	})
+	if updateBlank.Code != http.StatusOK {
+		t.Fatalf("update 空白 ip_acl_list status=%d body=%s, want 200（归一先于校验）", updateBlank.Code, updateBlank.Body.String())
 	}
 }

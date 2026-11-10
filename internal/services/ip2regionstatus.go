@@ -2,8 +2,6 @@ package services
 
 import (
 	"time"
-
-	"lazy-balancer-v2/internal/db"
 )
 
 type ip2RegionTaskState struct {
@@ -37,26 +35,38 @@ func (m *IP2RegionUpdateManager) StatusSnapshot() IP2RegionUpdateStatusSnapshot 
 	return ip2RegionStoredStatusSnapshot()
 }
 
+// setSlotAdvanceError 记录「本轮排程槽未推进」的原因（排程不可读，或状态行
+// 写入失败连带槽一起没落地）——任务引擎 Run 体据此把本轮按失败返回（更新
+// 本身可能已成功；失败的是调度契约，引擎需要失败才能退避重投同一槽，而不是
+// 把本槽记入消费水位）。
+func (m *IP2RegionUpdateManager) setSlotAdvanceError(err error) {
+	m.slots.set(err, ip2RegionUpdateLogFamily)
+}
+
+// ScheduleSlotError 本运行成功落库但排程槽未推进的原因（nil=槽已推进或本轮
+// 未成功）。驱动任务引擎 Run 体在状态为 success 时复核：非 nil 时返回该错误。
+func (m *IP2RegionUpdateManager) ScheduleSlotError() error {
+	return m.slots.get()
+}
+
 func ip2RegionStoredStatusSnapshot() IP2RegionUpdateStatusSnapshot {
-	var stored struct {
-		status, trigger, startedAt, finishedAt, message, version string
-	}
-	err := db.DB.QueryRow(`SELECT COALESCE(update_status,'idle'), COALESCE(trigger,''),
-		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(message,''), version
-		FROM security_ip2region_version WHERE id=1`).
-		Scan(&stored.status, &stored.trigger, &stored.startedAt, &stored.finishedAt, &stored.message, &stored.version)
+	// 半初始化（db.DB=nil）降级 idle（同 crsstatus 口径）。
+	row, ok, err := versionTableStatusRowOf("security_ip2region_version")
 	if err != nil {
-		// 同 crsstatus 口径（第 56 轮 P5）：失败留 warn 后回退 idle。
+		// 同 crsstatus 口径：失败留 warn 后回退 idle。
 		Logf("warn", "IP2Region 状态: 读取存储快照失败，回退 idle: %v", err)
+	}
+	if !ok {
 		return IP2RegionUpdateStatusSnapshot{Status: string(IP2RegionStatusIdle)}
 	}
+	status, message := ProjectActiveUpdateStatusForLocalRole(row.status, row.message)
 	return IP2RegionUpdateStatusSnapshot{
-		Status:     stored.status,
-		Trigger:    stored.trigger,
-		StartedAt:  stored.startedAt,
-		FinishedAt: stored.finishedAt,
-		Message:    stored.message,
-		Version:    stored.version,
+		Status:     status,
+		Trigger:    row.trigger,
+		StartedAt:  row.startedAt,
+		FinishedAt: row.finishedAt,
+		Message:    message,
+		Version:    row.version,
 	}
 }
 

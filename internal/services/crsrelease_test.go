@@ -6,18 +6,28 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
 
 // buildCRSTarball builds an in-memory tar.gz mimicking a GitHub release
 // tarball: every entry is prefixed with a single root directory.
+// 条目按名字排序写入——map 迭代顺序随机会让同输入的字节（size/digest）逐次
+// 不同，TOFU 基线与尺寸类断言不可复现。
 func buildCRSTarball(t *testing.T, files map[string]string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gw)
-	for name, content := range files {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		content := files[name]
 		hdr := &tar.Header{Name: name, Mode: 0644, Size: int64(len(content))}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatalf("WriteHeader(%s): %v", name, err)
@@ -162,7 +172,7 @@ func TestParseGitHubLatestTag(t *testing.T) {
 }
 
 func TestExtractCRSTarball_stripsRootAndExtracts(t *testing.T) {
-	// Given a GitHub-style tarball with a single root directory
+	// Given a tarball with a single root directory
 	tarball := buildCRSTarball(t, map[string]string{
 		"coreruleset-4.15.0/crs-setup.conf.example":    "# setup",
 		"coreruleset-4.15.0/rules/REQUEST-900.conf":    "SecRule 1",
@@ -206,4 +216,112 @@ func TestExtractCRSTarball_rejectsPathTraversal(t *testing.T) {
 	if err := extractCRSTarball(src, t.TempDir()); err == nil {
 		t.Fatal("extractCRSTarball()=nil, want error for path traversal entry")
 	}
+}
+
+// 绝对路径条目必须被 stripTarRoot 显性拒绝（不得依赖后续 Join 前缀兜底——
+// IsAbs 门是与「相对路径前缀」分离的第一道契约）。
+func TestStripTarRoot_rejectsAbsoluteEntry(t *testing.T) {
+	if _, err := stripTarRoot("/etc/passwd"); err == nil || !strings.Contains(err.Error(), "绝对路径") {
+		t.Fatalf("绝对路径条目必须被拒绝, err=%v", err)
+	}
+	if _, err := stripTarRoot("root/rules/ok.conf"); err != nil {
+		t.Fatalf("合法条目被拒: %v", err)
+	}
+}
+
+// 非 TypeReg/TypeDir 条目（符号链接等）被静默跳过——不得把链接目标当普通
+// 文件写入，也不得因跳过而中断整包解压。
+func TestExtractCRSTarball_skipsNonRegularEntries(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	writeHeader := func(hdr *tar.Header) {
+		t.Helper()
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeHeader(&tar.Header{Name: "root/", Typeflag: tar.TypeDir, Mode: 0755})
+	writeHeader(&tar.Header{Name: "root/link.conf", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd", Mode: 0777})
+	content := []byte("SecRule ok")
+	writeHeader(&tar.Header{Name: "root/rules/ok.conf", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(content))})
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "crs.tar.gz")
+	if err := os.WriteFile(src, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+
+	if err := extractCRSTarball(src, dest); err != nil {
+		t.Fatalf("非普通条目应被跳过而非中断解压: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "link.conf")); !os.IsNotExist(err) {
+		t.Fatalf("符号链接条目必须被跳过, err=%v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dest, "rules", "ok.conf")); err != nil || string(got) != "SecRule ok" {
+		t.Fatalf("普通文件应正常落盘: %q err=%v", got, err)
+	}
+}
+
+// 字节门不覆盖 0 字节条目与目录头：海量空条目/目录头会在 staging 建海量
+// inode 并让失败路径逐条删除。文件数/目录数门必须与字节门并行执法。
+func TestExtractCRSTarball_rejectsEntryCountOverLimit(t *testing.T) {
+	build := func(t *testing.T, entries []tarEntry) string {
+		t.Helper()
+		src := filepath.Join(t.TempDir(), "crs.tar.gz")
+		if err := os.WriteFile(src, rawTarGz(t, entries), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return src
+	}
+
+	t.Run("file count", func(t *testing.T) {
+		entries := make([]tarEntry, 0, crsExtractMaxFiles+1)
+		for i := 0; i <= crsExtractMaxFiles; i++ {
+			entries = append(entries, tarEntry{name: "root/rules/" + entryCountName(i)})
+		}
+		err := extractCRSTarball(build(t, entries), t.TempDir())
+		if err == nil || !strings.Contains(err.Error(), "文件条目数超过上限") {
+			t.Fatalf("error=%v, want file-count rejection", err)
+		}
+	})
+
+	t.Run("dir count", func(t *testing.T) {
+		entries := make([]tarEntry, 0, crsExtractMaxDirs+1)
+		for i := 0; i <= crsExtractMaxDirs; i++ {
+			entries = append(entries, tarEntry{name: "root/d" + entryCountName(i) + "/", typeflag: tar.TypeDir})
+		}
+		err := extractCRSTarball(build(t, entries), t.TempDir())
+		if err == nil || !strings.Contains(err.Error(), "目录条目数超过上限") {
+			t.Fatalf("error=%v, want dir-count rejection", err)
+		}
+	})
+
+	t.Run("within limits", func(t *testing.T) {
+		entries := []tarEntry{
+			{name: "root/", typeflag: tar.TypeDir},
+			{name: "root/rules/REQUEST-900.conf", body: []byte("SecRule a")},
+			{name: "root/rules/" + crsRulesProbeFile, body: []byte("SecRule init")},
+		}
+		dest := t.TempDir()
+		if err := extractCRSTarball(build(t, entries), dest); err != nil {
+			t.Fatalf("正常小包不得被条目门拒绝: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dest, "rules", crsRulesProbeFile)); err != nil {
+			t.Fatalf("探针文件应落盘: %v", err)
+		}
+	})
+}
+
+// entryCountName 生成互不相同的定长条目名（条目数门夹具）。
+func entryCountName(i int) string {
+	return "f" + strconv.Itoa(i) + ".conf"
 }

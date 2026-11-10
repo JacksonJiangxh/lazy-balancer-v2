@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -64,7 +66,7 @@ func setupAPIKeyTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// APIMCP42-3(第 42 轮测试卫生):M6 密码确认门已于 2026-09 裁定删除——
+	// 密码确认门已于 2026-09 裁定删除——
 	// 特权 Key(非只读或 MCP)创建不验密码,可选防线为 mfa_write_guard 的
 	// MFA step-up(428,见 apikeys.go createAPIKeyForUser);本文件用例未开
 	// guard,不再种子真实密码哈希、不再携带 password 载荷。
@@ -275,7 +277,7 @@ func TestCreateCurrentUserAPIKeyReturnsPlaintextOnce(t *testing.T) {
 	}
 }
 
-// B43-3-3(第 43 轮):API Key 名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
+// API Key 名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
 // 此前直接落库(api_keys.name VARCHAR(100) 在 SQLite 不强制长度),列表与审计
 // 出现不可读名。重名不拒绝(既有产品决策保持)。
 func TestCreateCurrentUserAPIKey_validatesName(t *testing.T) {
@@ -360,7 +362,7 @@ func TestUpdateCurrentUserAPIKeyForcesLegacyKeyReadOnly(t *testing.T) {
 
 func TestAdminAPIKeyReadOnlySettingIsUnchanged(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
-	// APIMCP42-3:特权 Key(可写)创建现行语义=mfa_write_guard 的 MFA step-up
+	// 特权 Key(可写)创建现行语义=mfa_write_guard 的 MFA step-up
 	//(428),无密码确认门;本用例未开 guard,直接创建。
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -369,7 +371,7 @@ func TestAdminAPIKeyReadOnlySettingIsUnchanged(t *testing.T) {
 	ctx.Set("user_id", 1)
 	ctx.Set("role", "admin")
 
-	(&Handlers{}).CreateAPIKey(ctx)
+	(&Handlers{}).CreateCurrentUserAPIKey(ctx)
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -414,8 +416,8 @@ func TestCreateCurrentUserAPIKeyNormalizesMCPWhitelist(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	// APIMCP42-3:mcp_enabled Key 属特权 Key——现行确认门为 mfa_write_guard
-	// 的 MFA step-up(428),密码载荷已随 M6 裁定删除。
+	// mcp_enabled Key 属特权 Key——现行确认门为 mfa_write_guard
+	// 的 MFA step-up(428),密码载荷已随裁定删除。
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys", strings.NewReader(`{"name":"mcp","mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["192.168.1.5","2001:db8::1"]}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Set("user_id", 1)
@@ -450,19 +452,22 @@ func TestUpdateAPIKeyRejectsInvalidMCPWhitelist(t *testing.T) {
 	}
 }
 
-// U7a-P5-5（第 66 轮审计）：每用户 50 配额的判定与插入必须原子——并发创建
+// 每用户 50 配额的判定与插入必须原子——并发创建
 // 此前 count-then-insert TOCTOU 可越过上限。本测试用生产 DSN（db.Initialize：
 // WAL+busy_timeout+_txlock=immediate）并发轰 55 个创建，总数不得超 50。
 // 注：setupAPIKeyTestDB 的裸 sql.Open 无 busy_timeout，并发下会以 SQLITE_BUSY
 // 500 污染断言，故此处独立搭生产形态环境。
 func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
-	oldDB, oldAuditDB := db.DB, db.AuditDB
+	// db.Initialize 会替换三个全局句柄，恢复必须
+	// 三者齐全——此前漏 MetricsDB，后续用例会踩已关闭的临时指标库。
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.AuditDB = oldDB, oldAuditDB
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	gin.SetMode(gin.TestMode)
 
@@ -504,5 +509,283 @@ func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
 	}
 	if created != apiKeyMaxPerUser {
 		t.Fatalf("created=%d, want exactly %d（限额满后其余必须 400 拒绝）", created, apiKeyMaxPerUser)
+	}
+}
+
+// 创建审计必须区分特权授予——此前只记 id/name/过期，
+// 「可写 + MCP 开 + 白名单」的 Key 与只读 Key 审计文案完全相同。字段级
+// detail 不得落完整密钥。
+func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize audit db: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys",
+		strings.NewReader(`{"name":"privileged","read_only":false,"mcp_enabled":true,"mcp_ip_whitelist":["127.0.0.1","10.0.0.0/8"]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("user_id", 1)
+	ctx.Set("role", "admin")
+	(&Handlers{}).CreateCurrentUserAPIKey(ctx)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Key string `json:"key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='创建' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	for _, want := range []string{"权限：可写", "MCP：开", "IP 白名单（约束全部 REST 与 MCP）：2 条"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
+		}
+	}
+	if body.Data.Key != "" && strings.Contains(detail, body.Data.Key) {
+		t.Fatalf("audit detail 不得落完整密钥: %q", detail)
+	}
+}
+
+// 更新审计必须留痕安全相关变更（启用态/MCP/只读/白名单），
+// 此前只有「密钥 id name」，禁用与放宽权限在审计中不可回溯。
+func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize audit db: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/v1/users/me/api-keys/10",
+		strings.NewReader(`{"is_enabled":false,"mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["192.0.2.0/24"]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "10"}}
+	ctx.Set("user_id", 1)
+	ctx.Set("role", "admin")
+	(&Handlers{}).UpdateCurrentUserAPIKeyStatus(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	for _, want := range []string{"启用状态：开→关", "MCP：关→开", "只读：关→开", "IP 白名单（约束全部 REST 与 MCP）：0 条→1 条"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
+		}
+	}
+}
+
+// 创建路径与删除路径同形守卫：认证上下文缺失（user_id 缺/类型未知 → 0）时
+// 必须 401——不得写入 created_by=0 的孤儿 Key（配额按 0 计数且列表 JOIN
+// users 隐藏它，不可见但可用）。
+func TestCreateAPIKey_missingUserContextRejected(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys", strings.NewReader(`{"name":"orphan"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("role", "admin")
+	// 刻意不置 user_id——生产链 jwtAuth/apiKeyAuth 必写，此为防御门。
+
+	(&Handlers{}).CreateCurrentUserAPIKey(ctx)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401（认证上下文缺失）", recorder.Code, recorder.Body.String())
+	}
+	var orphanKeys int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM api_keys WHERE created_by=0").Scan(&orphanKeys); err != nil {
+		t.Fatal(err)
+	}
+	if orphanKeys != 0 {
+		t.Fatalf("orphan keys=%d, want 0（不得写入 created_by=0 的孤儿 Key）", orphanKeys)
+	}
+}
+
+// 自助更新入口缺认证上下文必须 401（与创建/删除同形）——不得退化成
+// created_by=0 查询后的 404「不存在」。
+func TestUpdateCurrentUserAPIKeyStatus_missingAuthContextIs401(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/api-keys/:id", (&Handlers{}).UpdateCurrentUserAPIKeyStatus)
+
+	req := httptest.NewRequest(http.MethodPut, "/api-keys/10", strings.NewReader(`{"is_enabled":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401（认证上下文缺失）", rec.Code, rec.Body.String())
+	}
+	var enabled int
+	if err := db.DB.QueryRow("SELECT is_enabled FROM api_keys WHERE id=10").Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 {
+		t.Fatalf("is_enabled=%d, want 1（缺上下文不得更新任何行）", enabled)
+	}
+}
+
+// 审计 delta 的「变更后条数」必须用归一化后的白名单（与库内落值同源）：
+// 提交重复 CIDR 时不得显示 2 条而库内只有 1 条。
+func TestUpdateAPIKeyStatus_auditUsesNormalizedWhitelistCount(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if _, err := db.DB.Exec("CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_write_guard BOOLEAN DEFAULT 0); INSERT INTO global_config (id,mfa_write_guard) VALUES (1,0)"); err != nil {
+		t.Fatalf("seed disabled MFA guard: %v", err)
+	}
+	if _, err := db.AuditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(50), action VARCHAR(50), resource VARCHAR(50),
+		detail TEXT, ip_address VARCHAR(50), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("create audit table: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/api-keys/:id", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "alice")
+		c.Set("auth_type", "jwt")
+		c.Set("role", "user")
+		(&Handlers{}).UpdateCurrentUserAPIKeyStatus(c)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api-keys/10", strings.NewReader(`{"mcp_ip_whitelist":["1.2.3.4","1.2.3.4"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	if !strings.Contains(detail, "IP 白名单（约束全部 REST 与 MCP）：0 条→1 条") {
+		t.Fatalf("audit detail=%q, want 归一化后的「0 条→1 条」", detail)
+	}
+	if strings.Contains(detail, "→2 条") {
+		t.Fatalf("audit detail=%q 使用了请求原值条数（重复 CIDR 虚报）", detail)
+	}
+}
+
+// 已启用 MCP 的 Key 变更白名单属特权变更：与「收回只读/开启 MCP」同口径走
+// MFA step-up 判定（守卫开启 + 操作者启用 MFA 且无近期验码 → 428）。
+func TestUpdateAPIKeyStatus_whitelistChangeOnMCPKeyRequiresStepUp(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if _, err := db.DB.Exec(`ALTER TABLE users ADD COLUMN mfa_enabled INTEGER DEFAULT 0`); err != nil {
+		t.Fatalf("add mfa column: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE users SET mfa_enabled=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_write_guard INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO global_config (id, mfa_write_guard) VALUES (1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE api_keys SET mcp_enabled=1, mcp_ip_whitelist='["10.0.0.1/32"]' WHERE id=10`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/api-keys/:id", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "alice")
+		c.Set("auth_type", "jwt")
+		c.Set("role", "user")
+		(&Handlers{}).UpdateCurrentUserAPIKeyStatus(c)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api-keys/10", strings.NewReader(`{"mcp_ip_whitelist":["10.0.0.2/32"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPreconditionRequired {
+		t.Fatalf("status=%d body=%s, want 428（MCP 白名单放宽属特权变更）", rec.Code, rec.Body.String())
+	}
+	var whitelist string
+	if err := db.DB.QueryRow("SELECT COALESCE(mcp_ip_whitelist,'') FROM api_keys WHERE id=10").Scan(&whitelist); err != nil {
+		t.Fatal(err)
+	}
+	if whitelist != `["10.0.0.1/32"]` {
+		t.Fatalf("whitelist=%q，未通过 step-up 不得落库", whitelist)
+	}
+}
+
+// 状态更新必须是单事务形态：before 快照（审计 delta 的基准）与 UPDATE 在
+// 同一事务内取行/落库。两者分离时并发写者可在快照读取与更新之间插入提交，
+// 审计 delta 就会基于与实际更新脱节的旧状态。生产 DSN 开启 _txlock=immediate，
+// 事务开启即持写锁，快照到提交全程无插入窗口。函数体扫描钉源码契约
+// （技法同 autobackup_read_ctx_guard_test.go）：不得出现 db.DB 直连的
+// 单语句读/写/开事务（无事务边界且不消费 ctx），事务开启必须消费请求 ctx。
+func TestUpdateAPIKeyStatus_snapshotAndUpdateShareTransaction(t *testing.T) {
+	source, err := os.ReadFile("apikeys.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := handlerFunctionBody(string(source), "func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {")
+	if !ok {
+		t.Fatal("apikeys.go 中未找到 updateAPIKeyStatus（函数改名/内联会让本守卫失效）")
+	}
+	for _, banned := range []string{"db.DB.QueryRow(", "db.DB.Exec(", "db.DB.Query(", "db.DB.Begin("} {
+		if strings.Contains(body, banned) {
+			t.Fatalf("before 快照与 UPDATE 必须在同一事务内，函数体不得出现 %s", banned)
+		}
+	}
+	if !strings.Contains(body, "db.DB.BeginTx(c.Request.Context()") {
+		t.Fatal("更新事务必须以请求 ctx 开启（取消即中止）")
+	}
+}
+
+// 已取消的请求不得更新成功：事务开启消费请求 ctx，取消在事务开启处中止、
+// 零副作用——行保持原值、审计零留痕。事务化前快照与 UPDATE 各自 autocommit
+// 且不消费 ctx，已取消的请求仍会完整生效（200 + 落库 + 审计留痕）。
+func TestUpdateAPIKeyStatus_cancelledContextAborts(t *testing.T) {
+	database := setupAPIKeyTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize audit db: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/v1/api-keys/10/status", strings.NewReader(`{"is_enabled":false}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	ctx.Params = gin.Params{{Key: "id", Value: "10"}}
+	ctx.Set("user_id", 1)
+	ctx.Set("role", "admin")
+
+	(&Handlers{}).UpdateAPIKeyStatus(ctx)
+
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("status=%d body=%s，已取消的请求不得更新成功", recorder.Code, recorder.Body.String())
+	}
+	var enabled int
+	if err := database.QueryRow(`SELECT is_enabled FROM api_keys WHERE id=10`).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 {
+		t.Fatalf("取消后 is_enabled=%d，请求中止不得落库", enabled)
+	}
+	var auditRows int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='更新' AND resource='API密钥'`).Scan(&auditRows); err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if auditRows != 0 {
+		t.Fatalf("取消后写入审计 %d 行，中止的请求不得留痕", auditRows)
 	}
 }

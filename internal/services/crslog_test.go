@@ -9,15 +9,15 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// R63-P2-2/P2-3：旧 crs-update.log 已退役——WriteCRSUpdateLog 唯一落点=
-// tasks/crs.log（tee 单点；SEC-C-1 第 72 轮收敛后写口导出、无 Append* 别名）。
+// 旧 crs-update.log 已退役——WriteCRSUpdateLog 唯一落点=
+// tasks/crs.log（tee 单点；收敛后写口导出、无 Append* 别名）。
 // 本钉测双守卫：①单点写入口径（曾双写）恰 1 行/次；②旧文件不再产生。
 func TestWriteCRSUpdateLog_singleSinkNoDoubleTee(t *testing.T) {
 	dir := t.TempDir()
 	taskengine.SetLogDir(dir)
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 
-	// When: 唯一写口写一条（R62 修复前经包装层会双 tee）
+	// When: 唯一写口写一条
 	WriteCRSUpdateLog("INFO", "sync", "集群同步回放规则库")
 	WriteCRSUpdateLog("INFO", "sync", "集群同步回放规则库")
 
@@ -29,17 +29,15 @@ func TestWriteCRSUpdateLog_singleSinkNoDoubleTee(t *testing.T) {
 	}
 }
 
-// taskLogsHousekeeping 按配置阈值轮转任务日志（R63-P2-1：task_log_size_mb
-// 贯通到 tasks/*.log——本测试为配置消费的行为钉）。
-func TestTaskLogsHousekeeping_rotatesAtConfiguredThreshold(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+// taskLogsHousekeeping 只做保留期清理；尺寸滚动已统一归写入前检查，
+// 不再由每日巡检二次滚动。
+func TestTaskLogsHousekeeping_retentionOnlyDoesNotRotate(t *testing.T) {
+	setupIsolatedDB(t)
 	if _, err := db.DB.Exec("UPDATE global_config SET task_log_size_mb = 1 WHERE id = 1"); err != nil {
 		t.Fatal(err)
 	}
-	certJobLogSizeCachedAt.Store(0)
-	t.Cleanup(func() { certJobLogSizeCachedAt.Store(0) })
+	InvalidateTaskLogSizeCache()
+	t.Cleanup(InvalidateTaskLogSizeCache)
 
 	logsDir := t.TempDir()
 	tasksDir := logsDir + "/tasks"
@@ -53,27 +51,29 @@ func TestTaskLogsHousekeeping_rotatesAtConfiguredThreshold(t *testing.T) {
 
 	taskLogsHousekeeping(logsDir + "/app.log")
 
-	if _, err := os.Stat(tasksDir + "/probe.log.1"); err != nil {
-		t.Fatalf("超阈值任务日志应轮转到 .1: %v", err)
+	if _, err := os.Stat(tasksDir + "/probe.log.1"); !os.IsNotExist(err) {
+		t.Fatalf("保留期清理不得再做尺寸滚动: err=%v", err)
 	}
-	// Rename 语义：原文件移 .1，新文件由下次写入重建（不预建空文件）。
 }
 
-// L1-P4-1 收尾（第 67 轮 C2 残余收口）：certjobs/ 尺寸轮转归写入侧预写入轮转
+// 收尾：certjobs/ 尺寸轮转归写入侧预写入轮转
 // 单一负责（5 代移位），housekeeping 对 certjobs/ 只做保留期清理、不做尺寸轮转——
 // 否则孤儿超阈活动文件会被 rename 覆盖 .1 代际（双轨覆盖丢史窗口的残留面）。
 func TestTaskLogsHousekeeping_certjobsExemptFromSizeRotation(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	if _, err := db.DB.Exec("UPDATE global_config SET task_log_size_mb = 1 WHERE id = 1"); err != nil {
 		t.Fatal(err)
 	}
-	certJobLogSizeCachedAt.Store(0)
-	t.Cleanup(func() { certJobLogSizeCachedAt.Store(0) })
+	InvalidateTaskLogSizeCache()
+	t.Cleanup(InvalidateTaskLogSizeCache)
 
 	logsDir := t.TempDir()
-	certDir := logsDir + "/tasks/certjobs"
+	// 清理面取 CertJobLogDir（与写入侧同源）——必须注入任务日志目录，否则
+	// 用例播种的 certjobs 目录不在扫描面内，「不尺寸轮转」断言会空转。
+	oldTaskLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(logsDir + "/tasks")
+	t.Cleanup(func() { taskengine.SetLogDir(oldTaskLogDir) })
+	certDir := CertJobLogDir()
 	if err := os.MkdirAll(certDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

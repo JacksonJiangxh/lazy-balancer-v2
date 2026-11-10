@@ -1,22 +1,32 @@
 package db
 
 import (
+	"bytes"
 	"database/sql"
+	"log"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
+func TestCleanupMetricsHistory_nilMetricsDBReturnsNil(t *testing.T) {
+	// 库未装配/已关闭（嵌入与测试直调可达）：必须早退 nil 而非 nil 解引用
+	// panic——同族导出函数（PurgeOrphanMetricsHistory/PurgeTaskRuns）同口径。
+	old := MetricsDB
+	MetricsDB = nil
+	t.Cleanup(func() { MetricsDB = old })
+	if err := CleanupMetricsHistory(7); err != nil {
+		t.Fatalf("CleanupMetricsHistory with nil MetricsDB = %v, want nil", err)
+	}
+}
+
 func TestCleanupMetricsHistory_deletes_expired_global_and_rule_rows(t *testing.T) {
 	// Given
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	preserveDatabaseHandles(t)
 	if err := Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize databases: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
 	if _, err := MetricsDB.Exec(`INSERT INTO metrics_history (rule_id, timestamp) VALUES
 		(NULL, datetime('now','-8 days')),
 		('lb_old', datetime('now','-8 days')),
@@ -43,18 +53,14 @@ func TestCleanupMetricsHistory_deletes_expired_global_and_rule_rows(t *testing.T
 	}
 }
 
-// D3-F1 回归：过期历史清理必须分批执行（默认批 5000 下 12000 行过期数据
+// 回归：过期历史清理必须分批执行（默认批 5000 下 12000 行过期数据
 // 需 3 批），全部清理且保留保鲜行，重跑幂等零删除。
 func TestCleanupMetricsHistory_batchesLargeDeletes(t *testing.T) {
 	// Given
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	preserveDatabaseHandles(t)
 	if err := Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize databases: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
 	if _, err := MetricsDB.Exec(`INSERT INTO metrics_history (rule_id, timestamp)
 		WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 12000)
 		SELECT 'lb_old', datetime('now','-8 days') FROM cnt`); err != nil {
@@ -91,19 +97,15 @@ func TestCleanupMetricsHistory_batchesLargeDeletes(t *testing.T) {
 	}
 }
 
-// D3-F1：用测试钩子收缩批次（30 行 / 批 7 = 5 批 4 次批间停顿，每次至少
+// 用测试钩子收缩批次（30 行 / 批 7 = 5 批 4 次批间停顿，每次至少
 // 10ms）证明清理确实跨批推进——单语句 DELETE 实现不感知批次变量，耗时
 // 趋近 0，据此判红。
 func TestCleanupMetricsHistory_loopsAcrossBatches(t *testing.T) {
 	// Given
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	preserveDatabaseHandles(t)
 	if err := Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize databases: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
 	oldBatch := cleanupMetricsHistoryBatch
 	cleanupMetricsHistoryBatch = 7
 	t.Cleanup(func() { cleanupMetricsHistoryBatch = oldBatch })
@@ -135,18 +137,56 @@ func TestCleanupMetricsHistory_loopsAcrossBatches(t *testing.T) {
 	}
 }
 
+func TestOpenAndPingMetricsDB_beginsImmediateTransactions(t *testing.T) {
+	// Given：真实指标库与独立写连接。
+	dbPath := filepath.Join(t.TempDir(), "metrics-txlock.db")
+	metrics, err := openAndPingMetricsDB(dbPath)
+	if err != nil {
+		t.Fatalf("open metrics database: %v", err)
+	}
+	t.Cleanup(func() { _ = metrics.Close() })
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("initialize metrics schema: %v", err)
+	}
+	other, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(50)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+
+	// When：首个事务尚未写任何行时，deferred BEGIN 会放行另一连接写入；
+	// immediate BEGIN 必须在 BEGIN 当场取得写锁。
+	tx, err := metrics.Begin()
+	if err != nil {
+		t.Fatalf("begin metrics transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, writeErr := other.Exec(`INSERT INTO metrics_history (rule_id,timestamp) VALUES ('lb_lock',datetime('now'))`)
+
+	// Then：另一连接应得到锁冲突，而不是在首个事务读写升级前抢写成功。
+	if writeErr == nil {
+		t.Fatal("concurrent writer succeeded before first transaction wrote; BEGIN is deferred")
+	}
+	if !strings.Contains(writeErr.Error(), "SQLITE_BUSY") && !strings.Contains(writeErr.Error(), "database is locked") {
+		t.Fatalf("concurrent write error=%v, want SQLITE_BUSY", writeErr)
+	}
+	// 回归/夹具有效性：回滚后同一写入必须成功，排除表或连接本身不可用。
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if _, err := other.Exec(`INSERT INTO metrics_history (rule_id,timestamp) VALUES ('lb_lock',datetime('now'))`); err != nil {
+		t.Fatalf("write after rollback: %v", err)
+	}
+}
+
 func TestInitialize_omitsMetricsRetentionColumnAndAddsCompositeIndexes(t *testing.T) {
 	// metrics_retention_days 死列不再建(2026-09-15 用户裁定:固定 7 天窗口,
 	// 不读任何保留配置项);复合索引契约保留。
 	// Given
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	preserveDatabaseHandles(t)
 	if err := Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize databases: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
 
 	// When
 	var retentionColumn int
@@ -173,6 +213,93 @@ func TestInitialize_omitsMetricsRetentionColumnAndAddsCompositeIndexes(t *testin
 		if count != 1 {
 			t.Fatalf("index %s count=%d, want 1", index.name, count)
 		}
+	}
+}
+
+func TestInitMetricsSchema_duplicateTransactionIDsDedupedAndIndexCreated(t *testing.T) {
+	// Given 真实存量 metrics 库：唯一索引尚未建立，且已有重复/空 transaction_id
+	//（重复行带区分性 client_ip，用于断言保留最早行）。
+	metrics, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metrics-duplicates.db"))
+	if err != nil {
+		t.Fatalf("open metrics database: %v", err)
+	}
+	t.Cleanup(func() { _ = metrics.Close() })
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("initialize metrics schema: %v", err)
+	}
+	if _, err := metrics.Exec(`DROP INDEX idx_security_events_transaction;
+		INSERT INTO security_events (transaction_id, client_ip) VALUES
+		('duplicate-transaction','10.0.0.1'), ('duplicate-transaction','10.0.0.2'),
+		('unique-transaction','10.0.0.3'), ('','10.0.0.4'), ('','10.0.0.5')`); err != nil {
+		t.Fatalf("seed duplicate transaction IDs: %v", err)
+	}
+	var logBuf bytes.Buffer
+	oldLogOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(oldLogOutput) })
+
+	// When 升级再次初始化 schema。
+	err = initMetricsSchema(metrics)
+
+	// Then 重复历史行不得拖垮启动；启动期去重（保留每事务最早行）后唯一索引
+	// 照常建立——不再靠跳过索引放行（跳过会让 offset 重建/
+	// 轮转补采把重复事件重新入库并重复喂 autoban/rollup）。
+	if err != nil {
+		t.Fatalf("duplicate transaction IDs must not abort initialization: %v", err)
+	}
+	var indexCount, rowCount int
+	if err := metrics.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_security_events_transaction'`).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("unique index count=%d, want 1（去重后必须建索引，不得跳过）", indexCount)
+	}
+	if err := metrics.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 4 {
+		t.Fatalf("security event rows=%d, want 4（重复事务保留 1 行 + 唯一事务 + 2 空串行）", rowCount)
+	}
+	var keptIP string
+	if err := metrics.QueryRow(`SELECT client_ip FROM security_events WHERE transaction_id='duplicate-transaction'`).Scan(&keptIP); err != nil {
+		t.Fatalf("exactly one duplicate-transaction row must survive: %v", err)
+	}
+	if keptIP != "10.0.0.1" {
+		t.Fatalf("dedupe kept client_ip=%q, want earliest row 10.0.0.1", keptIP)
+	}
+	if !strings.Contains(logBuf.String(), "duplicate-transaction") || !strings.Contains(logBuf.String(), "去重") {
+		t.Fatalf("dedupe must WARN with the duplicated ID, log=%q", logBuf.String())
+	}
+
+	// And 幂等：再次初始化零去重、索引仍在。
+	logBuf.Reset()
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("reinitialize after dedupe: %v", err)
+	}
+	if strings.Contains(logBuf.String(), "去重") {
+		t.Fatalf("idempotent rerun must not dedupe again, log=%q", logBuf.String())
+	}
+	if err := metrics.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 4 {
+		t.Fatalf("security event rows=%d after rerun, want 4", rowCount)
+	}
+
+	// And 摄取幂等链恒成立：唯一索引拒绝重复非空事务 ID，OR IGNORE 静默去重，
+	// 空串仍不受唯一约束。
+	if _, err := metrics.Exec(`INSERT INTO security_events (transaction_id) VALUES ('duplicate-transaction')`); err == nil {
+		t.Fatal("unique index accepted a duplicate non-empty transaction ID")
+	}
+	result, err := metrics.Exec(`INSERT OR IGNORE INTO security_events (transaction_id, client_ip) VALUES ('duplicate-transaction','10.0.0.9')`)
+	if err != nil {
+		t.Fatalf("INSERT OR IGNORE must not error on duplicate: %v", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 0 {
+		t.Fatalf("INSERT OR IGNORE rows affected=%d, want 0（重复摄取不得再入库）", affected)
+	}
+	if _, err := metrics.Exec(`INSERT INTO security_events (transaction_id) VALUES ('')`); err != nil {
+		t.Fatalf("partial unique index rejected an empty transaction ID: %v", err)
 	}
 }
 
@@ -213,5 +340,77 @@ func TestInitializeMetricsDB_preserves_global_when_schema_creation_fails(t *test
 	}
 	if MetricsDB != sentinelDB {
 		t.Fatal("failed initialization replaced global metrics database")
+	}
+}
+
+// CleanupDailyAgg 按保留天数清理 metrics_daily_agg 过期日聚合行（默认 90 天，
+// 与 security_events 保留同口径；正常请求读路径窗口 ≤7 天+昨日，90 天为回溯
+// 余量）。nil 库早退 nil——与同族导出清理函数守卫口径一致
+// （CleanupMetricsHistory/CleanupL4ConnHistory 先例）。
+func TestCleanupDailyAgg_nilMetricsDBReturnsNil(t *testing.T) {
+	old := MetricsDB
+	MetricsDB = nil
+	t.Cleanup(func() { MetricsDB = old })
+	if err := CleanupDailyAgg(90); err != nil {
+		t.Fatalf("CleanupDailyAgg with nil MetricsDB = %v, want nil", err)
+	}
+}
+
+// 过期日行（>保留天数）删除、窗口内日行保留、二次执行幂等零删除。
+// local_date 为本地日历日（写入侧与总览读窗口同源），清理边界按同粒度日期串比较。
+func TestCleanupDailyAgg_deletesExpiredKeepsFreshAndIdempotent(t *testing.T) {
+	preserveDatabaseHandles(t)
+	if err := Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize databases: %v", err)
+	}
+	today := time.Now().Format("2006-01-02")
+	inside := time.Now().AddDate(0, 0, -89).Format("2006-01-02")
+	expired := time.Now().AddDate(0, 0, -91).Format("2006-01-02")
+	seed := func(rule, date string) {
+		t.Helper()
+		if _, err := MetricsDB.Exec(`INSERT INTO metrics_daily_agg (rule_id, local_date, requests_delta, blocked_delta, logged_delta) VALUES (?, ?, 3, 1, 1)`, rule, date); err != nil {
+			t.Fatalf("seed daily agg %s/%s: %v", rule, date, err)
+		}
+	}
+	seed("lb_today", today)
+	seed("lb_inside", inside)
+	seed("lb_expired", expired)
+
+	// When
+	if err := CleanupDailyAgg(90); err != nil {
+		t.Fatalf("cleanup daily agg: %v", err)
+	}
+
+	// Then
+	assertDailyAggDates(t, map[string]bool{today: true, inside: true, expired: false})
+	// 幂等：二次执行零删除零错误。
+	if err := CleanupDailyAgg(90); err != nil {
+		t.Fatalf("second cleanup daily agg: %v", err)
+	}
+	assertDailyAggDates(t, map[string]bool{today: true, inside: true, expired: false})
+}
+
+func assertDailyAggDates(t *testing.T, want map[string]bool) {
+	t.Helper()
+	got := map[string]bool{}
+	rows, err := MetricsDB.Query(`SELECT local_date FROM metrics_daily_agg`)
+	if err != nil {
+		t.Fatalf("query daily agg: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var date string
+		if err := rows.Scan(&date); err != nil {
+			t.Fatalf("scan daily agg: %v", err)
+		}
+		got[date] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate daily agg rows: %v", err)
+	}
+	for date, wantPresent := range want {
+		if got[date] != wantPresent {
+			t.Fatalf("daily agg row %s present=%v, want %v（现存=%v）", date, got[date], wantPresent, got)
+		}
 	}
 }
