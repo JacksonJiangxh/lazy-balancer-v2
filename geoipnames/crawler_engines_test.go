@@ -1,6 +1,9 @@
 package geoipnames
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCrawlerEngines_matchAndVerify(t *testing.T) {
 	// Given/When/Then: UA 匹配、PTR 后缀绑定（跨引擎不认）、合法 ID
@@ -36,6 +39,19 @@ func TestCrawlerEngines_matchAndVerify(t *testing.T) {
 	}
 	if !ValidCrawlerEngineID("gptbot") || ValidCrawlerEngineID("fakebot") {
 		t.Error("引擎 ID 校验错误")
+	}
+}
+
+// 超长 UA（攻击者在启用爬虫豁免的规则上灌 ~1MB 头）不得进入正则扫描：
+// 合并交替式是 O(len) 线性成本，且按「未命中」处理（不豁免/不判伪装）。
+func TestMatchCrawlerEngine_oversizedUAIsNotMatched(t *testing.T) {
+	base := "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+	if got := MatchCrawlerEngine(base); got != "googlebot" {
+		t.Fatalf("基线 UA 匹配=%q, want googlebot", got)
+	}
+	oversized := base + strings.Repeat(" ", crawlerUAMaxLen)
+	if got := MatchCrawlerEngine(oversized); got != "" {
+		t.Fatalf("超长 UA 匹配=%q, want 空串（不参与豁免判定）", got)
 	}
 }
 
@@ -124,8 +140,10 @@ func TestCrawlerSpoofEvidence_brandMarkersExcluded(t *testing.T) {
 	}{
 		{"Mozilla/5.0 (compatible; DeepSeek/1.0)", "deepseekbot"},
 		{"Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)", "gptbot"},
+		{"Mozilla/5.0 (compatible; Claude-User/1.0)", "claudebot"},
 		{"Mozilla/5.0 (compatible; Claude-Web/1.0; +claude.ai)", "claudebot"},
 		{"Mozilla/5.0 (compatible; anthropic-ai/1.0)", "claudebot"},
+		{"Mozilla/5.0 (compatible; Perplexity-User/1.0)", "perplexitybot"},
 	}
 	for _, c := range brandMarkers {
 		if got := MatchCrawlerEngine(c.ua); got != c.engine {
@@ -144,6 +162,7 @@ func TestCrawlerSpoofEvidence_brandMarkersExcluded(t *testing.T) {
 		{"Mozilla/5.0 (compatible; DeepSeekBot/1.0)", "deepseekbot"},
 		{"Mozilla/5.0 (compatible; ClaudeBot/1.0)", "claudebot"},
 		{"Mozilla/5.0 (compatible; Claude-SearchBot/1.0)", "claudebot"},
+		{"Mozilla/5.0 (compatible; PerplexityBot/1.0)", "perplexitybot"},
 		{"Mozilla/5.0 (compatible; Googlebot/2.1)", "googlebot"},
 		{"Mozilla/5.0 (compatible; PetalBot/2.0)", "petalbot"},
 	}

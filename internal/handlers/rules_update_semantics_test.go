@@ -1,28 +1,30 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
 )
 
-// 第 43 轮审计修复(用户 2026-09-19 裁定按建议修):
-// LB43-3 CreateRule/UpdateRule 对 chunked/未知长度超限 body 不映射 413(落 400),
+// (用户 2026-09-19 裁定按建议修)
+// CreateRule/UpdateRule 对 chunked/未知长度超限 body 不映射 413(落 400),
 // 与 PutCaddyConfig/导入路径(config_backup.go)口径不一。
-// LB43-4 UpdateRule 显式空 upstreams 数组曾被 len==0 归并进「保留存量」;改为
+// UpdateRule 显式空 upstreams 数组曾被 len==0 归并进「保留存量」;改为
 // nil 判定区分「省略」与「显式 []」——显式 [] 经 validateRulePayloadBeforeSave
-// 「至少需要一个上游服务器」400 拒绝（U3-3 第 69 轮纠正：零上游非合法形态，
+// 「至少需要一个上游服务器」400 拒绝（纠正：零上游非合法形态，
 // 本文件早期头注释「显式 []=清空（零上游为合法形态）」与现行语义相反，已更正；
 // 引用一律用函数名，不写行号——行号漂移曾致三处误导）。
-// LB43-5 DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule/UpdateRule
+// DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule/UpdateRule
 // 两入口不对称——源行遗留 tcp+ca_provider_id≠0 死形态会放大到副本。
 
-// LB43-3①:CreateRule 对 chunked(无 ContentLength)超限 body 期望 413。
+// CreateRule 对 chunked(无 ContentLength)超限 body 期望 413。
 func TestCreateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -42,7 +44,7 @@ func TestCreateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	}
 }
 
-// LB43-3②:UpdateRule 对 chunked 超限 body 期望 413。
+// UpdateRule 对 chunked 超限 body 期望 413。
 func TestUpdateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -63,7 +65,7 @@ func TestUpdateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	}
 }
 
-// LB43-4:UpdateRule 显式 "upstreams":[] 期望显式拒绝(400 点名上游),
+// UpdateRule 显式 "upstreams":[] 期望显式拒绝(400 点名上游),
 // 且存量上游保持不变——修复前 len==0 归并「保留存量」在校验前发生,
 // 显式清空被静默吞掉(200+旧上游),校验/落库分叉。
 func TestUpdateRule_explicitEmptyUpstreamsRejected(t *testing.T) {
@@ -90,7 +92,7 @@ func TestUpdateRule_explicitEmptyUpstreamsRejected(t *testing.T) {
 	}
 }
 
-// LB43-5:DuplicateRule 对遗留 tcp+ca_provider_id≠0 死形态源行,副本应归一
+// DuplicateRule 对遗留 tcp+ca_provider_id≠0 死形态源行,副本应归一
 // ca_provider_id=0(与 CreateRule/UpdateRule 的 TCP 归一同口径)。
 func TestDuplicateRule_clearsCAProviderIDForTCP(t *testing.T) {
 	// Given
@@ -162,4 +164,135 @@ func TestDuplicateRule_copiesSecurityPolicyBindings(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "2 条策略绑定") {
 		t.Fatalf("success message must state carried bindings, body=%.300s", response.Body.String())
 	}
+}
+
+// 跨模式残留清理——生效来源非 manual 不保留证书材料；
+// 非 acme_dns 的 ca_provider_id 归零（manual→manual 编辑同样自愈）。
+func TestUpdateRule_clearsCrossSourceTLSResidue(t *testing.T) {
+	t.Run("manual-to-acme-drops-certificate-material", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		seedAuditRule(t, "lb_a87_cross", "cross", "cross-a87.example.test", 8088, false, "manual", true)
+		seedAuditUpstream(t, "lb_a87_cross")
+		certPEM, keyPEM, err := generateTestCert("cross-a87.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+		if err != nil {
+			t.Fatalf("generate cert: %v", err)
+		}
+		if _, err := db.DB.Exec("UPDATE lb_rules SET tls_cert=?,tls_key=? WHERE caddy_id='lb_a87_cross'", certPEM, keyPEM); err != nil {
+			t.Fatalf("seed material: %v", err)
+		}
+		configID := seedR52CertificateConfig(t)
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_cross",
+			strings.NewReader(fmt.Sprintf(`{"tls_source":"acme_dns","acme_config_id":%d}`, configID)))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var storedCert, storedKey, source string
+		if err := db.DB.QueryRow("SELECT COALESCE(tls_cert,''),COALESCE(tls_key,''),COALESCE(tls_source,'') FROM lb_rules WHERE caddy_id='lb_a87_cross'").Scan(&storedCert, &storedKey, &source); err != nil {
+			t.Fatalf("read rule: %v", err)
+		}
+		if source != "acme_dns" {
+			t.Fatalf("tls_source=%q, want acme_dns", source)
+		}
+		if storedCert != "" || storedKey != "" {
+			t.Fatal("acme 源规则仍保留手动证书材料——私钥正文会随导出/备份/快照放大")
+		}
+	})
+
+	t.Run("manual-edit-zeroes-stale-ca-provider", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		seedAuditRule(t, "lb_a87_ca", "ca", "ca-a87.example.test", 8089, false, "manual", false)
+		seedAuditUpstream(t, "lb_a87_ca")
+		var providerID int
+		if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+			t.Fatalf("read CA provider: %v", err)
+		}
+		if _, err := db.DB.Exec("UPDATE lb_rules SET ca_provider_id=? WHERE caddy_id='lb_a87_ca'", providerID); err != nil {
+			t.Fatalf("seed stale provider: %v", err)
+		}
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_ca", strings.NewReader(`{"description":"touch"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var storedProvider int
+		if err := db.DB.QueryRow("SELECT COALESCE(ca_provider_id,0) FROM lb_rules WHERE caddy_id='lb_a87_ca'").Scan(&storedProvider); err != nil {
+			t.Fatalf("read rule: %v", err)
+		}
+		if storedProvider != 0 {
+			t.Fatalf("ca_provider_id=%d, want 0（manual 行不得继承陈旧 CA 提供商）", storedProvider)
+		}
+	})
+}
+
+// 空 tls_source（API/MCP 创建时省略来源且 TLS 关闭，或旧版本/导入行）
+// 同样不消费 acme_config_id——Create 与 Update 都必须清零该跨模式死引用，
+// 否则引用会随导出/备份/集群快照长期携带（渲染/签发零消费，全部消费方都以
+// enable_tls=1 && tls_source='acme_dns' 门控）。
+func TestRuleWrites_emptyTLSSourceClearsACMEReference(t *testing.T) {
+	t.Run("create-omitted-source", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		router := gin.New()
+		router.POST("/rules", handler.CreateRule)
+		body := `{"name":"empty-src-create","protocol":"http","domain":"empty-src-create.example.test","listen_port":8090,"enable_tls":false,"acme_config_id":7,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK && recorder.Code != http.StatusCreated {
+			t.Fatalf("status=%d body=%s, want 2xx", recorder.Code, recorder.Body.String())
+		}
+		var source string
+		var acmeID int
+		if err := db.DB.QueryRow("SELECT COALESCE(tls_source,''), COALESCE(acme_config_id,0) FROM lb_rules WHERE name='empty-src-create'").Scan(&source, &acmeID); err != nil {
+			t.Fatalf("read created rule: %v", err)
+		}
+		if source != "" {
+			t.Fatalf("tls_source=%q, want 空来源（省略即空）", source)
+		}
+		if acmeID != 0 {
+			t.Fatalf("acme_config_id=%d, want 0（非 acme_dns 不保留 ACME 引用）", acmeID)
+		}
+	})
+
+	t.Run("update-stored-empty-source", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		seedAuditRule(t, "lb_empty_acme", "empty-acme", "empty-acme.example.test", 8091, true, "", false)
+		seedAuditUpstream(t, "lb_empty_acme")
+		if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=7 WHERE caddy_id='lb_empty_acme'"); err != nil {
+			t.Fatalf("seed stale acme reference: %v", err)
+		}
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_empty_acme", strings.NewReader(`{"description":"touch"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var acmeID int
+		if err := db.DB.QueryRow("SELECT COALESCE(acme_config_id,0) FROM lb_rules WHERE caddy_id='lb_empty_acme'").Scan(&acmeID); err != nil {
+			t.Fatalf("read rule: %v", err)
+		}
+		if acmeID != 0 {
+			t.Fatalf("acme_config_id=%d, want 0（空来源不保留 ACME 引用）", acmeID)
+		}
+	})
 }

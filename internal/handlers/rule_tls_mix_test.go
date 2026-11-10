@@ -1,6 +1,6 @@
 package handlers
 
-// LB40-1(第 40 轮):同端口 TLS/明文混布拦截——Caddy 监听器按端口二选一,
+// 同端口 TLS/明文混布拦截——Caddy 监听器按端口二选一,
 // 混布会把整个端口监听器切为 TLS,明文规则流量全部握手失败。创建/更新/
 // 启用三入口按 enable_tls 意图拦截(不看证书存在性,ACME 延迟翻转一并覆盖)。
 
@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 func newTLSMixRouter(t *testing.T, handler *Handlers) *gin.Engine {
@@ -52,16 +53,14 @@ func seedTLSMixRule(t *testing.T, caddyID, domain string, listenPort int, enable
 func tlsMixBody(name, domain string, listenPort int, enableTLS bool) string {
 	if enableTLS {
 		certPEM, keyPEM, _ := generateTestCert(domain, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
-		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort, certPEM, keyPEM)
+		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort, certPEM, keyPEM)
 	}
-	return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort)
+	return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort)
 }
 
 func TestRulePortTLSMix_rejected(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	router := newTLSMixRouter(t, handler)
 	create := func(body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
@@ -106,14 +105,12 @@ func TestRulePortTLSMix_rejected(t *testing.T) {
 	}
 }
 
-// LB41-3(第 41 轮 P3):checkPortTLSMix 的 enable_tls 裸布尔比较与全仓
+// checkPortTLSMix 的 enable_tls 裸布尔比较与全仓
 // IIF(enable_tls IN ('1',1),1,0) 归一口径不一——NULL 行（远古存量/直改 DB）
 // 在裸比较下漏检。修复后 NULL 归一为明文（0）参与混布判定。
 func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	router := newTLSMixRouter(t, handler)
 	create := func(body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
@@ -145,5 +142,35 @@ func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T
 	rec = create(tlsMixBody("mix-plain-null", "mix-null-d.test", 18448, false))
 	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
 		t.Fatalf("plaintext coexistence with NULL-enable_tls row must pass, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 补 Update 方向——文件头声明覆盖 create/update/enable 三入口，
+// 实际只测了 create×2 + enable；更新开启 TLS 命中同端口混布门无钉测。
+func TestRulePortTLSMix_rejectedOnUpdate(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	router := newTLSMixRouter(t, handler)
+
+	// Given：同端口已启用明文规则 A + 一条禁用明文规则 B（同形态共存合法）
+	seedTLSMixRule(t, "lb_mix_upd_plain_a", "mix-upd-a.test", 18449, false, 1)
+	seedTLSMixRule(t, "lb_mix_upd_plain", "mix-upd-b.test", 18449, false, 0)
+
+	// When：更新 B 开启 TLS（同端口已有启用中的明文规则 → 混布门）
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_mix_upd_plain", strings.NewReader(`{"enable_tls":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	// Then：400 混布拒绝，DB 的 enable_tls 未被写入
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不能混布") {
+		t.Fatalf("update enabling TLS onto plaintext/TLS mixed port must 400, got %d %s", response.Code, response.Body.String())
+	}
+	var enableTLS int
+	if err := db.DB.QueryRow(`SELECT IIF(enable_tls IN ('1',1),1,0) FROM lb_rules WHERE caddy_id='lb_mix_upd_plain'`).Scan(&enableTLS); err != nil {
+		t.Fatalf("read enable_tls: %v", err)
+	}
+	if enableTLS != 0 {
+		t.Fatalf("rejected update persisted enable_tls=%d", enableTLS)
 	}
 }

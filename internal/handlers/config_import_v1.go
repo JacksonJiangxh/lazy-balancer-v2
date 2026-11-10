@@ -6,17 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
 type v1Backup struct {
-	UserList       *v1Section `json:"user_list"`
-	MainConfig     *v1Section `json:"main_config"`
 	ProxyConfig    *v1Section `json:"proxy_config"`
 	UpstreamConfig *v1Section `json:"upstream_config"`
 }
@@ -61,23 +61,23 @@ type v1Proxy struct {
 }
 
 type convertedRule struct {
-	Name         string
-	Domain       string
-	ListenPort   int
-	Protocol     string
-	Strategy     string
-	EnableTLS    bool
-	TLSCert      string
-	TLSKey       string
-	Redirect     bool
-	Compress     bool
-	HealthFails  int
-	HealthInt    int
-	ActiveHC     bool
-	Enabled      bool
-	OriginDomain string
-	Description  string
-	Upstreams    []convertedUpstream
+	Name        string
+	Domain      string
+	ListenPort  int
+	Protocol    string
+	Strategy    string
+	EnableTLS   bool
+	TLSCert     string
+	TLSKey      string
+	Redirect    bool
+	Compress    bool
+	HealthFails int
+	HealthInt   int
+	ActiveHC    bool
+	Enabled     bool
+	HostHeader  string
+	Description string
+	Upstreams   []convertedUpstream
 }
 
 type convertedUpstream struct {
@@ -96,7 +96,7 @@ type ruleConflictCandidate struct {
 	tlsHTTPRedirect                 bool
 }
 
-// Round 30 F-9: v1（disableConvertedRuleConflicts）与 v2（disableV2RuleConflicts）
+// v1（disableConvertedRuleConflicts）与 v2（disableV2RuleConflicts）
 // 各自组装 ruleConflictCandidate 的字段清单此前重复两份，新增字段需同步两处；
 // 收敛为单一构造函数，双路径共用。
 func newRuleConflictCandidate(name, caddyID, protocol, domain string, listenPort int, enabled, enableTLS, tlsHTTPRedirect bool) ruleConflictCandidate {
@@ -123,59 +123,143 @@ type ruleConflictOpponent struct {
 func validateRuleConflictMatrix(candidates []ruleConflictCandidate) []disabledRuleConflict {
 	reasons := make(map[int][]string)
 	opponents := make(map[int][]ruleConflictOpponent)
-	for leftIndex, left := range candidates {
-		for rightIndex := leftIndex + 1; rightIndex < len(candidates); rightIndex++ {
-			right := candidates[rightIndex]
-			reason := ""
-			switch {
-			case left.protocol == "http" && right.protocol == "http" && left.listenPort == right.listenPort:
-				// Round 31 C-1: 禁用规则无运行时占用——与禁用行的「同端口同域名」不构成
-				// 真实冲突，不得把启用中的一方静默置禁用（与跨端口分支同口径门控）。
-				// R30 F1 放行禁用自环行后该组合首次可达此分支。
-				if left.enabled && right.enabled {
-					leftDomains := make(map[string]struct{})
-					for _, domain := range normalizedRuleDomains(left.domain) {
-						leftDomains[domain] = struct{}{}
-					}
-					for _, domain := range normalizedRuleDomains(right.domain) {
-						if _, exists := leftDomains[domain]; exists {
-							reason = fmt.Sprintf("HTTP 域名 %s 重复", domain)
-							break
-						}
-					}
-				}
-			case left.protocol == "http" && right.protocol == "http" && left.listenPort != right.listenPort:
-				// Round 29 G-1: 跨端口跳转遮蔽方向——TLS+跳转规则在 HTTP 默认口（HTTP_PORT，
-				// 出厂 80）服务器头部生成 terminal 301（caddy.go redirectRoutes），同域名
-				// 直接监听该口的规则会被静默遮蔽为死规则。仅双方均启用时判定，按矩阵惯例
-				// 冲突双方置禁用。判定基准随部署侧默认口（ISSUE #7）。
-				if left.enabled && right.enabled {
-					if left.listenPort == services.DefaultHTTPPort() && right.enableTLS && right.tlsHTTPRedirect {
-						reason = httpRedirectShadowReason(left.domain, right.domain)
-					} else if right.listenPort == services.DefaultHTTPPort() && left.enableTLS && left.tlsHTTPRedirect {
-						reason = httpRedirectShadowReason(right.domain, left.domain)
-					}
-				}
-			case left.listenPort != right.listenPort:
+	// 一次性预计算 canonical 域名（normalizedRuleDomains 含 IDNA
+	// 转换，逐对调用是 O(N²) 次）与按 listenPort 分桶——矩阵内只做集合
+	// 交集；同端口对只在本桶内枚举，跨端口对仅 80↔非 80 可能相关（其余在
+	// 原 switch 的「端口不同 → continue」分支零产出）。
+	domainLists := make([][]string, len(candidates))
+	domainSets := make([]map[string]struct{}, len(candidates))
+	byPort := make(map[int][]int, 8)
+	for index := range candidates {
+		list := normalizedRuleDomains(candidates[index].domain)
+		domainLists[index] = list
+		set := make(map[string]struct{}, len(list))
+		for _, domain := range list {
+			set[domain] = struct{}{}
+		}
+		domainSets[index] = set
+		byPort[candidates[index].listenPort] = append(byPort[candidates[index].listenPort], index)
+	}
+	// 同端口 TLS/明文混布（保存/启用链 checkPortTLSMix 的导入侧
+	// 同口径落地）。Caddy 按端口生成单一 server，只要任一启用 HTTP 规则带证书
+	// 即生成 tls_connection_policies——同端口明文规则在该监听器上握手必败，
+	// 整条规则静默不可达。导入无法像保存链一样即时 400（备份可能来自旧版本/
+	// 手造/nginx 转换），按矩阵既有「冲突置禁用」语义只禁用不可达的明文一侧，
+	// TLS 一侧继续服务（该侧行为健康）。禁用行为不参与（不渲染、不占端口）。
+	for port, indexes := range byPort {
+		var tlsIndexes, plainIndexes []int
+		for _, index := range indexes {
+			candidate := candidates[index]
+			if !candidate.enabled || candidate.protocol != "http" {
 				continue
-			case left.protocol == "tcp" && right.protocol == "tcp":
-				// Round 32 F-2: 与 HTTP 同端口分支（Round 31 C-1）同口径门控——
-				// 禁用 TCP 规则不渲染（caddy.go WHERE enabled=1）、无运行时端口占用，
-				// 不得把启用中的一方静默置禁用。
-				if left.enabled && right.enabled {
-					reason = fmt.Sprintf("TCP 监听端口 %d 重复", left.listenPort)
-				}
-			case left.protocol == "tcp" || right.protocol == "tcp":
-				if left.enabled && right.enabled {
-					reason = fmt.Sprintf("TCP 与 HTTP 监听端口 %d 冲突", left.listenPort)
+			}
+			if candidate.enableTLS {
+				tlsIndexes = append(tlsIndexes, index)
+			} else {
+				plainIndexes = append(plainIndexes, index)
+			}
+		}
+		if len(tlsIndexes) == 0 || len(plainIndexes) == 0 {
+			continue
+		}
+		reason := fmt.Sprintf("端口 %d 的 TLS 与明文规则不能混布（该端口监听器将整体切换为 TLS，明文规则不可达）", port)
+		for _, plainIndex := range plainIndexes {
+			reasons[plainIndex] = append(reasons[plainIndex], reason)
+			for _, tlsIndex := range tlsIndexes {
+				opponents[plainIndex] = append(opponents[plainIndex], ruleConflictOpponent{
+					Name: candidates[tlsIndex].name, CaddyID: candidates[tlsIndex].caddyID, Reason: reason,
+				})
+			}
+		}
+	}
+	intersectFirst := func(primaryIndex, otherIndex int) (string, bool) {
+		for _, domain := range domainLists[primaryIndex] {
+			if _, exists := domainSets[otherIndex][domain]; exists {
+				return domain, true
+			}
+		}
+		return "", false
+	}
+	evaluate := func(leftIndex, rightIndex int) {
+		left, right := candidates[leftIndex], candidates[rightIndex]
+		reason := ""
+		switch {
+		case left.protocol == "http" && right.protocol == "http" && left.listenPort == right.listenPort:
+			// 禁用规则无运行时占用——与禁用行的「同端口同域名」不构成
+			// 真实冲突，不得把启用中的一方静默置禁用（与跨端口分支同口径门控）。
+			// 放行禁用自环行后该组合首次可达此分支。
+			if left.enabled && right.enabled {
+				if domain, hit := intersectFirst(rightIndex, leftIndex); hit {
+					reason = fmt.Sprintf("HTTP 域名 %s 重复", domain)
 				}
 			}
-			if reason != "" {
-				reasons[leftIndex] = append(reasons[leftIndex], reason)
-				reasons[rightIndex] = append(reasons[rightIndex], reason)
-				opponents[leftIndex] = append(opponents[leftIndex], ruleConflictOpponent{Name: right.name, CaddyID: right.caddyID, Reason: reason})
-				opponents[rightIndex] = append(opponents[rightIndex], ruleConflictOpponent{Name: left.name, CaddyID: left.caddyID, Reason: reason})
+		case left.protocol == "http" && right.protocol == "http" && left.listenPort != right.listenPort:
+			// 跨端口跳转遮蔽方向——TLS+跳转规则在 80 端口服务器头部
+			// 生成 terminal 301（caddy.go redirectRoutes），同域名直接监听 80 的规则
+			// 会被静默遮蔽为死规则。仅双方均启用时判定，按矩阵惯例冲突双方置禁用。
+			if left.enabled && right.enabled {
+				if left.listenPort == 80 && right.enableTLS && right.tlsHTTPRedirect {
+					if domain, hit := intersectFirst(rightIndex, leftIndex); hit {
+						reason = fmt.Sprintf("HTTP 域名 %s 被 HTTPS 跳转遮蔽", domain)
+					}
+				} else if right.listenPort == 80 && left.enableTLS && left.tlsHTTPRedirect {
+					if domain, hit := intersectFirst(leftIndex, rightIndex); hit {
+						reason = fmt.Sprintf("HTTP 域名 %s 被 HTTPS 跳转遮蔽", domain)
+					}
+				}
 			}
+		case left.listenPort != right.listenPort:
+			return
+		case left.protocol == "tcp" && right.protocol == "tcp":
+			// 与 HTTP 同端口分支同口径门控——
+			// 禁用 TCP 规则不渲染（caddy.go WHERE enabled=1）、无运行时端口占用，
+			// 不得把启用中的一方静默置禁用。
+			if left.enabled && right.enabled {
+				reason = fmt.Sprintf("TCP 监听端口 %d 重复", left.listenPort)
+			}
+		case left.protocol == "tcp" || right.protocol == "tcp":
+			if left.enabled && right.enabled {
+				reason = fmt.Sprintf("TCP 与 HTTP 监听端口 %d 冲突", left.listenPort)
+			}
+		}
+		if reason == "" {
+			return
+		}
+		reasons[leftIndex] = append(reasons[leftIndex], reason)
+		reasons[rightIndex] = append(reasons[rightIndex], reason)
+		opponents[leftIndex] = append(opponents[leftIndex], ruleConflictOpponent{Name: right.name, CaddyID: right.caddyID, Reason: reason})
+		opponents[rightIndex] = append(opponents[rightIndex], ruleConflictOpponent{Name: left.name, CaddyID: left.caddyID, Reason: reason})
+	}
+	for leftIndex := range candidates {
+		port := candidates[leftIndex].listenPort
+		rights := make([]int, 0, len(byPort[port]))
+		for _, rightIndex := range byPort[port] {
+			if rightIndex > leftIndex {
+				rights = append(rights, rightIndex)
+			}
+		}
+		if port == 80 {
+			for otherPort, indexes := range byPort {
+				if otherPort == 80 {
+					continue
+				}
+				for _, rightIndex := range indexes {
+					if rightIndex > leftIndex {
+						rights = append(rights, rightIndex)
+					}
+				}
+			}
+		} else {
+			for _, rightIndex := range byPort[80] {
+				if rightIndex > leftIndex {
+					rights = append(rights, rightIndex)
+				}
+			}
+		}
+		// 保持原始 (i<j) 枚举顺序，冲突/对手列表文案与旧实现逐字一致。
+		sort.Ints(rights)
+		for _, rightIndex := range rights {
+			evaluate(leftIndex, rightIndex)
 		}
 	}
 	conflicts := make([]disabledRuleConflict, 0, len(reasons))
@@ -200,21 +284,6 @@ func disableConvertedRuleConflicts(rules []convertedRule) []disabledRuleConflict
 		rules[conflict.index].Enabled = false
 	}
 	return conflicts
-}
-
-// httpRedirectShadowReason 判定 80 端口规则域名是否被 TLS+跳转规则域名遮蔽，
-// 命中返回遮蔽原因，未命中返回空串。
-func httpRedirectShadowReason(port80Domain, redirectDomain string) string {
-	leftDomains := make(map[string]struct{})
-	for _, domain := range normalizedRuleDomains(port80Domain) {
-		leftDomains[domain] = struct{}{}
-	}
-	for _, domain := range normalizedRuleDomains(redirectDomain) {
-		if _, exists := leftDomains[domain]; exists {
-			return fmt.Sprintf("HTTP 域名 %s 被 HTTPS 跳转遮蔽", domain)
-		}
-	}
-	return ""
 }
 
 func formatDisabledRuleConflicts(conflicts []disabledRuleConflict) string {
@@ -285,8 +354,13 @@ func convertV1Rules(proxies []v1Proxy, upstreams map[int]v1Upstream) ([]converte
 			warnings = append(warnings, fmt.Sprintf("规则 %s 的负载策略 %q 无法映射，已使用 weighted_round_robin", f.ProxyName, f.BalancerType))
 		}
 		rule := convertedRule{
-			Name:        f.ProxyName,
-			Domain:      strings.Join(strings.Fields(f.ServerName), ", "),
+			Name: f.ProxyName,
+			// server_name 拆分口径：nginx 导出以空格分隔，亦见「逗号+空格」
+			// 混合/连续逗号形态——先把逗号折算为分隔符再按空白拆分，逐段
+			// 剥离后拼接，杜绝空段落库（"a.com,, b.com" 形态曾直通 Caddy
+			// host matcher）。保存侧 v2 写入同样接受逗号/空白分隔（db 归一），
+			// 本口径与其消费面一致。
+			Domain:      strings.Join(strings.Fields(strings.ReplaceAll(f.ServerName, ",", " ")), ", "),
 			ListenPort:  f.Listen,
 			Protocol:    "http",
 			Strategy:    strategy,
@@ -307,17 +381,17 @@ func convertV1Rules(proxies []v1Proxy, upstreams map[int]v1Upstream) ([]converte
 			continue
 		}
 		if rule.HealthFails <= 0 {
-			rule.HealthFails = 3
+			rule.HealthFails = db.DefaultHealthCheckUnhealthyThreshold
 		}
 		if rule.HealthInt <= 0 {
-			rule.HealthInt = 10
+			rule.HealthInt = db.DefaultHealthCheckInterval
 		}
 		if f.SSL {
 			rule.TLSCert = f.SSLCert
 			rule.TLSKey = f.SSLKey
 		}
 		if f.BackendDomainToggle && f.BackendDomain != "" {
-			rule.OriginDomain = f.BackendDomain
+			rule.HostHeader = f.BackendDomain
 		}
 		for _, pk := range f.UpstreamList {
 			u, ok := upstreams[pk]
@@ -354,12 +428,18 @@ func mapV1BalancerStrategy(value string) (string, bool) {
 	}
 }
 
-func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string, []string) {
+// validateConvertedV1Rules 的 portGate 与 validateV2BackupRules 同口径
+// 生产预览/导入传入进程实际管理端口门；省略退回包级默认。
+func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, int) error) ([]convertedRule, []string, []string) {
+	validatePort := validateRuleListenPort
+	if len(portGates) > 0 && portGates[0] != nil {
+		validatePort = portGates[0]
+	}
 	var valid []convertedRule
 	var skips []string
 	var normalizations []string
 	for index, rule := range rules {
-		if err := validateRuleListenPort(rule.Protocol, rule.ListenPort); err != nil {
+		if err := validatePort(rule.Protocol, rule.ListenPort); err != nil {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
@@ -381,25 +461,10 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 				continue
 			}
 		}
-		enabledUpstreams := 0
+		// 先把 v1 协议名归一到 v2 值域，再复用保存侧上游单源校验。
 		upstreamBad := false
-		for upstreamIndex, upstream := range rule.Upstreams {
-			if !isValidHost(upstream.Host) {
-				skips = append(skips, fmt.Sprintf("规则 #%d（%s）上游 #%d：主机无效", index+1, rule.Name, upstreamIndex+1))
-				upstreamBad = true
-				break
-			}
-			if upstream.Port < 1 || upstream.Port > 65535 {
-				skips = append(skips, fmt.Sprintf("规则 #%d（%s）上游 #%d：端口必须在 1-65535 之间", index+1, rule.Name, upstreamIndex+1))
-				upstreamBad = true
-				break
-			}
-			// R70 C-2/R71 S-1：上游协议白名单 + http 规则归一化——值域与保存侧/渲染侧
-			// 一致；口径经 R71 S-1 统一：HTTP 规则下 tcp/tls 上游归一（tcp 渲染等同
-			// http 明文转发；tls 归一 https 即 TLS transport，封堵「明文 HTTP 打 TLS
-			// 端口静默 502」形态——v2 导入/保存侧均拒绝、v1 此前是唯一入口）。TCP
-			// 规则下 http 为 v1 原生（nginx stream 明文）语义、https 渲染按 TLS 处理
-			//（=tls），均保留。归一记入 normalizations 供导入报告呈现。
+		for upstreamIndex := range rule.Upstreams {
+			upstream := &rule.Upstreams[upstreamIndex]
 			switch upstream.Protocol {
 			case "http", "https", "tcp", "tls":
 				if rule.Protocol == "http" && (upstream.Protocol == "tcp" || upstream.Protocol == "tls") {
@@ -409,7 +474,13 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 					}
 					normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）上游 #%d：HTTP 规则上游协议 %s 已按 %s 导入", index+1, rule.Name, upstreamIndex+1, upstream.Protocol, normalized))
 					upstream.Protocol = normalized
-					rule.Upstreams[upstreamIndex].Protocol = normalized
+				} else if rule.Protocol == "tcp" && (upstream.Protocol == "http" || upstream.Protocol == "https") {
+					normalized := "tcp"
+					if upstream.Protocol == "https" {
+						normalized = "tls"
+					}
+					normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）上游 #%d：TCP 规则上游协议 %s 已按 %s 导入", index+1, rule.Name, upstreamIndex+1, upstream.Protocol, normalized))
+					upstream.Protocol = normalized
 				}
 			default:
 				skips = append(skips, fmt.Sprintf("规则 #%d（%s）上游 #%d：上游协议 %q 无效（支持 http/https/tcp/tls）", index+1, rule.Name, upstreamIndex+1, upstream.Protocol))
@@ -418,26 +489,33 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 			if upstreamBad {
 				break
 			}
-			if upstream.Enabled {
-				enabledUpstreams++
-			}
 		}
 		if upstreamBad {
 			continue
 		}
-		if enabledUpstreams == 0 {
-			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：至少需要一个已启用的上游服务器", index+1, rule.Name))
+		upstreams := make([]models.Upstream, 0, len(rule.Upstreams))
+		for _, upstream := range rule.Upstreams {
+			upstreams = append(upstreams, models.Upstream{Host: upstream.Host, Port: upstream.Port, Weight: upstream.Weight, Enabled: upstream.Enabled, Protocol: upstream.Protocol})
+		}
+		enabledUpstreams, err := validateRuleUpstreams(rule.Protocol, false, upstreams, true)
+		if err != nil {
+			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
-		// R62 C3-F3: 导入 INSERT 的探测超时硬编码 5s，Round 37 I-6 的
-		// timeout<interval 不变量（保存侧门控）在导入链未生效——fail_timeout ≤ 5 的
-		// v1 规则会让活动检查单次耗时与间隔重叠。钳位 interval ≥ 6（语义近似保留，
-		// 仅活动检查启用时生效；被动检查的 fail_duration=interval*3 不受超时约束）。
-		if rule.ActiveHC && rule.HealthInt <= 5 {
-			rule.HealthInt = 6
-			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：v1 健康检查间隔过短，已提为 6 秒（探测超时 5 秒须小于间隔）", index+1, rule.Name))
+		if err := validateRuleHostHeader(rule.HostHeader); err != nil {
+			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
+			continue
 		}
-		// R62 C2-N1: TCP 规则在 v2 渲染侧不终结入站 TLS（buildTCPServer 不触碰 TLS
+		// 导入 INSERT 的 health_check_timeout 恒取 db.DefaultHealthCheckTimeout，
+		// 而保存/启用侧的不变式要求超时小于间隔。v1 的 fail_timeout 直接映射为
+		// 间隔，过短时该行落库后会在下一次保存/启用被拒（规则变成不可维护的
+		// 陷阱行），故按落库超时归一间隔。阈值与文案同源派生自默认超时，
+		// 不区分主动/被动（被动熔断窗口同样由间隔派生）。
+		if minInterval := db.DefaultHealthCheckTimeout + 1; rule.HealthInt < minInterval {
+			rule.HealthInt = minInterval
+			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：v1 健康检查间隔过短，已提为 %d 秒（须大于健康检查超时 %d 秒）", index+1, rule.Name, minInterval, db.DefaultHealthCheckTimeout))
+		}
+		// TCP 规则在 v2 渲染侧不终结入站 TLS（buildTCPServer 不触碰 TLS
 		// 字段），v1 的 SSL 开关对 TCP 无意义；保留 enable_tls=1 + 空 manual 证书会因
 		// UpdateRule 非协议门控的手动证书检查使该规则任何编辑恒 400，且 UI 向导对
 		// TCP 隐藏 TLS 开关、无域名 TCP 规则无界面自救路径——导入即归一（与
@@ -447,7 +525,7 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 			rule.TLSCert, rule.TLSKey = "", ""
 			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：TCP 规则不支持入站 TLS，已按关闭 TLS 导入", index+1, rule.Name))
 		}
-		// R43 F-C: v1 SSL 规则导入后 tls_source 恒为 manual（tlsSource()）；启用但
+		// v1 SSL 规则导入后 tls_source 恒为 manual（tlsSource()）；启用但
 		// 证书/私钥为空的规则会在 TLS 端口明文服务（镜像 rule_features.go 保存/启用侧
 		// 口径），按 v1 风格软跳过并警告而非整包拒绝。
 		if rule.Enabled && rule.Protocol == "http" && rule.EnableTLS &&
@@ -455,15 +533,15 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：启用 TLS 但证书或私钥为空，已跳过导入", index+1, rule.Name))
 			continue
 		}
-		// R46 C-B-1: 禁用的空证书 SSL 行此前原样落库（enable_tls=1 + tls_source=
+		// 禁用的空证书 SSL 行此前原样落库（enable_tls=1 + tls_source=
 		// 'manual' + 空证书），并随 v2 导出回流；导入时归一为 enable_tls=0（证书
 		// 可后续补齐再启用），逐条告警但不计入跳过数。
 		if !rule.Enabled && rule.Protocol == "http" && rule.EnableTLS &&
 			(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
 			rule.EnableTLS = false
-			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：启用 TLS 但证书或私钥为空，已按关闭 TLS 导入（规则为禁用状态）", index+1, rule.Name))
+			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：规则为禁用状态且证书/私钥为空，已按关闭 TLS 导入（证书可后续补齐再启用）", index+1, rule.Name))
 		}
-		// Round 38 B4 / Round 29 G-1（审计 M15 前移）：strategy 白名单与 80 端口
+		// /：strategy 白名单与 80 端口
 		// +TLS 跳转自环门自导入循环前移至此——预览/导入共用同门，summary 计数
 		// 与实际导入数保持一致；strategy 空值按导入循环同款默认补齐。
 		mappedStrategy := rule.Strategy
@@ -473,7 +551,8 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 		if validateErr := validateRuleFeatures(ruleFeatureInput{
 			Protocol: rule.Protocol, Strategy: mappedStrategy,
 			ListenPort: rule.ListenPort, EnableTLS: rule.EnableTLS, TLSHTTPRedirect: rule.Redirect,
-			CompressTypes: "gzip",
+			HealthCheckInterval: rule.HealthInt, HealthCheckTimeout: db.DefaultHealthCheckTimeout,
+			EnabledUpstreamCount: enabledUpstreams, EnableCompress: rule.Compress, CompressTypes: "gzip",
 		}); validateErr != nil {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, validateErr))
 			continue
@@ -496,9 +575,15 @@ type importValidateResponse struct {
 	HasWafFiles bool `json:"has_waf_files"`
 }
 
-// v2.3.0:lbbak(tar.gz 含规则库文件)可达 ~15MB(xdb 10.6MB 原始字节+CRS 包),
-// 上限提至 48MB;纯 JSON 备份远小于此。
-const maxConfigImportBytes int64 = 48 << 20
+// lbbak 解压总字节上限 256MB；压缩上传上限取 128MB（远高于已知 ~15MB 完整包），
+// 导出侧同样拒绝超限产物，兼顾大备份往返与导入瞬态内存峰值。
+var maxConfigImportBytes int64 = 128 << 20
+
+// configImportLimitMessage 413 文案从 maxConfigImportBytes 派生（单源）：测试
+// 收窄限额后文案必须同步，否则「断言照过、文案失真」。
+func configImportLimitMessage() string {
+	return fmt.Sprintf("备份文件不能超过 %dMB", maxConfigImportBytes>>20)
+}
 
 // lbbakPayloadFromCtx 取 validate 流程中解包的 lbbak 载荷(可能为 nil)。
 func lbbakPayloadFromCtx(c *gin.Context) *lbbakPayload {
@@ -509,7 +594,7 @@ func lbbakPayloadFromCtx(c *gin.Context) *lbbakPayload {
 
 func limitConfigImportBody(c *gin.Context) bool {
 	if c.Request.ContentLength > maxConfigImportBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return false
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxConfigImportBytes)
@@ -530,9 +615,16 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 	}
 	body, err := c.GetRawData()
 	if isRequestBodyTooLarge(err) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return
 	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + err.Error()})
+		return
+	}
+	// BOM 剥离必须先于 lbbak 魔数检测（与导入核心同序）——带 BOM 的
+	// lbbak 否则被当作纯 JSON 解析失败；BOM 与 gzip 魔数不冲突。
+	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 	// v2.3.0 lbbak:tar.gz 先解包校验(含逐条目 sha256),内部 config.json
 	// 以其原始字节走下方 V2 解析——validate 端点对两种格式统一返回。
 	if isLbbakBytes(body) {
@@ -544,7 +636,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		body = payload.ConfigJSON
 		c.Set("lbbak_payload", payload)
 	}
-	if err != nil || len(body) == 0 {
+	if len(body) == 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
 		return
 	}
@@ -560,156 +652,101 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份文件格式不正确: " + err.Error()}})
 			return
 		}
-		// CERT41-1:与 ImportConfigBackup 同序——lbbak 的分类选择经 ?sections=
-		// query 传输(JSON 备份以体内 sections 字段为准)。
-		if lbbakPayloadFromCtx(c) != nil {
-			if sel := parseSectionsParam(c.Query("sections")); len(sel) > 0 {
-				backup.Sections = sel
+		// 与 ImportConfigBackup 共用 importValidationSteps 单一门序：完整性 →
+		// 分类选择/过滤 → 软跳过 → 行级门 → 规则库元数据剔除 → 零导入判据 →
+		// 形态/引用/任务/全局配置门。预览不再自行编排子集门，新增校验自然
+		// 双路径同序（此前两条路径各写一遍，增删门时静默分叉）。
+		chain, chainErr := validateImportBackupChain(c.Request.Context(), importValidationDeps{
+			DB:                     db.DB,
+			ValidateRuleListenPort: h.validateRuleListenPortForSave,
+		}, &backup, importValidationOptions{LbbakPayload: lbbakPayloadFromCtx(c), RequestedSections: c.Query("sections")})
+		if chainErr != nil {
+			// 校验链内含 DB 读取（受信代理/整数列门/安全策略 live 回退）：服务端
+			// 故障不回「备份校验失败」（会把「硬盘 I/O 错误」说成备份内容问题，
+			// 并透出 SQL 文本），统一 500 固定文案。
+			if writeImportChainReadFailure(c, chainErr) {
+				return
 			}
-		}
-		// CERT41-1:validateV2Backup 会回填缺失表(校验均匀性),快照真实携带
-		// 表集——缺席还原与反向悬挂降级口径都依赖「备份原本是否携带」。
-		exportedTables := map[string]bool{}
-		for table := range backup.Tables {
-			exportedTables[table] = true
-		}
-		backupCarriedCertTables := exportedTables["certificate_configs"] || exportedTables["ca_providers"]
-		if _, err := validateV2Backup(backup); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: chainErr.Error()}})
 			return
 		}
-		// CERT41-1:与 ImportConfigBackup 同序——还原「缺席」语义,回填表不得
-		// 被当作「清空本地表」参与校验/汇总。
-		for table := range backup.Tables {
-			if !exportedTables[table] {
-				delete(backup.Tables, table)
-			}
-		}
-		// CERT41-1:与 ImportConfigBackup 同序——sections 过滤前置到全部形态/
-		// 任务校验之前:①未选分类的坏行预览不误报;②ACME 引用「备份有表按
-		// 备份行、缺表按 live」自动等于「过滤后导入表∪live 保留表」正确口径;
-		// 未选系统数据时全局配置区不参与校验。
-		sectionTables, includeGlobal, sectionsOK := configBackupSectionTables(backup.Sections)
-		if !sectionsOK {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "未知的配置分类"}})
-			return
-		}
-		for table := range backup.Tables {
-			if !sectionTables[table] {
-				delete(backup.Tables, table)
-			}
-		}
-		if !includeGlobal {
-			backup.Config = nil
-		}
-		// L6-66-01（第 66 轮审计 P2）：users 键存在且为空数组——预览与导入
-		// 同位硬拒（同文案），此前预览显示「用户 0 个」仍 valid=true。
-		if rows, ok := backup.Tables["users"]; ok && len(rows) == 0 {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份 users 表为空，导入将清空全部账户，已拒绝"}})
-			return
-		}
-		skipWarnings := skipEmptyDomainHTTPRules(backup.Tables)
-		// N+13 H2-F3：与 ImportConfigBackup 同序——空内容拦截页软跳过也须
-		// 进预览，否则预览静默、导入才跳（summary/warnings 口径一致）。
-		skipWarnings = append(skipWarnings, skipEmptyBlockPages(backup.Tables)...)
-		// 第 53 轮 P3-3：与 ImportConfigBackup 同序——content_type 白名单值域收敛
-		// 也进预览，「导入/预览双路径同序」不变量补齐（预览不回显该值，无可观察
-		// 面分叉，纯不变量对齐）。
-		normalizeBlockPageContentTypes(backup.Tables)
-		// R39 C-3: 与 ImportConfigBackup 同序——skip 之后、逐行校验之前校验
-		// upstreams/path_rules 引用存在性，预览结果与实际导入一致（否则悬挂引用
-		// 备份在预览显示可导入、实际导入才 400）。
-		if err := validateBackupRuleReferences(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		if err := validateV2BackupRules(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序：安全策略 CRS 字段校验也须进预览，否则坏
-		// 组号备份在预览显示可导入、实际导入才 400（R47 B-5）。
-		if err := validateV2BackupSecurityPolicies(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		disabledConflicts := disableV2RuleConflicts(backup.Tables["lb_rules"])
-		// R55 C-1：与 ImportConfigBackup 同序——TLS 形态校验在冲突置禁用之后
-		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
-		// CERT41-1:与 ImportConfigBackup 同序——「导规则不导 cert 配置且备份
-		// 从未携带 cert 表」方向按 live 解析失败的 ACME 引用降级为悬挂警告。
-		softLiveACMERefs := sectionTables["lb_rules"] &&
-			!sectionTables["certificate_configs"] && !sectionTables["ca_providers"] &&
-			!backupCarriedCertTables
-		acmeDanglingImported, tlsShapeErr := validateV2BackupTLSShapeSoft(backup.Tables, softLiveACMERefs)
-		if tlsShapeErr != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: tlsShapeErr.Error()}})
-			return
-		}
-		// R54 新发现2：与 ImportConfigBackup 同序——任务不变量在冲突置禁用之后
-		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
-		if err := validateV2BackupCertJobs(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// R55 C-4：与 ImportConfigBackup 同序——坏 admin_tls_* 形态预览即报
-		// 不可导入，不得预览通过、导入才 400。
-		if err := validateV2BackupAdminTLS(backup.Config); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
+		sectionTables := chain.SectionTables
+		skipWarnings := chain.SkipWarnings
+		disabledConflicts := chain.DisabledConflicts
+		crsTreeReplaced := chain.CRSTreeReplaced
+		acmeDanglingImported := chain.ACMEDanglingImported
+		certJobProviderWarnings := chain.CertJobProviderWarnings
 		// 2026-09-18 用户裁定:操作者缺席不再阻断——降级为预览 warning(分类
 		// 未选系统数据时操作者不受影响;选了也尊重用户选择)。
-		// CERT41-1:同序后 sections 已知——未选系统数据/备份 users 缺席不再误告
-		// (与导入侧 A40-2-F3 口径一致)。
+		// 同序后 sections 已知——未选系统数据/备份 users 缺席不再误告
+		// (与导入侧口径一致)。
 		validateWarnings := skipWarnings[:0:0]
 		validateWarnings = append(validateWarnings, skipWarnings...)
+		if warning := backupProductVersionWarning(backup.Meta, h.cfg.Version); warning != "" {
+			validateWarnings = append(validateWarnings, warning)
+		}
+		// 完全不含校验和的史前 v1 备份：导入照常（结构门全执行），预览必须
+		// 明确告知内容未经摘要校验——与导入侧审计警告同文案。
+		if chain.NoIntegrityChecksum {
+			validateWarnings = append(validateWarnings, warningNoIntegrityChecksum)
+		}
+		if crsTreeReplaced {
+			validateWarnings = append(validateWarnings, warningCRSTreeReplaced)
+		}
 		if importUsername := c.GetString("username"); importUsername != "" && sectionTables["users"] && len(backup.Tables["users"]) > 0 && !backupContainsUsername(backup.Tables["users"], importUsername) {
 			validateWarnings = append(validateWarnings, "备份不包含当前操作账户——若导入时勾选“系统数据”，导入后请使用备份内的管理员账户登录")
 		}
-		// CERT41-1:反向悬挂降级警告进预览(与导入 responseWarnings 同文案)。
+		// 反向悬挂降级警告进预览(与导入 responseWarnings 同文案)。
 		if acmeDanglingImported > 0 {
 			validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 条启用规则的 DNS 提供商配置悬挂（引用未随备份导入，且现有配置中不存在或已禁用）——下一次签发/续签将失败，请及时补齐", acmeDanglingImported))
 		}
+		// 证书任务级 CA 提供商悬挂/禁用引用的归一警告（与导入同通道）。
+		validateWarnings = append(validateWarnings, certJobProviderWarnings...)
+		// 链内自动封禁钳制事实（阈值/窗口越界被归一）与上述并列，预览必须
+		// 可见——否则预览显示 valid 且无提示，导入后实际生效值已变。
+		validateWarnings = append(validateWarnings, chain.AutobanClampNotes...)
+		// 全局配置数值归一（整型钳制表 + request_body_max_size_mb）同源可见：
+		// 预览与导入共用链内归一点，同一份备份两侧给出同一组文案。
+		validateWarnings = append(validateWarnings, chain.ConfigClampNotes...)
+		// live 证书任务引用 live CA 提供商的悬挂预检：链内单源产出（按
+		// 「已禁用=真失败 / 不存在=回落自愈」分档，规则源按备份是否携带
+		// lb_rules 二选一），预览与导入对同一备份给出同一组文案。
+		validateWarnings = append(validateWarnings, chain.CertJobDanglingWarnings...)
 		hasWaf := false
 		if payload := lbbakPayloadFromCtx(c); payload != nil {
-			hasWaf = payload.CRSTarGz != nil || payload.Xdb != nil
+			// 威胁库名单条目也是规则库数据文件
+			// ——RDB 文件化后存在「仅威胁 .iplist、无 CRS/xdb」的合法 lbbak
+			// （只启用威胁库更新的节点）。此前 hasWaf 只认 CRS/xdb，预览据此
+			// 提示「不含规则库文件」而实际会落盘名单文件（文案与真实能力不符）。
+			hasWaf = payload.CRSTarGz != nil || payload.Xdb != nil || len(payload.ThreatIplists) > 0
 			if hasWaf {
-				validateWarnings = append(validateWarnings, "lbbak 完整备份（含规则库数据文件，完整性已校验）——规则库数据库分类将随导入落盘")
+				if payload.CRSTarGz != nil || payload.Xdb != nil {
+					validateWarnings = append(validateWarnings, "lbbak 完整备份（含规则库数据文件，完整性已校验）——规则库数据库分类将随导入落盘")
+				} else {
+					validateWarnings = append(validateWarnings, "lbbak 含威胁库名单文件（完整性已校验）——导入「安全防护」将落盘名单文件；本包不含 CRS/IP2Region 数据文件")
+				}
 			}
-			// F-B1（第 66 轮审计）：manifest 未登记的威胁库条目——预览/导入
+			// manifest 未登记的威胁库条目——预览/导入
 			// 同文案告警（不拒绝，老备份兼容）。
 			if len(payload.UnregisteredThreatEntries) > 0 {
-				validateWarnings = append(validateWarnings, fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(payload.UnregisteredThreatEntries, "、")))
+				warning := fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(payload.UnregisteredThreatEntries, "、"))
+				if !sectionTables["security_crs_version"] {
+					warning = fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验；本次分类未选择安全防护数据，条目未导入、未落盘", strings.Join(payload.UnregisteredThreatEntries, "、"))
+				}
+				validateWarnings = append(validateWarnings, warning)
 			}
 		}
-		// SYS-U4（第 69 轮，已声明例外）：本剔除步位于全部校验器之后，与导入侧
-		//（ImportConfigBackup 在行级校验之前剔除）顺序不一致——「导入/预览双路径
-		// 同序」不变量的有意例外：现存校验器均不读 security_crs_version/
-		// security_ip2region_version 两行表（第 69 轮逐函数核实），剔除先后无可观察
-		// 分叉。**未来新增读取这两表的校验器时，必须先把本步前移到
-		// validateBackupRuleReferences 之前与导入逐行对齐。**
-		// L6-66-03（第 66 轮审计）：镜像导入侧 BE-C1-10 单侧文件缺失建模——
-		// 单侧缺失剔对应版本表并告警（此前仅建模双侧缺失，单侧形态预览计数
-		// 含两表且无警告，与导入实际落库分叉）；双侧缺失语义保持（L6-F2，
-		// BE-C1-10「只有元数据=不导入」）。文案与导入侧共用常量（A40-2-F6）。
-		if sectionTables["security_crs_version"] {
-			previewPayload := lbbakPayloadFromCtx(c)
-			crsMissing := previewPayload == nil || previewPayload.CRSTarGz == nil
-			xdbMissing := previewPayload == nil || previewPayload.Xdb == nil
-			switch {
-			case crsMissing && xdbMissing:
-				for _, t := range []string{"security_crs_version", "security_ip2region_version"} {
-					delete(backup.Tables, t)
-				}
-				validateWarnings = append(validateWarnings, warningWafMetadataSkipped)
-			case crsMissing:
-				delete(backup.Tables, "security_crs_version")
-				validateWarnings = append(validateWarnings, warningWafCRSMetadataSkipped)
-			case xdbMissing:
-				delete(backup.Tables, "security_ip2region_version")
-				validateWarnings = append(validateWarnings, warningWafXdbMetadataSkipped)
-			}
+		// 版本表随文件缺失的剔除及其零导入判据已在链内按导入同序完成
+		// （行级校验 → 版本表剔除 → 剔除后判据），此处只把同一事实呈现为
+		// 响应 warning，文案与导入侧共用常量。
+		if chain.WAFMetadataSkipped {
+			validateWarnings = append(validateWarnings, warningWafMetadataSkipped)
+		}
+		if chain.WAFCRSMetadataSkipped {
+			validateWarnings = append(validateWarnings, warningWafCRSMetadataSkipped)
+		}
+		if chain.WAFXdbMetadataSkipped {
+			validateWarnings = append(validateWarnings, warningWafXdbMetadataSkipped)
 		}
 		summary := map[string]int{}
 		for table, rows := range backup.Tables {
@@ -726,9 +763,13 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			return
 		}
 		rules, conversionWarnings := convertV1Rules(proxies, upstreams)
-		validRules, validationSkips, normalizations := validateConvertedV1Rules(rules)
+		validRules, validationSkips, normalizations := validateConvertedV1Rules(rules, h.validateRuleListenPortForSave)
 		allWarnings := append(conversionWarnings, validationSkips...)
 		allWarnings = append(allWarnings, normalizations...)
+		// 证书质量警告与导入路径同源（预览阶段无 caddy_id，前缀只带规则名）。
+		for _, r := range validRules {
+			allWarnings = append(allWarnings, v1CertificateWarnings(r, "")...)
+		}
 		if len(validRules) == 0 {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v1", Error: "所有规则均校验失败", Warnings: allWarnings}})
 			return
@@ -743,7 +784,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			upstreamCount += len(r.Upstreams)
 		}
 		warnings := []string{
-			"仅导入负载规则（用户、全局配置不导入，证书任务保持不变）",
+			"仅导入负载规则（用户、全局配置不导入；旧规则的证书任务、证书材料与日志将随规则替换一并清理）",
 			"v1 不支持 ACME，HTTPS 规则的证书与私钥将以手动方式随规则导入",
 			"nginx 特有配置（custom_config、日志路径等）已忽略",
 		}
@@ -773,70 +814,95 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	body, err := c.GetRawData()
 	if isRequestBodyTooLarge(err) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage()})
 		return
 	}
+	if err != nil {
+		failImportValidation(c, "导入", "备份文件读取失败: "+err.Error())
+		return
+	}
+	// BOM 剥离先于魔数检测——与 validate/v2 两路径同序。
+	// 此前 BOM+lbbak 请求绕过 lbbak 指引、落入「不是有效的 JSON」，提示失真
+	// （安全面本就拒绝，仅语义质量）。BOM 与 gzip 魔数不冲突。
+	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 	// lbbak(tar.gz)是 V2 形态:提前给出正确端点指引,避免落入 JSON 解析
 	// 「不是有效的 JSON」困惑(安全面本就必拒,仅提示质量)。
-	if len(body) > 2 && body[0] == 0x1f && body[1] == 0x8b {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "V1 导入仅支持旧版 JSON 备份；lbbak 备份请使用 /api/v1/config/import"})
+	if isLbbakBytes(body) {
+		failImportValidation(c, "导入", "V1 导入仅支持旧版 JSON 备份；lbbak 备份请使用 /api/v1/config/import")
 		return
 	}
-	if err != nil || len(body) == 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
+	if len(body) == 0 {
+		failImportValidation(c, "导入", "备份文件内容为空")
 		return
 	}
-	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 	var v1 v1Backup
 	if err := json.Unmarshal(body, &v1); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件不是有效的 JSON"})
+		failImportValidation(c, "导入", "备份文件不是有效的 JSON")
 		return
 	}
 	proxies, upstreams, err := v1.parse()
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		failImportValidation(c, "导入", err.Error())
 		return
 	}
 	rules, conversionWarnings := convertV1Rules(proxies, upstreams)
-	validRules, validationSkips, normalizations := validateConvertedV1Rules(rules)
+	validRules, validationSkips, normalizations := validateConvertedV1Rules(rules, h.validateRuleListenPortForSave)
 	var allWarnings []string
 	allWarnings = append(allWarnings, conversionWarnings...)
 	allWarnings = append(allWarnings, validationSkips...)
 	allWarnings = append(allWarnings, normalizations...)
 	if len(validRules) == 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份中没有可导入的有效规则"})
+		failImportValidation(c, "导入", "备份中没有可导入的有效规则")
 		return
 	}
 	disabledConflicts := disableConvertedRuleConflicts(validRules)
 	ctx := c.Request.Context()
-	session, err := h.beginConfigImport(ctx)
+	session, err := h.beginConfigImport(ctx, "导入")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		respondImportBeginError(c, err)
 		return
 	}
 	defer session.close()
+	// 会话建立后与 v2 共用独立 ctx：请求断连不得取消已开始的写事务。
+	ctx = session.ctx
+	if configImportAfterSessionHook != nil {
+		configImportAfterSessionHook()
+	}
+	// v1 全量导入替换规则面：允许导入后清理消失规则产物。
+	session.replaceRuleArtifacts = true
 	tx := session.tx
+	restoreImportNodeRole, err := suppressImportClusterVersionBumps(ctx, tx)
+	if err != nil {
+		err = failImportTx(c, session, "导入", "准备导入事务", err, http.StatusInternalServerError, "准备导入事务失败")
+		return
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_rules"); err != nil {
-		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧路径规则失败，已回滚: " + err.Error()})
+		err = failImportTx(c, session, "导入", "清理旧路径规则", err, http.StatusInternalServerError, "清理旧路径规则失败")
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM upstreams"); err != nil {
-		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧上游失败，已回滚: " + err.Error()})
+		err = failImportTx(c, session, "导入", "清理旧上游", err, http.StatusInternalServerError, "清理旧上游失败")
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM lb_rules"); err != nil {
-		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧规则失败，已回滚: " + err.Error()})
+		err = failImportTx(c, session, "导入", "清理旧规则", err, http.StatusInternalServerError, "清理旧规则失败")
 		return
 	}
-	// 审计 M14：v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
+	// v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
 	// 绑定表对 rule_caddy_id 无外键级联，残留行会指向已删除规则成为悬挂绑定。
-	if _, err := tx.ExecContext(ctx, "DELETE FROM security_policy_bindings"); err != nil {
-		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧策略绑定失败，已回滚: " + err.Error()})
+	// v1 不恢复策略绑定：清空数量必须进入响应与审计，避免导入后原 WAF/安全
+	// 防护策略停止应用却零披露。TCP 绑定剪枝文案是另一语义，不在此复用。
+	var clearedBindings int64
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM security_policy_bindings").Scan(&clearedBindings); err != nil {
+		err = failImportTx(c, session, "导入", "统计旧策略绑定", err, http.StatusInternalServerError, "统计旧策略绑定失败")
 		return
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM security_policy_bindings"); err != nil {
+		err = failImportTx(c, session, "导入", "清理旧策略绑定", err, http.StatusInternalServerError, "清理旧策略绑定失败")
+		return
+	}
+	if clearedBindings > 0 {
+		allWarnings = append(allWarnings, fmt.Sprintf("已解除 %d 条安全策略绑定；v1 备份不恢复策略绑定，导入后规则不再应用原 WAF/安全防护策略，请按需重新绑定", clearedBindings))
 	}
 	userID := int(contextUserID(c))
 	imported := 0
@@ -847,7 +913,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	for _, r := range validRules {
 		caddyID, err := services.GenerateCaddyID()
 		if err != nil {
-			err = session.abort(err)
+			err = failImportAbort(c, session, "导入", "生成规则编号", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则编号失败: " + err.Error()})
 			return
 		}
@@ -857,25 +923,21 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_try_duration, tcp_try_interval,
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
-			origin_domain, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_http_redirect,
+			host_header, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_http_redirect,
 			enable_compress, compress_types, enabled, created_by, updated_by, updated_at, caddy_id, log_enabled)
-		VALUES (?, ?, ?, ?, ?, ?, 0, 0, '', '', ?, 5, ?, 2, ?, 0, 0, 250, 0, 0, 0, ?, ?, ?, 0, 0, ?, ?, ?, ?, 'gzip', ?, ?, ?, datetime('now'), ?, 0)`,
+		VALUES (?, ?, ?, ?, ?, ?, 0, 0, '', '', ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, ?, ?, ?, 0, 0, ?, ?, ?, ?, 'gzip', ?, ?, ?, datetime('now'), ?, 0)`,
 			r.Name, r.Description, r.Protocol, r.Domain, r.ListenPort, r.Strategy,
-			r.HealthInt, r.HealthFails, r.ActiveHC,
-			r.OriginDomain, r.EnableTLS, tlsSource(r), r.TLSCert, r.TLSKey, r.Redirect,
+			r.HealthInt, db.DefaultHealthCheckTimeout, r.HealthFails, db.DefaultHealthCheckHealthyThreshold, r.ActiveHC, db.DefaultTCPTryInterval,
+			r.HostHeader, r.EnableTLS, tlsSource(r), r.TLSCert, r.TLSKey, r.Redirect,
 			r.Compress, r.Enabled, userID, userID, caddyID)
 		if err != nil {
-			err = session.abort(err)
-			recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s: %v", r.Name, err))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则失败，已回滚: " + err.Error()})
+			err = failImportTx(c, session, "导入", "规则 "+r.Name, err, http.StatusInternalServerError, "导入规则失败")
 			return
 		}
 		for _, u := range r.Upstreams {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections)
 				VALUES (?, ?, ?, ?, 0, ?, ?, 0)`, caddyID, u.Host, u.Port, u.Weight, u.Enabled, u.Protocol); err != nil {
-				err = session.abort(err)
-				recordAudit(c, "导入失败", "配置备份", fmt.Sprintf("规则 %s 上游: %v", r.Name, err))
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入上游失败，已回滚: " + err.Error()})
+				err = failImportTx(c, session, "导入", "规则 "+r.Name+" 上游", err, http.StatusInternalServerError, "导入上游失败")
 				return
 			}
 			upstreamCount++
@@ -883,42 +945,69 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		if r.EnableTLS && r.TLSCert != "" && r.TLSKey != "" {
 			pendingCerts = append(pendingCerts, importCertificate{ruleID: caddyID, certPEM: r.TLSCert, keyPEM: r.TLSKey})
 		}
+		// 证书质量警告与规则保存/v2 导入同源（导入响应与「导入」审计都带出）。
+		allWarnings = append(allWarnings, v1CertificateWarnings(r, caddyID)...)
 		if r.EnableTLS {
 			tlsCount++
 		}
 		imported++
 	}
-	// CL-3（第 70 轮审计）：v1 导入此前是规则归一四面（导出/从端落库/v2 备份
+	// v1 导入此前是规则归一四面（导出/从端落库/v2 备份
 	// 导入/此处）中唯一事务内零归一的写路径——转换器对 BackendDomain/Gzip 无
 	// 协议门，TCP 行可携带 host_header/enable_compress/compress_types 死值落库。
 	// INSERT 后统一调与 v2 备份导入共享的 normalizeRuleRowsForTransport（单一
-	// 事实源）。
-	if err := normalizeRuleRowsForTransport(ctx, tx); err != nil {
-		err = session.abort(err)
-		recordAudit(c, "导入失败", "配置备份", err.Error())
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则归一失败，已回滚: " + err.Error()})
+	// 事实源）。其 droppedTCPBindings 在 v1 恒为 0（绑定表已在上方清空），
+	// 故 v1 不消费返回值、也不复用 v2 的告警文案。
+	if _, err := normalizeRuleRowsForTransport(ctx, tx); err != nil {
+		err = failImportTx(c, session, "导入", "", err, http.StatusInternalServerError, "导入规则归一失败")
+		return
+	}
+	if err := restoreImportNodeRole(); err != nil {
+		err = failImportTx(c, session, "导入", "", err, http.StatusInternalServerError, "恢复导入前节点角色失败")
 		return
 	}
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {
+		// 队列阶段=DB 已提交，与 v2 同语义返回 200+partial（500 会让前端
+		// 按“已回滚”处理并诱发重复导入）。
+		if importFailurePhase(err) == importPhaseQueue {
+			// 与 v2 尾部（config_backup.go queue
+			// 分支后继续提交后收敛）对齐——此前提前返回丢失全部转换/跳过/
+			// 归一化警告、不写「重载」审计、不清陈旧 caddy_apply_error 横幅。
+			// detail 走单源：审计 action 已带「部分失败」，detail 不再重复动作词。
+			auditDetail := importFailureAuditDetail(err)
+			if len(disabledConflicts) > 0 {
+				auditDetail = services.FormatAuditDetail(auditDetail, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
+			}
+			recordAudit(c, "部分失败", "配置备份", auditDetail)
+			recordAudit(c, "重载", "Caddy服务", "导入配置后自动重载")
+			h.recordCaddyApplyResult(nil)
+			// 提交已落地：imported 是真实已提交条数（回滚路径相反，不报条数）。
+			// message/warnings 只带阶段说明与真实原因（不重复动作词）——与 v2
+			// 出口共用 importPartialSuccess* 单源（此前 v1 自行内联两份同义文案，
+			// 措辞「，但」与单源的「（部分完成）：」分叉，只改单源会静默漂移）。
+			partialWarnings := append(append([]string{}, allWarnings...), importPartialSuccessWarning(err))
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: importPartialSuccessMessage("导入", err), Data: gin.H{
+				"imported": imported, "disabled_conflicts": disabledConflicts,
+				"partial": true, "warnings": partialWarnings,
+			}})
+			return
+		}
+		// message 正文与审计 detail 同源（阶段描述+真实错误）：err.Error() 自带
+		// 「导入失败」动作前缀，再拼「配置导入失败:」会双前缀。
 		status := http.StatusInternalServerError
-		message := "配置导入失败: " + err.Error()
-		if importFailurePhase(err) == importPhaseCaddy {
+		message := "配置导入失败: " + importFailureAuditDetail(err)
+		if importFailureCaddyRejected(err) {
 			status = http.StatusBadRequest
-			message = "备份生成的配置未通过 Caddy 验证，未执行导入: " + err.Error()
+			message = "备份生成的配置未通过 Caddy 验证，未执行导入: " + importFailureAuditDetail(err)
 		}
-		if importFailurePhase(err) == importPhaseQueue {
-			message = "配置已导入但证书任务恢复失败: " + err.Error()
-		}
-		auditAction := "导入失败"
-		if importFailurePhase(err) == importPhaseQueue {
-			auditAction = "部分失败"
-		}
-		auditDetail := err.Error()
-		if importFailurePhase(err) == importPhaseQueue && len(disabledConflicts) > 0 {
-			auditDetail = services.FormatAuditDetail(auditDetail, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
-		}
-		recordAudit(c, auditAction, "配置备份", auditDetail)
-		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"imported": imported, "disabled_conflicts": disabledConflicts}})
+		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
+		// 事务已回滚：循环里的插入计数全部作废，不得报 imported（否则前端/
+		// 运维会误判部分规则已落地）。warnings 透出会话收尾披露（提交不确定态
+		// 下的产物清理去向），否则「删除失败」被读成「磁盘也已收敛」。
+		failureWarnings := append([]string{}, session.failureWarnings...)
+		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{
+			"disabled_conflicts": disabledConflicts, "warnings": failureWarnings,
+		}})
 		return
 	}
 	auditParts := []string{"来源：v1 备份（覆盖导入规则）", fmt.Sprintf("规则 %d 条", imported), fmt.Sprintf("TLS 规则 %d 条", tlsCount), fmt.Sprintf("上游 %d 个", upstreamCount)}
@@ -931,7 +1020,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	auditParts = append(auditParts, services.AuditResultPart("success"))
 	recordAudit(c, "导入", "配置备份", services.FormatAuditDetail(auditParts...))
 	recordAudit(c, "重载", "Caddy服务", "导入配置后自动重载")
-	// 2026-09-07 审计 L4：导入成功后清除陈旧 caddy_apply_error（对齐 N3/L2 口径）。
+	// 2026-09-07：导入成功后清除陈旧 caddy_apply_error（对齐口径）。
 	h.recordCaddyApplyResult(nil)
 	tlsSuffix := ""
 	if tlsCount > 0 {
@@ -949,4 +1038,23 @@ func tlsSource(r convertedRule) string {
 		return "manual"
 	}
 	return ""
+}
+
+// v1CertificateWarnings 返回一条 v1 转化规则的手动证书质量警告（前缀与 v2
+// 备份导入同源）：规则保存与 v2 导入都会对手动证书做「域名不匹配/过期/未生效/
+// 链不完整」提示，v1 导入此前零判定——错域名或过期证书静默导入，上线后只在
+// 浏览器层面暴露。caddyID 为空（预览阶段尚未生成编号）时前缀只带规则名。
+func v1CertificateWarnings(r convertedRule, caddyID string) []string {
+	if !r.EnableTLS || r.TLSCert == "" || r.TLSKey == "" {
+		return nil
+	}
+	prefix := "规则 " + r.Name
+	if caddyID != "" {
+		prefix += "（" + caddyID + "）"
+	}
+	var out []string
+	for _, warning := range tlsCertificateWarnings(r.TLSCert, r.TLSKey, r.Domain) {
+		out = append(out, prefix+"："+warning)
+	}
+	return out
 }

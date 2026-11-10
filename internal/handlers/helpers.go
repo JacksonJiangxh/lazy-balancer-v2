@@ -2,22 +2,25 @@ package handlers
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/rsa"
+	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/singleflight"
 
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
@@ -26,7 +29,17 @@ import (
 var startTime = time.Now()
 
 var systemMetricsReadFile = os.ReadFile
-var systemMetricsDFCommand = func() *exec.Cmd { return exec.Command("df", "-B1", "/") }
+
+// systemMetricsCommandTimeout 外部命令（df/netstat）单次执行超时上限：宿主
+// 文件系统/网络栈卡住时，读路径不得无上限阻塞（老实现无 context，命令卡死即
+// 等待者全部挂起）。
+var systemMetricsCommandTimeout = 2 * time.Second
+
+var systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+	// -P（POSIX 输出）保证「一行一文件系统」：非 POSIX 格式下超长设备名会
+	// 独占一行，固定取第 2 行就把设备名当数字列，磁盘分项整体降级。
+	return exec.CommandContext(ctx, "df", "-P", "-B1", "/")
+}
 
 const systemSampleTTL = 5 * time.Second
 
@@ -40,17 +53,28 @@ var staticSystemInfo = struct {
 	caddyVersion: loadCaddyVersion(),
 }
 
+// systemSampleNegativeTTL 外部命令失败的短负缓存窗口：df/netstat 挂起时，
+// 每个轮询周期都重跑命令并等满超时（singleflight 只合并并发、不合并串行
+// 轮询），读路径持续高延迟。失败短缓存到期即重试，与指标端点负缓存同型。
+var systemSampleNegativeTTL = 2 * time.Second
+
 var diskUsageCache struct {
 	sync.Mutex
 	total     uint64
 	used      uint64
 	expiresAt time.Time
+	// 失败负缓存（窗口内直接返回同一错误，不再起子进程）。
+	negativeUntil time.Time
+	negativeErr   error
 }
 
 var connectionStatsCache struct {
 	sync.Mutex
 	stats     models.ConnectionStats
 	expiresAt time.Time
+	// 失败负缓存（同 diskUsageCache）。
+	negativeUntil time.Time
+	negativeErr   error
 }
 
 type CertificateInfo struct {
@@ -61,29 +85,14 @@ type CertificateInfo struct {
 	NotAfter        string `json:"not_after"`
 	DaysUntilExpiry int    `json:"days_until_expiry"`
 	Warning         string `json:"warning,omitempty"`
-	Error           string `json:"error,omitempty"`
+	// 原 Error 字段在本包零赋值点（恒空契约噪音），已删除
+	// ——解析失败走 4xx message，前端自备错误通道。
 }
 
 // validateTLSCertificate validates that the certificate and private key match
 func validateTLSCertificate(certPEM, keyPEM string) error {
 	_, err := parseTLSCertificate(certPEM, keyPEM)
 	return err
-}
-
-// validateReferencedCertificateFiles 校验引用型证书（tls_source="file"）的文件
-// 路径与内容：路径须位于程序可读写证书目录内、文件存在可读、且证书与私钥配对
-// 合法。返回归一后的路径、已读取的 PEM 内容（保存时摄取入库——文件只是采集
-// 来源，运行时唯一信任源是数据库）与质量警告（不阻断，与 manual 同口径）。
-func validateReferencedCertificateFiles(certPath, keyPath, domain string) (certResolved, keyResolved, certPEM, keyPEM string, warnings []string, err error) {
-	referenced, loadErr := services.LoadReferencedCertificate(certPath, keyPath)
-	if loadErr != nil {
-		return "", "", "", "", nil, loadErr
-	}
-	if validErr := validateTLSCertificate(referenced.CertPEM, referenced.KeyPEM); validErr != nil {
-		return "", "", "", "", nil, validErr
-	}
-	return referenced.CertPath, referenced.KeyPath, referenced.CertPEM, referenced.KeyPEM,
-		tlsCertificateWarnings(referenced.CertPEM, referenced.KeyPEM, domain), nil
 }
 
 // parseTLSCertificate parses certificate and returns info + error if invalid
@@ -116,72 +125,49 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 		domain = x509Cert.DNSNames[0]
 	}
 
-	// Extract issuer
-	issuer := x509Cert.Issuer.CommonName
-	if issuer == "" && len(x509Cert.Issuer.Organization) > 0 {
-		issuer = x509Cert.Issuer.Organization[0]
-	}
+	// Extract issuer（与证书卡/任务列表共用同一显示口径）
+	issuer := services.CertificateIssuerDisplay(x509Cert)
 
 	info.Valid = true
 	info.Domain = domain
 	info.Issuer = issuer
-	// CERT44-6（第 44 轮审计）：x509 时间为 UTC，直出会比配置时区少一天
+	// x509 时间为 UTC，直出会比配置时区少一天
 	// （如 Asia/Shanghai 凌晨到期的证书显示前一天）——按配置时区渲染，
 	// 与规则证书卡 formatDate 口径对齐。
 	info.NotBefore = x509Cert.NotBefore.In(services.CurrentLocation()).Format("2006-01-02")
 	info.NotAfter = x509Cert.NotAfter.In(services.CurrentLocation()).Format("2006-01-02")
-	info.DaysUntilExpiry = int(x509Cert.NotAfter.Sub(time.Now()).Hours() / 24)
+	info.DaysUntilExpiry = services.CertDaysRemaining(x509Cert.NotAfter, time.Now())
 
 	// Check if certificate is expired - warning only
 	if time.Now().After(x509Cert.NotAfter) {
-		info.Warning = fmt.Sprintf("证书已过期 (过期时间: %s)", x509Cert.NotAfter.Format("2006-01-02"))
+		info.Warning = fmt.Sprintf("证书已过期 (过期时间: %s)", x509Cert.NotAfter.In(services.CurrentLocation()).Format("2006-01-02"))
 	}
 
 	// Check if certificate is not yet valid - warning only
 	if time.Now().Before(x509Cert.NotBefore) {
-		info.Warning = fmt.Sprintf("证书尚未生效 (生效时间: %s)", x509Cert.NotBefore.Format("2006-01-02"))
+		info.Warning = fmt.Sprintf("证书尚未生效 (生效时间: %s)", x509Cert.NotBefore.In(services.CurrentLocation()).Format("2006-01-02"))
 	}
 
-	// Extract public key from certificate
-	var certPubKey interface{}
-	switch pub := x509Cert.PublicKey.(type) {
-	case *rsa.PublicKey:
-		certPubKey = pub
-	case *ecdsa.PublicKey:
-		certPubKey = pub
-	default:
-		return nil, fmt.Errorf("unsupported public key type in certificate")
-	}
-
-	// Extract public key from private key
-	var keyPubKey interface{}
-	switch priv := cert.PrivateKey.(type) {
-	case *rsa.PrivateKey:
-		keyPubKey = &priv.PublicKey
-	case *ecdsa.PrivateKey:
-		keyPubKey = &priv.PublicKey
-	default:
+	// 公钥等价比较：原实现按 *rsa.PublicKey/*ecdsa.PublicKey
+	// 白名单分型——Ed25519（内部 CA/自签常用，tls.X509KeyPair 与 Caddy 均支持）
+	// 被硬拒 400，面板支持面比引擎更窄。改为 crypto.Signer.Public() + PKIX 字节
+	// 比较（同类型同参数编码恒等，跨类型/不同密钥恒不等），保留「类型不可用」
+	// 与「不配对」两类错误文案。X509KeyPair 已先行拦截不配对形态，本段是引擎
+	// 接受面内的纵深校验。
+	signer, ok := cert.PrivateKey.(crypto.Signer)
+	if !ok {
 		return nil, fmt.Errorf("unsupported private key type")
 	}
-
-	// Compare public keys
-	switch certPub := certPubKey.(type) {
-	case *rsa.PublicKey:
-		keyPub, ok := keyPubKey.(*rsa.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("certificate and key public key types do not match")
-		}
-		if certPub.N.Cmp(keyPub.N) != 0 || certPub.E != keyPub.E {
-			return nil, fmt.Errorf("certificate and private key do not match")
-		}
-	case *ecdsa.PublicKey:
-		keyPub, ok := keyPubKey.(*ecdsa.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("certificate and key public key types do not match")
-		}
-		if !certPub.Equal(keyPub) {
-			return nil, fmt.Errorf("certificate and private key do not match")
-		}
+	certKeyDER, err := x509.MarshalPKIXPublicKey(x509Cert.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported public key type in certificate: %w", err)
+	}
+	keyDER, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return nil, fmt.Errorf("unsupported public key type in private key: %w", err)
+	}
+	if !bytes.Equal(certKeyDER, keyDER) {
+		return nil, fmt.Errorf("certificate and private key do not match")
 	}
 
 	return info, nil
@@ -191,7 +177,7 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 // (与 systemMetricsReadFile 同款测试隔离约定)。
 var tlsCertSystemRoots = x509.SystemCertPool
 
-// tlsCertificateWarnings(CERT41-4)对手动 TLS 证书做「不阻断」质量检查:
+// tlsCertificateWarnings对手动 TLS 证书做「不阻断」质量检查
 //  1. 链完整性——系统根 + PEM 内中间证书 x509.Verify,unknown authority 类
 //     失败说明链可能不完整(浏览器/严格客户端将握手失败);
 //  2. 域名覆盖——domain 非空且证书 DNSNames/CN 不覆盖(含通配符语义,
@@ -229,6 +215,16 @@ func tlsCertificateWarnings(certPEM, keyPEM, domain string) []string {
 			}
 		}
 	}
+	// 有效期同样以非阻断警告呈现——过期/未生效的自
+	// 手动证书允许先落库后轮换（管理面板 TLS 上传仍硬拒），但保存/导入审计
+	// 与响应 warnings 必须显式可见。此前 parseTLSCertificate 已算出 Warning，
+	// 规则保存路径却丢弃未用。
+	now := time.Now()
+	if now.After(leaf.NotAfter) {
+		warnings = append(warnings, "证书已过期 (过期时间: "+leaf.NotAfter.In(services.CurrentLocation()).Format("2006-01-02")+")")
+	} else if now.Before(leaf.NotBefore) {
+		warnings = append(warnings, "证书尚未生效 (生效时间: "+leaf.NotBefore.In(services.CurrentLocation()).Format("2006-01-02")+")")
+	}
 	for _, name := range strings.Split(domain, ",") {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -243,10 +239,16 @@ func tlsCertificateWarnings(certPEM, keyPEM, domain string) []string {
 }
 
 // tlsCertCoversDomain 判定证书是否覆盖域名:优先标准 SAN 校验(Go 内建通配
-// 语义),无 SAN 的老证书回退 CN 精确/单段通配匹配。比较小写化。
+// 语义);仅当证书完全没有 SAN（DNS/IP/Email/URI 均为空）时才回退 CN 精确/
+// 单段通配匹配。有 SAN 的现代证书以 SAN 为准（RFC 6125），CN 回退
+// 会抑制「SAN 不覆盖但 CN 恰好覆盖」的域名不匹配警告，而客户端仍握手失败。
+// 比较小写化。
 func tlsCertCoversDomain(cert *x509.Certificate, domain string) bool {
 	if err := cert.VerifyHostname(domain); err == nil {
 		return true
+	}
+	if len(cert.DNSNames) > 0 || len(cert.IPAddresses) > 0 || len(cert.EmailAddresses) > 0 || len(cert.URIs) > 0 {
+		return false
 	}
 	return tlsWildcardMatch(strings.ToLower(cert.Subject.CommonName), strings.ToLower(domain))
 }
@@ -265,14 +267,41 @@ func tlsWildcardMatch(pattern, domain string) bool {
 	return label != "" && !strings.Contains(label, ".")
 }
 
-func getOutboundIP() string {
+// dialOutboundIP 探测本机出口 IP（UDP dial 不写包，仅借路由决策读本地地址）。
+// 探测失败或地址类型意外（原 unchecked type assertion）
+// 回退 127.0.0.1 并返回 ok=false——单源实现，cluster_mode.go（需 ok 位做
+// 审计点名）与系统信息展示共用。
+//
+// dialOutboundIPFn 是可注入的探测缝：被保护的失败分支（无默认路由的容器里
+// ip_address 置空而非回显 127.0.0.1）只在该环境发生，而开发机/CI 恒有默认
+// 路由——不注入就永不被自动化覆盖。生产恒为 netDialOutboundIP。
+var dialOutboundIPFn = netDialOutboundIP
+
+func dialOutboundIP() (string, bool) { return dialOutboundIPFn() }
+
+func netDialOutboundIP() (string, bool) {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
-		return "127.0.0.1"
+		return "127.0.0.1", false
 	}
 	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return "127.0.0.1", false
+	}
+	return localAddr.IP.String(), true
+}
+
+// getOutboundIP 返回本机出口 IP；探测失败（无默认路由/受限网络）返回空串并
+// 留痕——不得把回环地址当机器地址展示（排障窗口会把人引向错误方向）。
+func getOutboundIP() string {
+	ip, ok := dialOutboundIP()
+	if !ok {
+		services.LogConfigReadFailure("system-outbound-ip", errors.New("出口 IP 探测失败（无默认路由/受限网络），ip_address 置空"))
+		return ""
+	}
+	services.LogConfigReadRecovered("system-outbound-ip")
+	return ip
 }
 
 func loadHostname() string {
@@ -312,8 +341,11 @@ func loadOSInfo() string {
 func getOSInfo() string { return staticSystemInfo.osInfo }
 
 func loadCommandOutput(name string, args ...string) string {
-	cmd := exec.Command(name, args...)
-	output, err := cmd.Output()
+	// 与运行期 df/netstat 同口径：包初始化路径同样不得无界阻塞（外部二进制
+	// 损坏/ PATH 指向阻塞脚本时，启动会在日志/端口就绪前挂死）。
+	ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, name, args...).Output()
 	if err != nil {
 		return "unknown"
 	}
@@ -337,25 +369,51 @@ func getNetworkIPs() map[string]string {
 		if err != nil {
 			continue
 		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil && ip.To4() != nil {
-				ips[iface.Name] = ip.String()
-			}
+		// IPv4 优先（页面展示口径不变）；接口只有 IPv6（IPv6-only 主机/容器）
+		// 时回落到全局单播 IPv6——否则该主机网络地址列表恒空。link-local
+		// (fe80::/10) 不可路由，不展示。
+		if ip := preferredInterfaceIP(addrs); ip != nil {
+			ips[iface.Name] = ip.String()
 		}
 	}
 	return ips
 }
 
+// preferredInterfaceIP 从接口地址中选出展示用地址：IPv4 优先；无 IPv4 时取
+// 第一个非 link-local/未指定的 IPv6（IPv6-only 主机不再显示为空）。
+func preferredInterfaceIP(addrs []net.Addr) net.IP {
+	var ipv4, ipv6 net.IP
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			if ipv4 == nil {
+				ipv4 = v4
+			}
+			continue
+		}
+		if ipv6 == nil && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() {
+			ipv6 = ip
+		}
+	}
+	if ipv4 != nil {
+		return ipv4
+	}
+	return ipv6
+}
+
 func loadCaddyVersion() string {
-	cmd := exec.Command("caddy", "version")
-	output, err := cmd.Output()
+	ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "caddy", "version").Output()
 	if err != nil {
 		return "unknown"
 	}
@@ -372,24 +430,55 @@ func getUptime() int64 {
 	return int64(time.Since(startTime).Seconds())
 }
 
+// getSystemMetrics 采集内存/磁盘/CPU——分项降级：任一项失败只把该项从结果中
+// 移除并在 Degraded 中披露（留痕走状态转换单源），不再「全或无」（旧实现
+// CPU 单点故障即让整卡内存/磁盘数据消失，排障窗口反而看不到健康维度）。
+// 三项全部失败才返回错误（此时确实无可展示数据）。
 func getSystemMetrics() (models.SystemMetrics, error) {
-	vmStat, err := systemMetricsReadFile("/proc/meminfo")
-	if err != nil {
-		return models.SystemMetrics{}, fmt.Errorf("读取系统内存指标失败: %w", err)
-	}
-	memoryTotal, memoryUsed, err := parseMemInfo(string(vmStat))
-	if err != nil {
-		return models.SystemMetrics{}, err
+	failures := map[string]error{}
+	order := []string{"memory", "disk", "cpu", "pids"}
+
+	memoryTotal, memoryUsed := uint64(0), uint64(0)
+	if vmStat, err := systemMetricsReadFile("/proc/meminfo"); err != nil {
+		failures["memory"] = fmt.Errorf("读取系统内存指标失败: %w", err)
+	} else if total, used, err := parseMemInfo(string(vmStat)); err != nil {
+		failures["memory"] = err
+	} else {
+		memoryTotal, memoryUsed = total, used
 	}
 
-	diskTotal, diskUsed, err := getCachedDiskUsage(time.Now())
-	if err != nil {
-		return models.SystemMetrics{}, err
+	diskTotal, diskUsed := uint64(0), uint64(0)
+	if total, used, err := getCachedDiskUsage(time.Now()); err != nil {
+		failures["disk"] = err
+	} else {
+		diskTotal, diskUsed = total, used
 	}
 
-	cpuPercent, err := getCPUPercent()
-	if err != nil {
-		return models.SystemMetrics{}, fmt.Errorf("读取系统 CPU 指标失败: %w", err)
+	cpuPercent := float64(0)
+	if percent, err := getCPUPercent(); err != nil {
+		failures["cpu"] = fmt.Errorf("读取系统 CPU 指标失败: %w", err)
+	} else {
+		cpuPercent = percent
+	}
+
+	// 进程/线程配额：cgroup pids 是 fork 失败的直接原因层；ulimit -u
+	// （RLIMIT_NPROC）作为二级提示，读取失败不影响 pids 展示。
+	pidsCurrent, pidsMax, nprocLimit, pidsErr := readPidsUsage()
+	if pidsErr != nil {
+		failures["pids"] = pidsErr
+	}
+
+	// 分项留痕按状态转换去重（面板 5s 一轮轮询，不得每轮刷一条 warn）。
+	var degraded []string
+	var joined []error
+	for _, part := range order {
+		if err, failed := failures[part]; failed {
+			degraded = append(degraded, part)
+			joined = append(joined, err)
+			services.LogConfigReadFailure("system-metrics-"+part, err)
+			continue
+		}
+		services.LogConfigReadRecovered("system-metrics-" + part)
 	}
 
 	var memPercent float64
@@ -400,8 +489,13 @@ func getSystemMetrics() (models.SystemMetrics, error) {
 	if diskTotal > 0 {
 		diskPercent = float64(diskUsed) / float64(diskTotal) * 100
 	}
+	// pids.max 为 "max"（无限）时 PidsMax=0：没有可展示的比例，保持 0。
+	var pidsPercent float64
+	if pidsMax > 0 {
+		pidsPercent = float64(pidsCurrent) / float64(pidsMax) * 100
+	}
 
-	return models.SystemMetrics{
+	metrics := models.SystemMetrics{
 		CPUPercent:    cpuPercent,
 		MemoryTotal:   memoryTotal,
 		MemoryUsed:    memoryUsed,
@@ -409,27 +503,169 @@ func getSystemMetrics() (models.SystemMetrics, error) {
 		DiskTotal:     diskTotal,
 		DiskUsed:      diskUsed,
 		DiskPercent:   diskPercent,
-	}, nil
+		PidsCurrent:   pidsCurrent,
+		PidsMax:       pidsMax,
+		NprocLimit:    nprocLimit,
+		PidsPercent:   pidsPercent,
+		Degraded:      degraded,
+	}
+	if len(joined) == len(order) {
+		return metrics, errors.Join(joined...)
+	}
+	return metrics, nil
 }
+
+// readPidsUsage 读取 cgroup pids 用量/上限（cgroup v2 优先，v1 回落）与
+// RLIMIT_NPROC 软限。cgroup v2 与 v1 的落点不同：v2 在 /sys/fs/cgroup 根，
+// v1 在 /sys/fs/cgroup/pids 子目录。读取失败按分项降级（pids），不影响
+// 内存/磁盘/CPU 展示。
+func readPidsUsage() (current, max, nproc int, err error) {
+	current, max, err = readCgroupPids("/sys/fs/cgroup")
+	if err != nil {
+		current, max, err = readCgroupPids("/sys/fs/cgroup/pids")
+	}
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("读取进程配额失败: %w", err)
+	}
+	return current, max, readNprocLimit(), nil
+}
+
+func readCgroupPids(dir string) (current, max int, err error) {
+	currentRaw, err := systemMetricsReadFile(dir + "/pids.current")
+	if err != nil {
+		return 0, 0, err
+	}
+	maxRaw, err := systemMetricsReadFile(dir + "/pids.max")
+	if err != nil {
+		return 0, 0, err
+	}
+	if current, err = parsePidsCount(string(currentRaw)); err != nil {
+		return 0, 0, err
+	}
+	if max, err = parsePidsLimit(string(maxRaw)); err != nil {
+		return 0, 0, err
+	}
+	return current, max, nil
+}
+
+func parsePidsCount(raw string) (int, error) {
+	value := strings.TrimSpace(raw)
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("pids.current 无效: %q", value)
+	}
+	return n, nil
+}
+
+// parsePidsLimit：cgroup v2 未设上限时文件内容为字面 "max"，统一归一为 0
+// （消费方按「不限额」处理，不参与百分比计算）。
+func parsePidsLimit(raw string) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "max" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("pids.max 无效: %q", value)
+	}
+	return n, nil
+}
+
+// readNprocLimit 解析 RLIMIT_NPROC 软限（ulimit -u）。按行首 "Max processes"
+// 取第二列；"unlimited"/读取失败统一返回 0（二级提示，缺失不影响 pids 主值）。
+func readNprocLimit() int {
+	raw, err := systemMetricsReadFile("/proc/self/limits")
+	if err != nil {
+		return 0
+	}
+	return parseNprocLimit(string(raw))
+}
+
+func parseNprocLimit(raw string) int {
+	for _, line := range strings.Split(raw, "\n") {
+		if !strings.HasPrefix(line, "Max processes") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[2] == "unlimited" {
+			return 0
+		}
+		n, err := strconv.Atoi(fields[2])
+		if err != nil || n < 0 {
+			return 0
+		}
+		return n
+	}
+	return 0
+}
+
+// diskUsageGroup / connectionStatsGroup 合并并发刷新：同一刷新窗口内并发请求
+// 等待同一趟外部命令，不各跑一遍。
+var (
+	diskUsageGroup       singleflight.Group
+	connectionStatsGroup singleflight.Group
+)
 
 func getCachedDiskUsage(now time.Time) (uint64, uint64, error) {
 	diskUsageCache.Lock()
-	defer diskUsageCache.Unlock()
 	if now.Before(diskUsageCache.expiresAt) {
-		return diskUsageCache.total, diskUsageCache.used, nil
+		total, used := diskUsageCache.total, diskUsageCache.used
+		diskUsageCache.Unlock()
+		return total, used, nil
 	}
-	dfOutput, err := systemMetricsDFCommand().Output()
+	if now.Before(diskUsageCache.negativeUntil) {
+		err := diskUsageCache.negativeErr
+		diskUsageCache.Unlock()
+		return 0, 0, err
+	}
+	diskUsageCache.Unlock()
+	// 外部命令在锁外执行（旧实现持锁 Output()：df 卡顿时连命中缓存的请求都
+	// 被串行阻塞），并发 miss 经 single-flight 合并。
+	value, err, _ := diskUsageGroup.Do("disk-usage", func() (any, error) {
+		diskUsageCache.Lock()
+		if time.Now().Before(diskUsageCache.expiresAt) {
+			total, used := diskUsageCache.total, diskUsageCache.used
+			diskUsageCache.Unlock()
+			return [2]uint64{total, used}, nil
+		}
+		if time.Now().Before(diskUsageCache.negativeUntil) {
+			err := diskUsageCache.negativeErr
+			diskUsageCache.Unlock()
+			return [2]uint64{}, err
+		}
+		diskUsageCache.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+		defer cancel()
+		dfOutput, err := systemMetricsDFCommand(ctx).Output()
+		if err != nil {
+			return [2]uint64{}, storeDiskUsageFailure(fmt.Errorf("读取系统磁盘指标失败: %w", err))
+		}
+		total, used, ok := parseDFOutput(string(dfOutput))
+		if !ok {
+			return [2]uint64{}, storeDiskUsageFailure(fmt.Errorf("解析系统磁盘指标失败"))
+		}
+		diskUsageCache.Lock()
+		diskUsageCache.total, diskUsageCache.used = total, used
+		diskUsageCache.expiresAt = time.Now().Add(systemSampleTTL)
+		diskUsageCache.negativeUntil, diskUsageCache.negativeErr = time.Time{}, nil
+		diskUsageCache.Unlock()
+		return [2]uint64{total, used}, nil
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("读取系统磁盘指标失败: %w", err)
+		return 0, 0, err
 	}
-	total, used, ok := parseDFOutput(string(dfOutput))
-	if !ok {
-		return 0, 0, fmt.Errorf("解析系统磁盘指标失败")
-	}
-	diskUsageCache.total = total
-	diskUsageCache.used = used
-	diskUsageCache.expiresAt = now.Add(systemSampleTTL)
-	return total, used, nil
+	values, _ := value.([2]uint64)
+	return values[0], values[1], nil
+}
+
+// storeDiskUsageFailure 写入失败短负缓存并原样返回错误（singleflight 的
+// 等待者也必须拿到同一错误）。
+func storeDiskUsageFailure(err error) error {
+	diskUsageCache.Lock()
+	diskUsageCache.negativeUntil = time.Now().Add(systemSampleNegativeTTL)
+	diskUsageCache.negativeErr = err
+	diskUsageCache.Unlock()
+	return err
 }
 
 func parseMemInfo(input string) (uint64, uint64, error) {
@@ -445,16 +681,39 @@ func parseMemInfo(input string) (uint64, uint64, error) {
 		}
 		values[fields[0]] = value * 1024
 	}
-	total, available := values["MemTotal:"], values["MemAvailable:"]
-	if total == 0 || available > total {
-		return 0, 0, fmt.Errorf("解析系统内存指标失败: MemTotal 或 MemAvailable 无效")
+	total, hasTotal := values["MemTotal:"]
+	available, hasAvailable := values["MemAvailable:"]
+	if !hasTotal || total == 0 {
+		return 0, 0, fmt.Errorf("缺少 MemTotal，无法计算内存使用")
+	}
+	// MemAvailable 缺失（内核 < 3.14 / 裁剪过的 meminfo）时必须报错走分项
+	// 降级——按「可用=0」计算会输出恒 100% 使用率的伪造数据。
+	if !hasAvailable {
+		return 0, 0, fmt.Errorf("缺少 MemAvailable，无法计算内存使用")
+	}
+	if available > total {
+		return 0, 0, fmt.Errorf("MemAvailable 大于 MemTotal，内存指标无效")
 	}
 	return total, total - available, nil
 }
 
+// cpuSampleWindow / netSampleWindow 采样窗口：窗口内的读取共享同一次采样与
+// 同一速率（速率=固定窗口差分）。旧实现以「上一次 HTTP 请求」为基线——多页签
+// 同时轮询或轮询周期变化时，A 客户端的请求会把 B 的基线拉近，算出尖峰或归零
+// 的假速率，不能作运维判据。窗口值 ≤0 = 不缓存（测试隔离用）。
+var (
+	cpuSampleWindow = time.Second
+	netSampleWindow = time.Second
+)
+
 func getCPUPercent() (float64, error) {
 	lastCPUStats.mu.Lock()
 	defer lastCPUStats.mu.Unlock()
+
+	now := time.Now()
+	if lastCPUStats.hasValue && cpuSampleWindow > 0 && now.Sub(lastCPUStats.sampledAt) < cpuSampleWindow {
+		return lastCPUStats.percent, nil
+	}
 
 	stat, err := systemMetricsReadFile("/proc/stat")
 	if err != nil {
@@ -465,54 +724,76 @@ func getCPUPercent() (float64, error) {
 		return 0, fmt.Errorf("解析 /proc/stat 失败")
 	}
 	previous := lastCPUStats.snapshot
+	lastCPUStats.snapshot = current
+	lastCPUStats.sampledAt = now
+	lastCPUStats.hasValue = true
+	lastCPUStats.percent = 0
 	if previous.total == 0 {
-		lastCPUStats.snapshot = current
 		return 0, nil
 	}
 	if current.total < previous.total || current.idle < previous.idle {
-		lastCPUStats.snapshot = current
 		return 0, nil
 	}
 	totalDelta := current.total - previous.total
 	idleDelta := current.idle - previous.idle
 	if idleDelta > totalDelta {
+		// 错误样本不得留在采样缓存里冒充成功：本轮已写入的 hasValue 会让
+		// 紧随其后的 1s 窗口内请求直接拿到 0,nil（Degraded 不含 cpu，面板
+		// 会显示为「负载骤降」）。置失效让下一个请求立即重采样。
+		lastCPUStats.hasValue = false
 		return 0, fmt.Errorf("CPU 空闲计数器增量无效")
 	}
-	lastCPUStats.snapshot = current
 	if totalDelta == 0 {
 		return 0, nil
 	}
-	return float64(totalDelta-idleDelta) / float64(totalDelta) * 100, nil
+	lastCPUStats.percent = float64(totalDelta-idleDelta) / float64(totalDelta) * 100
+	return lastCPUStats.percent, nil
 }
 
 var lastNetStats struct {
 	mu       sync.Mutex
 	bytesIn  uint64
 	bytesOut uint64
+	iface    string // 基线所属统计口径身份：默认路由接口名，或无默认路由时的聚合口径串；口径变化后新旧计数器不可比
 	time     time.Time
+	rateIn   int64
+	rateOut  int64
+	hasValue bool
 }
 
 func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 	lastNetStats.mu.Lock()
 	defer lastNetStats.mu.Unlock()
 
+	now := time.Now()
+	if lastNetStats.hasValue && netSampleWindow > 0 && now.Sub(lastNetStats.time) < netSampleWindow {
+		return models.RealtimeTraffic{BytesIn: lastNetStats.rateIn, BytesOut: lastNetStats.rateOut}, nil
+	}
+
 	netStat, err := systemMetricsReadFile("/proc/net/dev")
 	if err != nil {
 		return models.RealtimeTraffic{}, err
 	}
 
-	totalBytesIn, totalBytesOut, err := parseNetDevTotals(string(netStat))
+	totalBytesIn, totalBytesOut, iface, err := parseNetDevTotals(string(netStat))
 	if err != nil {
 		return models.RealtimeTraffic{}, err
 	}
 
-	now := time.Now()
 	var rateIn, rateOut int64
 
 	if !lastNetStats.time.IsZero() {
 		elapsed := now.Sub(lastNetStats.time).Seconds()
+		// 统计口径变化后新旧计数器不可比：默认路由切换（多网卡/容器重建/
+		// 策略路由变更）、默认路由消失退回物理网卡聚合、聚合成员集变化。任一
+		// 方向直接差分会把「新口径的历史总流量」当成本轮速率（数量级假峰值），
+		// 身份串不等即重建基线（本轮速率 0）。
+		ifaceChanged := lastNetStats.iface != iface
 		countersRolledBack := totalBytesIn < lastNetStats.bytesIn || totalBytesOut < lastNetStats.bytesOut
-		if elapsed > 0 && !countersRolledBack {
+		if ifaceChanged {
+			services.Logf("info", "实时流量基线重建：统计口径 %s → %s（新旧计数器不可比，本轮速率归零）", describeNetIdentity(lastNetStats.iface), describeNetIdentity(iface))
+		}
+		if elapsed > 0 && !countersRolledBack && !ifaceChanged {
 			rateIn = int64(float64(totalBytesIn-lastNetStats.bytesIn) / elapsed)
 			rateOut = int64(float64(totalBytesOut-lastNetStats.bytesOut) / elapsed)
 			if rateIn < 0 {
@@ -526,7 +807,11 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 
 	lastNetStats.bytesIn = totalBytesIn
 	lastNetStats.bytesOut = totalBytesOut
+	lastNetStats.iface = iface
 	lastNetStats.time = now
+	lastNetStats.rateIn = rateIn
+	lastNetStats.rateOut = rateOut
+	lastNetStats.hasValue = true
 
 	return models.RealtimeTraffic{
 		BytesIn:  rateIn,
@@ -534,10 +819,60 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 	}, nil
 }
 
-func parseNetDevTotals(input string) (uint64, uint64, error) {
+// primeSystemSamplers 在包初始化时建立 CPU/实时流量基线：首个采集不再把
+// 「尚无基线」静默显示为 0%（进程重启后首屏尤其明显——用户无法区分真的空闲
+// 与仍在建基线）。基线读取失败（非 Linux/无 /proc）时保持未初始化，由首个
+// 请求按原路径建基线。
+func primeSystemSamplers() {
+	now := time.Now()
+	if stat, err := systemMetricsReadFile("/proc/stat"); err == nil {
+		if snapshot, ok := parseCPUSnapshot(string(stat)); ok {
+			lastCPUStats.mu.Lock()
+			lastCPUStats.snapshot = snapshot
+			lastCPUStats.sampledAt = now
+			lastCPUStats.hasValue = true
+			lastCPUStats.mu.Unlock()
+		}
+	}
+	if netStat, err := systemMetricsReadFile("/proc/net/dev"); err == nil {
+		if bytesIn, bytesOut, iface, err := parseNetDevTotals(string(netStat)); err == nil {
+			lastNetStats.mu.Lock()
+			lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.iface = bytesIn, bytesOut, iface
+			lastNetStats.time = now
+			lastNetStats.hasValue = true
+			lastNetStats.mu.Unlock()
+		}
+	}
+}
+
+func init() {
+	primeSystemSamplers()
+}
+
+// netDevAggregateIdentityPrefix 标记「无默认路由时的物理网卡聚合」统计口径。
+// 聚合口径同样需要可比较的身份：成员集变化（网卡下线/上线）会改变聚合总量
+// 的含义，身份串随之变化才能触发基线重建。
+const netDevAggregateIdentityPrefix = "aggregate:"
+
+// describeNetIdentity 把统计口径身份串转成日志可读描述：默认路由接口名直出，
+// 聚合口径列出参与聚合的物理网卡，尚无基线时如实标注。
+func describeNetIdentity(identity string) string {
+	if identity == "" {
+		return "未知口径"
+	}
+	if names, ok := strings.CutPrefix(identity, netDevAggregateIdentityPrefix); ok {
+		return "物理网卡聚合(" + names + ")"
+	}
+	return identity
+}
+
+// parseNetDevTotals 返回默认路由出口接口的累计收发字节与统计口径身份（身份
+// 供读侧判定「基线是否仍属同一口径」）。无默认路由时统计物理类接口聚合并返回
+// 显式聚合身份串（成员集有序拼接——行序抖动不得被当成口径变化）。
+func parseNetDevTotals(input string) (uint64, uint64, string, error) {
 	route, err := systemMetricsReadFile("/proc/net/route")
 	if err != nil {
-		return 0, 0, fmt.Errorf("读取默认路由失败: %w", err)
+		return 0, 0, "", fmt.Errorf("读取默认路由失败: %w", err)
 	}
 	if defaultInterface, err := parseDefaultRouteInterface(string(route)); err == nil {
 		for _, line := range strings.Split(input, "\n") {
@@ -547,24 +882,24 @@ func parseNetDevTotals(input string) (uint64, uint64, error) {
 			}
 			fields := strings.Fields(counters)
 			if len(fields) < 16 {
-				return 0, 0, fmt.Errorf("解析网卡 %s 流量失败: 计数器字段不足", strings.TrimSpace(name))
+				return 0, 0, "", fmt.Errorf("解析网卡 %s 流量失败: 计数器字段不足", strings.TrimSpace(name))
 			}
 			bytesIn, err := strconv.ParseUint(fields[0], 10, 64)
 			if err != nil {
-				return 0, 0, fmt.Errorf("解析网卡 %s 接收流量失败: %w", strings.TrimSpace(name), err)
+				return 0, 0, "", fmt.Errorf("解析网卡 %s 接收流量失败: %w", strings.TrimSpace(name), err)
 			}
 			bytesOut, err := strconv.ParseUint(fields[8], 10, 64)
 			if err != nil {
-				return 0, 0, fmt.Errorf("解析网卡 %s 发送流量失败: %w", strings.TrimSpace(name), err)
+				return 0, 0, "", fmt.Errorf("解析网卡 %s 发送流量失败: %w", strings.TrimSpace(name), err)
 			}
-			return bytesIn, bytesOut, nil
+			return bytesIn, bytesOut, defaultInterface, nil
 		}
-		return 0, 0, fmt.Errorf("默认路由接口 %s 不存在于 /proc/net/dev", defaultInterface)
+		return 0, 0, "", fmt.Errorf("默认路由接口 %s 不存在于 /proc/net/dev", defaultInterface)
 	}
 	// 无默认路由（如容器 netns 只有子网路由）：统计物理类接口，排除 lo 与
 	// 会重复计数的虚拟叠加层（veth/docker 网桥/br-*）
 	var totalIn, totalOut uint64
-	matched := false
+	var members []string
 	for _, line := range strings.Split(input, "\n") {
 		name, counters, ok := strings.Cut(line, ":")
 		if !ok {
@@ -585,12 +920,13 @@ func parseNetDevTotals(input string) (uint64, uint64, error) {
 		}
 		totalIn += bytesIn
 		totalOut += bytesOut
-		matched = true
+		members = append(members, iface)
 	}
-	if !matched {
-		return 0, 0, fmt.Errorf("无法确定默认路由出口接口且无可用物理网卡")
+	if len(members) == 0 {
+		return 0, 0, "", fmt.Errorf("无法确定默认路由出口接口且无可用物理网卡")
 	}
-	return totalIn, totalOut, nil
+	sort.Strings(members)
+	return totalIn, totalOut, netDevAggregateIdentityPrefix + strings.Join(members, ","), nil
 }
 
 func parseDefaultRouteInterface(input string) (string, error) {
@@ -615,8 +951,11 @@ type cpuSnapshot struct {
 }
 
 var lastCPUStats struct {
-	mu       sync.Mutex
-	snapshot cpuSnapshot
+	mu        sync.Mutex
+	snapshot  cpuSnapshot
+	percent   float64
+	sampledAt time.Time
+	hasValue  bool
 }
 
 func parseCPUSnapshot(stat string) (cpuSnapshot, bool) {
@@ -642,36 +981,85 @@ func parseCPUSnapshot(stat string) (cpuSnapshot, bool) {
 }
 
 func parseDFOutput(output string) (uint64, uint64, bool) {
-	lines := strings.Split(output, "\n")
-	if len(lines) < 2 {
-		return 0, 0, false
+	// 以挂载点列定位数据行（`df /` 的目标挂载点恒为 "/"）：非 POSIX 格式下
+	// 超长设备名会独占一行，固定取第 2 行会把设备名当数字列；而只按「数字可
+	// 解析」倒推，折行后的数字行会少一列（设备名在上一行）导致列错位。POSIX
+	// (-P) 形态恒 6 列，折行形态为 5 列，按列数选择 total/used 下标。
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[len(fields)-1] != "/" {
+			continue
+		}
+		totalIndex, usedIndex := 1, 2
+		if len(fields) < 6 {
+			totalIndex, usedIndex = 0, 1
+		}
+		total, err := strconv.ParseUint(fields[totalIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+		used, err := strconv.ParseUint(fields[usedIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+		return total, used, true
 	}
-	fields := strings.Fields(lines[1])
-	if len(fields) < 4 {
-		return 0, 0, false
-	}
-	total, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0, 0, false
-	}
-	used, err := strconv.ParseUint(fields[2], 10, 64)
-	return total, used, err == nil
+	return 0, 0, false
 }
 
 func getConnectionStats() (models.ConnectionStats, error) {
 	now := time.Now()
 	connectionStatsCache.Lock()
-	defer connectionStatsCache.Unlock()
 	if now.Before(connectionStatsCache.expiresAt) {
-		return connectionStatsCache.stats, nil
+		stats := connectionStatsCache.stats
+		connectionStatsCache.Unlock()
+		return stats, nil
 	}
-	output, err := netstatCommand().Output()
+	if now.Before(connectionStatsCache.negativeUntil) {
+		err := connectionStatsCache.negativeErr
+		connectionStatsCache.Unlock()
+		return models.ConnectionStats{}, err
+	}
+	connectionStatsCache.Unlock()
+	// 外部命令在锁外执行且带超时、并发合并（旧实现持锁无超时执行
+	// netstat：宿主网络栈卡住时所有并发请求串行挂起）。
+	value, err, _ := connectionStatsGroup.Do("connection-stats", func() (any, error) {
+		connectionStatsCache.Lock()
+		if time.Now().Before(connectionStatsCache.expiresAt) {
+			stats := connectionStatsCache.stats
+			connectionStatsCache.Unlock()
+			return stats, nil
+		}
+		if time.Now().Before(connectionStatsCache.negativeUntil) {
+			err := connectionStatsCache.negativeErr
+			connectionStatsCache.Unlock()
+			return models.ConnectionStats{}, err
+		}
+		connectionStatsCache.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+		defer cancel()
+		output, err := netstatCommand(ctx).Output()
+		if err != nil {
+			failure := fmt.Errorf("execute netstat -tan: %w", err)
+			connectionStatsCache.Lock()
+			connectionStatsCache.negativeUntil = time.Now().Add(systemSampleNegativeTTL)
+			connectionStatsCache.negativeErr = failure
+			connectionStatsCache.Unlock()
+			return models.ConnectionStats{}, failure
+		}
+		stats := parseConnectionStats(string(output))
+		connectionStatsCache.Lock()
+		connectionStatsCache.stats = stats
+		connectionStatsCache.expiresAt = time.Now().Add(systemSampleTTL)
+		connectionStatsCache.negativeUntil, connectionStatsCache.negativeErr = time.Time{}, nil
+		connectionStatsCache.Unlock()
+		return stats, nil
+	})
 	if err != nil {
-		return models.ConnectionStats{}, fmt.Errorf("execute netstat -tan: %w", err)
+		return models.ConnectionStats{}, err
 	}
-	connectionStatsCache.stats = parseConnectionStats(string(output))
-	connectionStatsCache.expiresAt = now.Add(systemSampleTTL)
-	return connectionStatsCache.stats, nil
+	stats, _ := value.(models.ConnectionStats)
+	return stats, nil
 }
 
 func parseConnectionStats(output string) models.ConnectionStats {
@@ -731,8 +1119,8 @@ func parseConnectionStats(output string) models.ConnectionStats {
 	return stats
 }
 
-var netstatCommand = func() *exec.Cmd {
-	return exec.Command("netstat", "-tan")
+var netstatCommand = func(ctx context.Context) *exec.Cmd {
+	return exec.CommandContext(ctx, "netstat", "-tan")
 }
 
 type prometheusSample struct {
@@ -771,6 +1159,10 @@ type prometheusMetricsIndex struct {
 	// ruleMetricsByRule 是各规则全量流量指标(lb_rule_metrics 插件,
 	// 2026-09-15 用户裁定:caddy_id 直接匹配替代域名/host 匹配)。
 	ruleMetricsByRule map[string]*ruleMetricsAggregate
+	// ruleMetricsEpochSeconds 是统计起点无标签 gauge
+	// (lazybalancer_rule_metrics_epoch_seconds,Provision Unix 秒)——
+	// 0=引擎端无序列(旧镜像/嵌入降级),消费方据此隐藏统计起点显示。
+	ruleMetricsEpochSeconds int64
 }
 
 func buildPrometheusMetricsIndex(samples []prometheusSample) prometheusMetricsIndex {
@@ -824,17 +1216,17 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 	// 2026-09-15 用户裁定:caddy_id 直接匹配(lb_rule_metrics)——优先;
 	// 域名匹配兜底(未升级插件的形态/过渡期)。
 	if target.ruleID != "" {
-		// SR30-1(P4,第 30 轮审计):插件已升级(ruleMetricsByRule 全局非空)
+		// 插件已升级(ruleMetricsByRule 全局非空)
 		// 时本规则缺序列=零流量,返回空而非域名兜底(兜底在同裸域名多端口
 		// 拓扑下跨规则串流量;兜底仅在插件未升级(全局空)时启用)。
 		if len(index.ruleMetricsByRule) > 0 {
 			if agg := index.ruleMetricsByRule[target.ruleID]; agg != nil {
-				return agg.ruleMetrics(true)
+				return agg.ruleMetrics()
 			}
 			return emptyRuleMetrics() // 本规则零流量(插件已升级,无序列)
 		}
 		// 插件未升级（map 全局为空）：无 rule 级序列可查，落空返回上层兜底
-		// （第 53 轮补充轮 U6B-4：此处曾有「空 map 查找」死分支，已删）。
+		// （此处曾有「空 map 查找」死分支，已删）。
 	}
 	if target.domain == "" {
 		return emptyRuleMetrics()
@@ -854,9 +1246,16 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 			result.subtract(index.httpHosts[host])
 		}
 	}
-	return result.ruleMetrics(true)
+	return result.ruleMetrics()
 }
 
+// tcpRuleMetrics 按上游地址归集 TCP 单规则指标
+// caddy-l4 v0.1.2 的 L4 指标（caddy_layer4_proxy_connections_total /
+// active_connections / upstream_healthy）标签仅 []string{"upstream"}
+// （模块源码 modules/l4proxy/metrics.go:57-75 实证）——无 server/listener/
+// rule 级标签，引擎层面无法按规则拆分。多条 TCP 规则共享同一上游地址时，
+// 各规则看到的该上游连接数相同（跨规则合计值），UI（Dashboard 规则表
+// 请求数/处理中列 tooltip）已向用户明示该口径；不硬造规则级标签。
 func (index prometheusMetricsIndex) tcpRuleMetrics(upstreams []models.Upstream) gin.H {
 	var result ruleMetricsAggregate
 	addresses := make(map[string]struct{}, len(upstreams))
@@ -868,7 +1267,7 @@ func (index prometheusMetricsIndex) tcpRuleMetrics(upstreams []models.Upstream) 
 	for address := range addresses {
 		result.add(index.tcpUpstreams[address])
 	}
-	return result.ruleMetrics(false)
+	return result.ruleMetrics()
 }
 
 func (metrics *ruleMetricsAggregate) add(other *ruleMetricsAggregate) {
@@ -924,8 +1323,11 @@ func (metrics *ruleMetricsAggregate) subtract(other *ruleMetricsAggregate) {
 	metrics.bytesOut -= other.bytesOut
 }
 
-func (metrics ruleMetricsAggregate) ruleMetrics(includeHealthy bool) gin.H {
-	result := gin.H{
+// ruleMetrics 规则指标的统一键集（HTTP/TCP/空指标一致）。健康语义由
+// /config/health 通道承载——此处曾有恒假 healthy 键（唯一写点、零读点），
+// 外部消费者会把它当成真实健康状态。
+func (metrics ruleMetricsAggregate) ruleMetrics() gin.H {
+	return gin.H{
 		"requests_total":     metrics.requestsTotal,
 		"requests_in_flight": metrics.requestsInFlight,
 		"status_2xx":         metrics.status2xx,
@@ -935,10 +1337,6 @@ func (metrics ruleMetricsAggregate) ruleMetrics(includeHealthy bool) gin.H {
 		"bytes_in":           metrics.bytesIn,
 		"bytes_out":          metrics.bytesOut,
 	}
-	if includeHealthy {
-		result["healthy"] = false
-	}
-	return result
 }
 
 func ruleMetricHosts(target ruleMetricTarget) map[string]struct{} {
@@ -954,12 +1352,10 @@ func ruleMetricHosts(target ruleMetricTarget) map[string]struct{} {
 			continue
 		}
 		hosts[net.JoinHostPort(domain, strconv.Itoa(target.listenPort))] = struct{}{}
-		// TLS 规则的指标 host 另按 HTTPS 默认口（HTTPS_PORT，出厂 443）匹配；无 TLS 且
-		// 端口未显式指定（0）或正是 HTTP 默认口时按 HTTP 默认口匹配（ISSUE #7）。
 		if target.enableTLS {
-			hosts[net.JoinHostPort(domain, strconv.Itoa(services.DefaultHTTPSPort()))] = struct{}{}
-		} else if target.listenPort == services.DefaultHTTPPort() || target.listenPort == 0 {
-			hosts[net.JoinHostPort(domain, strconv.Itoa(services.DefaultHTTPPort()))] = struct{}{}
+			hosts[net.JoinHostPort(domain, "443")] = struct{}{}
+		} else if target.listenPort == 80 || target.listenPort == 0 {
+			hosts[net.JoinHostPort(domain, "80")] = struct{}{}
 		}
 	}
 	return hosts
@@ -967,6 +1363,13 @@ func ruleMetricHosts(target ruleMetricTarget) map[string]struct{} {
 
 func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 	name, value := sample.name, sample.value
+	// 统计起点 gauge（无标签）：早分支捕获，不进流量聚合桶（无标签序列
+	// 与 host/rule 聚合无交集，observeHTTP 对未知前缀本就零命中，此处
+	// 显式短路免掉一次空聚合走账）。
+	if name == "lazybalancer_rule_metrics_epoch_seconds" {
+		index.ruleMetricsEpochSeconds = int64(value)
+		return
+	}
 	var metric ruleMetricsAggregate
 	metric.observeHTTP(name, value)
 	index.global.add(&metric)
@@ -984,7 +1387,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 
 	if rule := services.ExtractMetricLabel(name, "rule"); rule != "" {
 		if strings.HasPrefix(name, "lazybalancer_security_blocked_total{") {
-			// SECLB30-2(P5,第 30 轮审计):blocked-only 样本不建 ruleMetricsByRule
+			// blocked-only 样本不建 ruleMetricsByRule
 			// 空聚合——否则过渡形态(插件未升级)下 ruleMetrics early return 空,
 			// 架空域名兜底。blocked 仅记 blockedByRule。
 			index.blockedByRule[rule] += int64(value)
@@ -1021,11 +1424,9 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 	if upstream := services.ExtractMetricLabel(name, "upstream"); upstream != "" {
 		aggregate := index.aggregateFor(index.tcpUpstreams, upstream)
 		switch {
-		case strings.HasPrefix(name, "caddy_layer4_proxy_connections_total{"),
-			strings.HasPrefix(name, "caddy_layer4_proxy_connections_total "):
+		case strings.HasPrefix(name, "caddy_layer4_proxy_connections_total{"):
 			aggregate.requestsTotal += int64(value)
-		case strings.HasPrefix(name, "caddy_layer4_proxy_active_connections{"),
-			strings.HasPrefix(name, "caddy_layer4_proxy_active_connections "):
+		case strings.HasPrefix(name, "caddy_layer4_proxy_active_connections{"):
 			aggregate.requestsInFlight += int64(value)
 		}
 	}
@@ -1047,15 +1448,30 @@ func parsePrometheusSamples(body string) ([]prometheusSample, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		// geoip 透传路由无 reverse_proxy：同一请求先过它、再过主/路径路由，
+		// 两条路由各自注入指标。本仓库的采集链按
+		// services.IsGeoIPPassSeries 整行剔除，实时指标解析必须同口径
+		// （共用同一判据），否则首页「总请求数/流量」在启用 GeoIP 的规则上
+		// 恰好是真实值的两倍，且与同页采集链来源的速率卡互相矛盾。
+		if services.IsGeoIPPassSeries(line) {
 			continue
 		}
-		value, err := strconv.ParseFloat(fields[1], 64)
-		if err != nil {
-			return nil, fmt.Errorf("解析 Prometheus 第 %d 行样本值 %q 失败: %w", lineNumber+1, fields[1], err)
+		// 行取值与规则指标采集共用 services 单源实现（引号感知：标签值可含
+		// 空格/`}`；无标签块的行按空白切分）。
+		name, rawValue, ok := services.PrometheusSampleLine(line)
+		if !ok {
+			continue
 		}
-		samples = append(samples, prometheusSample{name: fields[0], value: value})
+		value, finite, err := services.PrometheusSampleFloat(rawValue)
+		if err != nil {
+			return nil, fmt.Errorf("解析 Prometheus 第 %d 行样本值 %q 失败: %w", lineNumber+1, rawValue, err)
+		}
+		// 非有限样本不参与聚合（与规则指标采集同口径：NaN/±Inf 跳过，全部
+		// 无效时仍报错）——消费侧把样本值转 int64 对非有限值的转换实现相关。
+		if !finite {
+			continue
+		}
+		samples = append(samples, prometheusSample{name: name, value: value})
 	}
 	if len(samples) == 0 {
 		return nil, fmt.Errorf("Prometheus 正文不包含有效样本")
@@ -1087,7 +1503,7 @@ func parseHostMetricsFromSamples(samples []prometheusSample) []models.HostMetric
 	return buildPrometheusMetricsIndex(samples).hostMetrics()
 }
 
-// 指标 label 抽取统一走 services.ExtractMetricLabel（LBS/LBH-7 第 73 轮：
+// 指标 label 抽取统一走 services.ExtractMetricLabel（LBS/
 // 本包原 extractLabel 与 services extractMetricLabel 逐字重复，收敛为跨包单源）。
 
 func parseTCPRuleMetricsFromPrometheus(body string, upstreams []models.Upstream) (gin.H, error) {
@@ -1102,7 +1518,7 @@ func parseTCPRuleMetricsFromSamples(samples []prometheusSample, upstreams []mode
 	return buildPrometheusMetricsIndex(samples).tcpRuleMetrics(upstreams)
 }
 
-// deductBlockedFrom4xx 从 4xx 计数扣除安全拦截并钳制 ≥0(第 28.6 轮 F6:
+// deductBlockedFrom4xx 从 4xx 计数扣除安全拦截并钳制 ≥0(历史
 // Dashboard 与 GetRuleMetrics 两处逐字复制提为共享函数)。
 func deductBlockedFrom4xx(metrics gin.H, blocked int64) {
 	if s4, ok := metrics["status_4xx"].(int64); ok && blocked > 0 {
@@ -1114,7 +1530,7 @@ func deductBlockedFrom4xx(metrics gin.H, blocked int64) {
 	}
 }
 
-func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableTLS bool, ruleCaddyID ...string) (gin.H, error) { // SR30-3:protocol 死参移除
+func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableTLS bool, ruleCaddyID ...string) (gin.H, error) { // protocol 死参移除
 	samples, err := parsePrometheusSamples(body)
 	if err != nil {
 		return nil, err
@@ -1125,7 +1541,7 @@ func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableT
 		target.ruleID = ruleCaddyID[0]
 	}
 	result := index.ruleMetrics(target)
-	// P4-2(第 28.5 轮审计):GET /metrics/rule/:caddy_id 与仪表盘同口径——
+	// GET /metrics/rule/:caddy_id 与仪表盘同口径——
 	// 加 blocked 并扣 4xx(钳制 ≥0);ruleCaddyID 为空时(TCP)跳过。
 	if len(ruleCaddyID) > 0 && ruleCaddyID[0] != "" {
 		blocked := index.blockedByRule[ruleCaddyID[0]]
@@ -1135,14 +1551,24 @@ func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableT
 	return result, nil
 }
 
-// tailLogWindow 截断尾读日志窗口的首行残段（SYSB44-3 语义，LBH-B-U1 第 69 轮
-// 抽享——此前同一逻辑在 GetAppLogs/GetCaddyLogs 两份实现，第 44 轮修复只收敛了
+// tailLogWindow 截断尾读日志窗口的首行残段（语义，
+// 抽享——此前同一逻辑在 GetAppLogs/GetCaddyLogs 两份实现，历史只收敛了
 // system.go，caddy.go 漏网）：startOffset 非零时窗口首字节可能落在某行中段
 // （切在多字节 rune 中间时残段带无效字节，JSON 编码后以 U+FFFD 污染输出），
 // 丢弃到下一 '\n' 为止；窗口内无 '\n' 则整窗是同一巨行的中段，返回空。
-func tailLogWindow(data []byte, startOffset int64) []byte {
+//
+// 起点也可能恰为行首（调用方按 size-窗口 取任意字节偏移）：此时首行是完整行，
+// 不得丢弃。边界只能回读 src 的 startOffset-1 字节判定（窗口数据自身看不出），
+// 读不到时按行中段保守丢弃——宁丢一行残段，不输出半行。
+func tailLogWindow(src io.ReaderAt, data []byte, startOffset int64) []byte {
 	if startOffset <= 0 {
 		return data
+	}
+	if src != nil {
+		var prev [1]byte
+		if _, err := src.ReadAt(prev[:], startOffset-1); err == nil && prev[0] == '\n' {
+			return data
+		}
 	}
 	if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
 		return data[idx+1:]
@@ -1171,7 +1597,23 @@ func classifyStatusCode(code string) string {
 
 func emptyRuleMetrics() gin.H {
 	// 双源收敛：空值形状与 ruleMetricsAggregate 零值输出同源，禁手工维护两套键表。
-	return ruleMetricsAggregate{}.ruleMetrics(true)
+	return ruleMetricsAggregate{}.ruleMetrics()
+}
+
+// allNumericLabels 报告点分串的每个标签是否都只由数字组成（999.1.1.1 形态）。
+// 用于把「看似 IPv4 的非法地址」挡在含义更宽的主机名校验之外。
+func allNumericLabels(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false
+		}
+		for _, c := range label {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isValidHost(host string) bool {
@@ -1179,6 +1621,15 @@ func isValidHost(host string) bool {
 	ip := net.ParseIP(host)
 	if ip != nil {
 		return true
+	}
+
+	// 全数字点分串（999.1.1.1、1.2.3.256、1.2.3.4.5）：net.ParseIP 已失败，
+	// 下面的标签字母表校验会放行，但这类串只可能是想写 IP 的笔误——落库后
+	// 渲染进上游地址 / 健康检查 Host 头 / 动态上游 DNS 解析，解析或探测静默
+	// 失败（保存时零提示）。只拒绝「每个标签都纯数字」的点分形态，dns1.example.com
+	// 一类含数字域名与单段数字主机名不受影响。
+	if strings.Contains(host, ".") && allNumericLabels(host) {
+		return false
 	}
 
 	// Check if it's a valid domain name
@@ -1245,7 +1696,7 @@ func isValidDomain(domain string) bool {
 			return false
 		}
 		for _, c := range part {
-			// SYS20-P5-6：删 c=='.'——part 来自 Split(domain, ".") 的产物，恒不含 '.'。
+			// 删 c=='.'——part 来自 Split(domain, ".") 的产物，恒不含 '.'。
 			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
 				return false
 			}

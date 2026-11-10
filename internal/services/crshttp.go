@@ -21,18 +21,21 @@ var crsHTTPClient = &http.Client{Timeout: 30 * time.Second}
 // 避免 30s 短路读 body（50KB/s × 2-3MB ≈ 40-60s 常态超越）。tag 查询用原 client。
 var crsDownloadClient = &http.Client{}
 
-// ruleSetDownloadSizeCap 是 CRS/ip2region 下载的最大字节数（2GB）：代理在超时
-// 窗口内可无限流式灌入，无界 io.Copy 会写爆数据卷 staging 目录（R34 A）。
+// ruleSetDownloadSizeCap 是 CRS 发布包（tarball）下载的最大字节数（2GB）：代理
+// 在超时窗口内可无限流式灌入，无界 io.Copy 会写爆数据卷 staging 目录。
+// ip2region 的 xdb 走独立上限 ip2RegionXDBDownloadSizeCap（100MB）——xdb 在
+// BufferCache 构造期全量入内存，按 2GB 设限会让恶意/损坏响应体在内存小的
+// 容器里 OOM。两者不得合并回单常量。
 const ruleSetDownloadSizeCap = int64(2 << 30)
 
 // downloadProgressFunc 是下载进度回调：written 为已落盘字节数，total 为预期总
 // 字节数（未知时为 0）。下载函数在收到响应头后先以 (0, total) 触发一次开始
-// 信号，随后由计数 reader 在流式拷贝中持续回调（R57）。
+// 信号，随后由计数 reader 在流式拷贝中持续回调。
 type downloadProgressFunc func(written, total int64)
 
-// writeRuleSetDownload 将响应体限界写入目标文件：Content-Length 超上限先拒绝
-// 落盘，流式拷贝超上限即报错中止（R34 A）。progress 非 nil 时先发出 (0, total)
-// 开始信号，再经计数 reader 持续上报进度（R57）。
+// writeRuleSetDownload 将响应体限界写入目标文件：超上限先拒绝
+// 落盘，流式拷贝超上限即报错中止。progress 非 nil 时先发出 (0, total)
+// 开始信号，再经计数 reader 持续上报进度。
 func writeRuleSetDownload(out *os.File, resp *http.Response, cap int64, progress downloadProgressFunc) error {
 	if resp.ContentLength > cap {
 		return fmt.Errorf("下载声明 Content-Length=%d 超过大小上限 %d 字节", resp.ContentLength, cap)
@@ -56,7 +59,7 @@ func writeRuleSetDownload(out *os.File, resp *http.Response, cap int64, progress
 	return nil
 }
 
-// downloadProgressReader 是计数 reader：每次成功读取后累加并回调进度（R57）。
+// downloadProgressReader 是计数 reader：每次成功读取后累加并回调进度。
 type downloadProgressReader struct {
 	r        io.Reader
 	written  int64
@@ -73,8 +76,8 @@ func (r *downloadProgressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// newDownloadProgressLogger 返回节流进度闭包（R57）：首次回调（下载函数的
-// (0, total) 开始信号）写「开始下载」行，携带完整来源 URL，Content-Length
+// newDownloadProgressLogger 返回节流进度闭包：首次回调（下载函数的
+// (0, total) 开始信号）写「开始下载」行，携带完整来源 URL，
 // 已知时附预计大小；此后 total 已知按每 10% 阈值、未知按每 5MB 写一条「下载
 // 进度」行。logLine 由调用方接到各自的更新日志 writer。
 func newDownloadProgressLogger(sourceURL string, logLine func(message string)) downloadProgressFunc {
@@ -111,7 +114,7 @@ func newDownloadProgressLogger(sourceURL string, logLine func(message string)) d
 	}
 }
 
-// logDownloadCompletion 写下载完成行：落盘总字节 + 耗时秒（R57）。
+// logDownloadCompletion 写下载完成行：落盘总字节 + 耗时秒。
 func logDownloadCompletion(logLine func(message string), destPath string, startedAt time.Time) {
 	var size int64
 	if info, err := os.Stat(destPath); err == nil {
@@ -138,14 +141,15 @@ func formatDownloadBytes(n int64) string {
 // 文件在该部署网络不可靠。代理支持 raw.githubusercontent.com 与 github.com
 // archive 路径，但不支持 codeload.github.com / api.github.com（verified 403），
 // 故 CRS tarball 用等价 archive URL、最新 tag 检查回退经代理的 releases/latest
-// 跳转（R57）。代理地址经 global_config.github_proxy_url 配置（基础设置），
+// 跳转。代理地址经 global_config.github_proxy_url 配置（基础设置），
 // 仅允许 gitHubProxyOptions 内置选项；历史硬编码 ghfast.top 已废弃。
-const defaultGitHubProxyURL = "https://v4.gh-proxy.org/"
+// 默认项单源=db.DefaultGitHubProxyURL（fresh DDL DEFAULT/面板与快照读侧
+// COALESCE/MCP schema enum 首项同源）；另两项是非默认枚举选项，保留字面量。
 
 // gitHubProxyOptions 是允许配置的全部代理前缀：写侧 ValidateGitHubProxyURL
 // 拒绝白名单外取值（防 SSRF），读侧遇白名单外脏数据回退默认（fail-closed）。
 var gitHubProxyOptions = []string{
-	"https://v4.gh-proxy.org/",      // Cloudflare v4（默认）
+	db.DefaultGitHubProxyURL,        // Cloudflare v4（默认）
 	"https://axisnow.gh-proxy.org/", // AxisNow v4
 	"https://cdn.gh-proxy.org/",     // Fastly v4
 }
@@ -186,10 +190,10 @@ func getGitHubProxyURL() string {
 		case err == nil && isAllowedGitHubProxyURL(proxyURL):
 			return proxyURL
 		case err != nil && !errors.Is(err, sql.ErrNoRows):
-			Logf("error", "读取 GitHub 加速代理配置失败，回退默认 %s: %v", defaultGitHubProxyURL, err)
+			Logf("error", "读取 GitHub 加速代理配置失败，回退默认 %s: %v", db.DefaultGitHubProxyURL, err)
 		}
 	}
-	return defaultGitHubProxyURL
+	return db.DefaultGitHubProxyURL
 }
 
 func ghProxied(rawURL string) string {
@@ -202,7 +206,7 @@ func crsTarballSourceURL(tag string) string {
 	return ghProxied(crsTarballBaselineKey(tag))
 }
 
-// crsTarballBaselineKey 是完整性基线的键(GEO25-3,第 25 轮审计):裸 GitHub
+// crsTarballBaselineKey 是完整性基线的键:裸 GitHub
 // URL 不含代理前缀——代理是传输层(白名单可切换),内容校验应钉源站;切换
 // 代理不应另立基线(同一上游内容经不同代理下载,SHA256 不变)。
 func crsTarballBaselineKey(tag string) string {
@@ -213,27 +217,33 @@ func crsTarballBaselineKey(tag string) string {
 const crsRepoSlug = "coreruleset/coreruleset"
 
 // crsLatestReleaseAPIURL 是 CRS 最新版本的 GitHub API 直连地址；var 以便测试
-// 指向 httptest 服务（R57）。
+// 指向 httptest 服务。
 var crsLatestReleaseAPIURL = "https://api.github.com/repos/coreruleset/coreruleset/releases/latest"
 
-// defaultFetchCRSLatestTag 查询 CRS 最新版本：先直连 api.github.com（快路径不
-// 变），仅在 403 限流与传输类失败（Do() 错误、5xx、读体中断）时经 GitHub 代理
-// 回退查询 releases/latest 页面（api.github.com 不可代理，verified 403）；其余
-// 4xx 与 tag 解析失败不重试。两路均失败时错误同时点名两个尝试过的 URL（R57）。
-func defaultFetchCRSLatestTag(ctx context.Context) (string, error) {
-	tag, err, transport := fetchGitHubLatestTagFromAPI(ctx, crsHTTPClient, crsLatestReleaseAPIURL)
+// fetchLatestGitHubTag 是 CRS/ip2region 最新版本查询的单源实现
+// 先直连 api.github.com（快路径不变），仅在 403 限流与传输类失败（Do() 错误、
+// 5xx、读体中断）时经 GitHub 代理回退查询 releases/latest 页面（api.github.com
+// 不可代理，verified 403）；其余 4xx 与 tag 解析失败不重试。两路均失败时错误
+// 同时点名两个尝试过的 URL。resource 仅用于错误文案。
+func fetchLatestGitHubTag(ctx context.Context, client *http.Client, apiURL, slug, resource string) (string, error) {
+	tag, err, transport := fetchGitHubLatestTagFromAPI(ctx, client, apiURL)
 	if err == nil {
 		return tag, nil
 	}
 	if !transport {
-		return "", fmt.Errorf("查询 CRS 最新版本: %w", err)
+		return "", fmt.Errorf("查询 %s 最新版本: %w", resource, err)
 	}
-	proxyTag, proxyErr := fetchGitHubLatestTagViaProxy(ctx, crsRepoSlug)
+	proxyTag, proxyErr := fetchGitHubLatestTagViaProxy(ctx, slug)
 	if proxyErr != nil {
-		return "", fmt.Errorf("查询 CRS 最新版本: 直连 %s 失败: %v；经代理 %s 重试仍失败: %v",
-			crsLatestReleaseAPIURL, err, ghProxied(gitHubReleasesLatestURL(crsRepoSlug)), proxyErr)
+		return "", fmt.Errorf("查询 %s 最新版本: 直连 %s 失败: %v；经代理 %s 重试仍失败: %v",
+			resource, apiURL, err, ghProxied(gitHubReleasesLatestURL(slug)), proxyErr)
 	}
 	return proxyTag, nil
+}
+
+// defaultFetchCRSLatestTag 查询 CRS 最新版本（委托单源 helper）。
+func defaultFetchCRSLatestTag(ctx context.Context) (string, error) {
+	return fetchLatestGitHubTag(ctx, crsHTTPClient, crsLatestReleaseAPIURL, crsRepoSlug, "CRS")
 }
 
 func defaultDownloadCRSTarball(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error {
@@ -256,6 +266,16 @@ func defaultDownloadCRSTarball(ctx context.Context, tag, destPath string, progre
 	}
 	copyErr := writeRuleSetDownload(out, resp, ruleSetDownloadSizeCap, progress)
 	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		// 失败路径不得留下 0 字节/半截工件：ContentLength 超限时 writeRuleSetDownload
+		// 在写入前返回，io.Copy 中断则留下部分字节——seam 调用方（测试/复用）
+		// 传入任意 dest 时，下一次「跳过下载」的调用会把残件当成品消费
+		// （TOFU 完整性基线/解包都基于错误字节）。生产 dest 在 staging 内由
+		// defer RemoveAll 兜底，此处只补 seam 形态。
+		if rmErr := os.Remove(destPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			Logf("warn", "crs download: 清理失败下载工件 %s 失败: %v", destPath, rmErr)
+		}
+	}
 	if copyErr != nil {
 		return copyErr
 	}
@@ -267,7 +287,7 @@ func defaultDownloadCRSTarball(ctx context.Context, tag, destPath string, progre
 
 // gitHubReleasesLatestURL 是仓库 releases/latest 页面地址：GitHub 会 302 跳转
 // 到 /releases/tag/{最新 tag}，经 GitHub 代理即可绕过 api.github.com 不可代理
-// 的限制查询最新版本（R57）。
+// 的限制查询最新版本。
 func gitHubReleasesLatestURL(repoSlug string) string {
 	return "https://github.com/" + repoSlug + "/releases/latest"
 }
@@ -278,7 +298,7 @@ const ghLatestTagBodyLimit = int64(1 << 20)
 var ghLatestTagInBodyRegexp = regexp.MustCompile(`/releases/tag/([^"'/]+)`)
 
 // fetchGitHubLatestTagViaProxy 经 GitHub 代理查询 repoSlug 的最新 release tag
-// （R57）：GET 代理后的 releases/latest，用 CheckRedirect 捕获首个 Location
+// GET 代理后的 releases/latest，用 CheckRedirect 捕获首个 Location
 // （302 → /releases/tag/{tag}）而不跟随；代理直接返回 200 页面（无跳转）时改
 // 从响应体（≤1MB）正则提取首个 /releases/tag/ 出现。
 func fetchGitHubLatestTagViaProxy(ctx context.Context, repoSlug string) (string, error) {
@@ -311,13 +331,30 @@ func fetchGitHubLatestTagViaProxy(ctx context.Context, repoSlug string) (string,
 	if err != nil {
 		return "", fmt.Errorf("读取代理响应 %s: %w", proxiedURL, err)
 	}
-	if m := ghLatestTagInBodyRegexp.FindSubmatch(body); m != nil {
-		return string(m[1]), nil
+	// 扫描全部 /releases/tag/ 匹配，取首个通过形状校验的 tag：GitHub 页面
+	// HTML 会在真实 tag 之前混入路由模板通配符产物（如 /releases/tag/*name），
+	// 首个原始匹配优先会让整次查询被模板产物毒化。校验仍 fail-closed——
+	// 全部匹配都非法时报形状错误，不放水。
+	var invalidErr error
+	for _, m := range ghLatestTagInBodyRegexp.FindAllSubmatch(body, -1) {
+		// 与 Location/API 两条漏斗同口径校验形状；正则可捕获换行等控制字符，
+		// 不校验会污染任务日志/版本 message/审计详情。
+		tag := string(m[1])
+		if err := validateReleaseTag(tag); err != nil {
+			if invalidErr == nil {
+				invalidErr = err
+			}
+			continue
+		}
+		return tag, nil
+	}
+	if invalidErr != nil {
+		return "", invalidErr
 	}
 	return "", fmt.Errorf("代理响应 %s 未包含 /releases/tag/ 跳转", proxiedURL)
 }
 
-// releaseTagPattern 是 GitHub release tag 的白名单形状（F-47-4，第 47 轮）：
+// releaseTagPattern 是 GitHub release tag 的白名单形状
 // 首字符字母/数字，其余字母/数字/点/下划线/加号/连字符，长度 ≤64。tag 来源为
 // GitHub API 的 tag_name 与 releases/latest 跳转地址，二者此前均无形状校验——
 // API 路径可携带控制字符（换行可伪造日志与审计行、参与版本行写入与
@@ -356,12 +393,12 @@ func parseGitHubTagFromLocation(location string) (string, error) {
 // fetchGitHubLatestTagFromAPI 直连 GitHub releases/latest API 解析 tag_name。
 // transport 报告失败是否值得经 GitHub 代理重试：Do() 错误、5xx、响应体读取
 // 中断，以及 403 未认证限流——代理查询的是 github.com 的 releases/latest 页面
-// 而非 api.github.com，可绕过 API 限流；其余 4xx 与 tag 解析失败不重试（R57：
+// 而非 api.github.com，可绕过 API 限流；其余 4xx 与 tag 解析失败不重试
 // 对 api.github.com 本身重试只会放大延迟）。
 
 // gitHubAPIToken 读取可选 GITHUB_TOKEN（global_config.github_token，
 // 2026-09-25 用户裁定）：未认证 GitHub API 限流 60/h/IP（共享出口 IP 常被打满
-// 致自动更新连日 403，第 51 轮审计 P2-4），令牌提升至 5000/h。仅用于
+// 致自动更新连日 403），令牌提升至 5000/h。仅用于
 // api.github.com 直连——绝不随请求发往第三方加速代理（防泄漏）。
 func gitHubAPIToken() string {
 	if db.DB == nil {
@@ -369,7 +406,7 @@ func gitHubAPIToken() string {
 	}
 	var token string
 	if err := db.DB.QueryRow(`SELECT COALESCE(github_token,'') FROM global_config WHERE id=1`).Scan(&token); err != nil {
-		// SEC-C-2（第 72 轮审计）：非 ErrNoRows 读库失败记 warn 留痕（对齐
+		// 非 ErrNoRows 读库失败记 warn 留痕（对齐
 		// getGitHubProxyURL 口径）——静默降级会让连日 403 限流排障不可见。
 		if !errors.Is(err, sql.ErrNoRows) {
 			Logf("warn", "读取 GitHub API 令牌失败，按无令牌降级（未认证限流 60/h）: %v", err)
@@ -397,7 +434,7 @@ func fetchGitHubLatestTagFromAPI(ctx context.Context, client *http.Client, apiUR
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// 403 = GitHub API 未认证限流（60 次/小时/IP），401 = 令牌失效/作废——
-		// 同属认证面失败（第 52 轮 P2-3，用户裁定），与 5xx 传输类故障一并经
+		// 同属认证面失败，与 5xx 传输类故障一并经
 		// 代理 releases/latest 页面回退；其余 4xx 不重试。
 		return "", fmt.Errorf("GitHub 返回 %d", resp.StatusCode),
 			resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized

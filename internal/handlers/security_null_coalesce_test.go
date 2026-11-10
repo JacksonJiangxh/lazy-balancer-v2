@@ -2,23 +2,27 @@ package handlers
 
 import (
 	"bytes"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
-// C5 NULL 容忍残余（B5 I-C / C5 IMP-3 / C5 SUG-1）：handler 端点裸扫描可空列，
+// NULL 容忍残余：handler 端点裸扫描可空列，
 // 一行 NULL → 该端点 500。本文件三测试分别钉住三处修复：
-//   FIX 1 GetSecurityPolicyBindings 逐策略查询改用 securityPolicySelectColumns
-//   FIX 2 DeleteSecurityCustomRule 引用检查 COALESCE(custom_rules,'[]')
-//   FIX 3 List/Update 自定义规则与拦截页裸扫描列 COALESCE（对齐 cluster_snapshot dump 侧）
+//   GetSecurityPolicyBindings 逐策略查询改用 securityPolicySelectColumns
+//   DeleteSecurityCustomRule 引用检查 COALESCE(custom_rules,'[]')
+//   List/Update 自定义规则与拦截页裸扫描列 COALESCE（对齐 cluster_snapshot dump 侧）
 
 // newNullCoalesceRouter 注册本文件三测试所需的全部端点。
 func newNullCoalesceRouter(t *testing.T) *gin.Engine {
@@ -40,7 +44,7 @@ func newNullCoalesceRouter(t *testing.T) *gin.Engine {
 	return router
 }
 
-// FIX 1（B5 I-C）：GetSecurityPolicyBindings 的逐策略查询与 securityPolicySelectColumns
+// GetSecurityPolicyBindings 的逐策略查询与 securityPolicySelectColumns
 // 同 25 列但无 COALESCE——绑定策略任一可空列（如 description）为 NULL 时整列表 500。
 // 修复后按常量投影返回 200 与该策略的默认值形态。
 func TestGetSecurityPolicyBindings_nullPolicyColumnsReturn200(t *testing.T) {
@@ -72,7 +76,7 @@ func TestGetSecurityPolicyBindings_nullPolicyColumnsReturn200(t *testing.T) {
 	}
 }
 
-// FIX 2（C5 IMP-3）：DeleteSecurityCustomRule 引用检查裸扫 custom_rules——任一启用
+// DeleteSecurityCustomRule 引用检查裸扫 custom_rules——任一启用
 // 策略该列为 NULL 时扫描报错 500，全部自定义规则删除被阻断。修复后 COALESCE '[]'
 // 落入既有的「不可解析→跳过」分支，删除按引用检查通过放行。
 func TestDeleteSecurityCustomRule_nullCustomRulesPolicyDoesNot500(t *testing.T) {
@@ -103,7 +107,7 @@ func TestDeleteSecurityCustomRule_nullCustomRulesPolicyDoesNot500(t *testing.T) 
 	}
 }
 
-// FIX 3（C5 SUG-1）：List/Update 自定义规则与拦截页的裸扫描可空列，一行 NULL →
+// List/Update 自定义规则与拦截页的裸扫描可空列，一行 NULL →
 // 对应端点 500。修复后四个端点对同一 NULL 种子行均不得 500（List 返默认值 200，
 // Update 读-合并-写放行 200）。
 func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
@@ -120,7 +124,7 @@ func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pageRes, err := db.DB.Exec(`INSERT INTO security_block_pages (name, description, content, is_default) VALUES ('null拦截页', NULL, 'x', NULL)`)
+	pageRes, err := db.DB.Exec(`INSERT INTO security_block_pages (name, description, content, is_default) VALUES ('null拦截页', NULL, NULL, NULL)`)
 	if err != nil {
 		t.Fatalf("seed block page: %v", err)
 	}
@@ -129,15 +133,116 @@ func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When/Then：四个端点均不得 500（逐端点记录，一次性报告全部失败面）
-	statuses := map[string]int{}
-	statuses["GET /security/custom-rules"] = getRequest(t, router, "/security/custom-rules").Code
-	statuses[fmt.Sprintf("PUT /security/custom-rules/%d", ruleID)] = putJSON(t, router, fmt.Sprintf("/security/custom-rules/%d", ruleID), map[string]any{"name": "null规则改名"}).Code
-	statuses["GET /security/block-pages"] = getRequest(t, router, "/security/block-pages").Code
-	statuses[fmt.Sprintf("PUT /security/block-pages/%d", pageID)] = putJSON(t, router, fmt.Sprintf("/security/block-pages/%d", pageID), map[string]any{"name": "null拦截页改名", "content": "x"}).Code
-	for endpoint, code := range statuses {
-		if code == http.StatusInternalServerError {
-			t.Errorf("%s status=500（NULL 可空列不得拖垮端点）", endpoint)
+	// When/Then：四个端点均返回 200，且投影/落库值为 COALESCE 归一默认值
+	//（仅排除 500 会放过「非 500 的任意错误码」与「零值悄悄丢字段」两种漂移）。
+	listRules := getRequest(t, router, "/security/custom-rules")
+	if listRules.Code != http.StatusOK {
+		t.Fatalf("GET /security/custom-rules status=%d body=%s, want 200", listRules.Code, listRules.Body.String())
+	}
+	var rulesPayload struct {
+		Data []models.SecurityCustomRule `json:"data"`
+	}
+	if err := json.Unmarshal(listRules.Body.Bytes(), &rulesPayload); err != nil {
+		t.Fatalf("解析自定义规则列表: %v", err)
+	}
+	foundRule := false
+	for _, rule := range rulesPayload.Data {
+		if rule.ID != int(ruleID) {
+			continue
 		}
+		foundRule = true
+		if rule.Description != "" || rule.Action != "block" {
+			t.Fatalf("NULL 列投影 description=%q action=%q, want \"\"/block（COALESCE 默认值）", rule.Description, rule.Action)
+		}
+	}
+	if !foundRule {
+		t.Fatalf("自定义规则列表未包含 #%d", ruleID)
+	}
+
+	listPages := getRequest(t, router, "/security/block-pages")
+	if listPages.Code != http.StatusOK {
+		t.Fatalf("GET /security/block-pages status=%d body=%s, want 200", listPages.Code, listPages.Body.String())
+	}
+	var pagesPayload struct {
+		Data []models.SecurityBlockPage `json:"data"`
+	}
+	if err := json.Unmarshal(listPages.Body.Bytes(), &pagesPayload); err != nil {
+		t.Fatalf("解析拦截页列表: %v", err)
+	}
+	foundPage := false
+	for _, page := range pagesPayload.Data {
+		if page.ID != int(pageID) {
+			continue
+		}
+		foundPage = true
+		if page.Description != "" || page.Content != "" || page.IsDefault {
+			t.Fatalf("NULL 列投影 description=%q content=%q is_default=%v, want \"\"/\"\"/false",
+				page.Description, page.Content, page.IsDefault)
+		}
+		if page.ContentType != models.DefaultBlockPageContentType {
+			t.Fatalf("NULL content_type 投影=%q, want 默认 %q", page.ContentType, models.DefaultBlockPageContentType)
+		}
+	}
+	if !foundPage {
+		t.Fatalf("拦截页列表未包含 #%d", pageID)
+	}
+
+	if rec := putJSON(t, router, fmt.Sprintf("/security/custom-rules/%d", ruleID), map[string]any{"name": "null规则改名"}); rec.Code != http.StatusOK {
+		t.Fatalf("PUT custom rule status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var ruleDescription, ruleAction sql.NullString
+	if err := db.DB.QueryRow(`SELECT description, action FROM security_custom_rules WHERE id=?`, ruleID).Scan(&ruleDescription, &ruleAction); err != nil {
+		t.Fatal(err)
+	}
+	// 读-合并-写必须把归一值落回库：NULL 不得继续留在列里（否则下次裸扫描
+	// 的消费方仍会 500）。
+	if !ruleDescription.Valid || ruleDescription.String != "" {
+		t.Fatalf("自定义规则 description 落库=%v, want 非 NULL 空串", ruleDescription)
+	}
+	if !ruleAction.Valid || ruleAction.String != "block" {
+		t.Fatalf("自定义规则 action 落库=%v, want 非 NULL \"block\"", ruleAction)
+	}
+
+	if rec := putJSON(t, router, fmt.Sprintf("/security/block-pages/%d", pageID), map[string]any{"name": "null拦截页改名", "content": "x"}); rec.Code != http.StatusOK {
+		t.Fatalf("PUT block page status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var pageDescription, pageContent, pageContentType sql.NullString
+	if err := db.DB.QueryRow(`SELECT description, content, content_type FROM security_block_pages WHERE id=?`, pageID).
+		Scan(&pageDescription, &pageContent, &pageContentType); err != nil {
+		t.Fatal(err)
+	}
+	if !pageDescription.Valid || pageDescription.String != "" {
+		t.Fatalf("拦截页 description 落库=%v, want 非 NULL 空串", pageDescription)
+	}
+	if !pageContent.Valid || pageContent.String != "x" {
+		t.Fatalf("拦截页 content 落库=%v, want \"x\"", pageContent)
+	}
+	if !pageContentType.Valid || pageContentType.String != models.DefaultBlockPageContentType {
+		t.Fatalf("拦截页 content_type 落库=%v, want 非 NULL %q", pageContentType, models.DefaultBlockPageContentType)
+	}
+	// is_default 不在 Update 的可写字段面内：该列的 NULL 由列表投影的
+	// COALESCE(is_default,0) 吸收（上面已断言投影为 false），此处不再要求落库归一。
+}
+
+// 事件列表投影补齐 COALESCE——rule_name/
+// policy_name/duration_us/precheck_us/request_headers/request_body 均为可空
+// 列（schema 仅 DEFAULT 无 NOT NULL），带外/异常写入显式 NULL 时旧实现整页 500。
+func TestListSecurityEvents_nullProjectionColumnsReturn200(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityEventsRouter(t)
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events
+		(event_time, client_ip, method, uri, event_type, rule_triggered, action,
+		 rule_name, policy_name, duration_us, precheck_us, request_headers, request_body)
+		VALUES ('2026-10-19 10:00:00', '93.184.216.9', 'GET', '/null', 'crs', '942100', 'blocked',
+		 NULL, NULL, NULL, NULL, NULL, NULL)`); err != nil {
+		t.Fatalf("seed null event: %v", err)
+	}
+
+	recorder := getRequest(t, router, "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（NULL 可空列按零值投影）", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("body=%s, want total:1", recorder.Body.String())
 	}
 }

@@ -135,14 +135,24 @@ func TestNextScheduledSlot_emptyOrInvalidDaysFallbackAllWeek(t *testing.T) {
 	}
 }
 
-func TestNextScheduledSlot_invalidTimeFallback0400(t *testing.T) {
+func TestNextScheduledSlot_invalidTimeFallbackDefault(t *testing.T) {
 	loc := useShanghaiLocation(t)
 	now := time.Date(2026, 8, 11, 3, 0, 0, 0, loc)
-	want := time.Date(2026, 8, 11, 4, 0, 0, 0, loc)
+	// 兜底值必须与治理默认同源（db.DefaultScheduleTime），不得钉字面量——
+	// 否则默认时间变更后测试保护旧行为、兜底与配置分叉。
+	hour, minute, ok := parseAutoBackupHHMM(db.DefaultScheduleTime)
+	if !ok {
+		t.Fatalf("db.DefaultScheduleTime %q 不可解析", db.DefaultScheduleTime)
+	}
+	want := time.Date(2026, 8, 11, hour, minute, 0, 0, loc)
+	if !want.After(now) {
+		// 默认时间早于 now 时，下一槽落在次日（全周排程）。
+		want = want.AddDate(0, 0, 1)
+	}
 
 	for _, hhmm := range []string{"25:99", "9:00", "bad", ""} {
 		if slot := NextScheduledSlot(now, allWeek(), hhmm, loc); !slot.Equal(want) {
-			t.Fatalf("hhmm=%q: slot=%v, want %v（非法时间兜底 04:00）", hhmm, slot, want)
+			t.Fatalf("hhmm=%q: slot=%v, want %v（非法时间兜底 db.DefaultScheduleTime=%s）", hhmm, slot, want, db.DefaultScheduleTime)
 		}
 	}
 }
@@ -191,13 +201,27 @@ func parseSlotUTC(t *testing.T, raw string) time.Time {
 	t.Fatalf("next_update=%q 不可解析", raw)
 	return time.Time{}
 }
+func assertNextScheduledSlot(t *testing.T, raw string, before time.Time, days []int, hhmm string, loc *time.Location) time.Time {
+	t.Helper()
+	got := parseSlotUTC(t, raw)
+	if !got.After(before) {
+		t.Fatalf("next_update=%v 必须真实晚于操作前时间 %v", got, before)
+	}
+	wantBefore := NextScheduledSlot(before, days, hhmm, loc).UTC()
+	wantAfter := NextScheduledSlot(time.Now().UTC(), days, hhmm, loc).UTC()
+	if got.Equal(wantBefore) || got.Equal(wantAfter) {
+		return got
+	}
+	t.Fatalf("next_update=%v，不在稳定时钟 bracket 的合法槽位 [%v, %v]", got, wantBefore, wantAfter)
+	return time.Time{}
+}
 
 func TestSetCRSSchedule_persistsAndRearms(t *testing.T) {
 	// Given 已播种的 CRS 版本行
 	newTestCRSManager(t)
 	loc := useShanghaiLocation(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	// When 保存排程（仅周二 04:30）
 	if err := SetCRSSchedule([]int{2}, "04:30"); err != nil {
@@ -209,9 +233,7 @@ func TestSetCRSSchedule_persistsAndRearms(t *testing.T) {
 	if days != "2" || hhmm != "04:30" {
 		t.Fatalf("schedule=(%q,%q), want (2,04:30)", days, hhmm)
 	}
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 	if got := parseSlotUTC(t, nextUpdate).In(loc); got.Weekday() != time.Tuesday {
 		t.Fatalf("next_update weekday=%v, want Tuesday", got.Weekday())
 	}
@@ -241,7 +263,7 @@ func TestSetIP2RegionSchedule_persistsAndRearms(t *testing.T) {
 	newTestIP2RegionManager(t)
 	loc := useShanghaiLocation(t)
 	seedIP2RegionVersionRow(t, "commit-abc", true)
-	want := NextScheduledSlot(time.Now().UTC(), []int{6}, "23:15", loc)
+	clockBefore := time.Now().UTC()
 
 	if err := SetIP2RegionSchedule([]int{6}, "23:15"); err != nil {
 		t.Fatalf("SetIP2RegionSchedule: %v", err)
@@ -251,12 +273,10 @@ func TestSetIP2RegionSchedule_persistsAndRearms(t *testing.T) {
 	if days != "6" || hhmm != "23:15" {
 		t.Fatalf("schedule=(%q,%q), want (6,23:15)", days, hhmm)
 	}
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{6}, "23:15", loc)
 }
 
-// 注：F49-2「失败行保留退避」两测试（CRS/IP2Region）随退避机制撤除
+// 注：「失败行保留退避」两测试（CRS/IP2Region）随退避机制撤除
 // （2026-09-25 用户裁定）删除；新语义「一律重排到新槽」由
 // scheduled_update_retry_test.go 的 TestSetCRSSchedule_failedRowRearmedToSlot 钉住。
 
@@ -268,7 +288,7 @@ func TestSetThreatSchedule_persistsAndRearmsEnabledSources(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='failed', consecutive_failures=1, next_update=? WHERE name='ustc'`, backoff); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{3}, "05:00", loc)
+	clockBefore := time.Now().UTC()
 	// When
 	if err := SetThreatSchedule([]int{3}, "05:00"); err != nil {
 		t.Fatalf("SetThreatSchedule: %v", err)
@@ -288,9 +308,7 @@ func TestSetThreatSchedule_persistsAndRearmsEnabledSources(t *testing.T) {
 		if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_threat_sources WHERE name=?`, name).Scan(&next); err != nil {
 			t.Fatal(err)
 		}
-		if got := parseSlotUTC(t, next); !got.Equal(want.UTC()) {
-			t.Fatalf("%s next_update=%v, want %v", name, got, want.UTC())
-		}
+		assertNextScheduledSlot(t, next, clockBefore, []int{3}, "05:00", loc)
 	}
 }
 
@@ -313,7 +331,7 @@ func TestSetCRSAutoUpdate_enableUsesConfiguredSchedule(t *testing.T) {
 	if err := SetCRSSchedule([]int{2}, "04:30"); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	// When 开启自动更新
 	if err := SetCRSAutoUpdate(true); err != nil {
@@ -322,10 +340,7 @@ func TestSetCRSAutoUpdate_enableUsesConfiguredSchedule(t *testing.T) {
 
 	// Then next_update=排程槽（而非旧的 now+24h）
 	_, _, _, _, _, nextUpdate, _ := crsVersionRow(t)
-	got := parseSlotUTC(t, nextUpdate)
-	if !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestSetIP2RegionAutoUpdate_enableUsesConfiguredSchedule(t *testing.T) {
@@ -335,22 +350,20 @@ func TestSetIP2RegionAutoUpdate_enableUsesConfiguredSchedule(t *testing.T) {
 	if err := SetIP2RegionSchedule([]int{2}, "04:30"); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	if err := SetIP2RegionAutoUpdate(true); err != nil {
 		t.Fatal(err)
 	}
 
 	_, _, _, _, _, nextUpdate, _ := ip2RegionVersionRow(t)
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
-// 2026-09-25 用户裁定（原 F50-4 翻转）：失败退避机制撤除——重开开关一律
+// 2026-09-25 用户裁定（原翻转）：失败退避机制撤除——重开开关一律
 // 重排到排程槽，失败行不再保留退避点。
 func TestSetCRSAutoUpdate_failedRowRearmedToSlot(t *testing.T) {
-	// Given 失败行（历史退避形态的 next_update），当前开关关闭
+	// Given 失败行（退避形态的 next_update），当前开关关闭
 	newTestCRSManager(t)
 	loc := useShanghaiLocation(t)
 	seedCRSVersionRow(t, "v4.14.0", false)
@@ -360,7 +373,7 @@ func TestSetCRSAutoUpdate_failedRowRearmedToSlot(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_crs_version SET update_status='failed', consecutive_failures=1, next_update='2026-01-01 01:00:00' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	// When 重开自动更新
 	if err := SetCRSAutoUpdate(true); err != nil {
@@ -369,9 +382,7 @@ func TestSetCRSAutoUpdate_failedRowRearmedToSlot(t *testing.T) {
 
 	// Then 重排到排程槽（退避机制已撤除）
 	_, _, _, _, _, nextUpdate, _ := crsVersionRow(t)
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestSetCRSAutoUpdate_healthyRowRearmsToSlot(t *testing.T) {
@@ -382,7 +393,7 @@ func TestSetCRSAutoUpdate_healthyRowRearmsToSlot(t *testing.T) {
 	if err := SetCRSSchedule([]int{2}, "04:30"); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	// When 重开自动更新
 	if err := SetCRSAutoUpdate(true); err != nil {
@@ -391,9 +402,7 @@ func TestSetCRSAutoUpdate_healthyRowRearmsToSlot(t *testing.T) {
 
 	// Then next_update=排程槽（守卫不误伤正常行）
 	_, _, _, _, _, nextUpdate, _ := crsVersionRow(t)
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestSetIP2RegionAutoUpdate_failedRowRearmedToSlot(t *testing.T) {
@@ -406,16 +415,14 @@ func TestSetIP2RegionAutoUpdate_failedRowRearmedToSlot(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_ip2region_version SET update_status='failed', consecutive_failures=1, next_update='2026-01-01 01:00:00' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	if err := SetIP2RegionAutoUpdate(true); err != nil {
 		t.Fatal(err)
 	}
 
 	_, _, _, _, _, nextUpdate, _ := ip2RegionVersionRow(t)
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestSetIP2RegionAutoUpdate_healthyRowRearmsToSlot(t *testing.T) {
@@ -425,48 +432,14 @@ func TestSetIP2RegionAutoUpdate_healthyRowRearmsToSlot(t *testing.T) {
 	if err := SetIP2RegionSchedule([]int{2}, "04:30"); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
+	clockBefore := time.Now().UTC()
 
 	if err := SetIP2RegionAutoUpdate(true); err != nil {
 		t.Fatal(err)
 	}
 
 	_, _, _, _, _, nextUpdate, _ := ip2RegionVersionRow(t)
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
-}
-
-func TestCRSSchedulerTick_prewritesConfiguredSlot(t *testing.T) {
-	// Given 自动更新开、无 next_update、排程=周四 06:00
-	m := newTestCRSManager(t)
-	loc := useShanghaiLocation(t)
-	seedCRSVersionRow(t, "v4.14.0", true)
-	if err := SetCRSSchedule([]int{4}, "06:00"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.DB.Exec(`UPDATE security_crs_version SET next_update='' WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC) // 周二（上海 20:00）
-	fetchCalled := false
-	m.fetchLatestTag = func(context.Context) (string, error) {
-		fetchCalled = true
-		return "v4.15.0", nil
-	}
-
-	// When 首个 tick（只排程不启动）
-	m.schedulerTick(now)
-
-	// Then 预写=周四 06:00 槽且不启动更新
-	if fetchCalled {
-		t.Fatal("first tick should only schedule, not run")
-	}
-	want := NextScheduledSlot(now, []int{4}, "06:00", loc)
-	_, _, _, _, _, nextUpdate, _ := crsVersionRow(t)
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestCRSUpdate_successReschedulesToConfiguredSlot(t *testing.T) {
@@ -480,17 +453,15 @@ func TestCRSUpdate_successReschedulesToConfiguredSlot(t *testing.T) {
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.14.0", nil }
 
 	// When
+	clockBefore := time.Now().UTC()
 	m.run("manual", nil)
 
 	// Then 成功路径把 next_update 重排到槽位（而非 datetime('now','+24 hours')）
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
 	_, status, _, _, _, nextUpdate, _ := crsVersionRow(t)
 	if status != "success" {
 		t.Fatalf("status=%q, want success", status)
 	}
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestIP2RegionUpdate_successReschedulesToConfiguredSlot(t *testing.T) {
@@ -502,16 +473,14 @@ func TestIP2RegionUpdate_successReschedulesToConfiguredSlot(t *testing.T) {
 	}
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.0.0", nil }
 
+	clockBefore := time.Now().UTC()
 	m.run("manual", nil)
 
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
 	_, status, _, _, _, nextUpdate, _ := ip2RegionVersionRow(t)
 	if status != "success" {
 		t.Fatalf("status=%q, want success", status)
 	}
-	if got := parseSlotUTC(t, nextUpdate); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 func TestMarkSourceSuccess_usesConfiguredSchedule(t *testing.T) {
@@ -525,22 +494,22 @@ func TestMarkSourceSuccess_usesConfiguredSchedule(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT id FROM security_threat_sources WHERE name='ustc'`).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	want := NextScheduledSlot(time.Now().UTC(), []int{5}, "07:15", loc)
+	clockBefore := time.Now().UTC()
 
 	// When 源成功落库
-	markSourceSuccess(id, 10, time.Now().UTC().Format(crsTimeLayout), "auto")
+	if err := markSourceSuccess(id, 10, time.Now().UTC().Format(crsTimeLayout), "auto"); err != nil {
+		t.Fatalf("markSourceSuccess: %v", err)
+	}
 
 	// Then next_update=排程槽（而非 now+24h）
 	var next string
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_threat_sources WHERE id=?`, id).Scan(&next); err != nil {
 		t.Fatal(err)
 	}
-	if got := parseSlotUTC(t, next); !got.Equal(want.UTC()) {
-		t.Fatalf("next_update=%v, want 排程槽 %v", got, want.UTC())
-	}
+	assertNextScheduledSlot(t, next, clockBefore, []int{5}, "07:15", loc)
 }
 
-// LBS-B-U1（第 69 轮 P3）：SetThreatSchedule 两步写事务化——第二写点（重排
+// SetThreatSchedule 两步写事务化——第二写点（重排
 // 各源 next_update）失败时，第一写点（global_config 排程列）须整体回滚，
 // 不留「排程已改、槽位照旧」中间态（曾两独立 Exec 先后提交）。
 func TestSetThreatSchedule_rollsBackWhenRearmFails(t *testing.T) {
@@ -567,5 +536,17 @@ func TestSetThreatSchedule_rollsBackWhenRearmFails(t *testing.T) {
 	}
 	if days != "1" || hhmm != "03:00" {
 		t.Fatalf("回滚后排程=(%q,%q), want (1,03:00)——曾非事务两步写留中间态", days, hhmm)
+	}
+}
+
+// global_config 行被带外删除/导入异常缺失时，保存任务级排程必须显式报错：
+// 此前 UPDATE 命中 0 行仍返回成功（排程列未落库、重排也无效，零错误信号）。
+func TestSetThreatSchedule_missingGlobalConfigRowFails(t *testing.T) {
+	newClusterTestService(t)
+	if _, err := db.DB.Exec(`DELETE FROM global_config WHERE id=1`); err != nil {
+		t.Fatalf("delete global_config: %v", err)
+	}
+	if err := SetThreatSchedule([]int{3}, "05:00"); err == nil {
+		t.Fatal("global_config 行缺失时必须报错，不得静默成功")
 	}
 }

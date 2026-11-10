@@ -116,8 +116,8 @@ TCP规则A(port=8080) + TCP规则B(port=8080) → 冲突（TCP 端口独占；�
 
 3. 生成完整 Caddy 配置
    └── GenerateCaddyConfig() 从数据库读取所有启用规则
-   └── 内部对每个 HTTP 规则调用 generateHTTPRouteObjects()（经 SingleRuleConfig；
-      GenerateRouteObject 仅用于保存前校验的包装形态）
+   └── 内部对每个 HTTP 规则调用 generateHTTPRouteObjects()；配置生成与保存前
+      校验共用这一渲染源（经 SingleRuleConfig）
 
 4. 应用配置到 Caddy
    └── ApplyConfig() 将完整配置POST到 Caddy
@@ -139,7 +139,7 @@ TCP规则A(port=8080) + TCP规则B(port=8080) → 冲突（TCP 端口独占；�
 
 3. 为每个服务器生成路由
    └── HTTP 规则经 generateHTTPRouteObjects()（与保存前校验同源）；TCP 规则
-      经 buildTCPServer()/buildTCPProxyRoute()
+      经 buildTCPServer()/tcpSecurityRouteList()
    └── generateHTTPRouteObjects 处理域名分割、路径规则排序、健康检查、负载策略等
 
 4. 组装完整配置
@@ -179,12 +179,12 @@ GeoIP 打标不在主路由的 `handle` 链内。任一绑定策略启用地域�
 1. **headers**（X-LB-Rule-ID 注入）：HTTP 规则绑定安全策略时链首注入归因头（供预检与 coraza 事务消费，reverse_proxy 前无条件剥离，不直达上游）
 2. **lb_rule_metrics**：全 HTTP 规则的流量指标收点，位于安全处理器之前
 3. **lb_security_blocked_counter**：安全库可用且绑定策略时发射，包装后续安全段并统计拦截
-4. **安全段**：存在阶段 0 直通策略（`trust_detection=0`）时，整段包入 `not client_ip` 的 subroute；命中信任并集的请求跳过本段，不产生安全事件。保留检测（`trust_detection=1`）不包裹，信任 IP 走 DetectionOnly 全评估不拦但全记录。段内依次为：
+4. **安全段**：存在阶段 0 信任策略（直通 `trust_detection=0` 或保留检测 `trust_detection=1`）时，整段包入 `not client_ip` 的 subroute（跳过并集=直通∪保留检测信任并集）；命中任一并集的请求跳过本段，不进入任何 coraza 事务。保留检测（`trust_detection=1`）在本段之后另挂一条 `client_ip`（保留检测并集）subroute——仅含 id:12（`nolog,auditlog`）的独立最小检测事务：信任 IP 唯一安全事件（动作=检测，归因信任策略，与上游响应状态无关）产记录后直达上游。段内依次为：
    - **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器——信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13）→ 逐策略 GeoIP 链（800000+policyID）
    - **lb_security_timing_pre**：预检之后、请求体处理与策略评估之前的分段计时收点
    - **encode**（压缩）：启用压缩且包含 gzip/zstd 时发射，位于全部 waf 处理器外侧
    - **request_body**：先于全部 waf 处理器限制请求体
-   - **rate_limit / waf**：全部启用策略的限流先集中发射，再按 policy_id ASC 发射各策略 WAF
+   - **rate_limit / waf**：全部启用策略的限流先集中发射，再按绑定执行序（rank ASC=提交序/顺序编辑序，policy_id ASC 兜底遗留行）发射各策略 WAF
    - **lb_security_timing_end**：安全段末尾的计时收点
 5. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
 6. **map**（逐上游回源域名）：静态上游配置 origin_domain 时，在 reverse_proxy 前发射 dial→origin_domain 映射，晚绑定生成 Host/SNI 占位符

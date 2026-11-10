@@ -1,6 +1,6 @@
 package handlers
 
-// Round 62 第三批钉：更新日志同源——三端点读任务日志文件（单一数据源）。
+// 历史 第三批钉：更新日志同源——三端点读任务日志文件（单一数据源）。
 
 import (
 	"net/http"
@@ -18,8 +18,9 @@ import (
 // Then 返回任务日志文件内容（规则集页弹框与任务监控同文件同内容）。
 func TestGetCRSUpdateLogs_ReadsTaskLogFile(t *testing.T) {
 	dir := t.TempDir()
+	oldLogDir := taskengine.LogDir() // 保存旧值，cleanup 恢复（原置空——跨用例污染）
 	taskengine.SetLogDir(dir)
-	t.Cleanup(func() { taskengine.SetLogDir("") })
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 	taskengine.TeeTaskLog("crs", "2026/09/29 23:00:00", "INFO", "checking", "查询最新 CRS 版本")
 
 	h := newBackupTestHandlers(t)

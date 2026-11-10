@@ -22,22 +22,39 @@ func TestLoadSnapshotGlobalSettings_carriesTrustedProxySettings(t *testing.T) {
 		t.Fatalf("load snapshot settings: %v", err)
 	}
 	s := snapshot.BasicSettings
-	if !s.TrustedProxyEnabled || s.TrustedProxyRanges != `["203.0.113.0/24"]` ||
-		s.TrustedProxyHeaders != `["CF-Connecting-IP","X-Forwarded-For"]` || s.TrustedProxyStrict {
+	if s.TrustedProxyEnabled == nil || !*s.TrustedProxyEnabled ||
+		s.TrustedProxyRanges == nil || *s.TrustedProxyRanges != `["203.0.113.0/24"]` ||
+		s.TrustedProxyHeaders == nil || *s.TrustedProxyHeaders != `["CF-Connecting-IP","X-Forwarded-For"]` ||
+		s.TrustedProxyStrict == nil || *s.TrustedProxyStrict {
 		t.Fatalf("trusted proxy settings=%+v, want DB values", s)
 	}
 	wire, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"trusted_proxy_enabled":true`, `"trusted_proxy_ranges":"[\"203.0.113.0/24\"]"`, `"trusted_proxy_headers"`, `"trusted_proxy_strict"`} {
-		if want == `"trusted_proxy_strict"` {
-			// strict=false 时 omitempty 省略键——只验证 true 形态携带。
-			continue
-		}
+	// 键与值都要断言：只匹配裸键无法发现载荷值丢失/换源（从端 apply 会静默
+	// 回退本地值，CDN 真实 IP 解析随之分叉）。
+	for _, want := range []string{
+		`"trusted_proxy_enabled":true`,
+		`"trusted_proxy_ranges":"[\"203.0.113.0/24\"]"`,
+		`"trusted_proxy_headers":"[\"CF-Connecting-IP\",\"X-Forwarded-For\"]"`,
+	} {
 		if !strings.Contains(string(wire), want) {
 			t.Fatalf("wire basic_settings=%s, must contain %s", wire, want)
 		}
+	}
+	// strict 两态都必须显式上线（从端据此收敛；缺键会回退本地值）。
+	if !strings.Contains(string(wire), `"trusted_proxy_strict":false`) {
+		t.Fatalf("wire basic_settings=%s, must contain strict=false: %s", wire, wire)
+	}
+	strictOn := s
+	strictOn.TrustedProxyStrict = new(true)
+	wireOn, err := json.Marshal(strictOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wireOn), `"trusted_proxy_strict":true`) {
+		t.Fatalf("wire basic_settings=%s, must contain strict=true", wireOn)
 	}
 }
 
@@ -53,11 +70,11 @@ func TestUpdateSnapshotSettings_trustedProxySettingsApplied(t *testing.T) {
 	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{
 		CaddyConfig: &caddyConfig,
 		BasicSettings: models.ClusterBasicSettings{
-			JWTExpireMinutes:    20,
-			TrustedProxyEnabled: true,
-			TrustedProxyRanges:  `["198.51.100.0/24"]`,
-			TrustedProxyHeaders: `["X-Forwarded-For"]`,
-			TrustedProxyStrict:  true,
+			JWTExpireMinutes:    new(20),
+			TrustedProxyEnabled: new(true),
+			TrustedProxyRanges:  new(`["198.51.100.0/24"]`),
+			TrustedProxyHeaders: new(`["X-Forwarded-For"]`),
+			TrustedProxyStrict:  new(true),
 		},
 	}); err != nil {
 		t.Fatalf("apply settings: %v", err)

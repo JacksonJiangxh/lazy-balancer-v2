@@ -58,18 +58,18 @@ func TestUpdateConfig_skipsReloadAuditWhenRenderUnchanged(t *testing.T) {
 		return n
 	}
 
-	// When：改一个不进 Caddy JSON 的字段（日志大小 10→11）——DB 真变、渲染字节变
-	// （首存时运行配置为空，字节不等 → 真 /load → 重载审计一条）
-	if r := put(`{"source":"basic","task_log_size_mb":11}`); r.Code != http.StatusOK {
+	// When：改一个渲染消费但无规则时不影响字节的字段（全局代理连接超时 10→11）
+	// ——DB 真变、渲染字节变（首存时运行配置为空，字节不等 → 真 /load → 重载审计一条）
+	if r := put(`{"source":"basic","proxy_dial_timeout":10}`); r.Code != http.StatusOK {
 		t.Fatalf("首存 status=%d body=%s, want 200", r.Code, r.Body.String())
 	}
 	if n := reloadAuditCount(); n != 1 {
 		t.Fatalf("首存后重载审计=%d 条, want 1（真重载照记）", n)
 	}
 
-	// When：再改同字段（11→12）——DB 真变但 Caddy JSON 仍不含该字段 → 渲染字节
-	// 与运行配置相同 → 同字节短路 → 零真实重载
-	if r := put(`{"source":"basic","task_log_size_mb":12}`); r.Code != http.StatusOK {
+	// When：再改同字段（11→12）——DB 真变，但无规则时全局超时不进 Caddy JSON →
+	// 渲染字节与运行配置相同 → 同字节短路 → 零真实重载
+	if r := put(`{"source":"basic","proxy_dial_timeout":12}`); r.Code != http.StatusOK {
 		t.Fatalf("次存 status=%d body=%s, want 200", r.Code, r.Body.String())
 	}
 

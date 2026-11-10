@@ -10,7 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// S-8（2026-09-05 审计复核收窄）：恢复码重生成是纯会话门（2026-09 裁定）下
+// （2026-09-05 审计复核收窄）：恢复码重生成是纯会话门（2026-09 裁定）下
 // 「旧码全部作废 + 明文下发 10 个登录可用凭证」的高敏动作（恢复码可在登录
 // MFA 验证步消费），与同卡片禁用/重置 MFA 的留痕密度对齐——成功路径必须产生
 // 审计事件（此前 AuditPolicySkip + handler 零 recordAudit，事后零痕）。
@@ -39,5 +39,28 @@ func TestMFARecoveryCodes_regeneratesWithAuditTrail(t *testing.T) {
 	}
 	if events == 0 {
 		t.Fatal("recovery-codes regeneration produced no audit event（高敏动作须留痕）")
+	}
+}
+
+// MFA 启用态读取的 DB 错误此前被并入「MFA 未启用」
+// 400——DB 故障被误报为业务态。拆分：读失败 500，未启用保持 400。
+func TestMFARecoveryCodes_statusReadFailureReturns500(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'recycler','x','user',1)"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := db.DB.Exec("ALTER TABLE users RENAME COLUMN mfa_enabled TO mfa_enabled_unreadable"); err != nil {
+		t.Fatalf("break mfa_enabled column: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/auth/mfa/recovery-codes", nil)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("user_id", 1)
+	h.MFARecoveryCodes(ctx)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（DB 故障不得报 400 MFA 未启用）", recorder.Code, recorder.Body.String())
 	}
 }

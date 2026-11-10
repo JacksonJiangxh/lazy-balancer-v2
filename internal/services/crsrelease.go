@@ -14,7 +14,7 @@ import (
 )
 
 // validateCRSStaging ensures an extracted CRS release tree is complete enough
-// to swap into place: the setup template plus an intact rules tree. R51 F3：
+// to swap into place: the setup template plus an intact rules tree.
 // 探针文件（crsRulesProbeFile）是 backup restore / seed / snapshot 消费门共用
 // 的完整性契约，安装期必须同步把关——否则未来 CRS 重组 rules/ 的发布会装出
 // 退化树，之后每次启动都触发清空重播循环。
@@ -28,22 +28,23 @@ func validateCRSStaging(dir string) error {
 	return nil
 }
 
-// countSecRules counts SecRule directives across all *.conf files in dir.
+// countSecRules counts SecRule directives across all *.conf files in dir
+// (recursive, matching crsRulesTreeIntact's tree-wide .conf probe: a rule tree
+// with subdirectories must not report "library available, count 0").
 // Only lines whose first token is exactly "SecRule" count; comments and
 // lookalike directives (SecRuleUpdateTargetById, SecRuleRemoveById, ...) do not.
 func countSecRules(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, fmt.Errorf("读取规则目录: %w", err)
-	}
 	total := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return 0, fmt.Errorf("读取规则文件 %s: %w", entry.Name(), err)
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".conf") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("读取规则文件 %s: %w", d.Name(), err)
 		}
 		for _, line := range strings.Split(string(data), "\n") {
 			trimmed := strings.TrimLeft(line, " \t")
@@ -51,6 +52,13 @@ func countSecRules(dir string) (int, error) {
 				total++
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		if _, statErr := os.Stat(dir); statErr != nil {
+			return 0, fmt.Errorf("读取规则目录: %w", statErr)
+		}
+		return 0, err
 	}
 	return total, nil
 }
@@ -122,7 +130,7 @@ func parseGitHubLatestTag(body []byte) (string, error) {
 	if payload.TagName == "" {
 		return "", errors.New("GitHub 响应缺少 tag_name")
 	}
-	// F-47-4（第 47 轮）：与 HTML 回退路径同口径校验 tag 形状（控制字符/换行
+	// 与 HTML 回退路径同口径校验 tag 形状（控制字符/换行
 	// 会进入版本行、日志与审计，并参与 raw.githubusercontent URL 拼接）。
 	if err := validateReleaseTag(payload.TagName); err != nil {
 		return "", err
@@ -130,9 +138,18 @@ func parseGitHubLatestTag(body []byte) (string, error) {
 	return payload.TagName, nil
 }
 
-// crsExtractMaxBytes 是解压总字节上限（防 gzip 炸弹耗尽数据卷，R33 F8）：
+// crsExtractMaxBytes 是解压总字节上限（防 gzip 炸弹耗尽数据卷）
 // tar 头声明的 hdr.Size 即解压后写入的确切字节数，跨条目累计超限即中止。
 const crsExtractMaxBytes = 500 << 20
+
+// crsExtractMaxFiles / crsExtractMaxDirs 与 untarGzTo 三门同口径：字节门只
+// 累计 hdr.Size，0 字节条目与目录头不占额度——2GB 下载上限内的包可携带
+// 数百万个空条目/目录头，在 staging 建海量 inode 并让失败路径 RemoveAll
+// 逐条删除。正常 CRS 树 ~50 文件、数个目录，上限留两个数量级余量。
+const (
+	crsExtractMaxFiles = 2000
+	crsExtractMaxDirs  = 2 * crsExtractMaxFiles
+)
 
 // extractCRSTarball extracts a GitHub release tar.gz into destDir, stripping
 // the single top-level root directory GitHub adds to every entry.
@@ -150,6 +167,7 @@ func extractCRSTarball(tarballPath, destDir string) error {
 
 	tr := tar.NewReader(gz)
 	var totalBytes int64
+	files, dirs := 0, 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -160,11 +178,23 @@ func extractCRSTarball(tarballPath, destDir string) error {
 		}
 		// 先减后比：totalBytes 恒 ≤ crsExtractMaxBytes（每个被接受条目维持该
 		// 不变量），减法不下溢；加法在 hdr.Size 接近 2^63-1（GNU base-256）时
-		// int64 溢出为负，会绕过上限（R56 发现1，镜像 waffiles_sync.go 口径）。
+		// int64 溢出为负，会绕过上限（发现1，镜像 waffiles_sync.go 口径）。
 		if hdr.Size < 0 || hdr.Size > crsExtractMaxBytes-totalBytes {
 			return fmt.Errorf("tarball 解压超过大小上限（%d MB）", crsExtractMaxBytes>>20)
 		}
 		totalBytes += hdr.Size
+		// 条目数门（与字节门并行执法）：空条目/目录头不占字节额度。
+		if hdr.Typeflag == tar.TypeDir {
+			dirs++
+			if dirs > crsExtractMaxDirs {
+				return fmt.Errorf("tarball 目录条目数超过上限（%d）", crsExtractMaxDirs)
+			}
+		} else {
+			files++
+			if files > crsExtractMaxFiles {
+				return fmt.Errorf("tarball 文件条目数超过上限（%d）", crsExtractMaxFiles)
+			}
+		}
 		rel, err := stripTarRoot(hdr.Name)
 		if err != nil {
 			return err
@@ -190,9 +220,20 @@ func extractCRSTarball(tarballPath, destDir string) error {
 				return fmt.Errorf("写入 %s: %w", rel, err)
 			}
 			_, copyErr := io.Copy(out, tr)
+			// 落盘耐久性与 writeFileAtomicSynced 同口径：解压树随后被
+			// moveTree 换入 live，掉电/容器强杀窗口内未 fsync 的页可能留下
+			// 0 字节或截断规则文件——crsRulesTreeIntact 只查探针文件存在，
+			// 残缺树会被装载并静默削弱 WAF。
+			syncErr := error(nil)
+			if copyErr == nil {
+				syncErr = out.Sync()
+			}
 			closeErr := out.Close()
 			if copyErr != nil {
 				return fmt.Errorf("写入 %s: %w", rel, copyErr)
+			}
+			if syncErr != nil {
+				return fmt.Errorf("同步 %s: %w", rel, syncErr)
 			}
 			if closeErr != nil {
 				return fmt.Errorf("写入 %s: %w", rel, closeErr)

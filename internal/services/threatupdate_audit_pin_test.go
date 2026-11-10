@@ -1,9 +1,9 @@
 package services
 
-// Round 62 修复钉：更新族审计单记+操作者归人（U1-P3-1/U1-P3-2）。
+// 历史 修复钉：更新族审计单记+操作者归人。
 // threat 族零源路径（成功早退）为可测最小形：一次 run 恰一条审计、
 // operator 经 RunContext 流入审计 username。
-// 隔离（F-68-U2-01）：三源种子默认 update_enabled=1 且 URL 为外网——必须
+// 隔离：三源种子默认 update_enabled=1 且 URL 为外网——必须
 // 显式禁用（零源早退语义）+ URL 指回环桩（双保险零外网）+ waf/日志目录
 // 注入临时目录 + 重试等待桩化，否则真网络下载+真 /app 写+30s/60s 真睡。
 
@@ -25,19 +25,12 @@ func countThreatAudits(t *testing.T) int {
 
 // Given 零启用源的威胁库（run 走成功早退）。
 // When 经 RunContext 带 operator 执行一次 RunUpdate("manual")。
-// Then 恰落 1 条审计（U1-P3-2：曾 defer+端点补记 2-3 条），且
-// username=operator（U1-P3-1：曾恒 system，手动操作无法追责）。
+// Then 恰落 1 条审计（曾 defer+端点补记 2-3 条），且
+// username=operator（曾恒 system，手动操作无法追责）。
 func TestThreatRunUpdate_SingleAuditWithOperator(t *testing.T) {
 	overrideWafDirForTest(t)
 	stubUpdateRetrySleep(t)
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize test database: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+	setupIsolatedDB(t)
 	// 三源 URL 指回环桩（双保险：即使误启用也不触外网），随后禁用全部源
 	// ——「零启用源」非默认形态（种子默认 update_enabled=1），须显式落实。
 	setupThreatTest(t, nil, nil, nil)

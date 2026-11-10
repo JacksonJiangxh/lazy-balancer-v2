@@ -110,7 +110,7 @@ func TestCrawlerEngines_registryInvariants(t *testing.T) {
 			t.Errorf("fixture %q 无对应引擎（注册表删引擎须同步删 fixture）", id)
 		}
 	}
-	for _, id := range DefaultCrawlerEngines {
+	for _, id := range DefaultCrawlerEngines() {
 		if !ValidCrawlerEngineID(id) {
 			t.Errorf("DefaultCrawlerEngines 含非法 ID %q", id)
 		}
@@ -148,6 +148,16 @@ func TestCrawlerEnginePTRMatch_anchoringAndTrailingDot(t *testing.T) {
 func TestCrawlerEngines_returnsDeepCopy(t *testing.T) {
 	first := CrawlerEngines()
 	for i := range first {
+		if first[i].UARegex == crawlerEngines[i].UARegex {
+			t.Fatalf("engine %q UARegex 仍与全局注册表共享指针", first[i].ID)
+		}
+		if first[i].SpoofUARegex != nil && first[i].SpoofUARegex == crawlerEngines[i].SpoofUARegex {
+			t.Fatalf("engine %q SpoofUARegex 仍与全局注册表共享指针", first[i].ID)
+		}
+		first[i].UARegex.Longest()
+		if first[i].SpoofUARegex != nil {
+			first[i].SpoofUARegex.Longest()
+		}
 		if len(first[i].PTRSuffixes) > 0 {
 			first[i].PTRSuffixes[0] = ".evil.example"
 		}

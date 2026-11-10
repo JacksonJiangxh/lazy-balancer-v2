@@ -17,12 +17,25 @@
           <el-icon><Connection /></el-icon>
           MCP 文档
         </el-button>
-        <el-button type="primary" :disabled="nodeModeSlave || creating" @click="openCreateDialog">
-          <el-icon><Plus /></el-icon>
-          创建密钥
-        </el-button>
+        <el-tooltip :disabled="!nodeWriteBlocked" :content="nodeWriteBlockedReason">
+          <div>
+            <el-button type="primary" :disabled="nodeWriteBlocked || creating" @click="openCreateDialog">
+              <el-icon><Plus /></el-icon>
+              创建密钥
+            </el-button>
+          </div>
+        </el-tooltip>
       </div>
     </div>
+
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>API 密钥加载失败：密钥列表为空不代表没有密钥</span>
+          <el-button link type="danger" @click="fetchKeys">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
 
     <el-row v-loading="loading" :gutter="20">
       <el-col v-for="key in keys" :key="key.id" :span="8" class="key-col">
@@ -64,36 +77,48 @@
             </el-descriptions-item>
           </el-descriptions>
           <div class="key-actions">
-            <el-button
-              size="small"
-              type="primary"
-              plain
-              :disabled="nodeModeSlave || togglePendingId === key.id || deletingIds.has(key.id)"
-              @click="openFeatureDialog(key)"
-            >
-              <el-icon><Setting /></el-icon>
-              功能配置
-            </el-button>
-            <el-button
-              size="small"
-              :type="key.is_enabled ? 'warning' : 'success'"
-              :loading="togglePendingId === key.id"
-              :disabled="nodeModeSlave || deletingIds.has(key.id)"
-              @click="toggleKey(key)"
-            >
-              <el-icon><SwitchButton v-if="key.is_enabled" /><VideoPlay v-else /></el-icon>
-              {{ key.is_enabled ? '禁用' : '启用' }}
-            </el-button>
-            <el-button size="small" type="danger" :loading="deletingIds.has(key.id)" :disabled="nodeModeSlave || togglePendingId === key.id || deletingIds.has(key.id)" @click="deleteKey(key.id)">
-              <el-icon><Delete /></el-icon>
-              删除
-            </el-button>
+            <el-tooltip :disabled="!nodeWriteBlocked" :content="nodeWriteBlockedReason">
+              <div>
+                <el-button
+                  size="small"
+                  type="primary"
+                  plain
+                  :disabled="nodeWriteBlocked || togglePendingId === key.id || deletingIds.has(key.id)"
+                  @click="openFeatureDialog(key)"
+                >
+                  <el-icon><Setting /></el-icon>
+                  功能配置
+                </el-button>
+              </div>
+            </el-tooltip>
+            <el-tooltip :disabled="!nodeWriteBlocked" :content="nodeWriteBlockedReason">
+              <div>
+                <el-button
+                  size="small"
+                  :type="key.is_enabled ? 'warning' : 'success'"
+                  :loading="togglePendingId === key.id"
+                  :disabled="nodeWriteBlocked || (togglePendingId !== null && togglePendingId !== key.id) || deletingIds.has(key.id)"
+                  @click="toggleKey(key)"
+                >
+                  <el-icon><SwitchButton v-if="key.is_enabled" /><VideoPlay v-else /></el-icon>
+                  {{ key.is_enabled ? '禁用' : '启用' }}
+                </el-button>
+              </div>
+            </el-tooltip>
+            <el-tooltip :disabled="!nodeWriteBlocked" :content="nodeWriteBlockedReason">
+              <div>
+                <el-button size="small" type="danger" :loading="deletingIds.has(key.id)" :disabled="nodeWriteBlocked || togglePendingId === key.id || deletingIds.has(key.id)" @click="deleteKey(key.id)">
+                  <el-icon><Delete /></el-icon>
+                  删除
+                </el-button>
+              </div>
+            </el-tooltip>
           </div>
         </el-card>
       </el-col>
     </el-row>
 
-    <el-card v-if="!loading && keys.length === 0" class="empty-card">
+    <el-card v-if="!loading && keys.length === 0 && !loadError" class="empty-card">
       <el-empty description="暂无 API 密钥" :image-size="80" />
     </el-card>
 
@@ -107,6 +132,8 @@
       <template #header>
         <DialogHeader :icon="SetUp" title="MCP 接入文档" subtitle="服务地址与接入配置，供 AI 客户端（Claude / Cursor 等）连接" />
       </template>
+      <section class="dialog-panel mcp-connection-panel">
+        <DialogSectionHeader title="接入配置" description="Streamable HTTP 服务地址与客户端 JSON" />
       <el-form label-position="top">
         <el-form-item label="MCP 服务地址（Streamable HTTP）">
           <el-input :model-value="mcpServiceURL" readonly>
@@ -120,32 +147,34 @@
         </el-form-item>
         <el-form-item label="MCP 客户端配置 JSON（粘贴到客户端，替换 <YOUR_API_KEY> 为密钥全文）">
           <div style="width: 100%">
-            <div style="position: relative">
-              <el-input
-                class="mcp-config-json"
-                type="textarea"
-                :model-value="mcpConfigJSON"
-                readonly
-                :rows="13"
-              />
-              <el-button aria-label="复制 MCP 配置" size="small" style="position: absolute; top: 8px; right: 8px; z-index: 1" @click="copyMCPConfig">
+            <el-input
+              class="mcp-config-json"
+              type="textarea"
+              :model-value="mcpConfigJSON"
+              readonly
+              :rows="13"
+            />
+            <div class="mcp-config-toolbar">
+              <el-button size="small" @click="copyMCPConfig">
                 <el-icon><CopyDocument /></el-icon>
-                复制
+                复制配置
               </el-button>
             </div>
-            <div class="mcp-config-hints" style="margin-top: 6px">
-              如客户端报证书错误，处置方式见下方「AI Agent 接入指南」自签证书段。密钥需保持 MCP 开启，只读 Key 仅暴露只读工具。
+            <div class="info-note-bar">
+              <span class="info-note-desc">如客户端报证书错误，处置方式见下方「AI Agent 接入指南」自签证书段。密钥需保持 MCP 开启，只读 Key 仅暴露只读工具。</span>
             </div>
           </div>
         </el-form-item>
       </el-form>
+      </section>
 
       <div class="info-note-bar"><span class="info-note-desc">请求需通过 X-API-Key 头携带 API Key（兼容 Authorization: Bearer lb_sk_... 形式），且该 Key 必须开启 MCP 功能。read_only Key 仅能看到只读工具；配置 IP 白名单后，请求来源还必须命中白名单。</span></div>
 
       <el-collapse class="mcp-agent-guide">
         <el-collapse-item title="AI Agent 接入指南（协议流程 / 自签证书 / 错误码）" name="agent-guide">
           <div class="mcp-guide-block">
-            <div class="mcp-guide-subtitle">协议：Streamable HTTP（JSON-RPC 2.0，POST {{ mcpServiceURL }}）</div>
+            <section class="dialog-panel">
+              <DialogSectionHeader title="协议流程" :description="`Streamable HTTP · JSON-RPC 2.0 · POST ${mcpServiceURL}`" />
             <pre class="mcp-guide-pre">1) 初始化
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"your-agent","version":"1.0"}}}
 
@@ -154,13 +183,21 @@
 
 3) 调用工具（示例：获取指标总览）
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_metrics_overview","arguments":{}}}</pre>
-            <div class="mcp-guide-subtitle">自签证书（可选配置）</div>
+            </section>
+            <section class="dialog-panel">
+              <DialogSectionHeader title="自签证书" description="可选配置" />
             <div class="mcp-guide-text">如客户端报证书错误，在启动环境加 <code>NODE_TLS_REJECT_UNAUTHORIZED=0</code>，或将面板证书加入系统信任。</div>
-            <div class="mcp-guide-subtitle">常见错误</div>
-            <div class="mcp-guide-text">401：密钥无效或缺失 / JWT 无效；403：MCP 未开启 / 只读 Key 调用写工具 / 来源 IP 不在白名单；参数错误：校验在 REST 侧执行，以 IsError + 具体 message 文本返回（协议层不做 input_schema 校验，无 -32602）——读 message 修正后重试。</div>
-            <div class="mcp-guide-subtitle">权限范围（scope）</div>
-            <div class="mcp-guide-text">只读 Key 可调用 GET 查询类工具及 5 个读探测 POST 工具（test_ca_provider / test_certificate_config / parse_certificate / validate_import / preview_config）；其余写工具（POST/PUT/DELETE）需非只读 Key 且仅在主节点可用（从节点一律 403——集群端点 promote_cluster / pull_sync / set_cluster_mode / forget_cluster_pins 除外，在从节点本身可用）。写操作校验后即时生效，失败自动回滚，无需手动 reload。</div>
-            <div class="mcp-guide-subtitle">常用流程</div>
+            </section>
+            <section class="dialog-panel">
+              <DialogSectionHeader title="常见错误" />
+            <div class="mcp-guide-text">401：密钥无效或缺失 / JWT 无效；403：MCP 未开启 / 只读 Key 调用写工具或 export_config、get_caddy_config / 非管理员属主调用 validate_import、preview_config / 来源 IP 不在白名单；参数错误：校验在 REST 侧执行，以 IsError + 具体 message 文本返回（协议层不做 input_schema 校验，无 -32602）——读 message 修正后重试。</div>
+            </section>
+            <section class="dialog-panel">
+              <DialogSectionHeader title="权限范围（scope）" />
+            <div class="mcp-guide-text">只读 Key 可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希，后者原始 Caddy 配置可能含内联私钥，对只读 Key 恒 403 且 tools/list 不展示）及 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config）；其中 parse_certificate 对非管理员开放，validate_import 与 preview_config 要求 Key 属主为管理员（非管理员调用恒 403 且 tools/list 不展示）。证书配置测试与 CA 提供商测试会写入真实 DNS 记录/凭据，属写语义，只读 Key 不可用。其余写工具（POST/PUT/DELETE）需非只读 Key 且 Key 属主为管理员，仅在主节点可用（从节点一律 403——集群端点 promote_cluster / pull_sync / set_cluster_mode / forget_cluster_pins 除外，在从节点本身可用）。写操作校验后即时生效，失败自动回滚，无需手动 reload。完整口径以 <code>lazy-balancer://docs/ops-playbook</code> 资源为准。</div>
+            </section>
+            <section class="dialog-panel">
+              <DialogSectionHeader title="常用流程" />
             <pre class="mcp-guide-pre">新建 HTTP 代理：create_rule（protocol=http + domain + listen_port + upstreams）
   → 需要免费证书再 issue_certificate 传 caddy_id
 新建 TCP 代理：create_rule（protocol=tcp + listen_port + upstreams，不填 domain）
@@ -168,19 +205,23 @@
 排查流量异常：get_upstream_health → get_metrics_dashboard → list_audit_logs
 快速看全局指标：get_metrics_overview（轻量）
   dashboard 为全量聚合、数据量大，非必要不用</pre>
-            <div class="mcp-guide-subtitle">完整操作手册（MCP 资源）</div>
+            </section>
+            <section class="dialog-panel">
+              <DialogSectionHeader title="完整操作手册（MCP 资源）" />
             <div class="mcp-guide-text">Agent 连上后可通过 <code>resources/read</code> 读取 <code>lazy-balancer://docs/ops-playbook</code> 获取完整操作手册（接入/scope/工作流/排障/纪律/性能建议），无需访问代码仓库。</div>
             <el-button size="small" :loading="mcpPlaybookDownloading" @click="downloadMCPPlaybook">下载手册正文（markdown）</el-button>
+            </section>
           </div>
         </el-collapse-item>
         <el-collapse-item title="工具清单" name="tools-list">
-          <div class="mcp-table-scroll-hint">左右滑动表格可查看方法、REST 路径和类型</div>
+          <div class="info-note-bar mcp-table-scroll-hint"><span class="info-note-desc">左右滑动表格可查看方法、REST 路径和类型</span></div>
           <div v-loading="mcpToolsLoading" class="mcp-tools-table">
             <div v-if="mcpToolsError" class="info-note-bar">
               <span class="info-note-desc">{{ mcpToolsError }}</span>
               <span class="info-note-sub"><el-button size="small" @click="fetchMCPTools">重新加载</el-button></span>
             </div>
-            <el-table v-else :data="mcpTools" stripe max-height="38vh" empty-text="暂无工具">
+            <div v-else class="dialog-panel dialog-panel--flush">
+            <el-table :data="mcpTools" stripe max-height="38vh" empty-text="暂无工具">
               <el-table-column type="expand">
                 <template #default="scope">
                   <div class="mcp-tool-expand">
@@ -212,6 +253,7 @@
                 </template>
               </el-table-column>
             </el-table>
+            </div>
           </div>
         </el-collapse-item>
       </el-collapse>
@@ -269,7 +311,7 @@
             @input="createWhitelistError = ''"
           />
         </el-form-item>
-        <div class="info-note-bar"><span class="info-note-desc">IP 白名单对该密钥的所有请求生效（含 MCP 与 REST API）。</span></div>
+        <div class="info-note-bar"><span class="info-note-desc">IP 白名单约束该密钥的全部 REST 与 MCP 调用。</span></div>
       </el-form>
       <template #footer>
         <el-button :disabled="creating" @click="createDialogVisible = false">取消</el-button>
@@ -314,7 +356,7 @@
             @input="featureWhitelistError = ''"
           />
         </el-form-item>
-        <div class="info-note-bar"><span class="info-note-desc">IP 白名单对该密钥的所有请求生效（含 MCP 与 REST API）。</span></div>
+        <div class="info-note-bar"><span class="info-note-desc">IP 白名单约束该密钥的全部 REST 与 MCP 调用。</span></div>
       </el-form>
       <template #footer>
         <el-button :disabled="featureSaving" @click="featureDialogVisible = false">取消</el-button>
@@ -327,13 +369,14 @@
       class="dialog-body-inset"
       width="min(560px, 92vw)"
       :close-on-click-modal="false"
+      :before-close="closeCreatedKey"
       @closed="createdKey = ''"
     >
       <template #header>
         <DialogHeader :icon="CircleCheckFilled" title="API 密钥已创建" subtitle="仅显示一次，请立即复制并妥善保存" tone="success" />
       </template>
       <div class="info-note-bar"><span class="info-note-desc">此密钥仅显示一次，请立即复制并妥善保存。</span></div>
-      <div class="created-key-box">
+      <div class="dialog-panel created-key-box">
         <code class="created-key-text">{{ createdKey }}</code>
         <el-button type="primary" @click="copyCreatedKey">
           <el-icon><CopyDocument /></el-icon>
@@ -352,12 +395,15 @@ import { computed, ref, onMounted } from 'vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate, formatDateShort } from '@/utils/date'
-import { isValidCidr } from '@/utils/ruleValidation'
+import { parseWhitelist, serializeWhitelist } from '@/utils/apiKeyWhitelist'
 import { copyText } from '@/utils/copy'
+import { createOneTimeSecretCloseGuard } from '@/utils/oneTimeSecretGuard'
+import { saveBlob } from '@/utils/download'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { CircleCheckFilled, Connection, CopyDocument, Delete, Document, Key, Plus, Setting, SetUp, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
 import type { APIKey, APIResponse, CreateAPIKeyInput, MCPToolSpec, UpdateAPIKeyInput } from '@/types'
 import DialogHeader from '@/components/DialogHeader.vue'
+import DialogSectionHeader from '@/components/DialogSectionHeader.vue'
 
 interface CreateAPIKeyResponse {
   readonly data?: {
@@ -368,13 +414,16 @@ interface CreateAPIKeyResponse {
 }
 
 const authStore = useAuthStore()
-// M30：slave 节点只读；主节点非 admin 可管理本人密钥（后端强制只读 Key，
-// 白名单 60b43841 放行非 admin 自助密钥端点），故写入口仅按从节点收紧。
-const nodeModeSlave = computed(() => authStore.isSlaveNode)
+// 从节点判定走 store 单源；节点模式未知仍按既有契约 fail-closed。
+// 主节点非 admin 可管理本人密钥，因此不能复用全站 non-admin 只读门。
+const nodeWriteBlocked = computed(() => authStore.isSlaveNode || authStore.readOnlyReason === 'unknown')
+const nodeWriteBlockedReason = computed(() => authStore.isSlaveNode ? '从节点只读，请在主节点操作' : '节点信息加载中，暂以只读模式呈现')
 const isAdmin = computed(() => authStore.user?.role === 'admin')
 
 const keys = ref<readonly APIKey[]>([])
 const loading = ref(false)
+// 加载失败不得呈现为「暂无 API 密钥」——显性错误态 + 重试
+const loadError = ref(false)
 const creating = ref(false)
 const createDialogVisible = ref(false)
 const createNameError = ref('')
@@ -390,8 +439,15 @@ const togglePendingId = ref<number | null>(null)
 const deletingIds = ref(new Set<number>())
 const createdKey = ref('')
 const createdKeyVisible = ref(false)
+/** 明文密钥仅此一次下发（库内只存哈希）：ESC / 右上角 X 关闭前必须确认已保存，
+ *  否则误触即永久丢失、只能删除重建（一次性凭据守卫单源——与集群注册令牌、
+ *  MFA 恢复码同实现）。 */
+const closeCreatedKey = createOneTimeSecretCloseGuard({
+  message: '密钥仅此一次显示，关闭后将无法再次查看。确认已保存？',
+  title: '保存密钥',
+})
 const mcpDocsVisible = ref(false)
-const mcpTools = ref<readonly MCPToolSpec[]>([])
+const mcpTools = ref<MCPToolSpec[]>([])
 const mcpToolsLoading = ref(false)
 const mcpToolsLoaded = ref(false)
 const mcpToolsError = ref('')
@@ -419,13 +475,7 @@ const downloadMCPPlaybook = async (): Promise<void> => {
   mcpPlaybookDownloading.value = true
   try {
     const blob = await request.get<Blob>('/mcp/ops-playbook', { responseType: 'blob' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'lazy-balancer-mcp-ops-playbook.md'
-    link.click()
-    // Safari 下立即回收 objectURL 会截断下载文件，延迟 1s 再释放（与 BasicSettings 导出一致）
-    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    saveBlob(blob, 'lazy-balancer-mcp-ops-playbook.md')
   } catch (error: unknown) {
     // 全局拦截器已弹 toast（blob 错误体会被解析出后端 message），这里仅记录
     console.error('Failed to download MCP playbook:', error)
@@ -440,26 +490,23 @@ const fetchKeys = async () => {
   loading.value = true
   try {
     const res = await request.get<APIResponse<readonly APIKey[]>>('/users/me/api-keys')
-    if (requestSeq === keysRequestSeq) keys.value = res.data || []
+    if (requestSeq === keysRequestSeq) {
+      keys.value = res.data || []
+      loadError.value = false
+    }
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor; swallow here
     // so fire-and-forget refresh calls don't surface as unhandled rejections.
     console.error('Failed to fetch keys:', error)
+    if (requestSeq === keysRequestSeq) loadError.value = true
   } finally {
     if (requestSeq === keysRequestSeq) loading.value = false
   }
 }
 
-const normalizeCidr = (rawValue: string): string => {
-  const value = rawValue.trim()
-  if (!value || value.includes('/')) return value
-  return value.includes(':') ? `${value}/128` : `${value}/32`
-}
+// 白名单解析/归一/序列化/逐行 CIDR 校验收敛到 utils/apiKeyWhitelist 单源（可 node 行为测试）。
 
-// 后端契约恒为 string[]（internal/models/models.go APIKey/APIKeyResponse），无需 string 兼容分支
-const parseWhitelist = (value: readonly string[]): string => value.join('\n')
-
-const whitelistEntries = (value: readonly string[]): string[] => parseWhitelist(value).split('\n').filter(Boolean)
+const whitelistEntries = (value: readonly string[]): string[] => value.filter(Boolean)
 
 const whitelistSummary = (value: readonly string[]): string => {
   const entries = whitelistEntries(value)
@@ -467,17 +514,8 @@ const whitelistSummary = (value: readonly string[]): string => {
   return `${entries.length} 条：${preview}${entries.length > 3 ? ' 等' : ''}`
 }
 
-const serializeWhitelist = (value: string): { readonly value: string[]; readonly error: string } => {
-  const rows = value.split(/\r?\n/)
-    .map((cidr, originalIndex) => ({ cidr: normalizeCidr(cidr), originalIndex }))
-    .filter((row) => row.cidr !== '')
-  const invalidRow = rows.find((row) => !isValidCidr(row.cidr))
-  if (invalidRow) return { value: [], error: `第 ${invalidRow.originalIndex + 1} 行 IP 或 CIDR 格式不正确` }
-  return { value: rows.map((row) => row.cidr), error: '' }
-}
-
 const openCreateDialog = (): void => {
-  if (nodeModeSlave.value || creating.value) return
+  if (nodeWriteBlocked.value || creating.value) return
   resetCreateForm()
   createDialogVisible.value = true
 }
@@ -502,7 +540,7 @@ const disablePastDate = (date: Date): boolean => {
 }
 
 async function createKey() {
-  if (nodeModeSlave.value || creating.value) return
+  if (nodeWriteBlocked.value || creating.value) return
   const name = createForm.value.name.trim()
   if (!name) {
     createNameError.value = '请输入密钥名称'
@@ -522,6 +560,11 @@ async function createKey() {
 
   creating.value = true
   try {
+    try {
+      await ElMessageBox.confirm(`将创建 API 密钥「${name}」，密钥明文仅展示一次，请确认权限范围并妥善保存。是否继续？`, '创建 API 密钥', {
+        type: 'warning', confirmButtonText: '确认创建', cancelButtonText: '取消',
+      })
+    } catch { return }
     const payload: CreateAPIKeyInput = {
       name,
       mcp_enabled: createForm.value.mcp_enabled,
@@ -530,12 +573,18 @@ async function createKey() {
       expires_at: createForm.value.expiresAt ? createForm.value.expiresAt.toISOString() : undefined,
     }
     const res = await request.post<CreateAPIKeyResponse>('/users/me/api-keys', payload)
-    mfaAwareSuccess('密钥创建成功')
-    createDialogVisible.value = false
-    if (res.data?.key) {
-      createdKey.value = res.data.key
-      createdKeyVisible.value = true
+    // 一次性明文是本次创建的唯一产出：响应缺 key（契约漂移/网关改写）时不得
+    // 先报成功再关框——密钥已入库（列表会多一条），明文却永久不可得，用户只能
+    // 删除重建。缺 key 即显性报错、保持创建框并刷新列表，把违约形态摆到眼前。
+    if (!res.data?.key) {
+      ElMessage.error('响应异常：密钥未返回，请在列表中删除该条目后重建')
+      await fetchKeys()
+      return
     }
+    mfaAwareSuccess('密钥创建成功')
+    createdKey.value = res.data.key
+    createdKeyVisible.value = true
+    createDialogVisible.value = false
     await fetchKeys()
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor.
@@ -546,7 +595,7 @@ async function createKey() {
 }
 
 const openFeatureDialog = (key: APIKey): void => {
-  if (nodeModeSlave.value || featureSaving.value) return
+  if (nodeWriteBlocked.value || featureSaving.value) return
   featureTarget.value = key
   featureForm.value = {
     mcp_enabled: key.mcp_enabled,
@@ -564,7 +613,7 @@ const resetFeatureForm = (): void => {
 }
 
 const saveFeatures = async (): Promise<void> => {
-  if (nodeModeSlave.value || featureSaving.value || !featureTarget.value) return
+  if (nodeWriteBlocked.value || featureSaving.value || !featureTarget.value) return
   const whitelist = serializeWhitelist(featureForm.value.whitelistText)
   if (whitelist.error) {
     featureWhitelistError.value = whitelist.error
@@ -572,6 +621,11 @@ const saveFeatures = async (): Promise<void> => {
   }
   featureSaving.value = true
   try {
+    try {
+      await ElMessageBox.confirm(`将更新 API 密钥「${featureTarget.value.name}」的 MCP 开关、只读权限和 IP 白名单，新的访问范围立即生效。确认保存？`, '保存功能配置', {
+        type: 'warning', confirmButtonText: '确认保存', cancelButtonText: '取消',
+      })
+    } catch { return }
     const payload: UpdateAPIKeyInput = {
       mcp_enabled: featureForm.value.mcp_enabled,
       read_only: isAdmin.value ? featureForm.value.read_only : true,
@@ -590,10 +644,10 @@ const saveFeatures = async (): Promise<void> => {
 }
 
 const deleteKey = async (id: number) => {
-  if (nodeModeSlave.value || togglePendingId.value === id || deletingIds.value.has(id)) return
+  if (nodeWriteBlocked.value || togglePendingId.value === id || deletingIds.value.has(id)) return
   deletingIds.value.add(id)
   try {
-    await ElMessageBox.confirm('确定要删除这个 API 密钥吗？删除后无法恢复。', '警告', { type: 'warning' })
+    await ElMessageBox.confirm('将删除这个 API 密钥。删除后无法恢复，使用该密钥的调用会立即失效。', '删除 API 密钥', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' })
     await request.delete(`/users/me/api-keys/${id}`)
     mfaAwareSuccess('删除成功')
     await fetchKeys()
@@ -606,23 +660,24 @@ const deleteKey = async (id: number) => {
 }
 
 const toggleKey = async (key: APIKey) => {
-  if (nodeModeSlave.value || togglePendingId.value !== null || deletingIds.value.has(key.id)) return
+  if (nodeWriteBlocked.value || togglePendingId.value !== null || deletingIds.value.has(key.id)) return
   const isEnabled = !key.is_enabled
 
-  if (!isEnabled) {
-    try {
-      await ElMessageBox.confirm(`确定要禁用 API 密钥“${key.name}”吗？禁用后该密钥将无法访问接口。`, '禁用确认', {
-        type: 'warning',
-        confirmButtonText: '确认禁用',
-        cancelButtonText: '取消',
-      })
-    } catch {
-      return
-    }
-  }
-
+  // 占位先于确认（同 TaskMonitor/ClusterSettings 范式）：确认框悬挂期也是「操作在途」，
+  // 此时没有门，连点会叠出第二个确认框并重复写。
   togglePendingId.value = key.id
   try {
+    if (!isEnabled) {
+      try {
+        await ElMessageBox.confirm(`确定要禁用 API 密钥“${key.name}”吗？禁用后该密钥将无法访问接口。`, '禁用确认', {
+          type: 'warning',
+          confirmButtonText: '确认禁用',
+          cancelButtonText: '取消',
+        })
+      } catch {
+        return
+      }
+    }
     const payload: UpdateAPIKeyInput = { is_enabled: isEnabled }
     await request.patch(`/users/me/api-keys/${key.id}`, payload)
     mfaAwareSuccess(isEnabled ? '密钥已启用' : '密钥已禁用')
@@ -659,7 +714,7 @@ const fetchMCPTools = async (): Promise<void> => {
       mcpToolsError.value = `工具清单加载失败：${error.message}`
       return
     }
-    // FE43-6(第 43 轮):非 Error 异常同样置错误态——否则落入「暂无工具」误态。
+    // 非 Error 异常同样置错误态——否则落入「暂无工具」误态。
     mcpToolsError.value = `工具清单加载失败：${String(error) || '未知错误'}`
     console.error('Failed to fetch MCP tools:', error)
   } finally {
@@ -703,13 +758,12 @@ onMounted(() => {
 .readonly-alert { margin: -2px 0 18px; }
 
 .mcp-agent-guide { margin-bottom: 20px; }
-.mcp-guide-subtitle { font-weight: 600; margin: 10px 0 6px; }
 .mcp-guide-text { color: var(--el-text-color-regular); font-size: 13px; line-height: 1.6; }
-.mcp-guide-pre, .mcp-schema-pre { background: #f6f8fa; border-radius: 6px; padding: 10px 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 12px; line-height: 1.55; overflow-x: auto; white-space: pre; }
+.mcp-guide-pre, .mcp-schema-pre { background: #f6f8fa; border-radius: 0; padding: 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 12px; line-height: 1.55; overflow-x: auto; white-space: pre; }
 .mcp-schema-pre { max-height: 320px; overflow-y: auto; }
 .mcp-config-json { margin-top: 12px; }
 .mcp-config-json :deep(textarea) { font-family: 'SF Mono', Menlo, monospace; font-size: 12px; }
-.mcp-config-hints { margin-top: 10px; color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.8; }
+.mcp-config-toolbar { display: flex; justify-content: flex-end; margin-top: 8px; }
 .mcp-tool-expand { padding: 4px 12px 10px; }
 .mcp-tool-usage { font-size: 13px; line-height: 1.6; margin-bottom: 8px; }
 .mcp-expand-label { font-weight: 600; }
@@ -717,9 +771,9 @@ onMounted(() => {
 .mcp-tools-table { min-height: 120px; overflow-x: auto; }
 .mcp-tools-table :deep(.el-table) { min-width: 800px; }
 .mcp-tool-description { line-height: 1.5; white-space: normal; }
-:deep(.mcp-docs-dialog .el-dialog__body) { max-height: calc(100dvh - 200px); overflow-y: auto; padding: 0 20px; }
+:deep(.mcp-docs-dialog .el-dialog__body) { max-height: calc(100dvh - 200px); overflow-y: auto; }
 
-.created-key-box { display: flex; align-items: center; gap: 12px; margin-top: 20px; padding: 12px; border-radius: 6px; background: #f9fafb; }
+.created-key-box { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
 
 .created-key-text { flex: 1; min-width: 0; color: #111827; font-family: 'SF Mono', monospace; font-size: 12px; word-break: break-all; }
 
@@ -733,6 +787,6 @@ onMounted(() => {
 }
 
 @media (max-width: 1023px) {
-  .mcp-table-scroll-hint { display: block; margin: -4px 0 8px; color: var(--el-text-color-secondary); font-size: 12px; }
+  .mcp-table-scroll-hint { display: block; margin: -4px 0 8px; }
 }
 </style>

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/accesslog"
+	"lazy-balancer-v2/internal/apipath"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -23,221 +26,394 @@ type apiDocRoute struct {
 	Description string
 }
 
+// userResponseExample 是 models.UserResponse 的文档示例单源：列表、当前用户
+// 读取/更新、管理员更新四处共用同一段文本（此前四处各自手写，新增字段只
+// 被迫同步列表一处，其余端点示例停留在旧形状）。键集与结构体由
+// TestAPIDocs_decisionKeyExamplesMatchImplementation 双向对账——新增字段时
+// 该测试要求四处示例同时补齐。
+const userResponseExample = `{"id":1,"username":"admin","role":"admin","display_name":null,"is_enabled":true,"mfa_enabled":false,"auth_provider":"local","is_setup_admin":true,"created_at":"2026-01-01T00:00:00Z","last_login":null}`
+
+// apiKeyWithUserResponseExample 是 models.APIKeyWithUserResponse 的文档示例
+// 单源：管理列表与自助列表的实际投影都是同一结构（含属主 username 与
+// created_by/key_prefix 等生命周期字段），两处各自手写只会各自缺不同字段。
+// 键集由 TestAPIDocs_apiKeyExamplesMatchImplementation 双向对账。
+const apiKeyWithUserResponseExample = `{"id":1,"name":"ci","key_prefix":"lb_sk_abcd","created_by":1,"last_used":null,"expires_at":null,"is_enabled":true,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":["10.0.0.0/8"],"created_at":"2026-01-01T00:00:00Z","username":"admin"}`
+
+// certJobListItemExample 是 certJobListItem 的文档示例单源：证书任务列表的
+// data.list[] 与详情 data 是同一投影（字段同源），两处各自手写会让新增字段
+// 只在其中一侧可见。retry_cooldown_seconds 的三态（0=现在可重试、正数=剩余
+// 秒数、null=永久不可重试）在 route 描述里同步说明。键集由
+// TestAPIDocs_certJobExamplesMatchImplementation 双向对账。
+const certJobListItemExample = `{"id":1,"rule_id":"lb_...","domain":"example.com","ca_provider_id":1,"ca_provider_name":"Let's Encrypt","status":"issued","message":"","issuer":"Let's Encrypt","days_remaining":42,"certificate_status":"valid","expires_at":"2026-10-01T00:00:00Z","not_after":"2026-10-01T00:00:00Z","created_at":"2026-09-19T12:00:00Z","updated_at":"2026-09-19T12:00:00Z","retry_cooldown_seconds":null}`
+
 var apiDocRoutes = []apiDocRoute{
-	{"POST", "/auth/login", "认证", "用户登录", `{"username":"admin","password":"..."}`, `{"token":"jwt","user":{},"node_mode":"master"}`, []string{"400 invalid_request", "401 invalid_credentials", "403 account_disabled", "429 too_many_attempts_or_locked"}, "密码仅用于验证，不返回。启用 MFA 的用户返回 mfa_required 形态，凭 mfa_token 调 /auth/mfa/verify 换 JWT。"},
-	{"POST", "/auth/ticket-login", "认证", "从节点票据登录", `{"ticket":"base64url(payload).base64url(signature)"}`, `{"token":"jwt","user":{},"node_mode":"slave"}`, []string{"400 invalid_request", "401 invalid_or_expired_ticket", "429 too_many_attempts"}, "公开接口；仅从节点接受所属节点的一次性 90 秒登录票据。客户端从 URL fragment 读取并 percent-decode login_ticket，提交后无论成功或失败都通过 history.replaceState 清除 fragment。"},
-	{"POST", "/auth/mfa/verify", "认证", "MFA 登录第二步验证", `{"mfa_token":"<登录返回的挑战令牌>","code":"123456 或恢复代码"}`, `{"token":"jwt","user":{},"node_mode":"master"}`, []string{"400 invalid_request", "401 invalid_challenge_or_code", "429 too_many_attempts_or_locked"}, "公开接口（同 loginRateLimit）；启用 MFA 的用户密码验证通过后先收到 mfa_required+mfa_token，再凭本端点换取 JWT。挑战令牌 5 分钟单次。"},
+	{"POST", "/auth/login", "认证", "用户登录", `{"username":"admin","password":"..."}`, `{"token":"jwt","user":` + userResponseExample + `,"node_mode":"master"}`, []string{"400 invalid_request", "401 invalid_credentials", "403 account_disabled", "429 too_many_attempts_or_locked"}, "密码仅用于验证，不返回。启用 MFA 的用户返回 mfa_required 形态，凭 mfa_token 调 /auth/mfa/verify 换 JWT。"},
+	{"POST", "/auth/ticket-login", "认证", "从节点票据登录", `{"ticket":"base64url(payload).base64url(signature)"}`, `{"token":"jwt","user":` + userResponseExample + `,"node_mode":"slave"}`, []string{"400 invalid_request", "401 invalid_or_expired_ticket", "429 too_many_attempts"}, "公开接口；仅从节点接受所属节点的一次性 90 秒登录票据。客户端从 URL fragment 读取并 percent-decode login_ticket，提交后无论成功或失败都通过 history.replaceState 清除 fragment。"},
+	{"POST", "/auth/mfa/verify", "认证", "MFA 登录第二步验证", `{"mfa_token":"<登录返回的挑战令牌>","code":"123456 或恢复代码"}`, `{"token":"jwt","user":` + userResponseExample + `,"node_mode":"master"}`, []string{"400 invalid_request", "401 invalid_challenge_or_code", "409 verification_in_progress（同一挑战已有一笔请求在验码；对方验码失败会归还挑战，稍后用同一令牌重试即可，勿当作重放）", "429 too_many_attempts_or_locked"}, "公开接口（同 loginRateLimit）；启用 MFA 的用户密码验证通过后先收到 mfa_required+mfa_token，再凭本端点换取 JWT。挑战令牌 5 分钟单次。"},
 	{"GET", "/auth/mfa/status", "认证", "当前用户 MFA 状态", "", `{"enabled":true,"recovery_codes_remaining":7}`, []string{"401 unauthenticated"}, ""},
-	{"POST", "/auth/mfa/setup", "认证", "生成 MFA 绑定密钥", `{"code":"123456"}`, `{"secret":"base32","uri":"otpauth://totp/..."}`, []string{"400 invalid_request", "401 wrong_code（重新绑定）"}, "生成待激活密钥（pending），需经 activate 验证后才生效。首次绑定无需请求体；已启用 MFA 的用户重新 setup 须提交 6 位动态验证码确认（2026-09 起登录后无密码输入）。"},
-	{"POST", "/auth/mfa/activate", "认证", "激活 MFA", `{"code":"123456"}`, `{"code":0,"message":"MFA 已启用","data":{"recovery_codes":["...×10"]}}`, []string{"400 invalid_request_or_wrong_code", "401 pending_invalidated"}, "恢复代码仅此一次返回明文；pending 验证 5 次失败后作废需重新绑定。"},
-	{"POST", "/auth/mfa/disable", "认证", "禁用 MFA（双重确认）", `{"code":"123456"}`, `{"code":0,"message":"MFA 已禁用"}`, []string{"400 invalid_request", "401 wrong_code"}, "需有效 6 位动态验证码，防会话劫持后一键关闭（2026-09 登录后零密码输入裁定后无密码项；恢复代码仅限登录与重置 MFA 入口）。"},
-	{"POST", "/auth/mfa/recovery-codes", "认证", "重新生成恢复代码", ``, `{"code":0,"data":{"recovery_codes":["...×10"]}}`, []string{"400 invalid_request"}, "旧恢复码全部作废（重新生成仅需当前会话，无 401 路径）。"},
-	{"POST", "/auth/mfa/verify-step", "认证", "MFA step-up 验证", `{"code":"123456"}`, `{"token":"jwt(mfa_ts刷新)","user":{},"node_mode":"master"}`, []string{"400 invalid_request", "401 wrong_code_or_user_unavailable"}, "全局写操作验证开启时，写操作返回 428 后凭本端点刷新 JWT 重试。仅接受 6 位动态验证码（恢复代码仅限登录与重置 MFA 入口）。"},
-	{"POST", "/users/:id/mfa/reset", "认证", "重置用户 MFA（管理员）", `{"code":"123456"}`, `{"code":0,"message":"已重置用户 MFA（用户需重新绑定）"}`, []string{"400 invalid_request", "401 wrong_code", "403 admin_required", "404 not_found"}, "仅 admin；清除该用户全部 MFA 状态并审计留痕。操作者自己启用 MFA 时须提交本人有效 6 位动态验证码（body {code}）。"},
+	{"POST", "/auth/mfa/setup", "认证", "生成 MFA 绑定密钥", `{"code":"123456"}`, `{"secret":"base32","uri":"otpauth://totp/..."}`, []string{"400 invalid_request", "401 wrong_code（重新绑定）", "429 too_many_attempts", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝 MFA 写）", "403 oidc_user_local_mfa_unsupported"}, "生成待激活密钥（pending），需经 activate 验证后才生效。首次绑定无需请求体；已启用 MFA 的用户重新 setup 须提交 6 位动态验证码确认（2026-09 起登录后无密码输入）。登录后验码限流：每用户 60 秒内失败 5 次后 429，验码成功清零（仅限流不锁定）。守卫验码（428 弹码链）≤15 秒内发起的重绑免本层验码。"},
+	{"POST", "/auth/mfa/activate", "认证", "激活 MFA", `{"code":"123456"}`, `{"code":0,"message":"MFA 已启用","data":{"recovery_codes":["...×10"]}}`, []string{"400 invalid_request_or_wrong_code", "401 pending_invalidated", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝 MFA 写）", "403 oidc_user_local_mfa_unsupported"}, "恢复代码仅此一次返回明文；pending 验证 5 次失败后作废需重新绑定。"},
+	{"POST", "/auth/mfa/disable", "认证", "禁用 MFA（双重确认）", `{"code":"123456"}`, `{"code":0,"message":"MFA 已禁用"}`, []string{"400 invalid_request", "401 wrong_code", "429 too_many_attempts", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝 MFA 写）", "403 oidc_user_local_mfa_unsupported"}, "需有效 6 位动态验证码，防会话劫持后一键关闭（2026-09 登录后零密码输入裁定后无密码项；恢复代码仅限登录与重置 MFA 入口）。登录后验码限流：每用户 60 秒内失败 5 次后 429，验码成功清零。守卫验码（428 弹码链）≤15 秒内发起的禁用免本层验码，超过 15 秒需提交新时间片验证码。"},
+	{"POST", "/auth/mfa/recovery-codes", "认证", "重新生成恢复代码", ``, `{"code":0,"data":{"recovery_codes":["...×10"]}}`, []string{"400 invalid_request", "401 user_unavailable（鉴权通过后用户被并发删除或禁用）", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝 MFA 写）", "403 oidc_user_local_mfa_unsupported"}, "旧恢复码全部作废。重新生成不需要验证码/密码（无凭据校验 401 路径，会话即信任边界；仅鉴权与处理之间用户被并发删除时返回 401 user_unavailable）：响应返回的 10 个恢复代码是可绕过 MFA 完成登录的凭证，JWT 泄露等价于可重生成——如需第二因子确认请开启 mfa_write_guard 并走 step-up 链路。"},
+	{"POST", "/auth/mfa/verify-step", "认证", "MFA step-up 验证", `{"code":"123456"}`, `{"token":"jwt(mfa_ts刷新)","user":` + userResponseExample + `,"node_mode":"master"}`, []string{"400 invalid_request", "401 wrong_code_or_user_unavailable", "429 too_many_attempts"}, "全局写操作验证开启时，写操作返回 428 后凭本端点刷新 JWT 重试。仅接受 6 位动态验证码（恢复代码仅限登录与重置 MFA 入口）。登录后验码限流：每用户 60 秒内失败 5 次后 429（等待窗口滑动后重试），验码成功清零（仅限流不锁定）。"},
+	{"POST", "/users/:id/mfa/reset", "认证", "重置用户 MFA（管理员）", `{"code":"123456"}`, `{"code":0,"message":"已重置用户 MFA（用户需重新绑定）"}`, []string{"400 invalid_request", "401 wrong_code", "403 admin_required", "404 not_found", "429 too_many_attempts", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝 MFA 写）"}, "仅 admin；清除该用户全部 MFA 状态并审计留痕。目标为 OIDC 用户时拒绝（403——OIDC 身份由认证服务承担，不支持本地 MFA 操作）。操作者自己启用 MFA 时须提交本人有效 6 位动态验证码（body {code}）；守卫验码（428 弹码链）≤15 秒内发起的重置免本层验码，超过 15 秒需新时间片验证码。验码限流同 verify-step。"},
 	{"GET", "/auth/setup", "认证", "检查是否需要初始化", "", `{"needs_setup":true}`, []string{"429 请求过于频繁"}, "用户表为空时返回 needs_setup=true，前端应引导创建首个管理员。"},
 	{"POST", "/auth/setup", "认证", "创建首个管理员", `{"username":"admin","password":"...","display_name":""}`, `{"message":"管理员账号创建成功，请登录"}`, []string{"400 invalid_request", "403 already_initialized", "429 too_many_attempts"}, "仅当用户表为空时可用。"},
-	{"GET", "/branding", "系统", "品牌文案配置", "", `{"app_name":"Lazy Balancer","footer_text":"Lazy Balancer V2 · Copyright © 2026 XiaoBao","landing_text":"Lazy Balancer V2 is running!","version":"2.3.x","footer_uses_default":true,"landing_uses_default":true}`, []string{}, "公开接口；只读 data/branding.json（主节点变更经集群「全局配置」通道镜像分发到从节点）；footer_uses_default=true 表示当前渲染默认页脚（含 GitHub 链接），文件缺失或字段为空时逐字段回退默认值；有值则严格按配置渲染。启动时确保字段齐备:缺失建全空模板、缺字段补空值(保留已有值与未知键)、齐全零写入;文件修改即时生效(mtime 检测重载内存快照,热重载记操作日志「重载/品牌配置」逐字段旧→新;半截写保旧值且不镜像到从节点)。"},
+	{"GET", "/branding", "系统", "品牌文案配置", "", `{"app_name":"Lazy Balancer","footer_text":"Lazy Balancer V2 · Copyright © 2026 XiaoBao","landing_text":"Lazy Balancer V2 is running!","version":"2.3.x","footer_uses_default":true,"landing_uses_default":true}`, []string{"429 rate_limited(120/min/IP)"}, "公开接口；只读 data/branding.json（主节点变更经集群「全局配置」通道镜像分发到从节点）；footer_uses_default=true 表示当前渲染默认页脚（含 GitHub 链接），文件缺失或字段为空时逐字段回退默认值；有值则严格按配置渲染。启动时确保字段齐备:缺失建全空模板、缺字段补空值(保留已有值与未知键)、齐全零写入;文件修改即时生效(mtime 检测重载内存快照,热重载记操作日志「重载/品牌配置」逐字段旧→新;半截写保旧值且不镜像到从节点)。app_name 兼任 TCP 拦截提示品牌：显式自定义值原样透传到 TCP(L4) 拦截提示，空或默认值「Lazy Balancer」视为未配置（渲染回退内置文案「Lazy Balancer v2」）。"},
 	{"POST", "/auth/logout", "认证", "用户登出", "", `{"code":0,"message":"已退出登录"}`, []string{"404 not_found（API Key 认证）"}, "JWT 认证吊销当前会话令牌（jti 记入撤销表）；API Key 认证无会话令牌可吊销，直接返回 404。"},
-	{"POST", "/mcp", "MCP", "Model Context Protocol Streamable HTTP 端点", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"client","version":"1"}}}`, `{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"Lazy Balancer V2","version":"1.0.0"}}}`, []string{"400 invalid_body", "401 api_key_required", "403 mcp_disabled_or_ip_denied", "413 body_exceeds_1_MiB"}, "仅接受 X-API-Key 或 Bearer lb_sk_；支持 initialize、ping、tools/list、tools/call、resources/list、resources/read（资源 lazy-balancer://docs/ops-playbook 为完整操作手册）。请求体不可读返回 400，超过 1 MiB 返回 413。"},
-	{"GET", "/users", "用户", "用户列表", "", `{"code":0,"data":[{"id":1,"username":"admin","role":"admin","display_name":null,"is_enabled":true}]}`, []string{"401 unauthenticated"}, "所有已登录用户可读。"},
-	{"POST", "/users", "用户", "创建用户", `{"username":"viewer","password":"...","role":"user","display_name":"只读用户"}`, `{"code":0,"message":"用户创建成功","data":{"id":2}}`, []string{"400 invalid_request", "403 admin_required", "409 username_exists", "500 create_failed"}, "仅 admin。"},
-	{"PUT", "/users/:id", "用户", "更新用户", `{"username":"viewer","role":"user","display_name":"观察员","password":"新密码(可选)"}`, `{"code":0,"message":"用户更新成功"}`, []string{"400 invalid_request", "403 admin_required", "404 not_found", "409 username_exists_or_last_admin", "500 update_failed"}, "仅 admin；省略字段时保留原值。"},
-	{"PUT", "/users/:id/status", "用户", "启用或禁用用户", `{"is_enabled":false}`, `{"code":0,"message":"用户状态更新成功"}`, []string{"400 invalid_request", "400 cannot_disable_self", "403 admin_required", "404 not_found", "409 last_admin", "500 update_failed"}, "仅 admin。"},
-	{"POST", "/users/:id/reset-password", "用户", "重置用户密码", `{"new_password":"..."}`, `{"code":0,"message":"密码重置成功"}`, []string{"400 invalid_request", "403 admin_required", "404 not_found", "500 reset_failed"}, "仅 admin。"},
-	{"DELETE", "/users/:id", "用户", "删除用户", "", `{"code":0,"message":"用户删除成功"}`, []string{"400 cannot_delete_self", "403 admin_required", "404 not_found", "409 last_admin", "500 delete_failed"}, "仅 admin。"},
-	{"GET", "/users/me", "用户", "当前用户信息", "", `{"id":1,"username":"admin","role":"admin","display_name":null}`, []string{"401 unauthenticated"}, ""},
-	{"PATCH", "/users/me", "用户", "更新当前用户", `{"display_name":"昵称","password":"新密码(可选)"}`, `{"id":1,"username":"admin","display_name":"昵称"}`, []string{"400 invalid_request", "401 unauthenticated"}, "密码只接受新值，不返回。"},
-	{"GET", "/users/me/api-keys", "API密钥", "当前用户 API 密钥列表", "", `{"code":0,"data":[{"id":1,"name":"ci","key_prefix":"lb_sk_abcd","last_used":null,"expires_at":null,"is_enabled":true,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":["10.0.0.0/8"]}]}`, []string{"401 unauthenticated"}, "不返回完整密钥。"},
-	{"POST", "/users/me/api-keys", "API密钥", "创建当前用户 API 密钥", `{"name":"ci","expires_at":null,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":["10.0.0.0/8","192.168.1.5"]}`, `{"id":1,"key":"lb_sk_...","message":"完整密钥仅显示一次，请妥善保存。"}`, []string{"400 invalid_request", "401 unauthenticated", "428 mfa_step_up_required"}, "完整密钥只在创建时返回一次；普通用户创建的密钥强制为只读；裸 IP 自动规范化为 /32 或 /128。特权 Key（非只读或开启 MCP）创建在开启 mfa_write_guard 且创建者为启用 MFA 的 JWT 用户时要求 60 秒内 MFA 验证（428，经 verify-step 后携新 JWT 重试）；API Key 机器身份豁免。"},
-	{"PATCH", "/users/me/api-keys/:id", "API密钥", "更新当前用户 API 密钥", `{"is_enabled":true,"mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["10.0.0.0/8"]}`, `{"code":0,"message":"API 密钥已更新"}`, []string{"400 invalid_request", "404 not_found"}, "四个字段均可选，但至少提交一个；普通用户不能将 read_only 设为 false。"},
-	{"DELETE", "/users/me/api-keys/:id", "API密钥", "删除当前用户 API 密钥", "", `{"code":0,"message":"API 密钥已删除"}`, []string{"404 not_found"}, ""},
-	{"GET", "/api-keys", "API密钥", "API 密钥列表", "", `{"code":0,"data":[{"id":1,"name":"ci","username":"admin","is_enabled":true,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":[]}]}`, []string{"401 unauthenticated"}, "所有已登录用户可读。"},
-	{"POST", "/api-keys", "API密钥", "管理端创建 API 密钥", `{"name":"ci","expires_at":null,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":[]}`, `{"id":1,"key":"lb_sk_..."}`, []string{"400 invalid_request", "403 admin_required", "428 mfa_step_up_required"}, "特权 Key（非只读或开启 MCP）创建在开启 mfa_write_guard 且创建者为启用 MFA 的 JWT 用户时要求 60 秒内 MFA 验证（428，经 verify-step 后携新 JWT 重试）；API Key 机器身份豁免。"},
-	{"PATCH", "/api-keys/:id/status", "API密钥", "管理端更新 API 密钥", `{"is_enabled":true,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":[]}`, `{"code":0,"message":"API 密钥已更新"}`, []string{"400 invalid_request", "403 admin_required", "404 not_found"}, "四个字段均可选，但至少提交一个。"},
-	{"DELETE", "/api-keys/:id", "API密钥", "管理端删除 API 密钥", "", `{"code":0,"message":"API 密钥已删除"}`, []string{"403 admin_required", "404 not_found"}, ""},
-	{"GET", "/config", "配置", "读取全局配置", "", `{"log_level":"info","timezone":"Asia/Shanghai","github_proxy_url":"https://v4.gh-proxy.org/","has_github_token":true,"audit_retention_months":3,"proxy_dial_timeout":0,"proxy_response_header_timeout":0,"proxy_read_timeout":0,"proxy_write_timeout":0,"proxy_stream_timeout":0,"proxy_flush_interval":0,"proxy_stream_close_delay":0,"trusted_proxy_enabled":false,"trusted_proxy_ranges":"[]","trusted_proxy_range_refs":"[]","trusted_proxy_headers":"[]","trusted_proxy_strict":true}`, []string{"401 unauthorized"}, ""},
-	{"PUT", "/config", "配置", "更新全局配置", `{"source":"caddy","proxy_dial_timeout":10,"proxy_response_header_timeout":30,"proxy_read_timeout":60,"proxy_write_timeout":60,"proxy_stream_timeout":0,"proxy_flush_interval":-1,"proxy_stream_close_delay":0}`, `{"code":0,"message":"配置已更新并应用","data":{"changed":true,"section":"Caddy配置","changes":["代理连接超时"]}}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed"}, "只提交需要修改的字段；代理超时单位为秒，0 表示使用 Caddy 默认值；proxy_flush_interval：0=自动（仅 text/event-stream 触发立即刷新），-1=立即刷新所有响应（无缓冲），>0=每 N 秒刷新一次；proxy_stream_close_delay：0=reload 时立即关闭旧流，>0=延迟 N 秒关闭；无修改时返回「配置无变化」且不触发 Caddy 重载。github_token 三态：省略=保持现值、空串=清除（唯一撤销路径）、非空=覆盖。"},
-	{"GET", "/config/export", "配置", "导出配置备份（lbbak）", "", `{"meta":{},"config":{},"tables":{}}`, []string{"403 slave_or_admin_or_api_key_read_only", "428 mfa_step_up_required"}, "仅主节点；只读 API Key 不能导出配置备份（403）；开启 mfa_write_guard 时 JWT 身份需新鲜 MFA 验证（428，经 verify-step 后重试）。下载 lbbak 备份包（tar.gz 二进制，含用户与密钥哈希、证书任务；勾选安全防护分类时附 CRS/IP2Region 规则库文件本体，示例为包内 config.json 形态）。"},
-	{"POST", "/config/import", "配置", "导入配置备份", `{"meta":{"app":"lazy-balancer-v2"},"config":{},"tables":{}}`, `{"code":0,"message":"配置导入成功：规则 3 条、上游 3 个","data":{"summary":"规则 3 条；上游 3 个","disabled_conflicts":[{"name":"web-b","caddy_id":"lb_...","reason":"端口冲突","conflicts_with":[{"name":"web-a","caddy_id":"lb_...","reason":"同端口 8080"}]}],"warnings":["系统数据已导入：全部登录会话已吊销，请重新登录"]}}`, []string{"400 invalid_backup", "403 slave_or_admin_required", "500 rollback"}, "仅主节点；单事务全覆盖恢复，失败回滚并保留原配置。请求体支持二进制 lbbak 备份（tar.gz，含规则库文件本体）与旧式纯 JSON 备份（示例形态）；lbbak 的分类选择经 ?sections= query 传输（与导出对称），JSON 备份以体内 sections 字段为准。响应 data.summary 为分表计数汇总，disabled_conflicts 为冲突置禁用规则清单，warnings 是软跳过/元数据跳过/操作账户替换/会话吊销/ACME 悬挂/证书质量等警告的唯一机器可读出口（失败响应同构）。"},
-	{"POST", "/config/import/validate", "配置", "校验配置备份", `{"meta":{"app":"lazy-balancer-v2","version":1},"tables":{"lb_rules":[],"users":[]}}`, `{"code":0,"data":{"valid":true,"type":"v2","summary":{}}}`, []string{"400 empty_or_unreadable_transport", "413 body_exceeds_48MB", "403 slave_or_admin_required"}, "只校验备份格式和兼容性，不写数据库。传输层请求为空或不可读返回 400，超过 48MB 返回 413（与导入端点同上限）；可读取但格式或语义无效的备份返回 200，data.valid=false 并在 data.error 给出原因。"},
-	{"GET", "/settings/auto-backup", "配置", "读取自动备份设置与备份列表", "", `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["users","rules","security"],"last_run":"2026-09-20T03:00:00Z","backups":[{"id":1,"filename":"lbbak-auto-20260920-030000.lbbak","created_at":"2026-09-20 03:00:00","status":"success","size_bytes":1024,"sections":["users"],"trigger_type":"schedule","message":""}]}`, []string{"403 slave_or_admin_required"}, "仅主节点；调度器仅主节点运行（提升为主节点自动启动，切换为从节点自动停止）。"},
-	{"PUT", "/settings/auto-backup", "配置", "保存自动备份设置", `{"enabled":true,"frequency":"weekly","time":"03:00","day":1,"keep":7,"sections":["users","rules","security"]}`, `{"code":0,"message":"自动备份设置已保存"}`, []string{"400 invalid_request", "403 slave_or_admin_required", "428 mfa_step_up_required"}, "frequency=daily/weekly/monthly；time 为 HH:MM（按系统时区）；day：weekly 1-7（周一=1）、monthly 1-28（短月自动收敛到月末）；keep 1-30（超出上限返回 400；升级前保存的越界存量值读取时回退 7）；sections 为三分类（users=系统数据含全局配置、rules=负载规则、security=安全防护含 CRS/IP2Region 规则库）子集且不能为空；旧版 global_config/waf_files 键自动归一为 users/security。关闭→开启时置水位线（不回补停用期间的槽，也不立即执行），下一次执行=启用后的下一个到期槽；停机跨槽在下次启动补跑一次。"},
-	{"GET", "/system/tasks/:id/logs", "系统", "任务文本日志（统一任务引擎管理——tasks/{id}.log 尾部 256KB；更新族含分阶段流水）", "", `{"content":"2026/09/29 04:23:49 [start] 手动触发\n2026/09/29 04:23:50 [INFO] downloading - 下载 ustc\n2026/09/29 04:23:51 [done] success 耗时=1043ms 触发=manual"}`, []string{"401 unauthenticated"}, "每任务一个文本日志文件；运行日志轮转副本清理任务统一清理（保留期同审计月数）与轮转（10MB 上限超限保一份，task_log_size_mb）；生命周期与业务行时间戳均为 YYYY/MM/DD HH:MM:SS。"},
-	{"GET", "/system/tasks/:id/history", "系统", "任务运行历史（task_runs 时间倒序，最多 50 条）", "", `{"runs":[{"id":1,"task_id":"threat","family":"security","trigger":"manual","operator":"alice","status":"success","started_at":"2026-09-29 00:30:00","finished_at":"2026-09-29 00:30:01","duration_ms":1043,"message":""}]}`, []string{"401 unauthenticated"}, "每次真实执行落一行（含手动/自动）；无历史的任务族返回空数组。status ∈ running/success/failed/cancelled/skipped/interrupted。"},
-	{"GET", "/system/tasks", "系统", "任务监控聚合视图（全部定时/后台任务族）", "", `{"tasks":[{"id":"threat","name":"威胁情报库更新","category":"安全防护","kind":"scheduled","status":"idle","enabled":true,"cancellable":false,"controllable":false,"triggerable":true,"loop_on":true,"last_run":{"started_at":"2026-09-28 20:00:00","finished_at":"2026-09-28 20:00:01","duration_ms":1043,"trigger":"auto","operator":"","result":"success"},"next_run_at":"2026-09-29 20:00:00","runs_24h":3,"success_24h":3,"fail_24h":0}]}`, []string{"401 unauthenticated"}, "全员可见（从节点只读）；status=running 且 cancellable=true 的任务可经 /system/tasks/:id/cancel 取消（仅下载类）。"},
+	{"POST", "/mcp", "MCP", "Model Context Protocol Streamable HTTP 端点", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"client","version":"1"}}}`, `{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"Lazy Balancer V2","version":"<APP_VERSION，随面板版本下发>"}}}`, []string{"400 invalid_body", "401 api_key_required", "403 mcp_disabled_or_ip_denied", "413 body_exceeds_1_MiB", "429 rate_limited(120/min/Key + 120/min/IP；IP 桶仅 401 失败尝试计入，成功请求回滚；响应携带 Retry-After)"}, "仅接受 " + accesslog.APIKeyHeaderName + " 或 Bearer lb_sk_；支持 initialize、ping、tools/list、tools/call、resources/list、resources/read（资源 lazy-balancer://docs/ops-playbook 为完整操作手册）。请求体不可读返回 400，超过 1 MiB 返回 413。"},
+	{"GET", "/users", "用户", "用户列表", "", `{"code":0,"data":[` + userResponseExample + `]}`, []string{"401 unauthenticated"}, "所有已登录用户可读。is_setup_admin 标记初始化创建的首个管理员（break-glass 入口）：不可删除/禁用/降级。"},
+	{"POST", "/users", "用户", "创建用户", `{"username":"viewer","password":"...","role":"user","display_name":"只读用户"}`, `{"code":0,"message":"用户创建成功","data":{"id":2}}`, []string{"400 invalid_request", "403 admin_required", "409 username_exists", "500 create_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅 admin。"},
+	{"PUT", "/users/:id", "用户", "更新用户", `{"username":"viewer","role":"user","display_name":"观察员","password":"新密码(可选)"}`, `{"code":0,"message":"用户更新成功","data":` + userResponseExample + `}`, []string{"400 invalid_request", "400 setup_admin_protected（目标是初始化管理员，不可降级）", "403 admin_required", "404 not_found", "409 username_exists_or_last_admin", "500 update_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "管理员可更新任意用户；非管理员仅可更新本人（用户名/角色不可改）。初始化管理员（is_setup_admin=true）不可降级为普通用户（存在其他管理员时同样拒绝）。用户管理页的密码字段为重置语义，不验证当前密码（非管理员自助编辑本人同样不验证）；正常改密请走 PATCH /users/me（要求 current_password）。省略字段时保留原值。"},
+	{"PUT", "/users/:id/status", "用户", "启用或禁用用户", `{"is_enabled":false}`, `{"code":0,"message":"用户状态更新成功"}`, []string{"400 invalid_request", "400 cannot_disable_self", "400 setup_admin_protected（目标是初始化管理员，不可禁用）", "403 admin_required", "404 not_found", "409 last_admin", "500 update_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅 admin。初始化管理员（is_setup_admin=true）不可禁用。启用态实际变化时 pwd_ver 递增并吊销该用户既有 JWT 与 MFA 登录挑战，重新启用也不会恢复旧会话；重复提交相同启用态不吊销会话。OIDC 用户禁用会保留原身份、角色与绑定，响应提示重新启用即可恢复。"},
+	{"POST", "/users/:id/reset-password", "用户", "重置用户密码", `{"new_password":"..."}`, `{"code":0,"message":"密码重置成功"}`, []string{"400 invalid_request", "403 admin_required", "404 not_found", "500 reset_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "管理员可重置任意用户；非管理员可重置本人。自助重置与管理员重置同为「重置」语义：不验证也不读取 current_password（需要当前密码确认的改密请走 PATCH /users/me）。成功后 pwd_ver 递增、会话失效。"},
+	{"DELETE", "/users/:id", "用户", "删除用户", "", `{"code":0,"message":"用户删除成功"}`, []string{"400 cannot_delete_self", "400 setup_admin_protected（目标是初始化管理员，不可删除）", "403 admin_required", "404 not_found", "409 last_admin", "500 delete_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅 admin。初始化管理员（is_setup_admin=true）不可删除——存在其他管理员时同样拒绝。删除 OIDC 用户后，同一身份下次 SSO 登录会重新开户且原角色/禁用状态不继承；响应会提示改用禁用来撤销访问并保留身份。"},
+	{"GET", "/users/me", "用户", "当前用户信息", "", userResponseExample, []string{"401 unauthenticated"}, "响应形状与 GET /users 的行一致（含 is_setup_admin/mfa_enabled/auth_provider）；脚本可据此判定当前账号是否为不可删除/禁用/降级的初始化管理员。"},
+	{"PATCH", "/users/me", "用户", "更新当前用户", `{"display_name":"昵称","password":"新密码(可选)","current_password":"当前密码(修改密码时必填)"}`, userResponseExample, []string{"400 invalid_request", "401 unauthenticated", "401 current_password_wrong", "409 password_changed_concurrently（当前密码确认后、提交前密码被并发修改（如管理员重置），请重新确认后再试）", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "密码只接受新值，不返回。修改密码必须同时提交 current_password（本端点不提供重置语义）；current_password 校验失败返回 401 current_password_wrong（与会话失效的 401 unauthenticated 区分）。确认通过后若密码被并发操作修改（乐观版本守卫），返回 409 且不覆盖新密码。修改密码成功后 pwd_ver 递增，当前会话即刻失效——本响应仍返回 200 但只完成本次请求，后续任意请求将 401（密码已修改，请重新登录），客户端应引导重新登录。响应形状与 GET /users/me 一致。"},
+	{"GET", "/users/me/api-keys", "API密钥", "当前用户 API 密钥列表", "", `{"code":0,"data":[` + apiKeyWithUserResponseExample + `]}`, []string{"401 unauthenticated"}, "不返回完整密钥；与管理列表同一投影（含 username/created_by/key_prefix/created_at）。"},
+	{"POST", "/users/me/api-keys", "API密钥", "创建当前用户 API 密钥", `{"name":"ci","expires_at":null,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":["10.0.0.0/8","192.168.1.5"]}`, `{"id":1,"key":"lb_sk_...","message":"完整密钥仅显示一次，请妥善保存。"}`, []string{"400 invalid_request", "401 unauthenticated", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "完整密钥只在创建时返回一次；普通用户创建的密钥强制为只读；裸 IP 自动规范化为 /32 或 /128；mcp_ip_whitelist 最多 256 条，约束该密钥的全部 REST 与 MCP 调用（字段名为历史遗留，作用域不限于 MCP）。特权 Key（非只读或开启 MCP）创建在开启 mfa_write_guard 且创建者为启用 MFA 的 JWT 用户时要求 60 秒内 MFA 验证（428，经 verify-step 后携新 JWT 重试）；API Key 机器身份豁免。"},
+	{"PATCH", "/users/me/api-keys/:id", "API密钥", "更新当前用户 API 密钥", `{"is_enabled":true,"mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["10.0.0.0/8"]}`, `{"code":0,"message":"API 密钥已更新"}`, []string{"400 invalid_request", "404 not_found", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "四个字段均可选，但至少提交一个；普通用户不能将 read_only 设为 false；mcp_ip_whitelist 最多 256 条，约束该密钥的全部 REST 与 MCP 调用。"},
+	{"DELETE", "/users/me/api-keys/:id", "API密钥", "删除当前用户 API 密钥", "", `{"code":0,"message":"API 密钥已删除"}`, []string{"404 not_found", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, ""},
+	{"GET", "/api-keys", "API密钥", "API 密钥列表", "", `{"code":0,"data":[` + apiKeyWithUserResponseExample + `]}`, []string{"401 unauthenticated"}, "所有已登录用户可读；与自助列表同一完整投影。"},
+	{"POST", "/api-keys", "API密钥", "管理端创建 API 密钥", `{"name":"ci","expires_at":null,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":[]}`, `{"id":1,"key":"lb_sk_..."}`, []string{"400 invalid_request", "403 admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "属主恒为当前认证身份（与自助端点同实现，无指定属主参数）。mcp_ip_whitelist 最多 256 条，约束该密钥的全部 REST 与 MCP 调用（字段名为历史遗留，作用域不限于 MCP）。特权 Key（非只读或开启 MCP）创建在开启 mfa_write_guard 且创建者为启用 MFA 的 JWT 用户时要求 60 秒内 MFA 验证（428，经 verify-step 后携新 JWT 重试）；API Key 机器身份豁免。"},
+	{"PATCH", "/api-keys/:id/status", "API密钥", "管理端更新 API 密钥", `{"is_enabled":true,"mcp_enabled":true,"read_only":false,"mcp_ip_whitelist":[]}`, `{"code":0,"message":"API 密钥已更新"}`, []string{"400 invalid_request", "403 admin_required", "404 not_found", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "四个字段均可选，但至少提交一个；mcp_ip_whitelist 最多 256 条，约束该密钥的全部 REST 与 MCP 调用。"},
+	{"DELETE", "/api-keys/:id", "API密钥", "管理端删除 API 密钥", "", `{"code":0,"message":"API 密钥已删除"}`, []string{"403 admin_required", "404 not_found", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, ""},
+	{"GET", "/config", "配置", "读取全局配置", "", `{"log_level":"info","timezone":"Asia/Shanghai","server_map_lat":31.23,"server_map_lon":121.47,"github_proxy_url":"https://v4.gh-proxy.org/","has_github_token":true,"audit_retention_months":3,"proxy_dial_timeout":0,"proxy_response_header_timeout":0,"proxy_read_timeout":0,"proxy_write_timeout":0,"proxy_stream_timeout":0,"proxy_flush_interval":0,"proxy_stream_close_delay":0,"trusted_proxy_enabled":false,"trusted_proxy_ranges":"[]","trusted_proxy_range_refs":"[]","trusted_proxy_headers":"[]","trusted_proxy_strict":true}`, []string{"401 unauthorized"}, ""},
+	{"PUT", "/config", "配置", "更新全局配置", `{"source":"caddy","proxy_dial_timeout":10,"proxy_response_header_timeout":30,"proxy_read_timeout":60,"proxy_write_timeout":60,"proxy_stream_timeout":0,"proxy_flush_interval":-1,"proxy_stream_close_delay":0}`, `{"code":0,"message":"配置已更新并应用","data":{"changed":true,"section":"Caddy配置","changes":["代理连接超时"]}}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required"}, "只提交需要修改的字段；代理超时单位为秒，0 表示使用 Caddy 默认值；proxy_flush_interval：0=自动（仅 text/event-stream 触发立即刷新），-1=立即刷新所有响应（无缓冲），>0=每 N 秒刷新一次；proxy_stream_close_delay：0=reload 时立即关闭旧流，>0=延迟 N 秒关闭；无修改时返回「配置无变化」且不触发 Caddy 重载。github_token 三态：省略=保持现值、空串=清除（唯一撤销路径）、非空=覆盖。threat_traffic_sample_n 仅支持 -1=自适应（低流量等价全量，按事件速率在 1/4/8 档间滞回切换）或 0=关闭采集；1（全量档）与固定 2..64 已废除（400），存量值由启动迁移归一为 -1。access_log_format 为多行日志格式 DSL：上限 200 行、16 KiB（按写侧归一后的落库值计，超限 400 点名，不做静默截断）；空白格式表示使用 Caddy 原生字段。"},
+	{"GET", "/config/export", "配置", "导出配置备份（lbbak）", "", `{"meta":{},"config":{},"tables":{}}`, []string{"403 slave_or_admin_or_api_key_read_only", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝导出）"}, "仅主节点；只读 API Key 不能导出配置备份（403）；开启 mfa_write_guard 时 JWT 身份需新鲜 MFA 验证（428，经 verify-step 后重试）。下载 lbbak 备份包（tar.gz 二进制，含用户与密钥哈希、证书任务；meta.app_version 记录真实产品版本；勾选安全防护分类时附 CRS/IP2Region 规则库文件本体，示例为包内 config.json 形态）。导出与导入共用 128MB/64 条目/单条目 64MB 上限；超限时导出显式失败，不产出无法回传还原的备份。"},
+	{"POST", "/config/import", "配置", "导入配置备份", `{"meta":{"app":"lazy-balancer-v2"},"config":{},"tables":{}}`, `{"code":0,"message":"配置导入成功：规则 3 条、上游 3 个","data":{"summary":"规则 3 条；上游 3 个","disabled_conflicts":[{"name":"web-b","caddy_id":"lb_...","reason":"端口冲突","conflicts_with":[{"name":"web-a","caddy_id":"lb_...","reason":"同端口 8080"}]}],"warnings":["系统数据已导入：全部登录会话已吊销，请重新登录"]}}`, []string{"400 invalid_backup", "403 slave_or_admin_required", "409 certificate_queue_draining", "413 body_exceeds_128MB", "500 rollback", "428 mfa_step_up_required"}, "仅主节点；单事务全覆盖恢复，失败回滚并保留原配置（随包落盘的规则库文件——CRS 规则树/IP2Region 库/威胁名单——随事务一并回退到导入前状态；回退失败在 warnings 显性说明并写审计）。配置已提交但证书任务恢复失败时返回 200 且 data.partial=true（warnings 说明失败面），客户端应刷新页面并按部分成功提示。请求体支持二进制 lbbak 备份（tar.gz，含规则库文件本体）与旧式纯 JSON 备份（示例形态）；lbbak 的分类选择经 ?sections= query 传输（与导出对称），JSON 备份以体内 sections 字段为准。响应 data.summary 为分表计数汇总，disabled_conflicts 为冲突置禁用规则清单，warnings 是软跳过/元数据跳过/操作账户替换/会话吊销/ACME 悬挂/证书质量等警告的唯一机器可读出口（失败响应同构）。"},
+	{"POST", "/config/import/validate", "配置", "校验配置备份", `{"meta":{"app":"lazy-balancer-v2","version":1},"tables":{"lb_rules":[],"users":[]}}`, `{"code":0,"data":{"valid":true,"type":"v2","summary":{}}}`, []string{"400 empty_or_unreadable_transport", "413 body_exceeds_128MB", "403 slave_or_admin_required"}, "只校验备份格式和兼容性，不写数据库。传输层请求为空或不可读返回 400，超过 128MB 返回 413（与导入端点同上限）；可读取但格式或语义无效的备份返回 200，data.valid=false 并在 data.error 给出原因。"},
+	{"GET", "/settings/auto-backup", "配置", "读取自动备份设置与备份列表", "", `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":7,"sections":["users","rules","security","cluster"],"last_run":"2026-09-20T03:00:00Z","last_success_at":"2026-09-20 03:00:00","next_run_at":"2026-09-21T03:00:00+08:00","catch_up_due":false,"backups_truncated":false,"backups":[{"id":1,"filename":"lbbak-auto-20260920-030000.lbbak","created_at":"2026-09-20 03:00:00","status":"success","size_bytes":1024,"sections":["users"],"trigger_type":"schedule","message":"","app_version":"vX.Y.Z"}]}`, []string{"403 slave_or_admin_required", "500 query_failed（读取设置/备份列表失败；节点角色查询失败同为 500）"}, "仅主节点；调度器仅主节点运行（提升为主节点自动启动，切换为从节点自动停止）。last_run 为调度水位线（启用时置为当前时刻，非执行事实）；last_success_at 为最近一次成功备份的落库时间（无成功备份时为 null），界面「上次成功备份」取该字段；该字段由独立标量子查询给出，不受列表窗口截断影响。backups 按 created_at/id 倒序最多返回 200 行（正常态由内务裁剪收敛到 keep+failed 上限，远低于窗口）；backups_truncated=true 表示还有更旧的备份未返回。next_run_at 使用调度器同一 nextAutoBackupSlot 计算（已保存设置 + 水位线），未启用、库不可用或排程参数非法时为 null（客户端不得假定恒为时间串）；catch_up_due=true 表示停机跨槽补跑已到期，界面显示「待补跑」。created_at/last_success_at 为 UTC 墙钟串（2006-01-02 15:04:05，无时区标识，与 /audit-logs、/certificates 同族）；last_run/next_run_at 为 RFC3339。backups[].sections 解码失败（库内 JSON 损坏/带外改写）时该行携带 sections_error（sections 为空数组），不得据此判定「备份范围为空」。"},
+	{"PUT", "/settings/auto-backup", "配置", "保存自动备份设置", `{"enabled":true,"frequency":"weekly","time":"03:00","day":1,"keep":7,"sections":["users","rules","security","cluster"]}`, `{"code":0,"message":"自动备份设置已保存"}`, []string{"400 invalid_request", "403 slave_or_admin_required", "413 body_exceeds_16KiB", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）", "500 save_failed（读取/写入设置失败；节点角色查询失败同为 500）"}, "frequency=daily/weekly/monthly；time 为 HH:MM（按配置时区，即基础设置时区）；day 恒必填（省略返回 400「缺少必填字段」）：daily 忽略取值（调度不使用）、weekly 1-7（周一=1）、monthly 1-28（短月自动收敛到月末）；keep 1-30（超出上限返回 400；升级前保存的越界存量值读取时回退 7）；sections 为「" + configBackupSectionsDocText() + "」子集且不能为空；旧版 global_config/waf_files 键自动归一为 users/security。请求体上限 16 KiB（超过返回 413）。关闭→开启时置水位线（不回补停用期间的槽，也不立即执行），下一次执行=启用后的下一个到期槽；停机跨槽在下次启动补跑一次。"},
+	{"GET", "/system/tasks/:id/logs", "系统", "任务文本日志（统一任务引擎管理——tasks/{id}.log 与轮转副本合计尾部 256KB；更新族含分阶段流水）", "", `{"content":"2026/09/29 04:23:49 [start] 手动触发\n2026/09/29 04:23:50 [INFO] downloading - 下载 ustc\n2026/09/29 04:23:51 [done] success 耗时=1043ms 触发=manual"}`, []string{"401 unauthenticated", "500 read_failed（任务日志路径解析/读取失败）"}, "每任务一个文本日志文件；运行日志轮转副本清理任务统一清理（保留期同审计月数）与轮转（10MB 上限超限保一份，task_log_size_mb）；生命周期与业务行时间戳均为 YYYY/MM/DD HH:MM:SS；内容超过 256KB 响应预算被截断时首行前置提示行「[日志过长，仅显示最近 256KB]」（证书任务日志端点同形态）。"},
+	{"GET", "/system/tasks/:id/history", "系统", "任务运行历史（task_runs 时间倒序，最多 50 条）", "", `{"runs":[{"id":1,"task_id":"threat","family":"security","trigger":"manual","operator":"alice","status":"success","started_at":"2026-09-29 00:30:00","finished_at":"2026-09-29 00:30:01","duration_ms":1043,"message":""}]}`, []string{"400 invalid_job_id（cert-job:<id> 行 id 非法）", "401 unauthenticated", "404 not_found"}, "每次真实执行落一行（含手动/自动）；无历史的已注册任务族返回空数组。status ∈ running/success/failed/cancelled/skipped/interrupted。"},
+	{"GET", "/system/tasks", "系统", "任务监控聚合视图（全部定时/后台任务族）", "", `{"tasks":[{"id":"threat","name":"威胁情报库更新","description":"按排程更新三源威胁情报名单","cadence":"定时排程","category":"安全防护","kind":"scheduled","status":"idle","cancellable":true,"controllable":false,"triggerable":true,"loop_on":true,"business_driven":true,"role_applicable":true,"last_run":{"started_at":"2026-09-28 20:00:00","finished_at":"2026-09-28 20:00:01","duration_ms":1043,"trigger":"auto","operator":"","result":"success"},"next_run_at":"2026-09-29 20:00:00","retry_cooldown_seconds":0,"cert_job_ca_cooldown_active":false,"runs_24h":3,"success_24h":3,"fail_24h":0}],"cert_jobs_truncated":false}`, []string{"401 unauthenticated"}, "全员可见（从节点只读）；status=running 且 cancellable=true 的任务可经 /system/tasks/:id/cancel 取消（仅下载类）。description/cadence/started_at 为 omitempty（空值不下发：常驻族才有 started_at）；cert_jobs_truncated=true 表示证书队列行超出展示上限被截断；role_applicable=false 表示本节点角色不运行该任务（从节点上的 master-only 族，页面标注「仅主节点」且不展示下次执行）；retry_cooldown_seconds 恒下发（0=现在即可运行，null=该状态永久不可重试）：证书行与证书任务列表同口径——下发「此刻剩余秒」，通用退避（queued 15 / failed 5 / 执行态 2 分钟）按 updated_at 起算扣减、waiting_ca 取 CA 退避到期时刻；非证书行恒 0。cert_job_ca_cooldown_active 恒下发：行处于 CA 退避窗口时 true（CertJobCAcooldownActive 单源判定）——剩余秒数区分不了「通用冷却（触发放行）」与「CA 退避窗（未 force 默认拒绝）」，前端据此选提示措辞。"},
 	{"GET", "/system/tasks/stats-24h-series", "系统", "近 24 小时任务执行分小时桶序列（时间序列图数据源）", "", `{"series":[{"hour":"2026-10-11 03:00:00","success":12,"failed":1}]}`, []string{"401 unauthenticated"}, "全员可见（从节点只读）；恒 24 桶升序（now-23h..now 配置时区墙面小时），空桶零填。"},
-	{"POST", "/system/tasks/:id/trigger", "系统", "手动触发任务（全部非常驻任务族——类型派生，见 GET /system/tasks triggerable；证书队列行用 cert-job:<job_id>）", "", `{"code":0,"data":{"status":"running","trigger":"manual"}}`, []string{"400 not_triggerable", "401 unauthenticated", "403 admin_or_master_required", "409 running", "428 mfa_step_up_required"}, "仅管理员+主节点；统一经任务引擎（单飞/主节点门/历史单写）。手动触发操作者记入任务运行历史 operator 列。"},
-	{"POST", "/system/tasks/:id/toggle", "系统", "暂停/恢复任务自动调度", `{"enabled":false}`, `{"code":0,"message":"已暂停威胁情报库自动更新"}`, []string{"400 not_toggleable", "401 unauthenticated", "403 admin_or_master_required", "428 mfa_step_up_required"}, "统一调度开关（v2.0 四类型标准）：定时=暂停/恢复排程、循环=暂停/恢复循环、常驻=启停自管理循环；触发类不可调度（400）。"},
-	{"POST", "/system/tasks/:id/control", "系统", "常驻循环任务启停（start/stop/restart）", `{"action":"restart"}`, `{"code":0,"message":"已重启任务 config-watchdog"}`, []string{"400 not_controllable", "401 unauthenticated", "403 admin_required", "428 mfa_step_up_required"}, "仅常驻（daemon）任务可控：security-events-ingestion、cert-issuance、cluster-sync；其余类型恒 400 not_controllable。停止类操作前端有二次确认。"},
-	{"POST", "/system/tasks/:id/cancel", "系统", "取消运行中任务（仅下载类）", "", `{"code":0,"message":"已发出取消信号，任务将在当前下载阶段中断"}`, []string{"401 unauthenticated", "403 admin_or_master_required", "409 not_running", "428 mfa_step_up_required"}, "下载阶段中断，已完成源的结果保留；非下载类任务（备份/重载）不支持取消。"},
-	{"POST", "/auto-backup/run", "配置", "手动触发一次完整备份", "", `{"code":0,"message":"手动备份完成","data":{"id":2,"filename":"lbbak-manual-20260920-040000.lbbak","status":"success","trigger_type":"manual"}}`, []string{"403 slave_or_admin_required", "428 mfa_step_up_required", "500 run_failed"}, "仅主节点；与导出同构（lbbak，含凭证与证书材料），落盘服务器 backup 目录；已有任务执行中返回 500（不排队）。"},
-	{"DELETE", "/auto-backup/:id", "配置", "删除备份记录与文件", "", `{"code":0,"message":"备份已删除"}`, []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required"}, "行不存在 404；文件缺失容忍（仅删行）。"},
-	{"POST", "/auto-backup/:id/restore", "配置", "从备份还原配置", "", `{"message":"配置还原成功：..."}`, []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required"}, "按行读服务器 backup 目录内的备份文件走导入链（单事务，失败回滚）；还原的是备份实际包含的内容（导出时未选的分类不在备份内）。审计动作「还原」。"},
-	{"GET", "/auto-backup/:id/download", "配置", "下载备份文件", "", "(lbbak 二进制流)", []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required"}, "与手动导出同敏感级（备份含私钥与凭证明文），下载审计留痕。"},
+	{"POST", "/system/tasks/:id/trigger", "系统", "手动触发任务（全部非常驻任务族——类型派生，见 GET /system/tasks triggerable；证书队列行用 cert-job:<job_id>）", "", `{"code":0,"data":{"status":"running","trigger":"manual"}}`, []string{"400 not_triggerable", "401 unauthenticated", "403 admin_or_master_required", "404 not_found", "409 running（引擎行：任务运行中，请稍后重试）或 409 in_flight（cert-job 行：任务正在签发队列中，请勿重复操作）或 409 not_running（退役行）或 409 部署窗 busy（恢复窗口期）", "409/500 deployment_retry_failed（部署重排登记失败——409 规则证书操作被屏障阻塞（规则正在删除或更新），已登记自动部署，请稍后重试；409 部署重试未触发（证书签发队列已停止/规则状态冲突/规则屏障）；已登记自动部署，恢复后自动执行；500 触发重新部署失败；已登记自动部署，稍后自动执行）", "429 cooldown（cert-job 行冷却未到期：CA 退避窗未到期，或非 failed 行在途/queued/部署窗冷却中）", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）", "409 state_changed（cert-job 行并发窗：任务状态已变更，请刷新后重试）", "409 not_retryable（cert-job 行：任务关联规则已禁用、证书配置已变更或队列已暂停）", "500 enqueue_failed（cert-job 入队失败）", "500 queue_unavailable（cert-job 行：CA 队列管理器未初始化）", "500 status_read_failed（cert-job 行并发窗：读取任务状态失败）", "503 task_engine_unavailable（引擎停止关停窗）"}, "仅管理员+主节点；统一经任务引擎（单飞/主节点门/历史单写）。手动触发操作者记入任务运行历史 operator 列。cert-job 行（与 /certificates/jobs/:id/retry 共用重试核心）：通用冷却仅挡非 failed 行——failed 行冷却中放行并留越冷审计（cooldown_override），退役 409、在途/queued/部署窗口 429 按原形状拒绝；CA 退避窗口（failed/waiting_ca 行携带 ca_available_after）未到期 429（可 ?force=true 越过，越权审计留痕——冷却已自然到期时带 force 不算越过、不记越权）。"},
+	{"POST", "/system/tasks/:id/toggle", "系统", "停止/恢复任务自动调度", `{"enabled":false}`, `{"code":0,"message":"已停止威胁情报库自动更新"}`, []string{"400 not_toggleable", "401 unauthenticated", "403 admin_or_master_required", "404 not_found", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）", "500 pref_save_failed（任务调度偏好保存失败，调度状态未改变）", "503 task_engine_unavailable"}, "统一调度开关（v2.0 四类型标准）：定时/循环=停止/恢复调度、常驻=启停自管理循环；触发类不可调度（400）。threat/CRS/IP2Region/crawlerbot-update/auto-backup/autoban 六个业务驱动任务 toggle 只读，只能经对应业务页修改。"},
+	{"POST", "/system/tasks/:id/control", "系统", "常驻循环任务启停（start/stop/restart）", `{"action":"restart"}`, `{"code":0,"message":"已重启任务 cluster-sync"}`, []string{"400 not_controllable", "401 unauthenticated", "403 admin_required", "404 not_found", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）", "500 pref_save_failed（任务调度偏好保存失败，调度状态未改变）", "503 task_engine_unavailable"}, "Kind=daemon 恒可控（引擎元数据驱动），可控族以 GET /system/tasks 下发的 controllable 字段为准；其余类型恒 400 not_controllable。停止类操作前端有二次确认。"},
+	{"POST", "/system/tasks/:id/cancel", "系统", "取消运行中任务（仅下载类）", "", `{"code":0,"message":"已发出取消信号，任务将在当前阶段中断"}`, []string{"401 unauthenticated", "403 admin_or_master_required", "404 not_found", "409 not_running", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "下载阶段中断，已完成源的结果保留；非下载类任务（备份/重载）不支持取消。"},
+	{"POST", "/auto-backup/run", "配置", "手动触发一次完整备份（202 异步受理）", "", `{"code":0,"message":"手动备份已开始，完成后可在备份列表查看"}`, []string{"403 slave_or_admin_required", "409 backup_running", "428 mfa_step_up_required", "500 trigger_failed（触发失败；节点角色查询失败同为 500）", "503 task_engine_unavailable"}, "仅主节点；与导出同构（lbbak，含凭证与证书材料），落盘服务器 backup 目录。202 之前已完成引擎原子占位：手动触发进行中或定时备份在途返回 409（不排队），调度暂停（配置导入窗口）返回 409，引擎停止返回 503——不会出现「已受理但后台未执行」。备份在后台任务执行（task_runs/auto_backups 照常落行），客户端应轮询 GET /settings/auto-backup 查看结果。"},
+	{"DELETE", "/auto-backup/:id", "配置", "删除备份记录与文件", "", `{"code":0,"message":"备份已删除"}`, []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required", "500 delete_failed（删除记录失败；节点角色查询失败同为 500）"}, "行不存在 404；文件缺失容忍（仅删行）。"},
+	{"POST", "/auto-backup/:id/restore", "配置", "从备份还原配置", "", `{"message":"配置还原成功：..."}`, []string{"400 invalid_id", "400 invalid_backup", "403 slave_or_admin_required", "404 not_found", "409 task_or_certificate_queue_busy", "413 body_exceeds_128MB", "428 mfa_step_up_required", "500 import_failed"}, "按行读服务器 backup 目录内的备份文件走导入链；在途任务或证书队列排空失败返回 409，导入不执行。事务失败回滚；数据库已提交但证书任务恢复失败时返回 200 + data.partial=true 与 warnings。还原的是备份实际包含的内容（导出时未选的分类不在备份内）。审计动作「还原」。"},
+	{"GET", "/auto-backup/:id/download", "配置", "下载备份文件", "", "(lbbak tar.gz 二进制包，以 application/octet-stream 流式下发，非 JSON)", []string{"400 invalid_id", "403 slave_or_admin_required", "404 not_found", "428 mfa_step_up_required", "500 read_failed（读取备份文件失败；节点角色查询失败同为 500）"}, "与手动导出同敏感级（备份含私钥与凭证明文），下载审计留痕。"},
 	{"POST", "/config/preview", "配置", "预览配置变更", `{"source":"basic","log_level":"debug"}`, `{"changed":true,"section":"基础设置","changes":["系统日志级别"]}`, []string{"400 invalid_request", "403 admin_required"}, "不写数据库，不触发 Caddy。"},
-	{"POST", "/config/reload", "配置", "手动重载 Caddy", "", `{"code":0,"message":"Caddy 配置已重载"}`, []string{"403 admin_required", "500 caddy_reload_failed"}, ""},
+	{"POST", "/config/reload", "配置", "手动重载 Caddy", "", `{"code":0,"message":"Caddy 配置已重载"}`, []string{"403 admin_required", "500 caddy_reload_failed", "428 mfa_step_up_required"}, ""},
 	{"POST", "/config/validate", "配置", "验证 Caddy 配置", `{}`, `{"code":0,"message":"配置有效"}`, []string{"400 config_invalid", "403 admin_required", "428 mfa_step_up_required", "500 config_restore_failed"}, ""},
-	{"GET", "/config/health", "配置", "上游健康状态", "", `{"server":{"127.0.0.1:8080":{"healthy":true}}}`, []string{"401 unauthenticated"}, "所有已登录用户可读。"},
-	{"GET", "/rules", "规则", "负载规则列表", "", `[{"caddy_id":"lb_...","name":"example","protocol":"http","listen_port":80,"custom_routes_enabled":true,"proxy_dial_timeout":0,"proxy_response_header_timeout":0,"proxy_read_timeout":0,"proxy_write_timeout":0,"proxy_stream_timeout":0,"proxy_flush_interval":0,"proxy_stream_close_delay":0,"path_rules":[{"id":1,"match_type":"prefix","path":"/prometheus/","upstream_path":"","sort_order":0,"upstreams":null}],"enabled":true}]`, []string{"401 unauthenticated"}, "path_rules.upstreams 为 null 时继承父规则上游，否则使用 address、port、weight、protocol 对象数组；path_rules 支持 response_mode（2026-10-10）：空=转发（默认），static=直接返回（response_status 常用状态码 200/201/204/400/401/403/404/410/500/502/503 + response_body ≤64 字符 + response_content_type text/plain|application/json|text/html），redirect=301 跳转（redirect_to 为 http(s):// 绝对地址或 / 开头路径）；static/redirect 与 upstreams/upstream_path 互斥；static 与 redirect_to 互斥、redirect 与 response_body/response_content_type 互斥；static 缺省归一（response_status=0→200、response_content_type 空→text/plain）；path_rules.upstream_path 非空时改写转发 path（前缀匹配剥匹配前缀后前置、精确匹配整体替换，query 均保留，须以 / 开头且不含空格 ? #），空串=原样转发；TCP 规则可用 tcp_proxy_protocol=true 向上游发送 PROXY v2 协议头传递真实客户端 IP。"},
-	{"POST", "/rules", "规则", "创建负载规则", `{"name":"example","protocol":"http","listen_port":8080,"enable_tls":true,"tls_source":"manual","tls_cert":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----","tls_key":"$$PRIVATEKEY_UEJFJFBJ1ZAP:M$$","custom_routes_enabled":true,"proxy_dial_timeout":5,"proxy_response_header_timeout":15,"proxy_read_timeout":30,"proxy_write_timeout":30,"proxy_stream_timeout":0,"proxy_flush_interval":-1,"proxy_stream_close_delay":0,"path_rules":[{"match_type":"prefix","path":"/prometheus/","upstream_path":"","sort_order":0,"upstreams":[{"address":"127.0.0.1","port":9090,"weight":1,"protocol":"http"}]}],"upstreams":[{"host":"127.0.0.1","port":9000,"origin_domain":"origin.example.com"}],"health_check_host":"probe.example.com"}`, `{"caddy_id":"lb_..."}`, []string{"400 validation_failed", "403 slave_mode/非管理员用户只读(主节点)/从节点只读", "500 caddy_apply_failed"}, "TLS：enable_tls+tls_source（manual/acme_dns/file）；manual 时须同时传 tls_cert+tls_key（PEM）；file 时须传 tls_cert_path+tls_key_path（位于 /app/certs 内的成品证书文件，保存时读取并校验，PEM 内容摄取入库——数据库是运行时唯一信任源；外部更新文件后看门狗自动同步入库并重载）。路径必须以 / 开头，match_type 仅支持 prefix 或 exact；代理超时单位为秒，0 表示继承全局配置；proxy_flush_interval：0=自动（仅 text/event-stream 触发立即刷新），-1=立即刷新所有响应（无缓冲），>0=每 N 秒刷新一次；proxy_stream_close_delay：0=reload 时立即关闭旧流，>0=延迟 N 秒关闭；上游对象的 dynamic_dns 字段已废弃（不参与渲染），动态上游以规则级 dynamic_dns 为准。上游 origin_domain（2026-10-10）：该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口，端口沿用上游端口列），空=跟随规则 host_header；仅 HTTP 规则静态上游支持（dynamic_dns/TCP 规则 400）。health_check_host：主动健康检查请求的 Host 头（纯主机名不带端口），空=跟随 host_header。"},
-	{"GET", "/rules/:caddy_id", "规则", "规则详情", "", `{"caddy_id":"lb_...","name":"example","protocol":"http","domain":"example.com","listen_port":443,"strategy":"weighted_round_robin","enabled":true,"enable_tls":true,"tls_source":"manual","tls_cert":"-----BEGIN CERTIFICATE-----\n...","tls_key":"","tls_key_set":true,"tls_http_redirect":true,"acme_config_id":0,"ca_provider_id":0,"block_page_stage1_id":0,"block_page_stage1_status":0,"block_page_stage3_id":0,"block_page_stage3_status":0,"custom_routes_enabled":false,"proxy_dial_timeout":0,"proxy_response_header_timeout":0,"proxy_read_timeout":0,"proxy_write_timeout":0,"proxy_stream_timeout":0,"proxy_flush_interval":0,"proxy_stream_close_delay":0,"path_rules":[],"upstreams":[{"host":"127.0.0.1","port":9000,"weight":1,"enabled":true,"protocol":"http"}]}`, []string{"404 not_found"}, "tls_key 掩码语义：仅管理员 JWT 或管理员读写 API Key 可读回私钥原文，其余调用方返回 tls_key=\"\" 且 tls_key_set=true（表示已配置）；写回时省略 tls_key 或传空串均表示保留原私钥不变。"},
-	{"GET", "/rules/:caddy_id/metrics-history", "指标", "规则历史指标", "", `{"code":0,"data":{"protocol":"http","supported":true,"rows":[{"timestamp":"2026-07-18 12:00:00","requests_total":10,"requests_2xx":9,"requests_3xx":0,"requests_4xx":1,"requests_5xx":0,"requests_blocked":1,"bytes_in":100,"bytes_out":1000}]}}`, []string{"404 not_found"}, "query: range（1h/6h/24h/7d，默认 24h）；TCP 规则返回 supported=false 和空 rows。"},
-	{"PUT", "/rules/:caddy_id", "规则", "更新负载规则", `{"enable_tls":true,"tls_source":"manual","tls_cert":"-----BEGIN CERTIFICATE-----\n...","tls_key":"$$PRIVATEKEY_JXZXPB82EORI:M$$","custom_routes_enabled":true,"path_rules":[{"match_type":"exact","path":"/health","upstream_path":"","sort_order":0,"upstreams":null}],"health_check_host":"probe.example.com"}`, `{"code":0,"message":"Rule updated"}`, []string{"400 validation_failed", "404 not_found", "409 cert_job_active", "500 caddy_apply_failed"}, "合并更新：指针字段省略时保留原值，显式 false、0 或空数组会写入；host_header/health_check_host/description/dns_server/health_check_path 省略=保留原值、空串=清空；path_rules 仅在字段存在时整体替换。upstreams 为全量替换，须携带完整字段（含 enabled，缺省会被置为 false 禁用该上游）；显式 `[]` 将被 400 拒绝（无清空语义，见 TestUpdateRule_explicitEmptyUpstreamsRejected）。Caddy 应用/CLI 校验失败返回 400（数据库未写入）。tls_source=file 时须传 tls_cert_path+tls_key_path（位于 /app/certs 内的成品证书文件；同模式可沿用存量路径，保存时按路径重新读取并摄取内容入库——数据库是运行时唯一信任源，外部更新文件后看门狗自动同步入库并重载）。上游对象的 dynamic_dns 字段已废弃（不参与渲染），动态上游以规则级 dynamic_dns 为准。上游 origin_domain：该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口），空=跟随规则 host_header；仅 HTTP 规则静态上游支持。"},
-	{"DELETE", "/rules/:caddy_id", "规则", "删除负载规则", "", `{"code":0,"message":"Rule deleted"}`, []string{"404 not_found", "409 cert_job_running", "400 caddy_validation_failed", "500 caddy_apply_failed"}, "有 worker 正在执行签发时秒回 409（queued/冷却中不拦，稍后重试即可）；无在途任务的删除即时完成。"},
-	{"POST", "/rules/:caddy_id/enable", "规则", "启用规则", "", `{"code":0,"message":"Rule enabled"}`, []string{"404 not_found", "500 caddy_apply_failed", "400 caddy_validation_failed"}, "ACME 证书未过期且未到续期窗口时复用现有证书，不重新签发。"},
-	{"POST", "/rules/:caddy_id/disable", "规则", "禁用规则", "", `{"code":0,"message":"Rule disabled"}`, []string{"404 not_found", "409 cert_job_running", "500 caddy_apply_failed", "400 caddy_validation_failed"}, "非终态证书任务会置为 disabled。有 worker 正在执行签发时秒回 409（queued/冷却中不拦，稍后重试即可）。"},
-	{"POST", "/rules/:caddy_id/duplicate", "规则", "复制规则", "", `{"caddy_id":"lb_new..."}`, []string{"404 not_found", "400 port_or_domain_conflict", "500 tx_failed"}, "不读取请求体；名称固定追加「（副本）」后缀。"},
-	{"GET", "/certificate-configs", "证书", "DNS 提供商配置列表", "", `[{"id":1,"name":"dnspod","dns_provider":"dnspod","enabled":true}]`, []string{"401 unauthenticated"}, "凭证非管理员仅见掩码形态；更新时回传掩码串按未改动处理（sentinel），仅管理员可查看明文与修改。"},
-	{"GET", "/certificates", "证书", "证书任务列表（每域名最新签发任务）", "", `{"code":0,"data":{"certificates":[{"id":1,"rule_id":"lb_...","domain":"example.com","status":"issued","message":"","expires_at":"2026-10-01 00:00:00","updated_at":"2026-09-19 12:00:00"}],"total":1}}`, []string{"401 unauthenticated", "500 query_failed"}, "从证书任务（cert_jobs）聚合，每域名最新一条；不含 Caddy 内部 CA。"},
-	{"POST", "/certificate-configs", "证书", "创建 DNS 提供商配置", `{"name":"dnspod","dns_provider":"dnspod","dns_credentials":{"id":"...","token":"..."},"enabled":true}`, `{"id":1}`, []string{"400 invalid_request", "403 非管理员用户只读(主节点)/从节点只读"}, "凭证保存后非管理员仅见掩码形态（更新回传掩码按未改动处理），仅管理员可修改。"},
-	{"PUT", "/certificate-configs/:id", "证书", "更新 DNS 提供商配置", `{"name":"dnspod","enabled":true}`, `{"code":0,"message":"Config updated"}`, []string{"400 invalid_request", "403 非管理员用户只读(主节点)/从节点只读", "404 not_found"}, ""},
-	{"DELETE", "/certificate-configs/:id", "证书", "删除 DNS 提供商配置", "", `{"code":0,"message":"Config deleted"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found"}, ""},
-	{"GET", "/dns-providers", "证书", "DNS 提供商能力列表", "", `{"code":0,"data":[{"code":"dnspod","name":"DNSPod","credential_fields":[]}]}`, []string{"401 unauthenticated"}, "所有已登录用户可读；返回提供商代码及凭证字段定义。"},
-	{"POST", "/certificate-configs/test", "证书", "测试未保存的 DNS 提供商配置", `{"domain":"example.com","dns_provider":"dnspod","dns_credentials":{"id":"...","token":"..."}}`, `{"code":0,"message":"凭证有效"}`, []string{"400 invalid_credentials"}, "测试成功/失败都会记录操作日志，不记录凭证。"},
-	{"POST", "/certificate-configs/:id/test", "证书", "测试 DNS 提供商配置", `{"domain":"example.com"}`, `{"code":0,"message":"凭证有效"}`, []string{"400 invalid_credentials", "404 not_found"}, "测试成功/失败都会记录操作日志，不记录凭证。"},
+	{"GET", "/config/health", "配置", "上游健康状态", "", `{"srv0":{"127.0.0.1:8080":{"healthy":true,"unknown":false,"degraded":false,"num_requests":12,"fails":0}}}`, []string{"401 unauthenticated", "502 upstream_health_unavailable（收集上游健康状态失败——Caddy admin/指标源不可达或响应不可解析）"}, "所有已登录用户可读。外层键为 Caddy server 名（如 srv0），内层键为上游地址；dynamic=true 标记动态 DNS 上游（域名级健康/请求数不可观测，缺省省略）。"},
+	{"GET", "/rules", "规则", "负载规则列表", "", `[{"caddy_id":"lb_...","name":"example","protocol":"http","listen_port":80,"custom_routes_enabled":true,"proxy_dial_timeout":0,"proxy_response_header_timeout":0,"proxy_read_timeout":0,"proxy_write_timeout":0,"proxy_stream_timeout":0,"proxy_flush_interval":0,"proxy_stream_close_delay":0,"path_rules":[{"id":1,"match_type":"prefix","path":"/prometheus/","upstream_path":"","sort_order":0,"upstreams":null}],"enabled":true}]`, []string{"401 unauthenticated"}, "path_rules.upstreams 为 null 时继承父规则上游，否则使用 address、port、weight、protocol 对象数组；path_rules 支持 response_mode（2026-10-10）：空=转发（默认），static=直接返回（response_status 常用状态码 200/201/204/400/401/403/404/410/500/502/503 + response_body ≤64 字符 + response_content_type text/plain|application/json|text/html），redirect=301 跳转（redirect_to 为 http(s):// 绝对地址或 / 开头路径）；static/redirect 与 upstreams/upstream_path 互斥；static 与 redirect_to 互斥、redirect 与 response_body/response_content_type 互斥；static 缺省归一（response_status=0→200、response_content_type 空→text/plain）；path_rules.upstream_path 非空时改写转发 path（前缀匹配剥匹配前缀后前置、精确匹配整体替换，query 均保留，须以 / 开头且不含空格 ? #），空串=原样转发；TCP 规则可用 tcp_proxy_protocol=true 向上游发送 PROXY v2 协议头传递真实客户端 IP（入站 PROXY 头仅在绑定了安全策略的 TCP 规则上解析，且仅来自系统设置受信代理网段内的来源时采信（用于事件归因与发往上游的源地址），其余来源按直连地址处理，直连客户端无需发送 PROXY 头；未绑定安全策略的 TCP 规则不解析 PROXY 头，伪造头原样透传上游）；列表投影不加载私钥（tls_key 恒为空串），tls_key_set 仅详情接口提供。"},
+	{"POST", "/rules", "规则", "创建负载规则", `{"name":"example","protocol":"http","listen_port":8080,"enable_tls":true,"tls_source":"manual","tls_cert":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----","tls_key":"$$PRIVATEKEY_UEJFJFBJ1ZAP:M$$","custom_routes_enabled":true,"proxy_dial_timeout":5,"proxy_response_header_timeout":15,"proxy_read_timeout":30,"proxy_write_timeout":30,"proxy_stream_timeout":0,"proxy_flush_interval":-1,"proxy_stream_close_delay":0,"path_rules":[{"match_type":"prefix","path":"/prometheus/","upstream_path":"","sort_order":0,"upstreams":[{"address":"127.0.0.1","port":9090,"weight":1,"protocol":"http"}]}],"upstreams":[{"host":"127.0.0.1","port":9000,"origin_domain":"origin.example.com"}],"health_check_host":"probe.example.com"}`, `{"caddy_id":"lb_..."}`, []string{"400 validation_failed", "403 非管理员用户只读(主节点)/从节点只读", "500 caddy_apply_failed", "428 mfa_step_up_required"}, "TLS：enable_tls+tls_source（manual/acme_dns）；manual 时须同时传 tls_cert+tls_key（PEM）。路径必须以 / 开头，match_type 仅支持 prefix 或 exact；代理超时单位为秒，0 表示继承全局配置；proxy_flush_interval：0=自动（仅 text/event-stream 触发立即刷新），-1=立即刷新所有响应（无缓冲），>0=每 N 秒刷新一次；proxy_stream_close_delay：0=reload 时立即关闭旧流，>0=延迟 N 秒关闭；上游对象的 dynamic_dns 字段已废弃（不参与渲染），动态上游以规则级 dynamic_dns 为准。上游 origin_domain（2026-10-10）：该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口，端口沿用上游端口列），空=跟随规则 host_header；仅 HTTP 规则静态上游支持（dynamic_dns/TCP 规则 400）。NTLM 兼容（ntlm_compatible=1）禁止与「HTTPS 上游 + origin_domain」组合：该组合后端将拒绝（400）——该组合下连接走 TLS 直连通道，NTLM 长连接亲和失效且连接不回收。health_check_host：主动健康检查请求的 Host 头（纯主机名不带端口），空=跟随 host_header。"},
+	{"GET", "/rules/:caddy_id", "规则", "规则详情", "", `{"caddy_id":"lb_...","name":"example","protocol":"http","domain":"example.com","listen_port":443,"created_by":1,"updated_by":1,"created_at":"2026-07-18T12:00:00Z","updated_at":"2026-07-18T12:00:00Z","strategy":"weighted_round_robin","enabled":true,"enable_tls":true,"tls_source":"manual","tls_cert":"-----BEGIN CERTIFICATE-----\n...","tls_key":"","tls_key_set":true,"tls_http_redirect":true,"acme_config_id":0,"ca_provider_id":0,"block_page_stage1_id":0,"block_page_stage1_status":0,"block_page_stage3_id":0,"block_page_stage3_status":0,"custom_routes_enabled":false,"proxy_dial_timeout":0,"proxy_response_header_timeout":0,"proxy_read_timeout":0,"proxy_write_timeout":0,"proxy_stream_timeout":0,"proxy_flush_interval":0,"proxy_stream_close_delay":0,"path_rules":[],"upstreams":[{"host":"127.0.0.1","port":9000,"weight":1,"enabled":true,"protocol":"http"}]}`, []string{"404 not_found"}, "tls_key 掩码语义：仅管理员 JWT 或管理员读写 API Key 可读回私钥原文，其余调用方返回 tls_key=\"\" 且 tls_key_set=true（表示已配置）；写回时省略 tls_key 或传空串均表示保留原私钥不变。block_page_stage1_id/block_page_stage1_status/block_page_stage3_id/block_page_stage3_status 四字段已停用（规则级阶段拦截页功能下线）：响应保留兼容（存量值原样返回），写回提交值一律被忽略。"},
+	{"GET", "/rules/:caddy_id/metrics-history", "规则", "规则历史指标", "", `{"code":0,"data":{"protocol":"http","supported":true,"rows":[{"timestamp":"2026-07-18 12:00:00","requests_total":10,"requests_2xx":9,"requests_3xx":0,"requests_4xx":1,"requests_5xx":0,"requests_blocked":1,"bytes_in":100,"bytes_out":1000}]}}`, []string{"404 not_found", "500 query_failed（读取历史指标失败）"}, "query: range（1h/6h/24h/7d，默认 24h）；TCP 规则返回 supported=false 和空 rows。"},
+	{"PUT", "/rules/:caddy_id", "规则", "更新负载规则", `{"enable_tls":true,"tls_source":"manual","tls_cert":"-----BEGIN CERTIFICATE-----\n...","tls_key":"$$PRIVATEKEY_JXZXPB82EORI:M$$","custom_routes_enabled":true,"path_rules":[{"match_type":"exact","path":"/health","upstream_path":"","sort_order":0,"upstreams":null}],"health_check_host":"probe.example.com"}`, `{"code":0,"message":"Rule updated","data":{"warnings":["旧证书已弃用（域名已变更，证书材料已清除），新证书签发完成前该规则 HTTPS 不可用"]}}`, []string{"400 validation_failed", "403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "400 invalid_expected_updated_at（格式无效，需 RFC3339 或 YYYY-MM-DD HH:MM:SS）", "409 cert_job_active（证书申请中，规则写操作被暂缓）", "409 rule_version_conflict（expected_updated_at 与库内 updated_at 不一致，需重读后重试）", "500 caddy_apply_failed", "428 mfa_step_up_required"}, "合并更新：指针字段省略时保留原值，显式 false、0 或空数组会写入；host_header/health_check_host/description/dns_server/health_check_path 省略=保留原值、空串=清空；path_rules 仅在字段存在时整体替换。upstreams 为全量替换，须携带完整字段（含 enabled，缺省会被置为 false 禁用该上游）；显式 `[]` 将被 400 拒绝（无清空语义，见 TestUpdateRule_explicitEmptyUpstreamsRejected）。Caddy 应用/CLI 校验失败返回 400（数据库未写入）。上游对象的 dynamic_dns 字段已废弃（不参与渲染），动态上游以规则级 dynamic_dns 为准。上游 origin_domain：该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口），空=跟随规则 host_header；仅 HTTP 规则静态上游支持。NTLM 兼容（ntlm_compatible=1）禁止与「HTTPS 上游 + origin_domain」组合：该组合后端将拒绝（400）——该组合下连接走 TLS 直连通道，NTLM 长连接亲和失效且连接不回收。可选版本前置条件：回传打开编辑表单时读到的 updated_at（expected_updated_at）；省略或空串=不校验（后写覆盖前写），提供且与当前值不一致返回 409 rule_version_conflict，保护粒度秒。成功响应在 ACME 域名变更分支携带 data.warnings（机器可读可用性披露：旧证书已弃用/新证书签发完成前 HTTPS 不可用；无告警时该字段不出现）。证书任务在途守卫（409 cert_job_active）按操作分两套阻塞集，409 消息同为「证书申请中，请等待完成或失败后再修改规则」：保存拦 queued/pending（未起动行，放行会重复入队）；切换 manual 或关闭 TLS（脱离 ACME 自动签发）时 waiting_ca 亦拦（CA 限流冷却在途；queued/pending 维持「删除+提交后取消」的切换逃生口）。"},
+	{"DELETE", "/rules/:caddy_id", "规则", "删除负载规则", "", `{"code":0,"message":"Rule deleted"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "409 cert_job_running", "400 caddy_validation_failed", "500 caddy_apply_failed", "428 mfa_step_up_required"}, "有 worker 正在执行签发时秒回 409（queued/冷却中不拦，稍后重试即可）；无在途任务的删除即时完成。"},
+	{"POST", "/rules/:caddy_id/enable", "规则", "启用规则", "", `{"code":0,"message":"Rule enabled"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "500 caddy_apply_failed", "400 caddy_validation_failed", "428 mfa_step_up_required"}, "ACME 证书未过期且未到续期窗口时复用现有证书，不重新签发。"},
+	{"POST", "/rules/:caddy_id/disable", "规则", "禁用规则", "", `{"code":0,"message":"Rule disabled"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "409 cert_job_running", "500 caddy_apply_failed", "400 caddy_validation_failed", "428 mfa_step_up_required"}, "非终态证书任务会置为 disabled。有 worker 正在执行签发时秒回 409（queued/冷却中不拦，稍后重试即可）。"},
+	{"POST", "/rules/:caddy_id/duplicate", "规则", "复制规则", "", `{"caddy_id":"lb_new..."}`, []string{"400 source_rule_invalid", "403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "500 tx_failed", "428 mfa_step_up_required"}, "不读取请求体；名称固定追加「（副本）」后缀（源名过长时截断基名以保证总长 ≤100 字符）。副本按禁用态创建，不做端口/域名冲突检查；400 为源规则字段校验失败（坏上游/越界值/超长描述点名源规则）。"},
+	{"GET", "/certificate-configs", "证书", "DNS 提供商配置列表", "", `[{"id":1,"name":"dnspod","dns_provider":"dnspod","enabled":true}]`, []string{"401 unauthenticated"}, "凭证非管理员仅见掩码形态；admin 属主的只读 API Key 同样只见掩码（机器身份）；更新时回传掩码串按未改动处理（sentinel）。管理员会话与管理员非只读 API Key 可查看明文与修改（api_key_read_only 独立于属主角色生效）。"},
+	{"GET", "/certificates", "证书", "证书任务列表（每规则每域名最新签发任务）", "", `{"code":0,"data":{"certificates":[{"id":1,"rule_id":"lb_...","domain":"example.com","status":"issued","message":"","expires_at":"2026-10-01 00:00:00","updated_at":"2026-09-19 12:00:00"}],"total":1,"page":1,"page_size":1000}}`, []string{"401 unauthenticated", "500 query_failed"}, "从证书任务（cert_jobs）按 rule_id+domain 聚合最新一条；同域不同规则分别返回；不含 Caddy 内部 CA。expires_at/updated_at 为 UTC 墙钟串（无时区标识，NULL 下发空串）。可选 rule_id 过滤；分页 page/page_size（默认 1/1000，上限均为 1000），响应恒返回服务端实际生效的 page/page_size（请求被钳位时读这两个字段得知真实页位置），total 为匹配总数。需要 RFC3339 与派生天数请用 /certificates/jobs。"},
+	{"POST", "/certificate-configs", "证书", "创建 DNS 提供商配置", `{"name":"dnspod","dns_provider":"dnspod","dns_credentials":{"auth_mode":"dnspod","app_id":"...","app_token":"..."},"enabled":true}`, `{"id":1}`, []string{"400 invalid_request", "403 非管理员用户只读(主节点)/从节点只读", "428 mfa_step_up_required"}, "凭证保存后非管理员仅见掩码形态（更新回传掩码按未改动处理），仅管理员可修改。凭据键形随 dns_provider：dnspod=auth_mode+app_id+app_token（UI 形态）；aliyun={\"access_key_id\":\"...\",\"access_key_secret\":\"...\"}；cloudflare={\"auth_mode\":\"cloudflare\",\"api_token\":\"...\"}（Token 权限 Zone → DNS → Edit + Zone → Zone → Read，可限定 zone；保存前验证走 Token verify，不触 DNS 写入）。"},
+	{"PUT", "/certificate-configs/:id", "证书", "更新 DNS 提供商配置", `{"name":"dnspod","enabled":true}`, `{"code":0,"message":"Config updated"}`, []string{"400 invalid_request", "403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "409 enabled_acme_rule_references", "428 mfa_step_up_required"}, "禁用仍被启用 ACME 规则引用的配置返回 409，须先调整规则绑定。"},
+	{"DELETE", "/certificate-configs/:id", "证书", "删除 DNS 提供商配置", "", `{"code":0,"message":"Config deleted"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "428 mfa_step_up_required"}, ""},
+	{"GET", "/dns-providers", "证书", "DNS 提供商能力列表", "", `{"code":0,"data":[{"code":"dnspod","name":"DNSPod","credential_fields":[]}]}`, []string{"401 unauthenticated"}, "所有已登录用户可读；返回提供商代码、凭证字段定义与 description 字段说明（长指引在输入框下方渲染）；列表 DNSPod(腾讯云) 恒首位，其余按 code 升序。"},
+	{"POST", "/certificate-configs/test", "证书", "测试未保存的 DNS 提供商配置", `{"domain":"example.com","dns_provider":"dnspod","dns_credentials":{"auth_mode":"dnspod","app_id":"...","app_token":"..."}}`, `{"code":0,"message":"凭证有效"}`, []string{"400 invalid_credentials", "403 forbidden", "428 mfa_step_up_required"}, "测试成功/失败都会记录操作日志，不记录凭证。凭据键形随 dns_provider（同创建）：dnspod=auth_mode+app_id+app_token；aliyun={\"access_key_id\":\"...\",\"access_key_secret\":\"...\"}；cloudflare={\"auth_mode\":\"cloudflare\",\"api_token\":\"...\"}。"},
+	{"POST", "/certificate-configs/:id/test", "证书", "测试 DNS 提供商配置", `{"domain":"example.com"}`, `{"code":0,"message":"凭证有效"}`, []string{"400 invalid_credentials", "403 forbidden", "404 not_found", "428 mfa_step_up_required"}, "测试成功/失败都会记录操作日志，不记录凭证。"},
 	{"GET", "/ca-providers", "证书", "CA 提供商列表", "", `[{"id":1,"name":"Let's Encrypt","provider":"letsencrypt","enabled":true}]`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/ca-providers/:id", "证书", "CA 提供商详情", "", `{"code":0,"data":{"id":1,"name":"Let's Encrypt","provider":"letsencrypt","enabled":true}}`, []string{"400 invalid_request", "404 not_found"}, "所有已登录用户可读。"},
-	{"PUT", "/ca-providers/:id", "证书", "更新 CA 提供商", `{"name":"Let's Encrypt","enabled":true}`, `{"code":0,"message":"CA provider updated"}`, []string{"400 invalid_request", "404 not_found"}, ""},
-	{"POST", "/ca-providers/:id/test", "证书", "测试 CA 提供商", "", `{"code":0,"message":"CA 提供商配置有效"}`, []string{"400 test_failed", "403 admin_required", "404 not_found"}, "测试成功/失败都会记录操作日志。"},
-	{"GET", "/certificates/jobs", "证书", "证书任务列表", "", `[{"id":1,"rule_id":"lb_...","domain":"example.com","status":"issued","ca_provider_name":"Let's Encrypt"}]`, []string{"401 unauthenticated"}, "可用 query rule_id 过滤；page/page_size 分页（默认 1/50，page_size≤200）。"},
+	{"PUT", "/ca-providers/:id", "证书", "更新 CA 提供商", `{"name":"Let's Encrypt","enabled":true}`, `{"code":0,"message":"CA provider updated"}`, []string{"400 invalid_request", "403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "428 mfa_step_up_required"}, ""},
+	{"POST", "/ca-providers/:id/test", "证书", "测试 CA 提供商", "", `{"code":0,"message":"CA 提供商配置有效"}`, []string{"400 test_failed", "403 admin_required", "404 not_found", "428 mfa_step_up_required"}, "测试成功/失败都会记录操作日志。"},
+	{"GET", "/certificates/jobs", "证书", "证书任务列表", "", `{"list":[` + certJobListItemExample + `],"total":1,"page":1,"page_size":50,"status_counts":{"issued":1}}`, []string{"401 unauthenticated", "400 invalid_pagination"}, "可用 query rule_id 过滤；page/page_size 分页（默认 1/50，page_size≤200）；非整数返回 400，超上限钳到上限（page≤1000、page_size≤200）。响应 data 为对象：list/total/page/page_size/status_counts。每条任务含 expires_at（库值，导入/集群回插可能为 null）、not_after（真实到期时刻：expires_at 缺失时按 PEM 派生，RFC3339）、days_remaining 与 certificate_status——展示到期/自动重签时间应以 not_after 为准。retry_cooldown_seconds 为下发时刻的剩余重试冷却：0=现在即可重试，正数=还需等待的秒数，null=永久不可重试（已断言按 updated_at 扣减，客户端不得二次扣减）。"},
 	{"POST", "/certificates/jobs/current", "证书", "批量查询规则当前证书任务", `{"rule_ids":["lb_..."]}`, `{"code":0,"data":{"lb_...":{"id":1,"rule_id":"lb_...","status":"issued"}}}`, []string{"400 invalid_request", "401 unauthenticated"}, "每个规则返回最新一条非禁用任务（最多 200 个 rule_ids），供规则列表轮询任务状态。"},
-	{"POST", "/certificates/jobs/:id/retry", "证书", "重试证书任务", "", `{"code":0,"message":"Retry triggered"}`, []string{"404 not_found", "409 rule_disabled_or_queue_paused", "429 retry_guard", "500 queue_unavailable"}, ""},
-	{"DELETE", "/certificates/jobs/:id", "证书", "删除证书任务", "", `{"code":0,"message":"Job deleted"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found"}, ""},
-	{"POST", "/certificates/issue", "证书", "触发 ACME 签发流程", `{"caddy_id":"lb_...","domain":"example.com"}`, `{"code":0,"message":"已创建 1 个签发任务","data":{"queued":1}}`, []string{"400 invalid_request_or_rule", "403 非管理员用户只读(主节点)/从节点只读", "404 rule_not_found", "429 issuance_in_progress", "500 queue_or_storage_failure"}, "请求体必填其一：caddy_id（定向签发，domain 可选且须与规则域名集合一致）或 {\"all\":true}（全量重签，含已签发任务，将消耗 CA 配额并触发 DNS 变更）；两者同传以 caddy_id 为准。该接口仅触发流程，不表示签发完成。"},
-	{"POST", "/certificates/parse", "证书", "解析证书", `{"cert_pem":"...","key_pem":"..."}`, `{"domain":"example.com","valid":true}`, []string{"400 invalid_certificate"}, "证书材料不写入审计。"},
-	{"GET", "/cluster/status", "集群", "当前节点集群状态", "", `{"code":0,"message":"查询成功","data":{"node_mode":"master","cluster_version":3,"master_url":"","sync_interval":60,"cluster_active":true,"applied_version":0,"last_sync_at":"","last_sync_error":"","pending_count":1,"approved_count":2}}`, []string{"401 未登录"}, "JWT 或 API Key。主节点返回待审批和已批准节点计数。"},
-	{"GET", "/cluster/nodes", "集群", "主节点查看从节点", "", `{"code":0,"data":[{"id":2,"name":"slave-a","ip_address":"10.0.0.2","port":8000,"access_url":"http://127.0.0.1:8001","status":"online","is_approved":true,"reported_version":3,"current_version":3,"health":{"caddy_ok":true,"rules_count":5,"certs_expiring_30d":0,"last_sync_at":"2026-07-18T12:00:00Z","last_sync_error":"","uptime_sec":3600},"last_seen":"2026-07-18T12:00:00Z","created_at":"2026-07-18T11:00:00Z"}]}`, []string{"401 unauthenticated"}, "所有已认证用户可读；接受 JWT 或 API Key，仅主节点返回节点列表；离线状态按 last_seen 超过 2×sync_interval 在读取时计算。"},
-	{"POST", "/cluster/register-tokens", "集群", "生成一次性注册令牌", "", `{"code":0,"message":"注册令牌已生成，仅显示一次","data":{"token":"...","expires_at":"2026-07-18T12:30:00Z"}}`, []string{"403 仅主节点管理员"}, "admin JWT 或管理员 API Key；明文仅返回一次，服务端仅保存 SHA-256 哈希，30 分钟过期。"},
-	{"POST", "/cluster/register", "集群机器接口", "从节点注册", `{"token":"...","name":"slave-a","ip_address":"10.0.0.2","port":8000,"access_url":"http://127.0.0.1:8001"}`, `{"code":0,"message":"注册成功，等待主节点审批","data":{"registration_id":2,"registration_secret":"..."}}`, []string{"429 请求过于频繁", "401 注册令牌无效或已过期"}, "不使用 JWT；access_url 可选；注册令牌一次性。相同 IP+端口待审批注册幂等更新。"},
-	{"GET", "/cluster/register/:id/status", "集群机器接口", "轮询注册审批状态", "", `{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_..."}}`, []string{"400 注册编号无效", "401 注册凭证无效"}, "X-Registration-Secret 或 Bearer registration_secret；审批后可在交付确认前重复领取 cluster_token。从节点持久化 cluster_token 后调用注册交付确认接口，确认成功立即使 registration_secret 失效。"},
-	{"POST", "/cluster/registration/confirm", "集群机器接口", "确认集群令牌交付", "", `{"code":0,"message":"集群注册已确认"}`, []string{"401 集群凭证无效", "403 仅主节点"}, "X-Cluster-Token 或 Bearer cluster token；从节点持久化令牌后调用，立即清除 registration_secret。"},
-	{"POST", "/cluster/nodes/:id/approve", "集群", "批准待审批节点", "", `{"code":0,"message":"审批节点成功"}`, []string{"403 仅主节点管理员", "404 节点不存在"}, "admin JWT 或管理员 API Key；签发节点专属长期集群令牌，仅保存 SHA-256 哈希。"},
-	{"POST", "/cluster/nodes/:id/reject", "集群", "拒绝待审批节点", "", `{"code":0,"message":"拒绝节点成功"}`, []string{"403 仅主节点管理员", "404 节点不存在"}, "admin JWT 或管理员 API Key；删除节点记录。"},
-	{"POST", "/cluster/nodes/:id/login-ticket", "集群", "生成登录票据", "", `{"ticket":"...","url":"https://10.0.0.2:8000"}`, []string{"403 仅主节点管理员(登录从节点需先启用 MFA)", "404 节点不存在或不在线", "428 mfa_step_up_required(JWT 非 OIDC 且超 60s 未验码)"}, "admin JWT 或管理员 API Key；票据 90 秒有效且只能使用一次(时钟偏移预留)。客户端必须将返回地址拼接为 URL#login_ticket=<percent-encoded-ticket>；从节点消费后无论成功或失败都必须清除 fragment。"},
-	{"POST", "/cluster/nodes/:id/service", "集群", "控制从节点服务", `{"action":"restart_caddy"}`, `{"code":0,"message":"Caddy 已重启"}`, []string{"400 不支持的服务控制动作", "403 仅主节点管理员", "404 节点不存在", "502 从节点执行失败"}, "admin JWT 或管理员 API Key；action: start_caddy/stop_caddy/restart_caddy/restart_app。主节点签发 90 秒一次性 HMAC 服务控制票据并转发从节点执行，主从两侧均记录操作日志；restart_app 从节点立即应答后由容器重启策略拉起。"},
-	{"POST", "/cluster/nodes/:id/forget-pin", "集群", "清除节点证书指纹钉", "", `{"code":0,"message":"已清除该节点的证书指纹，下次服务控制将按其当前证书重新钉扎"}`, []string{"403 仅主节点管理员", "404 节点不存在"}, "admin JWT 或管理员 API Key；主节点侧单节点 TOFU 指纹钉重置（与 /cluster/forget-pins 对称）：从节点更换管理面板证书后服务控制持续指纹不匹配时，按该节点访问地址定位并删除 pin 文件，下次服务控制按从节点当前证书重新钉扎；操作留审计。"},
-	{"POST", "/cluster/service-control", "集群机器接口", "从节点执行服务控制", `{"action":"stop_caddy","ticket":"base64url(payload).base64url(signature)"}`, `{"code":0,"message":"Caddy 已停止"}`, []string{"429 请求过于频繁", "400 invalid_request", "401 服务控制票据无效或已过期"}, "由主节点调用；凭 90 秒一次性 HMAC-SHA256 票据授权（密钥为集群令牌哈希，与动作和目标节点绑定，防重放），不使用集群令牌头。"},
-	{"PUT", "/cluster/nodes/:id/access-url", "集群", "更新从节点访问地址", `{"access_url":"http://127.0.0.1:8001"}`, `{"code":0,"message":"更新访问地址节点成功"}`, []string{"400 地址格式无效", "403 仅主节点管理员", "404 节点不存在"}, "admin JWT 或管理员 API Key；access_url 允许置空，登录票据将回退到 protocol://ip_address:port。"},
-	{"DELETE", "/cluster/nodes/:id", "集群", "移除集群节点", "", `{"code":0,"message":"删除节点成功"}`, []string{"403 仅主节点管理员", "404 节点不存在"}, "admin JWT 或管理员 API Key；删除节点及其长期令牌哈希。"},
-	{"POST", "/cluster/mode", "集群", "主节点注册并切换为从节点", `{"mode":"slave","master_url":"https://master:8000","register_token":"...","node_name":"slave-a"}`, `{"code":0,"message":"已切换为从节点，等待主节点审批"}`, []string{"400 参数无效", "502 向目标主节点注册失败"}, "admin JWT 或管理员 API Key；仅在目标主节点注册成功后持久化 slave。http:// 地址成功但 message 包含明文传输警告。"},
-	{"POST", "/cluster/promote", "集群", "从节点提升为主节点", "", `{"code":0,"message":"已提升为主节点"}`, []string{"500 提升失败"}, "admin JWT 或管理员 API Key；清空主节点地址与集群令牌、重置同步残留状态（应用版本/指纹/错误）并停止同步，启动 ACME 与自动备份调度器、CRS/IP2Region 自动更新转主角色，清理旧主节点证书指纹钉；不递增集群版本。"},
-	{"PUT", "/cluster/settings", "集群", "更新集群设置", `{"sync_interval":60,"sync_users":true,"sync_rules":true,"sync_security":true}`, `{"code":0,"message":"集群设置已更新"}`, []string{"400 参数无效/恒同步项禁用", "403 从节点只读（全部集群设置）"}, "admin JWT 或管理员 API Key；三类同步开关默认全开：系统数据（含全局配置，恒同步不可禁用——置 false 返回 400）/负载规则/安全防护（含 CRS/IP2Region 规则库，文件哈希一致时跳过传输）；旧版 sync_global_config/sync_waf_files 字段已随三分类合并移除。从节点逐节比对哈希，一致跳过并记录操作日志。仅主节点可改。"},
-	{"GET", "/cluster/sync/snapshot", "集群机器接口", "拉取全量集群快照", "", fmt.Sprintf(`{"code":0,"data":{"schema_version":%d,"min_reader_version":%d,"version":3,"fingerprint":"sha256","signature":"hmac-sha256","rules":[],"users":[],"api_keys":[],"basic_settings":{},"certs":[]}}`, services.CurrentSnapshotSchema, services.CurrentSnapshotSchema), []string{"400 快照缺少签名", "401 集群凭证无效"}, "X-Cluster-Token 或 Bearer cluster token；query: since_version,fingerprint。schema_version 表示快照结构版本，min_reader_version 表示可读取该快照的最低实现版本；signature 为以节点令牌为键的 HMAC-SHA256（含版本号），从节点强制验签并拒绝版本回退。用户密码哈希、API key 哈希和证书私钥只通过此机器接口传输。"},
-	{"GET", "/cluster/sync/waf-files", "集群机器接口", "按需拉取安全数据包", "", `{"code":0,"data":{"crs_version":"v4.28.0","crs_sha256":"...","ip2region_version":"v3.17.0","ip2region_sha256":"...","crs_tar_gz":"...","xdb":"..."}}`, []string{"401 集群凭证无效", "404 主节点无安全数据"}, "X-Cluster-Token；快照只携带文件哈希引用，从节点本地哈希不一致时才调用本端点拉取完整 CRS 规则树与 GeoIP 数据库，内容与快照引用哈希核验后落盘。"},
-	{"POST", "/cluster/sync/pull", "集群", "从节点立即同步", "", `{"code":0,"message":"手动同步完成","data":{"applied_version":3,"changed":true}}`, []string{"500 同步失败"}, "admin JWT 或管理员 API Key；有变更记录应用版本，无变更记录「配置无变化」，均写入操作日志。"},
-	{"POST", "/cluster/forget-pins", "集群", "清除主节点证书指纹钉", "", `{"code":0,"message":"已清除全部主节点证书指纹，下次同步将按当前证书重新钉扎"}`, []string{"400 主节点调用(本端点仅从节点使用)", "500 清除失败"}, "admin JWT 或管理员 API Key；从节点 PinMismatch 补救：清空 TOFU 指纹（内存+磁盘），下次同步重新钉扎；操作留审计。"},
-	{"POST", "/cluster/nodes/report", "集群机器接口", "从节点上报健康状态", `{"applied_version":3,"service_status":"ok","health":{"caddy_ok":true,"rules_count":5,"certs_expiring_30d":0,"last_sync_at":"2026-07-18T12:00:00Z","last_sync_error":"","uptime_sec":3600},"last_sync_at":"2026-07-18T12:00:00Z","last_sync_error":""}`, `{"code":0,"message":"节点状态已更新"}`, []string{"401 集群凭证无效"}, "X-Cluster-Token 或 Bearer cluster token。"},
-	{"GET", "/caddy/status", "Caddy", "Caddy 状态", "", `{"status":"running","apply_error":"","config_consistent":"true","config_drift":"","config_drift_since":""}`, []string{}, "apply_error 为最近一次配置应用失败的持久化原因（空表示正常；失败保留旧配置运行，成功后清空）。config_consistent=false 时 config_drift 为漂移主文案（缺失/多余规则路由）、config_drift_since 为首次检测时间（UTC），一致时两者均为空串。"},
-	{"GET", "/caddy/config", "Caddy", "当前 Caddy 配置", "", `{...}`, []string{"500 caddy_unavailable"}, ""},
-	{"PUT", "/caddy/config", "Caddy", "直接更新 Caddy 配置", `{...}`, `{"code":0,"message":"配置已保存（注意：自定义配置为一次性逃生口，任何后续规则/配置变更或集群同步都会以数据库生成的权威配置覆盖它）"}`, []string{"400 config_invalid", "403 admin_required", "500 save_or_apply_failed"}, "一次性逃生口：任何后续配置变更都会以数据库生成的权威配置覆盖它。仅管理员。"},
-	{"POST", "/caddy/start", "Caddy", "启动 Caddy", "", `{"code":0,"message":"Caddy 已启动"}`, []string{"500 start_failed", "403 admin_required"}, "仅管理员。"},
-	{"POST", "/caddy/stop", "Caddy", "停止 Caddy", "", `{"code":0,"message":"Caddy 已停止"}`, []string{"500 stop_failed", "403 admin_required"}, "仅管理员。"},
-	{"POST", "/caddy/restart", "Caddy", "重启 Caddy", "", `{"code":0,"message":"Caddy 已重启"}`, []string{"500 restart_failed", "403 admin_required"}, "仅管理员。"},
-	{"GET", "/admin-tls", "系统", "管理面板 HTTPS 配置", "", `{"enabled":true,"mode":"selfsigned"}`, []string{"401 unauthenticated"}, "不返回证书内容。"},
-	{"PUT", "/admin-tls", "系统", "启用/禁用管理面板 HTTPS", `{"enabled":true,"mode":"selfsigned"}`, `{"code":0,"message":"已保存，服务正在重启以应用 HTTPS 配置"}`, []string{"400 invalid_request", "403 admin_required", "413 body_exceeds_2MiB"}, "multipart 表单；亦接受 application/json（cert_file/key_file 为 PEM 字符串）。mode=selfsigned 或 upload（upload 需 cert_file/key_file 文件字段）。请求体超过 2 MiB 返回 413。保存后服务自动重启，从节点同步后亦自动重启。"},
-	{"POST", "/admin-tls/inspect", "系统", "解析上传证书信息（不保存）", `"multipart form: cert_file, key_file"`, `{"domain":"example.com","issuer":"Let's Encrypt","not_after":"2027-01-01 00:00:00","days_left":365}`, []string{"400 invalid_certificate", "413 body_exceeds_2MiB"}, "亦接受 application/json（cert_file/key_file 为 PEM 字符串）；仅解析并返回证书信息，供保存前展示。请求体超过 2 MiB 返回 413。"},
-	{"POST", "/system/restart", "系统", "重启服务", "", `{"code":0,"message":"服务正在重启"}`, []string{"403 admin_required"}, "进程退出后由容器重启策略拉起，用于应用进程级配置（如 Caddy 日志时区）。"},
-	{"GET", "/system/logs", "系统", "读取应用运行日志", "", `{"content":"..."}`, []string{"401 unauthenticated"}, "运行日志恒写文件(内建轮转),LOG_FILE 仅覆盖路径。"},
-	{"GET", "/rules/:caddy_id/logs", "规则", "规则访问日志（最近 1000 行）", "", `{"content":"...","offset":12345}`, []string{}, "需规则开启访问日志；offset 为尾部结束位置，供 log-stream 续读。规则不存在或未启用日志时返回空内容。"},
-	{"GET", "/rules/:caddy_id/log-stream", "规则", "规则日志增量流", "", `{"offset":12456,"lines":["{...}"]}`, []string{}, "query: offset（字节偏移，上次返回值）。返回 offset 之后的新日志行与新 offset，供前端增量统计，无服务端状态。规则不存在或未启用日志时返回空内容。"},
-	{"GET", "/rules/:caddy_id/caddy-config", "规则", "单规则 Caddy 配置预览", "", `{...}`, []string{"404 not_found"}, ""},
+	{"POST", "/certificates/jobs/:id/retry", "证书", "重试证书任务", "", `{"code":0,"message":"Retry triggered"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "409 import_in_progress（配置导入进行中，暂不能重试证书任务）", "409 retired_job（已退役的证书任务不能重试；请先禁用再启用该规则以重新创建签发任务）", "409 rule_disabled_or_queue_paused", "409 state_changed（并发窗：任务状态已变更，请刷新后重试）", "409 in_flight（任务正在签发队列中，请勿重复操作）", "429 retry_guard", "500 queue_unavailable（CA 队列管理器未初始化）", "500 enqueue_failed（重试入队失败）", "500 status_read_failed（并发窗：读取任务状态失败）", "409/500 deployment_retry_failed（部署重排登记失败——409 上一次部署回调仍在退出中，已登记自动部署，稍后自动执行；409 规则证书操作被屏障阻塞（规则正在删除或更新），已登记自动部署，请稍后重试；409 部署重试未触发（证书签发队列已停止/规则状态冲突/规则屏障）；已登记自动部署，恢复后自动执行；500 触发重新部署失败；已登记自动部署，稍后自动执行）", "428 mfa_step_up_required"}, "CA 退避窗口（failed/waiting_ca 行的 ca_available_after）未到期时需显式 ?force=true 越过（前端确认对话框后携带），否则 429 并提示剩余冷却时长。部署生命周期（证书材料已在库）行重试不重签：直接登记立即重新部署；登记失败按 deployment_retry_failed 族返回 409/500，期间自动部署会接管。"},
+	{"DELETE", "/certificates/jobs/:id", "证书", "删除证书任务", "", `{"code":0,"message":"Job deleted"}`, []string{"403 非管理员用户只读(主节点)/从节点只读", "404 not_found", "409 rule_auto_issuance_or_job_state_conflict", "428 mfa_step_up_required"}, "规则仍启用自动签发或任务状态不允许删除时返回 409，不可盲目重试。"},
+	{"POST", "/certificates/issue", "证书", "触发 ACME 签发流程", `{"caddy_id":"lb_...","domain":"example.com"}`, `{"code":0,"message":"已创建 1 个签发任务","data":{"queued":1}}`, []string{"400 invalid_request_or_rule（批量目标数 >500 同属 400，请分批）", "403 非管理员用户只读(主节点)/从节点只读", "404 rule_not_found", "409 queue_paused_or_all_skipped", "429 issuance_in_progress", "500 queue_or_storage_failure", "428 mfa_step_up_required"}, "请求体必填其一：caddy_id（定向签发，domain 可选且须与规则域名集合一致）或 {\"all\":true}（全量重签，含已签发任务，将消耗 CA 配额并触发 DNS 变更）；两者同传以 caddy_id 为准。目标任务处于 CA 退避窗口（failed/waiting_ca 行携带的 ca_available_after）且未到期时需显式 ?force=true 越过，否则 429；省略或 false 不越过。批量形态单次最多匹配 500 个 ACME 规则（每个规则的全部域名一并签发），超出返回 400 并提示分批执行；拒绝发生在获取全局操作锁之前。该接口仅触发流程，不表示签发完成。目标任务若处于部署生命周期（downloaded/cleanup_dns/cleanup_warning）且证书材料在库，接口只触发重新部署而不重新签发（已签发证书不会丢弃、不消耗 CA 配额）。响应 data 的 redeployed 同名不同类型，客户端必须按请求形态解析：定向形态只触发重新部署时 data={\"queued\":0,\"redeployed\":true}（布尔；正常入队时无该键），批量形态（{\"all\":true}）data.redeployed 恒为整数计数，如 data={\"queued\":2,\"redeployed\":0,...}（0=没有任何目标只差部署）。"},
+	{"POST", "/certificates/parse", "证书", "解析证书", `{"cert_pem":"...","key_pem":"..."}`, `{"domain":"example.com","valid":true}`, []string{"400 invalid_certificate", "413 body_exceeds_2MiB"}, "证书与私钥合计请求体上限 2 MiB，超限返回 413；证书材料不写入审计。"},
+	{"GET", "/cluster/status", "集群", "当前节点集群状态", "", `{"code":0,"message":"查询成功","data":{"node_mode":"master","cluster_version":3,"master_url":"","sync_interval":60,"sync_users":true,"sync_rules":true,"sync_security":true,"cluster_active":true,"applied_version":0,"last_sync_at":"","last_sync_error":"","pending_count":1,"approved_count":2,"transport_insecure":false}}`, []string{"401 未登录"}, "JWT 或 API Key。主节点返回待审批和已批准节点计数。sync_users/sync_rules/sync_security 为三类同步开关（系统数据恒同步）；transport_insecure=true 表示从节点→主节点链路为明文 HTTP（快照承载私钥与凭证，常驻提示）；sync_error_code 仅在同步失败时下发（omitempty，成功/无错误时无此键）。"},
+	{"GET", "/cluster/nodes", "集群", "主节点查看从节点", "", `{"code":0,"data":[{"id":2,"name":"slave-a","ip_address":"10.0.0.2","port":8000,"protocol":"https","access_url":"http://127.0.0.1:8001","status":"online","is_approved":true,"reported_version":3,"current_version":3,"health":{"caddy_ok":true,"rules_count":5,"certs_expiring_30d":0,"last_sync_at":"2026-07-18T12:00:00Z","last_sync_error":"","uptime_sec":3600},"last_seen":"2026-07-18T12:00:00Z","created_at":"2026-07-18T11:00:00Z","server_map_lat":31.23,"server_map_lon":121.47,"site_inherited":true}]}`, []string{"401 unauthenticated"}, "所有已认证用户可读；接受 JWT 或 API Key，仅主节点返回节点列表；离线状态按 last_seen 超过 2×sync_interval 在读取时计算。"},
+	{"POST", "/cluster/register-tokens", "集群", "生成一次性注册令牌", "", `{"code":0,"message":"注册令牌已生成，仅显示一次","data":{"token":"...","expires_at":"2026-07-18T12:30:00Z"}}`, []string{"403 仅主节点管理员", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；明文仅返回一次，服务端仅保存 SHA-256 哈希，30 分钟过期。"},
+	{"POST", "/cluster/register", "集群机器接口", "从节点注册", `{"token":"...","name":"slave-a","ip_address":"10.0.0.2","port":8000,"access_url":"http://127.0.0.1:8001"}`, `{"code":0,"message":"注册成功，等待主节点审批","data":{"registration_id":2,"registration_secret":"..."}}`, []string{"429 rate_limited(30/min/IP)", "401 注册令牌无效或已过期"}, "不使用 JWT；access_url 可选；注册令牌一次性。相同 IP+端口待审批注册幂等更新。限流超限返回 429，客户端须退避重试。"},
+	{"GET", "/cluster/register/:id/status", "集群机器接口", "轮询注册审批状态", "", `{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_..."}}`, []string{"400 注册编号无效", "401 注册凭证无效", "429 集群机器接口请求过于频繁（仅 401 失败尝试计入：30/min/凭证、300/min/IP；成功请求回滚额度）"}, "X-Registration-Secret 或 Bearer registration_secret；审批后可在交付确认前重复领取 cluster_token。从节点持久化 cluster_token 后调用注册交付确认接口，确认成功立即使 registration_secret 失效。限流超限返回 429，客户端须退避重试。"},
+	{"POST", "/cluster/registration/confirm", "集群机器接口", "确认集群令牌交付", "", `{"code":0,"message":"集群注册已确认"}`, []string{"401 集群凭证无效", "403 仅主节点", "429 集群机器接口请求过于频繁（仅 401 失败尝试计入：30/min/凭证、300/min/IP；成功请求回滚额度）"}, "X-Cluster-Token 或 Bearer cluster token；从节点持久化令牌后调用，立即清除 registration_secret。限流超限返回 429，客户端须退避重试。"},
+	{"POST", "/cluster/nodes/:id/approve", "集群", "批准待审批节点", "", `{"code":0,"message":"审批节点成功"}`, []string{"403 仅主节点管理员", "404 节点不存在", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；签发节点专属长期集群令牌，仅保存 SHA-256 哈希。"},
+	{"POST", "/cluster/nodes/:id/reject", "集群", "拒绝待审批节点", "", `{"code":0,"message":"拒绝节点成功"}`, []string{"403 仅主节点管理员", "404 节点不存在", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；删除节点记录。"},
+	{"POST", "/cluster/nodes/:id/login-ticket", "集群", "生成登录票据", "", `{"ticket":"...","url":"https://10.0.0.2:8000"}`, []string{"403 仅主节点管理员(登录从节点需先启用 MFA)", "404 节点不存在", "409 节点尚未完成令牌交付(已批准但从节点未回传集群令牌) 或节点不在线", "428 mfa_step_up_required(JWT 非 OIDC 且超 60s 未验码)"}, "admin JWT 或管理员 API Key；票据 90 秒有效且只能使用一次(时钟偏移预留)。客户端必须将返回地址拼接为 URL#login_ticket=<percent-encoded-ticket>；从节点消费后无论成功或失败都必须清除 fragment。"},
+	{"POST", "/cluster/nodes/:id/service", "集群", "控制从节点服务", `{"action":"restart_caddy"}`, `{"code":0,"message":"Caddy 已重启"}`, []string{"400 不支持的服务控制动作", "403 仅主节点管理员", "404 节点不存在", "409 节点尚未完成令牌交付(已批准但从节点未回传集群令牌)", "502 从节点执行失败", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；action: start_caddy/stop_caddy/restart_caddy/restart_app。主节点签发 90 秒一次性 HMAC 服务控制票据并转发从节点执行，主从两侧均记录操作日志；restart_app 从节点立即应答后由容器重启策略拉起。"},
+	{"POST", "/cluster/nodes/:id/forget-pin", "集群", "清除节点证书指纹钉", "", `{"code":0,"message":"已清除该节点的证书指纹，下次服务控制将按其当前证书重新钉扎"}`, []string{"403 仅主节点管理员", "404 节点不存在", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；主节点侧单节点 TOFU 指纹钉重置（与 /cluster/forget-pins 对称）：从节点更换管理面板证书后服务控制持续指纹不匹配时，按该节点访问地址定位并删除 pin 文件，下次服务控制按从节点当前证书重新钉扎；操作留审计。"},
+	{"POST", "/cluster/service-control", "集群机器接口", "从节点执行服务控制", `{"action":"stop_caddy","ticket":"base64url(payload).base64url(signature)"}`, `{"code":0,"message":"Caddy 已停止"}`, []string{"429 rate_limited(20/min/IP)", "400 invalid_request", "401 服务控制票据无效或已过期"}, "由主节点调用；凭 90 秒一次性 HMAC-SHA256 票据授权（密钥为集群令牌哈希，与动作和目标节点绑定，防重放），不使用集群令牌头。"},
+	{"PUT", "/cluster/nodes/:id/access-url", "集群", "更新从节点访问地址", `{"access_url":"http://127.0.0.1:8001"}`, `{"code":0,"message":"更新访问地址节点成功"}`, []string{"400 地址格式无效", "403 仅主节点管理员", "404 节点不存在", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；access_url 允许置空，登录票据将回退到 protocol://ip_address:port。"},
+	{"PUT", "/cluster/nodes/:id/site", "集群", "更新从节点大屏站点坐标", `{"server_map_lat":31.23,"server_map_lon":121.47}`, `{"code":0,"message":"节点站点坐标已保存","data":{"server_map_lat":31.23,"server_map_lon":121.47}}`, []string{"400 invalid_request", "403 仅主节点管理员", "404 节点不存在", "428 mfa_step_up_required"}, "主节点为指定从节点配置威胁大屏本站信标位置；0,0=未设置。保存后 bump cluster_version，从节点下一同步周期按 registration_id 应用自己的坐标，其他节点不受影响。admin JWT 或管理员 API Key。"},
+	{"DELETE", "/cluster/nodes/:id", "集群", "移除集群节点", "", `{"code":0,"message":"删除节点成功"}`, []string{"403 仅主节点管理员", "404 节点不存在", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；删除节点及其长期令牌哈希。"},
+	{"POST", "/cluster/mode", "集群", "主节点注册并切换为从节点", `{"mode":"slave","master_url":"https://master:8000","register_token":"...","node_name":"slave-a"}`, `{"code":0,"message":"已切换为从节点，等待主节点审批"}`, []string{"400 参数无效", "403 仅主节点管理员", "502 向目标主节点注册失败", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；仅在目标主节点注册成功后持久化 slave。http:// 地址成功但 message 包含明文传输警告。"},
+	{"POST", "/cluster/promote", "集群", "从节点提升为主节点", "", `{"code":0,"message":"已提升为主节点"}`, []string{"403 仅主节点管理员", "500 提升失败", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；清空主节点地址与集群令牌、重置同步残留状态（应用版本/指纹/错误）并停止同步，任务引擎按主角色恢复 ACME、自动备份调度器与规则库更新调度，清理旧主节点证书指纹钉；不递增集群版本。"},
+	{"PUT", "/cluster/settings", "集群", "更新集群设置", `{"sync_interval":60,"sync_users":true,"sync_rules":true,"sync_security":true}`, `{"code":0,"message":"集群设置已更新"}`, []string{"400 参数无效/恒同步项禁用", "403 从节点只读（全部集群设置）", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；三类同步开关默认全开：系统数据（含全局配置，恒同步不可禁用——置 false 返回 400）/负载规则/安全防护（含 CRS/IP2Region 规则库，文件哈希一致时跳过传输）；旧版 sync_global_config/sync_waf_files 字段已随三分类合并移除。从节点逐节比对哈希，一致跳过并记录操作日志。仅主节点可改。"},
+	{"GET", "/cluster/sync/snapshot", "集群机器接口", "拉取全量集群快照", "", fmt.Sprintf(`{"code":0,"data":{"schema_version":%d,"min_reader_version":%d,"version":3,"fingerprint":"sha256","signature":"hmac-sha256","rules":[],"users":[],"api_keys":[],"basic_settings":{},"certs":[]}}`, services.CurrentSnapshotSchema, services.CurrentSnapshotSchema), []string{"400 快照缺少签名", "401 集群凭证无效", "429 集群机器接口请求过于频繁（仅 401 失败尝试计入：30/min/凭证、300/min/IP；成功请求回滚额度）"}, "X-Cluster-Token 或 Bearer cluster token；query: since_version,fingerprint。schema_version 表示快照结构版本，min_reader_version 表示可读取该快照的最低实现版本；signature 为以节点令牌为键的 HMAC-SHA256（含版本号），从节点强制验签并拒绝版本回退。用户密码哈希、API key 哈希和证书私钥只通过此机器接口传输。"},
+	{"GET", "/cluster/sync/waf-files", "集群机器接口", "按需拉取安全数据包", "", `{"code":0,"data":{"crs_version":"v4.28.0","crs_sha256":"...","ip2region_version":"v3.17.0","ip2region_sha256":"...","crs_tar_gz":"...","xdb":"..."}}`, []string{"401 集群凭证无效", "404 主节点无安全数据", "429 集群机器接口请求过于频繁（仅 401 失败尝试计入：30/min/凭证、300/min/IP；成功请求回滚额度）"}, "X-Cluster-Token；快照只携带文件哈希引用，从节点本地哈希不一致时才调用本端点拉取完整 CRS 规则树与 GeoIP 数据库，内容与快照引用哈希核验后落盘。限流超限返回 429，客户端须退避重试。"},
+	{"POST", "/cluster/sync/pull", "集群", "从节点立即同步", "", `{"code":0,"message":"手动同步完成","data":{"applied_version":3,"changed":true}}`, []string{"403 仅主节点管理员", "500 同步失败", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；有变更记录应用版本，无变更记录「配置无变化」，均写入操作日志。"},
+	{"POST", "/cluster/forget-pins", "集群", "清除主节点证书指纹钉", "", `{"code":0,"message":"已清除全部主节点证书指纹，下次同步将按当前证书重新钉扎"}`, []string{"400 主节点调用(本端点仅从节点使用)", "403 仅主节点管理员", "500 清除失败", "428 mfa_step_up_required"}, "admin JWT 或管理员 API Key；从节点 PinMismatch 补救：清空 TOFU 指纹（内存+磁盘），下次同步重新钉扎；操作留审计。"},
+	{"POST", "/cluster/nodes/report", "集群机器接口", "从节点上报健康状态", `{"applied_version":3,"service_status":"ok","health":{"caddy_ok":true,"rules_count":5,"certs_expiring_30d":0,"last_sync_at":"2026-07-18T12:00:00Z","last_sync_error":"","uptime_sec":3600},"last_sync_at":"2026-07-18T12:00:00Z","last_sync_error":""}`, `{"code":0,"message":"节点状态已更新"}`, []string{"401 集群凭证无效", "429 集群机器接口请求过于频繁（仅 401 失败尝试计入：30/min/凭证、300/min/IP；成功请求回滚额度）"}, "X-Cluster-Token 或 Bearer cluster token。限流超限返回 429，客户端须退避重试。"},
+	{"GET", "/caddy/status", "Caddy", "Caddy 状态", "", `{"status":"running","pid":"1234","apply_error":"","background_apply_error":"","config_consistent":"true","config_drift":"","config_drift_since":""}`, []string{}, "apply_error 为最近一次配置应用失败的持久化原因（空表示正常；失败保留旧配置运行，成功后清空）；background_apply_error 为后台数据类重载失败横幅（证书部署/CRS/IP2Region/威胁库/自动封禁库已更新但运行配置未收敛，与保存失败分开呈现）。pid 为 Caddy 进程号（未运行时为 0）。config_consistent=false 时 config_drift 为漂移主文案（缺失/多余规则路由）、config_drift_since 为首次检测时间（UTC），一致时两者均为空串。"},
+	{"GET", "/caddy/config", "Caddy", "当前 Caddy 配置（原始运行配置）", "", `{"apps":{"admin":{"listen":"localhost:2019"},"http":{"servers":{}}}}`, []string{"403 admin_required", "500 caddy_unavailable"}, "仅管理员（含仅管理员 API Key）：原始运行配置可能含经 PUT /caddy/config 逃生口写入的内联私钥或敏感 header，非管理员与只读 API Key 一律 403。"},
+	{"PUT", "/caddy/config", "Caddy", "直接更新 Caddy 配置", `{"content":"{\"apps\":{\"http\":{\"servers\":{}}}}"}`, `{"code":0,"message":"配置已保存（注意：自定义配置为一次性逃生口，任何后续规则/配置变更或集群同步都会以数据库生成的权威配置覆盖它）"}`, []string{"400 config_invalid", "403 slave_or_admin_required（从节点只读 / 非管理员只读）", "500 save_or_apply_failed", "428 mfa_step_up_required"}, "一次性逃生口：任何后续配置变更都会以数据库生成的权威配置覆盖它。仅管理员。"},
+	{"POST", "/caddy/start", "Caddy", "启动 Caddy", "", `{"code":0,"message":"Caddy 已启动"}`, []string{"500 start_failed", "403 admin_required", "428 mfa_step_up_required"}, "仅管理员。"},
+	{"POST", "/caddy/stop", "Caddy", "停止 Caddy", "", `{"code":0,"message":"Caddy 已停止"}`, []string{"500 stop_failed", "403 admin_required", "428 mfa_step_up_required"}, "仅管理员。"},
+	{"POST", "/caddy/restart", "Caddy", "重启 Caddy", "", `{"code":0,"message":"Caddy 已重启"}`, []string{"500 restart_failed", "403 admin_required", "428 mfa_step_up_required"}, "仅管理员。"},
+	{"GET", "/admin-tls", "系统", "管理面板 HTTPS 配置", "", `{"enabled":true,"mode":"selfsigned","config_unavailable":false}`, []string{"401 unauthenticated"}, "不返回证书内容。config_unavailable=true 表示库内配置读取失败、响应为降级默认（enabled=false/mode=selfsigned）而非真实启用态。"},
+	{"PUT", "/admin-tls", "系统", "启用/禁用管理面板 HTTPS", "multipart 表单：enabled、mode、cert_file/key_file 文件字段", `{"code":0,"message":"已保存，服务正在重启以应用 HTTPS 配置"}`, []string{"400 invalid_request", "403 slave_or_admin_required（从节点只读 / 非管理员只读）", "413 body_exceeds_4MiB", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）", "500 save_failed（读取当前 HTTPS 配置/落库失败；admin 端点保留底层错误细节供排障）"}, "multipart 表单；亦接受 application/json（cert_file/key_file 为 PEM 字符串）。mode=selfsigned 或 upload（upload 需 cert_file/key_file 文件字段）。单文件/单字段上限 1 MiB，整体请求体 4 MiB（可同时容纳两个满额材料），超过整体上限返回 413。保存后服务自动重启，从节点同步后亦自动重启。写门在网关（admin 组 middleware readOnlyGuard）：从节点直接 403「从节点只读，请在主节点操作」，非管理员 403「非管理员用户只读」——handler 内无角色/主节点判定。四列属集群快照同步列（cluster_snapshot/cluster_apply），即便绕过网关写入，主节点下一次快照应用也会覆盖从端值。enabled 仅接受 true/1/false/0（两通道同一白名单）；缺省=不修改，显式空串按白名单 400（不视为未提交）。"},
+	{"POST", "/admin-tls/inspect", "系统", "解析上传证书信息（不保存）", "multipart 表单：cert_file、key_file 文件字段", `{"domain":"example.com","issuer":"Let's Encrypt","not_after":"2027-01-01 00:00:00","days_left":365,"expired":false}`, []string{"400 invalid_certificate", "403 非管理员用户只读(主节点)/从节点只读", "413 body_exceeds_4MiB", "428 mfa_step_up_required"}, "亦接受 application/json（cert_file/key_file 为 PEM 字符串）；仅解析并返回证书信息，供保存前展示。expired 为服务端按 not_after 与当前时刻计算的判定（与 days_left 的向零截断语义分离，勿用 days_left<0 反推）。单文件/单字段上限 1 MiB，整体请求体 4 MiB，超过整体上限返回 413。"},
+	{"POST", "/system/restart", "系统", "重启服务", "", `{"code":0,"message":"服务正在重启"}`, []string{"403 admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "进程退出后由容器重启策略拉起，用于应用进程级配置（如 Caddy 日志时区）。"},
+	{"GET", "/system/logs", "系统", "读取应用运行日志", "", `{"content":"..."}`, []string{"401 unauthenticated", "500 read_failed（日志打开/读取失败；目标被替换为 FIFO 等非常规文件同为 500）"}, "运行日志恒写文件(内建轮转),LOG_FILE 仅覆盖路径。"},
+	{"GET", "/rules/:caddy_id/logs", "规则", "规则访问日志（最近 1000 行）", "", `{"content":"...","offset":12345}`, []string{"404 not_found", "500 read_failed（读取规则日志失败）"}, "需规则开启访问日志；offset 为尾部结束位置，供 log-stream 续读。规则不存在返回 404；未启用日志（日志文件不存在）时返回空内容。"},
+	{"GET", "/rules/:caddy_id/log-stream", "规则", "规则日志增量流", "", `{"offset":12456,"lines":["{...}"]}`, []string{"400 invalid_offset（offset 必须是非负整数；空=从 0 起）", "404 not_found", "500 read_failed（读取规则日志失败）"}, "query: offset（字节偏移，上次返回值）。返回 offset 之后的新日志行与新 offset，供前端增量统计，无服务端状态。规则不存在返回 404；未启用日志（日志文件不存在）时返回空内容。"},
+	{"GET", "/rules/:caddy_id/caddy-config", "规则", "单规则 Caddy 配置预览", "", `{"caddy_id":"lb_x","enabled":true,"config":{"listen":[":80"],"routes":[]}}`, []string{"404 not_found"}, ""},
 	{"POST", "/rules/cert-info", "规则", "批量查询规则证书信息", `{"caddy_ids":["lb_..."]}`, `{"lb_x":{"caddy_id":"lb_x","source":"manual","domains":"a.com","issuer":"Let's Encrypt","not_before":"2026-01-01 00:00:00","not_after":"2026-04-01 00:00:00","days_remaining":90,"status":"valid"}}`, []string{"400 caddy_ids 数量超过 200", "401 unauthenticated"}, "只读，不写操作日志。caddy_ids 单次最多 200 个，超过返回 400。not_before/not_after 为 UTC。"},
 	{"GET", "/rules/:caddy_id/cert-info", "规则", "查询单规则证书信息", "", `{"caddy_id":"lb_x","source":"manual","domains":"a.com","issuer":"Let's Encrypt","not_before":"2026-01-01 00:00:00","not_after":"2026-04-01 00:00:00","days_remaining":90,"status":"valid"}`, []string{"404 not_found"}, "只读，不写操作日志。not_before/not_after 为 UTC。"},
-	{"POST", "/config/import/v1", "配置", "导入 v1（nginx 版）备份", "v1 备份 JSON", `{"message":"已导入 26 条规则"}`, []string{"400 invalid_backup", "403 slave_or_admin_required", "413 body_exceeds_48MB", "500 rollback"}, "仅主节点；自动转换负载规则（含内联证书），仅导入规则部分；覆盖导入会清理旧规则及其安全策略绑定。"},
-	{"GET", "/caddy/logs", "Caddy", "Caddy 日志", "", `{"content":"..."}`, []string{"401 unauthenticated"}, "query: type（runtime 默认/server/proxy/tls）。"},
-	{"GET", "/caddy/metrics", "Caddy", "Caddy 指标", "", `{"requests_total":0,"requests_in_flight":0}`, []string{"401 unauthenticated"}, "JWT 或 lb_sk_ API Key（供 Prometheus 抓取）。"},
-	{"GET", "/caddy/host-metrics", "Caddy", "按域名统计指标", "", `[{"host":"example.com","requests_total":0}]`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/certificates/jobs/:id", "证书", "证书任务详情", "", `{"id":1,"rule_id":"lb_...","status":"issued"}`, []string{"404 not_found"}, ""},
-	{"GET", "/certificates/jobs/:id/logs", "证书", "证书任务日志", "", `{"content":"..."}`, []string{"404 not_found"}, ""},
-	{"GET", "/metrics/dashboard", "指标", "聚合监控面板指标", "", `{"global":{},"hosts":[],"overview":{},"rules":{}}`, []string{"401 unauthenticated", "500 query_failed", "502 caddy_metrics_unavailable"}, "单次采集并聚合全局、主机、总览及全部已启用规则指标。"},
-	{"GET", "/metrics/overview", "指标", "指标总览", "", `{"total_requests":0,"requests_per_sec":0}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/metrics/rule/:caddy_id", "指标", "单规则指标", "", `{"requests_total":0,"bytes_in":0,"bytes_out":0}`, []string{"404 not_found"}, ""},
-	{"GET", "/metrics/history", "指标", "历史指标", "", `[{"timestamp":"...","bytes_in":0,"bytes_out":0}]`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/metrics/realtime", "指标", "实时流量", "", `{"bytes_in":0,"bytes_out":0}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/metrics/connections", "指标", "连接统计", "", `{"established":0,"syn_recv":0,"fin_wait1":0,"fin_wait2":0,"close_wait":0,"last_ack":0,"listening":0,"closing":0,"time_wait":0,"total":0}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/system/info", "系统", "系统信息", "", `{"ip_address":"...","hostname":"..."}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/system/metrics", "系统", "系统指标", "", `{"cpu_percent":0,"memory_percent":0}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/system/ports", "系统", "代理默认监听口与面板口", "", `{"http_port":80,"https_port":443,"panel_port":8000}`, []string{"401 unauthenticated"}, "来自部署环境变量 HTTP_PORT/HTTPS_PORT/PANEL_PORT（出厂 80/443/8000）。前端向导默认值与保留端口判定用此值；只影响默认语义，存量规则的 listen_port 不随之迁移。"},
-	{"GET", "/audit-logs", "审计", "操作日志", "", `{"list":[],"total":0,"page":1,"page_size":20}`, []string{"401 unauthenticated"}, "query: page, page_size, username, action, resource, ip, keyword, start_time, end_time；created_at 为 UTC（2006-01-02 15:04:05），前端按配置时区展示。"},
-	{"GET", "/audit-logs/options", "审计", "操作日志筛选选项", "", `{"usernames":[{"value":"admin","count":12}],"actions":[{"value":"更新","count":5}],"resources":[{"value":"全局配置","count":3}]}`, []string{"401 unauthenticated"}, "操作人/操作/对象的去重可选值（按频次排序，对象取高频前 50）。"},
-	{"GET", "/auth/oidc/status", "认证", "OIDC 状态(公开)", "", `{"enabled":true,"display_name":"sso.example.com"}`, []string{}, "登录页按钮显隐;未启用返回 enabled=false。"},
-	{"GET", "/auth/oidc/login", "认证", "OIDC 登录跳转(302)", "", "\"302 Location: IdP 授权页\"", []string{"302 oidc_error(未启用/state 封顶/discovery 失败——回前端登录页错误位)"}, "浏览器跳转 IdP;失败同为 302(oidc_error 经 URL fragment 携带),非 API 消费形态。"},
-	{"GET", "/auth/oidc/callback", "认证", "OIDC 授权码回调", "", `"302 → /#/oidc/callback?token=…"`, []string{"400 invalid_state", "401 token_verify_failed", "403 account_disabled", "404 oidc_disabled", "502 discovery_or_token_exchange"}, "首登自动开户(默认普通角色);禁用账号拒绝。除 404 外,失败形态均为 302 重定向至前端错误页(error 经 URL fragment 携带)。"},
-	{"GET", "/settings/oidc", "系统", "OIDC 配置读取", "", `{"enabled":true,"issuer":"https://sso.example.com","client_id":"...","client_secret_masked":"ab****cd"}`, []string{"403 admin_required"}, "secret 掩码返回;has_secret 标识。"},
-	{"PUT", "/settings/oidc", "系统", "OIDC 配置更新", `{"issuer":"https://sso.example.com","client_id":"...","client_secret":"...","display_name":"公司统一登录","enabled":true}`, `{"code":0}`, []string{"400 invalid_request", "403 admin_required"}, "空 client_secret=保持现值;启用前 issuer+client_id+secret 须齐备。"},
-	{"POST", "/settings/oidc/test", "系统", "OIDC 发现探测", `{"issuer":"https://sso.example.com"}`, `{"ok":true,"provider_name":"...","token_endpoint":"..."}`, []string{"400 invalid_request(缺服务地址)/error(只读 Key 仅支持测试已保存配置)", "403 admin_required"}, "完整 discovery+JWKS 可达性探测。"},
-	{"DELETE", "/settings/oidc", "系统", "OIDC 配置删除", "", `{"code":0}`, []string{"403 admin_required"}, "清空配置(等效禁用);已建 OIDC 用户保留。"},
-	{"GET", "/logs/stats", "日志", "日志存储状态", "", `{"logs":[{"key":"audit","name":"操作日志","size_bytes":1048576,"rotated_bytes":0,"keep_count":0,"rows":6895,"retention_note":"每日清理 · 保留 3 个月","config_source":"基础设置 · 日志保留"}]}`, []string{"401 unauthenticated"}, "9 类日志的当前大小/阈值/保留策略；caddy_id 参数收窄证书任务与规则访问到单规则。"},
-	{"GET", "/security/overview", "安全", "安全总览", "", `{"today_blocked":0,"today_detected":0,"active_policies":0,"crs_version":"v4.28.0","trend":[{"date":"2026-08-04","blocked":0,"detected":0}],"top_ips":[{"ip":"1.2.3.4","blocked":5,"detected":10,"last_time":"2026-08-10 14:32:01","attack_type":"SQL注入"}],"attack_types":[{"name":"SQL注入","value":42}]}`, []string{"401 unauthenticated"}, ""},
-	// 口径实证(SECLB34-ACL-1,第 34 轮):任何 /load 重建 metrics registry,
+	{"POST", "/config/import/v1", "配置", "导入 v1（nginx 版）备份", "v1 备份 JSON", `{"code":0,"message":"配置已导入（部分完成）：证书任务恢复失败: ...","data":{"imported":26,"disabled_conflicts":[],"partial":true,"warnings":["数据库已提交，但证书任务恢复失败: ..."]}}`, []string{"400 invalid_backup", "403 slave_or_admin_required", "409 certificate_queue_draining", "413 body_exceeds_128MB", "500 rollback", "428 mfa_step_up_required"}, "仅主节点；自动转换负载规则（含内联证书），仅导入规则部分；覆盖导入会清理旧规则及其安全策略绑定。证书队列排空未完成返回 409；数据库已提交但证书任务恢复失败时返回 200 且 data.partial=true（warnings 说明失败面），客户端不得按已回滚重试。"},
+	{"GET", "/caddy/logs", "Caddy", "Caddy 日志", "", `{"content":"..."}`, []string{"400 invalid_type（未知日志类型）", "401 unauthenticated", "500 read_failed（日志文件不可访问/打开失败；文件尚不存在返回空内容）"}, "query: type（runtime 默认/server/proxy/tls）。"},
+	{"GET", "/caddy/metrics", "Caddy", "Caddy 指标", "", `{"requests_total":0,"requests_in_flight":0}`, []string{"401 unauthenticated", "502 caddy_metrics_unavailable（采集/解析 Caddy 指标失败）"}, "JWT 或 lb_sk_ API Key（供 Prometheus 抓取）。"},
+	{"GET", "/caddy/host-metrics", "Caddy", "按域名统计指标", "", `[{"host":"example.com","requests_total":0}]`, []string{"401 unauthenticated", "502 caddy_metrics_unavailable（采集/解析 Caddy 指标失败）"}, ""},
+	{"GET", "/certificates/jobs/:id", "证书", "证书任务详情", "", certJobListItemExample, []string{"404 not_found"}, "与列表 data.list[] 同一投影（同一字段集）；证书材料本体不外发。retry_cooldown_seconds 为下发时刻的剩余重试冷却：0=现在即可重试，正数=还需等待的秒数，null=永久不可重试。"},
+	{"GET", "/certificates/jobs/:id/logs", "证书", "证书任务日志", "", `{"content":"...","truncated":false}`, []string{"400 invalid_id", "404 not_found", "500 read_failed（读取任务日志失败）"}, "truncated=true 表示内容超过 256KB 响应预算被截断（首行提示）。"},
+	{"GET", "/metrics/dashboard", "指标", "聚合监控面板指标", "", `{"global":{},"hosts":[],"overview":{},"rules":{},"rule_metrics_epoch_seconds":0}`, []string{"401 unauthenticated", "500 query_failed", "502 caddy_metrics_unavailable"}, "单次采集并聚合全局、主机、总览及全部已启用规则指标。rule_metrics_epoch_seconds=规则级指标统计起点（lb_rule_metrics 上次 /load Provision 的 Unix 秒）：仪表盘规则页请求数/Block 数为「自该时刻以来」累计（保存规则/设置触发重载即归零），与安全总览今日窗口口径不同、不可直接对比；0=引擎端无该序列（旧镜像/嵌入降级），消费方应隐藏统计起点显示。"},
+	{"GET", "/metrics/overview", "指标", "指标总览", "", `{"total_requests":0,"requests_per_sec":0,"bytes_in":0,"bytes_out":0,"status_2xx":0,"status_3xx":0,"status_4xx":0,"status_5xx":0,"latency_p50":0,"latency_p95":0,"latency_p99":0,"active_rules":0,"total_rules":0,"online_nodes":0}`, []string{"401 unauthenticated"}, "全站累计指标；latency_* 为毫秒。"},
+	{"GET", "/metrics/rule/:caddy_id", "指标", "单规则指标", "", `{"requests_total":0,"requests_in_flight":0,"status_2xx":0,"status_3xx":0,"status_4xx":0,"status_5xx":0,"bytes_in":0,"bytes_out":0,"blocked":0}`, []string{"404 not_found", "500 query_failed（规则/上游数据库读取失败）", "502 caddy_metrics_unavailable（采集/解析 Caddy 指标失败）"}, "HTTP 规则按规则域名/端口口径；TCP 规则为上游地址口径（共享上游的多规则返回相同合计值，blocked 恒 0）。blocked 为安全拦截计数，status_4xx 已扣除该值。"},
+	{"GET", "/metrics/history", "指标", "历史指标", "", `[{"timestamp":"2026-07-18T12:00:00Z","requests_total":10,"status_2xx":9,"status_3xx":0,"status_4xx":1,"status_5xx":0,"bytes_in":100,"bytes_out":1000}]`, []string{"401 unauthenticated", "500 query_failed（读取指标历史失败）"}, "query: interval（<n>h/<n>d/<n>m，默认 1h，上限 7d；非正值/非法单位静默回退默认 1h）；可选 rule_id 过滤。每桶取末行样本（≤720 桶）；timestamp 为 RFC3339 UTC。"},
+	{"GET", "/metrics/realtime", "指标", "实时流量", "", `{"bytes_in":0,"bytes_out":0}`, []string{"401 unauthenticated", "500 read_failed（读取实时流量失败）"}, ""},
+	{"GET", "/metrics/connections", "指标", "连接统计", "", `{"established":0,"time_wait":0,"syn_sent":0,"syn_recv":0,"fin_wait1":0,"fin_wait2":0,"close_wait":0,"last_ack":0,"listening":0,"closing":0,"total":0}`, []string{"401 unauthenticated", "500 read_failed（读取连接统计失败）"}, ""},
+	{"GET", "/system/info", "系统", "系统信息", "", `{"ip_address":"192.0.2.10","hostname":"lb-node","os_info":"Ubuntu 24.04","kernel":"6.8.0","architecture":"x86_64","network_ips":{"eth0":"192.0.2.10"},"caddy_version":"v2.11.4","running_status":"running","uptime":3600,"node_mode":"master","version":"vX.Y.Z"}`, []string{"401 unauthenticated"}, "node_mode ∈ master/slave/unknown（unknown=节点角色查询失败或数据库未装配，不冒充主节点）。"},
+	{"GET", "/system/metrics", "系统", "系统指标", "", `{"cpu_percent":12.3,"memory_total":16000000000,"memory_used":6592000000,"memory_percent":41.2,"disk_total":500000000000,"disk_used":193500000000,"disk_percent":38.7,"pids_current":2368,"pids_max":4096,"nproc_limit":4096,"pids_percent":57.8}`, []string{"401 unauthenticated", "500 metrics_failed（读取系统指标失败）"}, ""},
+	{"GET", "/audit-logs", "审计", "操作日志", "", `{"list":[],"total":0,"total_stale":false,"partial":false,"page":1,"page_size":20}`, []string{"400 invalid_pagination", "400 page_exceeds_limit", "401 unauthenticated", "500 query_failed（读取操作日志失败）"}, "query: page, page_size, username, action, resource, ip, keyword, start_time, end_time；created_at 为 UTC（2006-01-02 15:04:05），前端按配置时区展示。total 为 5 秒进程内缓存计数，total_stale=true 表示本次计数来自缓存（可能滞后数秒），消费方可据此决定是否刷新核对。partial=true 表示本次响应部分降级：审计库未就绪/读失败、total 走降级路径、筛选时区读取失败或值非法（时间范围按 UTC 解析，整体偏移），或 display_name 富化失败（此时该字段退化为 username）；计数查询失败按 500 返回，不置 partial。键集与正常响应一致。页码分页保留跳页与总页数，但 page>500 返回 400（深 OFFSET 会退化为全表扫描），请用筛选条件缩小范围；page/page_size 非整数返回 400，page_size 超 100 钳到 100。列筛选（username/action/resource/ip/keyword）为子串匹配（LIKE '%…%'），对索引不可用，大审计库上为全表扫描且每个不同筛选组合各付一次计数——请与时间范围组合使用以缩小扫描面。"},
+	{"GET", "/audit-logs/options", "审计", "操作日志筛选选项", "", `{"usernames":[{"value":"admin","count":12}],"actions":[{"value":"更新","count":5}],"resources":[{"value":"全局配置","count":3}],"partial":false}`, []string{"401 unauthenticated"}, "操作人/操作/对象的去重可选值（按频次排序，对象取高频前 50）。partial=true 表示至少一列聚合失败或审计库未就绪（此时三列为空数组），下拉缺项须显式披露。"},
+	{"GET", "/auth/oidc/status", "认证", "OIDC 状态(公开)", "", `{"enabled":true,"display_name":"sso.example.com"}`, []string{"429 rate_limited(60/min/IP)"}, "登录页按钮显隐;未启用返回 enabled=false。"},
+	{"GET", "/auth/oidc/login", "认证", "OIDC 登录跳转(302)", "", "\"302 Location: IdP 授权页\"", []string{"429 rate_limited(10/min/IP)"}, "浏览器跳转 IdP；成功与失败同为 302（失败回前端登录页，oidc_error 经 URL fragment 携带：未启用/state 封顶/discovery 失败），非 API 消费形态。"},
+	{"GET", "/auth/oidc/callback", "认证", "OIDC 授权码回调（成功与失败同为 302）", "", `"302 → /#/oidc/callback?token=…"`, []string{"429 rate_limited(60/min/IP)"}, "浏览器整页导航端点：成功 302 回前端并携 token；一切失败同样 302 回前端错误页，错误经 URL fragment 携带（/api/v1/#/oidc/callback?error=…，不渲染 JSON body、不返回 4xx/5xx）。错误形态：未启用/配置读取失败、state 缺失或不匹配浏览器绑定、state 无效或已过期、提供商拒绝授权、服务不可达或 discovery 失败、令牌交换失败、缺少 id_token、id_token 校验失败、claims 解析失败、nonce 不匹配、缺少 sub、白名单拒绝、账号已被禁用、用户资料刷新失败、JIT 开户失败、查询用户失败、签发令牌失败。唯一非 302 响应是限流 429。首登自动开户(默认普通角色);配置访问白名单(allowed_email_domains/allowed_groups)时不在名单内拒登(IdP 未返回对应声明同拒,fail-visible);邮箱域名单额外要求 email_verified=true(声明缺失/false 一律拒登)。仓库内 issuer 由导入/还原带入的未归一形态在读侧归一(去尾斜杠、Entra 补 /v2.0)。"},
+	{"GET", "/settings/oidc", "系统", "OIDC 配置读取", "", `{"enabled":true,"issuer":"https://sso.example.com","client_id":"...","client_secret_masked":"ab****cd","has_secret":true,"display_name":"公司统一登录","callback_hint":"/api/v1/auth/oidc/callback","allowed_email_domains":["example.com"],"allowed_groups":["ops"]}`, []string{"403 admin_required"}, "secret 掩码返回;has_secret 标识;allowed_email_domains/allowed_groups 为可选访问白名单(均空=不限制,未配置时稳定返回空数组)。"},
+	{"PUT", "/settings/oidc", "系统", "OIDC 配置更新", `{"issuer":"https://sso.example.com","client_id":"...","client_secret":"...","display_name":"公司统一登录","enabled":true,"allowed_email_domains":["example.com"],"allowed_groups":["ops"]}`, `{"code":0}`, []string{"400 invalid_request(含无效 email 域条目)", "403 slave_or_admin_required（从节点只读 / 非管理员只读）", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "空或纯空白 client_secret=保持现值;启用前 issuer+client_id+secret 须齐备。白名单字段缺省(null)=不动、空数组=清除;email 域条目写入侧 trim+小写去重,组名大小写敏感。"},
+	{"POST", "/settings/oidc/test", "系统", "OIDC 发现探测", `{"issuer":"https://sso.example.com","client_id":"...","client_secret":"..."}`, `{"ok":true,"issuer":"https://sso.example.com","provider_name":"...","authorization_endpoint":"https://sso.example.com/authorize","token_endpoint":"https://sso.example.com/token","scopes":["openid","profile"],"credentials_checked":true,"jwks_checked":true}`, []string{"400 invalid_request(缺服务地址)/error(只读 Key 仅支持测试已保存配置)", "403 admin_required"}, "完整 discovery+JWKS 可达性及凭证探测。探测失败也可返回 HTTP 200 + code=0，客户端必须检查 data.ok；失败形态为 data.ok=false 且 data.error 非空。"},
+	{"DELETE", "/settings/oidc", "系统", "OIDC 配置删除", "", `{"code":0,"message":"OIDC 配置已删除","data":{"oidc_identity_rows":2}}`, []string{"403 slave_or_admin_required（从节点只读 / 非管理员只读）", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "清空配置(等效禁用);已建 OIDC 用户保留但无法登录，data.oidc_identity_rows 返回残留行数。响应提示：重新配置同一 issuer 可恢复原身份绑定，改用不同 issuer 会重新开户。"},
+	{"GET", "/logs/stats", "日志", "日志存储状态", "", `{"logs":[{"key":"audit","name":"操作日志","size_bytes":1048576,"rotated_bytes":0,"keep_count":0,"db_backed":true,"rows":6895,"retention_note":"每日清理 · 保留 3 个月","config_source":"基础设置 · 日志保留"}]}`, []string{"401 unauthenticated"}, "静态日志类别与逐任务 task:<id> 行的当前大小/阈值/保留策略；key/keys 参数收窄到所请求行（弹框只取单行，未请求行不做 DB/目录统计），caddy_id 参数收窄证书任务与规则访问到单规则。db_backed 标记纯库内行（如操作日志=audit_log 表按保留期清理）：没有轮转归档概念，消费方不得把 keep_count=0 呈现为「暂无归档」。"},
+	{"GET", "/security/overview", "安全", "安全总览", "", `{"today_blocked":0,"today_blocked_tcp":0,"today_detected":0,"today_detected_tcp":0,"yesterday_blocked":3,"yesterday_blocked_tcp":1,"yesterday_detected":5,"yesterday_detected_tcp":0,"normal_today":1234,"normal_today_http":1234,"normal_today_tcp":120,"normal_yesterday":1180,"normal_yesterday_http":1180,"normal_yesterday_tcp":98,"active_policies":0,"crs_version":"v4.28.0","crs_available":true,"ip2region_available":true,"update_status":"success","includes_reserved":true,"raw_coverage_from":"2026-10-09 00:00:00","backfill_incomplete":false,"raw_coverage_limited":false,"trend":[{"date":"2026-08-04","blocked":0,"detected":0}],"top_ips":[{"ip":"1.2.3.4","ip_location":"美国·加州","blocked":5,"detected":10,"recent_10m":2,"recent_1h":7,"recent_24h":9,"last_time":"2026-08-10 14:32:01","attack_type":"SQL注入","attack_type_stage":"WAF"}],"attack_types":[{"name":"SQL注入","value":42}],"attack_types_stage":[{"name":"WAF","value":42}],"ingestion":{"observed":true,"healthy":true,"consecutive_failures":0,"task_state":"running","task_running":true,"writer_dropped":0,"writer_io_errors":0,"writer_format_errors":0,"messages_dropped":0,"writer_degraded":false,"skipped_bytes":0,"skipped_regions":0,"data_loss":false,"rotation_deferred":false,"rotation_last_deferred_at":"","spool_dir":"/app/data/security-events-spool","spool_files":0,"spool_pending_entries":0,"spool_pending_bytes":0,"spool_limit_entries":100000,"spool_limit_bytes":67108864,"spool_saturated":false,"spool_unavailable":false,"spool_consecutive_failures":0,"spool_last_error":"","spool_last_error_at":""}}`, []string{"401 unauthenticated", "500 overview_query_failed（安全总览聚合查询失败——metrics 库不可达或聚合查询出错）"}, "includes_reserved 仅描述 today_blocked/today_detected：true 表示今日两项含私网与保留地址事件；trend/top_ips/attack_types 恒含私网与保留地址（与大屏口径不同，读路径下沉后新维度表写入侧同口径含保留地址，性能优化不改变统计口径）。top_ips 的 recent_10m/recent_1h/recent_24h=该 IP 近 10 分钟/1 小时/24 小时事件数（UTC 窗口，与 7 天排序窗口独立）；top-IP 候选账本有界 500（按事件数降序截断）：分布式扫描（窗口内 >500 去重攻击源）下 Top 10 可能漏列或计数缩水。crs_available/ip2region_available=库文件级可用性（缺库降级感知面，版本号为历史更新记录）；update_status=规则库最近更新状态。attack_types_stage=阶段五桶分布（总览分布图默认口径，attack_types 为具体分类）；raw_coverage_from/backfill_incomplete=近 7 天卡片原始表覆盖起点与回填完成度（覆盖可信度披露）。ingestion=采集健康位（与 GET /security/events 同源：任务已停/连续失败/审计写侧降级）。yesterday_blocked/yesterday_blocked_tcp/yesterday_detected=昨日拦截（含 TCP 拆分）与检测合计，按本地日界窗口 [昨日 0 点, 今日 0 点) 原始表直算（攻击面谓词同今日直算分支；极端保留期/行帽裁剪下可能少计，覆盖起点见 raw_coverage_from）；yesterday_detected_tcp=昨日 TCP 检测数（L4 信任检测 trust_detect 产 tcp+logged，与 HTTP stage0 DetectionOnly 对齐；无该形态时为 0）；today_detected_tcp=今日 TCP 检测拆分（同源；HTTP 拆分由消费方按 合计−TCP 计算）。normal_today=今日正常请求合计（HTTP+TCP，未拦截且未检测的全部放行流量；2026-11-08 起信任名单 IP 的保留检测流量计入正常列）；规则未匹配的直连流量（未命中任何规则的请求，如面板自身访问、探活）不计入正常请求 KPI；normal_today_http=其中 HTTP 差分口径（规则级 requests_total 累计差分 − per-rule requests_blocked 累计差分 − per-rule requests_logged 检测放行差分；拦截/检测放行/正常三列严格互斥、可加和=总差分，与安全事件表不逐一对账，含限流 429 等差异；2026-11 起读日聚合持久化 metrics_daily_agg：增量按采样点落账+重载前快照，重载零丢失，容器崩溃丢 ≤30s 增量为物理下限；日聚合激活当日仅覆盖激活后时段（激活前时段走累计锚点差分通道）；窗口内无聚合行（历史日/功能上线前/新装）回落累计锚点差分——区间内样本值下降视为重置、增量取后端样本当前值，不出现负数；requests_logged 列随 2026-11 版本引入，历史数据不回溯，切换点前检测放行计入正常列、前后口径断裂）；normal_yesterday/normal_yesterday_http 同口径作用于昨日窗口（TCP 同式）；normal_today/normal_yesterday 均为 HTTP+TCP 合计；normal_today_tcp/normal_yesterday_tcp=正常 TCP 连接（admin /lb/l4-conn-stats allowed 按 30s 差分落库后的日窗口求和——2026-11-08 起信任检测放行连接计入正常列，不再扣减同源 logged 差分；重置钳制同源）；指标历史样本不足（锚不到昨日起点前样本，即 history 短于 2 天）时 normal_* 全部返回 0（样本积累中）。正常请求列两项口径披露：已验证爬虫放行流量计入检测放行（logged）差分、从正常列剔除，而今日检测列按攻击面谓词不含爬虫放行——该类流量不入拦截/检测任一列（总览 KPI 拦截/检测为事件域、正常为指标域，双数据源混排）；开启认证网关（forward_auth）的规则，网关拒绝的未认证请求不计入总览任一 KPI 列（不进 per-rule 指标与安全链，仅网关侧可见）。7 天聚合为缓存快照（TTL 5s）：过期后台刷新、请求立即返回旧快照（SWR 零阻塞），刷新失败保留旧快照并限频告警——响应可能滞后至多一个刷新周期；行改判（检测→拦截）后至多一个刷新周期内收敛。"},
+	{"GET", "/security/overview/threat-screen", "安全", "威胁大屏聚合", "", `{"hours":24,"window_start":"2026-10-14 20:00:00","window_start_minute":"2026-10-14 20:00","rollup_stale":false,"rollup_last_success":"2026-10-15 19:59:00","rollup_coverage_from":"2026-10-15 19:59","raw_coverage_from":"2026-10-09 00:00:00","raw_coverage_limited":false,"backfill_incomplete":false,"total_events":123,"blocked_events":100,"logged_events":23,"block_rate":81.3,"ratelimit_blocks":12,"ratelimit_available":true,"active_sources":4,"countries":{"美国":30},"china_provinces":{"广东省":12},"top_countries":[{"name":"美国","value":30}],"top_attack_types":[{"name":"SQL注入","value":42}],"top_rules":[{"name":"SQL注入检测","value":36}],"top_targets":[{"name":"API 服务","domain":"api.example.com","value":36}],"hourly_hist":[{"name":"14:00","value":5}],"attack_type_share":[{"name":"SQL注入","value":42}],"recent_rate":2.4,"ingestion":{"observed":true,"healthy":true,"consecutive_failures":0,"task_state":"running","task_running":true,"writer_dropped":0,"writer_io_errors":0,"writer_format_errors":0,"messages_dropped":0,"writer_degraded":false,"skipped_bytes":0,"skipped_regions":0,"data_loss":false,"rotation_deferred":false,"rotation_last_deferred_at":"","spool_dir":"/app/data/security-events-spool","spool_files":0,"spool_pending_entries":0,"spool_pending_bytes":0,"spool_limit_entries":100000,"spool_limit_bytes":67108864,"spool_saturated":false,"spool_unavailable":false,"spool_consecutive_failures":0,"spool_last_error":"","spool_last_error_at":""}}`, []string{"401 unauthenticated", "500 metrics_unavailable"}, "威胁大屏数据源。query: hours（缺省 24，非法/越界回退 24，上限 720）。数据面=security_event_rollup 分钟 rollup（懒固化+60s 后台 warmer，保留/私网地址固化时排除；首轮未完成或固化陈旧时请求路径同步固化），rollup_stale/rollup_last_success 披露固化陈旧度/最近成功时刻（未就绪时 last_success 为空串）。窗口总量/拦截率按 rollup 计数；logged_events=total-blocked（夹 >=0）；recent_rate=近 5 分钟 blocked/min（logged 不计）；ratelimit_blocks 为 Caddy /metrics 429 总计（重载口径，抓取失败降级 200：ratelimit_blocks=0 且 ratelimit_available=false，其余维度照常）；active_sources=近 10 分钟去重 client_ip（原始表，保留/私网排除）；countries/top_countries 按 ip_location 首段（国家）计数、空归属跳过；china_provinces 仅首段=「中国」的事件取省段（第 2 段）计数（大屏省级下钻数据源）；top_attack_types=family 归因 Top3；attack_type_share=全部 family 计数（占比条数据源，不截断）；top_rules=触发规则 ID 归因 Top3（无 ID 时回退负载规则名）；top_targets=目标维度分钟 rollup（security_event_target_rollup）计数前 3 的现存规则（name/domain 取 lb_rules，已删除规则跳过，进程内 5min 缓存）；hourly_hist 为滑动窗口分桶——hours≤24 时每整点一小时桶（共 hours 槽，名称 HH:00，末槽=当前小时），hours>24 时 24h 日桶（共 ceil(hours/24) 槽、上限 30，名称 MM-DD，末槽=今天；桶边界按 UTC+配置时区偏移帧计算）。任一安全库查询失败整卡 500。rollup_coverage_from 为 rollup 已覆盖的最旧分钟（无覆盖时为空串），backfill_incomplete=true 表示本次统计只覆盖 [rollup_coverage_from, now]、宽窗口回填仍在进行（后续轮询补齐）。ingestion=采集健康位（与事件列表同源：任务已停/连续失败/审计写侧降级）。"},
+	{"GET", "/security/events/feed", "安全", "威胁大屏增量事件流", "", `{"events":[{"id":210,"event_time":"2026-10-15 12:00:00","client_ip":"1.2.3.4","ip_location":"美国·加州·洛杉矶·ISP","action":"blocked","rule_name":"SQL注入检测","attack_type":"SQL注入"}],"since_id":0,"next_since_id":210,"limit":50,"has_more":false}`, []string{"401 unauthenticated"}, "升序无漏增量流：since_id=0（首屏）返回最新 limit 条（events 按 id 升序，next_since_id=返回集最大 id，has_more=false 不回溯更老）；since_id>0 返回 id > since_id 的升序增量（>limit 积压分多次拉取无重无漏，has_more=true 表示本页填满且可能还有更新未返回）。响应 next_since_id=本批实际扫描到的最大 id（含被保留地址过滤的行），消费者应推进到 next_since_id（恒 ≥ since_id、无重复）；limit 缺省 50、上限 200。attack_type 为后端 family 归因（与安全总览同源），同时下发 trigger_type 与 rule_triggered；rule_msg 不下发。"},
+	{"GET", "/security/events/toast-summary", "安全", "威胁大屏攻击弹框精确聚合", "", `{"groups":[{"client_ip":"1.2.3.4","ip_location":"美国·加州","action":"blocked","attack_type":"SQL注入","count":120,"last_id":210,"avg_duration_us":1200}],"next_id":210}`, []string{"401 unauthenticated"}, "按 since_id 游标聚合新安全事件，按 IP+攻击类型+动作精确计数；单次最多聚合最新 1200 条（400 事件/秒 × 3s 默认上限），超限跳过更老弹框展示并推进 next_id，安全日志仍完整。baseline=1 仅返回当前高水位且 groups 为空；since_id=0 非 baseline 从最新记录倒序聚合，最多 1200 条并推进 next_id，更老事件跳过。next_id 为本批最大 id。"},
+	{"GET", "/security/overview/threat-screen/attack-flow", "安全", "威胁大屏攻击光流事件流", "", `{"enabled":true,"events":[{"seq":1,"at":1792300000000,"country":"美国","province":"加州","action":"blocked","rule_triggered":"942100","weight":4}],"next_seq":1,"sample_n":4,"gap":true,"gap_skipped":3}`, []string{"401 unauthenticated"}, "独立攻击流环形缓冲（内存、非 security_events 查询）；仅大屏采集租约有效时记录，sample_n=1/4/8 自适应。weight 为写入时采样因子，前端按 sum(weight) 还原近似量级。gap=true 且 gap_skipped>0 表示环形缓冲溢出造成永久空洞（与正常光流 /threat-screen/events 同口径），客户端须披露数据不完整并继续按 next_seq 追赶。next_seq 为本批实际推进序号；游标超前（进程重启）返回 0。"},
+	{"GET", "/security/overview/threat-screen/traffic", "安全", "大屏实时流量快照", "", `{"countries":{"美国":{"attack":12,"normal":345}},"available":true,"sample_n":1,"collecting":true}`, []string{"401 unauthenticated"}, "代理 Caddy admin /lb/traffic-stats（caddygeoip per-country 原子计数器：attack=安全中断、normal=非安全中断，在采集租约有效期间累计（collecting=false 时计数冻结）；统计边界=链尾 lb_security_blocked_counter 计数，国名仅取 geoip2region 写入的服务端变量，无 GeoIP 变量的规则不产生国名桶）。国名翻译中文、空/Reserved/0 过滤；admin 不可达 200 空数据降级（available=false）。sample_n=QPS 保险丝抽样因子（1/N 抽样×N 还原，误差 ±N）。大屏 1-2s 轮询消费。"},
+	{"POST", "/security/overview/threat-screen/collector", "安全", "申请/续租大屏流量采集", `{"lease_id":"tab-uuid","ttl_ms":30000,"sample_n":1}`, `{"enabled":true}`, []string{"401 unauthenticated", "503 collector_unavailable"}, "大屏打开时申请采集租约；插件只在存在租约时执行流量计数，关闭/崩溃后 TTL 过期自动停止。sample_n 缺省=0。lease_id 上限 64 字节、并发租约上限 64 条（超限 400 lease_id too long / too many leases；既有租约续租不受限）。审计跳过。"},
+	{"GET", "/security/overview/threat-screen/events", "安全", "大屏逐请求正常流量事件流", "", `{"enabled":true,"sample_n":8,"events":[{"seq":1,"country":"中国","province":"广东省","at":1792300000000}],"next_seq":1,"gap":true,"gap_skipped":3}`, []string{"401 unauthenticated", "503 collector_unavailable"}, "代理 Caddy admin /lb/traffic-events 环形缓冲；since=0 返回最近 limit 条，since>0 返回增量。仅采集租约有效时产生事件，sample_n=1/N 抽样。gap=true 且 gap_skipped>0 表示环形缓冲溢出造成永久空洞，客户端须披露数据不完整并继续按 next_seq 追赶。next_seq 恒为本批实际推进到的序号；游标超前于 Caddy 本进程已分配序号（重启后 seq 归零）时返回 next_seq=0，客户端须从 0 重新追赶（避免旧代际高水位永久过滤新事件）。"},
+	{"DELETE", "/security/overview/threat-screen/collector", "安全", "释放大屏流量采集租约", `{"lease_id":"tab-uuid"}`, `{"enabled":false}`, []string{"401 unauthenticated"}, "大屏关闭时释放租约；最后一个租约释放后 Caddy 流量采集热路径只保留一次 atomic 判断。审计跳过。"},
+	// 口径实证:任何 /load 重建 metrics registry,
 	// 429 计数随重载归零——公开文档只留净口径,追踪语留本注释。
 	{"GET", "/security/rate-limit-blocks", "安全", "各站点限流拦截累计次数", "", `{"total":12,"hosts":[{"host":"go029.com","count":9}]}`, []string{"401 unauthenticated", "500 metrics_unavailable"}, "数据来自 Caddy /metrics 的 429 计数，仅按 code=429 过滤（含上游自返 429），自最近一次 Caddy 配置重载以来累计，进程重启归零；采集失败返回 500。"},
-	{"GET", "/security/rules/:caddy_id/stage-stats", "安全", "单规则三阶段安全统计（流程抽屉计数）", "", `{"stage1_blocked_24h":3,"stage3_blocked_24h":5,"ratelimit_blocks_reload":9}`, []string{"401 unauthenticated", "404 not_found", "500 metrics_unavailable"}, "阶段 1/3=近 24h blocked 事件按触发 id 形状分桶（阶段 1={2,4,7,8,14}∪[800000,900000)，其余归阶段 3）；ratelimit_blocks_reload 为 429 计数按规则域名映射求和，自最近一次 Caddy 配置重载以来累计。caddy_id 不存在返回 404。"},
-	{"POST", "/security/policies/batch-bind", "安全", "批量绑定安全策略（规则多选）", `{"rule_ids":["lb_a","lb_b"],"policy_ids":[1,2],"mode":"merge"}`, `{"bound":2,"skipped":[{"rule_id":"lb_t","reason":"TCP 规则不经过安全链"}]}`, []string{"400 validation_failed", "403 slave_or_admin_required"}, "单事务一次渲染。mode=merge（默认，现有∪请求去重后 ≤8，超限的规则进 skipped）或 replace（全量替换为请求集，≤8）；策略存在性一次校验不全在则 400；TCP/不存在规则进 skipped。"},
-	{"POST", "/rules/batch-block-pages", "规则", "批量设置阶段拦截页", `{"rule_ids":["lb_a","lb_b"],"block_page_stage1_id":7,"block_page_stage1_status":403,"block_page_stage3_id":0,"block_page_stage3_status":0}`, `{"bound":2,"skipped":[{"rule_id":"lb_t","reason":"TCP 规则不经过安全链"},{"rule_id":"lb_x","reason":"规则不存在"}]}`, []string{"400 validation_failed", "403 slave_or_admin_required"}, "单事务一次渲染，逐规则 UPDATE 4 列（0=跟随策略）。页 id>0 须存在于 security_block_pages；状态码 ∈ {0,400,401,403,404,503}。TCP 规则（阶段页仅 http 渲染消费）与不存在规则进 skipped。"},
-	{"POST", "/security/policies/:id/split", "安全", "混合策略一键拆分迁移", "", `{"created":[{"id":9,"name":"默认策略（阶段 1）","policy_type":"stage1"}],"remapped":2,"skipped":[],"deleted_original":true}`, []string{"400 not_mixed", "403 slave_or_admin_required", "404 not_found"}, "仅 mixed 策略：按特征组生成「原名（阶段 N）」单职子策略（空组不生成，阶段 1/3 继承拦截页，阶段 2 恒 429、拦截页继承原策略）；全量重映射绑定（合并后 >8 条的规则进 skipped 保留原绑定）；无 skipped 才删除原策略。单事务一次渲染。"},
-	{"GET", "/security/policies", "安全", "安全策略列表", "", `[{"id":1,"name":"默认策略","mode":"blocking","enabled":true,"rule_count":3,"has_waf":true,"has_ip_control":true,"has_rate_limit":false,"ip_acl_enabled":true,"crs_rule_groups":["42","43"]}]`, []string{"401 unauthenticated"}, "每条规则最多绑定一条限流策略（stage2），写路径对 ≥2 条限流的提交集 400。v2.2.0：crs_rule_groups 为原生 JSON 数组（非字符串）。policy_type ∈ stage0（信任名单：trust_detection=0 直通上游零事件，=1 保留检测记录经 id:12 DetectionOnly）/stage1（IP 访问控制）/stage2（限流）/stage3（WAF）/mixed（存量混合兼容，不可新建）；创建/更新缺省按内容推断，显式提交时阶段外字段归一零值。"},
-	{"GET", "/security/policies/:id", "安全", "安全策略详情", "", `{"policy":{"id":1,"name":"默认策略","policy_type":"stage3","mode":"blocking","anomaly_threshold":5,"trust_detection":0,"ip_acl_enabled":false,"ip_acl_mode":"deny","ip_acl_list_refs":"[]","ip_whitelist_enabled":false,"ip_whitelist":"","ip_blacklist":"","rate_limit_enabled":false,"rate_limit_rps":0,"rate_limit_burst":0,"geoip_mode":"off","geoip_countries":"","crs_rule_groups":"","crs_excluded_rules":"","custom_rules":"[]","block_page_id":0,"block_status_code":0,"waf_check_response":false,"log_request_body":false,"enabled":true},"bindings":["lb_xxx"]}`, []string{"404 not_found"}, "policy_type=stage0/1/2/3/mixed（按内容推断）；trust_detection 仅 stage0 信任策略消费；mode: off/detection/blocking/custom_only。"},
-	{"POST", "/security/policies", "安全", "创建安全策略", `{"name":"默认策略","mode":"detection","anomaly_threshold":5}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required"}, "mode: off/detection/blocking/custom_only（off=CRS 与自定义均不生效；custom_only=仅自定义规则）。policy_type: stage0/1/2/3/mixed，缺省按内容自动推断（显式 mixed 须确含多阶段字段）；trust_detection 仅 stage0 信任策略消费。"},
-	{"PUT", "/security/policies/:id", "安全", "更新安全策略", `{"mode":"blocking","anomaly_threshold":5}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found"}, "只提交需要修改的字段；policy_type 缺省=按内容重推断；trust_detection 仅 stage0 策略消费。"},
-	{"DELETE", "/security/policies/:id", "安全", "删除安全策略", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed"}, ""},
-	{"POST", "/security/policies/:id/bind", "安全", "关联规则到策略", `{"rule_caddy_id":"lb_xxx"}`, `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed"}, "v2.2.0 起为 additive——不覆盖已有绑定；批量替换请用 PUT /security/rules/:caddy_id/policies。"},
-	{"POST", "/security/policies/:id/bindings/bulk", "安全", "批量更新策略绑定（bind/unbind）", `{"bind":["lb_a","lb_b"],"unbind":["lb_c"]}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed"}, "单事务批量增删本策略绑定行（不触碰兄弟绑定），一次渲染；bind+unbind 合计 ≤100；bind 侧同单条端点两道规则级门（单规则绑定上限 8、每规则至多一条限流 stage2 策略）；幂等（重复 bind/未绑定或已删除规则的 unbind 无害）；任一规则校验失败整体拒绝。"},
-	{"DELETE", "/security/policies/:id/bind/:caddy_id", "安全", "取消规则关联", "", `{"code":0}`, []string{"403 slave_or_admin_required", "400 caddy_validation_failed"}, ""},
-	{"PUT", "/security/rules/:caddy_id/policies", "安全", "原子替换规则的安全策略绑定（多策略）", `{"policy_ids":[1,3,2]}`, `{"code":0}`, []string{"400 validation_failed/max_8/tcp_rule/missing_policy", "403 slave_or_admin_required"}, "v2.2.0：单事务 DELETE+按序 INSERT；先按 policy_id 去重再强制最多 8 条（如 [1,1,2,3,4,5] 合法）；策略按 policy_id ASC 读取；空数组 [] = 解除该规则全部绑定。"},
-	{"GET", "/security/rules/:caddy_id/policy", "安全", "查看规则关联的策略（数组 ASC）", "", `[{"id":1,"name":"默认策略","mode":"blocking"}]`, []string{"401 unauthenticated"}, "v2.2.0：返回 []policy 按 id ASC，无绑定时为 []；仅含 enabled=1 的策略。"},
-	{"GET", "/security/bindings", "安全", "所有规则的安全策略绑定（map→数组 ASC）", "", `{"lb_xxx":[{"policy_id":1,"name":"默认策略","mode":"blocking","enabled":true,"block_page_id":1,"block_status_code":451}]}`, []string{"401 unauthenticated"}, "v2.2.0：值从单 BindingInfo 改为 []BindingInfo，按 policy_id ASC。block_status_code 为有效状态码（NULL/0 归一 403），供拦截页归因展示。"},
+	{"GET", "/security/rules/:caddy_id/stage-stats", "安全", "单规则三阶段安全统计（流程抽屉计数）", "", `{"stage1_blocked_24h":3,"stage3_blocked_24h":5,"stage_unattributed_24h":1,"ratelimit_blocks_reload":9,"precheck_avg_us":120.5,"precheck_samples":42,"waf_avg_us":350.25,"waf_samples":42}`, []string{"401 unauthenticated", "404 not_found", "500 metrics_unavailable"}, "阶段 1/3=近 24h blocked 事件按触发 id 形状分桶（阶段 1={2,4,7,8,14}∪[800000,900000)∪[1500000,1520000)，其余归阶段 3）；ratelimit_blocks_reload 为 429 计数按规则域名（支持 *.domain 匹配子域）与监听端口（server=http_<listen_port>）映射求和，自最近一次 Caddy 配置重载以来累计。caddy_id 不存在返回 404。"},
+	{"POST", "/security/policies/batch-bind", "安全", "批量绑定安全策略（规则多选）", `{"rule_ids":["lb_a","lb_b"],"policy_ids":[1,2],"mode":"merge"}`, `{"bound":2,"unchanged":0,"skipped":[{"rule_id":"lb_t","reason":"策略 \"限流防护\"（#3）含 TCP 不支持的能力（限流/WAF），仅阶段 0/1 特征策略可绑定 TCP 规则"}]}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "单事务一次渲染。rule_ids 去重后 ≤100（超限整批 400）；mode=merge（默认，现有∪请求去重后 ≤8，超限的规则进 skipped）或 replace（全量替换为请求集，≤8）；策略存在性一次校验不全在则 400；混合策略/提交集含多条限流策略同样 400 整体拒绝；TCP 规则走绑定能力门（阶段 0/1 特征策略正常绑定，含限流/WAF 特征的策略进 skipped，reason=能力门文案）、不存在规则进 skipped。"},
+	{"POST", "/rules/batch-block-pages", "规则", "批量设置阶段拦截页（已停用）", `{"rule_ids":["lb_a","lb_b"],"block_page_stage1_id":7,"block_page_stage1_status":403,"block_page_stage3_id":0,"block_page_stage3_status":0}`, `{"bound":0,"unchanged":2,"skipped":[{"rule_id":"lb_t","reason":"TCP 规则不经过安全链"},{"rule_id":"lb_x","reason":"规则不存在"}]}`, []string{"400 invalid_request", "403 slave_or_admin_required", "428 mfa_step_up_required"}, "已停用（规则级阶段拦截页功能下线）：路由保留兼容已发布自动化，四字段接受但一律忽略——零写入、零渲染、零版本推进；响应恒 bound=0，unchanged=存在的 http 规则数，TCP/不存在规则进 skipped。拦截页改由逐策略归因（策略自身配置页生效）。"},
+	{"POST", "/security/policies/:id/split", "安全", "混合策略一键拆分迁移", "", `{"created":[{"id":9,"name":"默认策略（阶段 1）","policy_type":"stage1"}],"remapped":2,"skipped":[],"deleted_original":true}`, []string{"400 invalid_id/not_mixed", "403 slave_or_admin_required", "404 not_found", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅 mixed 策略：按特征组生成「原名（阶段 N）」单职子策略（空组不生成，阶段 1/3 继承拦截页，阶段 2 恒 429、拦截页继承原策略）；全量重映射绑定（合并后 >8 条的规则进 skipped 保留原绑定）；无 skipped 才删除原策略。单事务一次渲染。"},
+	{"GET", "/security/policies", "安全", "安全策略列表", "", `{"code":0,"message":"查询成功","data":[{"id":1,"name":"默认策略","mode":"blocking","enabled":true,"rule_count":3,"has_waf":true,"has_ip_control":true,"has_rate_limit":false,"anomaly_threshold":5,"ip_acl_mode":"deny","ip_acl_enabled":true,"ip_acl_list":"[]","ip_whitelist":"[]","ip_whitelist_enabled":false,"ip_blacklist":"[]","rate_limit_rps":0,"rate_limit_burst":0,"crs_excluded_count":0,"crs_rule_groups":["42","43"],"crs_stale_selections":false,"has_geoip":false,"has_custom_rules":false,"custom_rules_count":0,"custom_rules_ref_count":0,"updated_by":1,"updated_at":"2026-10-01 00:00:00","geoip_countries":"[]","geoip_mode":"off","geoip_crawler_exempt":false,"geoip_crawler_engines":"[]","waf_check_response":false,"log_request_body":false,"ip_acl_list_refs":"[]","ip_whitelist_refs":"[]","policy_type":"stage3","trust_detection":false,"blocked_24h":0,"trigger_24h":0}]}`, []string{"401 unauthenticated"}, "每条规则最多绑定一条限流策略（stage2），写路径对 ≥2 条限流的提交集 400。query: enabled（true/1=仅启用，false/0=仅禁用，缺省=全部）, rule_caddy_id（仅列出绑定到该规则的策略，IP 归属地弹窗使用）。v2.2.0：crs_rule_groups 为原生 JSON 数组（非字符串）。policy_type ∈ stage0（信任名单：trust_detection=0 直通上游零事件，=1 保留检测——信任 IP 同样跳过全部安全阶段，唯一事件=id:12 独立检测记录（动作=检测））/stage1（IP 访问控制）/stage2（限流）/stage3（WAF）/mixed（存量混合兼容，不可新建）；创建/更新缺省按内容推断，显式提交时阶段外字段归一零值。"},
+	{"GET", "/security/policies/:id", "安全", "安全策略详情", "", `{"policy":{"id":1,"name":"默认策略","description":"","mode":"blocking","anomaly_threshold":5,"ip_acl_mode":"deny","ip_acl_list":"[]","ip_acl_enabled":false,"ip_whitelist_enabled":false,"ip_whitelist":"[]","ip_blacklist":"[]","rate_limit_enabled":false,"rate_limit_rps":0,"rate_limit_burst":0,"crs_rule_groups":"[]","crs_excluded_rules":"[]","custom_rules":"[]","block_page_id":0,"block_status_code":0,"enabled":true,"created_at":"2026-10-01 00:00:00","updated_at":"2026-10-01 00:00:00","geoip_countries":"[]","geoip_mode":"off","geoip_crawler_exempt":false,"geoip_crawler_engines":"[]","waf_check_response":false,"log_request_body":false,"ip_acl_list_refs":"[]","ip_whitelist_refs":"[]","policy_type":"stage3","trust_detection":false},"bindings":["lb_xxx"]}`, []string{"404 not_found"}, "policy_type=stage0/1/2/3/mixed（按内容推断）；trust_detection 仅 stage0 信任策略消费；mode: off/detection/blocking/custom_only。"},
+	{"POST", "/security/policies", "安全", "创建安全策略", `{"name":"默认策略","mode":"detection","anomaly_threshold":5}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "mode: off/detection/blocking/custom_only（off=CRS 与自定义均不生效；custom_only=仅自定义规则）。policy_type: stage0/1/2/3，缺省按内容自动推断——显式提交 mixed 会被 400 拒绝（混合策略为存量兼容形态，不可新建），跨阶段内容推断为 mixed 同样 400，请按阶段类型分别创建；显式提交阶段类型时阶段外字段归一零值。trust_detection 仅 stage0 信任策略消费。"},
+	{"PUT", "/security/policies/:id", "安全", "更新安全策略", `{"mode":"blocking","anomaly_threshold":5}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "只提交需要修改的字段；policy_type 缺省=按内容重推断（显式 mixed 拒绝——存量混合策略请用 POST /security/policies/:id/split 拆分迁移）；trust_detection 仅 stage0 策略消费。"},
+	{"DELETE", "/security/policies/:id", "安全", "删除安全策略", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, ""},
+	{"POST", "/security/policies/:id/bind", "安全", "关联规则到策略", `{"rule_caddy_id":"lb_xxx"}`, `{"code":0}`, []string{"400 混合策略仅可更新迁移", "400 每条规则最多绑定一条限流策略", "400 含 TCP 不支持的能力（限流/WAF），仅阶段 0/1 特征策略可绑定 TCP 规则", "403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "v2.2.0 起为 additive——不覆盖已有绑定；批量替换请用 PUT /security/rules/:caddy_id/policies。TCP 规则可绑定阶段 0/1 特征策略，含限流/WAF 特征的策略由绑定能力门拒绝。"},
+	{"POST", "/security/policies/:id/bindings/bulk", "安全", "批量更新策略绑定（bind/unbind/orders）", `{"bind":["lb_a","lb_b"],"unbind":["lb_c"],"orders":{"lb_d":[101,105,48]}}`, `{"code":0,"data":{"bound":2,"unbound":1,"ordered":1,"unchanged":0,"skipped":[]}}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "单事务批量更新本策略绑定行，一次渲染。bind/unbind：增删本策略绑定（不触碰兄弟绑定），合计 ≤100，任一规则校验失败整体 400；幂等。orders（2026-11 绑定顺序）：键=规则 id，值=该规则的全量有序 policy_id 列表（与 PUT /security/rules/:id/policies 同语义：提交序即执行序 rank），与 bind/unbind 同规则冲突 400、每列表 ≤8、规则数计入 ≤100 预算；顺序与现状一致计 unchanged（零写入），单规则校验失败进 skipped 不整体拒绝；响应 data.{bound,unbound,ordered,unchanged,orders:[{rule_id,policy_ids}],skipped:[{rule_id,reason}]}。"},
+	{"DELETE", "/security/policies/:id/bind/:caddy_id", "安全", "取消规则关联", "", `{"code":0}`, []string{"403 slave_or_admin_required", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, ""},
+	{"PUT", "/security/rules/:caddy_id/policies", "安全", "原子替换规则的安全策略绑定（多策略）", `{"policy_ids":[1,3,2]}`, `{"code":0}`, []string{"400 validation_failed/max_8/tcp_rule/missing_policy", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "v2.2.0：单事务 DELETE+按序 INSERT；先按 policy_id 去重再强制最多 8 条（如 [1,1,2,3,4,5] 合法）；策略按提交序写入 rank 并按绑定执行序（rank ASC，policy_id ASC 兜底）读取；空数组 [] = 解除该规则全部绑定。"},
+	{"GET", "/security/rules/:caddy_id/policy", "安全", "查看规则关联的策略（数组按执行序）", "", `[{"id":1,"name":"默认策略","mode":"blocking"}]`, []string{"401 unauthenticated"}, "v2.2.0：返回 []policy 按绑定执行序（rank ASC=提交序/顺序编辑序，policy_id ASC 兜底遗留行），无绑定时为 []；仅含 enabled=1 的策略。"},
+	{"GET", "/security/bindings", "安全", "所有规则的安全策略绑定（map→数组，执行序）", "", `{"lb_xxx":[{"policy_id":1,"name":"默认策略","mode":"blocking","enabled":true,"block_page_id":1,"block_status_code":451}]}`, []string{"401 unauthenticated"}, "v2.2.0：值从单 BindingInfo 改为 []BindingInfo。2026-11 绑定顺序：数组按每规则执行序（rank ASC，PUT/bulk orders 的提交序；rank=0 遗留行由 policy_id 兜底）。block_status_code 为有效状态码（NULL/0 归一 403），供拦截页归因展示。"},
 	{"GET", "/security/crs/rules", "安全", "CRS 规则文件列表", "", `{"rules":[{"filename":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","category":"SQL 注入","size":45000}],"total":30,"page":1}`, []string{"401 unauthenticated"}, "query: search, page, page_size。"},
-	{"GET", "/security/crs/rule-index", "安全", "CRS 结构化规则索引", "", `{"version":"v4.28.0","rules":[{"id":"942100","msg":"SQL Injection Attack Detected","file":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","category":"SQL 注入"}]}`, []string{"401 unauthenticated"}, "解析 CRS 全部 .conf 提取 id/msg/文件/分类（按 id 升序）；缓存键=版本+mtime+size，CRS 更新后自动重建；供排除规则选择器与 6 位规则 ID/组号保存校验消费。"},
+	{"GET", "/security/crs/rule-index", "安全", "CRS 结构化规则索引", "", `{"version":"v4.28.0","rules":[{"id":"942100","msg":"SQL Injection Attack Detected","file":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","category":"SQL 注入"}]}`, []string{"401 unauthenticated"}, "解析 CRS 全部 .conf 提取 id/msg/文件/分类（按 id 升序）；缓存键=版本+mtime+size，CRS 更新后自动重建；供排除规则选择器（含 path 作用域条目的目标搜索）与 6 位规则 ID/组号保存校验消费。"},
 	{"GET", "/security/crs/rules/:filename", "安全", "CRS 规则文件内容", "", `{"filename":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","content":"SecRule ...","size":45000}`, []string{"404 not_found"}, ""},
 	{"GET", "/security/crs/setup", "安全", "CRS 配置文件内容", "", `{"content":"# CRS setup..."}`, []string{"404 not_found"}, ""},
-	{"GET", "/security/custom-rules", "安全", "自定义规则列表", "", `[{"id":1,"name":"管理路径保护","conditions":[{"target":"uri","operator":"starts_with","pattern":"/admin"}],"action":"block","score":5,"enabled":true}]`, []string{"401 unauthenticated"}, ""},
-	{"POST", "/security/custom-rules", "安全", "创建自定义规则", `{"name":"管理路径保护","conditions":[{"target":"uri","operator":"starts_with","pattern":"/admin"}],"action":"block","score":5,"enabled":true}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required"}, "conditions 数组支持多条件（AND 关系）。"},
-	{"PUT", "/security/custom-rules/:id", "安全", "更新自定义规则", `{"name":"管理路径保护","conditions":[{"target":"uri","operator":"starts_with","pattern":"/admin"}],"action":"block","score":5,"enabled":true}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found"}, ""},
-	{"DELETE", "/security/custom-rules/:id", "安全", "删除自定义规则", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed"}, ""},
+	{"GET", "/security/custom-rules", "安全", "自定义规则列表", "", `[{"id":1,"name":"管理路径保护","conditions":[{"target":"uri","operator":"starts_with","pattern":"/admin"},{"target":"headers","operator":"equals","pattern":"br","header_name":"Content-Encoding"}],"condition_logic":"and","action":"block","score":5,"enabled":true}]`, []string{"401 unauthenticated"}, ""},
+	{"POST", "/security/custom-rules", "安全", "创建自定义规则", `{"name":"管理路径保护","conditions":[{"target":"uri","operator":"starts_with","pattern":"/admin"},{"target":"headers","operator":"equals","pattern":"br","header_name":"Content-Encoding"}],"condition_logic":"and","action":"block","score":5,"enabled":true}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "conditions 数组支持多条件；condition_logic=and（省略时默认，同时满足）或 or（任一满足），显式空串/其他值 400；enabled 省略=启用（需显式 false 才禁用）。target=headers 的条件可携带 header_name 限定匹配的请求头名（如 Content-Encoding；1-64 字符，仅字母数字与 -；空/省略=匹配全部头的值）；header_name 仅 target=headers 支持，其他 target 携带返回 400"},
+	{"PUT", "/security/custom-rules/:id", "安全", "更新自定义规则", `{"name":"管理路径保护","conditions":[{"target":"uri","operator":"starts_with","pattern":"/admin"}],"condition_logic":"or","action":"block","score":5,"enabled":true}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "condition_logic 省略=保持现值。全字段可选：name/description/conditions/action/score/enabled 省略同样保持现值。conditions 携带时与 POST 同契约：数组支持多条件，空数组 400；target 枚举 uri/args/body/headers/user_agent、operator 枚举 contains/regex/equals/starts_with，越集 400；condition_logic=and（同时满足）或 or（任一满足），显式空串/其他值 400；target=headers 的条件可携带 header_name 限定匹配的请求头名（如 Content-Encoding；1-64 字符，仅字母数字与 -；空/省略=匹配全部头的值）；header_name 仅 target=headers 支持，其他 target 携带返回 400"},
+	{"DELETE", "/security/custom-rules/:id", "安全", "删除自定义规则", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, ""},
 	{"GET", "/security/block-pages", "安全", "拦截页面列表", "", `[{"id":1,"name":"默认拦截页","description":"系统默认 403 页面","content":"...","content_type":"text/html; charset=utf-8","is_default":true,"rule_ref_count":3}]`, []string{"401 unauthenticated"}, "rule_ref_count=引用该页的规则去重数（启用策略绑定 ∪ 规则级阶段覆盖）。"},
-	{"POST", "/security/block-pages", "安全", "创建拦截页面", `{"name":"自定义拦截页","description":"自定义 403 页面","content":"<h1>Access Denied</h1>","content_type":"application/json; charset=utf-8"}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required"}, "content_type 可选 text/html、application/json、application/xml、text/plain（均 charset=utf-8），缺省 text/html。"},
-	{"PUT", "/security/block-pages/:id", "安全", "更新拦截页面", `{"name":"自定义拦截页","content":"<h1>Access Denied</h1>","content_type":"text/html; charset=utf-8"}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found"}, "默认页面不可编辑（返回 403）；content_type 白名单同创建。"},
-	{"DELETE", "/security/block-pages/:id", "安全", "删除拦截页面", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed"}, "默认页面不可删除（返回 403）。"},
-	{"GET", "/security/ip-lists", "安全", "IP 地址列表列表", "", `[{"id":1,"name":"办公网","description":"","category":"内网","entry_count":1,"ref_count":2,"ref_policies":[{"id":1,"name":"默认策略"}],"system":false}]`, []string{"401 unauthenticated"}, "ref_count/ref_policies 为引用该列表的安全策略（ip_acl_list_refs ∪ ip_whitelist_refs，JSON 精确解析）。v2.3.2 起列表载荷不内联 entries（大名单瘦身），详情用 GET /security/ip-lists/:id 按需拉取；system=true 为内置只读名单（威胁情报库）。"},
-	{"GET", "/security/ip-lists/:id", "安全", "IP 地址列表详情（含条目）", "", `{"id":1,"name":"办公网","entries":[{"value":"10.0.0.0/8","remark":"内网段"}],"entry_count":1,"system":false}`, []string{"401 unauthenticated", "404 not_found"}, "弹框查看/编辑按需拉取；system=true 的内置名单只读（写路径一律 400）。"},
-	{"POST", "/security/ip-lists", "安全", "创建 IP 地址列表", `{"name":"办公网","description":"办公网段","category":"内网","entries":"[{\"value\":\"10.0.0.0/8\",\"remark\":\"内网段\"}]"}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required", "409 name_exists"}, "entries 为 {value, remark} 对象数组的 JSON 文本；名称 ≤50 字符且全局唯一（忽略大小写）；条目 ≤500、全局 ≤200 个列表。"},
-	{"PUT", "/security/ip-lists/:id", "安全", "更新 IP 地址列表", `{"name":"办公网","entries":"[{\"value\":\"10.0.0.0/8\",\"remark\":\"内网段\"}]"}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "409 name_exists"}, "全量替换；省略的字段保持现值。"},
-	{"DELETE", "/security/ip-lists/:id", "安全", "删除 IP 地址列表", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "409 referenced", "400 caddy_validation_failed"}, "被安全策略引用时返回 409，需先解除引用。"},
-	{"POST", "/security/ip-lists/:id/ips", "安全", "向 IP 地址列表追加条目", `{"value":"203.0.113.7"}`, `{"added":true}`, []string{"400 invalid_value", "403 slave_or_admin_required", "404 not_found"}, "幂等：value 已存在时返回 added=false；新条目 remark 固定为「事件处置」。"},
-	{"POST", "/security/ip-lists/:id/remove-ip", "安全", "从 IP 地址列表移除条目", `{"value":"203.0.113.7"}`, `{"removed":true}`, []string{"400 invalid_value", "403 slave_or_admin_required", "404 not_found"}, "幂等：value 不在名单时返回 removed=false；内置威胁名单（system=1）只读拒绝。误报处置建议配合信任名单豁免。"},
-	{"GET", "/security/events", "安全", "安全事件日志", "", `{"events":[],"total":0,"page":1,"page_size":20}`, []string{"401 unauthenticated"}, "query: page, page_size, action, ip, rule_caddy_id, rule_name, policy_name, rule_triggered, rule_triggered_exclude（同 family 映射整体取反）, uri, start_time, end_time（配置时区，YYYY-MM-DD[ HH:MM:SS]）。"},
+	{"POST", "/security/block-pages", "安全", "创建拦截页面", `{"name":"自定义拦截页","description":"自定义 403 页面","content":"<h1>Access Denied</h1>","content_type":"application/json; charset=utf-8"}`, `{"id":1}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "content_type 可选 text/html、application/json、application/xml、text/plain（均 charset=utf-8），缺省 text/html。"},
+	{"PUT", "/security/block-pages/:id", "安全", "更新拦截页面", `{"name":"自定义拦截页","content":"<h1>Access Denied</h1>","content_type":"text/html; charset=utf-8"}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "默认页面与内置备选页不可编辑（返回 403）；content_type 白名单同创建。部分更新：省略的字段保留原值，显式空串才清空（校验作用于合并后的终值）。"},
+	{"DELETE", "/security/block-pages/:id", "安全", "删除拦截页面", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "默认页面不可删除（返回 403）。"},
+	{"GET", "/security/ip-lists", "安全", "IP 地址列表列表", "", `[{"id":1,"name":"办公网","description":"","category":"内网","entry_count":1,"ref_count":2,"ref_count_enabled":1,"ref_policies":[{"id":1,"name":"默认策略","enabled":true}],"trusted_proxy_referenced":false,"system":false}]`, []string{"401 unauthenticated"}, "ref_count/ref_policies 为引用该列表的安全策略（ip_acl_list_refs ∪ ip_whitelist_refs，JSON 精确解析；含禁用策略——ref_policies[].enabled 标注启用态）。ref_count_enabled 是阻止删除的引用数（仅启用策略 + 受信代理引用，与删除 409 门同口径）。v2.3.2 起列表载荷不内联 entries（大名单瘦身），详情用 GET /security/ip-lists/:id 按需拉取；system=true 为内置名单，分两类：威胁情报库名单只读（写路径一律 400），自动封禁预置名单（名称「自动封禁名单」）可经 POST ips / remove-ip 增删处置（手动封禁/解封）。"},
+	{"GET", "/security/ip-lists/:id", "安全", "IP 地址列表详情（含条目）", "", `{"id":1,"name":"办公网","entries":[{"value":"10.0.0.0/8","remark":"内网段"}],"entry_count":1,"system":false}`, []string{"400 invalid_id", "401 unauthenticated", "404 not_found"}, "弹框查看/编辑按需拉取；非规范数字 ID（如 5.0）400；system=true 内置名单分两类：威胁情报名单只读（写路径一律 400），自动封禁预置名单可增删条目（解封语义）。"},
+	{"POST", "/security/ip-lists", "安全", "创建 IP 地址列表", `{"name":"办公网","description":"办公网段","category":"内网","entries":"[{\"value\":\"10.0.0.0/8\",\"remark\":\"内网段\"}]"}`, `{"id":1,"entry_count":1}`, []string{"400 validation_failed", "403 slave_or_admin_required", "409 name_exists", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "entries 为 {value, remark} 对象数组的 JSON 文本；名称 ≤50 字符且全局唯一（忽略大小写）；生效条目 ≤2000（已到期条目保存时剔除、不计入上限）、用户创建名单 ≤200 个（系统内置名单由任务自动补齐、不占用户额度）。"},
+	{"PUT", "/security/ip-lists/:id", "安全", "更新 IP 地址列表", `{"name":"办公网","entries":"[{\"value\":\"10.0.0.0/8\",\"remark\":\"内网段\"}]"}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "404 not_found", "409 name_exists", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "全量替换；省略的字段保持现值。到期条目保存时剔除（到期即解封），响应 data.entry_count/pruned_expired 披露落库条数与剔除数。"},
+	{"DELETE", "/security/ip-lists/:id", "安全", "删除 IP 地址列表", "", `{"code":0}`, []string{"403 slave_or_admin_required", "404 not_found", "409 referenced", "400 caddy_validation_failed", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "被安全策略引用时返回 409，需先解除引用。"},
+	{"POST", "/security/ip-lists/:id/ips", "安全", "向 IP 地址列表追加条目", `{"value":"203.0.113.7"}`, `{"added":true}`, []string{"400 invalid_value", "400 builtin_list_readonly", "403 slave_or_admin_required", "404 not_found", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "幂等：value 已存在（且生效中）时返回 added=false，已到期条目原位覆盖为手动条目。remark 按名单语义：自定义名单固定为「事件处置」；自动封禁预置名单（system=1，名称「自动封禁名单」）固定为「手动封禁」（任务挤出豁免判据）。威胁情报内置名单（其余 system=1）只读，写路径 400。"},
+	{"POST", "/security/ip-lists/:id/remove-ip", "安全", "从 IP 地址列表移除条目", `{"value":"203.0.113.7"}`, `{"removed":true}`, []string{"400 invalid_value", "403 slave_or_admin_required", "404 not_found", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "幂等：value 不在名单时返回 removed=false；内置威胁名单（system=1）只读拒绝。误报处置建议配合信任名单豁免。自动封禁名单删除条目即解封（IP 重新达标会被再次封禁）。"},
+	{"GET", "/security/ip-lists/:id/export", "安全", "导出 IP 地址列表（TXT）", "", "198.51.100.1 自动封禁\n198.51.100.2\n", []string{"401 unauthenticated", "404 not_found"}, "每行「IP/CIDR 备注」（备注为空仅 IP）；text/plain 附件下载。自定义名单读 DB 条目；威胁名单（system=1）回退读 .iplist 文件条目。"},
+	{"GET", "/security/autoban", "安全", "读取自动封禁配置", "", `{"enabled":false,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","dry_run":true}`, []string{"401 unauthenticated", "500 读取配置失败"}, "六项配置：启用/阈值（1-10000 次）/窗口（1-60 分钟）/封禁时长（10m,30m,1h,6h,12h,24h,permanent）/统计口径（blocked,logged,all）/观察模式。喂入仅限 WAF 命中（CRS 规则与自定义规则两族，已验证爬虫豁免除外）；IP 访问控制、地域拦截与威胁情报事件不参与计数。数据库读取失败返回 500，不以默认配置冒充成功。"},
+	{"PUT", "/security/autoban", "安全", "更新自动封禁配置", `{"enabled":true,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","dry_run":true}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "窗口或口径变更会重置固定窗口计数器（口径语义变化后旧计数不可混算）。固定窗口按事件到达对齐分桶、桶满跨界即重置（非平滑滑动）：跨窗口边界的突发计数可能分散到相邻两桶。保存即联动任务调度：启用=开启 autoban 循环调度、禁用=停止调度并立即收敛已到期条目与暂存重载（调度唯一前提=业务启用）。喂入仅限 WAF 命中（CRS 规则与自定义规则两族，已验证爬虫豁免除外）；IP 访问控制、地域拦截与威胁情报事件不参与计数。"},
+	{"GET", "/security/autoban/status", "安全", "自动封禁运行状态", "", `{"enabled":false,"dry_run":true,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","banned_today":0,"list_entries":0,"list_referenced":false,"ban_effective":false,"tracked_ips":0,"suggestions":[],"is_master":true,"role":"master","running":false,"loop_on":false,"last_run":"","last_status":"","feed_degraded":false,"feed_degraded_reason":""}`, []string{"401 unauthenticated", "500 查询失败"}, "list_referenced=启用中的安全策略是否引用预置名单（热路径资格门四面引用集，不区分「引用」与「拦截生效」）；ban_effective=封禁是否实际生效（false 时面板黄条提示名单未生效）；suggestions=上一轮观察建议（dry-run 模式达阈值 IP 及计数，按计数降序最多展示 50 条，含窗口内首末时间）；is_master/role=节点角色（调度仅主节点执行，从端写操作 403）；banned_today/list_entries 与封禁生效面同口径（已到期未清理条目不计入）；feed_degraded/feed_degraded_reason=计数喂入源（安全事件采集任务）停摆降级（调度已停止或自愈预算用尽），此时自动封禁计数不再更新、状态卡提示原因。"},
+	{"GET", "/security/events", "安全", "安全事件日志", "", `{"events":[],"total":0,"page":1,"page_size":20,"includes_reserved":true,"ingestion":{"observed":true,"healthy":true,"consecutive_failures":0,"task_state":"running","task_running":true,"writer_dropped":0,"writer_io_errors":0,"writer_format_errors":0,"messages_dropped":0,"writer_degraded":false,"skipped_bytes":0,"skipped_regions":0,"data_loss":false,"rotation_deferred":false,"rotation_last_deferred_at":"","spool_dir":"/app/data/security-events-spool","spool_files":0,"spool_pending_entries":0,"spool_pending_bytes":0,"spool_limit_entries":100000,"spool_limit_bytes":67108864,"spool_saturated":false,"spool_unavailable":false,"spool_consecutive_failures":0,"spool_last_error":"","spool_last_error_at":""}}`, []string{"401 unauthenticated", "400 invalid_page_or_time_range"}, "query: page, page_size, action, ip, rule_caddy_id, rule_name, policy_name, rule_triggered, rule_triggered_exclude（同 family 映射整体取反）, uri, start_time, end_time（配置时区，YYYY-MM-DD[ HH:MM:SS]）。includes_reserved=true：事件总量含私网与保留地址（与大屏排除口径不同）；ingestion=采集健康位（与安全总览同源）。rotation_deferred/rotation_last_deferred_at=审计日志轮转顺延（活文件未截断、空间暂未回收；不是采集失败，healthy 不降级）。非法 page/page_size 返回 400（非整数；不静默忽略），超上限钳到上限（page≤1000、page_size≤100）；无效/倒置时间区间返回 400。"},
 	{"GET", "/security/events/count", "安全", "IP 事件计数（弹框上下文）", "", `{"count":2}`, []string{"401 unauthenticated", "400 缺少 ip", "500 查询失败"}, "query: ip（完整客户端 IP 精确匹配）, days（默认 30，1-365）。走 client_ip+event_time 索引范围 COUNT，近 N 天该 IP 的安全事件总数（含 blocked 与 logged）。"},
-	{"GET", "/security/crs", "安全", "CRS 规则集信息", "", `{"version":"v4.28.0","auto_update":true,"rule_count":832,"schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"500 数据库故障", "401 unauthenticated"}, "schedule_days/schedule_time 为定时更新排程（星期集 1=周一…7=周日 + HH:MM，时区遵循基础设置）。"},
-	{"PUT", "/security/crs/auto-update", "安全", "开关 CRS 自动更新", `{"auto_update":true}`, `{"code":0}`, []string{"403 slave_or_admin_required"}, ""},
-	{"PUT", "/security/crs/schedule", "安全", "设置 CRS 定时更新排程", `{"days":[1,2,3,4,5,6,7],"time":"04:00"}`, `{"code":0}`, []string{"400 至少选择一天或时间格式无效", "403 slave_or_admin_required"}, "星期多选（1=周一…7=周日，去重后非空）+ HH:MM；保存即把 next_update 重排到下一个槽位（auto_update 关闭时也重排，调度仍受开关门控）；手动「立即更新」不受影响。"},
-	{"POST", "/security/crs/update", "安全", "手动触发 CRS 更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running"}, ""},
+	{"GET", "/security/crs", "安全", "CRS 规则集信息", "", `{"version":"v4.28.0","server_version":"v2.11.4","auto_update":true,"last_checked":"2026-10-01 03:00:00","updated_at":"2026-10-01 03:00:00","next_update":"2026-10-02 04:00:00","rule_count":832,"is_latest":true,"update_status":"idle","message":"","available":true,"trigger":"schedule","schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"500 数据库故障", "401 unauthenticated"}, "available=false 表示规则目录缺失（缺库降级，安全链整体不渲染）；is_latest 三态省略=未知。schedule_days/schedule_time 为定时更新排程（星期集 1=周一…7=周日 + HH:MM，时区遵循基础设置）。"},
+	{"PUT", "/security/crs/auto-update", "安全", "开关 CRS 自动更新", `{"auto_update":true}`, `{"code":0}`, []string{"400 invalid_request（auto_update 缺失或为 null）", "403 slave_or_admin_required", "500 save_failed", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "auto_update 为必填布尔（缺字段/null 返回 400，不静默取 false）；仅主节点。"},
+	{"PUT", "/security/crs/schedule", "安全", "设置 CRS 定时更新排程", `{"days":[1,2,3,4,5,6,7],"time":"04:00"}`, `{"code":0}`, []string{"400 至少选择一天或时间格式无效", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "星期多选（1=周一…7=周日，去重后非空）+ HH:MM；保存即把 next_update 重排到下一个槽位（auto_update 关闭时也重排，调度仍受开关门控）；手动「立即更新」不受影响。"},
+	{"POST", "/security/crs/update", "安全", "手动触发 CRS 更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running", "503 task_engine_unavailable", "428 mfa_step_up_required"}, ""},
 	{"GET", "/security/crs/update/status", "安全", "CRS 更新任务状态", "", `{"status":"success","trigger":"manual","started_at":"2026-08-11 14:00:00","finished_at":"2026-08-11 14:01:00","message":"","version":"v4.15.0"}`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/security/crs/update/logs", "安全", "CRS 更新日志", "", `{"content":"2026/08/11 14:00:00 [INFO] checking - 查询最新 CRS 版本"}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/security/ip2region", "安全", "IP2Region数据库信息", "", `{"version":"v3.17.0","auto_update":true,"update_status":"success","schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"500 数据库故障", "401 unauthenticated"}, "schedule_days/schedule_time 为定时更新排程（同 /security/crs）。"},
-	{"GET", "/security/ip2region/regions", "安全", "IP2Region 区域列表", "", `["广东省","北京市","海外"]`, []string{"401 unauthenticated"}, ""},
-	{"PUT", "/security/ip2region/auto-update", "安全", "开关 IP2Region 自动更新", `{"auto_update":true}`, `{"code":0}`, []string{"403 slave_or_admin_required"}, ""},
-	{"PUT", "/security/ip2region/schedule", "安全", "设置 IP2Region 定时更新排程", `{"days":[2],"time":"04:30"}`, `{"code":0}`, []string{"400 至少选择一天或时间格式无效", "403 slave_or_admin_required"}, "同 /security/crs/schedule。"},
-	{"POST", "/security/ip2region/update", "安全", "手动触发 IP2Region 更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running"}, ""},
+	{"GET", "/security/ip2region", "安全", "IP2Region数据库信息", "", `{"version":"v3.17.0","available":true,"db_size":11200000,"updated_at":"2026-10-01 03:00:00","auto_update":true,"update_status":"success","message":"","trigger":"schedule","last_checked":"2026-10-02 03:00:00","next_update":"2026-10-03 04:00:00","schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00","v6_enabled":false,"v6_version":"v3.17.0","v6_updated_at":"2026-10-01 03:00:00","v6_update_status":"success","v6_message":"","v6_db_size":37258897}`, []string{"500 数据库故障", "401 unauthenticated"}, "available=false 表示库文件缺失（缺库降级，安全链整体不渲染）。schedule_days/schedule_time 为定时更新排程（同 /security/crs）。v6_* 六键为 IPv6 地理库数据源状态（v6_enabled=false 时版本/状态为「未启用」配置态）；开关经 PUT /security/ip2region/v6-enabled 切换。"},
+	{"PUT", "/security/ip2region/v6-enabled", "安全", "IPv6 地理库开关", `{"enabled":true}`, `{"code":0,"message":"IPv6 地理库已启用，重载后生效","data":{"v6_enabled":true,"warnings":["重载失败：开关已保存，待下次配置重载生效"]}}`, []string{"400 invalid_request（enabled 必填布尔）", "403 slave_or_admin_required（从节点只读 / 非管理员只读）", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "切换 IPv6 地理库数据源启用态。开启后 IPv6 客户端经 v6 xdb 解析归属（海外精确到国家、国内精确到省，与 IPv4 同语义）；关闭时 IPv6 客户端按「海外」哨兵处理（HTTP 链 fail-closed / TCP 链 fail-open）。保存即持久化并触发配置重载；重载失败时开关已保存、返回 200+warnings 披露「待下次重载生效」。操作记录全操作审计。"},
+	{"GET", "/security/ip2region/regions", "安全", "IP2Region 区域列表", "", `{"revision":"r27","provinces":["广东省","北京市","海外"],"cities":{"广东省":["深圳市","广州市"]},"countries":["United States","Japan"],"country_names_cn":{"United States":"美国","Japan":"日本"}}`, []string{"401 unauthenticated"}, "provinces=省级列表（含海外一级条目）；cities=省→城市集映射（省/市 联合匹配）；countries=海外国家集（海外行按国家粒度选择）；country_names_cn=海外国家英文→中文映射（选择器/归属地中文显示，缺失时消费方回退英文）。"},
+	{"PUT", "/security/ip2region/auto-update", "安全", "开关 IP2Region 自动更新", `{"auto_update":true}`, `{"code":0}`, []string{"400 auto_update 缺失或为 null", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, ""},
+	{"PUT", "/security/ip2region/schedule", "安全", "设置 IP2Region 定时更新排程", `{"days":[2],"time":"04:30"}`, `{"code":0}`, []string{"400 至少选择一天或时间格式无效", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "同 /security/crs/schedule。"},
+	{"POST", "/security/ip2region/update", "安全", "手动触发 IP2Region 更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running", "503 task_engine_unavailable", "428 mfa_step_up_required"}, ""},
 	{"GET", "/security/ip2region/update/status", "安全", "IP2Region 更新任务状态", "", `{"status":"success","trigger":"manual","started_at":"2026-08-12 14:00:00","finished_at":"2026-08-12 14:01:00","message":"","version":"commit-abc"}`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/security/ip2region/update/logs", "安全", "IP2Region 更新日志", "", `{"content":"2026/08/12 14:00:00 [INFO] checking - 查询最新 ip2region 提交"}`, []string{"401 unauthenticated"}, ""},
-	{"GET", "/security/threat-lib", "安全", "威胁情报库源列表与条目合计数", "", `{"sources":[{"id":1,"name":"ustc","display_name":"中科大恶意 IP（USTC）","url":"https://blackip.ustc.edu.cn/list.php?txt","format":"plain","update_enabled":true,"entry_count":14030,"version":"2026.09.23","update_status":"success","message":"","last_checked":"2026-09-23 02:00:00","next_update":"2026-09-24 02:00:00","list_id":4}],"total_entries":19144,"auto_update":true,"schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"401 unauthenticated", "500 数据库故障"}, "内置只读三源（USTC 黑 IP/FireHOL level1/ET Compromised）；total_entries=三源条目合计；auto_update 为任务级自动更新总闸（独立于逐源 update_enabled）。版本=最近成功更新日期（YYYY.MM.DD）。list_id=该源对应的内置 IP 名单 id（IP 地址列表 tab「查看」跳转与策略引用生效的载体）。schedule_days/schedule_time 为任务级定时更新排程（星期集 1=周一…7=周日 + HH:MM，时区遵循基础设置）。"},
-	{"PUT", "/security/threat-lib/auto-update", "安全", "开关威胁库自动更新总闸", `{"auto_update":true}`, `{"code":0,"message":"已更新"}`, []string{"400 invalid_request", "403 slave_or_admin_required"}, "任务级总开关：关闭时调度器整任务不启动；逐源 update_enabled（flags 端点）决定任务更新哪些源，两者解耦。"},
-	{"PUT", "/security/threat-lib/schedule", "安全", "设置威胁库定时更新排程", `{"days":[1,2,3,4,5,6,7],"time":"04:00"}`, `{"code":0}`, []string{"400 至少选择一天或时间格式无效", "403 slave_or_admin_required"}, "任务级排程（全部启用源共用）：保存即重排全部启用源（含失败源）的 next_update；失败重试在任务内完成，下一运行=下一排程槽。"},
-	{"PUT", "/security/threat-lib/:id/flags", "安全", "更新威胁库源开关", `{"update_enabled":true}`, `{"code":0,"message":"已更新"}`, []string{"400 无可更新字段", "401 unauthenticated", "403 slave_or_admin_required", "404 源不存在"}, "仅 update_enabled 可改，请求体携带的其余字段一律忽略（内置源不可变造）。名单化后「应用」= 策略引用内置名单（IP 地址列表 tab）。"},
-	{"POST", "/security/threat-lib/update", "安全", "手动触发威胁情报库更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running"}, "单一任务按顺序更新全部 update_enabled 源；某源失败仅影响该源（保留上次成功文件）。仅主节点。"},
+	{"GET", "/security/threat-lib", "安全", "威胁情报库源列表与条目合计数", "", `{"sources":[{"id":1,"name":"ustc","display_name":"中科大恶意 IP（USTC）","url":"https://blackip.ustc.edu.cn/list.php?txt","format":"plain","update_enabled":true,"entry_count":14030,"version":"2026.09.23","update_status":"success","message":"","last_checked":"2026-09-23 02:00:00","next_update":"2026-09-24 02:00:00","list_id":4}],"total_entries":19144,"auto_update":true,"schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"401 unauthenticated", "500 数据库故障"}, "内置只读三源（USTC 黑 IP/FireHOL level1/ET Compromised）；total_entries=三源条目合计；auto_update 为任务级自动更新总闸（独立于逐源 update_enabled）。已知状态：本库写操作仅开放面板与 REST，MCP 未提供工具（CRS/IP2Region 有 toggle/trigger 工具，属能力面差异，非权限缺口）。版本=最近成功更新日期（YYYY.MM.DD）。list_id=该源对应的内置 IP 名单 id（IP 地址列表 tab「查看」跳转与策略引用生效的载体）。schedule_days/schedule_time 为任务级定时更新排程（星期集 1=周一…7=周日 + HH:MM，时区遵循基础设置）。"},
+	{"PUT", "/security/threat-lib/auto-update", "安全", "开关威胁库自动更新总闸", `{"auto_update":true}`, `{"code":0,"message":"已更新"}`, []string{"400 invalid_request", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "任务级总开关：关闭时调度器整任务不启动；逐源 update_enabled（flags 端点）决定任务更新哪些源，两者解耦。"},
+	{"PUT", "/security/threat-lib/schedule", "安全", "设置威胁库定时更新排程", `{"days":[1,2,3,4,5,6,7],"time":"04:00"}`, `{"code":0}`, []string{"400 至少选择一天或时间格式无效", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "任务级排程（全部启用源共用）：保存即重排全部启用源（含失败源）的 next_update；失败重试在任务内完成，下一运行=下一排程槽。"},
+	{"PUT", "/security/threat-lib/:id/flags", "安全", "更新威胁库源开关", `{"update_enabled":true}`, `{"code":0,"message":"已更新"}`, []string{"400 无可更新字段", "401 unauthenticated", "403 slave_or_admin_required", "404 源不存在", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅 update_enabled 可改，请求体携带的其余字段一律忽略（内置源不可变造）。名单化后「应用」= 策略引用内置名单（IP 地址列表 tab）。"},
+	{"POST", "/security/threat-lib/update", "安全", "手动触发威胁情报库更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running", "503 task_engine_unavailable", "428 mfa_step_up_required"}, "单一任务按顺序更新全部 update_enabled 源；某源失败仅影响该源（保留上次成功文件）。仅主节点。"},
 	{"GET", "/security/threat-lib/update/status", "安全", "威胁库更新任务状态", "", `{"running":false,"trigger":"manual","started_at":"2026-09-23 14:00:00","finished_at":"2026-09-23 14:01:00","outcome":"success"}`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/security/threat-lib/update/logs", "安全", "威胁库更新日志", "", `{"content":"2026/09/23 14:00:00 [INFO] downloading - 下载 ustc（https://blackip.ustc.edu.cn/list.php?txt）"}`, []string{"401 unauthenticated"}, ""},
+	{"GET", "/security/crawler-lib", "安全", "爬虫地址库源列表、条目合计与独立排程", "", `{"sources":[{"id":1,"name":"googlebot","display_name":"Google 官方爬虫 IP（common-crawlers）","url":"https://developers.google.com/static/crawling/ipranges/common-crawlers.json","format":"json","update_enabled":true,"entry_count":170,"version":"2026.10.16","update_status":"success","message":"","last_checked":"2026-10-16 02:00:00","next_update":"2026-10-17 04:00:00","list_id":4}],"total_entries":216,"auto_update":true,"schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"401 unauthenticated", "500 数据库故障"}, "爬虫地址库独立源表（security_crawler_sources）：版本/状态/条目数/更新地址/独立总闸与排程。已知状态：本库写操作仅开放面板与 REST，MCP 未提供工具（CRS/IP2Region 有 toggle/trigger 工具，属能力面差异，非权限缺口）；master 写库，slave 只读不写。"},
+	{"PUT", "/security/crawler-lib/auto-update", "安全", "开关爬虫地址库自动更新总闸", `{"auto_update":true}`, `{"code":0,"message":"已更新"}`, []string{"400 invalid_request", "401 unauthenticated", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "与威胁库总闸及逐源 update_enabled 解耦。"},
+	{"PUT", "/security/crawler-lib/schedule", "安全", "设置爬虫地址库独立定时排程", `{"days":[1,2,3,4,5,6,7],"time":"04:00"}`, `{"code":0,"message":"已更新"}`, []string{"400 至少选择一天或时间格式无效", "401 unauthenticated", "403 slave_or_admin_required", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "保存即重排全部启用爬虫源 next_update；不修改威胁库排程。"},
+	{"POST", "/security/crawler-lib/update", "安全", "手动触发爬虫地址更新", "", `{"status":"running","trigger":"manual"}`, []string{"403 slave_or_admin_required", "409 update_running", "503 task_engine_unavailable", "428 mfa_step_up_required"}, "主节点执行，统一经任务引擎（crawlerbot-update）与独立定时任务同体；失败保留上次快照。"},
+	{"PUT", "/security/crawler-lib/:id/flags", "安全", "更新爬虫地址库逐源开关", `{"update_enabled":true}`, `{"code":0,"message":"已更新"}`, []string{"400 无可更新字段", "401 unauthenticated", "403 slave_or_admin_required", "404 源不存在", "428 mfa_step_up_required", "409 import_in_progress（配置导入窗口拒绝写）"}, "仅 update_enabled 可改。"},
+	{"GET", "/security/crawler-lib/update/status", "安全", "爬虫地址库更新任务状态", "", `{"running":false,"trigger":"manual","started_at":"2026-10-17 04:00:00","finished_at":"2026-10-17 04:00:05","outcome":"success"}`, []string{"401 unauthenticated", "503 task_engine_unavailable"}, "直接读取 crawlerbot-update 自身任务历史。"},
+	{"GET", "/security/crawler-lib/update/logs", "安全", "爬虫地址库更新任务日志", "", `{"content":"2026/10/16 22:00:00 [INFO] crawlerbot-update: 源 googlebot 更新 170 个 IP 段"}`, []string{"401 unauthenticated"}, ""},
+}
+
+// apiDocImportWindowError 返回导入窗口门的文档条目（按方法派生）。门对只读/
+// 导出端点拦的是「导出/下发」，对写端点才是「拒绝写」——同一句文案套两类端点
+// 会让排障者去找一个不存在的写点。
+func apiDocImportWindowError(method string) string {
+	if method == http.MethodGet {
+		return "409 import_in_progress（配置导入窗口拒绝导出）"
+	}
+	return "409 import_in_progress（配置导入窗口拒绝写）"
+}
+
+// importWindowGatedDocRoutes 受「配置导入窗口写门」约束的端点
+// （method + " " + path）。文档错误码由代码派生：buildOpenAPIYAML 对本集合内
+// 端点自动补 409——新增/删除写门只需改这里，且
+// TestAPIDocsImportWindow_derivedFromHandlerGates 从 handler 源码的门调用点与
+// middleware 路由注册双向派生校验，扩族/漏登不再靠人工逐条同步文案。
+var importWindowGatedDocRoutes = map[string]struct{}{
+	"DELETE /api-keys/:id":                         {},
+	"DELETE /certificate-configs/:id":              {},
+	"DELETE /certificates/jobs/:id":                {},
+	"DELETE /cluster/nodes/:id":                    {},
+	"DELETE /rules/:caddy_id":                      {},
+	"DELETE /security/block-pages/:id":             {},
+	"DELETE /security/custom-rules/:id":            {},
+	"DELETE /security/ip-lists/:id":                {},
+	"DELETE /security/policies/:id":                {},
+	"DELETE /security/policies/:id/bind/:caddy_id": {},
+	"DELETE /settings/oidc":                        {},
+	"DELETE /users/:id":                            {},
+	"DELETE /users/me/api-keys/:id":                {},
+	"GET /cluster/register/:id/status":             {},
+	"GET /cluster/sync/snapshot":                   {},
+	"GET /cluster/sync/waf-files":                  {},
+	"GET /config/export":                           {},
+	"PATCH /api-keys/:id/status":                   {},
+	"PATCH /users/me/api-keys/:id":                 {},
+	"PATCH /users/me":                              {},
+	"POST /api-keys":                               {},
+	"POST /auth/mfa/activate":                      {},
+	"POST /auth/mfa/disable":                       {},
+	"POST /auth/mfa/recovery-codes":                {},
+	"POST /auth/mfa/setup":                         {},
+	"POST /ca-providers/:id/test":                  {},
+	"POST /caddy/restart":                          {},
+	"POST /caddy/start":                            {},
+	"POST /caddy/stop":                             {},
+	"POST /certificate-configs":                    {},
+	"POST /certificates/issue":                     {},
+	"POST /certificates/jobs/:id/retry":            {},
+	"POST /cluster/mode":                           {},
+	"POST /cluster/nodes/:id/approve":              {},
+	"POST /cluster/nodes/:id/forget-pin":           {},
+	"POST /cluster/nodes/:id/reject":               {},
+	"POST /cluster/nodes/report":                   {},
+	"POST /cluster/promote":                        {},
+	"POST /cluster/register":                       {},
+	"POST /cluster/register-tokens":                {},
+	"POST /cluster/service-control":                {},
+	"POST /cluster/registration/confirm":           {},
+	"POST /cluster/sync/pull":                      {},
+	"POST /config/reload":                          {},
+	"POST /config/validate":                        {},
+	"POST /rules":                                  {},
+	"POST /rules/:caddy_id/disable":                {},
+	"POST /rules/:caddy_id/duplicate":              {},
+	"POST /rules/:caddy_id/enable":                 {},
+	"POST /rules/batch-block-pages":                {},
+	"POST /security/block-pages":                   {},
+	"POST /security/custom-rules":                  {},
+	"POST /security/ip-lists":                      {},
+	"POST /security/ip-lists/:id/ips":              {},
+	"POST /security/ip-lists/:id/remove-ip":        {},
+	"POST /security/policies":                      {},
+	"POST /security/policies/:id/bind":             {},
+	"POST /security/policies/:id/bindings/bulk":    {},
+	"POST /security/policies/:id/split":            {},
+	"POST /security/policies/batch-bind":           {},
+	"POST /system/restart":                         {},
+	"POST /system/tasks/:id/cancel":                {},
+	"POST /system/tasks/:id/control":               {},
+	"POST /system/tasks/:id/toggle":                {},
+	"POST /system/tasks/:id/trigger":               {},
+	"POST /users":                                  {},
+	"POST /users/:id/mfa/reset":                    {},
+	"POST /users/:id/reset-password":               {},
+	"POST /users/me/api-keys":                      {},
+	"PUT /admin-tls":                               {},
+	"PUT /ca-providers/:id":                        {},
+	"PUT /caddy/config":                            {},
+	"PUT /certificate-configs/:id":                 {},
+	"PUT /cluster/nodes/:id/access-url":            {},
+	"PUT /cluster/nodes/:id/site":                  {},
+	"PUT /cluster/settings":                        {},
+	"PUT /config":                                  {},
+	"PUT /rules/:caddy_id":                         {},
+	"PUT /security/autoban":                        {},
+	"PUT /security/block-pages/:id":                {},
+	"PUT /security/crawler-lib/:id/flags":          {},
+	"PUT /security/crawler-lib/auto-update":        {},
+	"PUT /security/crawler-lib/schedule":           {},
+	"PUT /security/crs/auto-update":                {},
+	"PUT /security/crs/schedule":                   {},
+	"PUT /security/custom-rules/:id":               {},
+	"PUT /security/ip-lists/:id":                   {},
+	"PUT /security/ip2region/auto-update":          {},
+	"PUT /security/ip2region/schedule":             {},
+	"PUT /security/ip2region/v6-enabled":           {},
+	"PUT /security/policies/:id":                   {},
+	"PUT /security/rules/:caddy_id/policies":       {},
+	"PUT /security/threat-lib/:id/flags":           {},
+	"PUT /security/threat-lib/auto-update":         {},
+	"PUT /security/threat-lib/schedule":            {},
+	"PUT /settings/auto-backup":                    {},
+	"PUT /settings/oidc":                           {},
+	"PUT /users/:id":                               {},
+	"PUT /users/:id/status":                        {},
+}
+
+// withDerivedImportWindowError 返回文档条目副本：受门约束但未登记该码的端点
+// 补上 409（已手工登记者原样返回，避免重复条目）。
+func withDerivedImportWindowError(route apiDocRoute) apiDocRoute {
+	if _, gated := importWindowGatedDocRoutes[route.Method+" "+route.Path]; !gated {
+		return route
+	}
+	for _, entry := range route.Errors {
+		if strings.Contains(entry, "import_in_progress") {
+			return route
+		}
+	}
+	clone := route
+	clone.Errors = append(append([]string{}, route.Errors...), apiDocImportWindowError(route.Method))
+	return clone
 }
 
 func buildOpenAPIYAML() string {
 	var b strings.Builder
 	b.WriteString("openapi: 3.1.0\ninfo:\n  title: Lazy Balancer API\n  version: 1.0.0\n")
-	b.WriteString("  description: |\n    Lazy Balancer V2 REST API(/api/v1)。管理接口使用 Authorization: Bearer <JWT 或 lb_sk_ API Key>。\n    集群机器接口使用 X-Cluster-Token 或 X-Registration-Secret。业务 JSON 响应统一为 {code,message,data?}；示例除特别注明外均为 data 载荷，实际响应为 {code,message,data} 包装。\n    例外：登录直接返回登录对象；配置下载直接返回备份 JSON；MCP 返回 JSON-RPC；304 无响应体；API 文档 HTML 与 OpenAPI YAML 使用各自媒体类型。\n    不返回用户密码；TLS 私钥、DNS 凭证及其他配置数据对所有已登录用户可读，仅管理员可修改。集群快照包含密码和密钥哈希及证书私钥，部署时建议使用 HTTPS。\nservers:\n  - url: /api/v1\npaths:\n")
+	b.WriteString("  description: |\n    Lazy Balancer V2 REST API(/api/v1)。管理接口使用 Authorization: Bearer <JWT 或 lb_sk_ API Key>。\n    集群机器接口使用 X-Cluster-Token 或 X-Registration-Secret。业务 JSON 响应统一为 {code,message,data?}；示例除特别注明外均为 data 载荷，实际响应为 {code,message,data} 包装。\n    例外：登录直接返回登录对象；配置下载直接返回 lbbak 备份二进制（application/gzip）；MCP 返回 JSON-RPC；304 无响应体；API 文档 HTML 与 OpenAPI YAML 使用各自媒体类型。\n    不返回用户密码；TLS 私钥与 DNS 凭证仅对管理员（非只读 API Key）明文返回，其他已登录用户读取时一律掩码（TLSKeySet 标记是否已配置），仅管理员可修改；其余配置数据对所有已登录用户可读。集群快照包含密码和密钥哈希及证书私钥，部署时建议使用 HTTPS。\nservers:\n  - url: /api/v1\npaths:\n")
 	pathOrder := make([]string, 0)
 	routesByPath := make(map[string][]apiDocRoute)
 	for _, r := range apiDocRoutes {
-		path := openAPIPath(r.Path)
+		path := apipath.ToOpenAPI(r.Path)
 		if _, exists := routesByPath[path]; !exists {
 			pathOrder = append(pathOrder, path)
 		}
@@ -246,15 +422,17 @@ func buildOpenAPIYAML() string {
 	for _, path := range pathOrder {
 		fmt.Fprintf(&b, "  %s:\n", path)
 		for _, route := range routesByPath[path] {
-			writeOpenAPIOperation(&b, route)
+			writeOpenAPIOperation(&b, withDerivedImportWindowError(route))
 		}
 	}
-	b.WriteString("components:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      description: JWT 或 lb_sk_ API Key\n    mcpApiKey:\n      type: apiKey\n      in: header\n      name: X-API-Key\n      description: MCP 专用 lb_sk_ API Key；也接受 Authorization Bearer 形式\n    clusterToken:\n      type: apiKey\n      in: header\n      name: X-Cluster-Token\n    registrationSecret:\n      type: apiKey\n      in: header\n      name: X-Registration-Secret\n")
+	b.WriteString("components:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      description: JWT 或 lb_sk_ API Key\n    mcpApiKey:\n      type: apiKey\n      in: header\n      name: " + accesslog.APIKeyHeaderName + "\n      description: MCP 专用 lb_sk_ API Key；也接受 Authorization Bearer 形式\n    clusterToken:\n      type: apiKey\n      in: header\n      name: X-Cluster-Token\n    registrationSecret:\n      type: apiKey\n      in: header\n      name: X-Registration-Secret\n")
 	return b.String()
 }
 
 func writeOpenAPIOperation(b *strings.Builder, route apiDocRoute) {
-	fmt.Fprintf(b, "    %s:\n      tags: [%s]\n      summary: %s\n", strings.ToLower(route.Method), route.Tag, route.Summary)
+	// tags/summary 是自由文本：裸拼会在含 ": "/"#" 等字符时破坏 YAML 或静默
+	// 改写语义。统一 strconv.Quote（与 description 同口径）。
+	fmt.Fprintf(b, "    %s:\n      tags: [%s]\n      summary: %s\n", strings.ToLower(route.Method), strconv.Quote(route.Tag), strconv.Quote(route.Summary))
 	contract := apiDocContractFor(route)
 	switch contract.security {
 	case "public":
@@ -273,27 +451,54 @@ func writeOpenAPIOperation(b *strings.Builder, route apiDocRoute) {
 		fmt.Fprintf(b, "      description: %s\n", strconv.Quote(description))
 	}
 	writeOpenAPIParameters(b, route, contract.queryParameters)
-	if route.Request != "" {
-		fmt.Fprintf(b, "      requestBody:\n        required: %t\n        content:\n          %s:\n            example: %s\n", !contract.requestOptional, contract.requestContentType, route.Request)
+	// GET 不产出 requestBody（查询参数一律经 queryParameters 表达）——
+	// 钉测试 TestAPIDocRoutes_getRequestsDeclareQueryNotBody 同口径。
+	if route.Request != "" && route.Method != http.MethodGet {
+		if len(contract.requestVariants) > 0 {
+			fmt.Fprintf(b, "      requestBody:\n        required: %t\n        content:\n", !contract.requestOptional)
+			for _, variant := range contract.requestVariants {
+				example := variant.example
+				if example == "" {
+					example = route.Request
+				}
+				fmt.Fprintf(b, "          %s:\n            example: %s\n", variant.contentType, example)
+			}
+		} else {
+			fmt.Fprintf(b, "      requestBody:\n        required: %t\n        content:\n          %s:\n            example: %s\n", !contract.requestOptional, contract.requestContentType, route.Request)
+		}
 	}
-	fmt.Fprintf(b, "      responses:\n        '%d':\n          description: 成功\n          content:\n            %s:\n              example: %s\n", contract.successStatus, contract.responseContentType, documentedResponse(route, contract.rawResponse))
+	fmt.Fprintf(b, "      responses:\n        '%d':\n          description: 成功\n          content:\n            %s:\n", contract.successStatus, contract.responseContentType)
+	writeYAMLExample(b, "              ", documentedResponse(route, contract.rawResponse))
 	for _, status := range contract.emptySuccessStatuses {
 		fmt.Fprintf(b, "        '%d':\n          description: 未修改\n", status)
 	}
-	seenStatuses := make(map[string]bool, len(route.Errors))
+	// 同码多形态合并描述而非取首丢弃（如 400 invalid_request +
+	// 400 cannot_disable_self）——OpenAPI YAML 不允许重复键，但具体拒绝语义
+	// 必须保留，否则「不能禁用自己」这类可行动原因在规格里消失。
+	statusOrder := make([]string, 0, len(route.Errors))
+	descriptionsByStatus := make(map[string][]string, len(route.Errors))
 	for _, routeError := range route.Errors {
 		parts := strings.SplitN(routeError, " ", 2)
-		// SYSRENDER28-P2 关联(第 28 轮):同码多形态(如 400 invalid_request+
-		// 400 cannot_disable_self)去重取首——OpenAPI YAML 不允许重复键。
-		if seenStatuses[parts[0]] {
-			continue
+		if _, seen := descriptionsByStatus[parts[0]]; !seen {
+			statusOrder = append(statusOrder, parts[0])
 		}
-		seenStatuses[parts[0]] = true
 		description := "错误"
 		if len(parts) == 2 {
 			description = parts[1]
 		}
-		fmt.Fprintf(b, "        '%s':\n          description: %s\n          content:\n            application/json:\n              example: {\"code\":%s,\"message\":\"%s\"}\n", parts[0], description, parts[0], description)
+		descriptionsByStatus[parts[0]] = append(descriptionsByStatus[parts[0]], description)
+	}
+	for _, status := range statusOrder {
+		description := strings.Join(descriptionsByStatus[status], " / ")
+		// 错误描述与 summary/tags 同口径转义：YAML 标量走 strconv.Quote；
+		// JSON 示例内的 message 走 json.Marshal——Go 字符串字面量的 \xNN
+		// 转义不是合法 JSON，直接复用 strconv.Quote 会让含控制字符的描述
+		// 生成无法解析的示例。
+		messageJSON, err := json.Marshal(description)
+		if err != nil {
+			messageJSON = []byte(strconv.Quote(description))
+		}
+		fmt.Fprintf(b, "        '%s':\n          description: %s\n          content:\n            application/json:\n              example: {\"code\":%s,\"message\":%s}\n", status, strconv.Quote(description), status, messageJSON)
 	}
 }
 
@@ -301,6 +506,11 @@ type apiDocParameter struct {
 	name        string
 	valueType   string
 	description string
+}
+
+type apiDocContentExample struct {
+	contentType string
+	example     string
 }
 
 type apiDocContract struct {
@@ -311,50 +521,130 @@ type apiDocContract struct {
 	rawResponse          bool
 	emptySuccessStatuses []int
 	queryParameters      []apiDocParameter
+	requestVariants      []apiDocContentExample
 	security             string
+}
+
+// /admin-tls 与 /admin-tls/inspect 同时接受 multipart
+// 表单与 JSON（MCP 通道固定发 application/json）——两个 content type 都必须
+// 出现在生成规格中，各自携带形态匹配的示例。
+func adminTLSRequestVariants() []apiDocContentExample {
+	return []apiDocContentExample{
+		{"multipart/form-data", "multipart 表单：enabled=true、mode=upload、cert_file/key_file 为文件字段"},
+		{"application/json", `{"enabled":true,"mode":"selfsigned"}`},
+	}
+}
+
+func inspectAdminTLSRequestVariants() []apiDocContentExample {
+	return []apiDocContentExample{
+		{"multipart/form-data", "multipart 表单：cert_file、key_file 为文件字段"},
+		{"application/json", `{"cert_file":"（PEM 证书文本）","key_file":"（PEM 私钥文本）"}`},
+	}
+}
+
+func configImportRequestVariants() []apiDocContentExample {
+	return []apiDocContentExample{
+		{"application/json", `{"meta":{"app":"lazy-balancer","version":"2"},"config":{},"tables":{}}`},
+		{"application/octet-stream", "lbbak 二进制备份（tar.gz）原始字节"},
+	}
+}
+
+func configBackupSectionsQueryParameter() apiDocParameter {
+	return apiDocParameter{"sections", "string", "可选配置分类（逗号分隔）：" + configBackupSectionKeysText() + "，默认全选；旧版 global_config/waf_files 键自动归一（分别视为 users/security）；未知分类返回 400"}
 }
 
 var apiDocContracts = map[string]apiDocContract{
 	"POST /auth/login":        {rawResponse: true, security: "public"},
 	"POST /auth/ticket-login": {rawResponse: true, security: "public"},
 	"POST /auth/mfa/verify":   {rawResponse: true, security: "public"},
-	"GET /auth/setup":         {security: "public"},
-	"POST /auth/setup":        {security: "public"},
-	// R39-6(C1):OIDC 公开路由契约——status 为登录页按钮显隐探测、login 为
+	// MFA 首次绑定无需请求体（仅已启用 MFA 的重绑才须提交 6 位验证码）——
+	// codegen 不得把 body 标必填。
+	"POST /auth/mfa/setup": {requestOptional: true},
+	"GET /auth/setup":      {security: "public"},
+	"POST /auth/setup":     {security: "public"},
+	// OIDC 公开路由契约——status 为登录页按钮显隐探测、login 为
 	// 浏览器 302 跳转、callback 为 IdP 回调重定向,三者均不携带 JWT/API Key;
 	// 漏登记会让 OpenAPI 把它们误标 bearerAuth。
 	"GET /auth/oidc/status":              {security: "public"},
-	"GET /auth/oidc/login":               {security: "public", rawResponse: true},
-	"GET /auth/oidc/callback":            {security: "public", rawResponse: true},
+	"GET /auth/oidc/login":               {security: "public", rawResponse: true, successStatus: http.StatusFound, queryParameters: []apiDocParameter{{"return_to", "string", "登录成功后返回的站内路径；仅允许站内路径"}}},
+	"GET /auth/oidc/callback":            {security: "public", rawResponse: true, successStatus: http.StatusFound},
 	"GET /branding":                      {security: "public"},
 	"POST /cluster/register":             {security: "public"},
 	"GET /cluster/register/:id/status":   {security: "registration"},
 	"POST /cluster/registration/confirm": {security: "cluster"},
 	"GET /cluster/sync/snapshot":         {security: "cluster", emptySuccessStatuses: []int{http.StatusNotModified}, queryParameters: []apiDocParameter{{"since_version", "integer", "客户端已应用的快照版本"}, {"fingerprint", "string", "客户端已应用的快照指纹"}}},
+	"GET /cluster/sync/waf-files":        {security: "cluster"},
 	"POST /cluster/nodes/report":         {security: "cluster"},
 	"POST /cluster/service-control":      {security: "public"},
 	"POST /mcp":                          {rawResponse: true, security: "mcp"},
 	"POST /users":                        {successStatus: http.StatusCreated},
+	"POST /auto-backup/run":              {successStatus: http.StatusAccepted},
 	"POST /users/me/api-keys":            {successStatus: http.StatusCreated},
 	"POST /api-keys":                     {successStatus: http.StatusCreated},
 	"POST /rules":                        {successStatus: http.StatusCreated},
 	"POST /rules/:caddy_id/duplicate":    {successStatus: http.StatusCreated},
 	"POST /certificate-configs":          {successStatus: http.StatusCreated},
-	// R39-8(C2):v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
-	// application/gzip 下发);sections query 与导入侧对称(五分类,默认全选)。
-	"GET /config/export":                   {rawResponse: true, responseContentType: "application/gzip", queryParameters: []apiDocParameter{{"sections", "string", "可选配置分类（逗号分隔）：users、rules、security，默认全选；旧版 global_config/waf_files 键自动归一（分别视为 users/security）；未知分类返回 400"}}},
-	"GET /mcp/ops-playbook":                {rawResponse: true, responseContentType: "text/markdown"},
-	"PUT /admin-tls":                       {requestContentType: "multipart/form-data"},
-	"POST /admin-tls/inspect":              {requestContentType: "multipart/form-data"},
+	// v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
+	// application/gzip 下发);sections query 与导入侧对称（分类键清单由
+	// configBackupSections 单一事实源派生，防文档与实现再分叉）。
+	"GET /config/export":           {rawResponse: true, responseContentType: "application/gzip", queryParameters: []apiDocParameter{configBackupSectionsQueryParameter()}},
+	"POST /config/import":          {queryParameters: []apiDocParameter{configBackupSectionsQueryParameter()}, requestVariants: configImportRequestVariants()},
+	"POST /config/import/validate": {queryParameters: []apiDocParameter{configBackupSectionsQueryParameter()}, requestVariants: configImportRequestVariants()},
+	// 非 JSON raw 响应端点显式登记 media type（与 handler 实参逐字一致，
+	// 由 apidocs_raw_response_derived_test 派生对账）——漏登记会回落到
+	// application/json 并被包成 {"code":0,...,"data":非 JSON}。
+	"GET /auto-backup/:id/download":        {rawResponse: true, responseContentType: "application/octet-stream"},
+	"GET /security/ip-lists/:id/export":    {rawResponse: true, responseContentType: "text/plain; charset=utf-8"},
+	"GET /mcp/ops-playbook":                {rawResponse: true, responseContentType: "text/markdown; charset=utf-8"},
+	"PUT /admin-tls":                       {requestContentType: "multipart/form-data", requestVariants: adminTLSRequestVariants()},
+	"POST /admin-tls/inspect":              {requestContentType: "multipart/form-data", requestVariants: inspectAdminTLSRequestVariants()},
 	"GET /rules/:caddy_id/metrics-history": {queryParameters: []apiDocParameter{{"range", "string", "时间范围：1h、6h、24h 或 7d，默认 24h"}}},
 	"GET /rules/:caddy_id/log-stream":      {queryParameters: []apiDocParameter{{"offset", "integer", "上次响应返回的字节偏移"}}},
-	"GET /certificates/jobs":               {queryParameters: []apiDocParameter{{"rule_id", "string", "按规则 ID 过滤"}, {"page", "integer", "页码，默认 1，1-1000000"}, {"page_size", "integer", "每页数量，默认 50，1-200"}}},
-	"GET /caddy/logs":                      {queryParameters: []apiDocParameter{{"type", "string", "日志类型：runtime、server、proxy 或 tls"}}},
-	"GET /metrics/history":                 {queryParameters: []apiDocParameter{{"rule_id", "string", "可选规则 ID"}, {"interval", "string", "时间范围，默认 1h"}}},
-	"GET /logs/stats":                      {queryParameters: []apiDocParameter{{"caddy_id", "string", "可选规则 ID，将证书任务与规则访问收窄到单规则"}}},
-	"GET /audit-logs":                      {queryParameters: []apiDocParameter{{"page", "integer", "页码，默认 1"}, {"page_size", "integer", "每页数量，默认 20"}, {"username", "string", "操作人模糊筛选"}, {"action", "string", "操作模糊筛选"}, {"resource", "string", "对象模糊筛选"}, {"ip", "string", "IP 模糊筛选"}, {"keyword", "string", "详情关键词"}, {"start_time", "string", "开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}, {"end_time", "string", "结束时间（配置时区）"}}},
-	"GET /security/events":                 {queryParameters: []apiDocParameter{{"page", "integer", "页码，默认 1"}, {"page_size", "integer", "每页数量，默认 20，1-100"}, {"action", "string", "按动作过滤（精确值：blocked/logged）"}, {"ip", "string", "按完整客户端 IP 精确匹配"}, {"rule_caddy_id", "string", "按规则 Caddy ID 过滤"}, {"rule_name", "string", "按负载规则名称过滤（子串，匹配事件时快照）"}, {"policy_name", "string", "按安全策略名称过滤（子串，匹配事件时快照）"}, {"rule_triggered", "string", "按触发规则过滤（类别：IP 访问控制/地域拦截/WAF 规则（CRS）/自定义规则；也可输细标签或 CRS 6 位规则 ID/消息关键词）"}, {"rule_triggered_exclude", "string", "按触发规则反向过滤（同 rule_triggered 的类别/细标签/ID，整体取反）"}, {"uri", "string", "按请求 URI 过滤（子串）"}, {"start_time", "string", "开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}, {"end_time", "string", "结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}}},
-	"GET /security/crs/rules":              {queryParameters: []apiDocParameter{{"search", "string", "搜索关键词"}, {"page", "integer", "页码，默认 1"}, {"page_size", "integer", "每页数量，默认 50，上限 50"}}},
+	"GET /certificates/jobs":               {queryParameters: []apiDocParameter{{"rule_id", "string", "按规则 ID 过滤"}, {"page", "integer", "页码，默认 1，1-1000"}, {"page_size", "integer", "每页数量，默认 50，1-200"}}},
+	"POST /certificates/jobs/:id/retry":    {queryParameters: []apiDocParameter{{"force", "boolean", "显式越过未到期的 CA 限流冷却；省略或 false 不越过"}}},
+	"POST /certificates/issue":             {queryParameters: []apiDocParameter{{"force", "boolean", "显式越过目标任务的 CA 限流冷却；省略或 false 不越过"}}},
+	// cert-job 行触发与 /certificates/jobs/:id/retry 共用重试核心：force 是真实
+	// query（冷却未到期时越过 429），漏登记时 SDK 拿不到越权形参。
+	"POST /system/tasks/:id/trigger": {queryParameters: []apiDocParameter{{"force", "boolean", "cert-job 行：显式越过未到期的 CA 冷却（越过留越权审计）；省略或 false 不越过，其余任务族忽略"}}},
+	// 列表查询的分页/过滤参数是真实 query（parsePaginationParam 实参同值）——
+	// 漏登记时生成 SDK 拿不到续页与过滤形参，只能凭描述手写 query。
+	"GET /certificates":          {queryParameters: []apiDocParameter{{"rule_id", "string", "按规则 ID 过滤"}, {"page", "integer", "页码，默认 1，1-1000"}, {"page_size", "integer", "每页数量，默认 1000，上限 1000"}}},
+	"GET /caddy/logs":            {queryParameters: []apiDocParameter{{"type", "string", "日志类型：runtime、server、proxy 或 tls"}}},
+	"GET /metrics/history":       {queryParameters: []apiDocParameter{{"rule_id", "string", "可选规则 ID"}, {"interval", "string", "时间范围，默认 1h"}}},
+	"GET /logs/stats":            {queryParameters: []apiDocParameter{{"caddy_id", "string", "可选规则 ID，将证书任务与规则访问收窄到单规则"}, {"key", "string", "可选日志 key（单行；日志弹框只取所看那一行，避免全量统计）"}, {"keys", "string", "可选逗号分隔的多个 key（与 key 合并去重）"}}},
+	"GET /audit-logs":            {queryParameters: []apiDocParameter{{"page", "integer", "页码，默认 1"}, {"page_size", "integer", "每页数量，默认 20"}, {"username", "string", "操作人模糊筛选"}, {"action", "string", "操作模糊筛选"}, {"resource", "string", "对象模糊筛选"}, {"ip", "string", "IP 模糊筛选"}, {"keyword", "string", "详情关键词"}, {"start_time", "string", "开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}, {"end_time", "string", "结束时间（配置时区）"}}},
+	"GET /security/events/count": {queryParameters: []apiDocParameter{{"ip", "string", "完整客户端 IP 精确匹配（必填）"}, {"days", "integer", "近 N 天（默认 30，1-365）"}}},
+	// 策略列表两个过滤参数是真实 query（enabled 三态语义；rule_caddy_id 子查询
+	// 绑定过滤）——漏登记时生成 SDK/脚本发现不了。
+	"GET /security/policies": {queryParameters: []apiDocParameter{{"enabled", "string", "只看启用/禁用：true 或 1=仅启用，false 或 0=仅禁用（省略=全部）"}, {"rule_caddy_id", "string", "仅列出绑定到该规则的策略（IP 归属地弹窗使用）"}}},
+	// 大屏增量族：游标/窗口参数原为 Request 字段的查询串（被生成器误产
+	// requestBody）——GET 查询参数一律登记于此（in: query）。
+	"GET /security/overview/threat-screen":             {queryParameters: []apiDocParameter{{"hours", "integer", "统计窗口小时数（缺省 24，上限 720，非法/越界回退 24）"}}},
+	"GET /security/events/feed":                        {queryParameters: []apiDocParameter{{"since_id", "integer", "增量游标（0=首屏返回最新 limit 条）"}, {"limit", "integer", "每批条数（缺省 50，上限 200）"}}},
+	"GET /security/events/toast-summary":               {queryParameters: []apiDocParameter{{"since_id", "integer", "聚合游标（0=非 baseline 从最新记录倒序聚合，最多 1200 条）"}, {"limit", "integer", "聚合批大小（缺省 20）"}, {"baseline", "integer", "1=仅返回当前高水位（groups 为空）"}}},
+	"GET /security/overview/threat-screen/attack-flow": {queryParameters: []apiDocParameter{{"since", "integer", "光流序号游标（0=最近 limit 条）"}, {"limit", "integer", "每批条数（缺省 200）"}}},
+	"GET /security/overview/threat-screen/events":      {queryParameters: []apiDocParameter{{"since", "integer", "事件序号游标（0=最近 limit 条）"}, {"limit", "integer", "每批条数（缺省 200）"}}},
+	"GET /security/events":                             {queryParameters: []apiDocParameter{{"page", "integer", "页码，默认 1"}, {"page_size", "integer", "每页数量，默认 20，1-100"}, {"action", "string", "按动作过滤（精确值：blocked/logged）"}, {"ip", "string", "按完整客户端 IP 精确匹配"}, {"rule_caddy_id", "string", "按规则 Caddy ID 过滤"}, {"rule_name", "string", "按负载规则名称过滤（子串，匹配事件时快照）"}, {"policy_name", "string", "按安全策略名称过滤（子串，匹配事件时快照）"}, {"rule_triggered", "string", "按触发规则过滤（类别：爬虫Bot/地域拦截/IP 访问控制/信任名单/威胁情报库/请求体异常/WAF·CRS/WAF·自定义；也可输细标签（评分拦截/协议异常/协议攻击）或 CRS 6 位规则 ID/消息关键词）"}, {"rule_triggered_exclude", "string", "按触发规则反向过滤（同 rule_triggered 的类别/细标签/ID，整体取反）"}, {"uri", "string", "按请求 URI 过滤（子串）"}, {"start_time", "string", "开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}, {"end_time", "string", "结束时间（配置时区）"}}},
+	"GET /security/crs/rules":                          {queryParameters: []apiDocParameter{{"search", "string", "搜索关键词"}, {"page", "integer", "页码，默认 1"}, {"page_size", "integer", "每页数量，默认 50，上限 50"}}},
+}
+
+// apiDocRequiredQueryParameters 登记「handler 缺参即 400」的必填 query 参数
+// （按「METHOD path」键）。默认全部可选——生成器此前把每条 query 参数一律写成
+// required=false，按规格生成的客户端会把缺参调用当合法请求，运行期才吃 400。
+// 只登记真正必填的项；新增项必须与 handler 的拒参分支同时改。
+var apiDocRequiredQueryParameters = map[string][]string{
+	// security.go GetIPEventCount：缺 ip 直接 400。
+	"GET /security/events/count": {"ip"},
+}
+
+// apiDocQueryParameterRequired 报告某路由的 query 参数是否必填。
+func apiDocQueryParameterRequired(route apiDocRoute, name string) bool {
+	for _, required := range apiDocRequiredQueryParameters[route.Method+" "+route.Path] {
+		if required == name {
+			return true
+		}
+	}
+	return false
 }
 
 func apiDocContractFor(route apiDocRoute) apiDocContract {
@@ -371,22 +661,12 @@ func apiDocContractFor(route apiDocRoute) apiDocContract {
 	return contract
 }
 
-func openAPIPath(path string) string {
-	parts := strings.Split(path, "/")
-	for index, part := range parts {
-		if name, found := strings.CutPrefix(part, ":"); found {
-			parts[index] = "{" + name + "}"
-		}
-	}
-	return strings.Join(parts, "/")
-}
-
 func writeOpenAPIParameters(b *strings.Builder, route apiDocRoute, queryParameters []apiDocParameter) {
 	parameters := make([]apiDocParameter, 0, len(queryParameters)+2)
 	for part := range strings.SplitSeq(route.Path, "/") {
 		if name, found := strings.CutPrefix(part, ":"); found {
 			valueType := "string"
-			// APIMCP-A2（第 70 轮）：任务 ID 是 "threat"/"cert-job:5" 等字符串
+			// 任务 ID 是 "threat"/"cert-job:5" 等字符串
 			// ——/system/tasks/ 前缀路由的 :id 保留 string，与其余数字 :id 路由
 			// 的 integer 判定分流（MCP 侧同参数始终 string，两侧此前自相矛盾）。
 			if name == "id" && !strings.HasPrefix(route.Path, "/system/tasks/") {
@@ -407,9 +687,32 @@ func writeOpenAPIParameters(b *strings.Builder, route apiDocRoute, queryParamete
 		if index < pathParameterCount {
 			location = "path"
 			required = true
+		} else {
+			required = apiDocQueryParameterRequired(route, parameter.name)
 		}
 		fmt.Fprintf(b, "        - name: %s\n          in: %s\n          required: %t\n          description: %s\n          schema:\n            type: %s\n", parameter.name, location, required, strconv.Quote(parameter.description), parameter.valueType)
 	}
+}
+
+// writeYAMLExample 输出 example 节点；多行纯文本（如 TXT/日志形态）用块标量，
+// 避免裸换行截断 YAML——TXT 下载示例即此形态。
+func writeYAMLExample(b *strings.Builder, indent, example string) {
+	if strings.Contains(example, "\n") {
+		b.WriteString(indent + "example: |\n")
+		for _, line := range strings.Split(strings.TrimRight(example, "\n"), "\n") {
+			b.WriteString(indent + "  " + line + "\n")
+		}
+		return
+	}
+	// 单行示例：JSON 对象/数组保持原样（OpenAPI 里是结构化示例），其余文本
+	// 一律 quote——裸标量含 ": "、"#"、括号开头或空格时会被 YAML 解析成
+	// 字符串/映射/注释，round-trip 会失败或静默改写语义。
+	trimmed := strings.TrimSpace(example)
+	if json.Valid([]byte(trimmed)) && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
+		fmt.Fprintf(b, "%sexample: %s\n", indent, trimmed)
+		return
+	}
+	fmt.Fprintf(b, "%sexample: %s\n", indent, strconv.Quote(example))
 }
 
 func documentedResponse(route apiDocRoute, raw bool) string {
@@ -419,12 +722,108 @@ func documentedResponse(route apiDocRoute, raw bool) string {
 	return `{"code":0,"message":"成功","data":` + route.Response + `}`
 }
 
+// idempotentDeleteDocRoutes 是「重复调用仍返回成功」的 DELETE 端点白名单
+// （方法 + " " + 路径）。其余 DELETE 走资源型删除文案（重复调用 404）。
+// 白名单必须有 handler 事实支撑：unbind / OIDC 清空 / 租约释放都是无条件
+// 幂等，而按 id 删行在行不存在时返回 404。文档绊线逐条对照本表与
+// apiDocRoutes，新增 DELETE 端点不会静默落入未分类兜底。
+var idempotentDeleteDocRoutes = map[string]struct{}{
+	"DELETE /security/policies/:id/bind/:caddy_id":      {},
+	"DELETE /security/overview/threat-screen/collector": {},
+	"DELETE /settings/oidc":                             {},
+}
+
+// apiDocRetryByMethod 是「重试语义」的方法级默认文案（单源）。
+//
+// 只有与默认不同的特例才进 operationDescription 的 switch：PUT/PATCH 未列出时
+// 不再是 POST 的「可能创建新资源」文案（那是与 handler 事实相反的断言）。
+var apiDocRetryByMethod = map[string]string{
+	http.MethodPost:   "不可安全重试：重复调用可能创建新资源或再次触发操作。",
+	http.MethodPut:    "可安全重试：相同请求重复调用保持相同目标状态。",
+	http.MethodPatch:  "可安全重试：相同请求重复调用保持相同目标状态。",
+	http.MethodDelete: "不可安全重试：首次删除成功，重复调用返回 404。",
+}
+
+// createLikeWriteDocRoutes 是「调用即可能创建资源/再次触发动作」的写端点登记表
+// （当前全部是 POST）：它们的重试文案沿用 POST 的兜底语义。
+//
+// 绊线用途：文档里携带这段兜底文案的写端点必须在此登记——新增端点掉进默认分支
+// 时用例立刻红，维护者被迫当场判断「它到底是不是创建类」（真创建→登记；可安全
+// 重试/不可盲目重试→在 operationDescription 里给专用文案）。不登记即无人过问的
+// 默认吞并，正是这份文档最容易腐化的形态。
+//
+// 语义边界：PUT/PATCH/DELETE 的文案由 apiDocRetryByMethod 派生，不进本表。
+var createLikeWriteDocRoutes = map[string]struct{}{
+	"POST /auth/login":                                {},
+	"POST /auth/ticket-login":                         {},
+	"POST /auth/mfa/verify":                           {},
+	"POST /auth/mfa/setup":                            {},
+	"POST /auth/mfa/activate":                         {},
+	"POST /auth/mfa/disable":                          {},
+	"POST /auth/mfa/recovery-codes":                   {},
+	"POST /auth/mfa/verify-step":                      {},
+	"POST /users/:id/mfa/reset":                       {},
+	"POST /auth/setup":                                {},
+	"POST /users":                                     {},
+	"POST /users/:id/reset-password":                  {},
+	"POST /users/me/api-keys":                         {},
+	"POST /api-keys":                                  {},
+	"POST /config/import":                             {},
+	"POST /system/tasks/:id/trigger":                  {},
+	"POST /system/tasks/:id/toggle":                   {},
+	"POST /system/tasks/:id/control":                  {},
+	"POST /system/tasks/:id/cancel":                   {},
+	"POST /auto-backup/run":                           {},
+	"POST /auto-backup/:id/restore":                   {},
+	"POST /config/reload":                             {},
+	"POST /rules":                                     {},
+	"POST /certificate-configs":                       {},
+	"POST /certificates/jobs/current":                 {},
+	"POST /cluster/nodes/:id/approve":                 {},
+	"POST /cluster/nodes/:id/reject":                  {},
+	"POST /cluster/nodes/:id/service":                 {},
+	"POST /cluster/nodes/:id/forget-pin":              {},
+	"POST /cluster/service-control":                   {},
+	"POST /cluster/mode":                              {},
+	"POST /cluster/promote":                           {},
+	"POST /cluster/sync/pull":                         {},
+	"POST /cluster/forget-pins":                       {},
+	"POST /cluster/nodes/report":                      {},
+	"POST /caddy/start":                               {},
+	"POST /caddy/stop":                                {},
+	"POST /caddy/restart":                             {},
+	"POST /system/restart":                            {},
+	"POST /config/import/v1":                          {},
+	"POST /security/overview/threat-screen/collector": {},
+	"POST /security/policies/batch-bind":              {},
+	"POST /rules/batch-block-pages":                   {},
+	"POST /security/policies/:id/split":               {},
+	"POST /security/policies":                         {},
+	"POST /security/policies/:id/bind":                {},
+	"POST /security/policies/:id/bindings/bulk":       {},
+	"POST /security/custom-rules":                     {},
+	"POST /security/block-pages":                      {},
+	"POST /security/ip-lists":                         {},
+	"POST /security/ip-lists/:id/remove-ip":           {},
+	"POST /security/crs/update":                       {},
+	"POST /security/ip2region/update":                 {},
+	"POST /security/threat-lib/update":                {},
+	"POST /security/crawler-lib/update":               {},
+}
+
 func operationDescription(route apiDocRoute) string {
 	description := route.Description
 	if route.Method != http.MethodPost && route.Method != http.MethodPut && route.Method != http.MethodDelete && route.Method != http.MethodPatch {
 		return description
 	}
-	retry := "不可安全重试：重复调用可能创建新资源或再次触发操作。"
+	// 默认按方法归族，不再逐条枚举：
+	//   - DELETE 是资源型删除（首次成功、重复 404），不创建资源；幂等删除另
+	//     登记 idempotentDeleteDocRoutes；
+	//   - PUT/PATCH 的语义就是「同请求重发保持目标态」——新增写端点若掉进
+	//     POST 的「可能创建新资源」默认文案，文档会与 handler 事实相反（此前
+	//     靠 switch 逐条枚举全部 PUT/PATCH 才没有暴露，漏登记一条即错）。
+	// 逐条 switch 只保留**与默认不同**的特例。
+	retry := apiDocRetryByMethod[route.Method]
 	key := route.Method + " " + route.Path
 	switch key {
 	case "POST /auth/logout":
@@ -445,22 +844,25 @@ func operationDescription(route apiDocRoute) string {
 		retry = "不可盲目安全重试：重复调用可能返回 429 或再次排队签发任务。"
 	case "POST /certificates/jobs/:id/retry":
 		retry = "不可盲目安全重试：重复调用可能返回 409 或 429。"
-	case "DELETE /users/:id", "DELETE /users/me/api-keys/:id", "DELETE /api-keys/:id", "DELETE /rules/:caddy_id", "DELETE /certificate-configs/:id", "DELETE /certificates/jobs/:id", "DELETE /cluster/nodes/:id":
-		retry = "不可安全重试：首次删除成功，重复调用返回 404。"
-	case "PUT /users/:id", "PUT /users/:id/status", "PUT /config", "PUT /rules/:caddy_id", "PUT /cluster/settings", "PUT /cluster/nodes/:id/access-url", "PUT /certificate-configs/:id", "PUT /ca-providers/:id", "PUT /caddy/config", "PUT /admin-tls", "PUT /settings/oidc",
-		"PUT /settings/auto-backup", "PUT /security/policies/:id", "PUT /security/rules/:caddy_id/policies", "PUT /security/custom-rules/:id", "PUT /security/block-pages/:id", "PUT /security/ip-lists/:id", "PUT /security/crs/auto-update", "PUT /security/ip2region/auto-update",
-		"PUT /security/threat-lib/auto-update", "PUT /security/threat-lib/:id/flags", "PUT /security/crs/schedule", "PUT /security/ip2region/schedule", "PUT /security/threat-lib/schedule":
-		retry = "可安全重试：相同请求重复调用保持相同目标状态。"
-	case "PATCH /users/me", "PATCH /users/me/api-keys/:id", "PATCH /api-keys/:id/status":
-		// APIMCP50-P5-16:PATCH 语义化部分更新与 PUT 同格幂等。
-		retry = "可安全重试：相同请求重复调用保持相同目标状态。"
+	case "PATCH /users/me":
+		// 改密是本组唯一的非幂等语义：密码变更后旧会话令牌立即失效，
+		// 自动重试会拿旧密码/旧令牌继续打，把一次成功变成一串 401。
+		retry = "改密请求不可重放：密码变更后旧会话令牌立即失效，请勿自动重试；仅修改显示名等无密码变更的请求可安全重试。"
 	case "POST /security/ip-lists/:id/ips":
-		// APIMCP42-1:幂等追加——条目已存在时返回 added=false,不重复落行。
+		// 幂等追加——条目已存在时返回 added=false,不重复落行。
 		retry = "可安全重试：重复追加同一条目返回 added=false，不产生重复数据。"
+	case "DELETE /security/overview/threat-screen/collector":
+		// 采集租约释放：释放不存在的租约同样返回成功（enabled=true），
+		// 重放无害——与资源型 DELETE 的 404 契约不同。
+		retry = "可安全重试：重复释放同一采集租约保持已释放状态并返回成功。"
 	case "DELETE /settings/oidc":
-		// APIMCP-6(C7):OIDC 删除为幂等清空——重复调用保持配置为已删除状态
+		// OIDC 删除为幂等清空——重复调用保持配置为已删除状态
 		// 并返回成功(与资源型 DELETE 的 404 语义不同)。
 		retry = "可安全重试：重复调用保持 OIDC 配置为已删除状态并返回成功。"
+	case "DELETE /security/policies/:id/bind/:caddy_id":
+		// unbind 是无条件删除绑定行——未绑定时同样返回
+		// 成功、状态不变（handler 不返回 404），与资源型 DELETE 不同。
+		retry = "可安全重试：重复解除同一绑定保持已解绑状态并返回成功（未绑定时不做变更）。"
 	case "POST /config/preview", "POST /config/validate", "POST /config/import/validate", "POST /rules/cert-info", "POST /certificate-configs/test", "POST /certificate-configs/:id/test", "POST /ca-providers/:id/test", "POST /certificates/parse", "POST /admin-tls/inspect", "POST /settings/oidc/test":
 		retry = "可安全重试：相同请求重复调用返回等价校验或查询结果。"
 	case "POST /mcp":
@@ -472,8 +874,8 @@ func operationDescription(route apiDocRoute) string {
 	return description + " " + retry
 }
 
-// APIMCP-P1（第 69 轮）：内容完全静态（apiDocRoutes 进程内不变），199 条路由
-// 的 YAML 拼接缓存一次——此前每请求全量重建。
+// 内容完全静态（apiDocRoutes 进程内不变，路由数随
+// 扩表增长），YAML 拼接缓存一次——此前每请求全量重建。
 var openAPIYAMLOnce = sync.OnceValue(buildOpenAPIYAML)
 
 func (h *Handlers) GetOpenAPIYAML(c *gin.Context) {
@@ -481,7 +883,7 @@ func (h *Handlers) GetOpenAPIYAML(c *gin.Context) {
 }
 
 // GetAPIDocs 返回 Swagger UI 的 HTML 壳（规格本体在 /api/v1/openapi.yaml，已鉴权）。
-// R48-SYS-1（第 48 轮审计）：本页外部依赖面 = unpkg CDN 的 swagger-ui CSS/bundle
+// 本页外部依赖面 = unpkg CDN 的 swagger-ui CSS/bundle
 // （已带 SRI 完整性校验 + 加载失败 fallback），离线环境降级为「直接取 YAML」链接；
 // 该外链为开发者便利通道，面板自身运行不依赖它。
 func (h *Handlers) GetAPIDocs(c *gin.Context) {
@@ -516,7 +918,7 @@ func (h *Handlers) GetAPIDocs(c *gin.Context) {
         docExpansion: "list",
         filter: true,
         tryItOutEnabled: false,
-        // R48-API-1（第 48 轮审计）：/openapi.yaml 已移入鉴权区，本页取自
+        // /openapi.yaml 已移入鉴权区，本页取自
         // localStorage 的登录令牌注入 Authorization 头（面板自身同源同键）。
         requestInterceptor: function (req) {
           try {

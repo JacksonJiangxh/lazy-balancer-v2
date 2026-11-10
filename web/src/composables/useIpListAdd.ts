@@ -13,7 +13,7 @@ export interface IpListOption {
   system?: boolean
 }
 
-// F-U10-1（第 68 轮）：全仓零外部消费（仅本模块参数类型）——去掉 export
+// 全仓零外部消费（仅本模块参数类型）——去掉 export
 interface AddIpToListOptions {
   /** 动作词（默认「加入」）：确认框标题/文案与成功反馈共用 */
   verb?: string
@@ -34,15 +34,17 @@ export const useIpListAdd = () => {
   const addIpToList = async (ip: string, list: IpListOption, options: AddIpToListOptions = {}): Promise<boolean> => {
     if (adding.value) return false
     const verb = options.verb ?? '加入'
-    try {
-      await ElMessageBox.confirm(
-        `将把 ${ip} ${verb}地址列表「${list.name}」（幂等，已存在时不会重复添加）。是否继续？`,
-        `${verb}地址列表`,
-        { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
-      )
-    } catch { return false }
+    // 确认框弹出前即占位——双击不再叠两个确认框、两次 POST（与
+    // useTrustAssociation 同型）；取消分支统一由 finally 复位。
     adding.value = true
     try {
+      try {
+        await ElMessageBox.confirm(
+          `将把 ${ip} ${verb}地址列表「${list.name}」（幂等，已存在时不会重复添加）。是否继续？`,
+          `${verb}地址列表`,
+          { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
+        )
+      } catch { return false }
       // 非 silent：错误走全局拦截器提示，428 时全局 MFA step-up 弹码链完整生效
       const res = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${list.id}/ips`, { value: ip })
       if (res.data?.added) {

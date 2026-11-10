@@ -180,6 +180,10 @@ func TestFileIPRangeSource_fail_stale_keeps_previous_set(t *testing.T) {
 	}
 }
 
+// Given：受信代理网段文件已成功加载。When：文件被删且缓存淘汰（受信代理
+// 停用 24h 后的残余形态）。Then：GetIPRanges 返回空集（fail-closed——信任
+// 无来源），并触发「名单不可读且无缓存」观测钩子——该状态迁移必须可观测，
+// 否则全站客户端 IP 静默退回 socket 地址而无任何日志。
 func TestFileIPRangeSource_evicted_and_deleted_file_fails_closed_empty(t *testing.T) {
 	forceFreshStat(t)
 	dir := useTPAllowedDir(t)
@@ -192,6 +196,11 @@ func TestFileIPRangeSource_evicted_and_deleted_file_fails_closed_empty(t *testin
 		t.Fatalf("provision: %v", err)
 	}
 
+	oldHook := wafiplist.OnListUnavailableServe
+	var hookCalls int
+	wafiplist.OnListUnavailableServe = func(string, error) { hookCalls++ }
+	t.Cleanup(func() { wafiplist.OnListUnavailableServe = oldHook })
+
 	// When：GC 删文件并淘汰缓存（受信代理停用 24h 后的形态）
 	wafiplist.EvictIPListCache(path)
 	if err := os.Remove(path); err != nil {
@@ -201,6 +210,9 @@ func TestFileIPRangeSource_evicted_and_deleted_file_fails_closed_empty(t *testin
 	// Then：空集=信任无来源（fail-closed——宁可退回 socket IP）
 	if ranges := s.GetIPRanges(new(http.Request)); ranges != nil {
 		t.Fatalf("缓存淘汰且文件消失必须返回 nil 空集: %v", ranges)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("不可读钩子调用=%d, want 1（节流后每路径一次；静默形态必须可观测）", hookCalls)
 	}
 }
 

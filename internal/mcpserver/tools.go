@@ -2,6 +2,8 @@ package mcpserver
 
 import (
 	"encoding/json"
+
+	"lazy-balancer-v2/internal/apipath"
 )
 
 const restAPIPathPrefix = "/api/v1"
@@ -12,9 +14,15 @@ type ToolSpec struct {
 	Method      string `json:"method"`
 	Path        string `json:"path"`
 	// ReadOnly 表示该工具对只读 API Key「只读可用」——GET 且非隐藏工具，或读
-	// 探测 POST 白名单（见 isReadOnlyTool）。R73 MISC-F1 修正：此前恒为
-	// method==HTTP GET，与真实只读能力集漂移（5 个读语义 POST 误标 false、
+	// 探测 POST 白名单（见 isReadOnlyTool）。修正：此前恒为
+	// method==HTTP GET，与真实只读能力集漂移（读语义探测 POST 误标 false、
 	// export_config 误标 true——外部契约变更，发布时向 MCP 使用者披露）。
+	// 隐藏 GET 集（readOnlyHiddenTools）当前两项：export_config（导出含用户/密钥
+	// 哈希）与 get_caddy_config（原始 Caddy 配置可能含内联私钥）——handler 首行
+	// 对只读 Key 恒 403，故 read_only=false 且不出现在其 tools/list。
+	// test_certificate_config 移出探测集（写 DNS TXT），
+	// 当前探测集 3 项（parse_certificate/validate_import/preview_config，
+	// 单一事实源 ReadOnlyProbeTools）。
 	ReadOnly    bool            `json:"read_only"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 	Usage       string          `json:"usage,omitempty"`
@@ -39,6 +47,39 @@ func ListToolSpecs() []ToolSpec {
 	return result
 }
 
+// ToolTransportForTest 是一个工具的参数传输面事实：schema 属性落在 path /
+// query / body 哪一侧，由 forward 的取值面（pathArgs/queryArgs）唯一决定，
+// body 是「其余全部参数」。handlers 侧的契约对账测试用它把「schema 属性 ↔
+// REST query 参数」做反向核对——属性同名于 REST query 参数却未登记为
+// queryArg 时，转发会把选项写进请求体改写业务数据（import_config 的
+// sections 即该形态：落进 body 会改动备份自身的分类记录，使 v3 校验和不匹配
+// 而被判「已篡改」）。
+type ToolTransportForTest struct {
+	Name      string
+	Method    string
+	GinPath   string
+	PathArgs  []string
+	QueryArgs []string
+	Schema    string
+}
+
+// ToolTransportsForTest 返回全部工具的传输面事实（路径还原为 Gin 形态
+// :param，与 handlers 侧 apiDocContracts 的键同形）。
+func ToolTransportsForTest() []ToolTransportForTest {
+	result := make([]ToolTransportForTest, 0, len(tools))
+	for _, spec := range tools {
+		result = append(result, ToolTransportForTest{
+			Name:      spec.name,
+			Method:    spec.method,
+			GinPath:   apipath.ToGin(spec.path),
+			PathArgs:  append([]string(nil), spec.pathArgs...),
+			QueryArgs: append([]string(nil), spec.queryArgs...),
+			Schema:    spec.schema,
+		})
+	}
+	return result
+}
+
 var toolUsage = map[string]string{
 	"list_rules":                   "先了解当前规则全貌（域名/端口/上游/启用状态），所有变更前的现状盘点入口",
 	"get_rule":                     "在修改某条规则前获取其完整配置（上游/证书/路径路由/超时）",
@@ -49,10 +90,10 @@ var toolUsage = map[string]string{
 	"disable_rule":                 "临时下线规则但保留配置与证书；非终态证书任务置为 disabled。有 worker 正在执行签发时秒回 409（queued/冷却中不拦，稍后重试即可）",
 	"duplicate_rule":               "以现有规则为模板快速克隆（新副本默认禁用，需再 enable）",
 	"list_cert_jobs":               "查看 ACME 签发/续签任务进度与失败原因，可按 rule_id 过滤",
-	"retry_cert_job":               "手动重试失败的签发任务（自动冷却期外的任务）",
+	"retry_cert_job":               "手动重试失败的签发任务；CA 退避窗口（failed/waiting_ca 行携带）未到期且已确认越过时传 force=true（省略/false 不越过）",
 	"delete_cert_job":              "删除证书任务记录（已签发证书文件不受影响）",
-	"issue_certificate":            `触发 ACME 证书签发：传 caddy_id 定向签发单条规则；批量全量重签（含已签发任务，消耗 CA 配额）须显式 {"all":true}`,
-	"list_certificates":            "列出证书任务清单（每域名最新签发任务：状态/到期时间）",
+	"issue_certificate":            `触发 ACME 证书签发：传 caddy_id 定向签发单条规则；批量全量重签（含已签发任务，消耗 CA 配额）须显式 {"all":true}，单次最多 500 个 ACME 规则（超出 400，请分批）；目标任务处于 CA 冷却且已确认越过时传 force=true`,
+	"list_certificates":            "列出证书任务清单（每规则每域名最新签发任务：状态/到期时间）。可按 rule_id（规则 Caddy ID）精确过滤；支持 page/page_size 分页（默认 1/1000，上限均 1000），响应 data.total 为匹配总数；超过 1000 行时按 page 续取",
 	"get_config":                   "读取全局配置（时区/日志级别/超时/续签策略等）",
 	"update_config":                "修改全局配置并即时应用（如时区、日志级别、代理超时）",
 	"reload_caddy":                 "从数据库重新生成并加载 Caddy 配置，用于配置异常时强制收敛",
@@ -61,17 +102,17 @@ var toolUsage = map[string]string{
 	"get_metrics_overview":         "获取轻量级指标总览（累计请求/字节/延迟分位数）",
 	"get_realtime_traffic":         "获取实时出入站速率（网卡计数器差分）",
 	"get_upstream_health":          "查看全部上游的三态健康（正常/异常/不健康），故障排查入口",
-	"list_audit_logs":              "分页查询操作审计（谁/何时/对什么/做了什么），支持 page/page_size/username/action/resource/ip/keyword/start_time/end_time",
+	"list_audit_logs":              "分页查询操作审计（谁/何时/对什么/做了什么），支持 page/page_size/username/action/resource/ip/keyword/start_time/end_time；page≤500（超过 REST 返回 400），更大历史请用时间/用户/动作筛选",
 	"get_system_info":              "查看版本/运行时间/主机/系统信息",
 	"list_users":                   "列出用户（角色/启用状态），判断操作者权限",
 	"list_api_keys":                "列出 API 密钥（不含明文），核对 MCP 启用与只读属性",
 	"get_cluster_status":           "查看本节点主/从角色、主节点地址、最近同步状态与错误",
-	"get_security_overview":        "安全总览：今日拦截/检测计数、攻击类型 TOP10、源 IP TOP10、事件趋势",
+	"get_security_overview":        "安全总览：拦截/检测/正常请求三组 KPI（今日/昨日，各含 HTTP/TCP 拆分；正常请求为指标域累计差分，非事件表逐一对账）、攻击类型 TOP10 与五阶段分布、源 IP TOP10（含近 10 分钟/1 小时/24 小时计数）、7 天趋势，附规则库可用性与事件采集健康位",
 	"list_security_policies":       "列出全部安全策略及其 WAF/CRS/IP ACL/GeoIP/限流配置",
 	"get_security_policy":          "获取指定策略完整配置（含自定义规则和绑定关系）",
-	"list_security_events":         "分页查询安全事件（WAF 拦截/IP ACL 拒绝），支持 page/page_size/action/ip/rule_caddy_id/rule_name/policy_name/rule_triggered/uri/start_time/end_time",
+	"list_security_events":         "分页查询安全事件（HTTP/WAF 与 TCP(L4) 同表）：触发阶段覆盖 WAF·CRS、WAF·自定义、IP 访问控制、地域拦截、信任名单（含 id:12 保留检测记录）、威胁情报库、请求体异常、爬虫Bot；action=blocked 拦截 / logged 检测放行；支持 page/page_size/action/ip/rule_caddy_id/rule_name/policy_name/rule_triggered/rule_triggered_exclude/uri/start_time/end_time",
 	"list_security_bindings":       "查看策略-规则绑定映射（规则可绑定多条安全策略），了解哪些规则启用了安全防护",
-	"get_rule_security_policy":     "查看指定规则绑定的安全策略列表（数组，按 policy_id ASC 有序；仅含 enabled=1 的策略）",
+	"get_rule_security_policy":     "查看指定规则绑定的安全策略列表（数组按绑定顺序即执行序排列，顺序由提交序或绑定链顺序编辑确定；仅含 enabled=1 的策略）",
 	"list_custom_rules":            "列出全部自定义安全规则（多条件链式匹配）",
 	"list_block_pages":             "列出全部拦截页面（含默认页和自定义页）",
 	"get_crs_info":                 "查看 CRS 规则库版本、更新状态、自动更新开关",
@@ -84,14 +125,14 @@ var toolUsage = map[string]string{
 	"get_ip2region_regions":        "获取可选的区域列表（中国省份+海外）",
 	"get_ip2region_update_status":  "查看 IP2Region 正在进行的更新进度",
 	"get_ip2region_update_logs":    "查看 IP2Region 最近一次更新的详细日志",
-	"get_rate_limit_blocks":        "查看限流拦截统计（按规则/时段聚合）",
+	"get_rate_limit_blocks":        "查看限流拦截统计（按 host 汇总 429 计数，含上游自返 429；自最近一次 Caddy 配置重载以来累计，重载或进程重启归零，无时段维度）",
 	"get_rule_stage_stats":         "查看单规则三阶段安全统计（IP 访问控制+地域拦截 / WAF 近 24h 拦截数，限流自最近重载累计）",
-	"create_security_policy":       "创建安全策略：配置 WAF 模式/异常阈值/CRS 规则组/IP ACL/GeoIP 区域控制/限流/拦截页面；custom_rules 为 JSON 数组字符串；policy_type 取值 stage0/1/2/3/mixed（缺省按内容自动推断，显式 mixed 须确含多阶段字段）；trust_detection 仅 stage0 信任策略消费（其余阶段写入无效）",
-	"update_security_policy":       "更新策略任意字段（如调整 WAF 模式、增减区域、修改阈值）；policy_type 缺省=按内容重推断；trust_detection 仅 stage0 策略消费",
+	"create_security_policy":       "创建安全策略：配置 WAF 模式/异常阈值/CRS 规则组/IP ACL/GeoIP 区域控制/限流/拦截页面；custom_rules 为 JSON 数组字符串；policy_type 取值 stage0/1/2/3（缺省按内容自动推断；显式提交 mixed 会被 400 拒绝，跨阶段内容推断为 mixed 同样 400，请按阶段类型分别创建）；trust_detection 仅 stage0 信任策略消费（其余阶段写入无效）",
+	"update_security_policy":       "更新策略任意字段（如调整 WAF 模式、增减区域、修改阈值）；policy_type 缺省=按内容重推断（显式 mixed 拒绝——存量混合策略请用 POST /security/policies/:id/split 拆分迁移）；trust_detection 仅 stage0 策略消费",
 	"delete_security_policy":       "删除策略（绑定关系自动解除）",
-	"bind_security_policy":         "将策略绑定到规则（rule_caddy_id）；规则可绑定多条安全策略（按 policy_id ASC 顺序评估，最多 8 条；超限时请使用 set_rule_security_policies 整体替换）",
+	"bind_security_policy":         "将策略绑定到规则（rule_caddy_id）；规则可绑定多条安全策略（按绑定顺序即执行序评估，新绑定追加到链末，最多 8 条；超限时请使用 set_rule_security_policies 整体替换）",
 	"unbind_security_policy":       "解除策略与规则的绑定（仅解除该策略，同规则的其他策略绑定保留）",
-	"set_rule_security_policies":   "原子设置规则的安全策略集合（最多 8 条，按 policy_id ASC 顺序评估，整体替换现有绑定；policy_ids 为空数组 [] = 解除该规则全部绑定）",
+	"set_rule_security_policies":   "原子设置规则的安全策略集合（最多 8 条，policy_ids 提交序即绑定执行序，整体替换现有绑定；policy_ids 为空数组 [] = 解除该规则全部绑定）",
 	"create_custom_rule":           "创建自定义安全规则（URI/参数/请求头/User-Agent 多条件匹配）",
 	"update_custom_rule":           "更新自定义规则的条件或动作",
 	"delete_custom_rule":           "删除自定义规则",
@@ -103,7 +144,8 @@ var toolUsage = map[string]string{
 	"create_ip_list":               "创建 IP 地址列表：entries 为 {value, remark} 对象数组的 JSON 文本（IP/CIDR+备注）；名称全局唯一（忽略大小写）",
 	"update_ip_list":               "更新 IP 地址列表（entries 为 {value, remark} 对象数组的 JSON 文本，全量替换；名称全局唯一）；省略的字段保持现值",
 	"delete_ip_list":               "删除 IP 地址列表；被安全策略引用时返回 409，需先解除引用",
-	"add_ip_to_list":               "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用）：幂等——value 已存在时返回 added=false，新条目备注固定为「事件处置」",
+	"add_ip_to_list":               "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用）：幂等——value 已存在（生效中）时返回 added=false，已到期条目原位覆盖。remark 按名单语义固定：自定义名单「事件处置」、自动封禁预置名单「手动封禁」；威胁情报内置名单只读（400）",
+	"remove_ip_from_list":          "从 IP 地址列表移除单条 IP/CIDR（解封/误封处置）：幂等——value 不在名单时返回 removed=false；自动封禁名单删除条目即解封（IP 重新达标会被再次封禁），误报处置建议配合信任名单豁免；威胁情报内置名单只读（400）。不要用 get_ip_list+update_ip_list 全量写回替代——自动封禁并发写入会被覆盖丢失",
 	"toggle_crs_auto_update":       "开启/关闭 CRS 每日自动更新",
 	"trigger_crs_update":           "手动触发 CRS 规则库在线更新（检查→下载→安装→重载）",
 	"toggle_ip2region_auto_update": "开启/关闭 IP2Region 每日自动更新",
@@ -119,13 +161,13 @@ var toolUsage = map[string]string{
 	"forget_cluster_node_pin":      "清除主节点对指定从节点的证书指纹钉（服务控制持续 PinMismatch 时的单节点重钉），无钉时幂等成功",
 	"forget_cluster_pins":          "从节点清除对主节点的全部证书指纹钉（PinMismatch 自救后下次同步重新钉扎）；主节点调用返回 400",
 	"set_cluster_mode":             "将本节点注册到主节点并切换为从节点，等待审批后开始同步；提升为主节点请使用 promote_cluster",
-	"get_system_task_logs":         "查看指定任务的文本运行日志（分阶段流水/生命周期行,尾部 256KB）",
+	"get_system_task_logs":         "查看指定任务的文本运行日志（分阶段流水/生命周期行,尾部 256KB）；超预算截断时首行前置提示行[日志过长，仅显示最近 256KB]",
 	"get_system_task_history":      "查看指定任务的最近 50 次真实运行（开始/耗时/触发/结果）",
 	"list_system_tasks":            "查看系统全部定时/后台任务的运行状态、最近执行与下次排程（任务监控聚合视图）",
-	"trigger_system_task":          "手动触发指定任务（定时/循环/触发类）——仅主节点管理员",
-	"toggle_system_task":           "暂停/恢复指定任务的自动调度（enabled 布尔）",
-	"control_system_task":          "重启常驻任务（action=restart——启停已由调度开关承担）",
-	"cancel_system_task":           "取消运行中的下载类任务（威胁库/CRS/IP2Region；已完成部分保留）",
+	"trigger_system_task":          "手动触发指定任务（定时/循环/触发类）——仅主节点管理员；cert-job 行通用冷却仅挡非 failed 行（failed 行冷却中放行并留越冷审计），CA 退避窗口（failed/waiting_ca 行携带 ca_available_after）未到期返回 429（REST 端点可 ?force=true 越过并留越权审计；MCP 越过冷却改用 retry_cert_job 的 force）",
+	"toggle_system_task":           "停止/恢复指定任务的自动调度（enabled 布尔）",
+	"control_system_task":          "action=restart 重启常驻任务；action=start/stop 用于排障时单独启停常驻循环（日常启停优先用 toggle_system_task 的 enabled）；仅常驻（daemon）族可用（Kind=daemon 恒可控，以 list_system_tasks 的 controllable 字段为准），ID 取自 list_system_tasks",
+	"cancel_system_task":           "取消运行中的下载类任务（威胁库/CRS/IP2Region/爬虫库更新等，以 list_system_tasks 的 cancellable 字段为准；已完成部分保留）",
 	"promote_cluster":              "将从节点提升为独立主节点（脱离集群）",
 	"pull_sync":                    "手动触发从节点立即拉取主节点快照",
 	"update_cluster_settings":      "更新集群同步间隔等设置",
@@ -134,19 +176,19 @@ var toolUsage = map[string]string{
 	"update_certificate_config":    "更新 DNS 证书配置的凭证或域名",
 	"delete_certificate_config":    "删除 DNS 证书配置",
 	"test_certificate_config":      "测试 DNS 证书配置的凭证是否有效",
-	"list_dns_providers":           "列出支持的 DNS 提供商类型",
+	"list_dns_providers":           "列出支持的 DNS 提供商类型（DNSPod/腾讯云、阿里云、Cloudflare，含各提供商的凭证字段定义与 description 字段说明；列表 DNSPod(腾讯云) 恒首位，其余按 code 升序）",
 	"list_ca_providers":            "列出全部 CA 提供商（Let's Encrypt/ZeroSSL/自定义）",
 	"get_ca_provider":              "获取指定 CA 提供商详情（含 EAB 凭证）",
-	"update_ca_provider":           "更新 CA 提供商配置（目录 URL/EAB 凭证/限流）",
+	"update_ca_provider":           "更新 CA 提供商配置（名称/Provider/EAB 凭证/并发与限流/启用开关）；目录 URL 不在本工具契约内（请求字段无 directory_url，传入会被忽略）",
 	"test_ca_provider":             "测试 CA 提供商连接是否正常",
 	"get_cert_job":                 "获取指定证书签发任务的详细状态",
-	"get_cert_job_logs":            "查看指定证书任务的签发/续签日志",
+	"get_cert_job_logs":            "查看指定证书任务的签发/续签日志（尾部 256KB）；超预算截断时首行前置提示行[日志过长，仅显示最近 256KB]，响应携带 truncated 标记",
 	"parse_certificate":            "解析上传的证书内容（域名/有效期/颁发者）",
 	"create_user":                  "创建用户（管理员/只读）",
-	"update_user":                  "更新用户信息（显示名/角色）",
-	"toggle_user_status":           "启用或禁用用户",
+	"update_user":                  "更新用户信息（显示名/角色）；初始化管理员（is_setup_admin=true）不可降级为普通用户（400）",
+	"toggle_user_status":           "启用或禁用用户；初始化管理员（is_setup_admin=true）不可禁用（400）",
 	"reset_user_password":          "重置用户密码为随机值",
-	"delete_user":                  "删除用户",
+	"delete_user":                  "删除用户；初始化管理员（is_setup_admin=true）不可删除（400）",
 	"reset_user_mfa":               "重置用户 MFA（仅管理员）：操作者已启用 MFA 时须提交本人 6 位动态验证码（未启用传空串）；MCP/API Key 路径不走 428 step-up，直接在本接口验码",
 	"create_api_key":               "创建 API 密钥（可配置 MCP/只读/IP 白名单）",
 	"update_api_key_status":        "更新密钥状态（启用/MCP 开关/只读开关/IP 白名单）",
@@ -163,7 +205,7 @@ var toolUsage = map[string]string{
 	"get_caddy_status":             "查看 Caddy 进程运行状态",
 	"get_caddy_config":             "查看 Caddy 当前加载的完整 JSON 配置",
 	"get_caddy_logs":               "查看 Caddy 运行日志（runtime/server/proxy/tls，按类型过滤）",
-	"update_caddy_config":          "直接更新 Caddy 配置（高级操作，慎用）",
+	"update_caddy_config":          "直接更新 Caddy 配置：content 传完整 Caddy 配置的 JSON 文本（字符串形式；与 REST PUT /caddy/config 同形，高级操作慎用）",
 	"start_caddy":                  "启动 Caddy 进程",
 	"stop_caddy":                   "停止 Caddy 进程",
 	"restart_caddy":                "重启 Caddy 进程",

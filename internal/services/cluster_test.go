@@ -19,20 +19,20 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// clusterLifecycleFake 是 lifecycleRecorder 的布尔观测视图：生命周期回调在
+// 引擎 daemon goroutine 上异步执行，「回调是否已发生」的断言必须经
+// waitForCond + 布尔视图（内嵌计数 >0），不得读后即断。
 type clusterLifecycleFake struct {
-	acmeStarted bool
-	syncStarted bool
-	syncStopped bool
+	lifecycleRecorder
 }
 
-func (f *clusterLifecycleFake) StartACME() { f.acmeStarted = true }
-func (f *clusterLifecycleFake) StopACME()  {}
-func (f *clusterLifecycleFake) StartSync() { f.syncStarted = true }
-func (f *clusterLifecycleFake) StopSync()  { f.syncStopped = true }
+func (f *clusterLifecycleFake) acmeStarted() bool { return f.acmeStarts.Load() > 0 }
+func (f *clusterLifecycleFake) syncStarted() bool { return f.syncStarts.Load() > 0 }
+func (f *clusterLifecycleFake) syncStopped() bool { return f.syncStops.Load() > 0 }
 
 // v3SnapshotWithACMESection 将直调 applySnapshot 的夹具补齐为生产可达形态：
 // 生产快照经 verifiedSnapshotIntegrity 闸门后必为当前 schema 且携带 ACME
-// 区段；validateSnapshotACMEState 对缺区段统一硬拒（R54 S-4 移除 v2 放行
+// 区段；validateSnapshotACMEState 对缺区段统一硬拒（移除 v2 放行
 // 死分支后，未设 SchemaVersion/ACME 的旧夹具会被拒）。
 func v3SnapshotWithACMESection(snapshot models.ClusterSnapshot) models.ClusterSnapshot {
 	snapshot.SchemaVersion = CurrentSnapshotSchema
@@ -46,18 +46,18 @@ func v3SnapshotWithACMESection(snapshot models.ClusterSnapshot) models.ClusterSn
 
 func newClusterTestService(t *testing.T) (*ClusterService, *sql.DB) {
 	stubUpdateRetrySleep(t) // 任务内重试等待即时化（威胁库失败路径测试）
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize test database: %v", err)
-	}
-	database := db.DB
-	t.Cleanup(func() {
-		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
-	return NewClusterService(database, nil, ""), database
+	database := setupIsolatedDB(t)
+	service := NewClusterService(database, "")
+	// 显式注销全局注册表条目：Cleanup 后注册先执行，早于夹具的 Close/还原。
+	t.Cleanup(func() { unregisterClusterService(service) })
+	return service, database
 }
 
+// replaceSnapshotDB 是 replaceSnapshotTx 的裸事务包装：只覆盖三节写入与
+// 归一列，不含角色复核、Caddy 重载、提交后副作用（日志清理/爬虫快照/重载
+// 判定）。用例用它时命名必须体现「事务层/往返」口径（TestReplaceSnapshotTx_*
+// 或 TestClusterSnapshot_*RoundTrip），不得取名 TestApplySnapshot_* 冒充
+// 端到端 apply 行为——后者只由 SyncService.applySnapshot 覆盖。
 func replaceSnapshotDB(ctx context.Context, database *sql.DB, snapshot models.ClusterSnapshot) error {
 	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
@@ -88,11 +88,11 @@ func TestClusterService_RegisterToken_regeneration_invalidates_previous_unused_t
 	// Then：旧令牌被作废，新令牌可用，令牌表仅剩新令牌
 	req := models.ClusterRegisterRequest{Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000}
 	req.Token = first
-	if _, err := service.RegisterNode(context.Background(), req, now); !errors.Is(err, ErrInvalidRegisterToken) {
+	if _, err := service.RegisterNode(context.Background(), req, req.IPAddress, now); !errors.Is(err, ErrInvalidRegisterToken) {
 		t.Fatalf("register with stale token error=%v, want invalid token", err)
 	}
 	req.Token = second
-	if _, err := service.RegisterNode(context.Background(), req, now); err != nil {
+	if _, err := service.RegisterNode(context.Background(), req, req.IPAddress, now); err != nil {
 		t.Fatalf("register with fresh token: %v", err)
 	}
 	var tokenCount int
@@ -115,15 +115,15 @@ func TestClusterService_RegisterToken_is_one_time(t *testing.T) {
 	req := models.ClusterRegisterRequest{Token: token, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000}
 
 	// When
-	_, err = service.RegisterNode(context.Background(), req, now)
+	_, err = service.RegisterNode(context.Background(), req, req.IPAddress, now)
 	if err != nil {
 		t.Fatalf("first registration: %v", err)
 	}
-	_, secondErr := service.RegisterNode(context.Background(), req, now)
+	_, secondErr := service.RegisterNode(context.Background(), req, req.IPAddress, now)
 
 	// Then
-	if secondErr == nil {
-		t.Fatal("second registration succeeded with a consumed token")
+	if !errors.Is(secondErr, ErrInvalidRegisterToken) {
+		t.Fatalf("second registration error=%v, want ErrInvalidRegisterToken（已消费令牌）", secondErr)
 	}
 	var plaintextCount int
 	if err := database.QueryRow("SELECT COUNT(*) FROM cluster_register_tokens WHERE token_hash=?", token).Scan(&plaintextCount); err != nil {
@@ -142,8 +142,8 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
-		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://127.0.0.1:8001",
-	}, now)
+		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://172.18.0.2:8001",
+	}, "172.18.0.2", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 	if err := database.QueryRow("SELECT access_url FROM nodes WHERE id=?", registration.RegistrationID).Scan(&accessURL); err != nil {
 		t.Fatal(err)
 	}
-	if accessURL != "http://127.0.0.1:8001" {
+	if accessURL != "http://172.18.0.2:8001" {
 		t.Fatalf("access_url=%q", accessURL)
 	}
 	if err := service.UpdateNodeAccessURL(context.Background(), registration.RegistrationID, "https://node.example:8443"); err != nil {
@@ -162,6 +162,56 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 	}
 	if accessURL != "https://node.example:8443" {
 		t.Fatalf("updated access_url=%q", accessURL)
+	}
+}
+
+// 自述 access_url 的唯一防护（主机必须与注册来源地址一致）：该值随后被用作
+// 登录/服务控制能力票据的投递地址，未校验时持有注册令牌的一方可把票据引向
+// 第三方主机。缺测试会让这道防护在重构中静默消失。
+func TestClusterService_RegisterNode_ignoresAccessURLFromForeignHost(t *testing.T) {
+	service, database := newClusterTestService(t)
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	register := func(name, ipAddress, accessURL, sourceIP string, port int) models.ClusterRegistration {
+		t.Helper()
+		token, _, err := service.GenerateRegisterToken(context.Background(), 1, now)
+		if err != nil {
+			t.Fatalf("generate token: %v", err)
+		}
+		registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
+			Token: token, Name: name, IPAddress: ipAddress, Port: port, AccessURL: accessURL,
+		}, sourceIP, now)
+		if err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+		return registration
+	}
+	storedAccessURL := func(registrationID int) string {
+		t.Helper()
+		var accessURL sql.NullString
+		if err := database.QueryRow("SELECT access_url FROM nodes WHERE id=?", registrationID).Scan(&accessURL); err != nil {
+			t.Fatalf("read access_url: %v", err)
+		}
+		return accessURL.String
+	}
+
+	// When：自述地址指向第三方主机。
+	foreign := register("slave-foreign", "10.0.0.9", "http://10.9.9.9:8001", "10.0.0.9", 8000)
+
+	// Then：显式标记忽略且不落库（不落库才是防护生效的证据）。
+	if !foreign.AccessURLIgnored {
+		t.Fatal("跨主机自述 access_url 必须标记忽略")
+	}
+	if stored := storedAccessURL(foreign.RegistrationID); stored != "" {
+		t.Fatalf("access_url=%q, want 空（防护失效会把能力票据引向第三方主机）", stored)
+	}
+
+	// 对照：同主机自述地址照常落库（防止把防护写成「一律忽略」）。
+	same := register("slave-same", "10.0.0.10", "https://10.0.0.10:8443", "10.0.0.10", 8001)
+	if same.AccessURLIgnored {
+		t.Fatal("同主机自述 access_url 不得标记忽略")
+	}
+	if stored := storedAccessURL(same.RegistrationID); stored != "https://10.0.0.10:8443" {
+		t.Fatalf("access_url=%q, want 同主机地址落库", stored)
 	}
 }
 
@@ -192,11 +242,11 @@ func TestClusterService_RegisterToken_rejects_expired_token(t *testing.T) {
 	// When
 	_, registerErr := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000,
-	}, issuedAt.Add(31*time.Minute))
+	}, "10.0.0.2", issuedAt.Add(31*time.Minute))
 
 	// Then
-	if registerErr == nil {
-		t.Fatal("registration succeeded with an expired token")
+	if !errors.Is(registerErr, ErrInvalidRegisterToken) {
+		t.Fatalf("registration error=%v, want ErrInvalidRegisterToken（过期令牌）", registerErr)
 	}
 }
 
@@ -210,7 +260,7 @@ func TestClusterService_ApproveNode_redelivers_cluster_token_until_confirmed(t *
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: registerToken, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000,
-	}, now)
+	}, "10.0.0.2", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
@@ -224,7 +274,7 @@ func TestClusterService_ApproveNode_redelivers_cluster_token_until_confirmed(t *
 	if storedRegistrationSecret != tokenHash(registration.RegistrationSecret) {
 		t.Fatal("registration secret was not stored as its SHA-256 hash")
 	}
-	if err := service.ApproveNode(context.Background(), registration.RegistrationID); err != nil {
+	if err := service.ApproveNode(context.Background(), registration.RegistrationID, time.Now()); err != nil {
 		t.Fatalf("approve node: %v", err)
 	}
 
@@ -273,11 +323,11 @@ func TestClusterService_RegistrationStatus_rejects_expired_secret(t *testing.T) 
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: registerToken, Name: "slave-expired", IPAddress: "10.0.0.3", Port: 8000,
-	}, now)
+	}, "10.0.0.3", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
-	if err := service.ApproveNode(context.Background(), registration.RegistrationID); err != nil {
+	if err := service.ApproveNode(context.Background(), registration.RegistrationID, time.Now()); err != nil {
 		t.Fatalf("approve node: %v", err)
 	}
 	if _, err := database.Exec("UPDATE nodes SET registration_secret_expires_at=datetime('now','-1 second') WHERE id=?", registration.RegistrationID); err != nil {
@@ -399,6 +449,7 @@ func TestSyncService_finishRun_doesNotClearNewerRun(t *testing.T) {
 func TestSyncService_run_retries_transient_state_read_failure(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // run 循环的同步状态写只属于从节点语境
 	attempts := 0
 	retryReached := make(chan struct{})
 	service := &SyncService{db: database}
@@ -525,7 +576,7 @@ func TestComputeNodeStatus_marks_stale_approved_node_offline(t *testing.T) {
 	}
 }
 
-// F-L2-68-02（第 68 轮审计 P4）：巡检离线阈值 max(2×sync_interval,120s)
+// 巡检离线阈值 max(2×sync_interval,120s)
 // （cluster_masterserving.go）与 UI 阈值 2×clamp(sync_interval)（ComputeNodeStatus/
 // updateOverview）在 sync_interval∈[10,59] 分叉——interval=30 时巡检以 120s 判
 // 在线、UI 以 60s 判离线，同一节点在告警与节点列表两口径打架。归一为同一函数
@@ -547,7 +598,7 @@ func TestNodeOfflineThreshold_unifiesInspectAndUIAtLowInterval(t *testing.T) {
 	if status != "online" {
 		t.Fatalf("ComputeNodeStatus(interval=30, last_seen 90s 前)=%q, want online（巡检同刻判在线，两口径必须一致）", status)
 	}
-	// 脏值 clamp 保持 R44-1 口径：sync_interval=5 按 60s 计 → max(120,120)=120s
+	// 脏值 clamp 保持口径：sync_interval=5 按 60s 计 → max(120,120)=120s
 	if got := nodeOfflineThreshold(5); got != 120*time.Second {
 		t.Fatalf("nodeOfflineThreshold(5)=%v, want 120s（脏值 clamp 60s 后与下限取大）", got)
 	}
@@ -559,11 +610,12 @@ func TestNodeOfflineThreshold_unifiesInspectAndUIAtLowInterval(t *testing.T) {
 
 func TestClusterService_Promote_resets_slave_state(t *testing.T) {
 	// Given
-	// Promote 成功路径会拉起自动备份调度器(CL41-1b)——测试结束即停,
+	// Promote 成功路径会拉起自动备份调度器——测试结束即停,
 	// 防止泄漏的 worker 跨用例 tick 全局 DB。
 	_, database := newClusterTestService(t)
 	lifecycle := &clusterLifecycleFake{}
-	service := NewClusterService(database, lifecycle, "")
+	service := NewClusterService(database, "")
+	wireClusterLifecycleEngineForTest(t, lifecycle, false)
 	if _, err := database.Exec(`UPDATE global_config SET is_master=0, master_url='https://master', cluster_token='secret', cluster_version=4, applied_version=3, sync_fingerprint='fp-1', last_sync_error='{"code":"transport_error","message":"同步拉取失败"}', registration_confirm_failures=2 WHERE id=1`); err != nil {
 		t.Fatalf("seed slave state: %v", err)
 	}
@@ -588,21 +640,19 @@ func TestClusterService_Promote_resets_slave_state(t *testing.T) {
 	if appliedVersion != 0 || fingerprint != "" || syncError != "" || confirmFailures != 0 {
 		t.Fatalf("promote left slave residue: applied_version=%d fingerprint=%q sync_error=%q confirm_failures=%d", appliedVersion, fingerprint, syncError, confirmFailures)
 	}
-	if !lifecycle.syncStopped || !lifecycle.acmeStarted {
-		t.Fatalf("lifecycle syncStopped=%v acmeStarted=%v", lifecycle.syncStopped, lifecycle.acmeStarted)
-	}
+	waitForCond(t, 2*time.Second, func() bool { return lifecycle.syncStopped() && lifecycle.acmeStarted() })
 }
 
 func TestClusterService_Promote_removes_old_master_pin_and_audits(t *testing.T) {
 	// Given
-	// Promote 成功路径会拉起自动备份调度器(CL41-1b)——测试结束即停。
+	// Promote 成功路径会拉起自动备份调度器——测试结束即停。
 	_, database := newClusterTestService(t)
-	service := NewClusterService(database, nil, "")
+	service := NewClusterService(database, "")
 	masterURL := "https://master.example:8443"
 	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='secret' WHERE id=1", masterURL); err != nil {
 		t.Fatal(err)
 	}
-	pinPath, err := clusterPinPathForDatabase(database, "master.example:8443")
+	pinPath, err := clusterPinPath("", database, "master.example:8443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,13 +683,13 @@ func TestClusterService_Promote_removes_old_master_pin_and_audits(t *testing.T) 
 
 func TestClusterService_Promote_succeeds_when_pin_cleanup_fails_then_retries_on_snapshot(t *testing.T) {
 	// Given
-	// Promote 成功路径会拉起自动备份调度器(CL41-1b)——测试结束即停。
+	// Promote 成功路径会拉起自动备份调度器——测试结束即停。
 	service, database := newClusterTestService(t)
 	masterURL := "https://master.example:8443"
 	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='secret' WHERE id=1", masterURL); err != nil {
 		t.Fatal(err)
 	}
-	pinPath, err := clusterPinPathForDatabase(database, "master.example:8443")
+	pinPath, err := clusterPinPath("", database, "master.example:8443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +725,8 @@ func TestClusterService_Promote_succeeds_when_pin_cleanup_fails_then_retries_on_
 func TestClusterService_Promote_restarts_sync_when_transaction_fails(t *testing.T) {
 	_, database := newClusterTestService(t)
 	lifecycle := &clusterLifecycleFake{}
-	service := NewClusterService(database, lifecycle, "")
+	service := NewClusterService(database, "")
+	wireClusterLifecycleEngineForTest(t, lifecycle, false)
 	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
 		t.Fatalf("seed slave state: %v", err)
 	}
@@ -687,9 +738,7 @@ func TestClusterService_Promote_restarts_sync_when_transaction_fails(t *testing.
 	if err := service.Promote(context.Background()); err == nil {
 		t.Fatal("promotion unexpectedly succeeded")
 	}
-	if !lifecycle.syncStopped || !lifecycle.syncStarted {
-		t.Fatalf("lifecycle syncStopped=%v syncStarted=%v", lifecycle.syncStopped, lifecycle.syncStarted)
-	}
+	waitForCond(t, 2*time.Second, func() bool { return lifecycle.syncStopped() && lifecycle.syncStarted() })
 	var isMaster bool
 	if err := database.QueryRow("SELECT is_master FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
 		t.Fatalf("read role after failed promotion: %v", err)
@@ -717,7 +766,7 @@ func TestReplaceSnapshotDB_replaces_resources_without_overwriting_role(t *testin
 		}},
 		Users:         []models.ClusterUser{{ID: 20, Username: "admin-master", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
 		APIKeys:       []models.ClusterAPIKey{{ID: 30, Name: "ci", KeyHash: "key-hash", KeyPrefix: "lb_sk_master", CreatedBy: 20, IsEnabled: true}},
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "debug", AccessLogJSON: true, Timezone: "Asia/Shanghai", SyncInterval: 120, ProxyDialTimeout: 8, ProxyResponseHeaderTimeout: 9, ProxyReadTimeout: 10, ProxyWriteTimeout: 11, ProxyStreamTimeout: 12, ProxyFlushInterval: 0, ProxyStreamCloseDelay: 3},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("debug"), AccessLogJSON: new(true), Timezone: new("Asia/Shanghai"), SyncInterval: new(120), ProxyDialTimeout: new(8), ProxyResponseHeaderTimeout: new(9), ProxyReadTimeout: new(10), ProxyWriteTimeout: new(11), ProxyStreamTimeout: new(12), ProxyFlushInterval: new(0), ProxyStreamCloseDelay: new(3)},
 		CaddyConfig:   &caddyConfig,
 	}
 
@@ -757,7 +806,7 @@ func TestReplaceSnapshotDB_replaces_resources_without_overwriting_role(t *testin
 func TestReplaceSnapshotDB_clamps_invalid_jwt_expiry(t *testing.T) {
 	_, database := newClusterTestService(t)
 	for _, expiry := range []int{0, -1, 1441} {
-		snapshot := models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: expiry}}
+		snapshot := models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: new(expiry)}}
 		if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
 			t.Fatalf("replace snapshot with JWT expiry %d: %v", expiry, err)
 		}
@@ -934,7 +983,7 @@ func TestSyncService_applySnapshot_keeps_committed_snapshot_when_caddy_rejects_c
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{
 		Version:       2,
 		Users:         []models.ClusterUser{{ID: 99, Username: "incoming", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "info", AccessLogJSON: true, Timezone: "Asia/Shanghai"},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), AccessLogJSON: new(true), Timezone: new("Asia/Shanghai")},
 	})
 
 	// When
@@ -975,9 +1024,14 @@ func TestSyncService_applySnapshot_invalidates_cache_only_after_commit(t *testin
 	}))
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
-	snapshotA := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 1, Users: []models.ClusterUser{{ID: 1, Username: "user-a", PasswordHash: "hash", Role: "admin", IsEnabled: true}}, BasicSettings: models.ClusterBasicSettings{LogLevel: "info", Timezone: "Asia/Shanghai"}})
+	snapshotA := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 1, Users: []models.ClusterUser{{ID: 1, Username: "user-a", PasswordHash: "hash", Role: "admin", IsEnabled: true}}, BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")}})
 	if err := syncService.applySnapshot(context.Background(), snapshotA); err != nil {
 		t.Fatalf("apply snapshot A: %v", err)
+	}
+	// 快照读取是主节点-only 契约（读路径 SQL 角色复核）：缓存检查前切主角色
+	// （apply 直调路径的零值守卫不校验角色，语义不受影响）。
+	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
 	}
 	cachedA, _, err := service.Snapshot(context.Background(), 0, "", "")
 	if err != nil || len(cachedA.Users) != 1 || cachedA.Users[0].Username != "user-a" {
@@ -1021,7 +1075,7 @@ func TestSyncService_restart_callback_runs_when_synced_admin_TLS_changes(t *test
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 2, BasicSettings: models.ClusterBasicSettings{
-		LogLevel: "info", AccessLogJSON: true, Timezone: "Asia/Shanghai", AdminTLSEnabled: true, AdminTLSMode: "selfsigned",
+		LogLevel: new("info"), AccessLogJSON: new(true), Timezone: new("Asia/Shanghai"), AdminTLSEnabled: new(true), AdminTLSMode: new("selfsigned"),
 	}})
 
 	// When
@@ -1214,12 +1268,18 @@ func TestClusterSnapshot_alwaysCarriesGlobalSettings(t *testing.T) {
 	if snapshot.CaddyConfig == nil {
 		t.Fatal("caddy config must always be carried (users section is always synced)")
 	}
-	if !snapshot.BasicSettings.AccessLogJSON || snapshot.BasicSettings.AccessLogFormat != "{request}" || snapshot.BasicSettings.CaddyLogLevel != "warn" {
+	if snapshot.BasicSettings.AccessLogJSON == nil || !*snapshot.BasicSettings.AccessLogJSON ||
+		snapshot.BasicSettings.AccessLogFormat == nil || *snapshot.BasicSettings.AccessLogFormat != "{request}" ||
+		snapshot.BasicSettings.CaddyLogLevel == nil || *snapshot.BasicSettings.CaddyLogLevel != "warn" {
 		t.Fatalf("access log settings must always be carried: %#v", snapshot.BasicSettings)
 	}
 }
 
-func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(t *testing.T) {
+// 测试名/注释原以「Caddy 同步开关关闭」描述行为，
+// 但三分类合并后已无 sync_caddy_config 开关（列已删，见下方
+// TestClusterService_Status_removesLegacySyncCaddyConfig）。真实契约是：
+// 快照未携带 caddy_config（=旧主端缺席）时跳过 Caddy 全局列，保留从端本地值。
+func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenSnapshotOmitsCaddyConfig(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -1250,15 +1310,15 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 		return jsonOut, format
 	}
 
-	// When snapshot carries no caddy config (sync off)
+	// When snapshot omits caddy_config（旧主端快照缺席；无开关语义）
 	apply(t, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
-		LogLevel: "debug", AccessLogJSON: true, AccessLogFormat: "master-format", JWTExpireMinutes: 20,
+		LogLevel: new("debug"), AccessLogJSON: new(true), AccessLogFormat: new("master-format"), JWTExpireMinutes: new(20),
 	}})
 
 	// Then slave-local access log settings survive, ungated settings applied
 	gotJSON, gotFormat := readAccessLog(t)
 	if gotJSON || gotFormat != "slave-format" {
-		t.Fatalf("access log settings overwritten without caddy sync: json=%v format=%q", gotJSON, gotFormat)
+		t.Fatalf("access log settings overwritten when snapshot omits caddy_config: json=%v format=%q", gotJSON, gotFormat)
 	}
 	var logLevel string
 	if err := database.QueryRowContext(ctx, "SELECT log_level FROM global_config WHERE id=1").Scan(&logLevel); err != nil {
@@ -1268,14 +1328,90 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 		t.Fatalf("ungated log level not applied: %q", logLevel)
 	}
 
-	// When snapshot carries caddy config (sync on)
+	// When snapshot carries caddy_config
 	caddyConfig := "{}"
 	apply(t, models.ClusterSnapshot{CaddyConfig: &caddyConfig, BasicSettings: models.ClusterBasicSettings{
-		AccessLogJSON: true, AccessLogFormat: "master-format", JWTExpireMinutes: 20,
+		AccessLogJSON: new(true), AccessLogFormat: new("master-format"), JWTExpireMinutes: new(20),
 	}})
 	gotJSON, gotFormat = readAccessLog(t)
 	if !gotJSON || gotFormat != "master-format" {
-		t.Fatalf("access log settings not applied with caddy sync: json=%v format=%q", gotJSON, gotFormat)
+		t.Fatalf("access log settings not applied when snapshot carries caddy_config: json=%v format=%q", gotJSON, gotFormat)
+	}
+}
+
+// 旧主端 basic_settings 缺字段与显式零值不同。缺席字段必须
+// 全部跳过写入，不能将本节点现有配置清成 Go 零值。
+func TestUpdateSnapshotSettings_legacyAbsentFieldsPreserveEntireLocalRow(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	if _, err := database.Exec(`UPDATE global_config SET
+		log_level='warn',task_log_size_mb=77,audit_log_size_mb=78,runtime_log_size_mb=79,
+		audit_retention_months=8,jwt_expire_minutes=777,timezone='UTC',acme_email='local@example.test',
+		cert_expiry_days=44,cert_renewal_days=45,cert_renewal_attempts=6,default_ca_provider_id=88,
+		sync_interval=321,
+		admin_tls_enabled=1,admin_tls_mode='upload',admin_tls_cert='local-cert',admin_tls_key='local-key',
+		mfa_write_guard=1,mfa_lockout_enabled=1,github_proxy_url='https://local.proxy',oidc_config='{"issuer":"local"}',
+		branding_json='{"app_name":"local"}',caddy_config='{"apps":{}}',access_log_json=0,
+		access_log_format='local-format',caddy_log_level='error',caddy_log_size_mb=66,
+		request_body_max_size_mb=64,http_read_timeout=61,http_write_timeout=62,http_idle_timeout=63,
+		upstream_keepalive_timeout=64,proxy_dial_timeout=65,proxy_response_header_timeout=66,
+		proxy_read_timeout=67,proxy_write_timeout=68,proxy_stream_timeout=69,proxy_flush_interval=70,
+		proxy_stream_close_delay=71,github_proxy_url='https://local.proxy',server_tokens_hidden=1,
+		trusted_proxy_enabled=1,trusted_proxy_ranges='["192.0.2.1"]',trusted_proxy_range_refs='[7]',
+		trusted_proxy_headers='["X-Local"]',trusted_proxy_strict=0
+		WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	readRow := func() string {
+		t.Helper()
+		rows, err := database.Query(`SELECT * FROM global_config WHERE id=1`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := make([]any, len(columns))
+		dest := make([]any, len(columns))
+		for i := range values {
+			dest[i] = &values[i]
+		}
+		if !rows.Next() {
+			t.Fatal("global_config row missing")
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatal(err)
+		}
+		object := make(map[string]any, len(columns))
+		for i, column := range columns {
+			object[column] = values[i]
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
+	}
+	before := readRow()
+	var snapshot models.ClusterSnapshot
+	if err := json.Unmarshal([]byte(`{"basic_settings":{},"caddy_config":"{\"apps\":{}}"}`), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := updateSnapshotSettings(ctx, tx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if after := readRow(); after != before {
+		t.Fatalf("legacy absent fields changed local global_config\nbefore=%s\nafter=%s", before, after)
 	}
 }
 
@@ -1327,7 +1463,7 @@ func TestClusterService_UpdateSettings_ignoresLegacySyncCaddyConfig(t *testing.T
 }
 
 func TestClusterService_UpdateSettings_sync_interval_range_validation(t *testing.T) {
-	// R42 发现1：sync_interval 落库前必须做范围校验，否则从节点 run 循环
+	// 发现1：sync_interval 落库前必须做范围校验，否则从节点 run 循环
 	// waitDelay(0) 进入零间隔 Pull 风暴。
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -1358,7 +1494,7 @@ func TestClusterService_UpdateSettings_sync_interval_range_validation(t *testing
 }
 
 func TestClusterService_Nodes_matchesOverviewOnlineCount_withDirtySyncInterval(t *testing.T) {
-	// R44-1：存量脏值 sync_interval=5（R42 前残留，低于校验下限 10）时，从节点
+	// 存量脏值 sync_interval=5时，从节点
 	// run loop 实际以 60s 上报；节点列表（ComputeNodeStatus）与总览在线数
 	// （updateOverview）必须同口径按 60s 计（阈值 120s），否则同一节点在两页面
 	// 判定打架，且上报窗口内的从节点被误判离线。
@@ -1399,7 +1535,7 @@ func TestClusterService_Nodes_matchesOverviewOnlineCount_withDirtySyncInterval(t
 	}
 }
 
-// CL23-1(第 23 轮审计):重新注册不携带 AccessURL(cluster_mode.go 恒空)时
+// 重新注册不携带 AccessURL(cluster_mode.go 恒空)时
 // 必须保留管理员维护的存量,不静默清空。
 func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -1410,7 +1546,7 @@ func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://127.0.0.1:8001",
-	}, now)
+	}, "172.18.0.2", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1426,7 +1562,7 @@ func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	}
 	if _, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token2, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000,
-	}, now); err != nil {
+	}, "172.18.0.2", now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1440,7 +1576,7 @@ func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	}
 }
 
-// P5-6（第 50 轮审计）：ConfirmRegistration 清列必须与 Snapshot 旧协议交付
+// ConfirmRegistration 清列必须与 Snapshot 旧协议交付
 // 确认（cluster_snapshot.go:84）对齐——registration_secret_expires_at 一并
 // 置 NULL，否则残留过期时间戳与已清空的 secret 长期分叉。
 func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
@@ -1451,8 +1587,12 @@ func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
 	}
 
 	// When
-	if err := service.ConfirmRegistration(context.Background(), "slave-token"); err != nil {
+	name, err := service.ConfirmRegistration(context.Background(), "slave-token")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if name != "s1" {
+		t.Fatalf("确认返回节点名=%q, want s1（审计归因依赖该值）", name)
 	}
 
 	// Then：secret 与过期时间戳双列均 NULL
@@ -1462,5 +1602,362 @@ func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
 	}
 	if secret.Valid || expires.Valid {
 		t.Fatalf("registration_secret.Valid=%v expires_at.Valid=%v（值 %q/%q）, want 双列均 NULL", secret.Valid, expires.Valid, secret.String, expires.String)
+	}
+}
+
+// nodes 不在 cluster_version 触发器清单——删除节点
+// 必须与注册/改坐标同构地在同事务 bump，否则快照缓存（键含 cluster_version）
+// 继续携带被删节点的站点项，直到下一次无关 bump。
+func TestDeleteNodeBumpsClusterVersion(t *testing.T) {
+	service, database := newClusterTestService(t)
+	nodeID := insertApprovedClusterNode(t, database, "slave-del")
+	version := func() int {
+		t.Helper()
+		var v int
+		if err := database.QueryRow(`SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1`).Scan(&v); err != nil {
+			t.Fatalf("read cluster_version: %v", err)
+		}
+		return v
+	}
+	before := version()
+	if err := service.DeleteNode(context.Background(), nodeID); err != nil {
+		t.Fatalf("delete node: %v", err)
+	}
+	if after := version(); after != before+1 {
+		t.Fatalf("cluster_version %d→%d，want +1（拓扑变更必须传播）", before, after)
+	}
+}
+
+// 作废旧令牌与写入新令牌必须同成同败：分两语句无事务时，INSERT 失败会留下
+// 「旧令牌已被 DELETE、新令牌未落库」的空窗——管理员拿到的仍是错误提示，
+// 却已无任何可用令牌。
+func TestGenerateRegisterToken_invalidationAndInsertAreAtomic(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	first, _, err := service.GenerateRegisterToken(ctx, 1, now)
+	if err != nil {
+		t.Fatalf("generate first token: %v", err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER reject_register_token_insert BEFORE INSERT ON cluster_register_tokens
+		BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.GenerateRegisterToken(ctx, 1, now); err == nil {
+		t.Fatal("注入的 INSERT 失败必须以错误上抛")
+	}
+	if _, err := database.Exec("DROP TRIGGER reject_register_token_insert"); err != nil {
+		t.Fatal(err)
+	}
+
+	var tokenCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM cluster_register_tokens").Scan(&tokenCount); err != nil {
+		t.Fatal(err)
+	}
+	if tokenCount != 1 {
+		t.Fatalf("生成失败后令牌数=%d, want 1（作废必须随生成失败回滚）", tokenCount)
+	}
+	req := models.ClusterRegisterRequest{Token: first, Name: "slave-atomic", IPAddress: "10.0.0.2", Port: 8000}
+	if _, err := service.RegisterNode(ctx, req, req.IPAddress, now); err != nil {
+		t.Fatalf("旧令牌必须仍可用（作废被回滚）: %v", err)
+	}
+}
+
+// 并发生成注册令牌后只允许留一枚有效令牌（作废+生成在同一事务内串行化）。
+func TestGenerateRegisterToken_concurrentGenerationLeavesSingleValidToken(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	const workers = 16
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, err := service.GenerateRegisterToken(ctx, 1, now)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发生成令牌失败: %v", err)
+		}
+	}
+	var valid int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cluster_register_tokens WHERE used_at IS NULL AND expires_at > ?`, now.UTC()).Scan(&valid); err != nil {
+		t.Fatal(err)
+	}
+	if valid != 1 {
+		t.Fatalf("并发生成后有效令牌数=%d, want 1（只允许最晚一次生成存活）", valid)
+	}
+}
+
+// 审批同时推进注册密钥的 24h 到期窗口，必须与同域其他方法一样使用注入 now
+// （真实时钟会让到期边界无法确定性断言）。
+func TestApproveNode_expiryUsesInjectedNow(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	token, _, err := service.GenerateRegisterToken(ctx, 1, now)
+	if err != nil {
+		t.Fatalf("generate register token: %v", err)
+	}
+	registration, err := service.RegisterNode(ctx, models.ClusterRegisterRequest{
+		Token: token, Name: "slave-expiry", IPAddress: "10.0.0.21", Port: 8000,
+	}, "10.0.0.21", now)
+	if err != nil {
+		t.Fatalf("register node: %v", err)
+	}
+	if err := service.ApproveNode(ctx, registration.RegistrationID, now); err != nil {
+		t.Fatalf("approve node: %v", err)
+	}
+	var expiresAt sql.NullTime
+	if err := database.QueryRow(`SELECT registration_secret_expires_at FROM nodes WHERE id=?`, registration.RegistrationID).Scan(&expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(24 * time.Hour)
+	if !expiresAt.Valid || !expiresAt.Time.UTC().Equal(want) {
+		t.Fatalf("registration_secret_expires_at=%v, want 注入 now+24h=%v", expiresAt, want)
+	}
+	// 落库形态必须仍可被 SQLite datetime() 解析（cluster_auth 的注册密钥
+	// 到期门用 datetime(...) 比较；解析失败会静默按过期拒绝）。
+	var parsed sql.NullString
+	if err := database.QueryRow(`SELECT datetime(registration_secret_expires_at) FROM nodes WHERE id=?`, registration.RegistrationID).Scan(&parsed); err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.Valid {
+		t.Fatalf("datetime(registration_secret_expires_at) 解析失败（值 %v）——认证门会静默拒绝注册密钥", expiresAt)
+	}
+}
+
+// approved 分支的 confirm 失败必须在下一轮重试，且连续达到上限后真正终止注册
+// 循环。此前在同一条 UPDATE 里先清 registration_secret：confirm 失败后下轮
+// pollRegistration 因 secret=="" 早退，confirm 永不重试、计数至多 1，
+// 「连续 5 次失败停止注册并提示人工介入」在 confirm 轴上不可达。
+func TestSyncService_pollRegistration_retriesConfirmAndStopsAfterConsecutiveFailures(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var confirmHits int
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
+			confirmHits++
+			// 凭证类拒绝（令牌无效）才推进终止轨道；5xx/409/403 属暂时性。
+			response.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if request.Header.Get("X-Registration-Secret") != "temporary-secret" {
+			response.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+	}))
+	defer master.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, registration_id=7, registration_secret='temporary-secret', cluster_token='', registration_confirm_failures=0 WHERE id=1", master.URL); err != nil {
+		t.Fatalf("seed pending registration: %v", err)
+	}
+	syncService := NewSyncService(database, &config.Config{}, NewCaddyService(master.URL))
+
+	// 首轮：令牌落库、confirm 失败、注册密钥必须保留（下一轮可重试）。
+	syncService.pollRegistration(context.Background())
+	var secret string
+	var failures int
+	if err := database.QueryRow("SELECT registration_secret, COALESCE(registration_confirm_failures,0) FROM global_config WHERE id=1").Scan(&secret, &failures); err != nil {
+		t.Fatalf("read registration state: %v", err)
+	}
+	if secret != "temporary-secret" {
+		t.Fatalf("confirm 失败后 registration_secret=%q, want 保留（否则 confirm 永不重试）", secret)
+	}
+	if failures != 1 {
+		t.Fatalf("registration_confirm_failures=%d, want 1", failures)
+	}
+
+	// 第二轮：仍会重新查询状态并发起 confirm（重试可达）。
+	syncService.pollRegistration(context.Background())
+	if confirmHits != 2 {
+		t.Fatalf("confirm attempts=%d after two polls, want 2（confirm 轴重试不可达）", confirmHits)
+	}
+
+	// 补足到上限：第 5 次失败触发终止轨道（清注册态并落终止文案）。
+	for range registrationConfirmMaxFailures - 2 {
+		syncService.pollRegistration(context.Background())
+	}
+	if confirmHits != registrationConfirmMaxFailures {
+		t.Fatalf("confirm attempts=%d, want %d", confirmHits, registrationConfirmMaxFailures)
+	}
+	var registrationID sql.NullInt64
+	var secretAfter, clusterToken, lastSyncError string
+	if err := database.QueryRow("SELECT registration_id, COALESCE(registration_secret,''), COALESCE(cluster_token,''), COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&registrationID, &secretAfter, &clusterToken, &lastSyncError); err != nil {
+		t.Fatalf("read terminal state: %v", err)
+	}
+	if secretAfter != "" || registrationID.Valid || clusterToken != "" {
+		t.Fatalf("终止轨道未清注册态: secret=%q registration_id=%v token=%q", secretAfter, registrationID, clusterToken)
+	}
+	if !strings.Contains(lastSyncError, "连续失败") {
+		t.Fatalf("last_sync_error=%q, want 携带连续失败终止文案", lastSyncError)
+	}
+
+	// 注册循环已退出：后续轮询不再发 confirm。
+	syncService.pollRegistration(context.Background())
+	if confirmHits != registrationConfirmMaxFailures {
+		t.Fatalf("终止后仍在重试 confirm: attempts=%d", confirmHits)
+	}
+}
+
+// 生产 run 循环中「令牌已落库、confirm 未成功」的轮次必须重试 confirm：
+// run 此前只在 cluster_token 为空时进注册轮询，approved 分支落库令牌后永不再
+// 轮询 → confirm 的「连续 5 次终止」与「稍后自动重试」文案都不可达，本地明文
+// registration_secret 无限期滞留。本用例走 run 循环（非直调 pollRegistration），
+// 断言连续轮次都在重试 confirm。
+func TestSyncService_run_retriesPendingRegistrationConfirmAfterTokenStored(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var confirmHits int
+	master := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/cluster/register/7/status":
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm":
+			confirmHits++
+			// 5xx 属暂时性：可重试、不清注册态（409 导入窗口同族）。
+			response.WriteHeader(http.StatusInternalServerError)
+		case request.URL.Path == "/api/v1/cluster/sync/snapshot":
+			response.WriteHeader(http.StatusNotModified)
+		default:
+			response.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer master.Close()
+	seedApprovedRegistration(t, database, master.URL)
+	syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+	rounds := 0
+	syncService.waitRunDelay = func(context.Context, time.Duration) bool {
+		rounds++
+		return rounds < 3
+	}
+
+	syncService.run(context.Background())
+
+	// 3 个周期：首轮状态轮询 + confirm，随后两轮令牌已在库、仍须重试 confirm。
+	if confirmHits != 3 {
+		t.Fatalf("confirm attempts=%d over 3 run cycles, want 3（令牌落库后 confirm 重试不可达）", confirmHits)
+	}
+	var failures int
+	var secret, stored string
+	if err := database.QueryRow("SELECT COALESCE(registration_confirm_failures,0), COALESCE(registration_secret,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&failures, &secret, &stored); err != nil {
+		t.Fatalf("read registration state: %v", err)
+	}
+	// 5xx 属暂时性：只重试、不清注册态、不推进 5 连败终止计数（终止计数只服务
+	// 凭证类拒绝）。
+	if failures != 0 {
+		t.Fatalf("registration_confirm_failures=%d, want 0（暂时性失败不得推进终止轨道）", failures)
+	}
+	if secret != "temporary-secret" {
+		t.Fatalf("registration_secret=%q, want 保留（暂时性失败不得清注册态）", secret)
+	}
+	if stored != "lb_cluster_approved" {
+		t.Fatalf("cluster_token=%q, want 已落库令牌保留", stored)
+	}
+}
+
+// seedApprovedRegistration 建立「主节点已审批、本地待 confirm」的注册态；
+// confirm 端点响应由各用例自建 mux 决定。
+func seedApprovedRegistration(t *testing.T, database *sql.DB, masterURL string) {
+	t.Helper()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, registration_id=7, registration_secret='temporary-secret', cluster_token='', registration_confirm_failures=0 WHERE id=1", masterURL); err != nil {
+		t.Fatalf("seed pending registration: %v", err)
+	}
+}
+
+// 暂时性 confirm 失败（409 导入窗口 / 403 目标降级 / 5xx 主节点故障）必须
+// 可重试且不清任何注册态：confirm 只是冗余交付确认，令牌在审批时刻即有效。
+func TestPollRegistration_transientConfirmFailuresKeepRegistrationState(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{name: "import_window_409", status: http.StatusConflict},
+		{name: "demoted_403", status: http.StatusForbidden},
+		{name: "master_error_500", status: http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, database := newClusterTestService(t)
+			var confirmHits int
+			master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
+					confirmHits++
+					response.WriteHeader(tc.status)
+					return
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+			}))
+			defer master.Close()
+			seedApprovedRegistration(t, database, master.URL)
+			syncService := NewSyncService(database, &config.Config{}, NewCaddyService(master.URL))
+
+			for range registrationConfirmMaxFailures * 2 {
+				syncService.pollRegistration(context.Background())
+			}
+			if confirmHits < registrationConfirmMaxFailures*2 {
+				t.Fatalf("confirm attempts=%d, want 持续重试（不得提前终止）", confirmHits)
+			}
+
+			var registrationID sql.NullInt64
+			var secret, clusterToken, lastSyncError string
+			var failures int
+			if err := database.QueryRow("SELECT registration_id, COALESCE(registration_secret,''), COALESCE(cluster_token,''), COALESCE(last_sync_error,''), COALESCE(registration_confirm_failures,0) FROM global_config WHERE id=1").Scan(&registrationID, &secret, &clusterToken, &lastSyncError, &failures); err != nil {
+				t.Fatalf("read registration state: %v", err)
+			}
+			if !registrationID.Valid || secret != "temporary-secret" || clusterToken != "lb_cluster_approved" {
+				t.Fatalf("暂时性失败清除了注册态: id=%v secret=%q token=%q", registrationID, secret, clusterToken)
+			}
+			if failures != 0 {
+				t.Fatalf("registration_confirm_failures=%d, want 0（暂时性失败不得计入终止轨道）", failures)
+			}
+			msg, _ := decodeSyncError(lastSyncError)
+			if !strings.Contains(msg, "稍后自动重试") {
+				t.Fatalf("last_sync_error=%q, want 可重试文案", msg)
+			}
+		})
+	}
+}
+
+// 网络错误同样不得推进终止轨道或清除注册态。
+func TestPollRegistration_networkFailureKeepsRegistrationState(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var confirmHits int
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
+			confirmHits++
+			// ErrAbortHandler 直接断连（客户端观测到网络错误，而非 HTTP 状态）。
+			panic(http.ErrAbortHandler)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+	}))
+	defer master.Close()
+	seedApprovedRegistration(t, database, master.URL)
+	syncService := NewSyncService(database, &config.Config{}, NewCaddyService(master.URL))
+
+	for range registrationConfirmMaxFailures * 2 {
+		syncService.pollRegistration(context.Background())
+	}
+	if confirmHits < registrationConfirmMaxFailures*2 {
+		t.Fatalf("confirm attempts=%d, want 持续重试（不得提前终止）", confirmHits)
+	}
+	var registrationID sql.NullInt64
+	var secret, clusterToken string
+	if err := database.QueryRow("SELECT registration_id, COALESCE(registration_secret,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&registrationID, &secret, &clusterToken); err != nil {
+		t.Fatalf("read registration state: %v", err)
+	}
+	if !registrationID.Valid || secret != "temporary-secret" || clusterToken != "lb_cluster_approved" {
+		t.Fatalf("网络失败清除了注册态: id=%v secret=%q token=%q", registrationID, secret, clusterToken)
 	}
 }

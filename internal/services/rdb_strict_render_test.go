@@ -23,15 +23,15 @@ import (
 func rdbStrictSeedThreatList(t *testing.T, database *sql.DB, source string) int64 {
 	t.Helper()
 	name := db.ThreatListNameBySource(source)
-	res, err := database.Exec(
-		`INSERT INTO security_ip_lists (name, description, entries, system, created_at) VALUES (?,?,?,?,datetime('now'))`,
-		name, "", "[]", 1)
-	if err != nil {
+	// system=1 名单名唯一，威胁库三源由 DB 初始化播种；复用其 id。
+	if _, err := database.Exec(
+		`INSERT OR IGNORE INTO security_ip_lists (name, description, entries, system, created_at) VALUES (?,?,?,?,datetime('now'))`,
+		name, "", "[]", 1); err != nil {
 		t.Fatalf("seed threat list %s: %v", source, err)
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("seed threat list %s last id: %v", source, err)
+	var id int64
+	if err := database.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&id); err != nil {
+		t.Fatalf("seed threat list %s id: %v", source, err)
 	}
 	return id
 }
@@ -131,6 +131,30 @@ func TestRDBStrictRender_threatFilePresentRendersNormally(t *testing.T) {
 	if mainRoute == nil && len(routes) == 0 {
 		t.Fatal("路由必须正常生成")
 	}
+	// 原断言只证明「不是空路由」，未钉住文件在场时
+	// 的实际契约——引用策略必须以 @ipListFast 文件投影参与预检，且投影内容=
+	// .iplist 条目聚合（ACL 保护面不得静默收窄）。
+	wafs := wafHandlers(t, mainRoute)
+	var precheck string
+	for _, waf := range wafs {
+		directives, _ := waf["directives"].(string)
+		if strings.Contains(directives, `"id:1500`) {
+			precheck = directives
+			break
+		}
+	}
+	if precheck == "" {
+		t.Fatalf("引用策略必须发射逐策略 deny ACL 预检链（id:1500000+policyID）: %#v", wafs)
+	}
+	if !strings.Contains(precheck, "@ipListFast ") {
+		t.Fatalf("deny ACL 必须经 @ipListFast 文件投影:\n%s", precheck)
+	}
+	projection := readRenderedIPList(t, precheck, "-acl")
+	for _, want := range []string{"192.0.2.0/24", "198.51.100.7/32"} {
+		if !strings.Contains(projection, want) {
+			t.Fatalf("u-deny 投影缺 %s（.iplist 条目必须完整进入 ACL 匹配集）: %q", want, projection)
+		}
+	}
 }
 
 // 从节点形状（RDB）：.iplist 文本缺失但 .fast 在场（waf_files 通道同步产物）
@@ -161,5 +185,28 @@ func TestRDBStrictRender_slaveShape_fastOnlyRenders(t *testing.T) {
 	dump, _ := json.Marshal(map[string]interface{}{"routes": routes, "main": mainRoute})
 	if !strings.Contains(string(dump), "GeoIP 区域拦截") {
 		t.Fatalf("从节点 .fast 回退：未受影响策略必须照常渲染")
+	}
+
+	// .fast 回退的实际契约是「回退展开的前缀集进入 ACL 匹配集」——只断言
+	// 旁路策略照常渲染时，回退展开成空集（ACL 静默收窄=fail-open/403 风暴）
+	// 仍绿。对照 .iplist 形态钉住 @ipListFast 与投影内容。
+	wafs := wafHandlers(t, mainRoute)
+	var precheck string
+	for _, waf := range wafs {
+		directives, _ := waf["directives"].(string)
+		if strings.Contains(directives, `"id:1500`) {
+			precheck = directives
+			break
+		}
+	}
+	if precheck == "" {
+		t.Fatalf(".fast 回退必须发射逐策略 deny ACL 预检链（id:1500000+policyID）: %#v", wafs)
+	}
+	if !strings.Contains(precheck, "@ipListFast ") {
+		t.Fatalf(".fast 回退的 deny ACL 必须经 @ipListFast 文件投影:\n%s", precheck)
+	}
+	projection := readRenderedIPList(t, precheck, "-acl")
+	if !strings.Contains(projection, "192.0.2.0/24") {
+		t.Fatalf("u-deny 投影缺 .fast 前缀 192.0.2.0/24（回退展开丢失=fail-open 方向静默失效）: %q", projection)
 	}
 }

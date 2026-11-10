@@ -1,9 +1,12 @@
 package wafiplist
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -98,6 +101,33 @@ func TestParseIPEntry_unmaps4in6Entries(t *testing.T) {
 	}
 }
 
+// 契约钉：ParseIPEntry 对 mapped 主机位变体的归一——::ffff:0.0.0.1/96 与
+// canonical ::ffff:0:0/96 是同一网段，Unmap + bits-96 后折叠为 0.0.0.0/0。
+// 这是通用 IP 名单语义（名单条目「全部 v4」是合法的），因此该折叠不可在
+// 装载层收窄；受信代理投影必须先按等价 v4 判宽并拒绝该形态（services
+// TrustedProxyPrefix* 判据 + 写侧校验），否则信任边界被绕过。本用例钉住
+// 归一语义，避免其漂移让上层「跳过/拒绝」失去依据。
+func TestParseIPEntry_mappedHostBitCollapsesToV4AllSpace(t *testing.T) {
+	for _, entry := range []string{"::ffff:0.0.0.1/96", "::ffff:0:0/96", "::ffff:0.0.0.0/96"} {
+		prefix, err := ParseIPEntry(entry)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry, err)
+		}
+		if want := netip.MustParsePrefix("0.0.0.0/0"); prefix != want {
+			t.Fatalf("%s = %s, want %s（mapped /96 折叠为 v4 全空间）", entry, prefix, want)
+		}
+	}
+	// 精确段不变（等价 v4 前缀）
+	prefix, err := ParseIPEntry("::ffff:203.0.113.7/120")
+	if err != nil || prefix != netip.MustParsePrefix("203.0.113.0/24") {
+		t.Fatalf("precise mapped drift: %s err=%v", prefix, err)
+	}
+	// bits<96 的 mapped 前缀无法折成 v4：明确报错，不得静默归成别的网段
+	if _, err := ParseIPEntry("::ffff:0.0.0.0/95"); err == nil {
+		t.Fatal("mapped /95 必须报错（bits<96 无法归一为 v4）")
+	}
+}
+
 // 算子级端到端：4in6 裸 IP 与 /120 前缀两条目对被 Unmap 后的 v4
 // 查询命中（修复前条目落入 v6 集，v4 查询恒不命中）。
 func TestIPListFast_4in6EntriesHitV4Queries(t *testing.T) {
@@ -145,13 +175,47 @@ func TestIPListFast_evictCacheForcesReparse(t *testing.T) {
 	}
 }
 
+func TestIPListFast_evictWaitsForInFlightParse(t *testing.T) {
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "evict-inflight.txt", []string{"203.0.113.0/24"})
+	_ = newOp(t, path)
+
+	unlock := lockIPListLoad(path) // 模拟解析持锁、尚未写回缓存的窗口
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
+	done := make(chan int, 1)
+	go func() { done <- EvictIPListCache(path) }()
+	select {
+	case got := <-done:
+		unlock()
+		unlock = nil
+		t.Fatalf("eviction returned %d while the path parse lock was held; in-flight state can be revived", got)
+	case <-time.After(50 * time.Millisecond):
+		// 预期：淘汰必须等本代解析落定后再删除。
+	}
+	unlock()
+	unlock = nil
+	if got := <-done; got != 1 {
+		t.Fatalf("EvictIPListCache=%d, want 1", got)
+	}
+	ipListCache.RLock()
+	left := ipListCache.states[path]
+	ipListCache.RUnlock()
+	if left != nil {
+		t.Fatal("completed eviction must not leave the old generation cached")
+	}
+}
+
 // 体积/条目上限：超限文件构建期拒绝，防异常文件拖垮内存。
 func TestIPListFast_loadCaps(t *testing.T) {
 	dir := useAllowedDir(t)
-	oldBytes, oldEntries := MaxFileBytes, MaxEntries
-	MaxFileBytes = 1024
-	MaxEntries = 8
-	t.Cleanup(func() { MaxFileBytes, MaxEntries = oldBytes, oldEntries })
+	oldBytes, oldEntries := maxFileBytes, maxEntries
+	maxFileBytes = 1024
+	maxEntries = 8
+	t.Cleanup(func() { maxFileBytes, maxEntries = oldBytes, oldEntries })
 
 	big := writeListFile(t, dir, "big.txt", []string{"203.0.113.7"})
 	if err := os.Truncate(big, 2048); err != nil { // 稀疏扩容超过 cap
@@ -391,20 +455,20 @@ func TestIPListFast_factoryDedupSharedState(t *testing.T) {
 // 直接喂解析器，模拟「stat 见小、实际读到超大」的形态。
 func TestParseIPListFile_enforcesMaxFileBytesAfterRead(t *testing.T) {
 	dir := useAllowedDir(t)
-	oldBytes := MaxFileBytes
-	MaxFileBytes = 16
-	t.Cleanup(func() { MaxFileBytes = oldBytes })
+	oldBytes := maxFileBytes
+	maxFileBytes = 16
+	t.Cleanup(func() { maxFileBytes = oldBytes })
 
 	path := writeListFile(t, dir, "grew.txt", []string{"203.0.113.7", "198.51.100.0/24", "2001:db8::/32"})
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() <= MaxFileBytes {
+	if info.Size() <= maxFileBytes {
 		t.Fatalf("fixture too small: %d bytes", info.Size())
 	}
 	if _, err := parseIPListFile(path); err == nil {
-		t.Fatal("超过 MaxFileBytes 的内容必须在读侧被拒绝（pre-stat 判限不构成硬上限）")
+		t.Fatal("超过 maxFileBytes 的内容必须在读侧被拒绝（pre-stat 判限不构成硬上限）")
 	}
 }
 
@@ -440,5 +504,188 @@ func TestParseIPListFile_stampsGenerationFromReadContent(t *testing.T) {
 	if !state.mtime.Equal(newInfo.ModTime()) {
 		t.Fatalf("state.mtime=%v, want %v (读取内容的 mtime，而非 pre-stat 的 %v)",
 			state.mtime, newInfo.ModTime(), oldInfo.ModTime())
+	}
+}
+
+// staleStatSource 模拟「stat 与读之间文件被原位改写」：第一次 Stat 返回改写
+// 前的小尺寸形态，Read 从真实 inode 流式读（因此可读到改写后的内容），
+// 第二次 Stat 返回当前真实形态——boundedReadSource 的替身注入点。
+type staleStatSource struct {
+	file  *os.File
+	stale os.FileInfo
+	stats int
+	read  int64
+}
+
+func (s *staleStatSource) Stat() (os.FileInfo, error) {
+	s.stats++
+	if s.stats == 1 {
+		return s.stale, nil
+	}
+	return s.file.Stat()
+}
+
+func (s *staleStatSource) Read(p []byte) (int, error) {
+	n, err := s.file.Read(p)
+	s.read += int64(n)
+	return n, err
+}
+
+// 有界代际读（名单加载器与爬虫段快照加载器共用同一原语）：
+//   - 定长读以 pre-stat 尺寸为准，stat 与读之间被原位追加不得放大读入量；
+//   - 读后复核同一 inode，形态变化（追加/截断/同尺寸改写）必须放弃本次
+//     加载——混合字节不能当作一代内容落定。
+func TestReadBoundedFile_boundedGenerationRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "list.txt")
+	if err := os.WriteFile(path, []byte("203.0.113.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("追加不放大读入量且拒绝混合代际", func(t *testing.T) {
+		fd, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer fd.Close()
+		before, err := fd.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendFd, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := appendFd.WriteString(strings.Repeat("# pad\n", 4096)); err != nil {
+			appendFd.Close()
+			t.Fatal(err)
+		}
+		if err := appendFd.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		src := &staleStatSource{file: fd, stale: before}
+		raw, _, err := readBoundedFrom(src, path, 1<<20)
+		if !errors.Is(err, ErrFileRewriteDuringRead) {
+			t.Fatalf("err=%v, want ErrFileRewriteDuringRead（读后形态变化必须拒绝）", err)
+		}
+		if raw != nil {
+			t.Fatal("拒绝的读取不得返回内容")
+		}
+		if src.read != before.Size() {
+			t.Fatalf("实际读入 %d 字节, want %d（定长读不得被追加放大）", src.read, before.Size())
+		}
+	})
+
+	t.Run("未改写读取成功且形态取自同一 inode", func(t *testing.T) {
+		raw, info, err := ReadBoundedFile(path, 1<<20)
+		if err != nil {
+			t.Fatalf("readBoundedFile: %v", err)
+		}
+		if int64(len(raw)) != info.Size() {
+			t.Fatalf("读入 %d 字节, stat %d 字节（同一代际）", len(raw), info.Size())
+		}
+	})
+
+	t.Run("超限拒绝", func(t *testing.T) {
+		if _, _, err := ReadBoundedFile(path, 4); !errors.Is(err, ErrFileSizeLimit) {
+			t.Fatalf("err=%v, want ErrFileSizeLimit", err)
+		}
+	})
+}
+
+// 缓存被淘汰 + 文件消失（上次 reload 失败、运行配置仍旧）时 Evaluate 按未命中
+// 处理——黑名单方向 fail-open，且旧实现完全静默。该形态必须按路径节流上报，
+// 否则静默放行直到 reload 成功无任何痕迹。
+func TestIPListFast_reportsUnavailableWhenCacheEvictedAndFileGone(t *testing.T) {
+	disableStatThrottle(t)
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "unavailable.txt", []string{"203.0.113.7"})
+	op := newOp(t, path)
+	if !op.Evaluate(nil, "203.0.113.7") {
+		t.Fatal("初始加载判定错误")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	EvictIPListCache(path)
+
+	var calls int
+	oldHook, oldInterval := OnListUnavailableServe, staleServeLogInterval
+	OnListUnavailableServe = func(string, error) { calls++ }
+	staleServeLogInterval = time.Minute
+	t.Cleanup(func() {
+		OnListUnavailableServe, staleServeLogInterval = oldHook, oldInterval
+		clearStaleReport(path)
+	})
+
+	if op.Evaluate(nil, "203.0.113.7") {
+		t.Fatal("无缓存且文件消失必须按未命中（fail-open 方向）")
+	}
+	if op.Evaluate(nil, "203.0.113.7") {
+		t.Fatal("第二次判定仍按未命中")
+	}
+	if calls != 1 {
+		t.Fatalf("不可读告警次数=%d, want 1（按路径节流，不逐请求刷屏）", calls)
+	}
+}
+
+// 白名单内的符号链接指向白名单外：构建期（Provision/算子构建）必须拒绝。
+// Clean+前缀只防 `..` 穿越，symlink 可绕过；运行期热路径不做 EvalSymlinks
+// （每请求 syscall），故硬边界落在归一入口。白名单内的链接指向白名单内
+// 目标仍合法。
+func TestIPListFast_symlinkEscapeRejected(t *testing.T) {
+	dir := useAllowedDir(t)
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("203.0.113.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(dir, "escape.txt")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	if _, err := newIPListFast(plugintypes.OperatorOptions{Arguments: escape}); err == nil {
+		t.Fatal("白名单内 symlink 指向白名单外必须在构建期被拒绝")
+	}
+
+	// 白名单内链接（相对目标）合法。
+	inside := writeListFile(t, dir, "inside.txt", []string{"203.0.113.8"})
+	friendly := filepath.Join(dir, "inside-link.txt")
+	if err := os.Symlink(filepath.Base(inside), friendly); err != nil {
+		t.Fatalf("create inside symlink: %v", err)
+	}
+	op := newOp(t, friendly)
+	if !op.Evaluate(nil, "203.0.113.8") {
+		t.Fatal("白名单内 symlink 指向白名单内目标必须正常加载")
+	}
+}
+
+// 预分配容量必须被 initialPrefixCapacity 封顶：注释/空行密集的大文件
+// （带外写入、损坏残留）按 len/12 预估会一次申请 32MiB（每项 32B）却几乎全空。
+func TestPrefixCapHint_boundedOnCommentHeavyFiles(t *testing.T) {
+	cases := []struct {
+		name string
+		size int
+		want int
+	}{
+		{"empty", 0, 1},
+		{"small list", 12*100 + 1, 101},
+		{"at cap", initialPrefixCapacity * 12, initialPrefixCapacity},
+		{"64MiB comment-only file", 64 << 20, initialPrefixCapacity},
+		{"zero size", 0, 1},
+	}
+	for _, tc := range cases {
+		if got := prefixCapHint(tc.size); got != tc.want {
+			t.Errorf("%s: prefixCapHint(%d)=%d, want %d", tc.name, tc.size, got, tc.want)
+		}
+	}
+	// 上界与 maxEntries 语义无关：即便 maxEntries 被测试收窄到极小值，
+	// 预分配也不得超过条目硬上限。
+	oldEntries := maxEntries
+	maxEntries = 4
+	t.Cleanup(func() { maxEntries = oldEntries })
+	if got := prefixCapHint(64 << 20); got > maxEntries+1 {
+		t.Fatalf("预分配 %d 超过条目硬上限 %d", got, maxEntries+1)
 	}
 }

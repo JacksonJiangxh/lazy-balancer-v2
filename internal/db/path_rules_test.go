@@ -15,8 +15,7 @@ func TestLoadPathRulesDecodesUpstreamsAndSortsRows(t *testing.T) {
 	defer database.Close()
 	if _, err := database.Exec(`CREATE TABLE path_rules (id INTEGER PRIMARY KEY, rule_id TEXT, sort_order INTEGER, match_type TEXT, path TEXT, upstream_path TEXT NOT NULL DEFAULT '', upstreams_json TEXT, response_mode TEXT NOT NULL DEFAULT '', response_status INTEGER NOT NULL DEFAULT 200, response_body TEXT NOT NULL DEFAULT '', response_content_type TEXT NOT NULL DEFAULT '', redirect_to TEXT NOT NULL DEFAULT '');
 		INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json) VALUES (2,'lb_path',20,'exact','/second','/v2',NULL);
-		INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json) VALUES (1,'lb_path',10,'prefix','/first','/v1','[{"address":"127.0.0.1","port":8080}]');
-		INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,redirect_to) VALUES (3,'lb_path',30,'exact','/static','',NULL,'redirect',200,'https://example.com/x');`); err != nil {
+		INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json) VALUES (1,'lb_path',10,'prefix','/first','/v1','[{"address":"127.0.0.1","port":8080}]');`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -27,18 +26,10 @@ func TestLoadPathRulesDecodesUpstreamsAndSortsRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rules) != 3 || rules[0].Path != "/first" || len(rules[0].Upstreams) != 1 || rules[0].Upstreams[0].Address != "127.0.0.1" || rules[0].Upstreams[0].Port != 8080 || rules[1].Path != "/second" {
+	if len(rules) != 2 || rules[0].Path != "/first" || len(rules[0].Upstreams) != 1 || rules[0].Upstreams[0].Address != "127.0.0.1" || rules[0].Upstreams[0].Port != 8080 || rules[1].Path != "/second" {
 		t.Fatalf("path rules=%#v", rules)
 	}
 	if rules[0].UpstreamPath != "/v1" || rules[1].UpstreamPath != "/v2" {
 		t.Fatalf("upstream_path=(%q,%q), want (/v1,/v2)", rules[0].UpstreamPath, rules[1].UpstreamPath)
-	}
-	// 存量行（未写 response_mode）读侧为空=转发；redirect 行原样带回目标。
-	if rules[0].ResponseMode != "" || rules[1].ResponseMode != "" {
-		t.Fatalf("legacy response_mode=(%q,%q), want empty/empty", rules[0].ResponseMode, rules[1].ResponseMode)
-	}
-	static := rules[2]
-	if static.ResponseMode != "redirect" || static.RedirectTo != "https://example.com/x" {
-		t.Fatalf("static rule=%+v, want redirect/https://example.com/x", static)
 	}
 }

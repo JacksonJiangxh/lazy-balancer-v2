@@ -6,11 +6,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -169,7 +171,7 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// F-L1-68-01（第 68 轮）：任一源失败即整体失败——RunUpdate 回传
+	// 任一源失败即整体失败——RunUpdate 回传
 	// ErrThreatUpdateFailed（引擎 task_runs 记 failed）；单源失败仍不中断其余源。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
 		t.Fatalf("second run err=%v, want ErrThreatUpdateFailed", err)
@@ -214,7 +216,7 @@ func TestThreatUpdate_parseGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// F-L1-68-01（第 68 轮）：两源失败（解析守卫拒绝）→ 整体失败回传。
+	// 两源失败（解析守卫拒绝）→ 整体失败回传。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
 		t.Fatalf("run err=%v, want ErrThreatUpdateFailed（两源被守卫拒绝）", err)
 	}
@@ -248,29 +250,32 @@ func TestThreatUpdate_updateDisabledSourceSkipped(t *testing.T) {
 	}
 }
 
-// 名单内容变化且被启用策略引用时触发一次 Caddy 重载（引用方渲染随新内容
-// 收敛）；内容未变化不重载；无引用方的变化同样不重载（2026-09-24 裁定）。
-func TestThreatUpdate_listChangeTriggersReload(t *testing.T) {
+// 名单内容变化即渲染刷新走投影热路径（2026-10-15 裁定：threatReloader 重载门
+// 退役；引用方=启用策略投影 ∪ 受信代理网段 tp.txt，引用面预筛退役）——投影
+// 文件重写收敛、零 Caddy 重载；内容未变化不刷新。
+func TestThreatUpdate_listChangeHotPathZeroReload(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
-	var reloads int
+	var reloads, refreshes int
 	SetThreatReloader(func() error { reloads++; return nil })
-	t.Cleanup(func() { SetThreatReloader(nil) })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if reloads != 0 {
-		t.Fatalf("无策略引用时内容新增也不重载: reloads=%d", reloads)
+	// 内容新增即渲染刷新（此时引用面为空=零发射面），零重载
+	if refreshes != 1 || reloads != 0 {
+		t.Fatalf("内容新增须刷新且零重载: refreshes=%d reloads=%d", refreshes, reloads)
 	}
-	// 引用 ustc 名单后，同内容仍不重载
+	// 引用 ustc 名单后，同内容仍不刷新（内容未变化）
 	seedThreatPolicyRefForSource(t, 900, "ustc")
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
-	if reloads != 0 {
-		t.Fatalf("内容未变化不应重载: reloads=%d", reloads)
+	if refreshes != 1 || reloads != 0 {
+		t.Fatalf("内容未变化不应刷新/重载: refreshes=%d reloads=%d", refreshes, reloads)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("192.0.2.99\n"))
@@ -282,8 +287,12 @@ func TestThreatUpdate_listChangeTriggersReload(t *testing.T) {
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
-	if reloads != 1 {
-		t.Fatalf("被引用的名单内容变化须重载: reloads=%d", reloads)
+	// Then：热路径再刷新一次，零重载（threatReloader 重载门退役）
+	if refreshes != 2 {
+		t.Fatalf("名单内容变化须走投影热路径: refreshes=%d, want 2", refreshes)
+	}
+	if reloads != 0 {
+		t.Fatalf("热路径架构下名单变化零重载: reloads=%d, want 0", reloads)
 	}
 }
 
@@ -301,23 +310,27 @@ func seedThreatPolicyRefForSource(t *testing.T, policyID int, source string) {
 	}
 }
 
-// 重载门（2026-09-24 用户裁定）：名单变化且**被启用策略引用**才重载 Caddy——
-// 未被引用的源即使内容变化也不重载（重载只服务引用方的渲染收敛）。
-func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
+// 收敛（热路径架构，2026-10-15 再述）：名单内容变化即全量渲染刷新投影（引用
+// 方=启用策略投影 ∪ 受信代理网段 tp.txt，引用面预筛随受信代理热路径化退役
+// ——引用面判据只会再犯同类漏判）；结构级比对证实零发射面变化 → 零重载
+// （未被引用的变化同样收敛为「无发射面 → 零重载」）；刷新失败/未证实收敛才
+// 回退 /load（fail-safe）。
+func TestThreatUpdate_refreshesOnAnyContentChange_zeroReload(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
-	var reloads int
+	var reloads, refreshes int
 	SetThreatReloader(func() error { reloads++; return nil })
-	t.Cleanup(func() { SetThreatReloader(nil) })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	// When 首轮写入全部名单（无任何策略引用）
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
-	// Then 内容新增但零引用 → 不重载
-	if reloads != 0 {
-		t.Fatalf("无策略引用时不得重载: reloads=%d", reloads)
+	// Then 内容新增 → 渲染刷新一次（引用面为空=零发射面），零重载
+	if refreshes != 1 || reloads != 0 {
+		t.Fatalf("内容变化须渲染刷新且零重载: refreshes=%d reloads=%d", refreshes, reloads)
 	}
 
 	// Given 启用策略引用 ustc 内置名单（firehol_l1 不被引用）
@@ -342,9 +355,9 @@ func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
-	// Then 仍不重载（变化的名单无人引用）
-	if reloads != 0 {
-		t.Fatalf("未被引用的源变化不得重载: reloads=%d", reloads)
+	// Then 渲染刷新（引用面不变=零发射面），零重载
+	if refreshes != 2 || reloads != 0 {
+		t.Fatalf("未被引用的源变化照常渲染刷新且零重载: refreshes=%d reloads=%d", refreshes, reloads)
 	}
 
 	// When 被引用的 ustc 内容变化
@@ -358,9 +371,94 @@ func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
-	// Then 重载一次（被引用的名单变了）
-	if reloads != 1 {
-		t.Fatalf("被引用的名单变化须重载: reloads=%d, want 1", reloads)
+	// Then 热路径刷新（被引用的名单变了），零重载
+	if refreshes != 3 {
+		t.Fatalf("被引用的名单变化须刷新投影: refreshes=%d, want 3", refreshes)
+	}
+	if reloads != 0 {
+		t.Fatalf("热路径架构下零重载: reloads=%d, want 0", reloads)
+	}
+}
+
+// 受信代理网段引用（trusted_proxy_range_refs）已热路径化（合并网段投影
+// tp.txt，lb_file 文件源 ≤1s stat 热感知）——被引用名单变化同样走投影
+// 热路径，零重载。
+func TestThreatUpdate_trustedProxyReferencedHotPath(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	var reloads, refreshes int
+	SetThreatReloader(func() error { reloads++; return nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
+
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	var ustcListID int
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=?`, db.ThreatListNameBySource("ustc")).Scan(&ustcListID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_range_refs=? WHERE id=1`,
+		fmt.Sprintf("[%d]", ustcListID)); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.0.2.88\n"))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if reloads != 0 {
+		t.Fatalf("受信代理引用名单变化应走热路径零重载: reloads=%d, want 0", reloads)
+	}
+	// run1（初始落盘，内容变化即渲染）+ run2（受信代理引用名单变化）各一次
+	if refreshes != 2 {
+		t.Fatalf("受信代理引用面经投影热路径收敛, refreshes=%d, want 2", refreshes)
+	}
+}
+
+// fail-safe：投影刷新器报错/未证实收敛（hot=false）→ 回退 /load 收敛——
+// 宁可一次重载，不欠引用方渲染收敛。
+func TestThreatUpdate_refresherFailureFallsBackToReload(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	seedThreatPolicyRefForSource(t, 902, "ustc")
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+
+	for i, tc := range []struct {
+		name      string
+		refresher func() (IPListProjectionOutcome, error)
+	}{
+		{"刷新器报错", func() (IPListProjectionOutcome, error) { return ProjectionFallback, errors.New("boom") }},
+		{"未证实收敛", func() (IPListProjectionOutcome, error) { return ProjectionFallback, nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reloads int
+			SetThreatReloader(func() error { reloads++; return nil })
+			SetThreatProjectionRefresher(tc.refresher)
+			t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(fmt.Sprintf("192.0.2.%d\n", 100+i*10)))
+			}))
+			t.Cleanup(srv.Close)
+			if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+				t.Fatal(err)
+			}
+			if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if reloads != 1 {
+				t.Fatalf("%s: 须回退 /load 收敛: reloads=%d, want 1", tc.name, reloads)
+			}
+		})
 	}
 }
 
@@ -417,6 +515,11 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("203.0.113.1/32\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// fast 同样必须在场，否则仍视为未装载。判据含可读性
+	// 校验——夹具用真实编译产物（伪「LBF1」头在可读性口径下即损坏文件）。
+	if err := CompileFromIplistFile(filepath.Join(wafDir, "threat-ustc.iplist")); err != nil {
+		t.Fatalf("编译 .fast 夹具: %v", err)
+	}
 	due, err = threatDueSources("auto")
 	if err != nil {
 		t.Fatal(err)
@@ -433,7 +536,7 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 
 // 内容哈希比对（2026-09-24 用户裁定）：聚合规范字节的 sha256 落
 // security_threat_sources.content_hash；同集乱序（USTC 源实测每次请求乱序
-// 返回同一集合）不得判变化；重载须留操作日志审计。
+// 返回同一集合）不得判变化；热路径收敛零重载零「重载」审计（审计真实性）。
 func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
@@ -443,9 +546,13 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	taskengine.SetLogDir(t.TempDir())
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 	setupThreatTest(t, nil, nil, nil)
-	var reloads int
-	SetThreatReloader(func() error { reloads++; return nil })
-	t.Cleanup(func() { SetThreatReloader(nil) })
+	var refreshes int
+	SetThreatReloader(func() error {
+		t.Error("热路径架构下被引用名单变化不得触发 /load（重载门已退役）")
+		return nil
+	})
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	readHash := func() string {
 		var h string
@@ -454,7 +561,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 		}
 		return h
 	}
-	// run1：写入 + 哈希落库（无策略引用 → 不重载）
+	// run1：写入 + 哈希落库（内容变化即渲染刷新；引用面为空=零发射面零重载）
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
@@ -463,12 +570,12 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 		t.Fatalf("run1 后 content_hash 应为 64 位 hex, got %q", h1)
 	}
 
-	// 重载门（2026-09-24 裁定）：审计断言前须有引用方——先验证无引用不重载
-	if reloads != 0 {
-		t.Fatalf("run1 无策略引用不得重载: reloads=%d", reloads)
+	if refreshes != 1 {
+		t.Fatalf("run1 内容新增须渲染刷新: refreshes=%d", refreshes)
 	}
 	seedThreatPolicyRefForSource(t, 901, "ustc")
-	// 被引用的 ustc 内容变化 → 重载 + 审计
+	// 被引用的 ustc 内容变化 → 投影热路径收敛（零重载、零「重载」审计——
+	// 审计真实性：未发生的重载不得落记录）
 	srvNew := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("198.51.100.9\n10.9.0.0/24\n"))
 	}))
@@ -479,24 +586,24 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1b: %v", err)
 	}
-	if reloads != 1 {
-		t.Fatalf("被引用名单变化须重载: reloads=%d", reloads)
+	if refreshes != 2 {
+		t.Fatalf("名单内容变化须热路径刷新: refreshes=%d", refreshes)
 	}
 	h1 = readHash() // 内容已换一轮——后续「同内容不变」断言以新哈希为基线
 	var auditCount int
 	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='重载' AND detail LIKE '%威胁情报库%'`).Scan(&auditCount); err != nil {
 		t.Fatalf("读审计库: %v", err)
 	}
-	if auditCount == 0 {
-		t.Fatal("名单变化触发的重载须写操作日志（来源：威胁情报库更新）")
+	if auditCount != 0 {
+		t.Fatal("热路径收敛未发生重载，不得落「重载」审计（审计真实性）")
 	}
 
-	// run2：同内容（同序）→ 不重载、哈希不变、更新日志留痕「未变化」
+	// run2：同内容（同序）→ 不刷新、哈希不变、更新日志留痕「未变化」
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
-	if reloads != 1 {
-		t.Fatalf("同内容不应重载: reloads=%d", reloads)
+	if refreshes != 2 {
+		t.Fatalf("同内容不应刷新: refreshes=%d", refreshes)
 	}
 	logRaw, lerr := os.ReadFile(taskengine.TaskLogPath("threat"))
 	if lerr != nil {
@@ -514,7 +621,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 		t.Fatal("同内容哈希不应变化")
 	}
 
-	// run3：同集乱序（USTC 实测形态）→ 哈希不变、不重载
+	// run3：同集乱序（USTC 实测形态）→ 哈希不变、不刷新
 	ustcBody := []string{"10.9.0.0/24", "198.51.100.9"} // 与 run1b 同集、顺序颠倒
 	shuffled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(strings.Join(ustcBody, "\n") + "\n"))
@@ -526,15 +633,15 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
-	if reloads != 1 {
-		t.Fatalf("乱序同集不应重载: reloads=%d", reloads)
+	if refreshes != 2 {
+		t.Fatalf("乱序同集不应刷新: refreshes=%d", refreshes)
 	}
 	if readHash() != h1 {
 		t.Fatal("乱序同集哈希应不变（聚合规范字节口径）")
 	}
 }
 
-// F49-4：原始哈希快速路径中的名单存在性 COUNT 查询失败时，不得按「存在」
+// 原始哈希快速路径中的名单存在性 COUNT 查询失败时，不得按「存在」
 // 走跳过分支标 success——必须记错并继续完整聚合/写库路径（本测试用 DROP
 // TABLE 使 COUNT 与后续写库一并失败，可观察终态=failed 而非 success）。
 func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
@@ -558,10 +665,10 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	}
 
 	// When：同内容 run2 —— 原始哈希一致进入快速路径，COUNT 失败。
-	// F-L1-68-01（第 68 轮）后失败回传引擎：源失败必须返回错误（旧契约
+	// 后失败回传引擎：源失败必须返回错误（旧契约
 	// 断言返回 nil 已随迁）；行级 failed 落库仍是本测试真契约。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err == nil {
-		t.Fatal("run2: 源写库失败必须返回错误（F-L1-68-01 失败回传契约）")
+		t.Fatal("run2: 源写库失败必须返回错误（失败回传契约）")
 	}
 
 	// Then：不得标 success 快速返回——完整路径写库失败落 failed
@@ -574,7 +681,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	}
 }
 
-// P5-10（第 50 轮审计）：策略 refs JSON 解析失败按「可能被引用」处理——与
+// 策略 refs JSON 解析失败按「可能被引用」处理——与
 // 同函数查询失败口径一致（宁可多一次重载，不欠引用方的渲染收敛）。
 func TestThreatListsReferenced_invalidRefsTreatedAsReferenced(t *testing.T) {
 	overrideWafDirForTest(t)
@@ -586,7 +693,7 @@ func TestThreatListsReferenced_invalidRefsTreatedAsReferenced(t *testing.T) {
 	}
 
 	// When/Then：按被引用处理（true）
-	if !threatListsReferencedByEnabledPolicy([]int{424242}) {
+	if !IPListsReferencedByEnabledPolicy([]int{424242}) {
 		t.Fatal("refs JSON 解析失败须按可能被引用处理（true）——与查询失败口径一致")
 	}
 }
@@ -600,43 +707,43 @@ func TestThreatListsReferenced_parseableRefsMiss(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if threatListsReferencedByEnabledPolicy([]int{424242}) {
+	if IPListsReferencedByEnabledPolicy([]int{424242}) {
 		t.Fatal("可解析 refs 不含目标 id 时应为 false")
 	}
-	if !threatListsReferencedByEnabledPolicy([]int{8}) {
+	if !IPListsReferencedByEnabledPolicy([]int{8}) {
 		t.Fatal("可解析 refs 含目标 id 时应为 true")
 	}
 }
 
-// 第 59 轮 R59-P2：重载失败必须自愈——失败后置 pending，下一轮即使内容未变
-// 也强制重载一次（对齐 CRS restoreBackup+failed / ip2region rollback+fail 家族；
-// 哈希已持久化使「unchanged」快路径永不再触发重载的缺口）。成功后清 pending，
-// 后续轮次恢复「内容未变不重载」口径。
-func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
+// 自愈标记退役（2026-10-15 热路径架构裁定）：被引用名单变化走投影
+// 热路径（零重载、无失败态）；热路径未证实收敛回退的 /load 失败不再置
+// pending——下一轮内容未变不再强制重载，残留分叉由配置一致性看门狗漂移
+// 横幅 + 下次任意配置变更收敛兜底。
+func TestThreatUpdate_reloadPendingMarkerRetired(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
-	failReload := true
-	var reloads int
+	var reloads, refreshes int
 	SetThreatReloader(func() error {
 		reloads++
-		if failReload {
-			return errors.New("reload boom")
-		}
-		return nil
+		return errors.New("reload boom")
 	})
-	t.Cleanup(func() { SetThreatReloader(nil) })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) {
+		refreshes++
+		return ProjectionFallback, nil // 未证实收敛 → 回退 /load（且 /load 失败）
+	})
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	mgr := GetThreatUpdateManager()
-	// 轮 1：建名单（无引用，不重载）
+	// 轮 1：建名单（内容变化即渲染刷新；刷新器未证实 → 回退重载#1，失败无 pending）
 	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
-	if reloads != 0 {
-		t.Fatalf("run1 不应重载: %d", reloads)
+	if reloads != 1 || refreshes != 1 {
+		t.Fatalf("run1 应刷新一次并回退重载一次: reloads=%d refreshes=%d", reloads, refreshes)
 	}
 	seedThreatPolicyRefForSource(t, 900, "ustc")
-	// 轮 2：内容变化 + 引用 → 重载#1 失败
+	// 轮 2：内容变化 → 热路径未证实 → 回退重载#2（失败，无 pending）
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("192.0.2.99\n"))
 	}))
@@ -647,32 +754,26 @@ func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
 	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
-	if reloads != 1 {
-		t.Fatalf("run2 应尝试重载一次: %d", reloads)
+	if reloads != 2 || refreshes != 2 {
+		t.Fatalf("run2 应热路径刷新一次并回退重载一次: reloads=%d refreshes=%d", reloads, refreshes)
 	}
-	// 轮 3：内容未变——失败自愈：必须强制重载（#2 成功）
-	failReload = false
+	// 轮 3：内容未变——pending 已退役，不再强制重载
 	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
-	if reloads != 2 {
-		t.Fatalf("run3 应自愈重试重载: %d", reloads)
-	}
-	// 轮 4：pending 已清——内容未变不再重载
-	if err := mgr.RunUpdate("manual", nil); err != nil {
-		t.Fatalf("run4: %v", err)
-	}
-	if reloads != 2 {
-		t.Fatalf("run4 不应重载: %d", reloads)
+	if reloads != 2 || refreshes != 2 {
+		t.Fatalf("run3 内容未变不再收敛（pending 标记已退役）: reloads=%d refreshes=%d", reloads, refreshes)
 	}
 }
 
-// 第 59 轮 R59-P3（U6-1）：run() 起点 is_master 复查（R54-N5 家族收敛——
+// run() 起点 is_master 复查（家族收敛——
 // crsupdate/ip2regionupdate 均有，威胁库为漏点）：tick 守卫与任务发出之间的
 // demote 竞态窗口内，从节点继续执行会写 security_ip_lists 并触发重载，
 // 打破从节点只读不变量。
 func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
-	overrideWafDirForTest(t)
+	wafDir := t.TempDir()
+	restoreWaf := OverrideThreatWafDirForTest(wafDir)
+	t.Cleanup(restoreWaf)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
@@ -681,19 +782,11 @@ func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("从节点 RunUpdate 应静默返回而非报错: %v", err)
 	}
-	// 从节点不得写内置名单内容（种子行恒存在——断言条目仍为空、源状态未被改写）
-	rows, err := db.DB.Query(`SELECT entries FROM security_ip_lists WHERE system=1`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var entries string
-		if err := rows.Scan(&entries); err != nil {
-			t.Fatal(err)
-		}
-		if entries != "[]" {
-			t.Fatalf("从节点不得写入内置名单条目: entries=%s", entries)
+	// 从节点不得写文本或编译名单；直接检查本次隔离 WAF 目录，而非以 DB
+	// 条目代理文件写入行为。
+	for _, name := range []string{"threat-ustc.iplist", "threat-ustc.iplist.fast"} {
+		if _, err := os.Stat(filepath.Join(wafDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("从节点不得写入 %s（stat err=%v）", name, err)
 		}
 	}
 	var touched int
@@ -705,7 +798,7 @@ func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
 	}
 }
 
-// F-L1-68-01（第 68 轮，P4）：RunUpdate 恒返 nil——源失败仅内部落行，引擎
+// RunUpdate 恒返 nil——源失败仅内部落行，引擎
 // task_runs 把失败轮记成 success（终态失真）。修复：失败终态回传
 // ErrThreatUpdateFailed（「任一源失败即失败」，与 run 内 anyFailed/
 // failSourceRow 口径对齐）；skipped/cancelled 各有终态通道，不算失败。
@@ -730,7 +823,7 @@ func TestThreatRunUpdate_returnsErrorOnSourceFailure(t *testing.T) {
 	}
 }
 
-// F-L1-68-01 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
+// 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
 // failed（曾恒 success）。Given 一源必败；When 引擎手动触发 threat；
 // Then Trigger 回传 ErrThreatUpdateFailed 且 task_runs 终态 failed。
 func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
@@ -750,7 +843,7 @@ func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
 	}
 }
 
-// SEC-C-N3（第 71 轮 P5）：CancelRunning 补 running 门——runCancel 一次运行后
+// CancelRunning 补 running 门——runCancel 一次运行后
 // 不清空，无运行中任务时（running=false）仍返回 true、与注释「无运行中任务
 // 返回 false」不符；对齐 CRS/IP2Region 同形（cancel!=nil && running）。
 func TestThreatCancelRunning_falseWhenIdleAfterRun(t *testing.T) {
@@ -768,7 +861,7 @@ func TestThreatCancelRunning_falseWhenIdleAfterRun(t *testing.T) {
 	}
 }
 
-// R71-⑪（第 71 轮主审补漏）：threatListsReferencedByEnabledPolicy 的引用查询
+// ⑪：IPListsReferencedByEnabledPolicy（原 threatListsReferencedByEnabledPolicy）的引用查询
 // 迭代失败（rows.Err）须按「被引用」处理（fail-closed）——与查询失败/解析
 // 失败同口径；漏查会跳过名单重载，引用该名单的启用策略渲染不收敛。
 type refsFailingConnector struct{}
@@ -793,18 +886,38 @@ func (refsFailingConn) Close() error { return nil }
 
 func (refsFailingConn) Begin() (driver.Tx, error) { return nil, errors.New("no tx") }
 
-func (refsFailingConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
-	// 语句执行成功、迭代第一步即失败——只有检查 rows.Err() 才能被发现
-	return refsFailingRows{}, nil
+func (refsFailingConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	// 仅对策略引用查询注入「语句成功、迭代第一步即失败」——该失败只有检查
+	// rows.Err() 才能被发现。其余查询（受信代理门）按零行成功返回：让本用例
+	// 的红/绿只由 rows.Err 检查承载，不被后续查询失败的兜底 return true 掩盖。
+	if strings.Contains(query, "FROM security_policies") {
+		return refsFailingRows{}, nil
+	}
+	return refsEmptyRows{}, nil
 }
 
 type refsFailingRows struct{}
 
-func (refsFailingRows) Columns() []string { return []string{"ip_acl_list_refs", "ip_whitelist_refs"} }
+// Columns 与生产查询（ipListsReferencedByEnabledPolicyLabeled 的 SELECT 三列）
+// 逐列一致：语句执行成功、迭代第一步即失败——只有检查 rows.Err() 才能被发现。
+func (refsFailingRows) Columns() []string {
+	return []string{"ip_acl_list_refs", "ip_whitelist_refs", "crs_excluded_rules"}
+}
 
 func (refsFailingRows) Close() error { return nil }
 
 func (refsFailingRows) Next([]driver.Value) error { return errors.New("注入的引用迭代失败") }
+
+// refsEmptyRows 是其余查询的零行成功形态（受信代理门按空引用处理）。
+type refsEmptyRows struct{}
+
+func (refsEmptyRows) Columns() []string {
+	return []string{"trusted_proxy_enabled", "trusted_proxy_range_refs"}
+}
+
+func (refsEmptyRows) Close() error { return nil }
+
+func (refsEmptyRows) Next([]driver.Value) error { return io.EOF }
 
 func TestThreatListsReferenced_iterationErrorTreatedAsReferenced(t *testing.T) {
 	overrideWafDirForTest(t)
@@ -815,7 +928,445 @@ func TestThreatListsReferenced_iterationErrorTreatedAsReferenced(t *testing.T) {
 	db.DB = broken
 	t.Cleanup(func() { db.DB = orig })
 
-	if !threatListsReferencedByEnabledPolicy([]int{424242}) {
+	if !IPListsReferencedByEnabledPolicy([]int{424242}) {
 		t.Fatal("迭代错误须按被引用处理（true）——与查询失败/解析失败同口径（fail-closed）")
+	}
+}
+
+// threat 通道 NeedForce→回退 /load 钉测——刷新返回
+// NeedForce（本轮渲染物化了证书文件）时必须回退强制重载
+// 收敛（宁可一次重载，不欠引用方渲染收敛）；重载失败仅留痕，
+// 不中断任务、不计任务失败。
+func TestThreatUpdate_needForceFallsBackToReload(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	var reloads, refreshes, reloadErrs int
+	SetThreatReloader(func() error { reloads++; return nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionNeedForce, nil })
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
+
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if refreshes != 1 || reloads != 1 {
+		t.Fatalf("NeedForce 必须回退强制重载: refreshes=%d reloads=%d", refreshes, reloads)
+	}
+
+	// 重载失败形态：内容再变（NeedForce 同形）、重载失败——同样回退、失败
+	// 留痕、任务不失败。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.0.2.99\n"))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	SetThreatReloader(func() error { reloads++; reloadErrs++; return errors.New("admin down") })
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("重载失败不得否决任务: %v", err)
+	}
+	if reloadErrs != 1 || reloads != 2 {
+		t.Fatalf("重载失败须留痕: reloads=%d reloadErrs=%d", reloads, reloadErrs)
+	}
+}
+
+func TestThreatDueSources_ignoresCrawlerAddressSources(t *testing.T) {
+	// Given：历史合并形态在威胁源表残留一个启用的爬虫地址库源
+	newClusterTestService(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,url,update_enabled,next_update)
+		VALUES (1039,'googlebot','Google 官方爬虫 IP','https://example.com/google.json',1,'2000-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	sources, err := threatDueSources("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then：威胁任务只处理三个威胁源，爬虫地址库由 crawlerbot-update 独立处理
+	if len(sources) != 3 {
+		t.Fatalf("sources=%d, want 3: %+v", len(sources), sources)
+	}
+	for _, source := range sources {
+		if source.name == "googlebot" {
+			t.Fatalf("威胁任务混入爬虫地址库源: %+v", sources)
+		}
+	}
+}
+
+func TestThreatDueSources_usesThreatSystemListRegistry(t *testing.T) {
+	// Given 模拟未来新增的第四个内置源：名单注册表与真实源表均扩展；
+	// 同表另有一个未注册的历史爬虫源。
+	original := db.ThreatSystemLists()
+	extended := append([]db.ThreatSystemList{}, original...)
+	extended = append(extended, db.ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
+	restore := db.SetThreatSystemListsForTest(extended)
+	t.Cleanup(restore)
+	newClusterTestService(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources
+		(id,name,display_name,url,update_enabled,next_update) VALUES
+		(1040,'future_source','未来威胁源','https://example.com/future.txt',1,'2000-01-01 00:00:00'),
+		(1041,'googlebot','Google 官方爬虫 IP','https://example.com/google.json',1,'2000-01-01 00:00:00')`); err != nil {
+		t.Fatalf("seed future and crawler sources: %v", err)
+	}
+
+	// When
+	sources, err := threatDueSources("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then 已注册的未来源自动纳入，未注册爬虫源仍排除。
+	if len(sources) != 4 {
+		t.Fatalf("sources=%d, want three current seeds plus future_source: %+v", len(sources), sources)
+	}
+	futureFound := false
+	for _, source := range sources {
+		if source.name == "future_source" {
+			futureFound = true
+		}
+		if source.name == "googlebot" {
+			t.Fatalf("unregistered crawler source entered threat update: %+v", sources)
+		}
+	}
+	if !futureFound {
+		t.Fatalf("registered future source was not selected: %+v", sources)
+	}
+
+	// And update_enabled 仍是独立门控。
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0 WHERE name='future_source'`); err != nil {
+		t.Fatal(err)
+	}
+	sources, err = threatDueSources("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range sources {
+		if source.name == "future_source" {
+			t.Fatalf("disabled future source remained due: %+v", sources)
+		}
+	}
+}
+
+func TestThreatUpdateRun_usesTaskRunStartedAt(t *testing.T) {
+	// Given：三个成功源与 task_runs 预插开始时刻。
+	newClusterTestService(t)
+	overrideWafDirForTest(t)
+	setupThreatTest(t, nil, nil, nil)
+	runID, wantUTC := seedTaskRunForTime(t, "threat", "2026-10-17 14:09:17")
+
+	// When：经生产 RunUpdate 入口运行。
+	if err := GetThreatUpdateManager().RunUpdate("manual", &taskengine.RunContext{Ctx: context.Background(), RunID: runID, Trigger: "manual"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then：每个源的 started_at/last_checked 均与 task_runs 同源。
+	rows, err := db.DB.Query(`SELECT name, COALESCE(started_at,''), COALESCE(last_checked,'') FROM security_threat_sources ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := 0
+	for rows.Next() {
+		var name, startedAt, lastChecked string
+		if err := rows.Scan(&name, &startedAt, &lastChecked); err != nil {
+			t.Fatal(err)
+		}
+		if startedAt != wantUTC || lastChecked != wantUTC {
+			t.Errorf("%s started_at=%q last_checked=%q, want %q", name, startedAt, lastChecked, wantUTC)
+		}
+		seen++
+	}
+	if seen != 3 {
+		t.Fatalf("源行数=%d, want 3", seen)
+	}
+}
+
+func TestHealThreatFastFromText_skipsComments(t *testing.T) {
+	overrideWafDirForTest(t)
+	raw := "# header\n; note\n1.2.3.4\n\n"
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, ok := healThreatFastFromText("ustc")
+	if !ok {
+		t.Fatal("heal .fast from valid text failed")
+	}
+	if len(entries) != 1 || entries[0] != "1.2.3.4" {
+		t.Fatalf("healed entries=%v, comments must not become entries", entries)
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); err != nil {
+		t.Fatalf("healed .fast missing: %v", err)
+	}
+}
+
+func TestHealThreatFastFromText_rejectsEmptyList(t *testing.T) {
+	overrideWafDirForTest(t)
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("# only comments\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := healThreatFastFromText("ustc"); ok {
+		t.Fatal("empty .iplist must not heal into an empty active list")
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); !os.IsNotExist(err) {
+		t.Fatal("rejected heal must not create .fast")
+	}
+}
+
+func TestUpdateOneSource_healPreservesRawHash(t *testing.T) {
+	newClusterTestService(t)
+	overrideWafDirForTest(t)
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("1.2.3.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET raw_hash='legacy-raw-hash' WHERE name='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+	var id int
+	if err := db.DB.QueryRow(`SELECT id FROM security_threat_sources WHERE name='ustc'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	m := &ThreatUpdateManager{}
+	if _, failed, _ := m.updateOneSource(context.Background(), threatSourceRow{id: id, name: "ustc"}, "manual", time.Now().UTC().Format(crsTimeLayout)); failed {
+		t.Fatal("heal update failed")
+	}
+	var raw string
+	if err := db.DB.QueryRow(`SELECT COALESCE(raw_hash,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "legacy-raw-hash" {
+		t.Fatalf("raw_hash=%q, want preserved upstream raw hash (heal text hash is not upstream bytes)", raw)
+	}
+}
+
+// 变化面判定不再依赖名单 id 查询 ——
+
+// 内容变化 → 收敛；内容未变 → 零收敛。钉住 changedIDs→changed bool 重构后的
+// 判定面无行为漂移（旧的逐源 id 查询只被 len() 消费，已删除）。
+func TestThreatUpdate_changeDetectionDrivesConvergence(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	var refreshes int
+	SetThreatReloader(func() error { return nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) {
+		refreshes++
+		return ProjectionConverged, nil
+	})
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
+
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("首轮建名单须收敛一次: refreshes=%d", refreshes)
+	}
+	// 内容未变：不再次收敛。
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("内容未变不得收敛: refreshes=%d", refreshes)
+	}
+	// 内容变化：收敛一次。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.0.2.99\n"))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run3: %v", err)
+	}
+	if refreshes != 2 {
+		t.Fatalf("内容变化须收敛: refreshes=%d, want 2", refreshes)
+	}
+}
+
+// StartUpdate 返回即 CancelRunning 必真 ——
+
+// 旧实现把 runCancel 登记放在 run goroutine 内：StartUpdate 返回后立刻取消
+// （任务引擎 CancelHook／前端连点）会读到 nil（首次）或上一轮陈旧 cancel，
+// 取消静默失效/取消错轮。单 P 调度使该窗口确定可复现。
+func TestThreatStartUpdate_registersCancelBeforeReturn(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(oldProcs) })
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // 下载在途：只有取消能结束
+	}))
+	t.Cleanup(blocked.Close)
+	for _, name := range []string{"ustc", "firehol_l1", "et_compromised"} {
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name=?`, blocked.URL, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := GetThreatUpdateManager()
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.CancelRunning() {
+		// 旧实现：run goroutine 尚未登记取消函数。推进 goroutine 后自行取消，
+		// 避免测试挂起（失败断言即 RED 证据）。
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+			if m.CancelRunning() {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		<-done
+		t.Fatal("StartUpdate 返回后立刻 CancelRunning=false（取消函数尚未登记，取消静默失效）")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后运行未退出")
+	}
+	if got := m.StatusSnapshot().Outcome; got != "cancelled" {
+		t.Fatalf("终态=%q, want cancelled", got)
+	}
+}
+
+// RunUpdate（生产同步入口）同样必须在进入管线前登记可取消 ctx：任务引擎的
+// CancelHook 读到 running+runCancel 组合，缺一即「取消不可用/取消错轮」。
+func TestThreatRunUpdate_registersCancelBeforePipeline(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	started := make(chan struct{}, 1)
+	blocked := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done() // 下载在途：只有取消能结束
+	}))
+	t.Cleanup(blocked.Close)
+	for _, name := range []string{"ustc", "firehol_l1", "et_compromised"} {
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name=?`, blocked.URL, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := GetThreatUpdateManager()
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.RunUpdate("manual", nil) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("下载未在 5s 内启动")
+	}
+	m.mu.Lock()
+	cancelRegistered := m.runCancel != nil
+	m.mu.Unlock()
+	if !cancelRegistered {
+		t.Fatal("RunUpdate 进入管线时 runCancel 未登记（取消将静默失效）")
+	}
+	if !m.CancelRunning() {
+		t.Fatal("RunUpdate 在途时 CancelRunning 必须命中本轮")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("取消后 RunUpdate 应正常返回（参与方取消非错误），err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后运行未退出")
+	}
+	if got := m.StatusSnapshot().Outcome; got != "cancelled" {
+		t.Fatalf("终态=%q, want cancelled", got)
+	}
+}
+
+// 快速路径（raw_hash 一致）的内置名单存在性判定必须限定 system=1：
+// 同名用户自建列表（system=0）不得抑制内置行穿透补建——否则引用旧 id 的
+// 策略漏拦且无任何告警，直到上游内容变化才自愈。
+func TestThreatUpdate_fastPathRebuildsSystemListDespiteSameNameUserList(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+
+	// Given：run1 成功（raw_hash 落库 + system=1 名单行存在）
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
+		t.Fatalf("run1 ustc status=%s, want success", status)
+	}
+	listName := db.ThreatListNameBySource("ustc")
+	// 内置行被删（备份还原/异常清理形态），同时存在同名用户自建列表
+	if _, err := db.DB.Exec(`DELETE FROM security_ip_lists WHERE name=? AND system=1`, listName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 0)`, listName); err != nil {
+		t.Fatal(err)
+	}
+	// 聚焦 ustc 单源
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0 WHERE name!='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：同内容 run2——原始哈希一致进入快速路径
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+
+	// Then：内置行必须被穿透补建（system=1 与同名用户行并存）
+	var system int
+	if err := db.DB.QueryRow(`SELECT system FROM security_ip_lists WHERE name=? AND system=1`, listName).Scan(&system); err != nil {
+		t.Fatalf("内置名单行未被穿透补建: %v", err)
+	}
+	// 条目经 .iplist 文件落盘（RDB 文件化形态），直读验证非空。
+	raw, err := os.ReadFile(filepath.Join(wafDir, "threat-ustc.iplist"))
+	if err != nil {
+		t.Fatalf("内置名单文件未重建: %v", err)
+	}
+	entryCount := 0
+	iterIPListTextLines(raw, func(string) bool { entryCount++; return true })
+	if entryCount == 0 {
+		t.Fatal("补建的内置名单条目不得为空")
+	}
+	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
+		t.Fatalf("run2 ustc status=%s, want success", status)
+	}
+}
+
+// entry_count 单源=markSourceSuccess（聚合后条数）：writeThreatSystemList 只写
+// content_hash——同轮 writeThreatSystemList 与 markSourceSuccess 各写一次
+// entry_count 是双份事实源，后写者胜掩盖了口径漂移。
+func TestWriteThreatSystemList_leavesEntryCountToMarkSourceSuccess(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+
+	changed, err := writeThreatSystemList("ustc", []string{"203.0.113.1", "10.9.0.0/24"})
+	if err != nil {
+		t.Fatalf("writeThreatSystemList: %v", err)
+	}
+	if !changed {
+		t.Fatal("首写应判定内容变化")
+	}
+	var count int
+	if err := db.DB.QueryRow(`SELECT COALESCE(entry_count,0) FROM security_threat_sources WHERE name='ustc'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("writeThreatSystemList 不得写 entry_count（单源=markSourceSuccess）, got %d", count)
+	}
+	// 哈希列照常落库：条数口径收敛不影响变更判定。
+	var hash string
+	if err := db.DB.QueryRow(`SELECT COALESCE(content_hash,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if len(hash) != 64 {
+		t.Fatalf("content_hash 未落库: %q", hash)
 	}
 }

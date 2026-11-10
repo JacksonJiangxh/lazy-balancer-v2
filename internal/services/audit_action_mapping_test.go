@@ -1,15 +1,15 @@
 package services
 
-// 审计动作 → 前端标签颜色映射契约（R49 D 域 S-1）：actionTagType 的颜色白名单
-// 长期靠人肉与后端词条 diff 维护，已连续三轮审计（R47 漏 9、R48 漏 7、R49 漏 2）
-// 发现漏映射。本测试把契约固化为 CI 卡口：
+// 审计动作 → 前端标签颜色映射契约：色调表曾长期靠人肉与后端词条 diff
+// 维护，反复出现漏映射。本测试把契约固化为 CI 卡口：
 //  1. 用与 audit_vocabulary_test.go 相同的 AST 扫描提取后端全部可落库动作词条
 //     （RecordAuditLog/recordAudit/recordSystemAudit 字面量 + FormatAuditAction
 //     返回字面量 + 动态 allowlist 词条的取值解析）；
-//  2. 解析 web/src/views/AuditLog.vue 的 actionTagType 三段 if 白名单；
-//  3. 断言每个后端动作都有前端映射（任意颜色），且语义分类契约成立：
+//  2. 解析前端单源 web/src/utils/auditActionTone.ts——视图只 import 该模块，
+//     色调由「例外表 → danger/warning/success 关键词派生 → info 兜底」决定；
+//  3. 断言每个后端动作都能被该单源判定为非 info 色调，且语义分类契约成立：
 //     以「失败」结尾的动作与 {配置漂移, 应用失败, 部署失败, 认证拒绝, 提升失败}
-//     必须落在 danger 行。新增未映射/误分类动作此测试直接红。
+//     必须判定为 danger。新增未覆盖/误分类动作此测试直接红。
 
 import (
 	"fmt"
@@ -26,12 +26,6 @@ import (
 	"testing"
 )
 
-// auditMappingNeverPersisted 是提取到但永不落库、因此无需前端映射的动作：
-// 「登录」仅是 FormatAuditAction 对 POST /api/v1/auth/login 的兜底映射——该路由
-// 命中 middleware.go auditMiddleware 的 HasExplicitAuditEvent 跳过分支
-// （auditpolicy.go:125），实际落库的是 auth.go 显式记录的 登录成功/登录失败。
-var auditMappingNeverPersisted = map[string]bool{"登录": true}
-
 // auditMappingDangerContract 是不以「失败」结尾但必须 danger 分类的动作（与
 // 前端 danger 行的语义约定）。
 var auditMappingDangerContract = map[string]bool{
@@ -44,6 +38,60 @@ type auditDynamicCallSite struct {
 	argIdent  string
 }
 
+// auditPackageStringValues 收集包级 const/var 的静态字符串初值。审计动作允许
+// 用包级单源常量，局部变量与运行时表达式仍走动态调用点边界。
+func auditPackageStringValues(file *ast.File) map[string]string {
+	values := map[string]string{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || (gen.Tok != token.CONST && gen.Tok != token.VAR) {
+			continue
+		}
+		for _, rawSpec := range gen.Specs {
+			spec, ok := rawSpec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for index, name := range spec.Names {
+				if index >= len(spec.Values) {
+					continue
+				}
+				if value, ok := auditVocabStringLit(spec.Values[index]); ok {
+					values[name.Name] = value
+				}
+			}
+		}
+	}
+	return values
+}
+
+// auditStaticStringValue 解析字面量及包级静态字符串标识符。本包标识符使用
+// 跨文件合并值；选择子仅在其限定包已解析且成员存在时解析，未知选择子与动态
+// 表达式不可静态判定。
+func auditStaticStringValue(expr ast.Expr, packageValues map[string]string, packages map[string]map[string]string) (string, bool) {
+	if value, ok := auditVocabStringLit(expr); ok {
+		return value, true
+	}
+	switch value := expr.(type) {
+	case *ast.Ident:
+		resolved, ok := packageValues[value.Name]
+		return resolved, ok
+	case *ast.SelectorExpr:
+		qualifier, ok := value.X.(*ast.Ident)
+		if !ok {
+			return "", false
+		}
+		values, ok := packages[qualifier.Name]
+		if !ok {
+			return "", false
+		}
+		resolved, ok := values[value.Sel.Name]
+		return resolved, ok
+	default:
+		return "", false
+	}
+}
+
 // backendAuditActions 提取后端全部可落库动作词条，返回 动作 → 首处证据位置。
 func backendAuditActions(t *testing.T) map[string]string {
 	t.Helper()
@@ -53,7 +101,7 @@ func backendAuditActions(t *testing.T) map[string]string {
 	}
 	actions := map[string]string{}
 	add := func(file string, line int, value string) {
-		if value == "" || auditMappingNeverPersisted[value] {
+		if value == "" {
 			return
 		}
 		if _, exists := actions[value]; !exists {
@@ -62,12 +110,12 @@ func backendAuditActions(t *testing.T) map[string]string {
 		}
 	}
 	type parsedFile struct {
-		fset  *token.FileSet
-		file  *ast.File
-		funcs map[string]*ast.FuncDecl
+		fset           *token.FileSet
+		file           *ast.File
+		funcs          map[string]*ast.FuncDecl
+		packageStrings map[string]string
 	}
 	parsed := map[string]*parsedFile{}
-	var dynamicSites []auditDynamicCallSite
 	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
@@ -78,9 +126,32 @@ func backendAuditActions(t *testing.T) map[string]string {
 			t.Errorf("parse %s: %v", path, err)
 			return nil
 		}
-		pf := &parsedFile{fset: fset, file: f, funcs: map[string]*ast.FuncDecl{}}
-		parsed[path] = pf
-		for _, decl := range f.Decls {
+		parsed[path] = &parsedFile{fset: fset, file: f, funcs: map[string]*ast.FuncDecl{}, packageStrings: auditPackageStringValues(f)}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk internal: %v", err)
+	}
+
+	// 第一阶段已读完全部生产文件；先按包名合并包级常量/变量，再扫描函数，
+	// 避免声明与审计调用分处同包不同文件时漏收。
+	packages := map[string]map[string]string{}
+	for _, pf := range parsed {
+		packageName := pf.file.Name.Name
+		if packages[packageName] == nil {
+			packages[packageName] = map[string]string{}
+		}
+		for name, value := range pf.packageStrings {
+			packages[packageName][name] = value
+		}
+	}
+	for _, pf := range parsed {
+		pf.packageStrings = packages[pf.file.Name.Name]
+	}
+
+	var dynamicSites []auditDynamicCallSite
+	for path, pf := range parsed {
+		for _, decl := range pf.file.Decls {
 			d, ok := decl.(*ast.FuncDecl)
 			if !ok || d.Body == nil {
 				continue
@@ -92,8 +163,8 @@ func backendAuditActions(t *testing.T) map[string]string {
 					if !ok || len(ret.Results) < 1 {
 						return true
 					}
-					if value, ok := auditVocabStringLit(ret.Results[0]); ok && value != "" {
-						add(path, fset.Position(ret.Pos()).Line, value)
+					if value, ok := auditStaticStringValue(ret.Results[0], pf.packageStrings, packages); ok && value != "" {
+						add(path, pf.fset.Position(ret.Pos()).Line, value)
 					}
 					return true
 				})
@@ -116,8 +187,8 @@ func backendAuditActions(t *testing.T) map[string]string {
 					return true
 				}
 				arg := call.Args[spec[0]]
-				if value, ok := auditVocabStringLit(arg); ok {
-					add(path, fset.Position(call.Pos()).Line, value)
+				if value, ok := auditStaticStringValue(arg, pf.packageStrings, packages); ok {
+					add(path, pf.fset.Position(call.Pos()).Line, value)
 					return true
 				}
 				if ident, ok := arg.(*ast.Ident); ok {
@@ -126,10 +197,6 @@ func backendAuditActions(t *testing.T) map[string]string {
 				return true
 			})
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk internal: %v", err)
 	}
 
 	// 解析动态动作实参的取值（auditVocabDynamicAllowlist 已核清的全部调用点）：
@@ -158,7 +225,7 @@ func backendAuditActions(t *testing.T) map[string]string {
 					if !ok || ident.Name != site.argIdent || i >= len(assign.Rhs) {
 						continue
 					}
-					if value, ok := auditVocabStringLit(assign.Rhs[i]); ok {
+					if value, ok := auditStaticStringValue(assign.Rhs[i], pf.packageStrings, packages); ok {
 						add(path, pf.fset.Position(assign.Pos()).Line, value)
 					}
 				}
@@ -196,7 +263,7 @@ func backendAuditActions(t *testing.T) map[string]string {
 					if name != site.enclosing {
 						return true
 					}
-					if value, ok := auditVocabStringLit(call.Args[paramPos]); ok {
+					if value, ok := auditStaticStringValue(call.Args[paramPos], callerPf.packageStrings, packages); ok {
 						add(callerPath, callerPf.fset.Position(call.Pos()).Line, value)
 					}
 					return true
@@ -208,113 +275,265 @@ func backendAuditActions(t *testing.T) map[string]string {
 }
 
 var (
-	auditTagColorLineRe  = regexp.MustCompile(`return '(success|warning|danger|info)'`)
-	auditTagActionLineRe = regexp.MustCompile(`action === '([^']+)'`)
-	// 第 62 轮 F62-13:表驱动形态条目行
+	// 例外表条目行：'动作': '色调',
 	auditTagTableEntryRe = regexp.MustCompile(`'([^']+)':\s*'(success|warning|danger|info)',`)
+	// 块注释可能整段注释例外条目，必须先剥离再解析，否则幽灵映射掩盖漏登记。
+	auditTagBlockCommentRe = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	// 关键词词表行：const DANGER_WORDS = ['失败', '拒绝'] as const
+	auditTagWordListRe = regexp.MustCompile(`(?m)^const (DANGER|WARNING|SUCCESS)_WORDS\s*=\s*\[([^\]]*)\]`)
+	auditTagWordRe     = regexp.MustCompile(`'([^']+)'`)
 )
 
-// frontendAuditTagMapping 解析 AuditLog.vue 的 actionTagType：支持两种形态——
-// 旧 if 链与新表驱动(第 62 轮 F62-13 后 ACTION_TAG_TABLE),返回 动作→颜色。
-// frontendAuditTagMapping 旧注释：逐行匹配
-// `action === '...' || ... return '<color>'` 形态的白名单 if 行，返回 动作 → 颜色。
-func frontendAuditTagMapping(t *testing.T) map[string]string {
+// frontendAuditToneSource 是审计动作色调的单一事实源：视图（AuditLog.vue）只
+// import 该模块的 actionTagType，映射不再写在视图里。
+const frontendAuditToneSource = "auditActionTone.ts"
+
+// frontendAuditTone 复刻单源的分类顺序：例外表 → danger 关键词 → warning →
+// success → info（兜底并告警一次）。解析基线漂移（缺例外表/缺词表/例外表出现
+// info 值）直接失败，避免契约测试在单源重构后假绿。
+type frontendAuditTone struct {
+	exceptions map[string]string
+	danger     []string
+	warning    []string
+	success    []string
+}
+
+// parseFrontendAuditTone 解析单源文本（剥离块注释与行内注释后逐行登记例外、
+// 提取三组关键词），供真实单源与合成夹具共用同一解析口径。
+func parseFrontendAuditTone(t *testing.T, data []byte, sourceName string) *frontendAuditTone {
 	t.Helper()
-	path := filepath.Join("..", "..", "web", "src", "views", "AuditLog.vue")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read AuditLog.vue: %v", err)
-	}
-	mapping := map[string]string{}
-	colors := map[string]bool{}
-	for _, rawLine := range strings.Split(string(data), "\n") {
-		// R68 D-N3：行内 `//` 之后的部分不参与匹配——文档化白名单历史的注释行
-		// 会注册幽灵映射（真条目被删时漏映射检查假绿/幽灵颜色误触 danger 契约）。
-		// actionTagType 白名单行为简单比较、不含 URL 类字符串，朴素截断无假阴性。
+	tone := &frontendAuditTone{exceptions: map[string]string{}}
+	source := auditTagBlockCommentRe.ReplaceAllString(string(data), "")
+	for _, rawLine := range strings.Split(source, "\n") {
+		// 行内 `//` 之后的部分不参与匹配——例外表旁的注释会注册幽灵映射
+		//（真条目被删时漏映射检查假绿/幽灵颜色误触 danger 契约）。
 		line := rawLine
 		if idx := strings.Index(line, "//"); idx >= 0 {
 			line = line[:idx]
 		}
-		if tm := auditTagTableEntryRe.FindStringSubmatch(line); tm != nil {
-			if _, dup := mapping[tm[1]]; !dup {
-				colors[tm[2]] = true
-			}
-			mapping[tm[1]] = tm[2]
+		match := auditTagTableEntryRe.FindStringSubmatch(line)
+		if match == nil {
 			continue
 		}
-		colorMatch := auditTagColorLineRe.FindStringSubmatch(line)
-		if colorMatch == nil || !strings.Contains(line, "action ===") {
-			continue
+		if previous, dup := tone.exceptions[match[1]]; dup && previous != match[2] {
+			t.Errorf("例外表动作 %q 被映射到多个色调（%s / %s）", match[1], previous, match[2])
 		}
-		color := colorMatch[1]
-		colors[color] = true
-		for _, m := range auditTagActionLineRe.FindAllStringSubmatch(line, -1) {
-			if _, exists := mapping[m[1]]; exists {
-				t.Errorf("前端动作 %q 被映射到多个颜色（含 %s）——白名单重复", m[1], color)
-				continue
+		tone.exceptions[match[1]] = match[2]
+	}
+	for _, spec := range auditTagWordListRe.FindAllStringSubmatch(source, -1) {
+		words := make([]string, 0, 4)
+		for _, word := range auditTagWordRe.FindAllStringSubmatch(spec[2], -1) {
+			words = append(words, word[1])
+		}
+		if len(words) == 0 {
+			t.Fatalf("%s 解析漂移：%s_WORDS 词表为空", sourceName, spec[1])
+		}
+		switch spec[1] {
+		case "DANGER":
+			tone.danger = words
+		case "WARNING":
+			tone.warning = words
+		case "SUCCESS":
+			tone.success = words
+		}
+	}
+	if len(tone.danger) == 0 || len(tone.warning) == 0 || len(tone.success) == 0 {
+		t.Fatalf("%s 解析漂移：关键词词表缺失（danger=%d warning=%d success=%d）", sourceName, len(tone.danger), len(tone.warning), len(tone.success))
+	}
+	// info 是兜底+告警分支，不是可登记的分类：例外表出现 info 会把「未识别」
+	// 粉饰成「已分类」，本测试的漏覆盖检查随即失效。
+	for action, color := range tone.exceptions {
+		if color == "info" {
+			t.Fatalf("例外表不得把动作 %q 显式映射为 info（info 是兜底+告警分支）", action)
+		}
+	}
+	return tone
+}
+
+func loadFrontendAuditTone(t *testing.T) *frontendAuditTone {
+	t.Helper()
+	path := filepath.Join("..", "..", "web", "src", "utils", frontendAuditToneSource)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", frontendAuditToneSource, err)
+	}
+	tone := parseFrontendAuditTone(t, data, frontendAuditToneSource)
+	// 当前单源登记 70 条（新增「导入归一」：备份携带的 waiting_ca 存量在导入
+	// 提交后保窗归一为 failed，与「启动迁移」同族告警性呈现）；
+	// 等值门同时拦截整表漏解析与未经审查的新增/删除。
+	const registeredExceptionCount = 70
+	if len(tone.exceptions) != registeredExceptionCount {
+		t.Fatalf("%s 解析漂移：例外表解析到 %d 条（登记值 %d）——请同步审查映射并更新解析", frontendAuditToneSource, len(tone.exceptions), registeredExceptionCount)
+	}
+	return tone
+}
+
+// 块注释内的例外条目不得注册为真映射：否则注释掉一条无关键词例外后，
+// 前端落 info 灰标而本测试仍绿。
+func TestParseFrontendAuditTone_ignoresBlockComments(t *testing.T) {
+	fixture := []byte(`
+'同步': 'warning',
+/* '删除': 'danger',
+   '禁用': 'danger' */
+const DANGER_WORDS = ['失败'] as const
+const WARNING_WORDS = ['跳过'] as const
+const SUCCESS_WORDS = ['成功'] as const
+`)
+	tone := parseFrontendAuditTone(t, fixture, "fixture")
+	if _, ok := tone.exceptions["删除"]; ok {
+		t.Fatal("块注释中的例外条目被注册为真映射")
+	}
+	if _, ok := tone.exceptions["禁用"]; ok {
+		t.Fatal("跨行块注释中的例外条目被注册为真映射")
+	}
+	if color := tone.exceptions["同步"]; color != "warning" {
+		t.Fatalf("块注释外的真实条目未解析: %q", color)
+	}
+}
+
+// mapped 判断动作是否会被前端归为非兜底色调（例外表精确命中，或含任一色调
+// 关键词）。这里只判「可分类性」，**不复制前端判定优先级**——顺序契约
+// （danger > warning > success）在前端自身用例 web/tests/auditActionTone.spec.ts
+// 单点钉住；在 Go 侧复刻一份顺序会在前端改序后继续按旧序断言（双绿）。
+func (f *frontendAuditTone) mapped(action string) bool {
+	if _, ok := f.exceptions[action]; ok {
+		return true
+	}
+	for _, words := range [][]string{f.danger, f.warning, f.success} {
+		for _, word := range words {
+			if strings.Contains(action, word) {
+				return true
 			}
-			mapping[m[1]] = color
 		}
 	}
-	for _, want := range []string{"success", "warning", "danger"} {
-		if !colors[want] {
-			t.Fatalf("actionTagType 解析漂移：未找到 %s 行——actionTagType 结构已改变，请同步更新本测试的解析", want)
+	return false
+}
+
+// dangerMapped 判断动作在前端是否必定渲染为 danger：例外表精确命中优先
+// （命中非 danger 即否），否则含任一 danger 关键词即为 danger。
+func (f *frontendAuditTone) dangerMapped(action string) bool {
+	if color, ok := f.exceptions[action]; ok {
+		return color == "danger"
+	}
+	for _, word := range f.danger {
+		if strings.Contains(action, word) {
+			return true
 		}
 	}
-	if len(mapping) < 50 {
-		t.Fatalf("actionTagType 解析漂移：仅提取到 %d 个动作映射（期望 ≥50）——actionTagType 结构已改变，请同步更新本测试的解析", len(mapping))
+	return false
+}
+
+func TestAuditActionMapping_staticPackageValueSyntax(t *testing.T) {
+	const declarationsSource = `package fixture
+const constAction = "自动封禁"
+var varAction = "手动封禁"`
+	const callsSource = `package fixture
+func record(dynamicAction func() string) {
+	RecordAuditLog("system", constAction, "资源", "", "")
+	RecordAuditLog("system", varAction, "资源", "", "")
+	RecordAuditLog("system", other.SelectorAction, "资源", "", "")
+	RecordAuditLog("system", "删除", "资源", "", "")
+	RecordAuditLog("system", unknownAction, "资源", "", "")
+	RecordAuditLog("system", dynamicAction(), "资源", "", "")
+	RecordAuditLog("system", missing.SelectorAction, "资源", "", "")
+}`
+	declarations, err := parser.ParseFile(token.NewFileSet(), "declarations.go", declarationsSource, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic declarations: %v", err)
 	}
-	return mapping
+	calls, err := parser.ParseFile(token.NewFileSet(), "calls.go", callsSource, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic calls: %v", err)
+	}
+	packages := map[string]map[string]string{
+		"fixture": auditPackageStringValues(declarations),
+		"other":   {"SelectorAction": "选择封禁"},
+	}
+	values := packages[declarations.Name.Name]
+	var arguments []ast.Expr
+	ast.Inspect(calls, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		ident, ok := call.Fun.(*ast.Ident)
+		if ok && ident.Name == "RecordAuditLog" {
+			arguments = append(arguments, call.Args[1])
+		}
+		return true
+	})
+	want := []struct {
+		value    string
+		resolved bool
+	}{
+		{value: "自动封禁", resolved: true},
+		{value: "手动封禁", resolved: true},
+		{value: "选择封禁", resolved: true},
+		{value: "删除", resolved: true},
+		{resolved: false},
+		{resolved: false},
+		{resolved: false},
+	}
+	if len(arguments) != len(want) {
+		t.Fatalf("arguments=%d, want %d", len(arguments), len(want))
+	}
+	for index, expected := range want {
+		value, resolved := auditStaticStringValue(arguments[index], values, packages)
+		if resolved != expected.resolved || value != expected.value {
+			t.Errorf("argument %d resolved=(%q,%v), want (%q,%v)", index, value, resolved, expected.value, expected.resolved)
+		}
+	}
+}
+
+func TestAuditActionMapping_packageConstantAutobanDangerMapping(t *testing.T) {
+	backend := backendAuditActions(t)
+	evidence, found := backend[AutobanAuditAction]
+	if !found {
+		t.Fatalf("包级常量动作 %q 未进入后端动作集；删除其前端例外会绕过映射门禁", AutobanAuditAction)
+	}
+	tone := loadFrontendAuditTone(t)
+	color, found := tone.exceptions[AutobanAuditAction]
+	if !found || color != "danger" {
+		t.Fatalf("动作 %q（%s）的前端例外=(%q,%v)，want (danger,true)", AutobanAuditAction, evidence, color, found)
+	}
 }
 
 func TestAuditActionMapping_backendActionsAllMapped(t *testing.T) {
 	backend := backendAuditActions(t)
-	frontend := frontendAuditTagMapping(t)
+	tone := loadFrontendAuditTone(t)
 	var missing []string
 	for action, evidence := range backend {
-		if _, ok := frontend[action]; !ok {
+		if !tone.mapped(action) {
 			missing = append(missing, action+"（首见 "+evidence+"）")
 		}
 	}
 	if len(missing) > 0 {
 		slices.Sort(missing)
-		t.Fatalf("后端动作未在 AuditLog.vue actionTagType 映射（落库后渲染为兜底 info 灰标）：\n%s", strings.Join(missing, "\n"))
-	}
-	// R50 D-04：info 是「无 action ===」的兜底行，任何后端动作被显式写进 info 行
-	// （如 `if (action === 'X') return 'info'`）都能通过上面的映射检查而隐藏
-	// 分类错误。此处强制 info 行词条数为零——当前 info 行本就无词条，零成本绊线。
-	var infoMapped []string
-	for action, evidence := range backend {
-		if frontend[action] == "info" {
-			infoMapped = append(infoMapped, action+"（首见 "+evidence+"）")
-		}
-	}
-	if len(infoMapped) > 0 {
-		slices.Sort(infoMapped)
-		t.Fatalf("后端动作不得显式映射到 info 兜底色（info 行应保持零词条）：\n%s", strings.Join(infoMapped, "\n"))
+		t.Fatalf("后端动作既不在例外表、也不含任何色调关键词——落库后渲染为兜底 info 灰标并告警（web/src/utils/%s）：\n%s",
+			frontendAuditToneSource, strings.Join(missing, "\n"))
 	}
 }
 
 func TestAuditActionMapping_dangerClassificationContract(t *testing.T) {
 	backend := backendAuditActions(t)
-	frontend := frontendAuditTagMapping(t)
+	tone := loadFrontendAuditTone(t)
 	var violations []string
 	for action, evidence := range backend {
 		if !strings.HasSuffix(action, "失败") && !auditMappingDangerContract[action] {
 			continue
 		}
-		if color, ok := frontend[action]; ok && color != "danger" {
-			violations = append(violations, action+"（首见 "+evidence+"，前端映射为 "+color+"）")
+		if !tone.dangerMapped(action) {
+			violations = append(violations, action+"（首见 "+evidence+"）")
 		}
 	}
 	if len(violations) > 0 {
 		slices.Sort(violations)
-		t.Fatalf("危险语义动作必须映射到 danger 行（失败后缀或 {配置漂移, 应用失败, 部署失败, 认证拒绝, 提升失败} 契约）：\n%s", strings.Join(violations, "\n"))
+		t.Fatalf("危险语义动作必须判定为 danger（失败后缀或 {配置漂移, 应用失败, 部署失败, 认证拒绝, 提升失败} 契约）：\n%s", strings.Join(violations, "\n"))
 	}
 }
 
-// genericRouteRegistry Generic 路由的 exactly-once 登记表（R65 D-N1 引入，R66
-// D-N3 提升为包级供穷尽性绊线共用）：handlerMustRecord=true 表示 handler 显式
+// genericRouteRegistry Generic 路由的 exactly-once 登记表（引入，
+// 提升为包级供穷尽性绊线共用）：handlerMustRecord=true 表示 handler 显式
 // 记录（FormatAuditAction 映射必须为空）；false 表示中间件经映射记录（映射
 // 必须非空且 handler 不得记录）。
 var genericRouteRegistry = []struct {
@@ -329,10 +548,10 @@ var genericRouteRegistry = []struct {
 	{"/api/v1/caddy/restart", "RestartCaddy", false},
 }
 
-// TestAuditGenericRoutesExactlyOnce Generic 路由 exactly-once 绊线（R65 D-N1）：
+// TestAuditGenericRoutesExactlyOnce Generic 路由 exactly-once 绊线
 // Generic 分类的路由要么由中间件记录（FormatAuditAction 有映射、handler 不得
 // 再记），要么由 handler 记录（映射为空、中间件跳过）——两侧同时激活即单次
-// 动作双条 audit_log（/config/reload 曾如此；R69 删除循环前的同断言重复——
+// 动作双条 audit_log（/config/reload 曾如此；删除循环前的同断言重复——
 // 子测试已覆盖）。
 func TestAuditGenericRoutesExactlyOnce(t *testing.T) {
 	handlersRoot, err := filepath.Abs(filepath.Join("..", "handlers"))
@@ -341,7 +560,7 @@ func TestAuditGenericRoutesExactlyOnce(t *testing.T) {
 	}
 	for _, route := range genericRouteRegistry {
 		t.Run(route.path, func(t *testing.T) {
-			action, _, _ := FormatAuditAction(http.MethodPost, route.path)
+			action, _, _ := FormatAuditAction(route.path)
 			if route.handlerMustRecord && action != "" {
 				t.Fatalf("FormatAuditAction 映射非空 %q——handler %s 已显式记录，会双条", action, route.handlerFunc)
 			}
@@ -362,26 +581,26 @@ func TestAuditGenericRoutesExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestAuditExplicitRoutesMappingEmpty Explicit 路由映射漂移哨兵（R66 D-N3）：
+// TestAuditExplicitRoutesMappingEmpty Explicit 路由映射漂移哨兵
 // Explicit 路由由 handler 显式记录且被 HasExplicitAuditEvent 前置短路——
 // FormatAuditAction 对它们必须返回空；映射非空意味着清单漂移漏掉该路由时
-// 中间件会恢复映射记录，与 handler 记录叠加成双条（R65 D-N1 缺陷形态）。
+// 中间件会恢复映射记录，与 handler 记录叠加成双条。
 func TestAuditExplicitRoutesMappingEmpty(t *testing.T) {
 	for route, policy := range auditRoutePolicies {
 		if policy != AuditPolicyExplicit {
 			continue
 		}
-		method, path, ok := strings.Cut(route, " ")
+		_, path, ok := strings.Cut(route, " ")
 		if !ok {
 			t.Fatalf("策略键格式异常: %q", route)
 		}
-		if action, _, _ := FormatAuditAction(method, path); action != "" {
+		if action, _, _ := FormatAuditAction(path); action != "" {
 			t.Errorf("Explicit 路由 %s 的 FormatAuditAction 映射非空（%q）——handler 已显式记录，双条风险", route, action)
 		}
 	}
 }
 
-// TestAuditGenericRoutesExhaustive Generic 路由穷尽性绊线（R66，C 域改进项）：
+// TestAuditGenericRoutesExhaustive Generic 路由穷尽性绊线
 // auditRoutePolicies 中每条 Generic 路由必须登记进 genericRouteRegistry——
 // 新增 Generic 路由未登记时其 exactly-once 契约对测试套件不可见。
 func TestAuditGenericRoutesExhaustive(t *testing.T) {
@@ -403,20 +622,32 @@ func TestAuditGenericRoutesExhaustive(t *testing.T) {
 	}
 }
 
-// TestAuditPolicyListsEqual F63-B5e2-4 后语义:HasExplicitAuditEvent 已从
+// TestAuditPolicyListsEqual 后语义:HasExplicitAuditEvent 已从
 // auditRoutePolicies 派生(原双清单 switch 已删)——本测试退化为「派生源
 // 非空且含已知 Explicit 路由」的活性钉(防策略表被清空后 Explicit 全静默
 // 降级为 Generic)。
 func TestAuditPolicyListsEqual(t *testing.T) {
-	explicitCount := 0
-	for route, policy := range auditRoutePolicies {
-		if policy == AuditPolicyExplicit {
+	// 冻结的独立期望（按类计数）：只遍历策略表再断言自身派生结果属自指——
+	// 路由被降级/新增时计数两侧同步变化，测试仍绿。策略表变更必须同步本清单。
+	const (
+		wantExplicit = 104
+		wantGeneric  = 5
+		wantSkip     = 16
+	)
+	explicitCount, genericCount, skipCount := 0, 0, 0
+	for _, policy := range auditRoutePolicies {
+		switch policy {
+		case AuditPolicyExplicit:
 			explicitCount++
-			_ = route
+		case AuditPolicyGeneric:
+			genericCount++
+		case AuditPolicySkip:
+			skipCount++
 		}
 	}
-	if explicitCount < 10 {
-		t.Fatalf("auditRoutePolicies Explicit 条目=%d,期望 ≥10——策略表被清空/损坏将使 HasExplicitAuditEvent 恒 false", explicitCount)
+	if explicitCount != wantExplicit || genericCount != wantGeneric || skipCount != wantSkip {
+		t.Fatalf("auditRoutePolicies 分类计数漂移：explicit=%d generic=%d skip=%d, want %d/%d/%d（策略口径变更须同步本清单）",
+			explicitCount, genericCount, skipCount, wantExplicit, wantGeneric, wantSkip)
 	}
 	// 抽样验证已知 Explicit 路由
 	known := []string{"POST /api/v1/auth/login", "POST /api/v1/auth/logout"}
@@ -427,12 +658,12 @@ func TestAuditPolicyListsEqual(t *testing.T) {
 	}
 }
 
-// TestAuditExplicitHandlersRecord Explicit 路由 handler-必须记录绊线（R66 D-N2）：
+// TestAuditExplicitHandlersRecord Explicit 路由 handler-必须记录绊线
 // Explicit 路由的审计完全依赖 handler 显式记录——从中间件路由注册（AST 提取
 // METHOD("/path", h.Handler)）解析路由→handler 映射，断言每个 Explicit 路由的
 // handler 函数体（含一层 h.X 委托，如 clusterNodeAction）包含审计记录调用；
 // handler 删除记录或经未登记 helper 绕过时该路由静默零审计，本测试直接红。
-// engineMediatedAuditRoutes B2（第 65 轮后裁定）：handler 经引擎 RunSync 执行
+// engineMediatedAuditRoutes：handler 经引擎 RunSync 执行
 // ——审计在执行器链（main 注入的 executor→RunAutoBackupOnce 内 RecordAuditLog）
 // 落盘，handler 体内无可达字面量（AST BFS 跨不过 main 装配闭包）。路由→执行
 // 仍恒有审计（RunAutoBackupOnce 内成功/失败双路径），此处豁免的是静态扫
@@ -499,7 +730,7 @@ func extractRouteHandlerRegistry(t *testing.T) map[string]string {
 			return true
 		}
 		// 注册形态：METHOD("/path"[, middleware...], h.Handler)——路径取首个
-		//字符串字面量，handler 取末参选择子（R66：auth 组带 loginRateLimit
+		//字符串字面量，handler 取末参选择子（auth 组带 loginRateLimit
 		// 中间件为 3 参形态）。
 		lit, ok := call.Args[0].(*ast.BasicLit)
 		if !ok || lit.Kind != token.STRING {
@@ -582,7 +813,7 @@ func scanHandlerForAuditCall(t *testing.T, root, funcName string) (bool, bool) {
 }
 
 // indexHandlerPackageFuncs 索引 handlers 包全部函数/方法的函数体字节
-// （同名冲突取首个——绊线用途下足够）。R67 D-3：切出前按 AST 注释区间把
+// （同名冲突取首个——绊线用途下足够）。切出前按 AST 注释区间把
 // 注释字节置零——字面量正则会命中「提及 recordAudit( 的注释」，删记录留
 // 注释即假绿（零审计逃逸通道）；置零保持偏移对齐。
 func indexHandlerPackageFuncs(t *testing.T, root string) map[string][]byte {
@@ -623,7 +854,7 @@ func indexHandlerPackageFuncs(t *testing.T, root string) map[string][]byte {
 
 // stripCommentBytes 返回把注释区间字节置零的源码副本（长度与偏移不变）——
 // 字面量正则对含注释的字节段会命中「提及目标 token 的注释」（假信号），置零
-// 后只可能命中代码。R67 D-3 引入于 indexHandlerPackageFuncs，R68 D-N2 提取
+// 后只可能命中代码。引入于 indexHandlerPackageFuncs，提取
 // 为共享 helper 供 INSERT 入口绊线同用。
 func stripCommentBytes(fset *token.FileSet, file *ast.File, src []byte) []byte {
 	stripped := make([]byte, len(src))
@@ -639,7 +870,7 @@ func stripCommentBytes(fset *token.FileSet, file *ast.File, src []byte) []byte {
 	return stripped
 }
 
-// TestAuditInsertEntryPointsExhaustive 审计写入入口穷尽性绊线（R62 D-5）：
+// TestAuditInsertEntryPointsExhaustive 审计写入入口穷尽性绊线
 // 词汇/映射两个契约测试只扫描调用名命中 auditVocabCallSpecs 的调用点——若未来
 // 新增绕过这 4 个入口、直接向 audit_log 表 INSERT 的低层写入函数，其动作词条对
 // 两个契约测试均不可见（漏映射检查失效、超长词条不红，前端渲染兜底 info 灰标）。
@@ -655,7 +886,7 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 		"RecordAuditLog":       true, // services/auditlog.go —— auditVocabCallSpecs 已覆盖其调用点
 		"flushSystemAuditLogs": true, // db/audit.go —— recordSystemAudit 缓冲的唯一落库点，无字面量动作
 	}
-	// R63 D-N3：SQL 关键字与表名大小写不敏感，正则加 (?i) 防 "insert into
+	// SQL 关键字与表名大小写不敏感，正则加 (?i) 防 "insert into
 	// audit_log" 等变体从文件级预筛静默漏过。
 	pattern := regexp.MustCompile(`(?i)INTO\s+audit_log\b`)
 	found := false
@@ -678,7 +909,7 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
-		// R68 D-N2：正文匹配改在注释置零副本上做——与 D-3 的 handlers 侧免疫
+		// 正文匹配改在注释置零副本上做——与 handlers 侧免疫
 		// 同源：允许集函数体内「提及该 SQL 的注释」会假满足活性锚点（写入机制
 		// 整体迁移后测试恒绿），非允许集函数的注释则误红。预筛仍用原始 src
 		//（超集过滤，仅省解析），置零后无命中则 found 不置位。
@@ -700,7 +931,7 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 					}
 				}
 			case *ast.GenDecl:
-				// R63 D-N2：包级函数字面量（var x = func(){...INSERT...}）无外围
+				// 包级函数字面量（var x = func(){...INSERT...}）无外围
 				// FuncDecl，允许集检查对其永不触发——按整段文本命中即红（包级
 				// 裸写入点无法按函数名归因，契约上不应存在；确有需要先重构为
 				// 命名函数并加入允许集）。
@@ -721,10 +952,10 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 	}
 }
 
-// TestAuditEntryAliasExhaustive 审计入口别名穷尽性绊线（R63 D-N4）：两个契约
+// TestAuditEntryAliasExhaustive 审计入口别名穷尽性绊线：两个契约
 // 测试按「调用名 ∈ auditVocabCallSpecs」提取调用点——入口被函数变量别名后以
 // 别名调用，别名未登记时该调用点对两测试整点不可见（动作词条不进后端动作集、
-// 漏映射检查失明、danger 契约条目虚设；R50 D-01 的「认证拒绝」缺失即此类，
+// 漏映射检查失明、danger 契约条目虚设；「认证拒绝」缺失即此类，
 // 当时仅靠人工审计发现）。本测试扫描 internal/ 生产代码中 RHS 为入口名的
 // var 值规格与赋值语句，断言 LHS 标识符 ∈ auditVocabCallSpecs；新别名未登记
 // 即红。

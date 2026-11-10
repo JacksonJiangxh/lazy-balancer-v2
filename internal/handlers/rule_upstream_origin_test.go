@@ -54,6 +54,7 @@ func TestRulePayload_originDomainAndHealthCheckHostValidation(t *testing.T) {
 				extra += ","
 			}
 			body := fmt.Sprintf(`{"name":"origin-v-%d","protocol":%q,"domain":"origin-%d.test","listen_port":%d,%s`+
+				`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,`+
 				`"upstreams":[%s]}`, i, tc.protocol, i, 18700+i, extra, tc.upstream)
 			request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")

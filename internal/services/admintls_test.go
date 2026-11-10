@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -16,7 +17,7 @@ func TestRuntimeAdminTLSChanged_detects_uploaded_certificate_rotation(t *testing
 	}
 }
 
-// LBH-B-N1（第 72 轮）：存在但损坏的自签证书对必须自愈——读侧仅验「双文件
+// 存在但损坏的自签证书对必须自愈——读侧仅验「双文件
 // 可读」不够，X509KeyPair 解析失败（截断/换位/垃圾内容）原样上抛会让启动
 // 进入崩溃循环且面板无清除入口。先读后验：损坏对记 warn 并落既有重生成路径。
 func TestSelfSignedCert_corrupt_pair_regenerates(t *testing.T) {
@@ -60,7 +61,37 @@ func TestSelfSignedCert_corrupt_pair_regenerates(t *testing.T) {
 	}
 }
 
-// LBH-B-N2（第 72 轮）：指纹对 cert/key 无分隔拼接存在理论双解——
+// 证书在场而私钥缺失必须留痕：静默重生成会以新密钥对覆盖既有 crt（已导入
+// 浏览器/系统的信任失效），且日志无线索指向「私钥丢失」这一真实原因。
+func TestSelfSignedCert_missingKeyWarnsAndRegenerates(t *testing.T) {
+	// Given：目录只有证书文件，私钥不存在（卷只挂 crt / 人工删除）
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "admin_tls.crt")
+	if err := os.WriteFile(certPath, []byte("not-a-cert"), 0644); err != nil {
+		t.Fatalf("seed certificate: %v", err)
+	}
+	logs := captureServiceLog(t)
+
+	// When：selfsigned 模式解析证书
+	cert, err := AdminTLSConfig{}.ResolveCertificate(dir)
+
+	// Then：自愈仍成功，且日志点名「私钥不可读」+ 缺失形态
+	if err != nil {
+		t.Fatalf("resolve certificate: %v", err)
+	}
+	if len(cert.Certificate) == 0 || cert.PrivateKey == nil {
+		t.Fatal("regenerated certificate is incomplete")
+	}
+	got := logs.String()
+	if !strings.Contains(got, "私钥不可读") {
+		t.Fatalf("私钥缺失必须留痕（当前日志无线索指向真实原因）: %q", got)
+	}
+	if !strings.Contains(got, "缺失=true") {
+		t.Fatalf("日志必须区分「私钥缺失」与其它读失败形态: %q", got)
+	}
+}
+
+// 指纹对 cert/key 无分隔拼接存在理论双解——
 // cert="A",key="BC" 与 cert="AB",key="C" 同串同哈希，真实轮换会被误判为
 // 未变化。钉住「边界组合必须产生不同指纹」。
 func TestFingerprintAdminTLS_separates_cert_key_boundary(t *testing.T) {
@@ -72,29 +103,56 @@ func TestFingerprintAdminTLS_separates_cert_key_boundary(t *testing.T) {
 	}
 }
 
-func TestWriteAdminTLSCertPair_second_file_failure_restores_previous_pair(t *testing.T) {
+func TestWriteAdminTLSCertPair_keyRenameFailureRestoresPreviousCertificate(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "admin_tls.crt")
 	keyPath := filepath.Join(dir, "admin_tls.key")
 	if err := os.WriteFile(certPath, []byte("old-cert"), 0644); err != nil {
 		t.Fatalf("seed certificate: %v", err)
 	}
-	if err := os.WriteFile(keyPath, []byte("old-key"), 0600); err != nil {
-		t.Fatalf("seed private key: %v", err)
+	// 非空目录作为私钥目标：两个临时文件均可写、证书 rename 已成功，只有私钥
+	// rename 失败，从而真实进入 certstore 的证书补偿分支（无需生产测试缝）。
+	if err := os.Mkdir(keyPath, 0700); err != nil {
+		t.Fatalf("seed private key target directory: %v", err)
 	}
-	if err := os.Mkdir(keyPath+".tmp", 0700); err != nil {
-		t.Fatalf("block temporary private key write: %v", err)
+	if err := os.WriteFile(filepath.Join(keyPath, "keep"), []byte("block rename"), 0600); err != nil {
+		t.Fatalf("make private key target non-empty: %v", err)
 	}
 
 	if err := writeAdminTLSCertPair(certPath, keyPath, []byte("new-cert"), []byte("new-key")); err == nil {
-		t.Fatal("second file write unexpectedly succeeded")
+		t.Fatal("private key rename unexpectedly succeeded")
 	}
-	cert, certErr := os.ReadFile(certPath)
-	key, keyErr := os.ReadFile(keyPath)
-	if certErr != nil || keyErr != nil {
-		t.Fatalf("read pair after rollback: cert=%v key=%v", certErr, keyErr)
+	cert, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read certificate after rollback: %v", err)
 	}
-	if string(cert) != "old-cert" || string(key) != "old-key" {
-		t.Fatalf("pair after rollback=(%q,%q), want previous pair", cert, key)
+	if string(cert) != "old-cert" {
+		t.Fatalf("certificate after key rename failure=%q, want previous certificate", cert)
+	}
+	if _, err := os.Stat(filepath.Join(keyPath, "keep")); err != nil {
+		t.Fatalf("failed private key target must remain untouched: %v", err)
+	}
+}
+
+// 白名单外 mode（历史库值/带外改库）按自签名回落（坏值不得让启动进入崩溃
+// 循环的既有裁定不变），但必须 warn 点名坏值——静默回落让「配置了 upload
+// 却跑成自签名」零信号。
+func TestResolveCertificate_unknownModeFallsBackToSelfSignedWithWarn(t *testing.T) {
+	// Given：mode 为白名单（selfsigned/upload）之外的垃圾值
+	dir := t.TempDir()
+	logs := captureServiceLog(t)
+
+	// When：解析证书
+	cert, err := AdminTLSConfig{Mode: "garbage"}.ResolveCertificate(dir)
+
+	// Then：回落自签名仍成功（不 crash），且 warn 点名坏值
+	if err != nil {
+		t.Fatalf("resolve certificate: %v", err)
+	}
+	if len(cert.Certificate) == 0 || cert.PrivateKey == nil {
+		t.Fatal("fallback certificate is incomplete")
+	}
+	if got := logs.String(); !strings.Contains(got, `TLS 模式 "garbage" 不在白名单内`) {
+		t.Fatalf("未知 mode 必须留痕: %q", got)
 	}
 }

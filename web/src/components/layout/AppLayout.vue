@@ -1,8 +1,13 @@
 <template>
   <el-container class="layout-container">
-    <el-aside :width="effectiveCollapsed ? '64px' : '220px'" class="layout-aside">
+    <!-- 窄屏展开为浮层：遮罩承接「点空白收起」（纯视觉层，对读屏隐藏） -->
+    <div v-if="sidebarOverlayVisible" class="sidebar-backdrop" aria-hidden="true" @click="closeNarrowSidebar" />
+    <el-aside :width="sidebarWidth(effectiveCollapsed)" class="layout-aside" :class="{ 'is-overlay': sidebarOverlayVisible }">
       <div class="aside-header">
-        <div class="logo-area" role="button" tabindex="0" aria-label="切换侧边栏" @click="collapsed = !collapsed" @keydown.enter.prevent="collapsed = !collapsed" @keydown.space.prevent="collapsed = !collapsed">
+        <!-- 折叠入口的展开状态必须对读屏可见：折叠只由宽度表达，此前读屏无从得知
+             （aria-expanded + aria-controls 指向被折叠的导航）。长按 Enter/Space
+             经 activateOnce 去重，否则按系统重复率反复切换。 -->
+        <div class="logo-area" role="button" tabindex="0" aria-label="切换侧边栏" :aria-expanded="!effectiveCollapsed" aria-controls="app-sidebar-nav" @click="toggleSidebar" @keydown.enter.prevent="activateOnce($event, toggleSidebar)" @keydown.space.prevent="activateOnce($event, toggleSidebar)">
           <AppLogo :size="28" />
           <transition name="fade">
             <span v-if="!effectiveCollapsed" class="logo-text">
@@ -13,6 +18,7 @@
       </div>
 
       <el-menu
+        id="app-sidebar-nav"
         :default-active="currentPage"
         class="layout-menu"
         :collapse="effectiveCollapsed"
@@ -20,85 +26,87 @@
         background-color="#ffffff"
         text-color="#6b7280"
         active-text-color="#3b82f6"
-       
       >
         <el-menu-item index="dashboard" @click="goPage('dashboard')">
           <el-icon><DataAnalysis /></el-icon>
-          <template #title>仪表盘</template>
+          <template #title>{{ NAV_LABELS.dashboard }}</template>
         </el-menu-item>
         <el-menu-item index="rules" @click="goPage('rules')">
           <el-icon><List /></el-icon>
-          <template #title>负载均衡</template>
+          <template #title>{{ NAV_LABELS.rules }}</template>
         </el-menu-item>
         <el-sub-menu index="security">
           <template #title>
             <el-icon><Lock /></el-icon>
-            <span>安全防护</span>
+            <span>{{ SECURITY_PARENT }}</span>
           </template>
           <el-menu-item index="security-overview" @click="goPage('security-overview')">
             <el-icon><DataAnalysis /></el-icon>
-            <template #title>安全总览</template>
+            <template #title>{{ NAV_LABELS['security-overview'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-policies" @click="goPage('security-policies')">
             <el-icon><Lock /></el-icon>
-            <template #title>安全策略</template>
+            <template #title>{{ NAV_LABELS['security-policies'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-rules" @click="goPage('security-rules')">
             <el-icon><Notebook /></el-icon>
-            <template #title>规则集</template>
+            <template #title>{{ NAV_LABELS['security-rules'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-block-pages" @click="goPage('security-block-pages')">
             <el-icon><Document /></el-icon>
-            <template #title>拦截页面</template>
+            <template #title>{{ NAV_LABELS['security-block-pages'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-events" @click="goPage('security-events')">
             <el-icon><Warning /></el-icon>
-            <template #title>事件日志</template>
+            <template #title>{{ NAV_LABELS['security-events'] }}</template>
           </el-menu-item>
         </el-sub-menu>
         <el-menu-item index="caddy" @click="goPage('caddy')">
           <el-icon><Cpu /></el-icon>
-          <template #title>配置预览</template>
+          <template #title>{{ NAV_LABELS.caddy }}</template>
         </el-menu-item>
         <el-sub-menu index="settings">
           <template #title>
             <el-icon><Setting /></el-icon>
-            <span>系统设置</span>
+            <span>{{ SETTINGS_BREADCRUMB_PARENT }}</span>
           </template>
           <el-menu-item index="settings-basic" @click="goPage('settings-basic')">
             <el-icon><Setting /></el-icon>
-            <template #title>基础设置</template>
+            <template #title>{{ NAV_LABELS['settings-basic'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-cluster" @click="goPage('settings-cluster')">
             <el-icon><Connection /></el-icon>
-            <template #title>集群管理</template>
+            <template #title>{{ NAV_LABELS['settings-cluster'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-certificates" @click="goPage('settings-certificates')">
             <el-icon><Lock /></el-icon>
-            <template #title>免费证书</template>
+            <template #title>{{ NAV_LABELS['settings-certificates'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-apikeys" @click="goPage('settings-apikeys')">
             <el-icon><Key /></el-icon>
-            <template #title>API 密钥</template>
+            <template #title>{{ NAV_LABELS['settings-apikeys'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-tasks" @click="goPage('settings-tasks')">
             <el-icon><Timer /></el-icon>
-            <template #title>任务监控</template>
+            <template #title>{{ NAV_LABELS['settings-tasks'] }}</template>
           </el-menu-item>
           <el-menu-item index="users" @click="goPage('users')">
             <el-icon><User /></el-icon>
-            <template #title>用户认证</template>
+            <template #title>{{ NAV_LABELS.users }}</template>
           </el-menu-item>
         </el-sub-menu>
         <el-menu-item index="audit-log" @click="goPage('audit-log')">
           <el-icon><Document /></el-icon>
-          <template #title>操作日志</template>
+          <template #title>{{ NAV_LABELS['audit-log'] }}</template>
         </el-menu-item>
       </el-menu>
 
       <div class="aside-footer">
         <el-dropdown trigger="click" @command="handleCommand">
-          <div class="user-info">
+          <div class="user-info" :class="{ 'is-collapsed': effectiveCollapsed }" :aria-label="accountTriggerLabel(menuDisplayName)" :title="accountTriggerLabel(menuDisplayName)">
+            <!-- 折叠态必须有可见标识与无障碍名称：此前只剩 24px 无内容条带，
+                 而「退出登录」只存在于本下拉里（窄屏等于没有可发现的退出入口） -->
+            <span v-if="effectiveCollapsed" class="user-avatar" aria-hidden="true">{{ accountInitial(menuDisplayName) }}</span>
             <transition name="fade">
               <div v-if="!effectiveCollapsed" class="user-detail">
                 <div class="user-name">
@@ -126,7 +134,7 @@
         <div class="header-left">
           <el-breadcrumb separator="/">
             <el-breadcrumb-item>{{ appName }}</el-breadcrumb-item>
-            <el-breadcrumb-item>{{ pageTitle[currentPage] || '仪表盘' }}</el-breadcrumb-item>
+            <el-breadcrumb-item>{{ hasOwn(pageTitle, currentPage) ? pageTitle[currentPage] : '仪表盘' }}</el-breadcrumb-item>
           </el-breadcrumb>
         </div>
         <div class="header-right">
@@ -139,6 +147,24 @@
           </div>
         </div>
       </el-header>
+
+      <!-- Caddy 进程停摆全局横幅：/caddy/status 的 status 字段（running|stopped）——
+           只有仪表盘消费该字段时，停留在规则/设置/日志页完全看不到停摆
+           （apply_error 可能为空）。全节点全页面可见，带重启入口。 -->
+      <el-alert
+        v-if="caddyStopped"
+        type="error"
+        :closable="false"
+        show-icon
+        class="error-banner"
+      >
+        <template #title>
+          <div class="polling-error-title">
+            <span>Caddy 服务未运行：站点当前无法提供服务（面板操作不受影响）</span>
+            <el-button v-if="authStore.readOnlyReason === null" link type="danger" :loading="restarting" @click="handleRestartForDrift">重启服务</el-button>
+          </div>
+        </template>
+      </el-alert>
 
       <el-alert
         v-if="configDrift && authStore.nodeMode === 'master'"
@@ -158,6 +184,22 @@
         </template>
       </el-alert>
 
+      <!-- 配置应用失败全局横幅：写路径保存分叉（apply_error，含「已保存但
+           未生效」退化提交两态文案）与后台重载失败（background_apply_error，
+           含从节点集群同步重载失败）同源轮询——全部节点全部页面可见 -->
+      <el-alert
+        v-if="applyErrorBanner"
+        :type="applyErrorBannerKind"
+        :closable="false"
+        show-icon
+        class="error-banner"
+      >
+        <template #title>
+          <span>{{ applyErrorBanner }}</span>
+          <div v-if="backgroundApplyErrorBanner" class="polling-error-meta error-banner-meta">另有后台重载失败：{{ backgroundApplyErrorBanner }}</div>
+        </template>
+      </el-alert>
+
       <el-main class="layout-main">
         <slot />
       </el-main>
@@ -166,124 +208,104 @@
       </el-footer>
     </el-container>
 
-    <el-dialog v-model="showProfile" width="min(520px, 92vw)" :close-on-click-modal="false" :before-close="beforeProfileClose" class="profile-dialog">
-      <template #header>
-        <DialogHeader :icon="User" title="个人资料" :subtitle="isOIDCUser ? 'OIDC 企业认证账户' : '本地账户'" />
-      </template>
-      <div v-if="isReadOnly" class="info-note-bar profile-readonly-note"><span class="info-note-desc">{{ authStore.readOnlyMessage }}</span></div>
-      <el-form :model="profileForm" label-width="80px" class="profile-form" :disabled="saving">
-        <el-form-item label="用户名">
-          <el-input v-model="profileForm.username" disabled />
-        </el-form-item>
-        <!-- v2.3.0:OIDC 用户显示名/密码源自 IdP,本地不可改(用户裁定) -->
-        <template v-if="isOIDCUser">
-          <el-form-item label="显示名">
-            <el-input :model-value="profileForm.display_name" disabled />
-          </el-form-item>
-          <el-form-item label="认证方式">
-            <el-tag type="primary" effect="plain" size="small">OIDC 企业认证</el-tag>
-          </el-form-item>
-          <el-form-item label-width="0">
-            <div class="oidc-hint-block">显示名与密码由认证服务管理，如需修改请前往 OIDC 服务</div>
-          </el-form-item>
-        </template>
-        <template v-else>
-          <el-form-item label="显示名">
-            <el-input v-model="profileForm.display_name" :disabled="isReadOnly" placeholder="选填" maxlength="50" />
-          </el-form-item>
-          <el-form-item label="新密码">
-            <el-input v-model="profileForm.password" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="如不修改请留空（8-24位）" show-password />
-          </el-form-item>
-          <el-form-item label="确认新密码">
-            <el-input v-model="profileForm.passwordConfirm" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="再次输入新密码" show-password />
-          </el-form-item>
-          <el-form-item label="当前密码">
-            <el-input v-model="profileForm.currentPassword" :disabled="isReadOnly" type="password" maxlength="72" :placeholder="profileForm.password ? '修改密码时必填' : '填写新密码后需确认'" show-password />
-          </el-form-item>
-        </template>
-      </el-form>
-      <template #footer>
-        <el-button :disabled="saving" @click="closeProfile">取消</el-button>
-        <!-- U9-4：OIDC 用户全部字段只读（显示名/密码源自 IdP），保存必败（后端 400）——直接隐藏保存钮 -->
-        <el-button v-if="!isOIDCUser" type="primary" :loading="saving" :disabled="isReadOnly || saving" @click="saveProfile">保存</el-button>
-      </template>
-    </el-dialog>
+    <ProfileDialog v-model="showProfile" />
   </el-container>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
 import { useAuthStore } from '@/stores/auth'
-import type { PageId } from '@/stores/auth'
-import { request, mfaAwareSuccess } from '@/utils/api'
-import { ElMessageBox } from 'element-plus'
+import { accountInitial, accountTriggerLabel, sidebarCollapsed, sidebarOverlay, sidebarWidth, toggleSidebarState } from '@/utils/sidebarLayout'
+import type { PageId } from '@/utils/pageIds'
+import { request } from '@/utils/api'
 import {Timer,  DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
-import DialogHeader from '@/components/DialogHeader.vue'
+import ProfileDialog from '@/components/ProfileDialog.vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
-import { reloadAfterRestart } from '@/utils/restart'
+import { restartServiceWithFeedback } from '@/utils/restart'
+import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
+import { SETTINGS_BREADCRUMB_PARENT, SETTINGS_TAB_IDS, SETTINGS_TAB_TITLES } from '@/utils/settingsPages'
+import { activateOnce } from '@/utils/keyboardActivate'
+import { hasOwn } from '@/utils/hasOwn'
 
 const authStore = useAuthStore()
-const collapsed = ref(false)
+// 宽屏用户折叠记忆与窄屏显式展开分开持有：窄屏强制折叠只是默认态，折叠入口
+// 必须真的有可观察效果（此前点击/回车/空格只翻转 collapsed，窄屏下完全无效）。
+const userCollapsed = ref(false)
+const narrowExpanded = ref(false)
 const isNarrowViewport = useMediaQuery('(max-width: 768px)')
-const effectiveCollapsed = computed(() => collapsed.value || isNarrowViewport.value)
+const effectiveCollapsed = computed(() => sidebarCollapsed({
+  narrow: isNarrowViewport.value,
+  userCollapsed: userCollapsed.value,
+  narrowExpanded: narrowExpanded.value,
+}))
+// 窄屏展开走浮层（不挤压内容区），遮罩点击收起
+const sidebarOverlayVisible = computed(() => sidebarOverlay({ narrow: isNarrowViewport.value, collapsed: effectiveCollapsed.value }))
+const toggleSidebar = (): void => {
+  const next = toggleSidebarState({
+    narrow: isNarrowViewport.value,
+    userCollapsed: userCollapsed.value,
+    narrowExpanded: narrowExpanded.value,
+  })
+  userCollapsed.value = next.userCollapsed
+  narrowExpanded.value = next.narrowExpanded
+}
+const closeNarrowSidebar = (): void => { narrowExpanded.value = false }
+// 视口回到宽屏后复位窄屏展开态：下次拉窄应回到默认折叠，而不是沿用旧选择
+watch(isNarrowViewport, (narrow) => { if (!narrow) narrowExpanded.value = false })
 const showProfile = ref(false)
-const saving = ref(false)
 const loggingOut = ref(false)
 
 const currentPage = computed(() => authStore.currentPage)
-// A6-S3：unknown（用户信息尚未拉取成功）窗口期 fail-closed，与 slave 同口径锁定
+// unknown（用户信息尚未拉取成功）窗口期 fail-closed，与 slave 同口径锁定
 // 自助资料编辑；非管理员的自我显示名/改密是自助能力而非管理员操作，不随此收紧
 //（后端恢复后仍按自身身份正确鉴权）。
 const isOIDCUser = computed(() => authStore.user?.auth_provider === 'oidc')
-const isReadOnly = computed(() => authStore.readOnlyReason === 'slave' || authStore.readOnlyReason === 'unknown')
 const menuDisplayName = computed(() => authStore.user?.display_name || authStore.user?.username || '用户')
 const hasCustomDisplayName = computed(() => {
   const displayName = authStore.user?.display_name || ''
   return displayName !== '' && displayName !== authStore.user?.username
 })
 
-const pageTitle: Record<string, string> = {
-  dashboard: '仪表盘',
-  rules: '负载均衡',
-  caddy: '配置预览',
-  users: '系统设置 / 用户认证',
-  'audit-log': '操作日志',
-  'settings-basic': '系统设置 / 基础设置',
-  'settings-tasks': '系统设置 / 任务监控',
-  'settings-cluster': '系统设置 / 集群管理',
-  'settings-certificates': '系统设置 / 免费证书',
-  'settings-apikeys': '系统设置 / API 密钥',
-  'security-overview': '安全防护 / 安全总览',
-  'security-events': '安全防护 / 事件日志',
-  'security-policies': '安全防护 / 安全策略',
-  'security-rules': '安全防护 / 规则集',
-  'security-block-pages': '安全防护 / 拦截页面',
+// 侧栏文案与顶栏面包屑唯一事实源：键→label（parent=面包屑前缀分组）。
+// 此前侧栏 menu 与 pageTitle 各持一份页面名字面量，改名必漏一侧（菜单与
+// 面包屑不一致）；现在模板与面包屑都从本表取值，settings 段继续复用
+// utils/settingsPages 的标题单源。
+const SECURITY_PARENT = '安全防护'
+const NAV_ITEMS: ReadonlyArray<{ id: string; label: string; parent?: string }> = [
+  { id: 'dashboard', label: '仪表盘' },
+  { id: 'rules', label: '负载均衡' },
+  { id: 'security-overview', label: '安全总览', parent: SECURITY_PARENT },
+  { id: 'security-policies', label: '安全策略', parent: SECURITY_PARENT },
+  { id: 'security-rules', label: '规则集', parent: SECURITY_PARENT },
+  { id: 'security-block-pages', label: '拦截页面', parent: SECURITY_PARENT },
+  { id: 'security-events', label: '事件日志', parent: SECURITY_PARENT },
+  { id: 'caddy', label: '配置预览' },
+  { id: 'users', label: '用户认证', parent: SETTINGS_BREADCRUMB_PARENT },
+  { id: 'audit-log', label: '操作日志' },
+]
+
+// 系统设置五个分页标题与 Settings.vue 页头同源（utils/settingsPages）——原两处
+// 各持一份同构映射，改名必然漏改其一。
+const settingsPageTitles: Record<string, string> = Object.fromEntries(
+  SETTINGS_TAB_IDS.map((tab) => [`settings-${tab}`, `${SETTINGS_BREADCRUMB_PARENT} / ${SETTINGS_TAB_TITLES[tab]}`]),
+)
+
+const NAV_LABELS: Record<string, string> = {
+  ...Object.fromEntries(NAV_ITEMS.map((item) => [item.id, item.label])),
+  ...Object.fromEntries(SETTINGS_TAB_IDS.map((tab) => [`settings-${tab}`, SETTINGS_TAB_TITLES[tab]])),
 }
 
-const profileForm = ref({
-  username: '',
-  display_name: '',
-  password: '',
-  // 2026-09-19 用户裁定：密码修改需二次确认
-  passwordConfirm: '',
-  // M5：提交新密码时的当前密码确认（后端密码确认门，不改密码时不需要）
-  currentPassword: '',
-})
-
-const syncProfileForm = () => {
-  profileForm.value = {
-    username: authStore.user?.username || '',
-    display_name: authStore.user?.display_name || '',
-    password: '',
-    passwordConfirm: '',
-    currentPassword: '',
-  }
+const pageTitle: Record<string, string> = {
+  ...Object.fromEntries(NAV_ITEMS.map((item) => [item.id, item.parent ? `${item.parent} / ${item.label}` : item.label])),
+  ...settingsPageTitles,
 }
 
 const goPage = (page: PageId) => {
   authStore.setCurrentPage(page)
+  // 窄屏浮层选完页面即收起（否则浮层挡住新页内容）
+  if (isNarrowViewport.value) narrowExpanded.value = false
 }
 
 const logout = async (): Promise<void> => {
@@ -298,119 +320,79 @@ const logout = async (): Promise<void> => {
 
 const handleCommand = async (command: string): Promise<void> => {
   if (command === 'profile') {
-    if (saving.value) return
-    syncProfileForm()
     showProfile.value = true
   } else if (command === 'logout') {
     await logout()
   }
 }
 
-const beforeProfileClose = (done: () => void): void => {
-  if (!saving.value) done()
-}
-
-const closeProfile = (): void => {
-  if (!saving.value) showProfile.value = false
-}
-
-const saveProfile = async () => {
-  if (isReadOnly.value || saving.value) return
-  if (profileForm.value.password && profileForm.value.password.length < 8) {
-    authStore.showToast('warning', '密码长度至少8位（8-24位，仅限数字、大小写字母和特殊字符）')
-    return
-  }
-  // M5：提交新密码必须携带当前密码（后端密码确认门），不改密码时不需要。
-  if (profileForm.value.password && !profileForm.value.currentPassword) {
-    authStore.showToast('warning', '请输入当前密码')
-    return
-  }
-  if (profileForm.value.password && profileForm.value.password !== profileForm.value.passwordConfirm) {
-    authStore.showToast('warning', '两次输入的新密码不一致')
-    return
-  }
-  saving.value = true
-  const passwordChanged = Boolean(profileForm.value.password)
-  try {
-    await request.patch('/users/me', {
-      display_name: profileForm.value.display_name,
-      ...(profileForm.value.password && { password: profileForm.value.password, current_password: profileForm.value.currentPassword }),
-    })
-    showProfile.value = false
-    if (passwordChanged) {
-      authStore.showToast('success', '密码已修改，请重新登录')
-      await logout()
-    } else {
-      mfaAwareSuccess('保存成功')
-      await authStore.fetchUser()
-    }
-  } catch (error: unknown) {
-    // Error toast is already shown by the global axios interceptor.
-    console.error('Failed to save profile:', error)
-  } finally {
-    saving.value = false
-  }
-}
-
 // 配置一致性看门狗横幅：轮询 /caddy/status，漂移时展示并给出重启恢复入口。
 const configDrift = ref('')
 const configDriftSince = ref('')
+// 配置应用失败全局横幅（全部节点、全部页面）：apply_error=写路径
+// 「保存失败/已保存未生效」（库态分叉），background_apply_error=后台数据类
+// 重载失败（证书部署/CRS/IP库/威胁库/自动封禁/集群同步重载——从节点
+// 「快照已提交但运行配置未收敛」分叉的唯一全局信号）。此前两者都只在
+// 仪表盘以标签呈现，非仪表盘页面与从节点完全不可见。
+const applyErrorBanner = ref('')
+const backgroundApplyErrorBanner = ref('')
+const applyErrorBannerKind = ref<'error' | 'warning'>('error')
+// Caddy 进程状态（running|stopped）：非仪表盘页面的停摆信号（Dashboard 另有一处
+// 消费）。查询失败时不改写旧值——保留最后一次已知状态，避免横幅闪烁。
+const caddyStopped = ref(false)
 const restarting = ref(false)
-let driftTimer: number | undefined
 let disposed = false
 
 const fetchDriftStatus = async () => {
-  // 看门狗语义主节点权威（横幅本就仅 master 渲染）：从节点不发请求；
-  // 节点模式未知（null，/config 未就绪窗口）同样跳过，下轮 interval 自然补查。
-  if (authStore.nodeMode !== 'master') return
+  // 节点模式未知（/config 未就绪窗口）仍查询——apply 失败横幅全节点有效；
+  // 漂移看门狗语义主节点权威，漂移文案仍仅 master 渲染。
   try {
     const res = await request.get('/caddy/status', { silent: true })
-    const drifted = res.data?.config_consistent === 'false'
+    const drifted = res.data?.config_consistent === 'false' && authStore.nodeMode === 'master'
     configDrift.value = drifted ? (res.data?.config_drift || '规则路由与运行配置不一致') : ''
     configDriftSince.value = drifted ? (res.data?.config_drift_since || '') : ''
+    const applyErr = res.data?.apply_error || ''
+    const bgErr = res.data?.background_apply_error || ''
+    caddyStopped.value = res.data?.status === 'stopped'
+    applyErrorBanner.value = applyErr || bgErr
+    // 两者触发源不同且 apply_error 仅在下一次成功保存时清空：并存时后台失败
+    // 必须单独成行，否则在 apply_error 清空前完全不可见（从节点同步重载失败即此类）。
+    backgroundApplyErrorBanner.value = applyErr ? bgErr : ''
+    applyErrorBannerKind.value = applyErr ? 'error' : 'warning'
   } catch {
     // 状态查询失败静默——网络层错误已有全局处理
   }
 }
 
 const handleRestartForDrift = async () => {
-  try {
-    await ElMessageBox.confirm(
-      '将重启服务以重新应用全部规则配置，期间服务短暂不可用。确认重启？',
-      '重启服务恢复',
-      { confirmButtonText: '确认重启', cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch {
-    return
-  }
+  if (restarting.value) return
   restarting.value = true
-  try {
-    await request.post('/system/restart')
-  } catch {
-    // 重启请求失败（全局拦截器已提示），复位按钮允许重试
-    restarting.value = false
-    return
-  }
-  mfaAwareSuccess('服务正在重启，就绪后自动刷新页面')
-  // 保持 restarting=true 直到 reload（防就绪等待窗口内二次点击）；超时或失败才复位
-  const reloaded = await reloadAfterRestart(() => disposed)
-  if (!reloaded) restarting.value = false
+  // 确认/重启/就绪轮询流程单源（utils/restart），与设置页同一实现
+  const result = await restartServiceWithFeedback({
+    confirmMessage: '将重启服务以重新应用全部规则配置，期间服务短暂不可用。确认重启？',
+    confirmTitle: '重启服务恢复',
+    confirmButtonText: '确认重启',
+    successMessage: '服务正在重启，就绪后自动刷新页面',
+    isDisposed: () => disposed,
+  })
+  if (result !== 'reloaded') restarting.value = false
 }
 
+// 漂移轮询接可见性间隔单源（与 usePollingTask/
+// useLogTailPolling 同范式）——hidden 停表、恢复可见立即补查；原手写
+// setInterval+document.hidden 只跳过轮次，返回页后横幅最长 60s 陈旧。
+// immediate:true = 挂载即首查（替代原显式 fetchDriftStatus 调用）。
+const driftPolling = createVisibilityIntervals({
+  intervals: [{ tick: () => { void fetchDriftStatus() }, ms: 60000, immediate: true }],
+})
+
 onMounted(() => {
-  syncProfileForm()
-  fetchDriftStatus()
-  // FE40-D1-5：后台标签页跳过漂移轮询——不可见页的持续请求无意义,
-  // visibilitychange 恢复可见时下一周期自然补查。
-  driftTimer = window.setInterval(() => {
-    if (document.hidden) return
-    void fetchDriftStatus()
-  }, 60000)
+  driftPolling.start()
 })
 
 onUnmounted(() => {
   disposed = true
-  if (driftTimer) clearInterval(driftTimer)
+  driftPolling.stop()
 })
 </script>
 
@@ -419,14 +401,12 @@ onUnmounted(() => {
 
 .config-drift-banner {
   border-radius: 0;
-  /* 垂直留白由全局 .error-banner（main.css）供给（第 53 轮补充轮去双份） */
+  /* 垂直留白由全局 .error-banner（main.css）供给（去双份）*/
 }
 /* 与站内 polling-error-alert 统一模式（Rules/CertJobs/ClusterSettings）同构：
-   图标+标题 flex（文案左、动作右）+ 12px meta 次行 */
-.config-drift-banner .polling-error-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; line-height: 1.5; }
+   图标+标题 flex（文案左、动作右）+ 12px meta 次行——flex/字号/行高全部由全局
+   .polling-error-title / .error-banner .error-banner-meta（main.css）供给，此处不重复声明。 */
 .config-drift-banner .drift-text { font-weight: 500; }
-/* 2026-09-25 用户反馈：两行行间距过宽——meta 贴合主行 */
-.config-drift-banner .polling-error-meta { font-size: 12px; margin-top: 0; line-height: 1.5; }
 
 .layout-aside {
   background: #ffffff;
@@ -434,6 +414,24 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   transition: width 0.2s;
+}
+
+/* 窄屏展开=浮层：不挤压内容区，抬到内容之上；遮罩承接「点空白收起」。
+   height/inset 用固定定位脱离 el-container 流式布局。 */
+.layout-aside.is-overlay {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2001;
+  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.16);
+}
+
+.sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(17, 24, 39, 0.32);
 }
 
 .aside-header {
@@ -533,10 +531,6 @@ onUnmounted(() => {
   width: 17px;
 }
 
-.layout-menu :deep(.el-sub-menu.is-opened) {
-  margin-bottom: 0 !important;
-}
-
 .layout-menu :deep(.el-sub-menu__title + .el-menu) {
   margin-top: 0 !important;
   padding-top: 0 !important;
@@ -544,10 +538,6 @@ onUnmounted(() => {
 
 .layout-menu :deep(.el-sub-menu) {
   margin-top: 4px !important;
-  margin-bottom: 4px !important;
-}
-
-.layout-menu :deep(.el-sub-menu.is-opened) {
   margin-bottom: 4px !important;
 }
 
@@ -591,6 +581,26 @@ onUnmounted(() => {
   background: #f9fafb;
 }
 
+/* 折叠态：只余头像标识，水平居中（原实现是无内容的热区） */
+.user-info.is-collapsed {
+  justify-content: center;
+  padding: 12px 8px;
+}
+
+.user-avatar {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 50%;
+  background: #eff6ff;
+  color: #3b82f6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+}
+
 
 .user-detail { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 
@@ -622,8 +632,6 @@ onUnmounted(() => {
   align-items: center;
   padding: 0 24px;
 }
-
-.header-left { flex: 1; }
 
 .header-right { display: flex; align-items: center; gap: 12px; }
 .readonly-tag { cursor: default; }
@@ -691,19 +699,6 @@ onUnmounted(() => {
   opacity: 0;
 }
 
-.profile-form { padding: 4px 28px 0; }
-.profile-form :deep(.el-form-item) { margin-bottom: 20px; }
-.profile-form :deep(.el-form-item__label) { color: var(--el-text-color-regular); }
-.profile-readonly-note { margin: 0 28px 12px; }
 .user-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .user-source-tag { flex-shrink: 0; height: 18px; padding: 0 6px; font-size: 11px; line-height: 16px; }
-.oidc-hint-block {
-  width: 100%;
-  padding: 8px 12px;
-  border-radius: 6px;
-  background: var(--el-fill-color-light);
-  color: var(--el-text-color-secondary);
-  font-size: 12.5px;
-  line-height: 1.6;
-}
 </style>

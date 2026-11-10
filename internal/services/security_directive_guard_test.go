@@ -54,17 +54,28 @@ func TestDirectiveLineLength_assertHelper(t *testing.T) {
 	if err := assertDirectiveLines("SecRule REMOTE_ADDR \"@streq x\" \"id:1,phase:1,deny\"\n"); err != nil {
 		t.Fatalf("短行不得触发护栏: %v", err)
 	}
+	// 精确边界：恰 48KiB 通过、48KiB+1 拒绝。`>` 改 `>=` 会让所有含 48KiB
+	// 行的配置保存失败，而 49KiB 夹具仍然报错——只有精确边界能钉住翻转。
+	if err := assertDirectiveLines(strings.Repeat("a", 48*1024)); err != nil {
+		t.Fatalf("恰 48KiB 行必须通过护栏（边界为 >）: %v", err)
+	}
+	if err := assertDirectiveLines(strings.Repeat("a", 48*1024+1)); err == nil || !strings.Contains(err.Error(), "48KiB") {
+		t.Fatalf("48KiB+1 必须触发护栏, err=%v", err)
+	}
 }
 
 func TestDirectiveLineLength_engineGuardViaGiantCustomPattern(t *testing.T) {
 	// Given：自定义规则携带 50KB pattern（渲染单行超 48KiB）
 	policy := &models.SecurityPolicy{
-		Mode:        "custom_only",
-		CustomRules: json.RawMessage(`[{"id":1,"name":"r","enabled":true,"action":"block","conditions":[{"target":"uri","operator":"contains","pattern":"` + strings.Repeat("a", 50*1024) + `"}]}]`),
+		Mode: "custom_only",
+		// custom_only + 启用规则会发射 body processor 守卫（id:11 计分=阈值），
+		// 阈值按真实库形态给合法值 5。
+		AnomalyThreshold: 5,
+		CustomRules:      json.RawMessage(`[{"id":1,"name":"r","enabled":true,"action":"block","conditions":[{"target":"uri","operator":"contains","pattern":"` + strings.Repeat("a", 50*1024) + `"}]}]`),
 	}
 
 	// When
-	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0)
+	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test")
 
 	// Then
 	if err == nil || !strings.Contains(err.Error(), "48KiB") {
@@ -78,12 +89,13 @@ func TestDirectiveLineLength_engineGuardViaGiantCustomPattern(t *testing.T) {
 func TestDirectiveLineLength_normalListsPass(t *testing.T) {
 	// Given：大名单（回归形状——名单走文件投影，护栏不误伤）
 	policy := &models.SecurityPolicy{
-		Mode:        "blocking",
-		IPBlacklist: jsonRawIPList(oversizedIPList(5000)),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		IPBlacklist:      jsonRawIPList(oversizedIPList(5000)),
 	}
 
 	// When
-	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0)
+	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test")
 
 	// Then：产物含 @ipListFast 文件引用且名单文件内容完整
 	if err != nil {

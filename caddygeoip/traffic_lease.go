@@ -198,6 +198,16 @@ type trafficLeaseRequest struct {
 	SampleN uint32 `json:"sample_n"`
 }
 
+// writeTrafficCollectorError 写 JSON 错误体并保留 application/json：
+// http.Error 会覆写 Content-Type 为 text/plain 并加 nosniff——错误体是 JSON
+// 文本而声明是纯文本，对任何直接解码错误体的消费者都是坑。文案均为固定
+// ASCII（无引号/控制字符），可直接拼接。
+func writeTrafficCollectorError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(`{"error":"` + message + `"}`))
+}
+
 // serveTrafficCollector admin API：POST 申请/续租，DELETE 释放，GET 状态。
 func serveTrafficCollector(w http.ResponseWriter, r *http.Request) error {
 	w.Header().Set("Content-Type", "application/json")
@@ -206,13 +216,13 @@ func serveTrafficCollector(w http.ResponseWriter, r *http.Request) error {
 	case http.MethodPost:
 		var req trafficLeaseRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-			http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+			writeTrafficCollectorError(w, http.StatusBadRequest, "invalid body")
 			return nil
 		}
 		if err := acquireTrafficLease(req.LeaseID, time.Duration(req.TTLMs)*time.Millisecond, req.SampleN); err != nil {
 			// 三种失败原因均为固定 ASCII 文案（无引号/控制字符），可直接拼进
 			// JSON；调用方（app 端点）原样转发该 400 状态。
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			writeTrafficCollectorError(w, http.StatusBadRequest, err.Error())
 			return nil
 		}
 		_, _ = w.Write([]byte(`{"enabled":true}`))
@@ -232,7 +242,7 @@ func serveTrafficCollector(w http.ResponseWriter, r *http.Request) error {
 		writeTrafficCollectorState(w)
 		return nil
 	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeTrafficCollectorError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return nil
 	}
 }

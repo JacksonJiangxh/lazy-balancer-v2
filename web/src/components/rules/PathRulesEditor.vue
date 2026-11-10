@@ -1,10 +1,7 @@
 <template>
   <div class="path-rules-editor">
     <div class="editor-section-header">
-      <div class="editor-heading-copy">
-        <h3 class="editor-title">自定义路由</h3>
-        <el-text type="info" size="small">按顺序匹配，先命中先生效；未命中走默认上游</el-text>
-      </div>
+      <DialogSectionHeader title="自定义路由" description="按顺序匹配，先命中先生效；未命中走默认上游" />
       <el-button type="primary" size="small" :icon="Plus" @click="addRule">添加路径规则</el-button>
     </div>
 
@@ -13,7 +10,7 @@
         v-for="(rule, index) in pathRules"
         :key="rule.id ?? `new-${index}`"
         shadow="never"
-        class="path-rule-card"
+        class="path-rule-card dialog-panel dialog-panel--flush"
       >
         <!-- 组内层次(用户裁定重构):徽标+操作行 → 匹配行 → 自定义上游开关行 → 缩进上游表格 -->
         <div class="path-rule-head">
@@ -49,14 +46,14 @@
                 size="small"
                 :aria-label="`路径规则 ${index + 1} 的路径`"
                 placeholder="例如：/api"
-                :class="{ 'is-error-input': rowError(index) }"
+                :class="{ 'is-error': rowDiagnostics[index]?.pathError }"
               />
-              <span v-if="rowError(index)" class="path-field-error">{{ rowError(index) }}</span>
-              <span v-else-if="rowShadowWarning(index)" class="path-field-warning">{{ rowShadowWarning(index) }}</span>
+              <span v-if="rowDiagnostics[index]?.pathError" class="path-field-error">{{ rowDiagnostics[index]?.pathError }}</span>
+              <span v-else-if="rowDiagnostics[index]?.shadow" class="path-field-warning">{{ rowDiagnostics[index]?.shadow }}</span>
             </div>
           </label>
 
-          <label v-if="isForwardMode(rule)" class="rule-field upstream-path-field">
+          <label v-if="isForwardResponseMode(rule)" class="rule-field upstream-path-field">
             <span class="rule-field-label">
               上游路径
               <!-- 语义说明合并为单一 tooltip:留空语义 + 前缀/精确改写示例 -->
@@ -68,9 +65,9 @@
                 size="small"
                 :aria-label="`路径规则 ${index + 1} 的上游路径`"
                 placeholder="留空=原样转发"
-                :class="{ 'is-error-input': upstreamError(index) }"
+                :class="{ 'is-error': rowDiagnostics[index]?.upstreamError }"
               />
-              <span v-if="upstreamError(index)" class="path-field-error">{{ upstreamError(index) }}</span>
+              <span v-if="rowDiagnostics[index]?.upstreamError" class="path-field-error">{{ rowDiagnostics[index]?.upstreamError }}</span>
             </div>
           </label>
         </div>
@@ -78,13 +75,13 @@
         <!-- 响应方式行（2026-10-10 用户裁定）：转发上游（默认）/直接返回/301 跳转 -->
         <div class="rule-field path-rule-mode-row">
           <span class="rule-field-label">响应方式</span>
-          <el-select v-model="rule.response_mode" size="small" style="width: 160px;" aria-label="响应方式" @change="onModeChange(rule)">
+          <el-select v-model="rule.response_mode" size="small" style="width: 160px;" aria-label="响应方式" @change="applyResponseMode(rule)">
             <!-- forward 为 UI 哨兵（el-select 空串选项不显示标签）——提交归一 '' -->
             <el-option label="转发上游（默认）" value="forward" />
             <el-option label="直接返回" value="static" />
             <el-option label="301 跳转" value="redirect" />
           </el-select>
-          <span class="form-tip-inline" v-if="isForwardMode(rule)">按路径转发到上游</span>
+          <span class="form-tip-inline" v-if="isForwardResponseMode(rule)">按路径转发到上游</span>
           <span class="form-tip-inline" v-else-if="rule.response_mode === 'static'">不访问上游，直接返回指定状态码与内容（该路径不经安全链：信任/IP 访问控制/限流/WAF 不生效）</span>
           <span class="form-tip-inline" v-else>不访问上游，301 永久跳转到目标地址（该路径不经安全链：信任/IP 访问控制/限流/WAF 不生效）</span>
         </div>
@@ -95,7 +92,7 @@
             <span class="rule-field-label">状态码</span>
             <!-- 标准全称显示（2026-10-10 用户裁定）：值仍为数字状态码 -->
             <el-select v-model="rule.response_status" size="small" style="width: 210px;" aria-label="状态码">
-              <el-option v-for="code in STATIC_STATUSES" :key="code" :label="`${code} ${STATUS_REASONS[code]}`" :value="code" />
+              <el-option v-for="code in STATIC_RESPONSE_STATUSES" :key="code" :label="`${code} ${STATIC_RESPONSE_STATUS_REASONS[code]}`" :value="code" />
             </el-select>
           </label>
           <label class="rule-field">
@@ -119,19 +116,19 @@
           <label class="rule-field" style="flex: 1;">
             <span class="rule-field-label">跳转地址</span>
             <div class="rule-field-control">
-              <el-input v-model="rule.redirect_to" size="small" placeholder="https://example.com/new 或 /new/" :aria-label="`路径规则 ${index + 1} 的跳转地址`" :class="{ 'is-error-input': responseError(index) }" />
-              <span v-if="responseError(index)" class="path-field-error">{{ responseError(index) }}</span>
+              <el-input v-model="rule.redirect_to" size="small" placeholder="https://example.com/new 或 /new/" :aria-label="`路径规则 ${index + 1} 的跳转地址`" :class="{ 'is-error': rowDiagnostics[index]?.responseError }" />
+              <span v-if="rowDiagnostics[index]?.responseError" class="path-field-error">{{ rowDiagnostics[index]?.responseError }}</span>
             </div>
           </label>
         </div>
 
-        <div v-if="isForwardMode(rule)" class="custom-upstream-toggle">
+        <div v-if="isForwardResponseMode(rule)" class="custom-upstream-toggle">
           <span class="custom-upstream-title">使用自定义上游</span>
           <el-switch :model-value="rule.upstreams !== null" @change="toggleCustomUpstreams(rule, $event)" />
           <span class="form-tip-inline">关闭时使用规则的默认上游服务器</span>
         </div>
 
-        <div v-if="rule.upstreams !== null" class="custom-upstream-editor">
+        <div v-if="rule.upstreams !== null" class="custom-upstream-editor dialog-panel">
           <div class="upstream-grid upstream-grid-header" aria-hidden="true">
             <span>协议</span>
             <span>地址</span>
@@ -147,7 +144,7 @@
                 <el-option value="https" label="HTTPS" />
               </el-select>
             </label>
-            <label class="upstream-field upstream-address-field">
+            <label class="upstream-field">
               <span class="mobile-field-label">地址</span>
               <el-input v-model="upstream.address" size="small" :aria-label="`路径规则 ${index + 1} 自定义上游 ${upstreamIndex + 1} 地址`" placeholder="IP 或域名" />
             </label>
@@ -165,7 +162,8 @@
           </div>
           <div class="add-upstream-actions">
             <el-button class="add-upstream-button" size="small" plain :icon="Plus" :disabled="rule.upstreams.length >= MAX_UPSTREAM_ROWS" @click="addUpstream(rule)">添加上游</el-button>
-            <el-text v-if="rule.upstreams.length >= MAX_UPSTREAM_ROWS" type="info" size="small">最多添加 {{ MAX_UPSTREAM_ROWS }} 个上游</el-text>
+            <el-text v-if="rule.upstreams.length > MAX_UPSTREAM_ROWS" type="warning" size="small">已有 {{ rule.upstreams.length }} 个上游（超过编辑器 {{ MAX_UPSTREAM_ROWS }} 行上限）：权重仍可调整且不再被清零，保存前请删至 {{ MAX_UPSTREAM_ROWS }} 个以内，或通过 API 维护</el-text>
+            <el-text v-else-if="rule.upstreams.length >= MAX_UPSTREAM_ROWS" type="info" size="small">最多添加 {{ MAX_UPSTREAM_ROWS }} 个上游</el-text>
           </div>
         </div>
       </el-card>
@@ -174,129 +172,44 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import { ArrowDown, ArrowUp, Delete, Plus } from '@element-plus/icons-vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
+import DialogSectionHeader from '@/components/DialogSectionHeader.vue'
 import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
-import { canonicalPathKey } from '@/utils/ruleValidation'
+import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, upstreamPathRuleError } from '@/utils/ruleValidation'
+import {
+  applyResponseMode,
+  isForwardResponseMode,
+  pathRuleResponseError,
+  pathRuleRowError,
+  pathRuleShadowWarning,
+} from '@/utils/pathRulesEditor'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
-
-const rowError = (index: number): string => {
-  const rule = pathRules.value[index]
-  if (!rule) return ''
-  // M32：与后端/validatePathRules 同口径——前缀校验用原始串（后端 HasPrefix 在
-  // TrimSpace 之前），查重与跨类型遮蔽互查用 canonicalPathKey 归一。
-  if (rule.path !== '' && !rule.path.startsWith('/')) return '必须以 / 开头'
-  if (/[*?{}]/.test(rule.path)) return '不能包含 * ? { } 通配字符'
-  if (rule.path.trim() === '') return ''
-  const canonical = canonicalPathKey(rule.match_type, rule.path)
-  const dupIndex = pathRules.value.findIndex((other, otherIndex) =>
-    otherIndex !== index && other.path.trim() !== '' && canonicalPathKey(other.match_type, other.path) === canonical)
-  if (dupIndex >= 0) {
-    const other = pathRules.value[dupIndex]
-    if (!other) return ''
-    return other.match_type === rule.match_type
-      ? `与规则 ${dupIndex + 1} 重复`
-      : `与规则 ${dupIndex + 1} 同路径前缀+精确互相遮蔽`
-  }
-  return ''
-}
-
-// LB41-6(第 41 轮,P5):前序 prefix 规则遮蔽提示——后端有意放行(测试钉住),
-// 仅 UI 非阻断警告。判定口径与 services/caddy.go pathMatcherSpecs + terminal
-// 路由一致:prefix 渲染 [root, root/*] 双 matcher(root=剥尾 / 与 *,剥空=
-// /* 全匹配),路由按 sort_order 稳定排序、先命中即终结,故前序 prefix P 遮蔽
-// 后序规则 Q 当且仅当 canonical(Q)===root(P) 或以 root(P)+"/" 开头。
-const shadowedByIndex = (index: number): number => {
-  const rule = pathRules.value[index]
-  if (!rule) return -1
-  // 非法/空路径由 rowError 负责,不参与遮蔽判定(避免提示噪音)
-  if (rule.path !== '' && !rule.path.startsWith('/')) return -1
-  if (/[*?{}]/.test(rule.path)) return -1
-  if (rule.path.trim() === '') return -1
-  const canonical = canonicalPathKey(rule.match_type, rule.path)
-  for (let priorIndex = 0; priorIndex < index; priorIndex++) {
-    const prior = pathRules.value[priorIndex]
-    if (!prior || prior.match_type !== 'prefix') continue
-    if (prior.path.trim() === '' || !prior.path.startsWith('/') || /[*?{}]/.test(prior.path)) continue
-    const root = canonicalPathKey('prefix', prior.path)
-    if (root === '/' || canonical === root || canonical.startsWith(`${root}/`)) return priorIndex
-  }
-  return -1
-}
-
-const rowShadowWarning = (index: number): string => {
-  const priorIndex = shadowedByIndex(index)
-  if (priorIndex < 0) return ''
-  const prior = pathRules.value[priorIndex]
-  return `被前序前缀规则 ${priorIndex + 1}（${prior?.path.trim() ?? ''}）遮蔽，不会生效`
-}
-
-// 直接返回/301 跳转（2026-10-10 用户裁定）：常用状态码白名单（与后端
-// validStaticResponseStatuses / ruleValidation.ts 同源）
-const STATIC_STATUSES: readonly number[] = [200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503]
-
-// STATUS_REASONS 状态码标准全称（下拉显示用；值仍为数字状态码）
-const STATUS_REASONS: Readonly<Record<number, string>> = {
-  200: 'OK', 201: 'Created', 204: 'No Content',
-  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 410: 'Gone',
-  500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
-}
-
-// isForwardMode 转发判定：''（API 形态）与 'forward'（UI 哨兵——el-select 空串
-// 选项不显示标签）同为转发；提交时归一为 ''。
-const isForwardMode = (rule: PathRule): boolean => !rule.response_mode || rule.response_mode === 'forward'
-
-// onModeChange 模式切换归一：非转发模式清空转发专属字段（上游路径/自定义上游），
-// 跳转/静态互清对方字段，静态进场补默认值（后端写侧同口径归一）。
-const onModeChange = (rule: PathRule): void => {
-  if (!isForwardMode(rule)) {
-    rule.upstream_path = ''
-    rule.upstreams = null
-  }
-  if (rule.response_mode === 'static') {
-    rule.redirect_to = ''
-    if (!rule.response_status) rule.response_status = 200
-    if (!rule.response_content_type) rule.response_content_type = 'text/plain'
-  } else if (rule.response_mode === 'redirect') {
-    rule.response_body = ''
-    rule.response_content_type = ''
-  } else {
-    rule.response_status = 200
-    rule.response_body = ''
-    rule.response_content_type = ''
-    rule.redirect_to = ''
-  }
-}
-
-// responseError 行内校验（与后端 validateRuleFeatures / ruleValidation.ts 同口径）
-const responseError = (index: number): string => {
-  const rule = pathRules.value[index]
-  if (!rule) return ''
-  if (rule.response_mode === 'redirect') {
-    const target = (rule.redirect_to ?? '').trim()
-    if (!target) return '301 跳转需要填写跳转地址'
-    // eslint-disable-next-line no-control-regex
-    if (/[\x00-\x1f\x7f]/.test(target)) return '跳转地址含非法字符'
-    if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径'
-  }
-  return ''
-}
 
 const normalizeOrder = (): void => {
   pathRules.value.forEach((rule, index) => { rule.sort_order = index })
 }
 
 // 上游路径改写：与后端 validateRuleFeatures 同口径——非空须以 / 开头且
-// 不含空格 ? #（query/fragment 不允许）；空串=原样转发。返回空串即无错误。
+// 不含空格 ? #（query/fragment 不允许）；空串=原样转发。判据单源在
+// utils/ruleValidation.upstreamPathRuleError。返回空串即无错误。
 const upstreamError = (index: number): string => {
   const rule = pathRules.value[index]
-  if (!rule || !rule.upstream_path) return ''
-  if (!rule.upstream_path.startsWith('/')) return '必须以 / 开头'
-  if (/[\s?#]/.test(rule.upstream_path)) return '不能包含空格 ? # 字符'
-  return ''
+  if (!rule) return ''
+  return upstreamPathRuleError(rule.upstream_path ?? '') ?? ''
 }
+
+// 每轮响应式求值只为每行计算一次诊断；模板多属性读取共享结果，
+// 不再为同一行重复执行全表重复/遮蔽扫描。
+const rowDiagnostics = computed(() => pathRules.value.map((_, index) => ({
+  pathError: pathRuleRowError(pathRules.value, index),
+  shadow: pathRuleShadowWarning(pathRules.value, index),
+  upstreamError: upstreamError(index),
+  responseError: pathRuleResponseError(pathRules.value[index]),
+})))
 
 const addRule = (): void => {
   pathRules.value.push({ match_type: 'prefix', path: '/', upstream_path: '', sort_order: pathRules.value.length, upstreams: null, response_mode: 'forward', response_status: 200, response_body: '', response_content_type: '', redirect_to: '' })
@@ -346,12 +259,10 @@ const onWeightChange = (rule: PathRule, index: number): void => {
 </script>
 
 <style scoped>
-.path-rules-editor { display: flex; flex-direction: column; gap: 16px; padding: 0 20px; }
+.path-rules-editor { display: flex; flex-direction: column; gap: 6px; padding: 0 20px; }
 .editor-section-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.editor-heading-copy { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.editor-title { margin: 0; color: var(--text-primary); font-size: 14px; font-weight: 600; }
-.path-rules-list { display: flex; flex-direction: column; gap: 12px; }
-.path-rule-card :deep(.el-card__body) { padding: 12px 14px; }
+.path-rules-list { display: flex; flex-direction: column; }
+.path-rule-card :deep(.el-card__body) { padding: 12px; }
 /* 层次一：徽标 + 行内操作，动作列固定右上不随字段挤压 */
 .path-rule-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .path-rule-order { padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-secondary); color: var(--text-secondary); font-size: 12px; font-weight: 600; white-space: nowrap; }
@@ -372,21 +283,8 @@ const onWeightChange = (rule: PathRule, index: number): void => {
 .path-rule-response-row { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
 /* 层次二/三：开关行单句说明 + 满宽次级卡片（左右贴齐外层卡片内容缘，双侧同 padding），行距统一 12px */
 .custom-upstream-toggle { display: flex; align-items: center; gap: 8px; min-height: 24px; }
-/* 处理方式行：方式选择与响应码同基线；静态响应时上游相关区块整体隐藏 */
-.path-rule-action-row { display: flex; align-items: flex-start; gap: 12px; margin-top: 4px; }
-.action-field { flex: 0 0 auto; }
-.action-select { width: 128px; }
-.status-field { flex: 0 0 auto; }
-.status-select { width: 200px; }
-/* 静态响应编辑区：与自定义上游编辑器同款的满宽次级卡片 */
-.respond-editor { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-secondary); }
-.respond-field { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
-.respond-field-label { color: var(--el-text-color-regular); font-size: 13px; }
-.required-mark { color: var(--el-color-danger); }
-.respond-hint { color: var(--el-text-color-placeholder); font-size: 12px; }
-.respond-note { padding: 2px 0; }
 .custom-upstream-title { color: var(--el-text-color-regular); font-size: 13px; }
-.custom-upstream-editor { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-secondary); }
+.custom-upstream-editor { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .upstream-grid { display: grid; grid-template-columns: minmax(0, 0.45fr) minmax(0, 1fr) minmax(0, 0.4fr) minmax(0, 0.4fr) auto; align-items: center; gap: 8px; }
 .upstream-grid-header { color: var(--text-secondary); font-size: 12px; font-weight: 500; }
 .upstream-field { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
@@ -424,8 +322,5 @@ const onWeightChange = (rule: PathRule, index: number): void => {
   font-size: 12px;
   line-height: 1;
   color: var(--el-color-warning);
-}
-.is-error-input :deep(.el-input__wrapper) {
-  box-shadow: 0 0 0 1px var(--el-color-danger) inset;
 }
 </style>

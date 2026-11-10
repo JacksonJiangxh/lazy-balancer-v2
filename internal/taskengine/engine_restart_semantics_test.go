@@ -1,13 +1,14 @@
 package taskengine
 
 import (
+	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// 第 66 轮 U1-66-01/02/04 + L1-66-01 修复钉测试。
 // 形状来源：生产调用形态=启动/翻转期三连 SetMasterRole→SetRole（每次转发），
 // 既有测试每轮只翻一次与生产不符——本文件按真实形态钉。
 
@@ -25,35 +26,23 @@ func daemonRunning(e *Engine, id string) bool {
 	return r.running
 }
 
-// waitDaemonNotRunning 轮询直到真实 running 位归 false。
-func waitDaemonNotRunning(t *testing.T, e *Engine, id string, timeout time.Duration) bool {
+// waitDaemonNotRunning 等待真实 running 位归 false。what 描述失败场景——
+// waitForEngine 超时会带着它失败，调用方无需 `if !...` 外壳（旧布尔返回恒为
+// true，造就死分支）。
+func waitDaemonNotRunning(t *testing.T, e *Engine, id string, timeout time.Duration, what string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !daemonRunning(e, id) {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return !daemonRunning(e, id)
+	waitForEngine(t, what, timeout, func() bool { return !daemonRunning(e, id) })
 }
 
-// waitNotRunning 轮询直到 IsRunning(id)==false 或超时。
-func waitNotRunning(t *testing.T, e *Engine, id string, timeout time.Duration) bool {
+// waitNotRunning 等待 IsRunning(id)==false（what 同上承载失败场景）。
+func waitNotRunning(t *testing.T, e *Engine, id string, timeout time.Duration, what string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !e.IsRunning(id) {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return !e.IsRunning(id)
+	waitForEngine(t, what, timeout, func() bool { return !e.IsRunning(id) })
 }
 
 // Given RoleAny 常驻已运行 + 三连同角色 SetRole 重申（生产启动/翻转形态）。
 // When 用户 StopLoop。
-// Then daemon 停止且不复活（SetRole 重申不得栽 pendingRestart——U1-66-01①）。
+// Then daemon 停止且不复活（SetRole 重申不得栽 pendingRestart——①）。
 func TestEngine_SetRoleReassertionDoesNotReviveStoppedDaemon(t *testing.T) {
 	e := newTestEngine(t)
 	started := make(chan struct{}, 4)
@@ -71,9 +60,7 @@ func TestEngine_SetRoleReassertionDoesNotReviveStoppedDaemon(t *testing.T) {
 	e.SetRole(true)
 	e.SetRole(true)
 	e.StopLoop("t-ra")
-	if !waitNotRunning(t, e, "t-ra", time.Second) {
-		t.Fatal("StopLoop 后 daemon 应停止")
-	}
+	waitNotRunning(t, e, "t-ra", time.Second, "StopLoop 后 daemon 应停止")
 	// 停止后 300ms 内不得复活（误栽 pendingRestart 的复活面）
 	time.Sleep(300 * time.Millisecond)
 	if e.IsRunning("t-ra") {
@@ -84,7 +71,7 @@ func TestEngine_SetRoleReassertionDoesNotReviveStoppedDaemon(t *testing.T) {
 // Given master-only 常驻在主节点运行 + 启动/重申期 SetRole(true) 已栽标
 // （生产形态：main 启动三连 SetMasterRole 全部走允许侧 tryStartDaemon）。
 // When demote（三连 SetRole(false)——生产形态）。
-// Then Run 取消退出后**不得按栽标在从节点复活**（U1-66-01③a）。
+// Then Run 取消退出后**不得按栽标在从节点复活**。
 func TestEngine_DemoteTripleSetRoleDoesNotReviveOnSlave(t *testing.T) {
 	e := newTestEngine(t)
 	started := make(chan struct{}, 4)
@@ -104,9 +91,7 @@ func TestEngine_DemoteTripleSetRoleDoesNotReviveOnSlave(t *testing.T) {
 	e.SetRole(false)
 	e.SetRole(false)
 	e.SetRole(false)
-	if !waitNotRunning(t, e, "t-mo", time.Second) {
-		t.Fatal("demote 后 master-only daemon 不得在从节点继续/复活运行")
-	}
+	waitNotRunning(t, e, "t-mo", time.Second, "demote 后 master-only daemon 不得在从节点继续/复活运行")
 	time.Sleep(300 * time.Millisecond)
 	if e.IsRunning("t-mo") {
 		t.Fatal("demote 后 master-only daemon 在从节点复活——违反禁签发不变量")
@@ -114,7 +99,7 @@ func TestEngine_DemoteTripleSetRoleDoesNotReviveOnSlave(t *testing.T) {
 }
 
 // Given 常驻运行中且已被 SetRole 重申（bug 形态下会栽标）。
-// When Engine.Stop()（进程退出——U10 补充的第四触发面）。
+// When Engine.Stop()（进程退出——补充的第四触发面）。
 // Then 不在 teardown 中拉起新代。
 func TestEngine_StopPreventsRestart(t *testing.T) {
 	e := newTestEngine(t)
@@ -131,14 +116,12 @@ func TestEngine_StopPreventsRestart(t *testing.T) {
 	e.SetRole(true) // 生产启动期恒有的角色重申
 	e.Stop()
 	// Stop 后 cleanup 消费 pendingRestart 的路径必须被 stopped 门拦下
-	if !waitDaemonNotRunning(t, e, "t-sp", 500*time.Millisecond) {
-		t.Fatal("Engine.Stop 后不得复活 daemon（teardown 复活面）")
-	}
+	waitDaemonNotRunning(t, e, "t-sp", 500*time.Millisecond, "Engine.Stop 后不得复活 daemon（teardown 复活面）")
 }
 
 // Given master-only Periodic（interval 1h）在从节点 StartLoop。
 // When 若干 tick 后 promote（SetRole(true)）。
-// Then 首轮在 promote 后立即执行（U1-66-02：置零分支不可达+tick 在角色门
+// Then 首轮在 promote 后立即执行（置零分支不可达+tick 在角色门
 // 前推进 lastCheck——两处叠加使首轮要等残余间隔）。
 func TestEngine_PeriodicRunsPromptlyAfterPromote(t *testing.T) {
 	e := newTestEngine(t)
@@ -164,7 +147,7 @@ func TestEngine_PeriodicRunsPromptlyAfterPromote(t *testing.T) {
 }
 
 // Given StartLoop→StopLoop→StartLoop（restart 过渡）后立即 StopLoop
-// （U1-66-04：restart 路径的 startDaemon 由退出 goroutine 异步调用——
+// （restart 路径的 startDaemon 由退出 goroutine 异步调用——
 // 占位与 cancel 登记之间的窗口内取消者读到 cancel==nil）。
 // When 重复 20 次。
 // Then 每次 daemon 最终停止（首停信号不得丢失）。
@@ -178,13 +161,12 @@ func TestEngine_StopLoopImmediatelyAfterStartEventuallyStops(t *testing.T) {
 		e.StopLoop("t-w")
 		e.StartLoop("t-w") // restart 过渡（pendingRestart 消费路径）
 		e.StopLoop("t-w")
-		if !waitNotRunning(t, e, "t-w", 400*time.Millisecond) {
-			t.Fatalf("第 %d 次 restart 过渡中 StopLoop：daemon 未停止（首停信号丢失——cancel 登记滞后窗口）", i+1)
-		}
+		waitNotRunning(t, e, "t-w", 400*time.Millisecond,
+			fmt.Sprintf("第 %d 次 restart 过渡中 StopLoop：daemon 未停止（首停信号丢失——cancel 登记滞后窗口）", i+1))
 	}
 }
 
-// Given oneshot 任务体 panic（L1-66-01）。
+// Given oneshot 任务体 panic。
 // When Trigger。
 // Then panic 被隔离为 failed 行（不得杀进程）。
 func TestEngine_TaskRunPanicRecordsFailed(t *testing.T) {
@@ -204,35 +186,27 @@ func TestEngine_TaskRunPanicRecordsFailed(t *testing.T) {
 	}
 }
 
-// Given daemon 任务体启动即 panic（L1-66-01）。
+// Given daemon 任务体启动即 panic。
 // When StartLoop。
-// Then 补记 failed 行且不自动重启（防紧循环）。
-func TestEngine_DaemonRunPanicRecordsFailedNoRestart(t *testing.T) {
+// Then 补记 failed 行且退避窗口内不得紧循环（起异常退出按有界退避
+// 重拉——默认首档 1s，本断言窗口 200ms 内必须保持未运行；重拉本身由
+// u05_r79_test.go 的缩短退避用例覆盖）。
+func TestEngine_DaemonRunPanicRecordsFailedWithBackoff(t *testing.T) {
 	e := newTestEngine(t)
 	e.Register(Descriptor{ID: "t-dpanic", Family: "t", Name: "恐慌常驻", Kind: KindDaemon, RunsOn: RoleAny,
 		Run: func(rc RunContext) error { panic("daemon boom") }})
 	e.SetRole(true)
 	e.StartLoop("t-dpanic")
 	// 补 failed 行
-	deadline := time.Now().Add(time.Second)
-	sawFailed := false
-	for time.Now().Before(deadline) {
-		if rec := e.LatestRun("t-dpanic"); rec != nil && rec.Status == "failed" {
-			sawFailed = true
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !sawFailed {
-		t.Fatal("daemon panic 应补记 failed 行")
-	}
-	// 不自动重启：真实运行位归 false 后保持
-	if !waitDaemonNotRunning(t, e, "t-dpanic", time.Second) {
-		t.Fatal("daemon panic 后不得自动重启（防紧循环）")
-	}
+	waitForEngine(t, "daemon panic failed 行", time.Second, func() bool {
+		rec := e.LatestRun("t-dpanic")
+		return rec != nil && rec.Status == "failed"
+	})
+	// 退避窗口内不得紧循环（真实运行位归 false 后保持）
+	waitDaemonNotRunning(t, e, "t-dpanic", time.Second, "daemon panic 后必须退出运行（不得紧循环）")
 	time.Sleep(200 * time.Millisecond)
 	if daemonRunning(e, "t-dpanic") {
-		t.Fatal("daemon panic 后被自动重启——紧循环风险")
+		t.Fatal("daemon panic 后在退避窗口内被立即重启——紧循环风险")
 	}
 }
 
@@ -330,7 +304,7 @@ func TestEngine_RoleFlipWithoutFlagNoRestart(t *testing.T) {
 
 // Given master-only Scheduled 任务在途（Run 阻塞于 rc.Ctx.Done）。
 // When demote（SetRole(false)，生产形态）。
-// Then 在途 Run 被中止且终态落 cancelled（F-L2-68-01：SetRole targets 曾仅
+// Then 在途 Run 被中止且终态落 cancelled（SetRole targets 曾仅
 // Daemon/Periodic——定时族在途 Run 继续跑完，demote 后从节点写面（三库
 // 版本行/名单/规则树）打破只读不变量；取消经 rc.Ctx 传播，Run 体据此落
 // skipped 与起点角色复查对齐）。
@@ -340,7 +314,7 @@ func TestEngine_DemoteCancelsInFlightScheduled(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-sched", Family: "t", Name: "定时", Kind: KindScheduled, RunsOn: RoleMasterOnly,
-		// TASK-L2（第 69 轮）配套：Scheduled 注册必须带 NextSlotFn（远期槽——
+		// 配套：Scheduled 注册必须带 NextSlotFn（远期槽——
 		// tick 不触发，本测试经 Trigger 驱动在途形态）。
 		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
 		Run: func(rc RunContext) error {
@@ -368,9 +342,87 @@ func TestEngine_DemoteCancelsInFlightScheduled(t *testing.T) {
 	}
 }
 
+// Given：到期 Scheduled 已执行一次（成功轮消费槽：schedDoneSlot=该槽）。
+// When：StopLoop 后再次 tick（槽与水位保持停止前形态）。
+// Then：不得复活派发，且停止前已消费的槽水位不被 tick 改写——tick 对已停
+// 任务零求值零改写（loopEnabled 门先于一切求值；同表驱动对照
+// TestEngine_ScheduledStoppedLoopDoesNotDispatch 钉「停止先于 tick」形态）。
+func TestEngine_StopLoopPreservesConsumedSlotWatermark(t *testing.T) {
+	e := newTestEngine(t)
+	pastSlot := time.Now().Add(-time.Hour)
+	started := make(chan struct{}, 1)
+	var runs atomic.Int32
+	e.Register(Descriptor{ID: "t-stop-sched", Family: "t", Name: "停止定时", Kind: KindScheduled, RunsOn: RoleAny,
+		NextSlotFn: func() time.Time { return pastSlot },
+		Run: func(RunContext) error {
+			runs.Add(1)
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			return nil
+		}})
+	e.SetRole(true)
+	e.StartLoop("t-stop-sched")
+	e.tick()
+	<-started
+	// 等在途轮排空：executeRun 尾部回写消费水位（success+槽未推进→消费）。
+	waitForEngine(t, "首轮回写落定", 2*time.Second, func() bool { return e.inFlight.Load() == 0 })
+
+	// When：关闭调度后再次 tick（槽仍是过去值）。
+	e.StopLoop("t-stop-sched")
+	e.tick()
+	// Then：不得再触发（StopLoop 是 Scheduled 唯一停调入口）。
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("StopLoop 后 Run 次数=%d, want 1", got)
+	}
+	if loopEnabledOf(t, e, "t-stop-sched") {
+		t.Fatal("StopLoop 后调度开关仍为开")
+	}
+	// 已消费槽水位不被 tick 复活/改写：done=该槽、槽缓存原值保留。
+	slot, done, _, _ := scheduleStateOf(t, e, "t-stop-sched")
+	if !done.Equal(pastSlot) {
+		t.Fatalf("已消费槽水位 done=%v, want %v（tick 不得改写停止前的消费水位）", done, pastSlot)
+	}
+	if !slot.Equal(pastSlot) {
+		t.Fatalf("停止后 tick 改写了槽缓存 slot=%v, want %v", slot, pastSlot)
+	}
+	if got := countRuns(t, "t-stop-sched"); got != 1 {
+		t.Fatalf("StopLoop 后追加 task_runs=%d, want 0", got-1)
+	}
+}
+
+func TestEngine_RapidRoleFlipRestartsMasterOnlyDaemon(t *testing.T) {
+	// Given：master-only daemon 第一代运行中。
+	e := newTestEngine(t)
+	starts := make(chan struct{}, 2)
+	e.Register(Descriptor{ID: "t-flip-fast", Family: "t", Name: "快速翻转", Kind: KindDaemon, RunsOn: RoleMasterOnly,
+		Run: func(rc RunContext) error {
+			starts <- struct{}{}
+			<-rc.Ctx.Done()
+			return rc.Ctx.Err()
+		}})
+	e.StartLoop("t-flip-fast")
+	<-starts
+
+	// When：demote 后立即 promote（旧代尚未退出清理）。
+	e.SetRole(false)
+	e.SetRole(true)
+
+	// Then：必须记录重启意图并在旧代退出后拉起第二代，不得 loop_on=true/running=false。
+	select {
+	case <-starts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("快速 demote→promote 后未拉起第二代 daemon")
+	}
+	if !daemonRunning(e, "t-flip-fast") {
+		t.Fatal("快速角色翻转后 daemon 实态为 stopped")
+	}
+}
+
 // Given master-only Periodic 任务在途（Run 阻塞于 rc.Ctx.Done）。
 // When demote（SetRole(false)，生产形态）。
-// Then 在途 Run 被中止且终态落 cancelled（X-3 第 73 轮：Periodic 分支曾仅在
+// Then 在途 Run 被中止且终态落 cancelled（Periodic 分支曾仅在
 // 角色获得时置零节拍，demote 不取消在途 Run——与 Scheduled 分支同型的只读
 // 不变量破坏：从节点写面继续跑完。本测试钉「镜像 Scheduled 取消」）。
 func TestEngine_DemoteCancelsInFlightPeriodic(t *testing.T) {
@@ -379,7 +431,7 @@ func TestEngine_DemoteCancelsInFlightPeriodic(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-periodic", Family: "t", Name: "周期", Kind: KindPeriodic, RunsOn: RoleMasterOnly,
-		// TASK-L2（第 69 轮）配套：Periodic 注册必须带 IntervalFn（长间隔——
+		// 配套：Periodic 注册必须带 IntervalFn（长间隔——
 		// tick 不触发，本测试经 Trigger 驱动在途形态）。
 		IntervalFn: func() time.Duration { return time.Hour },
 		Run: func(rc RunContext) error {

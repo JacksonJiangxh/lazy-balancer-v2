@@ -3,10 +3,13 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +20,48 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+func TestSetClusterMode_rejectsRegisteringNodeAsItsOwnSlave(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	var registrationCalls atomic.Int32
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		registrationCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"registration_id":1,"registration_secret":"secret"}}`))
+	}))
+	defer master.Close()
+	parsed, err := url.Parse(master.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.NodeName = "self-node"
+	h.cfg.Port = port
+	h.syncService = services.NewSyncService(db.DB, h.cfg, services.NewCaddyService("http://127.0.0.1:1"))
+	router := gin.New()
+	router.POST("/cluster/mode", h.SetClusterMode)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/cluster/mode", strings.NewReader(`{"mode":"slave","master_url":"`+master.URL+`","register_token":"one-time"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不能将本节点注册为自己的从节点") {
+		t.Fatalf("status=%d body=%s, want self-registration 400", response.Code, response.Body.String())
+	}
+	if got := registrationCalls.Load(); got != 0 {
+		t.Fatalf("registration calls=%d, self-registration must be rejected before network", got)
+	}
+	var isMaster bool
+	if err := db.DB.QueryRow("SELECT is_master FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+		t.Fatal(err)
+	}
+	if !isMaster {
+		t.Fatal("rejected self-registration changed node role")
+	}
+}
+
 func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -26,8 +71,9 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
-	// CLUSTER-1（第 72 轮审计）：本地转换失败的注入不再关闭包级 db.DB——
+	// 本地转换失败的注入不再关闭包级 db.DB——
 	// 假 handler 关包级句柄会污染全局状态（Cleanup 前的审计与断言全踩
 	// closed 连接）。改为给 clusterService 单独注入已关闭句柄，BecomeSlave
 	// 的 DB 失败语义不变且不外溢。
@@ -47,7 +93,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 	h := &Handlers{
 		cfg:            cfg,
 		syncService:    services.NewSyncService(db.DB, cfg, services.NewCaddyService("http://127.0.0.1:1")),
-		clusterService: services.NewClusterService(closedDB, nil, ""),
+		clusterService: services.NewClusterService(closedDB, ""),
 	}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -80,7 +126,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 	}
 }
 
-// CL43-2(第 43 轮):syncService 缺失的 503 必须先于 Promote 生效——此前先
+// syncService 缺失的 503 必须先于 Promote 生效——此前先
 // Promote(角色已提升)再报 503,调用方见到失败但节点已变主,重试撞
 // ErrAlreadyMaster。
 func TestPromoteClusterNode_reportsUnavailableBeforePromoting(t *testing.T) {
@@ -92,11 +138,12 @@ func TestPromoteClusterNode_reportsUnavailableBeforePromoting(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0, master_url='', cluster_token='' WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	h := &Handlers{clusterService: services.NewClusterService(db.DB, nil, "")}
+	h := &Handlers{clusterService: services.NewClusterService(db.DB, "")}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/cluster/promote", h.PromoteClusterNode)
@@ -127,6 +174,7 @@ func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	master := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("credentialed master URL reached the remote server")
@@ -141,7 +189,7 @@ func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t
 	h := &Handlers{
 		cfg:            cfg,
 		syncService:    services.NewSyncService(db.DB, cfg, services.NewCaddyService("http://127.0.0.1:1")),
-		clusterService: services.NewClusterService(db.DB, nil, ""),
+		clusterService: services.NewClusterService(db.DB, ""),
 	}
 	router := gin.New()
 	router.POST("/cluster/mode", h.SetClusterMode)
@@ -169,7 +217,7 @@ func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t
 }
 
 func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
-	// R42 发现1：handler 必须把 ErrInvalidSyncInterval 映射为 400（原实现统一 403），
+	// handler 必须把 ErrInvalidSyncInterval 映射为 400（原实现统一 403），
 	// 合法区间仍返回 200。
 	h := newBackupTestHandlers(t)
 	router := gin.New()
@@ -200,11 +248,25 @@ func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
 			if tc.wantBody != "" && !strings.Contains(response.Body.String(), tc.wantBody) {
 				t.Fatalf("body=%s, want to contain %q", response.Body.String(), tc.wantBody)
 			}
+			// 合法区间必须真正落库（只断 200 时写入退化也全绿）。
+			if tc.wantStatus == http.StatusOK {
+				var stored int
+				if err := db.DB.QueryRow(`SELECT COALESCE(sync_interval,0) FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+					t.Fatal(err)
+				}
+				var want int
+				if _, err := fmt.Sscanf(tc.payload, `{"sync_interval":%d}`, &want); err != nil {
+					t.Fatalf("parse payload %q: %v", tc.payload, err)
+				}
+				if stored != want {
+					t.Fatalf("global_config.sync_interval=%d, want %d（合法值必须落库）", stored, want)
+				}
+			}
 		})
 	}
 }
 
-// SR9-1(第 9 轮审计):恒同步拒绝属客户端错误 → 400(与间隔校验同型),
+// 恒同步拒绝属客户端错误 → 400(与间隔校验同型),
 // 此前普通 error 落 403 与 apidocs 声称相悖。
 func TestUpdateClusterSettings_rejectsDisablingSyncUsersAs400(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -219,7 +281,7 @@ func TestUpdateClusterSettings_rejectsDisablingSyncUsersAs400(t *testing.T) {
 	}
 }
 
-// CL41 观察项转正(第 41 轮):集群设置审计的 sync_rules 标签必须与设置卡/
+// 观察项转正:集群设置审计的 sync_rules 标签必须与设置卡/
 // 新版 hover 标签统一为「负载均衡规则」(不再用旧称「负载规则」)。
 func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 	// Given
@@ -243,5 +305,103 @@ func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 	}
 	if !strings.Contains(detail, "负载均衡规则：关闭") {
 		t.Fatalf("audit detail=%q, want unified label 负载均衡规则", detail)
+	}
+}
+
+// 空 body 的幂等空保存曾落「更新/集群设置」零详情审计
+// （parts 为空 → Join 空串），无法区分「无修改」与记录缺陷——复用同域既有
+// 「无修改」文案（caproviders/certificates 同口径）。
+func TestUpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	router := gin.New()
+	router.PUT("/cluster/settings", h.UpdateClusterSettings)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/cluster/settings", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（幂等空保存）", response.Code, response.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='集群设置' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("query settings audit: %v", err)
+	}
+	if !strings.Contains(detail, "无修改") {
+		t.Fatalf("audit detail=%q, want 无修改（空变更不得零详情）", detail)
+	}
+}
+
+// 导入窗口节点写门覆盖了
+// 注册/审批/改址/清 pin/上报，但漏掉角色切换端点——SetClusterMode 在远端
+// 注册后写 global_config、Promote 写 global_config，导入事务全量替换
+// global_config 时会被覆盖（含远端孤儿注册）。本测试钉住三端点在导入窗口内
+// 一律 409 fast-fail（先于任何网络副作用与 DB 写）。
+func TestClusterRoleEndpoints409DuringImport(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.syncService = services.NewSyncService(db.DB, &config.Config{DataDir: t.TempDir()}, nil)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/cluster/mode", h.SetClusterMode)
+	router.POST("/cluster/promote", h.PromoteClusterNode)
+	router.PUT("/cluster/settings", h.UpdateClusterSettings)
+
+	beginImportWindowForTest(t)
+	calls := []struct {
+		method, path, body string
+	}{
+		{"POST", "/cluster/mode", `{"mode":"slave","master_url":"https://master.example:8443","register_token":"one-time","node_name":"slave-a"}`},
+		{"POST", "/cluster/promote", ``},
+		{"PUT", "/cluster/settings", `{"sync_interval":60}`},
+	}
+	for _, call := range calls {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(call.method, call.path, strings.NewReader(call.body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s %s status=%d body=%s, want 409（导入窗口角色切换 fast-fail）", call.method, call.path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "配置导入进行中") {
+			t.Fatalf("%s %s body=%s, want 配置导入进行中 文案", call.method, call.path, rec.Body.String())
+		}
+	}
+}
+
+// 重新注册成功的唯一出口：BecomeSlave 后必须调用 syncService.Resume()——
+// Halted（令牌撤销/schema 不匹配）态下 Start() 是 no-op，删除该行会让从节点
+// 重新注册后静默永久脱同步。Resume 对非 Halted 态是幂等的唤醒，故以调用
+// 计数（测试缝）而非循环状态断言。
+func TestSetClusterMode_successInvokesSyncResume(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"registration_id":11,"registration_secret":"secret"}}`))
+	}))
+	defer master.Close()
+	parsed, err := url.Parse(master.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.NodeName = "node-resume"
+	h.cfg.Port = port + 1 // 与主节点端口不同，避免自注册拒绝
+	h.syncService = services.NewSyncService(db.DB, h.cfg, services.NewCaddyService("http://127.0.0.1:1"))
+
+	router := gin.New()
+	router.POST("/cluster/mode", h.SetClusterMode)
+	before := services.SyncResumeCallsForTest()
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/cluster/mode", strings.NewReader(`{"mode":"slave","master_url":"`+master.URL+`","register_token":"one-time"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if got := services.SyncResumeCallsForTest(); got != before+1 {
+		t.Fatalf("Resume 调用次数=%d, want %d（重新注册后必须调用唯一复活点）", got, before+1)
 	}
 }

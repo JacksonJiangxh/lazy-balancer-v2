@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"net"
@@ -10,10 +11,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/mcpserver"
 )
 
 func TestAPIKeyReadOnlyGuardBlocksWritesAndAllowsReadOnlyPOST(t *testing.T) {
@@ -43,11 +46,12 @@ func TestAPIKeyReadOnlyGuardBlocksWritesAndAllowsReadOnlyPOST(t *testing.T) {
 	if parseAllowed.Code != http.StatusNoContent {
 		t.Fatalf("parse POST status=%d, want 204", parseAllowed.Code)
 	}
-	// DNS 凭证测试端点：2026-09-10 终裁开放(读探测,白名单在列)
-	testAllowed := httptest.NewRecorder()
-	router.ServeHTTP(testAllowed, httptest.NewRequest(http.MethodPost, "/api/v1/certificate-configs/test", nil))
-	if testAllowed.Code != http.StatusNoContent {
-		t.Fatalf("cert-config test POST status=%d, want 204", testAllowed.Code)
+	// DNS 凭证测试端点会真实 Present+CleanUp DNS TXT——已移出
+	// 只读白名单，只读 API Key 必须 403。
+	testBlocked := httptest.NewRecorder()
+	router.ServeHTTP(testBlocked, httptest.NewRequest(http.MethodPost, "/api/v1/certificate-configs/test", nil))
+	if testBlocked.Code != http.StatusForbidden {
+		t.Fatalf("cert-config test POST status=%d, want 403（真实 DNS 写副作用）", testBlocked.Code)
 	}
 }
 
@@ -101,9 +105,109 @@ func TestMCPEndpointAuthenticationGatesAndProtocol(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	// 136 = 全量工具数（v2.3.4 +5 任务监控工具：list/trigger/toggle/cancel/control；与 server_test 只读 64 同步维护）
-	if len(payload.Result.Tools) != 136 {
-		t.Fatalf("tool count=%d, want 136", len(payload.Result.Tools))
+	// 不钉工具总数——硬编码 136 在每次增删工具时都红，且不表达任何
+	// 可观察契约。改为断言 tools/list 与 ListToolSpecs 全量一致（无遗漏/无重复/
+	// 无多余），新增工具无需改测试。
+	specs := mcpserver.ListToolSpecs()
+	expected := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		expected[spec.Name] = struct{}{}
+	}
+	if len(payload.Result.Tools) != len(expected) {
+		t.Fatalf("tools/list count=%d, want %d (= ListToolSpecs)", len(payload.Result.Tools), len(expected))
+	}
+	seen := make(map[string]struct{}, len(payload.Result.Tools))
+	for _, raw := range payload.Result.Tools {
+		var tool struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &tool); err != nil {
+			t.Fatalf("tool entry unmarshal: %v", err)
+		}
+		if _, ok := expected[tool.Name]; !ok {
+			t.Fatalf("tools/list exposes unregistered tool %q", tool.Name)
+		}
+		if _, duplicate := seen[tool.Name]; duplicate {
+			t.Fatalf("tools/list repeats tool %q", tool.Name)
+		}
+		seen[tool.Name] = struct{}{}
+	}
+}
+
+// 装配钉：SetupRouter 把 admin 组路由集合注入 MCP 可见性后，非管理员
+// 属主的 MCP Key 的 tools/list 不再暴露恒 403 的管理工具（真实守卫链 + 真实
+// 注入），business 组工具照常可见。
+func TestMCPToolsListForNonAdminKeyHidesAdminGroupTools(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+	key := "lb_sk_mcp-nonadmin"
+	hash := sha256.Sum256([]byte(key))
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (31,'mcp-nonadmin','x','user',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO api_keys (name,key_hash,key_prefix,created_by,is_enabled,mcp_enabled,mcp_ip_whitelist)
+		VALUES ('mcp-nonadmin',?,?,31,1,1,'')`, hex.EncodeToString(hash[:]), key[:12]); err != nil {
+		t.Fatal(err)
+	}
+	request := func(body []byte) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("X-API-Key", key)
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
+	initialize := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+	if response := request(initialize); response.Code != http.StatusOK {
+		t.Fatalf("initialize status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	// When
+	response := request([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`))
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%q", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	visible := make(map[string]bool, len(payload.Result.Tools))
+	for _, tool := range payload.Result.Tools {
+		visible[tool.Name] = true
+	}
+	// admin 组路由与 business 组未豁免只读白名单的写路由对非管理员恒 403，
+	// tools/list 必须同口径隐藏；business 组只读查询与读探测 POST 保留。
+	// preview_config/validate_import 虽为只读探测语义，但注册在 admin 组
+	// （adminOnly 对非管理员一律 403），故仍不可见。
+	known := map[string]bool{}
+	for _, spec := range mcpserver.ListToolSpecs() {
+		known[spec.Name] = true
+	}
+	hiddenNames := []string{"get_caddy_config", "preview_config", "validate_import", "update_user", "create_user", "create_rule", "update_rule", "retry_cert_job", "inspect_admin_tls"}
+	// 反向对账：隐藏名单必须先落在真实工具目录内——工具改名/删除后旧名恒
+	// false，`visible[hidden]` 断言会静默通过（假绿）。
+	for _, hidden := range hiddenNames {
+		if !known[hidden] {
+			t.Fatalf("隐藏名单中的 %s 不在 ListToolSpecs（改名/删除后的陈旧键）", hidden)
+		}
+	}
+	for _, hidden := range hiddenNames {
+		if visible[hidden] {
+			t.Errorf("non-admin tools/list exposes tool %s（调用恒 403）", hidden)
+		}
+	}
+	for _, callable := range []string{"list_rules", "get_config", "parse_certificate"} {
+		if !visible[callable] {
+			t.Errorf("non-admin tools/list hides callable tool %s: %v", callable, visible)
+		}
 	}
 }
 
@@ -143,7 +247,7 @@ func TestMCPEndpointToolCallAllowsOriginalClientIPWhitelist(t *testing.T) {
 	}
 }
 
-// 第 15 轮审计 K-1：MCP 工具调用经回环转发后，操作审计的源 IP 必须是发起
+// MCP 工具调用经回环转发后，操作审计的源 IP 必须是发起
 // MCP 请求的真实客户端 IP，而非回环地址 127.0.0.1（此前 RemoteAddr 恒为
 // 回环，MCP 操作在审计日志里无法定位真实来源）。stop_caddy 走 Generic
 // 中间件审计（Caddy 测试环境不可达 → 500，中间件仍记录）。
@@ -212,8 +316,11 @@ func TestMCPEndpointAuditIgnoresForgedInternalClientIPHeader(t *testing.T) {
 	request.Header.Set("X-Lazy-Balancer-Internal-MCP-Client-IP", "8.8.8.8")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("caddy/stop status=%d body=%q, want 500 (caddy unreachable in test)", response.Code, response.Body.String())
+	// 测试环境无 Caddy：stopCaddy 按事实分类为「已停止」（admin 不可达且无
+	// caddy 进程）→ 200 且保留 pause。本用例的断言面是审计源 IP，不是停止结果；
+	// 请求必须真正进入 handler 并落审计，故只要求非鉴权失败（非 401/403）。
+	if response.Code != http.StatusOK {
+		t.Fatalf("caddy/stop status=%d body=%q, want 200（已停止判定；鉴权必须通过）", response.Code, response.Body.String())
 	}
 	var recordedIP string
 	if err := db.AuditDB.QueryRow(`SELECT ip_address FROM audit_log WHERE resource='Caddy服务' ORDER BY id DESC LIMIT 1`).Scan(&recordedIP); err != nil {
@@ -247,7 +354,7 @@ func TestMCPEndpointRejectsRequestBodyLargerThanOneMiB(t *testing.T) {
 	}
 }
 
-// APIMCP45-6：mcpAccessGuard 两拒绝分支此前不留任何审计——无凭证探测 /mcp 与
+// mcpAccessGuard 两拒绝分支此前不留任何审计——无凭证探测 /mcp 与
 // 未开启 MCP 的 Key 使用在认证拒绝台账零痕迹（同链 adminOnly/apiKeyReadOnly/
 // readOnly 守卫均已留痕）。镜像既有形态：recordAuthenticationRejection +
 // securityAuditLimiter 去重（同 reason+path+ip 一分钟窗记 1 条）。
@@ -303,5 +410,93 @@ func TestMCPAccessGuard_rejectionsAreAudited(t *testing.T) {
 	}
 	if len(*recorded) != 2 {
 		t.Fatalf("pass-through must not add rejection audits, got %d: %q", len(*recorded), *recorded)
+	}
+}
+
+// 从节点 MCP 写工具的端到端契约：真实 listener + 完整 router + 管理员 Key
+// （mcp_enabled=1）。MCP 层不做从节点判定，写请求经回环转发后被 REST 侧
+// readOnlyGuard 拦截——工具结果必须是内层 403「从节点只读」，且规则零落库
+// （此前只有转发目标路由的中间件级钉测，没有「转发确实发生且被拦」的证明）。
+func TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	router := newMiddlewareTestRouterAtPort(t, port)
+	server := &httptest.Server{Listener: listener, Config: &http.Server{Handler: router}}
+	server.Start()
+	t.Cleanup(server.Close)
+
+	key := "lb_sk_mcp-slave-write"
+	hash := sha256.Sum256([]byte(key))
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (34,'mcp-slave','x','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO api_keys (name,key_hash,key_prefix,created_by,is_enabled,mcp_enabled)
+		VALUES ('mcp-slave',?,?,34,1,1)`, hex.EncodeToString(hash[:]), key[:12]); err != nil {
+		t.Fatal(err)
+	}
+	// Given 本节点为从节点
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_rule","arguments":{}}}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("X-API-Key", key)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	// Then ① JSON-RPC 层成功返回（错误经工具结果表达，不劫持协议层）
+	if response.Code != http.StatusOK {
+		t.Fatalf("mcp status=%d body=%q", response.Code, response.Body.String())
+	}
+	// ② 工具结果标记 isError 且携带内层 403 真因
+	if !strings.Contains(response.Body.String(), `"isError":true`) {
+		t.Fatalf("body=%q, want 工具结果 isError=true", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "从节点只读") {
+		t.Fatalf("body=%q, want 内层 403「从节点只读」", response.Body.String())
+	}
+	// ③ 规则零落库
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules`).Scan(&count); err != nil {
+		t.Fatalf("count rules: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("lb_rules 行数=%d, want 0（从节点写入必须被拦截且不落库）", count)
+	}
+}
+
+// 自签回环豁免只属于 MCP 内部转发专用客户端：通用默认传输一旦被改成跳过
+// 校验，面板全部出站请求（集群同步、CA/DNS 调用）都会静默失去证书校验。
+// 每次装配返回独立 transport，避免调用方改 CheckRedirect 等字段互相污染。
+func TestLoopbackAPIClient_TLSExemptionIsScoped(t *testing.T) {
+	client := LoopbackAPIClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("LoopbackAPIClient().Transport=%T, want *http.Transport", client.Transport)
+	}
+	if transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("回环专用客户端必须显式豁免自签证书校验（面板 selfsigned 形态下 TLS 重放依赖它）")
+	}
+	if transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("回环 TLS MinVersion=%x, want TLS1.2", transport.TLSClientConfig.MinVersion)
+	}
+	if client.Timeout != 60*time.Second {
+		t.Fatalf("回环客户端 Timeout=%s, want 60s（长操作单次等待上限）", client.Timeout)
+	}
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.DefaultTransport=%T, want *http.Transport", http.DefaultTransport)
+	}
+	if defaultTransport.TLSClientConfig != nil && defaultTransport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("默认传输被改成跳过证书校验——豁免不得扩散到通用客户端")
+	}
+	if LoopbackAPIClient().Transport == client.Transport {
+		t.Fatal("每次装配必须返回独立 transport（客户端副本改字段不得污染共享实例）")
 	}
 }

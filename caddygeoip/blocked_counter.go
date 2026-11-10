@@ -14,6 +14,12 @@ import (
 // securityBlockedMetricName 是安全拦截计数器指标名。
 const securityBlockedMetricName = "security_blocked_total"
 
+// securityLoggedMetricName 是检测放行（logged）计数器指标名——审计行存在
+// 且事务未中断（检测命中放行）的请求按规则计数；信任检测审计行（首消息
+// id:12）不打标不计数（2026-11-08 用户裁定：信任流量=正常流量）；与 blocked
+// 互斥（先录后拦的多策略请求只计 blocked），正常请求（无审计行）不计。
+const securityLoggedMetricName = "security_logged_total"
+
 // newSecurityBlockedCounterVec 每次 Provision 新建 CounterVec 并注册——
 // caddy-l4 newProxyMetrics 同模式(l4proxy/metrics.go:54):同 registry 时
 // registerOrExisting 复用已注册实例(不丢数据),跨 reload 新 registry 时
@@ -25,6 +31,19 @@ func newSecurityBlockedCounterVec(reg *prometheus.Registry) *prometheus.CounterV
 			Namespace: "lazybalancer",
 			Name:      securityBlockedMetricName,
 			Help:      "Requests interrupted by the security engine (WAF/GeoIP/IP ACL) with a 4xx status.",
+		},
+		[]string{"rule"},
+	))
+}
+
+// newSecurityLoggedCounterVec 构造检测放行计数器（与 blocked 同 epoch 语义：
+// 同 registry 复用、跨 reload 新 registry 归零，与 caddy_http_* 同纪元）。
+func newSecurityLoggedCounterVec(reg *prometheus.Registry) *prometheus.CounterVec {
+	return registerOrExisting(reg, prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "lazybalancer",
+			Name:      securityLoggedMetricName,
+			Help:      "Requests logged by the security engine (detection hits; trust detection excluded) but allowed through.",
 		},
 		[]string{"rule"},
 	))
@@ -55,11 +74,15 @@ func init() {
 // 按规则计数。覆盖:coraza 中断(WAF/GeoIP/IP ACL,ID=tx.ID() 16 字符)+限流 429;
 // 排除:proxy 499/request_body 413/其他 caddyhttp.Error 4xx(ID 9 字符)/coraza
 // 引擎 500(4xx 约束);上游 4xx 不产 HandlerError 不误计。
-// 稳定优先设计(2026-09-15 用户裁定,负载均衡/WAF 稳定最重要):
-//   - Provision 无操作——无 I/O/无外部依赖/无失败模式,配置加载零风险;
-//   - ServeHTTP 只读检测——不修改请求/响应/错误,链语义与无插件时逐字节一致;
-//   - 无锁/无共享态——prometheus counter 线程安全,reload 幂等;
-//   - API 兼容面:caddy.Module/caddyhttp.HandlerError 稳定(v2.0 起);
+// 稳定优先设计（2026-09-15 用户裁定，负载均衡/WAF 稳定最重要）：
+//   - Provision 只做 registry 注册（ctx.GetMetricsRegistry() nil 守卫；无 I/O/
+//     无外部依赖/无失败模式），配置加载零风险；reload 幂等由 registerOrExisting
+//     复用既有 Collector 保证（重复 MustRegister 会 panic）；
+//   - ServeHTTP 只读检测 + 原子计数/计时注册表写入——不修改请求/响应/错误；
+//     唯一请求头改动是计时关联头，渲染侧已将其列入上游头删除清单；
+//   - 无自定义锁/无跨请求可变状态——prometheus CounterVec 线程安全，每请求
+//     WithLabelValues 取子计数器；reload 幂等；
+//   - API 兼容面：caddy.Module/caddyhttp.HandlerError 稳定（v2.0 起）；
 //     ctx.GetMetricsRegistry() 是 EXPERIMENTAL(Caddy 标注 subject to change)
 //     已 nil 守卫(移除则降级为不计数而非崩溃),。
 type SecurityBlockedCounter struct {
@@ -67,6 +90,9 @@ type SecurityBlockedCounter struct {
 	Rule string `json:"rule,omitempty"`
 
 	metrics *prometheus.CounterVec
+	// loggedMetrics 是检测放行计数器（检测放行拆分；Provision 与 blocked 同
+	// registry 同 epoch 注册）。
+	loggedMetrics *prometheus.CounterVec
 }
 
 // CaddyModule returns the Caddy module information.
@@ -85,6 +111,7 @@ func (SecurityBlockedCounter) CaddyModule() caddy.ModuleInfo {
 func (h *SecurityBlockedCounter) Provision(ctx caddy.Context) error {
 	if reg := ctx.GetMetricsRegistry(); reg != nil {
 		h.metrics = newSecurityBlockedCounterVec(reg)
+		h.loggedMetrics = newSecurityLoggedCounterVec(reg)
 	}
 	return nil
 }
@@ -105,6 +132,15 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// SecurityTimingPre 记 pre 后把起始头重写为「预检完成」分段锚点,
 	// SecurityTimingEnd 读锚点计算 logged 事件的 WAF 段耗时)。起始头与 ID 头
 	// 均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
+	//
+	// 先删后设(与 handler.go 的 geoip 控制头同族防御原则):两头的值只在
+	// 本方法注入,客户端携带的同名头一律无效。此前只在 ID 生成成功时才
+	// Set——securityTimingID 失败(crypto/rand 出错)时客户端自带头原样
+	// 流入下游,recordSecurityTiming 只校验 16 字符小写 hex 形态而不校验来源,
+	// 于是客户端可自选计时注册表 key 与起始纳秒(审计行 lb_timing 注入任意
+	// 耗时),该头同时是安全事件的请求级去重键,两个不同请求可被误并。
+	r.Header.Del(securityTimingHeader)
+	r.Header.Del(securityTimingStartHeader)
 	timingID := securityTimingID()
 	var timingStartVal string
 	if timingID != "" {
@@ -129,6 +165,10 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		// 国名只取 geoip handler 写入的 Caddy 服务端变量。无 GeoIP handler
 		// 时变量缺席即跳过，客户端自带的同名请求头永不可信。
 		country, _ := caddyhttp.GetVar(r.Context(), "geoip.country_name").(string)
+		// 归一一次并把归一值同时用于「是否国内」门与两个记录函数（二者保留
+		// 自身归一作幂等防御）：用未归一键比较会让脏形态下省门与外发键不一致
+		// （country=「 中国」时省被丢、计数桶却正常）。
+		country = normalizeTrafficCountryKey(country)
 		trafficRecord(country, isSecurityBlock)
 		if !isSecurityBlock && country != "" {
 			province, _ := caddyhttp.GetVar(r.Context(), "geoip.province").(string)
@@ -176,14 +216,26 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		if h.metrics != nil {
 			h.metrics.WithLabelValues(h.Rule).Inc()
 		}
+	} else if timingID != "" && auditTimingLogged(timingID) {
+		// 检测放行（logged）计数：审计写插件对未中断审计行打标（见
+		// lbAuditWriter.Write——coraza defer ProcessLogging 先于本收点，打标
+		// 严格先于本读取，无竞态窗）；多策略引擎多行同键幂等 → 每请求至多
+		// +1。与 blocked 严格互斥：先录后拦的请求走上面分支，不进此处。
+		// 正常请求（无审计行）零打标，此处只付一次注册表查表（与
+		// auditTimingClose 同量级）。registry 缺席（嵌入形态）静默降级为
+		// 不计数，与 blocked 同语义；Prometheus 恒计数，不受大屏采集租约
+		// 门控（trafficCollectorActive 只门控流量统计）。
+		if h.loggedMetrics != nil {
+			h.loggedMetrics.WithLabelValues(h.Rule).Inc()
+		}
 	}
 	return err
 }
 
 // Cleanup 在 Caddy reload/优雅停机时冲刷审计管线（上游 coraza 不调用
 // AuditLogWriter.Close）。每个规则一个实例，一次 reload 会调用 N 次；
-// FlushAuditPipelines 内部按合并窗口去重，只有首个调用付出排空等待——
-// 收尾成本与规则数解耦。
+// FlushAuditPipelines 内部按合并窗口去重排空等待（刷盘本身每次都做）——
+// 收尾成本与规则数解耦，停机语义不受影响。
 func (h *SecurityBlockedCounter) Cleanup() error {
 	FlushAuditPipelines()
 	return nil

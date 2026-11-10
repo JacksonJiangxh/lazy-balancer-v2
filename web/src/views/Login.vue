@@ -1,6 +1,6 @@
 <template>
   <div class="login-container">
-    <el-card class="login-card">
+    <el-card class="login-card" v-loading="checkingSetup" element-loading-text="正在检查登录状态...">
       <div class="login-header">
         <div class="logo-wrapper">
           <AppLogo :size="64" />
@@ -8,7 +8,7 @@
         <h1 class="login-title">
           {{ appName }} <span class="v2-badge">V2</span>
         </h1>
-        <p class="login-subtitle">Caddy 负载均衡管理平台</p>
+        <p class="login-subtitle">负载均衡与安全防护管理平台</p>
       </div>
 
       <template v-if="!checkingSetup">
@@ -65,14 +65,18 @@
             </el-button>
           </el-form-item>
           <div class="mfa-switch">
-            <el-link type="primary" underline="never" @click="mfaUseRecovery = !mfaUseRecovery; mfaCode = ''">
+            <AccessibleLink type="primary" underline="never" @click="mfaUseRecovery = !mfaUseRecovery; mfaCode = ''">
               {{ mfaUseRecovery ? '使用验证码' : '使用恢复代码' }}
-            </el-link>
-            <el-link type="info" underline="never" @click="resetToPasswordStep">返回重新登录</el-link>
+            </AccessibleLink>
+            <AccessibleLink type="info" underline="never" @click="resetToPasswordStep">返回重新登录</AccessibleLink>
           </div>
         </el-form>
 
         <template v-else>
+          <div v-if="oidcStatusError" class="oidc-status-error">
+            <el-alert :title="oidcStatusError" type="error" show-icon :closable="false" class="login-error" />
+            <el-button text type="primary" :loading="oidcStatusLoading" @click="loadOidcStatus">重试</el-button>
+          </div>
           <!-- v2.3.0 OIDC:品牌主按钮;本地账号次级入口,可双向切换 -->
           <div v-if="oidcEnabled && !showLocalForm" class="oidc-login">
             <button class="oidc-sso-btn" :disabled="oidcRedirecting" @click="goOIDCLogin">
@@ -105,7 +109,7 @@
               placeholder="请输入密码"
               size="large"
               :prefix-icon="Lock"
-              maxlength="24"
+              maxlength="72"
               show-password
             />
           </el-form-item>
@@ -149,7 +153,10 @@ import { useAuthStore } from '@/stores/auth'
 import { ApiRequestError, normalizeMfaCodeInput, request } from '@/utils/api'
 import { User, Lock, Postcard, Key, ArrowLeft } from '@element-plus/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { appName, appVersion } from '@/utils/branding'
+import { validatePassword, validateUsername } from '@/utils/credentials'
+import { OIDC_APP_NONCE_KEY, createOidcAppNonce, withOidcAppNonce } from '@/utils/oidcCallback'
 import type { FormInstance, FormRules, InputOtpInstance } from 'element-plus'
 
 interface SetupStatusResponse {
@@ -182,24 +189,32 @@ const rules: FormRules = {
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 8, message: '密码至少8位', trigger: 'blur' },
   ],
 }
 
-const usernamePolicyRe = /^[a-z][a-z0-9]*$/
 const setupRules: FormRules = {
   username: [
     { required: true, message: '请输入管理员用户名', trigger: 'blur' },
-    { min: 3, message: '用户名至少3位', trigger: 'blur' },
-    { max: 50, message: '用户名最多50位', trigger: 'blur' },
-    { pattern: usernamePolicyRe, message: '用户名仅允许小写英文开头，字符只允许小写字母和数字', trigger: 'blur' },
+    {
+      validator: (_rule: unknown, value: string, callback: (error?: Error) => void) => {
+        const message = validateUsername(value)
+        callback(message ? new Error(message) : undefined)
+      },
+      trigger: 'blur',
+    },
   ],
   display_name: [
     { max: 50, message: '显示名最多50位', trigger: 'blur' },
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 8, message: '密码至少8位', trigger: 'blur' },
+    {
+      validator: (_rule: unknown, value: string, callback: (error?: Error) => void) => {
+        const message = validatePassword(value)
+        callback(message ? new Error(message) : undefined)
+      },
+      trigger: 'blur',
+    },
   ],
   confirm: [
     { required: true, message: '请再次输入密码', trigger: 'blur' },
@@ -237,6 +252,13 @@ watch([mfaStage, mfaUseRecovery], async ([stage, useRecovery]) => {
   }
 })
 
+// 通道切换（验证码 ⇄ 恢复代码）即清空上一通道的输入与错误：
+// 输错后输入框残留同一串错误码，用户回车会重复提交同一失败值。
+watch(mfaUseRecovery, () => {
+  mfaCode.value = ''
+  error.value = ''
+})
+
 const resetToPasswordStep = () => {
   mfaStage.value = false
   mfaToken.value = ''
@@ -250,12 +272,15 @@ const handleMfaVerify = async () => {
   error.value = ''
   loading.value = true
   try {
-    // B6-S1：与 step-up/管理员重置同口径——归一化后仅提交首个 token，
+    // 与 step-up/管理员重置同口径——归一化后仅提交首个 token，
     // 兼容整段粘贴恢复代码块（@input 已在恢复模式归一化，此处兜底）。
     const result = await authStore.verifyMfaLogin(mfaToken.value, normalizeMfaCodeInput(mfaCode.value))
-    // FI-18：store 重入护栏命中（请求未发出）——显式提示而非静默无事发生。
+    // store 重入护栏命中（请求未发出）——显式提示而非静默无事发生。
     if (result.skipped) error.value = '登录请求进行中，请稍候'
   } catch (caught: unknown) {
+    // 失败即清空验证码（watch 已自动 refocus）：残留同一串错误码会让
+    // 用户回车重复提交同一失败值。
+    mfaCode.value = ''
     error.value = errorMessage(caught, '验证失败，请重试')
   } finally {
     loading.value = false
@@ -269,55 +294,76 @@ const oidcEnabled = ref(false)
 const oidcDisplayName = ref('OIDC')
 const showLocalForm = ref(false)
 const oidcRedirecting = ref(false)
-onMounted(async () => {
-  // A40-1-2:OIDC 跳转失败(302)经 hash query 携带 oidc_error——展示后从
-  // hash 清除(参照 C2-7 回调错误链的一次性语义)。
-  try {
-    const hash = window.location.hash
-    const qIndex = hash.indexOf('?')
-    if (qIndex >= 0) {
-      const params = new URLSearchParams(hash.slice(qIndex + 1))
-      const oidcError = params.get('oidc_error')
-      if (oidcError) {
-        ElMessage.error(`OIDC 登录失败：${oidcError}`)
-        params.delete('oidc_error')
-        const rest = params.toString()
-        // FE43-8(第 43 轮):rest 为空串时不拼「?」——避免 URL 残留「#/?」。
-        window.history.replaceState(null, '', window.location.pathname + hash.slice(0, qIndex) + (rest ? `?${rest}` : ''))
-      }
-    }
-  } catch { /* 隐私模式 */ }
-  // C2-7:回调失败 302 回前端,错误经 sessionStorage 一次性带到这里展示
-  try {
-    const oidcErr = sessionStorage.getItem('oidc_login_error')
-    if (oidcErr) {
-      sessionStorage.removeItem('oidc_login_error')
-      ElMessage.error(`OIDC 登录失败：${oidcErr}`)
-    }
-  } catch { /* 隐私模式 */ }
+const oidcStatusError = ref('')
+const oidcStatusLoading = ref(false)
+const loadOidcStatus = async (): Promise<void> => {
+  if (oidcStatusLoading.value) return
+  oidcStatusLoading.value = true
   try {
     const res = await request.get<{ data?: { enabled?: boolean; display_name?: string } }>('/auth/oidc/status', { silent: true })
-    if (res.data?.enabled) {
-      oidcEnabled.value = true
-      oidcDisplayName.value = res.data.display_name || 'OIDC'
+    oidcEnabled.value = res.data?.enabled === true
+    if (oidcEnabled.value) oidcDisplayName.value = res.data?.display_name || 'OIDC'
+    oidcStatusError.value = ''
+  } catch (caught: unknown) {
+    const status = caught instanceof ApiRequestError ? caught.status : undefined
+    if (status === 403) {
+      oidcEnabled.value = false
+      oidcStatusError.value = ''
+    } else {
+      // 状态未知不等于未启用：纯 OIDC 账户必须看到故障与重试入口，
+      // 本地表单仍保留给已有本地密码的账户使用。
+      oidcStatusError.value = '无法获取企业登录状态，请重试或使用本地账号登录'
     }
-  } catch {
-    // 状态端点不可达=未启用,静默回退本地登录
+  } finally {
+    oidcStatusLoading.value = false
   }
+}
+onMounted(async () => {
+  // oidc_error 通道由 App 的 hash 预处理单源消费（本预处理先于路由视图执行，
+  // 已持有效会话、本组件不挂载的形态也能提示并从 hash 剥离）；回调失败不经
+  // sessionStorage 传递——App 解析 hash 时当场提示，这两条读取通道随之删除。
+  await loadOidcStatus()
 })
+let oidcRedirectTimer: ReturnType<typeof setTimeout> | null = null
+const clearOidcRedirectTimer = (): void => {
+  if (oidcRedirectTimer !== null) clearTimeout(oidcRedirectTimer)
+  oidcRedirectTimer = null
+}
 const goOIDCLogin = () => {
+  if (oidcRedirecting.value) return
+  clearOidcRedirectTimer()
   oidcRedirecting.value = true
-  const returnTo = encodeURIComponent('/')
+  // 顶层导航若被浏览器/扩展中止，pageshow 不会触发；十秒后恢复入口。
+  oidcRedirectTimer = setTimeout(() => {
+    oidcRedirecting.value = false
+    oidcRedirectTimer = null
+  }, 10_000)
+  // 深链保持：登录前停留的页面键（首屏 ?page= 已由 auth store 消费进
+  // currentPage）随 return_to 回跳；后端只放行站内相对路径，App 侧再按
+  // isPageId 白名单兜底（未知值回 dashboard）。
+  // 回跳来源绑定：nonce 先写本标签页 sessionStorage，再随 return_to 往返
+  //（后端原样回显到回调 fragment）——App 侧只有命中同值才接受令牌，构造链接
+  // 里塞别人的令牌不可能知道受害者浏览器的 nonce。
+  const nonce = createOidcAppNonce()
+  try {
+    sessionStorage.setItem(OIDC_APP_NONCE_KEY, nonce)
+  } catch { /* 隐私模式：无 nonce 时回调侧一律拒绝并提示重新登录 */ }
+  const returnTo = encodeURIComponent(withOidcAppNonce(`/${authStore.currentPage}`, nonce))
   window.location.href = `/api/v1/auth/oidc/login?return_to=${returnTo}`
 }
-// C2-6:IdP 侧「返回」经 bfcache 恢复时 JS 状态保留——复位跳转锁,防 SSO
+// IdP 侧「返回」经 bfcache 恢复时 JS 状态保留——复位跳转锁,防 SSO
 // 按钮永久禁用(整页跳转本无重复提交面,disabled 仅作点击反馈)。
-// 监听器随组件卸载移除(防登出-登录循环渐进累积)。
+// 监听器与计时器随组件卸载清理(防登出-登录循环渐进累积)。
 const onPageShow = (e: PageTransitionEvent) => {
-  if (e.persisted) oidcRedirecting.value = false
+  if (!e.persisted) return
+  clearOidcRedirectTimer()
+  oidcRedirecting.value = false
 }
 window.addEventListener('pageshow', onPageShow)
-onUnmounted(() => window.removeEventListener('pageshow', onPageShow))
+onUnmounted(() => {
+  clearOidcRedirectTimer()
+  window.removeEventListener('pageshow', onPageShow)
+})
 
 const handleLogin = async () => {
   if (loading.value) return
@@ -330,7 +376,7 @@ const handleLogin = async () => {
     loading.value = true
     try {
       const result = await authStore.login(form.username, form.password)
-      // FI-18：重入护栏命中时不再伪装成功——分流前先判 skipped。
+      // 重入护栏命中时不再伪装成功——分流前先判 skipped。
       if (result.skipped) {
         error.value = '登录请求进行中，请稍候'
         return
@@ -359,24 +405,18 @@ const handleSetup = async () => {
     error.value = ''
     loading.value = true
     try {
-      // R68 D-N4：silent 抑制全局拦截器 toast——403「已完成初始化」竞态时
+      // silent 抑制全局拦截器 toast——403「已完成初始化」竞态时
       // 全局 toast 与 inline alert 双通道呈现同一文案；改为单通道 inline。
       await request.post('/auth/setup', {
         username: setupForm.username,
         password: setupForm.password,
         display_name: setupForm.display_name,
       }, { silent: true })
-      const loginResult = await authStore.login(setupForm.username, setupForm.password)
-      // FI-18：管理员已创建但登录被重入护栏跳过（防御路径）——切回登录表单提示手动登录。
-      if (loginResult.skipped) {
-        setupMode.value = false
-        error.value = '管理员已创建，请登录'
-      }
     } catch (caught: unknown) {
-      // R68 D-N4：403 = 提交期间系统已被另一路径初始化——复探状态并切换
+      // 403 = 提交期间系统已被另一路径初始化——复探状态并切换
       // 登录表单（后端文案即指引），而非停在 setup 表单要求手动刷新。
       if (caught instanceof ApiRequestError && caught.status === 403) {
-        // R69 D-S-1：复探失败时回显可行动提示（原代码清空错误但注释称「仍呈现」，
+        // 复探失败时回显可行动提示（原代码清空错误但注释称「仍呈现」，
         // 复探失败态下用户停留 setup 表单且无任何提示）；复探成功才切换登录表单。
         try {
           const res = await request.get<SetupStatusResponse>('/auth/setup', { silent: true })
@@ -388,6 +428,18 @@ const handleSetup = async () => {
       } else {
         error.value = errorMessage(caught, '创建管理员失败，请稍后重试')
       }
+      loading.value = false
+      return
+    }
+    // 创建已成功：后续自动登录是独立阶段，其失败不得报成「创建管理员失败」
+    // （管理员实际已创建，重填提交只会得到 403 并让用户重输密码）。
+    setupMode.value = false
+    try {
+      const loginResult = await authStore.login(setupForm.username, setupForm.password)
+      // 管理员已创建但登录被重入护栏跳过（防御路径）——切回登录表单提示手动登录。
+      if (loginResult.skipped) error.value = '管理员已创建，请登录'
+    } catch (caught: unknown) {
+      error.value = `管理员已创建，请手动登录（自动登录失败：${errorMessage(caught, '请重试')}）`
     } finally {
       loading.value = false
     }
@@ -436,11 +488,12 @@ onMounted(async () => {
   margin-bottom: 28px;
 }
 
+/* 直角标识：外层半径会把 SVG 方块的四角裁圆，必须与 AppLogo 的 rx=0 同口径。 */
 .logo-wrapper {
   width: 64px;
   height: 64px;
   margin: 0 auto 16px;
-  border-radius: 14px;
+  border-radius: 0;
   overflow: hidden;
   box-shadow: 0 4px 12px rgba(59, 130, 246, 0.25);
 }

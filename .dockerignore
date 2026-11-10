@@ -1,6 +1,6 @@
 # 构建上下文瘦身 + 防止本地敏感数据(数据库/私钥/日志)进入镜像中间层。
 # Dockerfile COPY 源(go.mod/cmd/internal/caddygeoip/caddydeps/wafiplist/
-# geoipnames/docker-entrypoint.sh/config/LICENSE)均不在排除清单内。
+# geoipnames/web/dist/docker-entrypoint.sh/config/LICENSE)均不在排除清单内。
 data/
 data-slave/
 logs/
@@ -17,13 +17,35 @@ ui/
 .git/
 .gitignore
 .dockerignore
-# 前端源码**必须**留在上下文内：Dockerfile 有独立的 web-builder 阶段
-# （node:22-alpine → npm ci → npm run build → /app/web/dist），final 阶段
-# 以 `COPY --from=web-builder` 取产物，故 web/src、package.json 等均为构建源。
-# backend 阶段的显式 COPY 清单不含 web/，前端改动不影响 Go 编译层。
-# 只排除依赖目录与本地构建产物——web/dist 若入上下文会无谓撑大上下文，
-# 且镜像用的是 web-builder 阶段的重建产物，本地 web/dist 一律不参与。
+# 前端依赖与源码不参与镜像构建：Dockerfile 只消费预构建的 web/dist
+# （final 阶段 COPY web/dist /app/ui）。backend 阶段的显式 COPY 清单不含 web/，
+# 故前端源码改动不影响 Go 编译层；但**重新构建的 web/dist 内容变化**仍会让
+# final 阶段的 COPY web/dist 层失效（构建缓存按内容摘要判定）——这是发版必然
+# 开销，不是本文件能消除的。注意 web/dist 必须留在上下文内——Docker 的排除
+# 模式按上下文根相对匹配，下方 dist/ 只匹配根目录 dist，不会波及 web/dist。
+# 仓根 node_modules（在仓库根跑 vitest/node 脚本时生成的 .vite/.vitest-cache
+# 转译缓存）——Docker 的排除模式按上下文根锚定，本条只匹根级目录，web/ 内的
+# 依赖目录仍是下方显式一条。
+node_modules/
 web/node_modules/
+web/src/
+web/tests/
+web/public/
+web/index.html
+web/vite.config.ts
+web/tsconfig.json
+web/tsconfig.node.json
+web/tsconfig.test.json
+web/package.json
+web/package-lock.json
+# Go 测试面不入构建上下文：Dockerfile 的 COPY 面按整目录复制 caddygeoip/ 等
+# （xcaddy 阶段的 COPY caddygeoip/ 与 backend 阶段的显式清单同形），测试源码
+# （16 个 *_test.go ≈290KB，其中 auditwriter_test.go 117KB 且频繁变动）与
+# 10.6MB 的 ip2region 测试夹具都会让「只改测试」也 bust 最贵的插件编译层
+# ——这正是 Dockerfile 该 COPY 面注释要避免的形态。测试夹具只服务仓内测试：
+# 运行期用的是镜像内 /app/waf.dist/ip2region.xdb。
+**/*_test.go
+caddygeoip/testdata/
 docs/
 .opencode/
 *.db
@@ -51,6 +73,9 @@ test-ui/
 openspec/
 .omo/
 .sisyphus/
+# 代码图索引（本地工具产物，单库可达 ~160MB）：不进构建上下文，
+# 否则每次 docker build 都要传输这份无意义内容（Dockerfile 不 COPY 它）。
+.codegraph/
 data-qa-master/
 data-qa-slave/
 dist/

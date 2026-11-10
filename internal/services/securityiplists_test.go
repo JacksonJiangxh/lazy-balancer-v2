@@ -1,15 +1,21 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -41,7 +47,7 @@ func TestExpandPolicyIPRefs_mergeDedupInlineFirst(t *testing.T) {
 	}
 	exp := expandPolicyIPRefs(p, lists)
 
-	// 第 57 轮 P5：合并即聚合——输出为聚合规范形（排序、兄弟归并、覆盖剔除），
+	// 合并即聚合——输出为聚合规范形（排序、兄弟归并、覆盖剔除），
 	// 匹配集合与旧 inline-first 去重口径逐点等价（1.2.3.4 与 10/8、192.0.2.1
 	// 互不覆盖，条数不变仅排序变化）。
 	wantACL := []string{"1.2.3.4/32", "10.0.0.0/8", "192.0.2.1/32"}
@@ -119,6 +125,48 @@ func TestLoadIPListEntriesByID_valuesOnlyAndMissingSkipped(t *testing.T) {
 	}
 }
 
+func TestResolvePolicyIPListRefs_logsDanglingRefs(t *testing.T) {
+	newClusterTestService(t)
+	p := &models.SecurityPolicy{Name: "悬空引用留痕策略", IPACLList: `["1.2.3.4"]`, IPACLListRefs: `[999]`}
+	var logs bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, nil)
+	if !strings.Contains(logs.String(), `引用的 IP 列表(id=999)不存在`) {
+		t.Fatalf("dangling ref must be visible in logs: %q", logs.String())
+	}
+	if p.IPRefMissing {
+		t.Fatal("dangling refs retain documented inline-only behavior, not IPRefMissing")
+	}
+	if got := mergedACLList(p); len(got) != 1 || got[0] != "1.2.3.4/32" {
+		t.Fatalf("merged ACL=%v, want inline preserved", got)
+	}
+}
+
+func TestResolvePolicyIPListRefs_malformedCustomListFailsClosed(t *testing.T) {
+	newClusterTestService(t)
+	listID := seedIPList(t, "corrupt-custom", `not-json`)
+	p := &models.SecurityPolicy{Name: "畸形名单策略", IPACLList: `["1.2.3.4"]`, IPACLListRefs: fmtListIDs(listID)}
+
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, nil)
+	if !p.IPRefMissing {
+		t.Fatal("malformed custom entries must mark IPRefMissing and skip narrowed rendering")
+	}
+	_, failed, _ := loadIPListEntriesVia(db.DB, []int64{listID})
+	if !failed[listID] {
+		t.Fatalf("malformed custom list must be failedIDs: %v", failed)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE resource='安全策略' AND action='渲染跳过' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read render-skip audit: %v", err)
+	}
+	if !strings.Contains(detail, "IP 列表(id=") || strings.Contains(detail, "威胁库列表") || strings.Contains(detail, "<nil>") {
+		t.Fatalf("failure detail must be kind-neutral and include a real cause: %q", detail)
+	}
+}
+
 func TestBuildCorazaDirectives_mergedEmission_inlinePlusListEntries(t *testing.T) {
 	newClusterTestService(t)
 	listID := seedIPList(t, "merged-src", `[{"value":"10.0.0.0/8","remark":""},{"value":"192.0.2.0/24","remark":""}]`)
@@ -135,7 +183,7 @@ func TestBuildCorazaDirectives_mergedEmission_inlinePlusListEntries(t *testing.T
 	if policy == nil {
 		t.Fatal("expected bound policy to load")
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// v2.3.x：inline + 列表条目合并进同一 @ipListFast 投影文件（聚合排序）
 	if got := readRenderedIPList(t, directives, "-acl"); got != "1.2.3.4/32\n10.0.0.0/8\n192.0.2.0/24\n" {
 		t.Fatalf("deny 名单文件须含 inline + list 聚合条目: %q", got)
@@ -158,7 +206,7 @@ func TestBuildCorazaDirectives_refsOnlyPolicyStillEmits(t *testing.T) {
 	if policy == nil {
 		t.Fatal("expected bound policy to load")
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if got := readRenderedIPList(t, directives, "-acl"); got != "203.0.113.0/24\n" {
 		t.Fatalf("refs-only policy must emit list entries via file: %q", got)
 	}
@@ -175,7 +223,7 @@ func TestBuildCorazaDirectives_unresolvedPolicyFallsBackToInline(t *testing.T) {
 		IPACLEnabled:  true,
 		IPACLListRefs: "[42]",
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// 未解析引用（refs 指向不存在的列表）回退 inline-only——名单文件恰含 inline 条目
 	if got := readRenderedIPList(t, directives, "-acl"); got != "1.2.3.4/32\n" {
 		t.Fatalf("inline entries must survive (file=%q), 未解析引用不得追加内容", got)
@@ -185,7 +233,7 @@ func TestBuildCorazaDirectives_unresolvedPolicyFallsBackToInline(t *testing.T) {
 func TestBuildCorazaDirectives_whitelistRefsMergedIntoTrustRule(t *testing.T) {
 	newClusterTestService(t)
 	listID := seedIPList(t, "trust-src", `[{"value":"198.51.100.7","remark":""}]`)
-	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, ip_whitelist, ip_whitelist_refs, enabled) VALUES ('trustrefs', 'off', '["198.51.100.9"]', ?, 1)`, fmtListIDs(listID))
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, anomaly_threshold, ip_whitelist, ip_whitelist_refs, enabled) VALUES ('trustrefs', 'blocking', 5, '["198.51.100.9"]', ?, 1)`, fmtListIDs(listID))
 	if err != nil {
 		t.Fatalf("seed policy: %v", err)
 	}
@@ -198,7 +246,7 @@ func TestBuildCorazaDirectives_whitelistRefsMergedIntoTrustRule(t *testing.T) {
 	if policy == nil {
 		t.Fatal("expected bound policy to load")
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "id:3,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly") {
 		t.Fatalf("trust rule must be emitted (DetectionOnly, 2026-09-15 裁定):\n%s", directives)
 	}
@@ -216,10 +264,15 @@ func TestSecurityPolicyHasIPControl_refsOnlyTruthTable(t *testing.T) {
 	}{
 		{"ACL refs only, enabled", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[3]"}, true},
 		{"ACL refs only, toggle off", &models.SecurityPolicy{IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[3]"}, false},
-		{"whitelist refs only, enabled", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]"}, true},
+		{"whitelist refs only, enabled", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]", MergedWhitelist: []string{"198.51.100.7"}}, true},
+		{"whitelist refs only, enabled but unresolved", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]"}, false},
 		{"whitelist refs only, toggle off", &models.SecurityPolicy{IPWhitelistRefs: "[3]"}, false},
-		{"malformed ACL refs", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]", IPACLListRefs: "bad"}, false},
-		{"no refs no inline", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]"}, false},
+		// 始终发射收敛（2026-10-15）：ACL 开启即恒发射（allow+空名单
+		// 表示拒绝全部）；信任名单（默认 flag 非 opt-in）维持内容门控。
+		{"malformed ACL refs", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]", IPACLListRefs: "bad"}, true},
+		{"no refs no inline", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]"}, true},
+		{"allow mode enabled, empty", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: "[]"}, true},
+		{"trust enabled, empty", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,19 +287,29 @@ func TestBuildIPPrecheckDirectives_mergedDenyUnion(t *testing.T) {
 	newClusterTestService(t)
 	listA := seedIPList(t, "deny-a", `[{"value":"10.0.0.0/8","remark":""}]`)
 	listB := seedIPList(t, "deny-b", `[{"value":"192.0.2.0/24","remark":""}]`)
-	p1 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["1.2.3.4"]`, IPACLListRefs: fmtListIDs(listA)}
-	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: fmtListIDs(listB)}
+	p1 := &models.SecurityPolicy{ID: 1, IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["1.2.3.4"]`, IPACLListRefs: fmtListIDs(listA)}
+	p2 := &models.SecurityPolicy{ID: 2, IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: fmtListIDs(listB)}
 	resolvePolicyIPListRefs([]*models.SecurityPolicy{p1, p2}, nil)
 
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
-	if !strings.Contains(directives, "id:2,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END") {
-		t.Fatalf("deny union rule missing:\n%s", directives)
-	}
-	union := readRenderedIPList(t, directives, "u-deny")
-	for _, want := range []string{"1.2.3.4/32", "10.0.0.0/8", "192.0.2.0/24"} {
-		if !strings.Contains(union, want) {
-			t.Fatalf("deny union file must contain %s: %q", want, union)
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, "lb_test"))
+	// 拆链（2026-11 用户裁定）：每条 deny ACL 策略一条独立链，id=1500000+policyID。
+	for _, wantID := range []string{"id:1500001,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝'", "id:1500002,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝'"} {
+		if !strings.Contains(directives, wantID) {
+			t.Fatalf("per-policy deny chain missing %q:\n%s", wantID, directives)
 		}
+	}
+	first := readRenderedIPList(t, directives, "p1-acl")
+	for _, want := range []string{"1.2.3.4/32", "10.0.0.0/8"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("policy 1 deny 名单必须含 %s: %q", want, first)
+		}
+	}
+	if strings.Contains(first, "192.0.2.0/24") {
+		t.Fatalf("policy 1 名单不得包含 policy 2 的条目（拆链串染）: %q", first)
+	}
+	second := readRenderedIPList(t, directives, "p2-acl")
+	if !strings.Contains(second, "192.0.2.0/24") {
+		t.Fatalf("policy 2 deny 名单必须含自己的引用条目: %q", second)
 	}
 }
 
@@ -257,17 +320,17 @@ func TestBuildIPPrecheckDirectives_mergedAllowIntersection(t *testing.T) {
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `[]`, IPACLListRefs: fmtListIDs(listID)}
 	resolvePolicyIPListRefs([]*models.SecurityPolicy{p1, p2}, nil)
 
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, "lb_test"))
 	if !strings.Contains(directives, "id:7,phase:1,deny,status:403,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END") {
 		t.Fatalf("allow intersection rule missing:\n%s", directives)
 	}
-	// P1 合并集 [198.51.100.1 203.0.113.5] ∩ P2 合并集 [203.0.113.5] = [203.0.113.5]
+	// 合并集 [198.51.100.1 203.0.113.5] ∩ 合并集 [203.0.113.5] = [203.0.113.5]
 	intersection := readRenderedIPList(t, directives, "u-allow")
 	if intersection != "203.0.113.5/32\n" {
-		t.Fatalf("intersection must be merged(P1) ∩ merged(P2) = [203.0.113.5/32]: %q", intersection)
+		t.Fatalf("intersection must be merged(allow list A) ∩ merged(allow list B) = [203.0.113.5/32]: %q", intersection)
 	}
 	if strings.Contains(intersection, "198.51.100.1") {
-		t.Fatalf("198.51.100.1 only in P1 must not survive the allow intersection: %q", intersection)
+		t.Fatalf("198.51.100.1 only in one side must not survive the allow intersection: %q", intersection)
 	}
 }
 
@@ -302,7 +365,7 @@ func fmtListIDs(ids ...int64) string {
 	return string(raw)
 }
 
-// ---- SEC-A-F1/RV71-1（第 71 轮 P4）：loadIPListEntriesVia 迭代错误驱动桩 ----
+// loadIPListEntriesVia 迭代错误驱动桩 ----
 
 // iplistIterFailConnector 让 security_ip_lists 查询「语句执行成功、迭代第一
 // 步即失败」——只有循环后检查 rows.Err() 才能发现，否则表现为装载成功但
@@ -344,7 +407,7 @@ func (zeroColsRows) Columns() []string         { return []string{"c"} }
 func (zeroColsRows) Close() error              { return nil }
 func (zeroColsRows) Next([]driver.Value) error { return io.EOF }
 
-// SEC-A-F1：迭代错误必须与查询失败同通道上抛，且整块 id 进 failedIDs
+// 迭代错误必须与查询失败同通道上抛，且整块 id 进 failedIDs
 // （fail-closed）——修复前 rows.Err() 未检查，错误被静默吞掉。
 func TestLoadIPListEntriesVia_iterationErrorMarksChunkFailed(t *testing.T) {
 	broken := sql.OpenDB(iplistIterFailConnector{})
@@ -362,7 +425,7 @@ func TestLoadIPListEntriesVia_iterationErrorMarksChunkFailed(t *testing.T) {
 	}
 }
 
-// SEC-A-F1 端到端形态：迭代错误下引用该列表的策略必须标记 IPRefMissing
+// 端到端形态：迭代错误下引用该列表的策略必须标记 IPRefMissing
 // 跳过渲染（严格模式）——修复前拿到「静默缺内容的合并集」，ACL/信任面
 // 静默收窄零留痕。
 func TestResolvePolicyIPListRefs_iterationErrorFailsClosed(t *testing.T) {
@@ -374,5 +437,246 @@ func TestResolvePolicyIPListRefs_iterationErrorFailsClosed(t *testing.T) {
 	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, broken)
 	if !p.IPRefMissing {
 		t.Fatal("迭代错误必须 fail-closed：引用该列表的策略须标记 IPRefMissing 跳过渲染")
+	}
+}
+
+// 无引用形态（绝大多数策略）同样必须在加载路径一次展开并附加合并集：旧实现
+// refIDs 为空即早退，MergedACLList/MergedWhitelist 恒为 nil，发射端每次调用
+// mergedWhitelist/mergedACLList 都重跑 json.Unmarshal + aggregateIPEntries
+// ——摄取侧按「规则×策略」逐次调用，接收侧信任并集聚合成本随事件吞吐放大。
+func TestResolvePolicyIPListRefs_attachesInlineOnlyMergeWithoutRefs(t *testing.T) {
+	newClusterTestService(t)
+	p := &models.SecurityPolicy{
+		ID:           1,
+		Name:         "inline-only",
+		IPACLEnabled: true,
+		IPACLMode:    "deny",
+		IPACLList:    `["198.51.100.7"]`,
+		IPWhitelist:  json.RawMessage(`["203.0.113.1","203.0.113.0/24"]`),
+	}
+
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, nil)
+
+	if p.MergedWhitelist == nil || p.MergedACLList == nil {
+		t.Fatalf("无引用形态必须附加合并集（MergedWhitelist=%v MergedACLList=%v）", p.MergedWhitelist, p.MergedACLList)
+	}
+	// 合并即聚合：203.0.113.1 被 203.0.113.0/24 覆盖，同类兄弟归并。
+	if want := []string{"203.0.113.0/24"}; !reflect.DeepEqual(p.MergedWhitelist, want) {
+		t.Fatalf("MergedWhitelist=%v, want %v（与 mergedWhitelist 的 inline-only 回退逐字等价）", p.MergedWhitelist, want)
+	}
+	// 单地址条目在合并时按 /32 规范化（aggregateIPEntries 的 CIDR 归并）。
+	if want := []string{"198.51.100.7/32"}; !reflect.DeepEqual(p.MergedACLList, want) {
+		t.Fatalf("MergedACLList=%v, want %v", p.MergedACLList, want)
+	}
+	// 发射端取值零分配：已附加时 mergedWhitelist 直接返回（不得每次重跑解析+聚合）。
+	if allocs := testing.AllocsPerRun(50, func() { _ = mergedWhitelist(p) }); allocs != 0 {
+		t.Fatalf("mergedWhitelist 每次调用分配=%v, want 0（合并集已附加，不得重跑 json.Unmarshal+聚合）", allocs)
+	}
+	if allocs := testing.AllocsPerRun(50, func() { _ = mergedACLList(p) }); allocs != 0 {
+		t.Fatalf("mergedACLList 每次调用分配=%v, want 0", allocs)
+	}
+}
+
+// 畸形 refs 静默 fail-open ——
+
+// 全形状：畸形（非 JSON / 错元素类型）/空/合法 + deny/allow 两种 ACL 语义。
+// 畸形：留痕且仅保留 inline（行为不变）；空：零告警（未配置引用）；合法：
+// refs 条目进入合并集（deny 与 allow 同口径）。
+func TestIPListRefs_shapesWarnAndMerge(t *testing.T) {
+	_, database := newClusterTestService(t)
+	res, err := database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+		VALUES ('引用自定义列表', '常规', '[{"value":"203.0.113.0/24"}]', 0, datetime('now'), datetime('now'))`)
+	if err != nil {
+		t.Fatalf("seed list: %v", err)
+	}
+	listID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := fmt.Sprintf("[%d]", listID)
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	// 限流隔离：同包先序用例（如 TestExpandPolicyIPRefs_missingAndMalformedRefsSkipped
+	// 用 `not-json`）已放行过同一归一化键（auditFailureThrottleKey 把数字统一
+	// 成 #，不同策略 id 同键），60s 窗口会抑制本用例的 WARN 断言。推进注入
+	// 时钟并清空窗口记录（仅测试缝隙，不改生产限流口径）。
+	oldClock := auditFailureLogClock
+	auditFailureLogClock = func() time.Time { return time.Now().Add(2 * time.Minute) }
+	auditFailureLogMu.Lock()
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	t.Cleanup(func() {
+		auditFailureLogClock = oldClock
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = map[string]time.Time{}
+		auditFailureLogMu.Unlock()
+	})
+
+	policies := []*models.SecurityPolicy{
+		{ID: 8701, Name: "畸形 JSON", IPACLList: `["198.51.100.0/24"]`, IPACLListRefs: `not-json`},
+		{ID: 8702, Name: "错元素类型", IPACLList: `["198.51.100.0/24"]`, IPACLListRefs: `["1"]`},
+		{ID: 8703, Name: "空 refs", IPACLList: `["198.51.100.0/24"]`},
+		{ID: 8704, Name: "deny 引用", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: refs},
+		{ID: 8705, Name: "allow 引用", IPACLEnabled: true, IPACLMode: "allow", IPACLList: `[]`, IPACLListRefs: refs, IPWhitelistRefs: refs},
+	}
+
+	resolvePolicyIPListRefs(policies, nil)
+
+	// 畸形形状：仅保留 inline（不升级 IPRefMissing——整条策略不被跳过）。
+	for _, p := range policies[:2] {
+		if p.IPRefMissing {
+			t.Fatalf("策略 %q 不得因畸形 refs 置 IPRefMissing（放大会跳过 WAF/限流渲染）", p.Name)
+		}
+		if got := p.MergedACLList; len(got) != 1 || got[0] != "198.51.100.0/24" {
+			t.Fatalf("策略 %q 畸形 refs 合并集=%v, want 仅 inline 198.51.100.0/24", p.Name, got)
+		}
+	}
+	if !strings.Contains(logs.String(), "ip_acl_list_refs") || !strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("畸形 refs 必须 WARN 留痕（同一 fail-open 方向的内联畸形已留痕）:\n%s", logs.String())
+	}
+	// 空形状：不告警。
+	logs.Reset()
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{{ID: 8706, IPACLList: `["198.51.100.0/24"]`}}, nil)
+	if strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("空 refs（未配置引用）不得留痕:\n%s", logs.String())
+	}
+	// 合法形状：deny / allow 两语义都拿到引用条目；信任面同口径。
+	for _, p := range policies[3:] {
+		if p.IPRefMissing {
+			t.Fatalf("策略 %q 合法 refs 不得置 IPRefMissing", p.Name)
+		}
+		if got := p.MergedACLList; len(got) != 1 || got[0] != "203.0.113.0/24" {
+			t.Fatalf("策略 %q 合法 refs 合并集=%v, want 引用条目 203.0.113.0/24", p.Name, got)
+		}
+	}
+	if got := policies[4].MergedWhitelist; len(got) != 1 || got[0] != "203.0.113.0/24" {
+		t.Fatalf("信任面合法 refs 合并集=%v, want 203.0.113.0/24", got)
+	}
+}
+
+// 同一 tick 内相同来源列的展开结果去重 ——
+
+// 多策略引用同一名单（相同来源列）共享一次性展开；不同 inline 的策略仍各自
+// 得到独立合并集（去重不得跨输入串味）。
+func TestIPListRefs_identicalColumnsShareExpansion(t *testing.T) {
+	_, database := newClusterTestService(t)
+	res, err := database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+		VALUES ('共享引用名单', '常规', '[{"value":"203.0.113.0/24"}]', 0, datetime('now'), datetime('now'))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listID, _ := res.LastInsertId()
+	refs := fmt.Sprintf("[%d]", listID)
+
+	shared := []*models.SecurityPolicy{
+		{ID: 8721, Name: "共享 A", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: refs},
+		{ID: 8722, Name: "共享 B", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: refs},
+		{ID: 8723, Name: "独有 inline", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.0/24"]`, IPACLListRefs: refs},
+	}
+	resolvePolicyIPListRefs(shared, nil)
+
+	for _, p := range shared[:2] {
+		if got := p.MergedACLList; len(got) != 1 || got[0] != "203.0.113.0/24" {
+			t.Fatalf("策略 %q 共享展开=%v, want 203.0.113.0/24", p.Name, got)
+		}
+	}
+	if got := shared[2].MergedACLList; len(got) != 2 || got[0] != "198.51.100.0/24" || got[1] != "203.0.113.0/24" {
+		t.Fatalf("不同 inline 的策略不得复用他人展开: %v", got)
+	}
+}
+
+// 文本代际的一次读取内只允许解析一遍：可解析率门与坏行剔除必须共用同一份
+// 扫描结果。旧实现在同一批 vals 上分别调用「算比率」与「剔除坏行」，条目被
+// 重复解析 2–3 遍（20 万条名单每次渲染多付 1–2 次全量 ParseIPEntry）。
+func TestReadThreatIplistPath_parsesTextOncePerRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "threat-ustc.iplist")
+	// 无 .fast 同名文件 → 走文本代际；2/3 行合法（≥ threatMinParseRatio）。
+	writeTestFile(t, path, "203.0.113.0/24\n198.51.100.7\nnot-an-ip\n")
+
+	threatTextScanRunsForTest.Store(0)
+	vals, err := readThreatIplistPath(path)
+	if err != nil {
+		t.Fatalf("readThreatIplistPath: %v", err)
+	}
+	if want := []string{"203.0.113.0/24", "198.51.100.7"}; !reflect.DeepEqual(vals, want) {
+		t.Fatalf("vals=%v, want %v（不可解析行必须剔除）", vals, want)
+	}
+	if got := threatTextScanRunsForTest.Load(); got != 3 {
+		t.Fatalf("条目解析次数=%d, want 3（一次读取只解析一遍；重复解析说明比率门与坏行剔除各扫一次）", got)
+	}
+}
+
+// 分批 IN 查询只允许一套实现：渲染装载与摘要存在性判定曾各持一份同构的
+// 「切块 + 拼占位符 + 迭代错误捕获」，任一侧修正（如 rows.Err fail-closed）
+// 都会单边漂移。两边现在只通过 forEachIPListChunk 分批。
+func TestIPListChunking_singleImplementation(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offenders []string
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, readErr := os.ReadFile(name)
+		if readErr != nil {
+			t.Fatalf("读取 %s 失败: %v", name, readErr)
+		}
+		if n := strings.Count(string(data), "start += ipListChunkSize"); n > 0 {
+			offenders = append(offenders, fmt.Sprintf("%s(%d)", name, n))
+		}
+	}
+	if len(offenders) != 1 || offenders[0] != "securityiplists.go(1)" {
+		t.Fatalf("分批 IN 查询的切块循环散落多份: %v——必须只在 forEachIPListChunk 内出现一次", offenders)
+	}
+}
+
+// 跨块形态：ipListChunkSize 之外的 id 必须全部装载（分批边界不得漏行），
+// 且块内迭代错误按块 fail-closed 并上抛首个错误——两条装载路径共用同一实现，
+// 本用例同时覆盖渲染装载与摘要存在性判定。
+func TestIPListChunking_crossChunkLoadsAndFailsClosed(t *testing.T) {
+	_, database := newClusterTestService(t)
+	oldChunk := ipListChunkSize
+	ipListChunkSize = 2
+	t.Cleanup(func() { ipListChunkSize = oldChunk })
+
+	var ids []int64
+	for i := 0; i < 5; i++ {
+		res, err := database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+			VALUES (?, '常规', ?, 0, datetime('now'), datetime('now'))`, fmt.Sprintf("跨块列表%d", i), fmt.Sprintf(`[{"value":"203.0.113.%d"}]`, i+1))
+		if err != nil {
+			t.Fatalf("seed list: %v", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	entries, failed, err := loadIPListEntriesVia(database, ids)
+	if err != nil {
+		t.Fatalf("跨块装载失败: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("跨块装载不得有失败块: %v", failed)
+	}
+	for _, id := range ids {
+		if _, ok := entries[id]; !ok {
+			t.Fatalf("列表 id=%d 未装载（分批边界漏行）", id)
+		}
+	}
+	presence, failedPresence := loadIPListRefPresenceVia(database, ids)
+	if len(failedPresence) != 0 {
+		t.Fatalf("摘要存在性判定不得有失败块: %v", failedPresence)
+	}
+	for _, id := range ids {
+		if !presence[id] {
+			t.Fatalf("列表 id=%d 在摘要口径必须判为有生效条目", id)
+		}
 	}
 }

@@ -10,15 +10,17 @@
   >
     <template #header>
       <div class="flow-header">
-        <span class="flow-header-title">处理流程</span>
-        <span v-if="target" class="flow-header-name" :title="target.name">{{ target.name }}</span>
+        <DialogHeader :icon="Connection" title="处理流程" :subtitle="target?.name" />
+        <!-- 协议徽标：HTTP 蓝 / TCP 青（全局 proto-tcp-tag 单源） -->
+        <el-tag v-if="isTcp" size="small" effect="plain" class="proto-tcp-tag flow-proto-badge">TCP</el-tag>
+        <el-tag v-else size="small" effect="plain" type="primary" class="flow-proto-badge">{{ protocolLabel }}</el-tag>
       </div>
     </template>
 
     <div v-if="target" class="flow-body">
-      <div v-if="isTcp" class="info-note-bar info-note-bar--inset">
-        <span class="info-note-desc">TCP 规则无 HTTP 安全链</span>
-        <span class="info-note-sub">TCP（L4）流量不经信任名单、IP 访问控制、限流与 WAF 阶段，接入后直接转发至上游。</span>
+      <div v-if="model?.ruleDisabled" class="info-note-bar info-note-bar--inset">
+        <span class="info-note-desc">规则已禁用——安全链未进入运行配置</span>
+        <span class="info-note-sub">绑定与阶段页保留，启用后生效；当前该规则不产生任何 listener 路由，下方阶段按「保留配置」展示。</span>
       </div>
 
       <!-- 纵向时间线：接入 → 阶段 0 → 阶段 1 → 阶段 2 → 阶段 3 → 上游 -->
@@ -48,8 +50,8 @@
 
         <!-- 接入信息（选中节点下方展开）：我们收到什么样的请求 -->
         <el-collapse-transition v-if="node.key === 'access'">
-          <div v-if="activeNode === 'access'" class="flow-panel tl-panel">
-            <div class="flow-panel-head"><span class="flow-panel-title">接入 · 收到的请求</span></div>
+          <div v-if="activeNode === 'access'" class="flow-panel dialog-panel tl-panel">
+            <DialogSectionHeader title="接入 · 收到的请求" />
             <div class="flow-kv-grid">
               <div class="flow-kv flow-kv--wide">
                 <span class="flow-kv-label">域名</span>
@@ -73,12 +75,18 @@
             </div>
             <template v-if="target.enableTls && !isTcp">
               <div v-if="certLoading" class="flow-cert-loading"><el-skeleton :rows="2" animated /></div>
+              <div v-else-if="certFailed" class="flow-detail-line">
+                证书信息加载失败
+                <el-button link type="warning" size="small" @click="retryCertInfo">重试</el-button>
+              </div>
               <template v-else-if="certInfo">
-                <div class="flow-cert-title">TLS 证书</div>
+                <div class="flow-cert-section"><DialogSectionHeader title="TLS 证书" /></div>
                 <div class="flow-kv-grid">
                   <div class="flow-kv"><span class="flow-kv-label">签发者</span><span class="flow-kv-value" :title="certInfo.issuer">{{ certInfo.issuer || '-' }}</span></div>
                   <div class="flow-kv"><span class="flow-kv-label">证书域名</span><span class="flow-kv-value" :title="certInfo.domains">{{ certInfo.domains || '-' }}</span></div>
-                  <div class="flow-kv"><span class="flow-kv-label">到期时间</span><span class="flow-kv-value">{{ certInfo.not_after || '-' }}</span></div>
+                  <!-- 到期时间与规则列表同口径（formatDate=配置时区换算）：后端 not_after 是
+                       UTC 墙钟串，直出会让弹框与列表相差一个时区偏移。 -->
+                  <div class="flow-kv"><span class="flow-kv-label">到期时间</span><span class="flow-kv-value">{{ formatDate(certInfo.not_after) || '-' }}</span></div>
                   <div class="flow-kv">
                     <span class="flow-kv-label">剩余天数</span>
                     <span class="flow-kv-value" :class="{ 'is-expired': certInfo.status === 'expired' }">
@@ -102,9 +110,13 @@
 
         <!-- 阶段 0 · 信任名单面板 -->
         <el-collapse-transition v-if="node.key === 'stage0'">
-          <div v-if="activeNode === 'stage0'" class="flow-panel tl-panel">
+          <div v-if="activeNode === 'stage0'" class="flow-panel dialog-panel tl-panel">
             <template v-if="stageZero">
-            <div class="flow-panel-head"><span class="flow-panel-title">{{ stageZero.title }}</span></div>
+            <DialogSectionHeader :title="stageZero.title" />
+            <div v-if="detailFailedSources.length > 0" class="flow-detail-line">
+              部分明细加载失败（{{ detailFailedSources.join('、') }}）
+              <el-button link type="warning" size="small" @click="ensureDetails(true)">重试</el-button>
+            </div>
             <div
               v-for="group in stageZero.groups"
               :key="group.key"
@@ -116,7 +128,7 @@
                 <span class="flow-policy-name" :title="group.name">{{ group.name }}</span>
                 <el-tag v-if="!group.enabled" type="info" size="small" effect="plain">已禁用</el-tag>
                 <el-button
-                  v-if="groupHasDetails(group)"
+                  v-if="groupHasDetails(group) || detailFailedSources.length > 0"
                   link
                   type="primary"
                   size="small"
@@ -145,7 +157,8 @@
                 </div>
               </el-collapse-transition>
             </div>
-            <div class="flow-panel-footnote">「直通上游」模式：信任 IP 命中后跳过全部后续安全阶段，不产生任何安全事件（故无计数 chip）；「保留检测记录」模式：继续评估后续全部阶段但不拦截，命中事件动作记为检测</div>
+            <div v-if="isTcp" class="info-note-bar"><span class="info-note-desc">「直通上游」模式：连接直达上游（不产生安全事件，故无计数 chip）；「保留检测记录」模式：命中产检测事件（记录为检测）后直达上游，不拦截（与 HTTP 语义一致）；未命中继续进入阶段 1 判定</span></div>
+            <div v-else class="info-note-bar"><span class="info-note-desc">「直通上游」模式：信任 IP 命中后跳过全部后续安全阶段，不产生任何安全事件（故无计数 chip）；「保留检测记录」模式：信任 IP 命中后同样跳过全部后续安全阶段，由独立轻量检测事务记录（动作=检测）后直达上游，不拦截</span></div>
             </template>
             <div v-else class="flow-detail-line">未启用——未绑定信任名单策略，请求直接进入阶段 1</div>
           </div>
@@ -153,13 +166,27 @@
 
         <!-- 阶段 1/2/3 面板 -->
         <el-collapse-transition v-if="node.key.startsWith('stage') && node.key !== 'stage0'">
-          <div v-if="activeNode === node.key && typedStageByKey(node.key)" class="flow-panel tl-panel">
+          <div v-if="activeNode === node.key && typedStageByKey(node.key)" class="flow-panel dialog-panel tl-panel">
+              <!-- TCP 规则阶段 2/3 整组灰态：无 429/WAF 引擎面，面板只出不适用说明
+                   （无策略组/明细/计数——绑定侧已拒绝此类策略） -->
+              <div v-if="isTcp && typedStageByKey(node.key)!.stage >= 2" class="flow-stage-empty">TCP 规则不适用（TCP 仅支持阶段 0/1：信任名单 · IP 访问控制/地域拦截）</div>
+              <template v-else>
               <div class="flow-panel-head">
-                <span class="flow-panel-title">{{ typedStageByKey(node.key)!.title }}</span>
-                <el-tag v-if="typedStageByKey(node.key)!.override && !typedStageByKey(node.key)!.override!.broken" type="warning" size="small" effect="plain">阶段页：{{ typedStageByKey(node.key)!.override!.pageName }}（{{ typedStageByKey(node.key)!.override!.status }}）</el-tag>
-                <el-tag v-else-if="typedStageByKey(node.key)!.override?.broken" type="danger" size="small" effect="plain">阶段页已失效（回落跟随策略）</el-tag>
-                <el-tag v-else-if="typedStageByKey(node.key)!.stage !== 2" type="info" size="small" effect="plain">拦截页跟随策略</el-tag>
-                <el-tag v-if="!typedStageByKey(node.key)!.enabled" type="info" size="small" effect="plain">未启用</el-tag>
+                <DialogSectionHeader :title="typedStageByKey(node.key)!.title" />
+                <div class="flow-panel-meta">
+                  <!-- TCP（L4）拒绝=断连无拦截页：跟随策略措辞仅 HTTP 渲染面成立。
+                       规则级阶段页覆盖徽标已随触发归因裁定退役。 -->
+                  <el-tag v-if="typedStageByKey(node.key)!.stage !== 2" type="info" size="small" effect="plain">{{ isTcp ? '拦截页不支持' : '拦截页跟随策略' }}</el-tag>
+                  <el-tag v-if="!typedStageByKey(node.key)!.enabled" type="info" size="small" effect="plain">未启用</el-tag>
+                </div>
+              </div>
+              <div v-if="detailFailedSources.length > 0" class="flow-detail-line">
+                部分明细加载失败（{{ detailFailedSources.join('、') }}）
+                <el-button link type="warning" size="small" @click="ensureDetails(true)">重试</el-button>
+              </div>
+              <div v-if="statsFailed" class="flow-detail-line">
+                阶段计数加载失败：24h 拦截数不可用
+                <el-button link type="warning" size="small" @click="retryStageStats">重试</el-button>
               </div>
               <div v-if="stageStatsText(typedStageByKey(node.key)!.stage)" class="flow-panel-stats">{{ stageStatsText(typedStageByKey(node.key)!.stage) }}</div>
               <template v-if="typedStageByKey(node.key)!.enabled">
@@ -175,7 +202,7 @@
                     <el-tag v-if="policyTypeOf(group.key) === 'mixed'" type="warning" size="small" effect="plain">混合</el-tag>
                     <el-tag v-if="!group.enabled" type="info" size="small" effect="plain">已禁用</el-tag>
                     <el-button
-                      v-if="groupHasDetails(group)"
+                      v-if="groupHasDetails(group) || detailFailedSources.length > 0"
                       link
                       type="primary"
                       size="small"
@@ -204,6 +231,14 @@
                             <span class="flow-detail-meta">{{ list.count }} 条</span>
                           </div>
                         </template>
+                        <template v-if="group.details.blacklistEntries && group.details.blacklistEntries.length > 0">
+                          <!-- 遗留独立黑名单：摘要对非 deny 模式明示「N 条仍生效」，
+                               明细逐条对账（不受 ACL 开关门控） -->
+                          <div class="flow-detail-block-title">独立黑名单（{{ group.details.blacklistEntries.length }} 条{{ group.details.blacklistEntries.length > 200 ? '，仅显示前 200 条' : '' }}）</div>
+                          <div v-for="entry in group.details.blacklistEntries.slice(0, 200)" :key="`bl:${entry}`" class="flow-detail-entry">
+                            <span class="flow-detail-value">{{ entry }}</span>
+                          </div>
+                        </template>
                         <template v-if="group.details.trustEntries">
                           <div class="flow-detail-block-title">信任名单（{{ group.details.trustEntries.length }} 条{{ group.details.trustEntries.length > 200 ? '，仅显示前 200 条' : '' }}）</div>
                           <div v-for="entry in group.details.trustEntries.slice(0, 200)" :key="`trust:${entry.value}`" class="flow-detail-entry">
@@ -213,8 +248,10 @@
                         </template>
                         <template v-if="group.details.geoipRegions && group.details.geoipRegions.length > 0">
                           <div class="flow-detail-block-title">地域拦截区域（{{ group.details.geoipRegions.length }} 个）</div>
+                          <!-- 国家条目展示层翻译（country_names_cn 单源），
+                               省份/省市联值/海外哨兵未命中回退原文；geoipRegions 值零改动 -->
                           <div class="flow-detail-chips">
-                            <el-tag v-for="region in group.details.geoipRegions" :key="region" size="small" effect="plain" class="flow-detail-chip">{{ region }}</el-tag>
+                            <el-tag v-for="region in group.details.geoipRegions" :key="region" size="small" effect="plain" class="flow-detail-chip">{{ countryLabel(countryZh, region) }}</el-tag>
                           </div>
                         </template>
                         <template v-if="group.details.rateLimit">
@@ -241,18 +278,19 @@
                 </div>
               </template>
               <div v-else class="flow-stage-empty">该阶段未启用（无策略配置对应能力）</div>
-              <div class="flow-panel-footnote">
-                {{ typedStageByKey(node.key)!.stage === 1 ? stage1Footnote : `未通过即终止${typedStageByKey(node.key)!.footnote ? `；${typedStageByKey(node.key)!.footnote}` : ''}` }}
+              <div class="info-note-bar">
+                <span class="info-note-desc">{{ typedStageByKey(node.key)!.stage === 1 ? (isTcp ? TCP_STAGE1_FOOTNOTE : stage1Footnote) : `未通过即终止${typedStageByKey(node.key)!.footnote ? `；${typedStageByKey(node.key)!.footnote}` : ''}` }}</span>
               </div>
+              </template>
           </div>
         </el-collapse-transition>
 
         <!-- 上游信息（发给什么样的上游） -->
         <el-collapse-transition v-if="node.key === 'upstream'">
-          <div v-if="activeNode === 'upstream'" class="flow-panel tl-panel">
+          <div v-if="activeNode === 'upstream'" class="flow-panel dialog-panel tl-panel">
             <div class="flow-panel-head">
-              <span class="flow-panel-title">上游 · 转发目标</span>
-              <el-tag v-if="target.health" size="small" effect="plain" :type="target.health.unhealthy + target.health.degraded > 0 ? 'warning' : 'success'">
+              <DialogSectionHeader title="上游 · 转发目标" />
+              <el-tag v-if="target.health" size="small" effect="plain" :type="target.health.unhealthy + target.health.degraded > 0 ? 'warning' : 'success'" class="flow-panel-meta">
                 健康 {{ target.health.healthy }}/{{ target.health.total }}
               </el-tag>
             </div>
@@ -275,7 +313,7 @@
               </el-table-column>
               <el-table-column label="状态" width="110" align="center">
                 <template #default="{ row }">
-                  <el-tag size="small" effect="plain" :type="upstreamStateType(row)">{{ upstreamStateText(row) }}</el-tag>
+                  <el-tag size="small" effect="plain" :type="upstreamStateType(row as Pick<RuleFlowUpstream, 'host' | 'port' | 'enabled'>)">{{ upstreamStateText(row as Pick<RuleFlowUpstream, 'host' | 'port' | 'enabled'>) }}</el-tag>
                 </template>
               </el-table-column>
             </el-table>
@@ -283,10 +321,7 @@
             <!-- 路由分发明细分组：主路由+逐条路径行的健康明细（自定义路由信息唯一呈现处，
                  不再设独立流程节点）；主路由行含禁用位（主上游表上方已列全量，明细口径一致） -->
             <div v-if="target.pathRules && target.pathRules.length > 0" class="flow-route-group">
-              <div class="flow-route-group-head">
-                <span class="flow-route-group-title">路由分发</span>
-                <span class="flow-route-group-sub">{{ target.pathRules.length }} 条自定义路由 · 未命中走主路由</span>
-              </div>
+              <DialogSectionHeader title="路由分发" :description="`${target.pathRules.length} 条自定义路由 · 未命中走主路由`" />
               <div class="flow-route-row">
                 <span class="flow-route-match">/<em class="flow-route-type">主路由</em></span>
                 <span class="flow-route-arrow">→</span>
@@ -304,7 +339,31 @@
                 <span class="flow-route-match">{{ pr.path }}<em class="flow-route-type">{{ pathMatchLabel(pr.match_type) }}</em></span>
                 <span class="flow-route-arrow">→</span>
                 <span class="flow-route-targets">
-                  <template v-if="enabledPathUpstreams(pr).length > 0">
+                  <template v-if="pr.response_mode === 'static'">
+                    <span class="flow-route-target">
+                      <el-tag size="small" effect="plain" type="success">静态返回</el-tag>
+                      <span class="flow-upstream-addr">状态码 {{ pr.response_status || 200 }}</span>
+                    </span>
+                  </template>
+                  <template v-else-if="pr.response_mode === 'redirect'">
+                    <span class="flow-route-target">
+                      <el-tag size="small" effect="plain" type="warning">301</el-tag>
+                      <span class="flow-upstream-addr">{{ pr.redirect_to || '-' }}</span>
+                    </span>
+                  </template>
+                  <template v-else-if="pr.upstreams === null">
+                    <span class="flow-route-target">
+                      <el-tag size="small" effect="plain" type="info">跟随主路由上游</el-tag>
+                    </span>
+                    <template v-if="target.upstreams && target.upstreams.length > 0">
+                      <span v-for="u in target.upstreams" :key="`${pr.path}-default-${u.host}:${u.port}`" class="flow-route-target">
+                        <span class="flow-upstream-addr">{{ u.host }}:{{ u.port }}</span>
+                        <el-tag size="small" effect="plain" :type="upstreamStateType(u)">{{ upstreamStateText(u) }}</el-tag>
+                      </span>
+                    </template>
+                    <span v-else class="flow-route-none">无主上游</span>
+                  </template>
+                  <template v-else-if="enabledPathUpstreams(pr).length > 0">
                     <span v-for="u in enabledPathUpstreams(pr)" :key="`${u.host}:${u.port}`" class="flow-route-target">
                       <span class="flow-upstream-addr">{{ u.host }}:{{ u.port }}</span>
                       <el-tag size="small" effect="plain" :type="upstreamStateType(u)">{{ upstreamStateText(u) }}</el-tag>
@@ -314,7 +373,7 @@
                 </span>
               </div>
             </div>
-            <div class="flow-panel-footnote">健康口径：规则级计数（健康 {{ target.health?.healthy ?? 0 }}/共 {{ target.health?.total ?? 0 }}）；无逐上游实时探针数据时按「上游启用/禁用 + 规则健康计数」呈现——逐上游状态为最近一次轮询快照；自定义路由上游与主路由同享规则级健康检查</div>
+            <div class="info-note-bar"><span class="info-note-desc">健康口径：规则级计数（健康 {{ target.health?.healthy ?? 0 }}/共 {{ target.health?.total ?? 0 }}）；无逐上游实时探针数据时按「上游启用/禁用 + 规则健康计数」呈现——逐上游状态为最近一次轮询快照；转发型自定义路由上游与主路由同享规则级健康检查（静态返回 / 301 跳转不转发上游）</span></div>
           </div>
         </el-collapse-transition>
           </div>
@@ -328,12 +387,18 @@
 import { computed, ref } from 'vue'
 import { Connection, CircleCheck, Key, Odometer, Aim, TopRight } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import DialogHeader from '@/components/DialogHeader.vue'
+import DialogSectionHeader from '@/components/DialogSectionHeader.vue'
 import { request } from '@/utils/api'
+import { formatDate } from '@/utils/date'
 import type { APIResponse } from '@/types'
 import type { RuleFlowPathRule } from '@/types/rules'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { weightPercent } from '@/utils/upstreamWeights'
-import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds } from '@/utils/securityStages'
+import { STAGE_TITLES, attachStageDetails, hasTrustDetectionBinding, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds, stage1FootnoteText, stageSubLabel, trustHitMode } from '@/utils/securityStages'
+import { stageCountChip, stageCountSummary, stageTimingChip, type RuleStageCounts } from '@/utils/ruleStageStats'
+import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
+import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type {
   CrsRuleFileOption,
   RuleFlowTarget,
@@ -357,23 +422,14 @@ const props = defineProps<{
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
 const isTcp = computed(() => props.target?.protocol === 'tcp')
+// 海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
+// 读 ref 自动解包并注册响应依赖）。
+const countryZh = useCountryNamesCn()
 const protocolLabel = computed(() => {
   if (!props.target) return '-'
   if (props.target.protocol === 'tcp') return 'TCP'
   return props.target.enableTls ? 'HTTPS' : 'HTTP'
 })
-
-interface StageStats {
-  stage1_blocked_24h: number
-  stage3_blocked_24h: number
-  ratelimit_blocks_reload: number
-  // 分段平均处理耗时（µs,2026-09-27）:预检段=信任+IP ACL+GeoIP(同一 coraza
-  // handler 不可分);WAF 段=隔离预检后的评估成本(含限流,纳秒级可忽略)。
-  precheck_avg_us?: number
-  precheck_samples?: number
-  waf_avg_us?: number
-  waf_samples?: number
-}
 
 interface FlowCertInfo {
   source: string
@@ -386,9 +442,16 @@ interface FlowCertInfo {
   error?: string
 }
 
-const stats = ref<StageStats | null>(null)
+const stats = ref<RuleStageCounts | null>(null)
 const statsSettled = ref(false)
+// 计数取数失败位：与「加载中」由 statsSettled 区分，与「成功但载荷为空」由本位
+// 区分——原实现两条失败形态都压成 stats=null 渲染固定 '—'，读者无法分辨
+// 「请求失败（可重试）」与「计数确为 0」。
+const statsFailed = ref(false)
 const certInfo = ref<FlowCertInfo | null>(null)
+// cert-info 拉取失败位：失败与「后端无可展示证书」必须区分——原实现两者共用
+// certInfo=null，弹框会把一次 5xx/超时读成「规则禁用或证书未就绪」的业务结论。
+const certFailed = ref(false)
 const certLoading = ref(false)
 let statsSeq = 0
 // 证书拉取用独立序列计数器：与 statsSeq 共用时，TLS 规则的 cert-info 请求
@@ -406,6 +469,8 @@ const activeNode = ref('access')
 // ── 明细懒加载（决策 C：现有只读端点前端拼装）——阶段面板首次选中时拉取三源并附着 ──
 const detailLoading = ref(false)
 const detailsAttached = ref(false)
+// 每源失败位：部分失败不得被读成「该策略确无明细」——面板内显式降级说明。
+const detailFailedSources = ref<string[]>([])
 const fullPolicies = ref<Map<number, SecurityStagePolicyDetail>>(new Map())
 // 引用名单条目按需缓存（2026-09-24：列表载荷不再内联 entries——大名单
 // 460KB/行；明细展开时按引用 id 拉 GET /security/ip-lists/:id）
@@ -450,10 +515,16 @@ const stageZero = computed<StageZeroPanel | undefined>(() => {
 const typedStagePanels = computed<StageGroup[]>(() => (displayModel.value?.stages ?? []).filter((s) => s.stage !== 0))
 const typedStageByKey = (key: string): StageGroup | undefined => typedStagePanels.value.find((s) => `stage${s.stage}` === key)
 
-// 阶段 0 导航副标题按该规则 stage0 策略的实际模式聚合：全直通/全保留检测/混合
+// 阶段 0 导航副标题按该规则 stage0 策略的实际信任命中模式聚合：全直通/全保留检测/混合
 const stageZeroSubtitle = computed(() => {
   if (!stageZero.value) return ''
-  const states = stageZero.value.groups.map((g) => props.policies.find((p) => p.id === g.key)?.trust_detection === true)
+  const states = stageZero.value.groups.map((g) => {
+    const policy = props.policies.find((p) => p.id === g.key)
+    return trustHitMode(policy?.policy_type, policy?.trust_detection) === 'detection'
+  })
+  // 空数组时 every(Boolean) 恒真会误报「保留检测记录」：阶段 0 已启用但未绑定
+  // 任何名单/策略时，副标题按「未启用」呈现（不暗示存在检测保留语义）。
+  if (states.length === 0) return '未启用'
   if (states.every(Boolean)) return '保留检测记录'
   if (states.every((v) => !v)) return '直通上游'
   return '直通 + 保留检测'
@@ -466,6 +537,7 @@ const groupHasDetails = (group: StagePolicyGroup): boolean => {
   const d = group.details
   if (!d) return false
   return (d.aclInlineCount ?? 0) > 0 || (d.aclLists?.length ?? 0) > 0
+    || (d.blacklistEntries?.length ?? 0) > 0
     || (d.trustEntries?.length ?? 0) > 0
     || (d.geoipRegions?.length ?? 0) > 0
     || d.rateLimit !== undefined
@@ -473,9 +545,13 @@ const groupHasDetails = (group: StagePolicyGroup): boolean => {
     || (d.crsGroups?.length ?? 0) > 0
 }
 
-const ensureDetails = async (): Promise<void> => {
-  if (detailsAttached.value || detailLoading.value) return
+// CRS 文件清单全量分页取回走 utils/crsRuleFiles 单源（策略页同实现）。
+const ensureDetails = async (force = false): Promise<void> => {
+  // force=用户点「重试」：即使已附着（部分源失败）也重拉；在途请求不叠加。
+  if (detailLoading.value) return
+  if (detailsAttached.value && !force) return
   const seq = ++detailsSeq
+  detailFailedSources.value = []
   detailLoading.value = true
   try {
     const caddyId = props.target?.caddyId
@@ -484,21 +560,28 @@ const ensureDetails = async (): Promise<void> => {
         ? request.get<APIResponse<SecurityStagePolicyDetail[]>>(`/security/rules/${encodeURIComponent(caddyId)}/policy`, { silent: true })
         : Promise.resolve<APIResponse<SecurityStagePolicyDetail[]>>({ code: 0, data: [] }),
       request.get<APIResponse<SecurityStageCustomRule[]>>('/security/custom-rules', { silent: true }),
-      // 第 62 轮 F62-26:50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
-      request.get<APIResponse<{ rules: CrsRuleFileOption[] }>>('/security/crs/rules?page_size=50', { silent: true }),
+      // 全量分页取回（组名映射不再因超页宽静默降级为裸组码）
+      fetchAllCrsRuleFiles(),
     ])
     // 续体落地前校验会话序号：弹框已切换（onDialogOpen ++）或更新一次拉取已发起
     // 时丢弃过期结果，避免旧会话数据附着或抢置 detailsAttached
     if (seq !== detailsSeq) return
+    const failedSources: string[] = []
     if (policyRes.status === 'fulfilled') {
       fullPolicies.value = new Map((policyRes.value.data ?? []).map((p) => [p.id, p]))
-    }
+    } else failedSources.push('策略明细')
     if (customRes.status === 'fulfilled') customRules.value = customRes.value.data ?? []
-    if (crsRes.status === 'fulfilled') crsFiles.value = crsRes.value.data?.rules ?? []
+    else failedSources.push('自定义规则')
+    if (crsRes.status === 'fulfilled') crsFiles.value = crsRes.value
+    else failedSources.push('CRS 规则组')
     // 引用名单条目：仅信任名单引用需条目值（阶段 0 明细逐条展示）；
     // ACL 明细为列表级汇总（名称+entry_count），不拉条目
     const refIds = new Set<number>()
+    const boundTrustPolicyIds = new Set(
+      props.model?.stages.find((stage) => stage.stage === 0)?.groups.map((group) => group.key) ?? [],
+    )
     for (const pol of props.policies) {
+      if (!boundTrustPolicyIds.has(pol.id)) continue
       for (const id of parseRefIds(pol.ip_whitelist_refs)) refIds.add(id)
     }
     const missing = [...refIds].filter((id) => !ipListEntryCache.value.has(id))
@@ -508,18 +591,27 @@ const ensureDetails = async (): Promise<void> => {
       )
       if (seq !== detailsSeq) return
       const cache = new Map(ipListEntryCache.value)
+      let entriesFailed = false
       listRes.forEach((r, i) => {
         if (r.status === 'fulfilled' && r.value.data) cache.set(missing[i], r.value.data.entries ?? [])
+        else if (r.status === 'rejected') entriesFailed = true
       })
       ipListEntryCache.value = cache
+      // 名单条目失败不得静默——阶段 0 信任预览/明细会因此缺条目
+      if (entriesFailed) failedSources.push('引用名单条目')
     }
-    // F-47-36：三端点全部 rejected 时不置 detailsAttached——原无条件置位会把弹框
+    // 三端点全部 rejected 时不置 detailsAttached——原无条件置位会把弹框
     // 锁死在「明细按钮缺失且不可重试」且 silent 请求零反馈；保持可重试（下次点击
     // 重新拉取）并显式提示一次；部分成功仍置 attached（可用数据降级展示，保持现状语义）
     if (policyRes.status === 'rejected' && customRes.status === 'rejected' && crsRes.status === 'rejected') {
+      // 全源失败同样保留失败位：面板级说明与「明细」按钮据此恒可见（可重试）。
+      detailFailedSources.value = failedSources
       ElMessage.warning('明细数据加载失败，可重试')
       return
     }
+    detailFailedSources.value = failedSources
+    // 部分失败：可用数据降级展示但显式提示——否则故障被读成「确无明细」业务结论
+    if (failedSources.length > 0) ElMessage.warning('部分明细加载失败（可收起重开重试）')
     detailsAttached.value = true
   } finally {
     // 失配会话不回落 detailLoading——现行会话（重置区或新一次拉取）自行管理该锁
@@ -533,6 +625,13 @@ const togglePolicyDetail = (stage: 0 | 1 | 2 | 3, policyId: number): void => {
 }
 
 const toggleNode = (key: string): void => {
+  // 卡片对读屏声明 aria-expanded，必须是真 toggle：再次点击同一环节收起面板
+  //（原实现恒赋值 → 承诺可折叠却无法收起，键盘与指针用户同受影响）。
+  if (activeNode.value === key) {
+    activeNode.value = ''
+    expandedPolicyKey.value = ''
+    return
+  }
   activeNode.value = key
   expandedPolicyKey.value = ''
   // 阶段面板首次选中触发明细拉取（接入/上游面板无明细）
@@ -560,47 +659,36 @@ const upstreamStateType = (row: Pick<RuleFlowUpstream, 'host' | 'port' | 'enable
 
 // 自定义路由路径行辅助（上游面板路由分发明细分组共用）
 const enabledPathUpstreams = (pr: RuleFlowPathRule): Array<{ host: string; port: number; enabled: boolean }> =>
-  pr.upstreams.filter((u) => u.enabled)
+  pr.upstreams?.filter((u) => u.enabled) ?? []
 
 
 const pathMatchLabel = (matchType: string): string => (matchType === 'exact' ? '精确' : '前缀')
 
-// 计数 chip：静默拉取（未到数不渲染 chip；绝不渲染加载态字面）；
-// 分段平均耗时(µs):阶段 1=预检段,阶段 3=WAF 段;无数据返回 0(不渲染 chip)
-// 面板耗时行:有采样时显示「· 平均耗时 X（N 次采样)」
-const stageTimingText = (stage: 1 | 3): string => {
-  const us = stageTimingUs(stage)
-  if (us <= 0) return ''
-  const samples = stage === 1 ? (stats.value?.precheck_samples ?? 0) : (stats.value?.waf_samples ?? 0)
-  return ` · 平均耗时 ${formatDurationUs(us)}（近 24 小时 ${samples} 次采样）`
-}
-
-const stageTimingUs = (stage: 1 | 3): number => {
-  if (!stats.value || isTcp.value) return 0
-  return stage === 1 ? (stats.value.precheck_avg_us ?? 0) : (stats.value.waf_avg_us ?? 0)
-}
+// 计数 chip / 面板统计行：口径单源在 utils/ruleStageStats（形态区分与未归因桶
+// 披露均在那里实现并有行为测试）；此处只负责「本弹框是否具备取数前提」。
+const countsView = (): { settled: boolean; failed: boolean } => ({ settled: statsSettled.value, failed: statsFailed.value })
 
 const stageChip = (stage: 1 | 2 | 3): { chip?: string; caption?: string } => {
-  if (!props.target?.caddyId || isTcp.value || !statsSettled.value) return {}
-  if (!stats.value) return { chip: '—' }
-  if (stage === 1) return { chip: `24h 拦截 ${stats.value.stage1_blocked_24h}` }
-  if (stage === 2) return { chip: `429 拦截 ${stats.value.ratelimit_blocks_reload}`, caption: '自最近重载' }
-  return { chip: `24h 拦截 ${stats.value.stage3_blocked_24h}` }
+  if (!props.target?.caddyId || isTcp.value) return {}
+  return stageCountChip(stage, stats.value, countsView())
 }
 
-// 面板统计行：同样静默口径（无数据不占行，绝不渲染加载态文本）
 const stageStatsText = (stage: 0 | 1 | 2 | 3): string => {
-  if (stage === 0 || !props.target?.caddyId || isTcp.value || !statsSettled.value || !stats.value) return ''
-  if (stage === 1) return `近 24 小时本阶段拦截 ${stats.value.stage1_blocked_24h} 次${stageTimingText(1)}`
-  if (stage === 2) return `自最近重载以来限流拦截 ${stats.value.ratelimit_blocks_reload} 次（恒 429）`
-  return `近 24 小时本阶段拦截 ${stats.value.stage3_blocked_24h} 次${stageTimingText(3)}`
+  if (!props.target?.caddyId || isTcp.value) return ''
+  return stageCountSummary(stage, stats.value, countsView())
+}
+
+// 时间线耗时角标：取数失败时同样不出（不把失败说成「无采样」）。
+const stageTimingLabel = (stage: 1 | 3): string => {
+  if (isTcp.value || statsFailed.value) return ''
+  return stageTimingChip(stage, stats.value)
 }
 
 interface FlowNode {
   key: string
   title: string
   subtitle: string
-  tone: 'blue' | 'green' | 'primary' | 'orange' | 'red' | 'gray'
+  tone: 'blue' | 'green' | 'primary' | 'orange' | 'red'
   icon: typeof Connection
   disabled?: boolean
   chip?: string
@@ -613,7 +701,19 @@ const flowNodes = computed<FlowNode[]>(() => {
   if (!target) return []
   const access: FlowNode = { key: 'access', title: '接入', subtitle: `${protocolLabel.value} · 端口 ${target.listenPort}`, tone: 'primary', icon: Connection }
   const upstream: FlowNode = { key: 'upstream', title: '上游', subtitle: target.upstreamSummary, tone: 'primary', icon: TopRight }
-  if (isTcp.value) return [access, upstream]
+  if (isTcp.value) {
+    // TCP（L4）阶段 0/1 放开：节点与 HTTP 同构（同图标/色阶/灰态语义）；
+    // 阶段 2/3 恒出但灰态「不适用」——L4 无 429/WAF 引擎面（绑定侧已拒绝此类策略）。
+    const s1 = typedStagePanels.value.find((s) => s.stage === 1)
+    return [
+      access,
+      { key: 'stage0', title: STAGE_TITLES[0], subtitle: stageZero.value ? stageZeroSubtitle.value : '未启用', tone: 'green', icon: CircleCheck, disabled: !stageZero.value },
+      { key: 'stage1', title: STAGE_TITLES[1], subtitle: s1?.enabled ? '命中即断连（无拦截页）' : '未启用', tone: 'blue', icon: Key, disabled: !s1?.enabled },
+      { key: 'stage2', title: STAGE_TITLES[2], subtitle: 'TCP 规则不适用', tone: 'orange', icon: Odometer, disabled: true },
+      { key: 'stage3', title: STAGE_TITLES[3], subtitle: 'TCP 规则不适用', tone: 'red', icon: Aim, disabled: true },
+      upstream,
+    ]
+  }
   const nodes: FlowNode[] = [access]
   // 阶段 0 与 1/2/3 同构恒出：未绑定信任策略时灰态「未启用」（用户裁定 2026-09-21——
   // 流程图必须完整呈现五个环节，缺环节比灰态更误导）
@@ -638,30 +738,58 @@ const flowNodes = computed<FlowNode[]>(() => {
       chip,
       chipCaption: caption,
       // 平均处理耗时 chip:阶段 1=预检段(信任+IP ACL 共用),阶段 3=WAF 段;
-      // 阶段 2 限流纳秒级不挂;无样本(24h 无命中)不挂——不误导。
-      timing: stageNo === 1 && stageTimingUs(1) > 0 ? `平均耗时 ${formatDurationUs(stageTimingUs(1))}`
-        : stageNo === 3 && stageTimingUs(3) > 0 ? `平均耗时 ${formatDurationUs(stageTimingUs(3))}`
-        : undefined,
+      // 阶段 2 限流纳秒级不挂;无样本(24h 无命中)或取数失败不挂——不误导。
+      timing: (stageNo === 1 ? stageTimingLabel(1) : stageNo === 3 ? stageTimingLabel(3) : '') || undefined,
     })
   }
   nodes.push(upstream)
   return nodes
 })
 
-// 阶段 1 脚注（第 59 轮文案修正）：合并预检真实链序（信任 DetectionOnly →
-// 黑名单 → 遗留黑名单 → 白名单外拒绝 → 白名单命中豁免地域 → 地域拦截）；
-// 绑定「保留检测」信任策略时命中降级为检测不终止——原「拦截判定前/未通过即
-// 终止」两处与管线语义不符（保留检测不跳过评估、命中不终止）。
+// 阶段 1 脚注：合并预检真实链序由
+// securityStages.stage1FootnoteText 单源给出（信任（阶段 0）→ 黑名单 →
+// 遗留黑名单 → 白名单外拒绝 → 爬虫校验 → 地域拦截；stage0 信任命中跳过本段
+// 与全部安全阶段，由独立轻量检测事务记录；mixed 等其他类型为引擎内检测
+// 降级、不跳段）；原实现漏列遗留黑名单（id:4 仍由 security.go 发射）与
+// v2.3.8 爬虫校验。
 const stage1Footnote = computed(() => {
-  const base = '多策略合并预检：信任（阶段 0）→ 黑名单 → 白名单外拒绝（白名单命中豁免地域拦截）→ 地域拦截；未通过即终止'
-  const td1Bound = props.policies.some((p) => p.policy_type === 'stage0' && p.enabled && p.ip_whitelist_enabled && p.trust_detection === true)
-  return td1Bound ? `${base}；绑定「保留检测」信任策略时命中降级为检测事件，不终止` : base
+  // 按本规则实际绑定链判定（model.stages[0] 的 group 键 = 绑定策略 id）：
+  // 按全部策略判定会在「本规则未绑 stage0、但别处存在保留检测策略」时误称
+  // 本规则存在检测降级路径。降级判定与阶段 0 模式行同源
+  // （hasTrustDetectionBinding → trustHitMode）：mixed 存量信任在引擎侧同样
+  // 恒 DetectionOnly，不能退回 policy_type === 'stage0' 等值判断。
+  const boundIds = new Set(props.model?.stages.find((stage) => stage.stage === 0)?.groups.map((group) => group.key) ?? [])
+  return stage1FootnoteText(hasTrustDetectionBinding(boundIds, props.policies))
 })
 
-const stageSub = (stage: 1 | 2 | 3): string => {
-  if (stage === 1) return 'IP 名单 · 地域 · 威胁库'
-  if (stage === 2) return '速率限制'
-  return '自定义 · CRS'
+const stageSub = (stage: 1 | 2 | 3): string => stageSubLabel(stage)
+
+// TCP 规则阶段 1 脚注：L4 无 HTTP 拦截页/状态码面——拒绝动作是断连（close），
+// 不是 403；替换 HTTP 版 stage1Footnote（预检链序文案对 TCP 不适用）。
+const TCP_STAGE1_FOOTNOTE = '拒绝动作=断连（连接直接关闭，无拦截页/状态码）；保留检测信任命中记录为检测后直达上游；名单/地域未命中的连接直达上游'
+
+// 计数取数（弹框打开与面板「重试」共用）：失败置 statsFailed，使「请求失败」
+// 与「成功但载荷为空」可区分（此前两者同落 stats=null，统一渲染成 '—'）。
+// 序号守卫丢弃过期响应——弹框快速切换规则时旧规则计数不得写进新会话。
+const loadStageStats = (caddyId: string): void => {
+  const seq = ++statsSeq
+  statsFailed.value = false
+  stats.value = null
+  statsSettled.value = false
+  request.get<APIResponse<RuleStageCounts>>(`/security/rules/${encodeURIComponent(caddyId)}/stage-stats`, { silent: true })
+    .then((res) => { if (seq === statsSeq) stats.value = res.data ?? null })
+    .catch(() => {
+      if (seq !== statsSeq) return
+      stats.value = null
+      statsFailed.value = true
+    })
+    .finally(() => { if (seq === statsSeq) statsSettled.value = true })
+}
+
+const retryStageStats = (): void => {
+  const caddyId = props.target?.caddyId
+  if (!caddyId || isTcp.value) return
+  loadStageStats(caddyId)
 }
 
 const onDialogOpen = (): void => {
@@ -669,48 +797,73 @@ const onDialogOpen = (): void => {
   expandedPolicyKey.value = ''
   stats.value = null
   statsSettled.value = false
+  statsFailed.value = false
   certInfo.value = null
+  certFailed.value = false
   certLoading.value = false
   // 明细缓存随弹框会话重置（规则绑定/策略内容可能已在页间变更）；序号自增使
   // 上一会话在途明细续体失配（修复 A→B 快速切换后 B 明细被 A 续体占死/残留）
   detailsSeq++
+  // 证书序号同样无条件自增：打开非 TLS/TCP 规则时不走证书分支，若只在那条
+  // 分支里自增，上一会话（TLS 规则）在途的 cert-info 响应会通过 seq 校验写回
+  // 旧规则证书（当前模板以 enableTls 门控渲染，故不可见；但属状态污染型回归）。
+  certSeq++
+  // 统计序号同样无条件推进：TCP 与无 caddyId 早退不拉 stage-stats，若只在 HTTP
+  // 分支自增，上一会话在途响应会通过 seq 校验把旧规则计数写进新会话。
+  statsSeq++
   detailLoading.value = false
   detailsAttached.value = false
+  detailFailedSources.value = []
   fullPolicies.value = new Map()
   customRules.value = []
   crsFiles.value = []
-  ipListEntryCache.value = new Map() // 引用名单条目缓存同重置（第 53 轮补充轮 P3-3：页间编辑名单后不再显示旧条目）
+  ipListEntryCache.value = new Map() // 引用名单条目缓存同重置（页间编辑名单后不再显示旧条目）
   const caddyId = props.target?.caddyId
   if (!caddyId) {
     statsSettled.value = true
     return
   }
   if (!isTcp.value) {
-    const seq = ++statsSeq
-    request.get<APIResponse<StageStats>>(`/security/rules/${encodeURIComponent(caddyId)}/stage-stats`, { silent: true })
-      .then((res) => { if (seq === statsSeq) stats.value = res.data ?? null })
-      .catch(() => { if (seq === statsSeq) stats.value = null })
-      .finally(() => { if (seq === statsSeq) statsSettled.value = true })
+    loadStageStats(caddyId)
   } else {
     statsSettled.value = true
   }
-  // TLS 启用时拉取证书信息（接入卡富化）
+  // TLS 启用时拉取证书信息（接入卡富化）；失败与「无可展示证书」区分开
   if (props.target?.enableTls && !isTcp.value) {
-    const seq = ++certSeq
-    certLoading.value = true
-    request.get<APIResponse<FlowCertInfo>>(`/rules/${encodeURIComponent(caddyId)}/cert-info`, { silent: true })
-      .then((res) => { if (seq === certSeq) certInfo.value = res.data ?? null })
-      .catch(() => { if (seq === certSeq) certInfo.value = null })
-      .finally(() => { if (seq === certSeq) certLoading.value = false })
+    loadCertInfo(caddyId)
   }
+}
+
+// 证书信息加载：失败置 certFailed（面板给「加载失败 + 重试」），成功但无数据
+// 才落到「规则禁用或证书未就绪」。certSeq 守卫丢弃过期响应（同 cert-info 独立
+// 计数器理由见上方注释）。
+const loadCertInfo = (caddyId: string): void => {
+  const seq = ++certSeq
+  certLoading.value = true
+  certFailed.value = false
+  request.get<APIResponse<FlowCertInfo>>(`/rules/${encodeURIComponent(caddyId)}/cert-info`, { silent: true })
+    .then((res) => { if (seq === certSeq) certInfo.value = res.data ?? null })
+    .catch(() => {
+      if (seq !== certSeq) return
+      certInfo.value = null
+      certFailed.value = true
+    })
+    .finally(() => { if (seq === certSeq) certLoading.value = false })
+}
+
+const retryCertInfo = (): void => {
+  const caddyId = props.target?.caddyId
+  if (!caddyId || certLoading.value) return
+  loadCertInfo(caddyId)
 }
 </script>
 
 <style scoped>
-.flow-header { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
-.flow-header-title { font-size: 16px; font-weight: 600; color: #1f2937; }
-.flow-header-name { font-size: 13px; color: #6b7280; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-body { display: flex; flex-direction: column; gap: 0; }
+
+/* 头部协议徽标：HTTP 蓝（el-tag primary）/ TCP 青（全局 proto-tcp-tag 单源） */
+.flow-header { display: flex; align-items: center; gap: 10px; }
+.flow-proto-badge { flex-shrink: 0; }
 
 /* ── 纵向时间线：图标圆点 + 阶段色阶 + 竖向连接线流动粒子 + 错峰进场 ── */
 @keyframes tl-row-in {
@@ -727,7 +880,7 @@ const onDialogOpen = (): void => {
   flex: 0 0 auto;
   width: 28px;
   height: 28px;
-  border-radius: 50%;
+  border-radius: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -739,7 +892,6 @@ const onDialogOpen = (): void => {
 .tl-dot--blue { background: var(--el-color-primary); }
 .tl-dot--orange { background: var(--el-color-warning); }
 .tl-dot--red { background: var(--el-color-danger); }
-.tl-dot--gray { background: var(--el-color-info); }
 .tl-row.is-off .tl-dot { background: #c9cdd4; box-shadow: 0 0 0 3px #f3f4f6; }
 .tl-line {
   flex: 1 1 auto;
@@ -761,7 +913,6 @@ const onDialogOpen = (): void => {
   padding: 10px 14px;
   background: #fff;
   border: 1px solid #e5e7eb;
-  border-radius: 10px;
   box-shadow: var(--el-box-shadow-light);
   cursor: pointer;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -798,9 +949,8 @@ const onDialogOpen = (): void => {
 .tl-panel { margin: -6px 0 14px 0; }
 
 /* ── 信息区：定义列表双列栅格 + 字级层次 ── */
-.flow-panel { border: 1px solid #ebeef5; border-radius: 8px; padding: 14px 18px; background: #fafafa; box-shadow: var(--el-box-shadow-lighter); }
-.flow-panel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-.flow-panel-title { font-size: 14px; font-weight: 600; color: #1f2937; }
+.flow-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.flow-panel-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 .flow-panel-stats { font-size: 12px; color: #1f6fbd; margin-bottom: 8px; }
 .flow-kv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 8px 24px; }
 .flow-kv { display: flex; align-items: baseline; gap: 12px; font-size: 13px; line-height: 1.8; min-width: 0; }
@@ -809,7 +959,7 @@ const onDialogOpen = (): void => {
 .flow-kv-value { color: #1f2937; overflow: hidden; text-overflow: ellipsis; }
 .flow-kv-value.is-expired { color: var(--el-color-danger); }
 .flow-domain-chip { margin: 0 6px 4px 0; }
-.flow-cert-title { font-size: 13px; font-weight: 600; color: #4b5563; margin: 12px 0 6px; padding-top: 10px; border-top: 1px dashed #e5e7eb; }
+.flow-cert-section { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #e5e7eb; }
 .flow-cert-loading { margin-top: 12px; }
 .flow-policy-block + .flow-policy-block { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e5e7eb; }
 .flow-policy-block.is-disabled { opacity: 0.45; }
@@ -821,7 +971,6 @@ const onDialogOpen = (): void => {
 .flow-row-label { color: #6b7280; flex-shrink: 0; }
 .flow-row-detail { color: #1f2937; text-align: right; overflow: hidden; text-overflow: ellipsis; }
 .flow-stage-empty { font-size: 13px; color: #9ca3af; padding: 8px 0; }
-.flow-panel-footnote { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #e5e7eb; font-size: 12px; color: #9ca3af; }
 .flow-upstream-table { width: 100%; }
 .flow-upstream-addr { font-family: monospace; font-size: 12px; color: #1f2937; }
 
@@ -835,9 +984,6 @@ const onDialogOpen = (): void => {
 .flow-route-none { color: #9ca3af; }
 .flow-route-group { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #e5e7eb; }
 .flow-route-group .flow-route-row + .flow-route-row { margin-top: 2px; }
-.flow-route-group-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
-.flow-route-group-title { font-size: 13px; font-weight: 600; color: #4b5563; }
-.flow-route-group-sub { font-size: 12px; color: #9ca3af; }
 
 /* ── 二级明细区（max-height 滚动） ── */
 .flow-policy-details { max-height: 260px; overflow-y: auto; margin-top: 6px; border-top: 1px dashed #e5e7eb; padding-top: 8px; }
@@ -850,4 +996,12 @@ const onDialogOpen = (): void => {
 .flow-detail-meta { color: #9ca3af; text-align: right; }
 .flow-detail-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .flow-detail-line { font-size: 12px; color: #6b7280; line-height: 1.8; }
+
+/* 动效无障碍：系统「减少动态效果」下取消装饰性动画——竖向连接线的 0.7s
+   循环流动与卡片错峰进场（弹框常驻直到关闭，循环动效对前庭敏感用户不友好）。
+   同族范式见 views/security/ThreatScreen.vue 的 reduced-motion 段。 */
+@media (prefers-reduced-motion: reduce) {
+  .tl-row { animation: none; }
+  .tl-line { animation: none; background-position-y: 0; }
+}
 </style>

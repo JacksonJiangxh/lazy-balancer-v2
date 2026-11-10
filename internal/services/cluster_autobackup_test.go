@@ -6,19 +6,17 @@ import (
 	"strings"
 	"testing"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
-// SYS41-2(第 41 轮审计):demote 必须停自动备份调度器——与 R54-N5
-// (CRS/IP2Region SetMasterRole(false),TestClusterService_BecomeSlave_
-// stopsUpdateSchedulers)同点位对称;否则降级后调度器继续运行,从节点本地
-// 产出备份文件,打破「调度器仅主节点运行」不变量。
+// demote 必须停自动备份调度——与 CRS/IP2Region 的角色
+// 门同点位对称，否则降级后从节点本地产出备份文件。
 // v2.0：promote/demote 与自动备份的调度耦合已消除——引擎 Scheduled +
-// RunsOn=MasterOnly 角色门接管（Promote/BecomeSlave 经 manager SetMasterRole
-// 联动 TaskEngine().SetRole；角色门行为由 engine_test 钉死），此处不再
-// 有独立调度器生命周期可测。
+// RunsOn=MasterOnly 角色门接管（Promote/BecomeSlave 直接调用 TaskEngine().SetRole；
+// 角色门行为由 engine_test 钉死），不再有独立调度器生命周期可测。
 
-// CL41-1a(第 41 轮审计)快照面:自动备份六设置列(不含 last_run 节点本地
+// 快照面:自动备份六设置列(不含 last_run 节点本地
 // 运行态)随 users 节同步——主端装载恒携带(非 nil 指针),线格式六键齐全。
 func TestLoadSnapshotGlobalSettings_carriesAutoBackupSettings(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -52,7 +50,7 @@ func TestLoadSnapshotGlobalSettings_carriesAutoBackupSettings(t *testing.T) {
 	}
 }
 
-// CL41-1a apply 面:快照携带六列时从端落库(新主端→新从端收敛);
+// apply 面:快照携带六列时从端落库(新主端→新从端收敛);
 // last_run 为节点本地运行态,任何快照形态都不得覆盖。
 func TestUpdateSnapshotSettings_autoBackupSettingsAppliedWhenPresent(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -67,7 +65,7 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAppliedWhenPresent(t *testing.
 		t.Fatal(err)
 	}
 	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
-		JWTExpireMinutes:    20,
+		JWTExpireMinutes:    new(20),
 		AutoBackupEnabled:   &enabled,
 		AutoBackupFrequency: &freq,
 		AutoBackupTime:      &tm,
@@ -97,7 +95,7 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAppliedWhenPresent(t *testing.
 	}
 }
 
-// CL41-1a 偏斜面(镜像 branding_json d55a675 缺席语义):旧主端快照缺该组
+// 偏斜面(镜像 branding_json d55a675 缺席语义):旧主端快照缺该组
 // 字段(全 nil 指针)时,从端 apply 必须跳过写入、保留本地设置——不得把
 // 从端本地值清成零值。
 func TestUpdateSnapshotSettings_autoBackupSettingsAbsentPreservesLocal(t *testing.T) {
@@ -112,7 +110,7 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAbsentPreservesLocal(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: 20}}); err != nil {
+	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: new(20)}}); err != nil {
 		t.Fatalf("apply settings: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -129,5 +127,27 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAbsentPreservesLocal(t *testin
 	if !gotEnabled || gotFreq != "weekly" || gotTime != "04:30" || gotDay != 3 || gotKeep != 5 || gotSections != `["users"]` || gotLastRun != "2026-09-19T03:00:00+08:00" {
 		t.Fatalf("absent snapshot must preserve local settings, got enabled=%v freq=%q time=%q day=%d keep=%d sections=%q last_run=%q",
 			gotEnabled, gotFreq, gotTime, gotDay, gotKeep, gotSections, gotLastRun)
+	}
+}
+
+// 带外形态：主端 auto_backup_sections 为 NULL（仅直改库可达，ADD COLUMN 时已
+// 带默认）时，快照必须下发与 DDL/补列默认同源的四分类。此前 COALESCE 写死
+// 三分类——从端原样落库，升主后自动备份静默缺 cluster（节点拓扑）节。
+func TestLoadSnapshotGlobalSettings_nullAutoBackupSectionsUsesDDLDefault(t *testing.T) {
+	service, database := newClusterTestService(t)
+	if _, err := database.Exec(`UPDATE global_config SET auto_backup_sections=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	var snapshot models.ClusterSnapshot
+	if err := service.loadSnapshotGlobalSettings(context.Background(), database, &snapshot); err != nil {
+		t.Fatalf("load snapshot settings: %v", err)
+	}
+	sections := snapshot.BasicSettings.AutoBackupSections
+	if sections == nil {
+		t.Fatal("auto_backup_sections 必须恒携带（指针非 nil）")
+	}
+	if *sections != db.DefaultAutoBackupSections {
+		t.Fatalf("auto_backup_sections=%q, want DDL 同源默认 %q（三分类下发会让升主后备份缺 cluster 节）", *sections, db.DefaultAutoBackupSections)
 	}
 }

@@ -6,16 +6,20 @@
 package caddygeoip
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/lionsoul2014/ip2region/binding/golang/service"
+	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
 	"go.uber.org/zap"
 	"lazy-balancer-v2/geoipnames"
 )
@@ -44,7 +48,14 @@ type GeoIPHandler struct {
 	// ——与根服务容器默认逐字节一致（插件侧兜底，非渲染层）。
 	CrawlerIPListFile string `json:"crawler_ip_list_file,omitempty"`
 
-	searcher *service.Ip2Region
+	// XdbV6Path 是 IPv6 xdb 的路径：渲染侧仅在面板 v6 开关开启时发射（插件
+	// 无路径兜底默认——空=v6 禁用）。禁用/文件缺失/损坏（健康门降级）时
+	// IPv6 客户端查询返回空串，维持既有「海外」fail-closed 哨兵语义（仅
+	// 作用于不可解析形态，见 setGeoIPPlaceholders）；开启且健康时 IPv6 与
+	// v4 同语义解析（海外精确到国家、国内精确到省）。
+	XdbV6Path string `json:"xdb_v6_path,omitempty"`
+
+	searcher *geoipSearcher
 }
 
 // CaddyModule returns the Caddy module information.
@@ -66,9 +77,11 @@ func (h *GeoIPHandler) Provision(ctx caddy.Context) error {
 		h.CrawlerIPListFile = defaultCrawlerIPListFile
 	}
 	setCrawlerIPListFilePath(h.CrawlerIPListFile)
-	searcher, err := sharedGeoIPSearcher(h.XdbPath)
+	searcher, err := sharedGeoIPSearcher(h.XdbPath, h.XdbV6Path)
 	if err != nil {
-		ctx.Logger().Warn("geoip2region: ip2region database unavailable, geoip disabled",
+		// 告警已在 sharedGeoIPSearcher 内按（原因|路径）节流上报——一次
+		// reload 每条地域规则各调一次本函数，此处再 Warn 会按规则数放大。
+		ctx.Logger().Debug("geoip2region: ip2region database unavailable, geoip disabled",
 			zap.String("xdb_path", h.XdbPath), zap.Error(err))
 		return nil
 	}
@@ -76,19 +89,263 @@ func (h *GeoIPHandler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// geoipSharedSearcher：按 XdbPath 进程级共享的 Ip2Region 单例条目。
-// 每条 GeoIP 规则各建一份 NewIp2RegionWithPath（内部 NewV4Config(VIndexCache,
-// path, 20)——20 个 searcher 各持 1 个 xdb fd + vIndex 缓冲），50 条规则≈1000 fd
-// 逼近 soft limit，重载期新旧实例并存再翻倍；fd 耗尽 → Provision 降级
-// pass-through → 全客户端判「海外」→ 含海外 deny 的策略全量误拦。SearcherPool
-// 内部 channel 借还本就并发安全，同路径跨 handler 共享一份即可。modTime/size
-// 记录建库时的文件形态：xdb 更新流程 rename 换库后 Caddy 随 reloader 重载，
-// 纯路径键缓存会让新配置继续持有旧 inode 的 fd、更新静默失效（ip2regionupdate.go
-// 依赖「Caddy 侧 geoip 随 reloader 收敛」），文件形态变化即重建。
+// —— xdb 全量内容缓存 + 池化 buffer searcher ——
+//
+// geoipSearcher 是本模块的双协议查询器：v4 必选、v6 可选。每族 = xdb 全量
+// 内容字节（BufferCache 策略，查询零 syscall）+ 自建 20-searcher 池
+// （channel 借还，与绑定库 SearcherPool 同构）。
+//
+// 为什么不用绑定库 NewIp2RegionWithPath / NewIp2Region(BufferCache)：
+//   - NewIp2RegionWithPath 硬编码 VIndexCache——每查询 1-2 次 pread（热路径
+//     syscall，before 基准 5710ns/op@5 allocs）；
+//   - NewIp2Region 的 BufferCache 分支只建**单个** in-mem Searcher——
+//     xdb.Searcher.Search 每次入口复写 ioCount 诊断字段（库内注释明示
+//     not thread safe；根服务 internal/services/ip2region.go 对同一事实的
+//     处置是全局互斥串行化）——并发下 -race 必红；
+//   - SearcherPool 只能经 Config 构造（Config 字段不导出、无注入构造器），
+//     无法复用进程级共享的内容字节。
+//
+// 因此自建池：内容字节进程内按（路径+文件形态）共享一份（geoipContentCache），
+// N 个池的 20 只 searcher 全部引用同一字节数组（xdb.NewWithBuffer 是引用持有
+// 非复制——绑定库源码 searcher.go NewSearcher cBuff 分支零拷贝）；并发查询各
+// 借各还，零共享可变状态（ioCount 属 searcher 私有）。内存代价 = live v4
+// xdb 大小 + v6 大小（各 ×1），换库重载窗口内新旧两份内容并存 ≤
+// geoipOldInstanceCloseDelay（旧实例延迟关闭，在途查询保护），窗口过后旧
+// 字节随实例一起 GC。
+type geoipSearcher struct {
+	v4 *geoipSearcherPool
+	// v6 为 nil = v6 禁用族（Search 对 16 字节 IP 返回空串，哨兵语义，
+	// 与绑定库双协议 API 的禁用形态一致）。
+	v6 *geoipSearcherPool
+}
+
+// geoipSearcherPoolSize 是每族池深（与绑定库 NewIp2RegionWithPath 的默认
+// 20 同值——借空时借还路径退化为 channel 阻塞等待，20 深对应此前 fd 形态
+// 的并发容量，行为等价）。
+const geoipSearcherPoolSize = 20
+
+// Search 按 IP 字节长度分发到对应族（与 service.Ip2Region.Search 同形：
+// string 走 ParseIP，[]byte 直查，其它类型报错）。
+func (g *geoipSearcher) Search(ip any) (string, error) {
+	var ipBytes []byte
+	switch v := ip.(type) {
+	case string:
+		parsed, err := xdb.ParseIP(v)
+		if err != nil {
+			return "", fmt.Errorf("parse ip %s: %w", v, err)
+		}
+		ipBytes = parsed
+	case []byte:
+		ipBytes = v
+	default:
+		return "", fmt.Errorf("invalid ip value type %s", v)
+	}
+
+	if l := len(ipBytes); l == 4 {
+		return g.v4.search(ipBytes)
+	} else if l == 16 {
+		if g.v6 == nil {
+			// v6 禁用族：绑定库双协议 API 同形返回空串（哨兵语义由发射侧
+			// setGeoIPPlaceholders 维持）。
+			return "", nil
+		}
+		return g.v6.search(ipBytes)
+	}
+	return "", fmt.Errorf("invalid byte ip address with len=%d", len(ipBytes))
+}
+
+// Close 满足延迟回收路径的默认超时语义（与绑定库 Ip2Region.Close 同值 10s）。
+func (g *geoipSearcher) Close() { g.CloseTimeout(10 * time.Second) }
+
+// CloseTimeout 关闭两族池（等待借出的 searcher 归还或超时）。
+func (g *geoipSearcher) CloseTimeout(d time.Duration) {
+	if g.v4 != nil {
+		g.v4.CloseTimeout(d)
+	}
+	if g.v6 != nil {
+		g.v6.CloseTimeout(d)
+	}
+}
+
+// geoipSearcherPool 是单族 buffer searcher 池（镜像绑定库 SearcherPool 的
+// channel 借还 + 关闭等待语义；差别仅在 searcher 由全量内容字节构造、不持
+// fd——借空时 channel 接收阻塞，同绑定库形态）。
+type geoipSearcherPool struct {
+	searchers chan *xdb.Searcher
+	closing   chan struct{}
+	loanCount atomic.Int32
+}
+
+// newGeoipSearcherPool 构造单族池：校验链与绑定库 newConfig 同强度
+// （VerifyFromFile 结构自检 → 共享内容字节 → 头版本门），任一步失败返回
+// error（调用方走 fail-stale 保旧实例，语义不变）。
+func newGeoipSearcherPool(version *xdb.Version, path string) (*geoipSearcherPool, error) {
+	if err := xdb.VerifyFromFile(path); err != nil {
+		return nil, err
+	}
+	cBuffer, err := geoipContentBuffer(path)
+	if err != nil {
+		return nil, err
+	}
+	header, err := xdb.LoadHeaderFromBuff(cBuffer)
+	if err != nil {
+		return nil, err
+	}
+	got, err := xdb.VersionFromHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	if got.Id != version.Id {
+		return nil, fmt.Errorf("ip verison not match: xdb file %s with ip version=%s, as %s expected", path, got.Name, version.Name)
+	}
+	p := &geoipSearcherPool{
+		searchers: make(chan *xdb.Searcher, geoipSearcherPoolSize+1),
+		closing:   make(chan struct{}, 1),
+	}
+	for range geoipSearcherPoolSize {
+		s, err := xdb.NewWithBuffer(version, cBuffer)
+		if err != nil {
+			p.CloseTimeout(0)
+			return nil, fmt.Errorf("failed to create the %dth searcher: %w", len(p.searchers)+1, err)
+		}
+		p.searchers <- s
+	}
+	return p, nil
+}
+
+// search 借一只 searcher 查询并归还。借侧先选 closing（池关闭后空池借还
+// 不再排队——与绑定库 BorrowSearcher 同形）；借空时 channel 接收阻塞等待
+// 归还（并发容量 = 池深，同绑定库形态）。归还遇已关闭池（CloseTimeout 排空
+// 后迟到归还）：丢引用让内容字节可回收，与绑定库 ReturnSearcher 关闭分支同形。
+func (p *geoipSearcherPool) search(ipBytes []byte) (string, error) {
+	p.loanCount.Add(1)
+	defer func() {
+		p.loanCount.Add(-1)
+	}()
+	var s *xdb.Searcher
+	select {
+	case <-p.closing:
+		return "", fmt.Errorf("searcher pool already closed")
+	case s = <-p.searchers:
+	}
+	defer func() {
+		select {
+		case <-p.closing:
+			s.Close()
+		default:
+			p.searchers <- s
+		}
+	}()
+	return s.Search(ipBytes)
+}
+
+// CloseTimeout 关闭池：close(closing) 后排空余量（丢引用让内容字节可回收），
+// 限时等待借出的 searcher 归还（与绑定库 SearcherPool.CloseTimeout 同形）。
+func (p *geoipSearcherPool) CloseTimeout(d time.Duration) {
+	close(p.closing)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		if p.loanCount.Load() == 0 && len(p.searchers) == 0 {
+			return
+		}
+		select {
+		case s := <-p.searchers:
+			s.Close() // buffer searcher 无 fd，Close 仅为丢引用
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+// geoipContentEntry 是内容缓存条目：字节 + 装载时的文件形态（modTime/size
+// ——与共享实例的缓存判定同键口径，形态变化即换字节）。
+type geoipContentEntry struct {
+	buf     []byte
+	modTime time.Time
+	size    int64
+	ino     int64
+}
+
+var (
+	geoipContentMu    sync.Mutex
+	geoipContentCache = map[string]geoipContentEntry{}
+)
+
+// geoipContentBuffer 返回 path 的 xdb 全量内容字节（进程内共享）：同路径且
+// 磁盘形态未变 → 复用已装载字节（多实例/多池共享同一字节数组）；形态变化
+// → 重新装载并替换条目（旧字节仍被旧实例 searcher 引用，随旧实例关闭 GC）。
+// 装载源是文件本身——构造调用方（sharedGeoIPSearcher 重建分支）已由
+// geoipSharedMu 串行化，无并发重复装载面；本锁为独立使用方兜底。
+func geoipContentBuffer(path string) ([]byte, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	// 缓存键 = 路径 + modTime + size + inode：带外 rsync -a 替换（新 inode、
+	// 保留 mtime/size）可被 inode 差异检出；cp -p 原地覆写仍同形态（残余边角，
+	// 生产更新走 rename 流不可达）。
+	ino := int64(0)
+	if stt, ok := st.Sys().(*syscall.Stat_t); ok {
+		ino = int64(stt.Ino)
+	}
+	geoipContentMu.Lock()
+	if e, ok := geoipContentCache[path]; ok && e.modTime.Equal(st.ModTime()) && e.size == st.Size() && e.ino == ino {
+		geoipContentMu.Unlock()
+		return e.buf, nil
+	}
+	geoipContentMu.Unlock()
+	buf, err := xdb.LoadContentFromFile(path)
+	if err != nil {
+		return nil, err
+	}
+	geoipContentMu.Lock()
+	geoipContentCache[path] = geoipContentEntry{buf: buf, modTime: st.ModTime(), size: st.Size(), ino: ino}
+	geoipContentMu.Unlock()
+	return buf, nil
+}
+
+// newGeoipSearcher 构造双协议查询器（v4 必选；v6Effective 非空时附加 v6
+// 池，构造失败收敛已建的 v4 池不留半构造实例）。
+func newGeoipSearcher(path, v6Effective string) (*geoipSearcher, error) {
+	v4Pool, err := newGeoipSearcherPool(xdb.IPv4, path)
+	if err != nil {
+		return nil, err
+	}
+	g := &geoipSearcher{v4: v4Pool}
+	if v6Effective != "" {
+		v6Pool, err := newGeoipSearcherPool(xdb.IPv6, v6Effective)
+		if err != nil {
+			v4Pool.CloseTimeout(time.Second)
+			return nil, err
+		}
+		g.v6 = v6Pool
+	}
+	return g, nil
+}
+
+// geoipSharedSearcher：按（XdbPath, v6 有效路径）进程级共享的查询器单例
+// 条目。每条 GeoIP 规则各建一份查询器（20-searcher 池 ×2 族），同路径跨
+// handler 共享一份即可——查询器本身无 fd（全量内容缓存 + buffer searcher），
+// 共享动机从「fd 预算」演进为「内存预算」：50 条规则各建一份 = 50×xdb 字节
+// 驻留，共享后 = 1×xdb 字节。modTime/size 记录建库时的文件形态：xdb 更新
+// 流程 rename 换库后 Caddy 随 reloader 重载，纯路径键缓存会让新配置继续
+// 持有旧字节、更新静默失效（更新任务依赖「Caddy 侧 geoip 随 reloader 收敛」），
+// 文件形态变化即重建。v6 同构：v6ModTime/v6Size 记录 v6 库形态（双源更新
+// 单任务内先 v4 后 v6，两次 rename 分属同一 reload 窗口，两形态都必须进
+// 缓存判定）。needsRebuild 标记「文件形态曾不可 stat」：下一次 Provision
+// 即使 stat 形态与缓存一致也必须重建（rsync -a 保留 mtime+size 的重铺形态），
+// 防被删 inode 的旧库被无限期当有效数据服务。重建成功后由新条目清除。
 type geoipSharedSearcher struct {
-	searcher *service.Ip2Region
-	modTime  time.Time
-	size     int64
+	searcher  *geoipSearcher
+	modTime   time.Time
+	size      int64
+	v6ModTime time.Time
+	v6Size    int64
+	// needsRebuild 标记「文件形态曾不可 stat」：下一次 Provision 即使 stat
+	// 形态与缓存一致也必须重建（rsync -a 保留 mtime+size 的重铺形态），
+	// 防被删 inode 的旧库被无限期当有效数据服务。重建成功后由新条目清除。
+	needsRebuild bool
 }
 
 var (
@@ -96,42 +353,88 @@ var (
 	geoipSharedSearchers = map[string]*geoipSharedSearcher{}
 )
 
+// geoipWarnLogInterval 是同路径同原因告警的最小间隔：每条地域规则各调一次
+// sharedGeoIPSearcher，文件不可 stat/重建失败会按规则数放大重复 WARN（稀释
+// 真实告警）。恢复成功后清除记录——再次故障即时上报。
+var geoipWarnThrottle = newKeyedWarnThrottle(time.Minute)
+
+// geoipWarnCallsForTest 仅测试观测「实际写日志次数」（节流生效的机器断言）。
+var geoipWarnCallsForTest atomic.Int64
+
+// geoipWarnThrottled 按（路径|原因）节流后写 WARN。
+func geoipWarnThrottled(reason, path, msg string, fields ...zap.Field) {
+	if !geoipWarnThrottle.allow(path + "|" + reason) {
+		return
+	}
+	geoipWarnCallsForTest.Add(1)
+	caddy.Log().Named("geoip2region").Warn(msg, fields...)
+}
+
+// clearGeoIPWarnLogs 清除路径的节流记录（成功重建/命中后调用：恢复后再次
+// 故障必须立即上报）。
+func clearGeoIPWarnLogs(path string) {
+	geoipWarnThrottle.clearPrefix(path + "|")
+}
+
 // geoipOldInstanceCloseDelay 换库重建后旧实例的延迟关闭窗口：重载窗口内旧
-// 配置的 handler 仍可能持旧实例在途查询（BorrowSearcher 落空会判「海外」
-// 误拦——恰是要修的问题），故不立即关闭；但旧实例也不再「保留至进程
-// 退出」（每次 xdb 更新遗留 20 个 fd + vIndex 缓冲），延迟窗口过后 Close
-// 收敛。测试可缩短。
+// 配置的 handler 仍可能持旧实例在途查询（借空阻塞或判「海外」误拦——恰是要
+// 修的问题），故不立即关闭；但旧实例也不再「保留至进程退出」（每次 xdb 更新
+// 遗留一份旧内容字节 + 池），延迟窗口过后 CloseTimeout 收敛（排空池丢引用，
+// 旧内容字节随实例 GC）。测试可缩短。
 var geoipOldInstanceCloseDelay = 60 * time.Second
 
-// sharedGeoIPSearcher 返回按路径共享的单例：文件形态未变时命中缓存，变化时重建。
-// 被替换的旧实例经 geoipOldInstanceCloseDelay 延迟关闭——新实例先接管（下方
-// 缓存替换完成后 Provision 返回，新配置随之重载），旧实例在窗口内继续服务
-// 在途查询，窗口过后由定时器 Close（Ip2Region.Close 等待借出的 searcher
-// 归还，在途查询不受截断）。
-func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
+// sharedGeoIPSearcher 返回按（v4 路径, v6 有效路径）共享的单例：文件形态未变时
+// 命中缓存，变化时重建；曾因不可 stat 被标记的条目（needsRebuild）即使形态未变
+// 也重建。被替换的旧实例经 geoipOldInstanceCloseDelay 延迟关闭——新实例先接管
+// （下方缓存替换完成后 Provision 返回，新配置随之重载），旧实例在窗口内继续服务
+// 在途查询，窗口过后由定时器 CloseTimeout（等待借出的 searcher 归还，在途查询
+// 不受截断）。v6Path 为空或健康门（healthyV6Path 头校验）不过时按「v6 禁用」
+// 构造——双协议 API 对禁用族的 Search 返回空串，setGeoIPPlaceholders 维持
+// 「海外」哨兵（fail-closed 语义不变，仅作用于不可解析形态），v4 链不受影响。
+func sharedGeoIPSearcher(path, v6Path string) (*geoipSearcher, error) {
+	v6Effective := healthyV6Path(v6Path, path)
+	key := path + "\x00" + v6Effective
 	st, err := os.Stat(path)
 	if err != nil {
-		// stat 失败（xdb 更新 rename 窗口/文件被删）且
-		// 缓存持有该路径条目时驱逐之——旧实例走既有 AfterFunc 延迟关闭
-		// （在途查询保护与换库路径一致）。不驱逐则旧 inode 实例永久占据
-		// 缓存槽：文件以「同 modtime+size」形态恢复（rsync -a 保时间戳重铺）
-		// 时缓存命中判定通过，被删 inode 的旧库被无限期当有效数据服务。
+		// stat 失败（xdb 更新 rename 窗口/文件被删）且缓存持有该路径条目时
+		// **本次仍返回该实例**（fail-stale），并把条目标为「必须重建」：
+		//   - 返回 error 会让 Provision 降级 pass-through → 该次 reload 之后
+		//     全部客户端判「海外」→ allow 模式的 geoip 规则等价全量拦截
+		//     （deny 海外同样全量命中），唯一痕迹只有一条 Warn；而 stat 瞬时
+		//     失败（挂载抖动、权限瞬变、rm+cp 交错）并不等于数据库已不可用。
+		//   - 标记而不删条目：一次 reload 里每个 geoip 规则各调一次本函数，
+		//     删掉条目会让第二个及之后的实例拿不到缓存而再次降级（只有首个
+		//     规则免于全量拦截，同一份配置内部行为不一致）。
+		//   - 标记保证下一次 Provision 必然重读重建（不复用旧 inode）：文件以
+		//     「同 modtime+size」形态恢复（rsync -a 保时间戳重铺）时缓存命中
+		//     判定不会把被删 inode 的旧库当有效数据继续服务。
 		geoipSharedMu.Lock()
-		if cached, ok := geoipSharedSearchers[path]; ok {
-			old := cached.searcher
-			delete(geoipSharedSearchers, path)
-			time.AfterFunc(geoipOldInstanceCloseDelay, func() { old.Close() })
+		cached, ok := geoipSharedSearchers[key]
+		if ok {
+			cached.needsRebuild = true
 		}
 		geoipSharedMu.Unlock()
-		return nil, err
+		if !ok {
+			// 无缓存形态（首次缺失/权限错/挂载未就绪）是最常见的失败分支，
+			// 必须与 fail-stale 分支同族节流：一次 reload 会为每条地域规则
+			// 各调一次本函数，不节流则 WARN 按规则数放大并稀释真实告警。
+			geoipWarnThrottled("unavailable", path, "ip2region database unavailable, geoip disabled",
+				zap.String("xdb_path", path), zap.Error(err))
+			return nil, err
+		}
+		geoipWarnThrottled("stat", path, "ip2region database is not stat-able, serving the previous database instance and rebuilding on the next reload",
+			zap.String("xdb_path", path), zap.Error(err))
+		return cached.searcher, nil
 	}
 	geoipSharedMu.Lock()
 	defer geoipSharedMu.Unlock()
-	if cached, ok := geoipSharedSearchers[path]; ok &&
-		cached.modTime.Equal(st.ModTime()) && cached.size == st.Size() {
+	if cached, ok := geoipSharedSearchers[key]; ok && !cached.needsRebuild &&
+		cached.modTime.Equal(st.ModTime()) && cached.size == st.Size() &&
+		v6FormUnchanged(cached, v6Effective) {
+		clearGeoIPWarnLogs(path)
 		return cached.searcher, nil
 	}
-	searcher, err := service.NewIp2RegionWithPath(path, "")
+	searcher, err := newGeoipSearcher(path, v6Effective)
 	if err != nil {
 		// 重建失败（带外损坏的 xdb 等）不回退缓存旧实例，则
 		// Provision 收到 error → handler 降级 pass-through → 全部客户端判
@@ -139,25 +442,75 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 		// 正常更新走 rename（文件形态变化即命中成功重建），失败分支只可能是
 		// 带外损坏：保留旧实例继续服务（fail-stale），文件修复后的下一次
 		// Provision/reload 再重建。缓存条目保持旧形态，不驱逐。
-		if cached, ok := geoipSharedSearchers[path]; ok {
-			caddy.Log().Named("geoip2region").Warn("ip2region rebuild failed, serving the previous database instance",
+		if cached, ok := geoipSharedSearchers[key]; ok {
+			geoipWarnThrottled("rebuild", path, "ip2region rebuild failed, serving the previous database instance",
 				zap.String("xdb_path", path), zap.Error(err))
 			return cached.searcher, nil
 		}
+		// 无缓存的重建失败同样按（原因|路径）节流上报，与有缓存分支同族。
+		geoipWarnThrottled("rebuild-unavailable", path, "ip2region database unavailable, geoip disabled",
+			zap.String("xdb_path", path), zap.Error(err))
 		return nil, err
 	}
-	if replaced, ok := geoipSharedSearchers[path]; ok {
+	entry := &geoipSharedSearcher{searcher: searcher, modTime: st.ModTime(), size: st.Size()}
+	if v6Effective != "" {
+		if v6st, v6err := os.Stat(v6Effective); v6err == nil {
+			entry.v6ModTime, entry.v6Size = v6st.ModTime(), v6st.Size()
+		}
+	}
+	if replaced, ok := geoipSharedSearchers[key]; ok {
 		old := replaced.searcher
 		time.AfterFunc(geoipOldInstanceCloseDelay, func() { old.Close() })
 	}
-	geoipSharedSearchers[path] = &geoipSharedSearcher{searcher: searcher, modTime: st.ModTime(), size: st.Size()}
+	geoipSharedSearchers[key] = entry
+	clearGeoIPWarnLogs(path)
 	return searcher, nil
+}
+
+// healthyV6Path 是 v6 文件健康门：空值=禁用直接放行空串；非空时读 256B 头
+// 校验（xdb.LoadHeaderFromFile + VersionFromHeader 必须判定为 IPv6 库），
+// 失败按「v6 禁用」降级（节流 WARN；v4Path 仅作告警键归属）。
+func healthyV6Path(v6Path, v4Path string) string {
+	if v6Path == "" {
+		return ""
+	}
+	header, err := xdb.LoadHeaderFromFile(v6Path)
+	if err != nil {
+		geoipWarnThrottled("v6-unavailable", v4Path, "ip2region v6 database unavailable, v6 lookups degrade to disabled",
+			zap.String("xdb_v6_path", v6Path), zap.Error(err))
+		return ""
+	}
+	version, verr := xdb.VersionFromHeader(header)
+	if verr != nil || version != xdb.IPv6 {
+		geoipWarnThrottled("v6-invalid", v4Path, "ip2region v6 database is not an IPv6 xdb, v6 lookups degrade to disabled",
+			zap.String("xdb_v6_path", v6Path))
+		return ""
+	}
+	return v6Path
+}
+
+// v6FormUnchanged 报告缓存条目的 v6 形态是否仍与磁盘一致：v6 禁用（空路径）
+// 恒一致；启用时 v6 文件被换库（rename 换 mtime/size）即失效重建——与 v4
+// 的 modTime/size 判定同构（双源更新依赖「Caddy 侧 geoip 随 reloader 收敛」，
+// v6 换库同样依赖本判定）。
+func v6FormUnchanged(cached *geoipSharedSearcher, v6Effective string) bool {
+	if v6Effective == "" {
+		return cached.v6ModTime.IsZero() && cached.v6Size == 0
+	}
+	v6st, err := os.Stat(v6Effective)
+	if err != nil {
+		return false
+	}
+	return cached.v6ModTime.Equal(v6st.ModTime()) && cached.v6Size == v6st.Size()
 }
 
 // geoipCorazaHeaders lists the request headers this module owns. v2.2.0 地域
 // 拦截改走 coraza（BuildCorazaDirectives 的 GeoIP SecRule 在 phase:1 读取
-// X-LB-GeoIP-Loc），这些头是 geoip.* 变量的镜像；客户端伪造的同名头在
-// ServeHTTP 入口无条件删除（先删后设，防伪造绕过/误伤）。
+// X-LB-GeoIP-Loc），其中 X-LB-GeoIP-Loc 是 geoip.* 变量的镜像；其余同名头
+// 只做剥离、不再发射（X-LB-GeoIP-Country-Code 的发射已删除，
+// geoip.country_code 变量与测试均按「不发布」钉住）。客户端伪造的同名头在
+// ServeHTTP 入口无条件删除（先删后设，防伪造绕过/误伤）——不要按「镜像」
+// 语义把已删的发射加回来。
 var geoipCorazaHeaders = []string{
 	"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
 	"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
@@ -182,9 +535,11 @@ func (h *GeoIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		// xdb 缺失/损坏（Provision 降级 pass-through）：coraza 的地域规则读
 		// REQUEST_HEADERS:X-LB-GeoIP-Loc，缺失变量在 coraza 连取反算子都不产生
 		// 匹配（rule.go evaluate 按值循环）——不置哨兵则 deny/allow 两模式的
-		// id:8 恒不命中，地域拦截静默 fail-open。与查询失败同口径发「海外」，
-		// 恢复文档化 fail-closed 语义。
-		r.Header.Set("X-LB-GeoIP-Loc", "海外")
+		// id:8 恒不命中，地域拦截静默 fail-open。必须与查询失败分支同口径发射
+		// 全套哨兵（变量 + 头）：只发 Loc 头会让 geoip.* 变量消费方
+		// （流量统计桶/未来 CEL 规则）读到未设置变量，形成
+		// 「collecting=true 但恒零」的静默口径分裂。
+		setGeoIPSentinels(r.Context(), r)
 	}
 	h.applyCrawlerVerification(r)
 	return next.ServeHTTP(w, r)
@@ -260,21 +615,12 @@ func (h *GeoIPHandler) Cleanup() error {
 	return nil
 }
 
-// setGeoIPPlaceholders resolves the client IP against the database and
-// publishes the country fields on the request replacer. v2.2.0 起同值镜像为
-// X-LB-GeoIP-* 请求头（含 fail-closed 空串哨兵），供下游 coraza 的 GeoIP
-// SecRule 匹配；X-LB-GeoIP-Loc 是地域规则匹配键：国名/省/省-市，海外为
-// 解析失败与非国家值的兜底（详见下方）。
-func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
-	ctx := r.Context()
-	// （裁决：fail-closed 哨兵）：不可解析客户端（全部 IPv6 流量、
-	// 查询失败、残缺 region）此前不发任何变量 → geoip CEL 对未设置变量求值出
-	// 错 → match=false → deny 模式地域拦截对 IPv6 静默零强制。现恒发全部变量，
-	// 空串哨兵下：海外项 country_name != "中国" 对空串成立（IPv6 按海外处理，
-	// 与 fail-closed 立场一致）；省/市项对空串恒不匹配（不误伤）。
-	// 头镜像同语义：X-LB-GeoIP-Loc 先置「海外」哨兵（承载 fail-closed 海外裁决
-	// ——不可解析客户端保此值）；已解析行随后覆盖为国名（海外）或省/省-市（国内，
-	// 域 G 历史）。省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
+// setGeoIPSentinels 发射 fail-closed 哨兵形态：4 个 geoip.* 变量与 4 个空串
+// 头哨兵 + X-LB-GeoIP-Loc=「海外」。已解析行随后覆盖（国内为省/省-市，海外
+// 为国名）。xdb 不可用与查询失败两条分支必须共用本实现——只发 Loc 头会让
+// geoip.* 变量消费方（流量统计桶、未来 CEL 规则）读到未设置变量，形成与
+// 「查询失败」不同的静默口径。
+func setGeoIPSentinels(ctx context.Context, r *http.Request) {
 	caddyhttp.SetVar(ctx, "geoip.country_name", "")
 	caddyhttp.SetVar(ctx, "geoip.region", "")
 	caddyhttp.SetVar(ctx, "geoip.province", "")
@@ -284,6 +630,27 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	r.Header.Set("X-LB-GeoIP-Province", "")
 	r.Header.Set("X-LB-GeoIP-City", "")
 	r.Header.Set("X-LB-GeoIP-Loc", "海外")
+}
+
+// setGeoIPPlaceholders resolves the client IP against the database and
+// publishes the country fields on the request replacer. v2.2.0 起同值镜像为
+// X-LB-GeoIP-* 请求头（含 fail-closed 空串哨兵），供下游 coraza 的 GeoIP
+// SecRule 匹配；X-LB-GeoIP-Loc 是地域规则匹配键：国名/省/省-市，海外为
+// 解析失败与非国家值的兜底（详见下方）。
+func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
+	ctx := r.Context()
+	// （裁决：fail-closed 哨兵）：不可解析客户端（v6 禁用/缺库时的全部 IPv6
+	// 流量、查询失败、残缺 region）此前不发任何变量 → geoip CEL 对未设置变量
+	// 求值出错 → match=false → deny 模式地域拦截对 IPv6 静默零强制。现恒发
+	// 全部变量，空串哨兵下：海外项 country_name != "中国" 对空串成立（IPv6
+	// 按海外处理，与 fail-closed 立场一致）；省/市项对空串恒不匹配（不误伤）。
+	// v6 开关开启且库健康时 IPv6 客户端经双协议 API 正常解析（海外精确到
+	// 国家、国内精确到省），「海外」哨兵兜底面随之收窄到真正的不可解析形态
+	// （库缺失/损坏/查询失败/禁用）——两链失败语义裁定不变。
+	// 头镜像同语义：X-LB-GeoIP-Loc 先置「海外」哨兵（承载 fail-closed 海外裁决
+	// ——不可解析客户端保此值）；已解析行随后覆盖为国名（海外）或省/省-市（国内，
+	// 域 G 历史）。省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
+	setGeoIPSentinels(ctx, r)
 	province, city := "", ""
 	ip := realClientIP(r)
 	if ip == "" {
@@ -348,7 +715,7 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 	// 会导致「广东省/广州市」类城市级规则对这些段恒不命中。
 	// 台湾城市误入省列的段：城市名在省列（城市列是该段的乱码罗马化值）——
 	// 城市变量改发省列值，与树侧归并语义一致，使「台湾省/台中市」可命中。
-	if rawProv := strings.TrimSpace(fields[1]); geoipnames.TaiwanCities[rawProv] {
+	if rawProv := strings.TrimSpace(fields[1]); geoipnames.IsTaiwanCity(rawProv) {
 		out.City = rawProv
 	} else if c := strings.TrimSpace(fields[2]); c != "" && c != "0" {
 		out.City = normalizeCity(c)
@@ -360,25 +727,26 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 	if out.Province == "" {
 		out.City = ""
 	}
-	// geoipLocFor 承载三态判定。
-	out.Loc = geoipLocFor(fields[0], out.Province, out.City)
+	// geoipLocFor 承载三态判定。传入已归一的国家列（out.Country）——归一
+	// 是单源（normalizeTrafficCountryKey），Loc 与 country_name 不得各自
+	// 归一（历史形态：两处逐案等价，加新别名时单侧漏改会让两个头的口径分裂）。
+	out.Loc = geoipLocFor(out.Country, out.Province, out.City)
 	return out, true
 }
 
-// geoipLocFor 由 xdb 国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：
-// 国内（国家列 TrimSpace 后为「中国」——TrimSpace 对称，树侧
-// 收集判定同口径）→ 省 或 省/市；海外 → 归一化国名（域 G，历史——已
-// 解析海外行细化到国家，与选项树 Countries 同源同归一）；国家列不可解析为
-// 国名（空/0/Reserved/中国空白异形经 NormalizeCountry 折叠空串）→「海外」
-// 哨兵，与 fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
-func geoipLocFor(rawCountry, province, city string) string {
-	if strings.TrimSpace(rawCountry) == "中国" {
+// geoipLocFor 由**已归一**的国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：
+// 国内（country == 中国）→ 省 或 省/市；海外 → 归一化国名（域 G，历史——
+// 已解析海外行细化到国家，与选项树 Countries 同源同归一）；国家列不可解析为
+// 国名（空/0/Reserved/中国空白异形经归一折叠空串）→「海外」哨兵，与
+// fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
+func geoipLocFor(country, province, city string) string {
+	if country == "中国" {
 		if city != "" {
 			return province + "/" + city
 		}
 		return province
 	}
-	if country := geoipnames.NormalizeCountry(rawCountry); country != "" {
+	if country != "" {
 		return country
 	}
 	return "海外"

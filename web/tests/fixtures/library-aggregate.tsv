@@ -1,0 +1,16 @@
+# 跨栈多源聚合夹具（单一事实源）：case<TAB>versions<TAB>expected_latest<TAB>expected_status。
+# 两侧同读本文件：Go internal/services/cluster_library_version_report_test.go
+# （latestSourceVersion）与 web/tests/securityLibraries.spec.ts
+# （summarizeLibrarySources）。
+# versions 字段用 ';' 分隔各源版本；<empty> 表示空串、<blank> 表示纯空白串
+# （含空白即「非空但 trim 后为空」的形态，曾让前端 !!v 过滤与后端 TrimSpace
+# 跳过分叉：后端报未更新、前端报 success）。字段整体为空表示零源。
+# 语义契约：版本先 trim 再判空——纯空白源不参与聚合，latestVersion = 各源
+# trim 后的最大值；全部为空/零源 → 空串与 status=never；存在有效版本 → status=success。
+# 夹具用例的行形态恒为「启用 + idle」，故 status 只由 latest 是否为空决定。
+blank-only	<blank>		never
+blank-and-empty	<blank>;<empty>		never
+blank-with-version	1.2.3;<blank>	1.2.3	success
+padded-version	 1.2.3 	1.2.3	success
+empty-then-version	<empty>;2026.10.01	2026.10.01	success
+zero-sources			never

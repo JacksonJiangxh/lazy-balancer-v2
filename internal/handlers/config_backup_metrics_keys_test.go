@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// S-6（2026-09-05 审计裁定）：global_config.metrics_public/metrics_origins 死列
+// （2026-09-05 审计裁定）：global_config.metrics_public/metrics_origins 死列
 // 删除后的备份兼容契约——①携带这两键的历史备份导入无错（恢复侧按现存列过滤，
 // 未知键静默跳过，其余配置正常落库）；②新导出的备份不再携带两键。
 func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {
@@ -55,12 +55,12 @@ func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {
 	if importRec.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s, want 200（携带已删死列键的历史备份必须兼容）", importRec.Code, importRec.Body.String())
 	}
-	var timezone string
-	if err := db.DB.QueryRow("SELECT COALESCE(timezone,'') FROM global_config WHERE id=1").Scan(&timezone); err != nil {
-		t.Fatalf("read imported timezone: %v", err)
+	var timezone, logLevel string
+	if err := db.DB.QueryRow("SELECT COALESCE(timezone,''), COALESCE(log_level,'') FROM global_config WHERE id=1").Scan(&timezone, &logLevel); err != nil {
+		t.Fatalf("read imported config: %v", err)
 	}
-	if timezone != "Asia/Shanghai" {
-		t.Fatalf("timezone=%q, want Asia/Shanghai（其余配置正常落库）", timezone)
+	if timezone != "Asia/Shanghai" || logLevel != "warn" {
+		t.Fatalf("timezone/log_level=%q/%q, want Asia/Shanghai/warn（非默认哨兵必须真实落库）", timezone, logLevel)
 	}
 
 	// And When：重新导出
@@ -89,7 +89,7 @@ func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {
 	}
 }
 
-// CL14-新2(第 14 轮审计):CL13-新3 钉住——备份携带字面量 "null" 白名单导入后
+// 新2:-新3 钉住——备份携带字面量 "null" 白名单导入后
 // 归一为 ”(中间件把非空串当白名单配置,null 解析成功但 0 CIDR→全来源 403)。
 func TestImportConfigBackup_normalizesNullWhitelist(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -129,7 +129,7 @@ func TestImportConfigBackup_normalizesNullWhitelist(t *testing.T) {
 	}
 }
 
-// CL15-新1(第 15 轮审计):CL14-新1 钉住——sync_users 入保护键,导出不含、
+// 新1:-新1 钉住——sync_users 入保护键,导出不含、
 // 导入携带 0 值不落库(恒同步不变量的第五强制点)。
 func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -152,6 +152,7 @@ func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	}
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
+	router.GET("/config/export", h.ExportConfigBackup)
 	importRec := httptest.NewRecorder()
 	importReq := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(string(body)))
 	importReq.Header.Set("Content-Type", "application/json")
@@ -165,5 +166,23 @@ func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	}
 	if v != 1 {
 		t.Fatalf("sync_users=%d after import carrying 0, want 1 (protected key)", v)
+	}
+	// 导出半边：保护键只在导出侧剔除时才是恒同步不变量，「导入不落库」单独
+	// 无法阻止旧值/异常行被下一次导出外带。同包正常键必须仍在，证明 Config 区
+	// 确实被导出（否则「不含 sync_users」恒真）。
+	exportRec := httptest.NewRecorder()
+	router.ServeHTTP(exportRec, httptest.NewRequest(http.MethodGet, "/config/export", nil))
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	var exported configBackup
+	if err := json.Unmarshal(unpackExportBody(t, exportRec.Body.Bytes()), &exported); err != nil {
+		t.Fatalf("parse export: %v", err)
+	}
+	if _, exists := exported.Config["sync_users"]; exists {
+		t.Fatal("export carries sync_users（保护键必须从导出剔除）")
+	}
+	if got, exists := exported.Config["timezone"]; !exists || got != "Asia/Shanghai" {
+		t.Fatalf("exported timezone=%v exists=%v, want Asia/Shanghai（导出须携带正常配置键）", got, exists)
 	}
 }

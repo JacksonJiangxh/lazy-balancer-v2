@@ -1,12 +1,17 @@
 package handlers
 
-// 第 49 轮 F49-P5-13：BatchRuleBlockPages 的逐规则 UPDATE 必须带同值守卫——
+// BatchRuleBlockPages 的逐规则 UPDATE 必须带同值守卫——
 // 修复前同值批量（拦截页/状态码未变）同样 UPDATE 命中全部行，触发 lb_rules
 // 行级同步触发器（阶段页四列在 OF 清单内）→ 同值操作引发全集群快照重放。
-// 契约：同值批量 → 规则仍计 bound（已在目标态）但上游表零写入；真实变更照常落库。
+// bound 改按 RowsAffected>0 计（真实变更），同值命中计入
+// unchanged——修复前同值批量仍报 bound=N，把零写入算作成功。同值批量仍零写入。
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -35,52 +40,76 @@ func stagePageWriteCount(t *testing.T) int {
 	return count
 }
 
-func TestBatchRuleBlockPages_sameValueZeroWrite(t *testing.T) {
-	// Given：3 条 http 规则 + 拦截页 7；首次批量设置阶段页落库
+func TestBatchRuleBlockPages_alwaysZeroWrite(t *testing.T) {
 	handler, _ := newStageBatchTestHandlers(t)
 	seedStageBatchRules(t)
 	router := stageBatchRouter(handler)
-	first := postStageJSON(t, router, "/rules/batch-block-pages",
-		`{"rule_ids":["lb_b1","lb_b2","lb_b3"],"block_page_stage1_id":7,"block_page_stage1_status":403,"block_page_stage3_id":7,"block_page_stage3_status":503}`)
-	if first.Code != http.StatusOK {
-		t.Fatalf("first batch status=%d body=%s", first.Code, first.Body.String())
-	}
-	if bound, skipped := batchResult(t, first); bound != 3 || len(skipped) != 0 {
-		t.Fatalf("first batch bound=%d skipped=%v, want bound=3", bound, skipped)
-	}
 	installStagePageWriteTally(t)
 
-	// When 1：同值批量（拦截页/状态码完全未变）
-	second := postStageJSON(t, router, "/rules/batch-block-pages",
-		`{"rule_ids":["lb_b1","lb_b2","lb_b3"],"block_page_stage1_id":7,"block_page_stage1_status":403,"block_page_stage3_id":7,"block_page_stage3_status":503}`)
-
-	// Then 1：规则仍计 bound（已在目标态，非「不存在」跳过）且阶段页四列零写入
-	if second.Code != http.StatusOK {
-		t.Fatalf("same-value batch status=%d body=%s", second.Code, second.Body.String())
-	}
-	if bound, skipped := batchResult(t, second); bound != 3 || len(skipped) != 0 {
-		t.Fatalf("same-value batch bound=%d skipped=%v, want bound=3 skipped=0（同值不是跳过理由）", bound, skipped)
+	for _, body := range []string{
+		`{"rule_ids":["lb_b1","lb_b2","lb_b3"],"block_page_stage1_id":7,"block_page_stage1_status":403,"block_page_stage3_id":7,"block_page_stage3_status":503}`,
+		`{"rule_ids":["lb_b1","lb_b2","lb_b3"],"block_page_stage1_id":7,"block_page_stage1_status":404,"block_page_stage3_id":7,"block_page_stage3_status":503}`,
+	} {
+		response := postStageJSON(t, router, "/rules/batch-block-pages", body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+		}
+		if bound, unchanged, skipped := batchResultAll(t, response); bound != 0 || unchanged != 3 || len(skipped) != 0 {
+			t.Fatalf("bound=%d unchanged=%d skipped=%v, want 0/3/0", bound, unchanged, skipped)
+		}
 	}
 	if n := stagePageWriteCount(t); n != 0 {
-		t.Fatalf("同值批量触发 %d 次阶段页列写（应 0 次——零写入零同步 bump）", n)
+		t.Fatalf("停用端点触发 %d 次阶段页列写（应 0 次）", n)
 	}
+	for _, id := range []string{"lb_b1", "lb_b2", "lb_b3"} {
+		if s1, s1s, s3, s3s := stageColumnsByID(t, id); s1 != 0 || s1s != 0 || s3 != 0 || s3s != 0 {
+			t.Fatalf("%s stage columns=(%d,%d,%d,%d), want all zero", id, s1, s1s, s3, s3s)
+		}
+	}
+}
+func TestBatchRuleBlockPages_rejectsOversizedBody(t *testing.T) {
+	handler, _ := newStageBatchTestHandlers(t)
+	seedStageBatchRules(t)
+	router := stageBatchRouter(handler)
+	body := `{"rule_ids":["lb_b1"],"padding":"` + strings.Repeat("x", 1<<20) + `"}`
+	response := postStageJSON(t, router, "/rules/batch-block-pages", body)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413（独立 1MB 上限）", response.Code, response.Body.String())
+	}
+}
 
-	// When 2：真实变更（阶段 1 状态码 403→404）
-	third := postStageJSON(t, router, "/rules/batch-block-pages",
-		`{"rule_ids":["lb_b1","lb_b2","lb_b3"],"block_page_stage1_id":7,"block_page_stage1_status":404,"block_page_stage3_id":7,"block_page_stage3_status":503}`)
+// chunked/未知长度（ContentLength=-1）的超限请求体必须同样映射 413：
+// MaxBytesReader 在解析期截断，错误不得被统一折成「请求参数无效」——
+// 按 413 做重试/降级策略的客户端否则会误判为参数错误。
+func TestBatchRuleBlockPages_rejectsOversizedChunkedBody(t *testing.T) {
+	handler, _ := newStageBatchTestHandlers(t)
+	seedStageBatchRules(t)
+	router := stageBatchRouter(handler)
+	body := `{"rule_ids":["lb_b1"],"padding":"` + strings.Repeat("x", 1<<20) + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/rules/batch-block-pages", io.NopCloser(strings.NewReader(body)))
+	request.ContentLength = -1 // 模拟 chunked：快路径拿不到长度
+	request.TransferEncoding = []string{"chunked"}
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413（chunked 超限不得折成参数错误）", response.Code, response.Body.String())
+	}
+}
 
-	// Then 2：照常落库（三行各一次写）
-	if third.Code != http.StatusOK {
-		t.Fatalf("changed batch status=%d body=%s", third.Code, third.Body.String())
+// batchResultWithUnchanged 解析批量阶段页响应的 bound/unchanged/skipped
+// （新增 unchanged：RowsAffected=0 的同值命中）。
+func batchResultWithUnchanged(t *testing.T, recorder *httptest.ResponseRecorder) (int, int, []map[string]any) {
+	t.Helper()
+	var payload struct {
+		Data struct {
+			Bound     int              `json:"bound"`
+			Unchanged int              `json:"unchanged"`
+			Skipped   []map[string]any `json:"skipped"`
+		} `json:"data"`
 	}
-	if bound, _ := batchResult(t, third); bound != 3 {
-		t.Fatalf("changed batch bound=%d, want 3", bound)
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode batch result: %v (body=%s)", err, recorder.Body.String())
 	}
-	if n := stagePageWriteCount(t); n != 3 {
-		t.Fatalf("真实变更触发 %d 次写（应 3=三条规则各 UPDATE 一次）", n)
-	}
-	var status int
-	if err := db.DB.QueryRow(`SELECT block_page_stage1_status FROM lb_rules WHERE caddy_id='lb_b1'`).Scan(&status); err != nil || status != 404 {
-		t.Fatalf("变更未落库：status=%d err=%v, want 404", status, err)
-	}
+	return payload.Data.Bound, payload.Data.Unchanged, payload.Data.Skipped
 }

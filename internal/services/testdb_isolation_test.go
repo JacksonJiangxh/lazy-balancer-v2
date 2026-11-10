@@ -1,0 +1,115 @@
+package services
+
+// 测试用 DB 夹具：一个用例一个临时库，退出时把全局句柄还原到用例前的身份。
+//
+// 三处状态必须一起还原：db.DB / db.MetricsDB / db.AuditDB（同步侧读取）以及
+// db.SetDB 注册的原子句柄（后台刷新循环经 db.GetDB 读取）。db.Close 内部会
+// 调 SetDB(nil)，只写回三个包级变量的旧写法会让清理后仍在跑的后台循环看到
+// nil 句柄——与 tz_test 的夹具同理。
+
+import (
+	"database/sql"
+	"testing"
+
+	"lazy-balancer-v2/internal/db"
+)
+
+// setupIsolatedDB 初始化临时库并把全部全局句柄在 t.Cleanup 中还原，
+// 返回新库句柄（调用方不需要时可直接忽略返回值）。
+func setupIsolatedDB(t *testing.T) *sql.DB {
+	t.Helper()
+	// 全局 CA 队列管理器的 ticker 跨用例存活：上个用例启动后未 Stop 的实例会在
+	// 本用例的临时库上继续扫 cert_jobs，先把同 id 任务改走状态，随后本用例的
+	// Resume 归一化转换（queued→queued）撞上 WHERE status IN(...) 冲突被跳过，
+	// 表现为假红（本轮实测：TestCAQueueManager_Resume_requeuesLifecycleStrandedJobs
+	// 间歇失败，同一次运行的日志里同时出现全局 "CA queue periodic scan"）。
+	// 进入用例先停掉遗留实例，退出时同样停掉，避免把泄漏传给下一个用例。
+	ResetCAQueueManagerForTest()
+	t.Cleanup(ResetCAQueueManagerForTest)
+	oldDB, oldMetricsDB, oldAuditDB, oldCurrent := db.DB, db.MetricsDB, db.AuditDB, db.GetDB()
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	database := db.DB
+	t.Cleanup(func() {
+		_ = db.Close()
+		restoreGlobalDBHandles(oldDB, oldMetricsDB, oldAuditDB, oldCurrent)
+	})
+	return database
+}
+
+// setupIsolatedDBWithMetrics 在临时库上同时初始化主库与指标库，清理时还原
+// 全部全局句柄（含 db.GetDB 的原子句柄）。指标类夹具必须复用本 helper：
+// 手工「db.Initialize + db.InitializeMetricsDB + 只回写三个导出变量」会留下
+// 未还原的 db.GetDB 句柄（后台刷新循环读到刚被 Close 的库），且
+// InitializeMetricsDB 直接覆盖 MetricsDB 不关闭旧池。
+func setupIsolatedDBWithMetrics(t *testing.T) *sql.DB {
+	t.Helper()
+	oldDB, oldMetricsDB, oldAuditDB, oldCurrent := db.DB, db.MetricsDB, db.AuditDB, db.GetDB()
+	dataDir := t.TempDir()
+	if err := db.Initialize(dataDir); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatalf("initialize test metrics database: %v", err)
+	}
+	database := db.DB
+	t.Cleanup(func() {
+		_ = db.Close()
+		restoreGlobalDBHandles(oldDB, oldMetricsDB, oldAuditDB, oldCurrent)
+	})
+	return database
+}
+
+// restoreGlobalDBHandles 恢复三个全局句柄并同步 db.GetDB() 的原子句柄：
+// 只还原导出变量会让后台刷新循环（GetDB 消费方）继续读到刚被 Close 的库。
+// 所有直接调用 db.Initialize 的夹具共用本实现（单一出处，避免各自演化）。
+func restoreGlobalDBHandles(oldDB, oldMetricsDB, oldAuditDB, oldCurrent *sql.DB) {
+	db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	db.SetDB(oldCurrent)
+}
+
+func TestSecurityDBFixtures_restoreEveryGlobalHandle(t *testing.T) {
+	originalDB, originalMetrics, originalAudit, originalCurrent := db.DB, db.MetricsDB, db.AuditDB, db.GetDB()
+	t.Cleanup(func() {
+		db.DB, db.MetricsDB, db.AuditDB = originalDB, originalMetrics, originalAudit
+		db.SetDB(originalCurrent)
+	})
+	fixtures := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{name: "task isolated DB helper", run: func(t *testing.T) { setupIsolatedDB(t) }},
+		{name: "geoip helper", run: setupGeoipConfigTestDB},
+		{name: "auto backup helper", run: setupAutoBackupTestDB},
+		{name: "services regression helper", run: setupU05ServicesDB},
+		{name: "audit cleanup helper", run: func(t *testing.T) { newAuditCleanupFixture(t, 0, 3) }},
+		{name: "policy context direct init", run: func(t *testing.T) { TestLoadSecurityPolicyContext_carriesTriStateGateFields(t) }},
+		{name: "reconcile direct init", run: func(t *testing.T) { TestReconcileCRSState_versionReadFailureSkipsWrites(t) }},
+		{name: "task log retention direct init", run: func(t *testing.T) { TestTaskLogsHousekeeping_retentionOnlyDoesNotRotate(t) }},
+		{name: "task log certjobs direct init", run: func(t *testing.T) { TestTaskLogsHousekeeping_certjobsExemptFromSizeRotation(t) }},
+		{name: "security events helper", run: func(t *testing.T) {
+			if err := initSecurityEventsTestDB(t, t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "security enum helper", run: setupSecurityEnumTestDB},
+		{name: "retention helper", run: setupSecurityEventsRetentionTestDB},
+		{name: "stall helper", run: func(t *testing.T) { stallSetup(t) }},
+		{name: "library sentinel direct init", run: func(t *testing.T) { TestArmSecurityLibraryFirstSlots_healsImportSentinelRow(t) }},
+		{name: "rate limit direct init", run: func(t *testing.T) { TestSecurityEnumNormalizedChanges_reportsRateLimitShutdown(t) }},
+		{name: "commit recovery direct init", run: func(t *testing.T) { TestSecurityEventsIngestion_commitFailureReleasesLeakedTransaction(t) }},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			sentinelDB, sentinelMetrics, sentinelAudit, sentinelCurrent := &sql.DB{}, &sql.DB{}, &sql.DB{}, &sql.DB{}
+			db.DB, db.MetricsDB, db.AuditDB = sentinelDB, sentinelMetrics, sentinelAudit
+			db.SetDB(sentinelCurrent)
+			t.Run("fixture", fixture.run)
+			if db.DB != sentinelDB || db.MetricsDB != sentinelMetrics || db.AuditDB != sentinelAudit || db.GetDB() != sentinelCurrent {
+				t.Fatalf("global handles were not restored: DB=%p/%p metrics=%p/%p audit=%p/%p current=%p/%p",
+					db.DB, sentinelDB, db.MetricsDB, sentinelMetrics, db.AuditDB, sentinelAudit, db.GetDB(), sentinelCurrent)
+			}
+		})
+	}
+}

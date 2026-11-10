@@ -1,6 +1,6 @@
 package handlers
 
-// LB40-2(第 40 轮):http→tcp 协议切换的零值化集合补 dynamic_dns/
+// http→tcp 协议切换的零值化集合补 dynamic_dns/
 // enable_dns_server/dns_server/dns_family 四字段——DNS 动态上游是 HTTP 语义,
 // 残留会让 TCP 规则行携带永不消费的脏配置(快照/导出/审计随之放大)。
 
@@ -44,14 +44,16 @@ func TestUpdateRule_protocolSwitchToTCPZeroesDNSFields(t *testing.T) {
 		Scan(&dynamicDNS, &enableDNSServer, &dnsServer, &dnsFamily); err != nil {
 		t.Fatal(err)
 	}
-	if dynamicDNS != 0 || enableDNSServer != 0 || dnsServer != "" || dnsFamily != "" {
+	// dns_family 归一到建库默认 ipv4（而非空串）——同一 TCP 终态不得出现
+	// ''/ipv4 两形态，导出/快照 canonical 需要稳定值；其余 DNS 字段清空。
+	if dynamicDNS != 0 || enableDNSServer != 0 || dnsServer != "" || dnsFamily != "ipv4" {
 		t.Fatalf("tcp switch must zero dns fields, got dynamic_dns=%d enable_dns_server=%d dns_server=%q dns_family=%q", dynamicDNS, enableDNSServer, dnsServer, dnsFamily)
 	}
 }
 
-// LBH-A-L1（第 69 轮 P2）：http→tcp 协议切换不清上游 origin_domain——后端
+// http→tcp 协议切换不清上游 origin_domain——后端
 // validateRulePayloadBeforeSave 对 TCP+origin_domain 硬 400，前端 TCP 下该列
-// 不渲染（隐藏字段卡保存）。切换即弃置（与同族 HTTP 专属字段同格归零）。
+// 不渲染（隐藏字段卡保存）。切换即弃置（与 host_header 同格归零）。
 func TestUpdateRule_protocolSwitchToTCPZeroesOriginDomain(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -83,7 +85,7 @@ func TestUpdateRule_protocolSwitchToTCPZeroesOriginDomain(t *testing.T) {
 	}
 }
 
-// LB40-3(第 40 轮):路径规则上游 host:port 去重——主上游已有同口径判定
+// 路径规则上游 host:port 去重——主上游已有同口径判定
 // (handlers.go hostPortSeen),路径规则缺位:同 host:port 双条目权重翻倍,
 // 均衡语义静默漂移。
 func TestPathRuleUpstreams_duplicateRejected(t *testing.T) {
@@ -93,8 +95,9 @@ func TestPathRuleUpstreams_duplicateRejected(t *testing.T) {
 	router.POST("/rules", handler.CreateRule)
 
 	body := `{"name":"path-dup","protocol":"http","domain":"pathdup.test","listen_port":18581,"custom_routes_enabled":true,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],` +
-		`"path_rules":[{"path":"/a","match_type":"prefix","upstreams":[{"address":"Up.Test","port":9001},{"address":"up.test ","port":9001}]}]}`
+		`"path_rules":[{"path":"/a","match_type":"prefix","upstreams":[{"address":"Up.Test","port":9001,"weight":1},{"address":"up.test ","port":9001,"weight":1}]}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -104,7 +107,7 @@ func TestPathRuleUpstreams_duplicateRejected(t *testing.T) {
 	}
 }
 
-// LBH-A-U2（第 69 轮 P3）：CreateRule 的 TCP 归一顺位必须先于 TLS 来源/手动
+// CreateRule 的 TCP 归一顺位必须先于 TLS 来源/手动
 // 证书材料校验（与 UpdateRule 同格）——此前 TCP+enable_tls:true+空/bogus
 // tls_source 创建恒 400「启用 TLS 时必须选择证书来源」，同形态更新却归一放行
 // 200，两入口对同一输入响应分叉。
@@ -127,6 +130,7 @@ func TestCreateRule_tcpNormalizationPrecedesTLSValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Given：TCP 创建载荷携带 TLS 死形态（UI 不发，API/MCP 直构可达）
 			body := fmt.Sprintf(`{"name":%q,"protocol":"tcp","listen_port":%d,%s,`+
+				`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,`+
 				`"upstreams":[{"host":"10.0.0.1","port":9000,"enabled":true}]}`, tc.name, tc.port, tc.tls)
 			request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")
@@ -152,8 +156,8 @@ func TestCreateRule_tcpNormalizationPrecedesTLSValidation(t *testing.T) {
 	}
 }
 
-// LBH-A-U1（第 69 轮 P3）：TCP 规则创建不得落库 HTTP 专属死配置字段族
-// （origin_domain/health_check_path/enable_compress/compress_types/
+// TCP 规则创建不得落库 HTTP 专属死配置字段族
+// （host_header/health_check_path/enable_compress/compress_types/
 // request_body_max_size_mb/upstream_keepalive_timeout/server_tokens_hidden）——
 // TCP 渲染零消费（buildTCPServer/buildTCPProxyRoute 实证），携带即归一弃置
 // （与 protocolChanged 归零同格），不随快照/导出/复制放大。
@@ -165,9 +169,10 @@ func TestCreateRule_tcpDropsHTTPOnlyFieldFamily(t *testing.T) {
 
 	// Given：TCP 创建载荷显式携带全部七个 HTTP 专属字段
 	body := `{"name":"tcp-family","protocol":"tcp","listen_port":18595,` +
-		`"origin_domain":"dead.example","health_check_path":"/healthz",` +
+		`"host_header":"dead.example","health_check_path":"/healthz",` +
 		`"enable_compress":true,"compress_types":"zstd",` +
 		`"request_body_max_size_mb":64,"upstream_keepalive_timeout":30,"server_tokens_hidden":1,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"10.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -183,8 +188,8 @@ func TestCreateRule_tcpDropsHTTPOnlyFieldFamily(t *testing.T) {
 	assertTCPRuleFamilyZeroed(t, "lb_rules 创建行", "name='tcp-family'")
 }
 
-// LBH-A-U1 同族：协议未变的 TCP 编辑同样归一（存量/导入残留的编辑自愈，
-// 与 R62 C2-N1 的 TLS 归一/U3-1 阶段页归一同格）。
+// 同族：协议未变的 TCP 编辑同样归一（存量/导入残留的编辑自愈，
+// 与 TLS 归一/ 阶段页归一同格）。
 func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -193,7 +198,7 @@ func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 
 	// Given：存量 TCP 行携带死配置（修复前 API 直构/导入落库的形态）
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
-		origin_domain,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
+		host_header,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
 		VALUES ('lb_tcpfam','tcpfam','','tcp','',18596,'weighted_round_robin',1,
 		'legacy.example','/h',1,'gzip',32,15,2)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -215,10 +220,11 @@ func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 	assertTCPRuleFamilyZeroed(t, "lb_rules 编辑自愈", "caddy_id='lb_tcpfam'")
 }
 
-// LBH-A-N1（第 72 轮 P3）：NTLM 接管态（td=-1，方案 C 库级表达）随
+// NTLM 接管态（td=-1，方案 C 库级表达）随
 // http→tcp 切换命中校验死端——指针合并（rules.go nil=沿用存量）把 -1 带进
 // TCP 值域门（rule_features.go TCP 分支拒负值），400 指向用户从未提交的字段，
-// UI 无自救路径。切换路径负值自愈归零（0=默认 5s 窗口）；非负间隔不受波及。
+// UI 无自救路径。切换路径负值自愈归零（TCP 语义：0/-1 均为不重试；5s
+// 默认窗口仅属 HTTP）；非负间隔不受波及。
 func TestUpdateRule_switchToTCPHealsNegativeTryDurationFromNTLMState(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -260,9 +266,9 @@ func TestUpdateRule_switchToTCPHealsNegativeTryDurationFromNTLMState(t *testing.
 	}
 }
 
-// LBH-A-N1 同族第二面：直改 DB/导入残留的 TCP 行携带负值重试窗口——任意
+// 同族第二面：直改 DB/导入残留的 TCP 行携带负值重试窗口——任意
 // 同协议编辑（如改名）同样命中负值门 400。同协议编辑路径负值一并自愈归零
-// （与 LBH-A-U1 死配置自愈同格）；非负值尊重 LB-02 指针合并契约
+// （与死配置自愈同格）；非负值尊重指针合并契约
 // （nil=沿用存量/显式值=尊重输入，rules_lb_fixes_test 钉测）。
 func TestUpdateRule_tcpEditHealsNegativeTryWindowResidue(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
@@ -299,7 +305,7 @@ func TestUpdateRule_tcpEditHealsNegativeTryWindowResidue(t *testing.T) {
 	}
 }
 
-// LBH-A-N1 同族（R-12 收敛）：DuplicateRule 把源行 td/ti 原样喂进
+// 同族：DuplicateRule 把源行 td/ti 原样喂进
 // validateRuleFeatures（rules.go 复制校验）——直改 DB 残留的负值 TCP 源行
 // 复制即 400 死端（与编辑路径同形）；负值不放大到副本，非负窗口原样复制。
 func TestDuplicateRule_tcpCopyHealsNegativeTryWindowResidue(t *testing.T) {
@@ -336,8 +342,8 @@ func TestDuplicateRule_tcpCopyHealsNegativeTryWindowResidue(t *testing.T) {
 	}
 }
 
-// LBH-A-U1 同族：DuplicateRule 不把源 TCP 行的死配置放大到副本（与
-// CreateRule/UpdateRule 归一同口径，A2-S2 归一块的家族补齐）。
+// 同族：DuplicateRule 不把源 TCP 行的死配置放大到副本（与
+// CreateRule/UpdateRule 归一同口径，归一块的家族补齐）。
 func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -346,7 +352,7 @@ func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 
 	// Given
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
-		origin_domain,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
+		host_header,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
 		VALUES ('lb_tcpdup','tcpdup','','tcp','',18597,'weighted_round_robin',1,
 		'legacy.example','/h',1,'gzip',32,15,2)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -367,21 +373,290 @@ func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 	assertTCPRuleFamilyZeroed(t, "副本行", "name='tcpdup（副本）'")
 }
 
+// TCP 归一的 HTTP 专属字段清单补齐 TLSHTTPRedirect/
+// Domain/UpstreamForceHTTP1——单一 tcpDeadFieldReset 清单由 Create/Update/
+// Duplicate 共用（此前 Create 显式携带落库、Update/Duplicate 仅零散归零，
+// 死配置随快照/导出/复制放大）。
+func TestCreateRule_tcpDropsHTTPOnlyTransportFields(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+
+	body := `{"name":"tcp-transport","protocol":"tcp","listen_port":18820,` +
+		`"domain":"dead-transport.example","tls_http_redirect":true,"upstream_force_http1":1,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
+		`"upstreams":[{"host":"10.0.0.9","port":9000,"enabled":true}]}`
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", response.Code, response.Body.String())
+	}
+	assertTCPDeadTransportFieldsZeroed(t, "创建行", "caddy_id IS NOT NULL AND name='tcp-transport'")
+}
+
+// 同族：协议未变化的 TCP 编辑同样归一（存量/导入残留的编辑自愈）。
+func TestUpdateRule_tcpEditDropsHTTPOnlyTransportFields(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
+		tls_http_redirect,upstream_force_http1)
+		VALUES ('lb_tcptransport','tcp-transport-upd','','tcp','dead-transport.example',18821,'weighted_round_robin',1,
+		1,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tcptransport','up.test',9000,1,1,'tcp')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_tcptransport", strings.NewReader(`{"name":"tcp-transport-upd-renamed"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	assertTCPDeadTransportFieldsZeroed(t, "编辑自愈", "caddy_id='lb_tcptransport'")
+}
+
+// 同族：DuplicateRule 不把源 TCP 行的 HTTP 专属传输字段放大到副本。
+func TestDuplicateRule_tcpCopyDropsHTTPOnlyTransportFields(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
+		tls_http_redirect,upstream_force_http1)
+		VALUES ('lb_tcptransportdup','tcp-transport-dup','','tcp','dead-transport.example',18822,'weighted_round_robin',1,
+		1,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tcptransportdup','up.test',9000,1,1,'tcp')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/rules/lb_tcptransportdup/duplicate", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", response.Code, response.Body.String())
+	}
+	assertTCPDeadTransportFieldsZeroed(t, "副本行", "name='tcp-transport-dup（副本）'")
+}
+
+// assertTCPDeadTransportFieldsZeroed 断言 TCP 行不携带 HTTP 专属传输字段。
+func assertTCPDeadTransportFieldsZeroed(t *testing.T, label, where string) {
+	t.Helper()
+	var domain string
+	var tlsHTTPRedirect, upstreamForceHTTP1 int
+	if err := db.DB.QueryRow(`SELECT COALESCE(domain,''), IIF(tls_http_redirect IN ('1',1),1,0), COALESCE(upstream_force_http1,0)
+		FROM lb_rules WHERE `+where).Scan(&domain, &tlsHTTPRedirect, &upstreamForceHTTP1); err != nil {
+		t.Fatalf("%s readback: %v", label, err)
+	}
+	if domain != "" || tlsHTTPRedirect != 0 || upstreamForceHTTP1 != 0 {
+		t.Fatalf("%s HTTP 专属传输字段未归一: domain=%q tls_http_redirect=%d upstream_force_http1=%d", label, domain, tlsHTTPRedirect, upstreamForceHTTP1)
+	}
+}
+
 // assertTCPRuleFamilyZeroed 断言 lb_rules 中匹配 where 的行七字段全部为零值形态。
 func assertTCPRuleFamilyZeroed(t *testing.T, label, where string) {
 	t.Helper()
-	var originDomain, healthCheckPath, compressTypes string
+	var hostHeader, healthCheckPath, compressTypes string
 	var enableCompress, bodyMax, keepalive, tokensHidden int
-	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,''), COALESCE(health_check_path,''),
+	if err := db.DB.QueryRow(`SELECT COALESCE(host_header,''), COALESCE(health_check_path,''),
 		IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,''),
 		COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0)
 		FROM lb_rules WHERE `+where).
-		Scan(&originDomain, &healthCheckPath, &enableCompress, &compressTypes, &bodyMax, &keepalive, &tokensHidden); err != nil {
+		Scan(&hostHeader, &healthCheckPath, &enableCompress, &compressTypes, &bodyMax, &keepalive, &tokensHidden); err != nil {
 		t.Fatalf("%s readback: %v", label, err)
 	}
-	if originDomain != "" || healthCheckPath != "" || enableCompress != 0 || compressTypes != "" ||
+	if hostHeader != "" || healthCheckPath != "" || enableCompress != 0 || compressTypes != "" ||
 		bodyMax != 0 || keepalive != 0 || tokensHidden != 0 {
-		t.Fatalf("%s HTTP 专属死配置未归一: origin_domain=%q health_check_path=%q enable_compress=%d compress_types=%q body_max=%d keepalive=%d tokens_hidden=%d",
-			label, originDomain, healthCheckPath, enableCompress, compressTypes, bodyMax, keepalive, tokensHidden)
+		t.Fatalf("%s HTTP 专属死配置未归一: host_header=%q health_check_path=%q enable_compress=%d compress_types=%q body_max=%d keepalive=%d tokens_hidden=%d",
+			label, hostHeader, healthCheckPath, enableCompress, compressTypes, bodyMax, keepalive, tokensHidden)
+	}
+}
+
+func TestUpdateRule_httpEditDropsTCPOnlyFields(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,tcp_health_check_port,tcp_proxy_protocol)
+		VALUES ('lb_http_tcpdead','http-tcpdead','','http','hdead.test',18583,'weighted_round_robin',1,99,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_http_tcpdead','up.test',80,1,1,'http')`); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_http_tcpdead", strings.NewReader(`{"name":"http-tcpdead-renamed"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("http edit status=%d body=%s", response.Code, response.Body.String())
+	}
+	var port, proxy int
+	if err := db.DB.QueryRow(`SELECT COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0) FROM lb_rules WHERE caddy_id='lb_http_tcpdead'`).Scan(&port, &proxy); err != nil {
+		t.Fatal(err)
+	}
+	if port != 0 || proxy != 0 {
+		t.Fatalf("http edit must clear TCP-only fields, got port=%d proxy=%d", port, proxy)
+	}
+}
+
+// HTTP 源行的 TCP-only 残留（tcp_health_check_port/
+// tcp_proxy_protocol）不得随复制放大——Create/Update 已反向清零，复制
+// 路径此前只处理 TCP 源行。
+func TestDuplicateRule_httpCopyClearsTCPOnlyFields(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+
+	// Given：HTTP 源行直改 DB 携带 TCP-only 字段
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,tcp_health_check_port,tcp_proxy_protocol)
+		VALUES ('lb_httpduptcp','http-dup-tcp','','http','httpduptcp.test',18830,'weighted_round_robin',1,99,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_httpduptcp','up.test',80,1,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	// When
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_httpduptcp/duplicate", nil))
+
+	// Then：副本 TCP-only 列归零
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", response.Code, response.Body.String())
+	}
+	var port, proxy int
+	if err := db.DB.QueryRow(`SELECT COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0) FROM lb_rules WHERE name='http-dup-tcp（副本）'`).
+		Scan(&port, &proxy); err != nil {
+		t.Fatalf("read copy: %v", err)
+	}
+	if port != 0 || proxy != 0 {
+		t.Fatalf("HTTP 副本携带 TCP-only 残留: tcp_health_check_port=%d tcp_proxy_protocol=%d, want 0/0", port, proxy)
+	}
+}
+
+// 同协议 TCP 编辑必须自愈健康检查域名、上游回源
+// 域名与死证书/私钥材料（此前只在协议切换分支清理，或 SQL 写入条件不命中）。
+func TestUpdateRule_tcpEditClearsHTTPOnlyAndTLSResidue(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+
+	// Given：直改 DB 的 TCP 行携带 HTTP-only / TLS 死材料
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
+		health_check_host,tls_cert,tls_key,tls_source)
+		VALUES ('lb_tcpresidue','tcp-residue','','tcp','',18831,'weighted_round_robin',1,
+		'probe.example','CERT-PEM','KEY-PEM','manual')`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol,origin_domain)
+		VALUES ('lb_tcpresidue','up.test',9000,1,1,'tcp','origin.example')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	// When：同协议编辑（纯改名）
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_tcpresidue", strings.NewReader(`{"name":"tcp-residue-renamed"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	// Then：200 且三类残留全部清零
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var healthCheckHost, tlsCert, tlsKey string
+	if err := db.DB.QueryRow(`SELECT COALESCE(health_check_host,''), COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_tcpresidue'`).
+		Scan(&healthCheckHost, &tlsCert, &tlsKey); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if healthCheckHost != "" || tlsCert != "" || tlsKey != "" {
+		t.Fatalf("TCP 编辑未清残留: health_check_host=%q tls_cert=%q tls_key=%q", healthCheckHost, tlsCert, tlsKey)
+	}
+	var originDomain string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams WHERE rule_id='lb_tcpresidue'`).Scan(&originDomain); err != nil {
+		t.Fatalf("read upstream: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("TCP 编辑未清上游回源域名: %q", originDomain)
+	}
+}
+
+// 同族：DuplicateRule 复制 TCP 源行时不得放大 upstreams.origin_domain——
+// 该字段仅 HTTP 规则支持，残留会让复制命中保存门 400 死端（用户看不到字段、
+// 无自救路径）并随快照/导出放大。
+func TestDuplicateRule_tcpCopyDropsUpstreamOriginDomain(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled)
+		VALUES ('lb_tcporigin','tcp-origin','','tcp','',18841,'weighted_round_robin',1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol,origin_domain)
+		VALUES ('lb_tcporigin','up.test',9000,1,1,'tcp','origin.example')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_tcporigin/duplicate", nil))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201（复制不得因 TCP 残留回源域名 400）", response.Code, response.Body.String())
+	}
+	var originDomain string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams
+		WHERE rule_id=(SELECT caddy_id FROM lb_rules WHERE name='tcp-origin（副本）')`).Scan(&originDomain); err != nil {
+		t.Fatalf("read copied upstream: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("副本上游回源域名=%q, want 空（TCP 零消费字段不得复制）", originDomain)
+	}
+}
+
+// 同族：EnableRule 启用 TCP 规则时清零 upstreams.origin_domain，避免启用成功
+// 却把死配置留在库中随导出/备份/集群快照放大。
+func TestEnableRule_tcpClearsUpstreamOriginDomain(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled)
+		VALUES ('lb_tcporigin_en','tcp-origin-en','','tcp','',18842,'weighted_round_robin',0)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol,origin_domain)
+		VALUES ('lb_tcporigin_en','up.test',9000,1,1,'tcp','origin.example')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_tcporigin_en/enable", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var originDomain string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams WHERE rule_id='lb_tcporigin_en'`).Scan(&originDomain); err != nil {
+		t.Fatalf("read upstream: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("启用后上游回源域名=%q, want 空", originDomain)
 	}
 }

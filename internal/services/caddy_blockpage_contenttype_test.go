@@ -1,6 +1,6 @@
 package services
 
-// 拦截页 Content-Type 渲染（2026-09-25 用户裁定）：各错误路由的 Content-Type
+// 拦截页渲染（2026-09-25 用户裁定）：各错误路由的
 // 响应头跟随页面配置（默认 text/html; charset=utf-8），不再恒 text/html。
 
 import (
@@ -48,7 +48,7 @@ func TestBuildRateLimitErrorRoute_usesPageContentType(t *testing.T) {
 }
 
 func TestBuildBlockPageAttributionRoute_usesPageContentType(t *testing.T) {
-	route := buildBlockPageAttributionRoute(483, "{\"error\":\"blocked\"}", 403, "text/plain; charset=utf-8")
+	route := buildBlockPageAttributionRoute(483, nil, "{\"error\":\"blocked\"}", 403, "text/plain; charset=utf-8")
 	if got := errorRouteContentType(t, route); got != "text/plain; charset=utf-8" {
 		t.Fatalf("Content-Type=%q, want text/plain; charset=utf-8", got)
 	}

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"lazy-balancer-v2/internal/models"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,8 +28,7 @@ func TestJWTLogout_revokes_only_current_token(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
 	if err != nil {
@@ -60,7 +58,7 @@ func TestJWTLogout_revokes_only_current_token(t *testing.T) {
 	}
 	firstToken := login()
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.POST("/logout", h.Logout)
 	router.GET("/protected", noContent)
 	request := func(method, path, token string) *httptest.ResponseRecorder {
@@ -90,8 +88,7 @@ func TestJWTLogout_revokes_legacy_token_without_jti(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (2,'legacy-logout','hash','user',1,0)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -111,7 +108,7 @@ func TestJWTLogout_revokes_legacy_token_without_jti(t *testing.T) {
 	otherToken := sign("other")
 	h := handlers.NewHandlers(handlers.Dependencies{Config: cfg})
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.POST("/logout", h.Logout)
 	router.GET("/protected", noContent)
 	request := func(method, path, token string) *httptest.ResponseRecorder {
@@ -156,8 +153,7 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (3,'timezone-logout','hash','user',1,0)"); err != nil {
 		t.Fatal(err)
@@ -172,7 +168,7 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	}
 	h := handlers.NewHandlers(handlers.Dependencies{Config: cfg})
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.POST("/logout", h.Logout)
 	router.GET("/protected", noContent)
 	request := func(method, path string) *httptest.ResponseRecorder {
@@ -194,10 +190,12 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM revoked_jti WHERE expires_at > ?", time.Now().UTC().Format("2006-01-02T15:04:05Z")).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
-	var cleanupErr error
-	if _, err := db.DB.Exec("DELETE FROM revoked_jti WHERE expires_at<=?", time.Unix(expiresAt+1, 0).UTC().Format(models.RevokedTokenTimeFormat)); err != nil {
-		cleanupErr = err
+	// 驱动生产清理实现（db.CleanupExpiredRevokedJTI）而非在测试里复刻
+	// DELETE——真实 SQL 与时间格式由此被覆盖。
+	if _, err := db.DB.Exec("INSERT INTO revoked_jti (jti_hash, expires_at) VALUES ('stale-jti','2000-01-01T00:00:00Z')"); err != nil {
+		t.Fatal(err)
 	}
+	cleanupErr := db.CleanupExpiredRevokedJTI(db.DB)
 	var remaining int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM revoked_jti").Scan(&remaining); err != nil {
 		t.Fatal(err)
@@ -207,14 +205,15 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	if logout.Code != http.StatusOK || revoked.Code != http.StatusUnauthorized {
 		t.Fatalf("logout=%d revoked=%d", logout.Code, revoked.Code)
 	}
-	if !strings.HasSuffix(stored, "Z") || active != 1 || cleanupErr != nil || remaining != 0 {
-		t.Fatalf("stored=%q active=%d cleanup=%v remaining=%d", stored, active, cleanupErr, remaining)
+	// 过期行被清理、未过期的登出行保留（UTC 文本比较格式与生产一致）。
+	if !strings.HasSuffix(stored, "Z") || active != 1 || cleanupErr != nil || remaining != 1 {
+		t.Fatalf("stored=%q active=%d cleanup=%v remaining=%d, want stale removed and active kept", stored, active, cleanupErr, remaining)
 	}
 }
 
-// 第 15 轮审计 S-2：401 消息按失败类别分语义——过期（自然态，重登可解）与
+// 401 消息按失败类别分语义——过期（自然态，重登可解）与
 // 签名无效/格式损坏（凭证问题）不得同发「登录状态已过期」；状态码均保持 401。
-// 第 15 轮审计 S-4：API Key 认证无会话令牌概念——登出应返回 404（无会话令牌
+// API Key 认证无会话令牌概念——登出应返回 404（无会话令牌
 // 可吊销，对齐 DELETE 重复调用 404 的幂等契约），而非旧代码的恒 500（context
 // 缺少 JWT 吊销哈希落穿错误分支）。
 func TestAPIKeyLogout_returnsNotFoundInsteadOf500(t *testing.T) {
@@ -241,17 +240,16 @@ func TestAPIKeyLogout_returnsNotFoundInsteadOf500(t *testing.T) {
 
 func TestJWTAuth_splitsExpiredVsInvalidMessages(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "split-message-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	hit := func(token string) *httptest.ResponseRecorder {
 		response := httptest.NewRecorder()
@@ -278,14 +276,16 @@ func TestJWTAuth_splitsExpiredVsInvalidMessages(t *testing.T) {
 func TestJWTAuth_rejects_username_mismatch_for_same_user_id(t *testing.T) {
 	// Given
 	cfg := &config.Config{JWTSecret: "username-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		// db.Close() 会把 AuditDB/MetricsDB 一并关闭并置 nil——收尾必须走
+		// 单源 helper，否则本用例之后包级句柄恒为 nil（后续直读 db.AuditDB 的
+		// 用例只在「先经 Initialize」时侥幸绿，-shuffle 下会 nil 解引用）。
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (12,'current-name','hash','admin',1,0)"); err != nil {
 		t.Fatal(err)
@@ -298,7 +298,7 @@ func TestJWTAuth_rejects_username_mismatch_for_same_user_id(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	request.Header.Set("Authorization", "Bearer "+signed)
@@ -315,15 +315,14 @@ func TestJWTAuth_rejects_username_mismatch_for_same_user_id(t *testing.T) {
 
 func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "password-version-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	hash, err := bcrypt.GenerateFromPassword([]byte("initial-secret"), bcrypt.MinCost)
 	if err != nil {
@@ -339,7 +338,7 @@ func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *t
 	h := handlers.NewHandlers(handlers.Dependencies{})
 	update := func(current, next string) int64 {
 		response := httptest.NewRecorder()
-		// M5（契约）：本人改密须携带 current_password 过共享确认门。
+		// （契约）：本人改密须携带 current_password 过共享确认门。
 		request := httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"password":"`+next+`","current_password":"`+current+`"}`))
 		request.Header.Set("Content-Type", "application/json")
 		context, _ := gin.CreateTestContext(response)
@@ -365,7 +364,7 @@ func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *t
 		t.Fatalf("password versions=(%d,%d), want (1,2)", firstVersion, secondVersion)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	sign := func(passwordVersion int64) string {
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -395,15 +394,14 @@ func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *t
 
 func TestResetUserPassword_revokes_target_users_existing_token(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "reset-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (9,'target','hash','user',1,0)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -432,7 +430,7 @@ func TestResetUserPassword_revokes_target_users_existing_token(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	authRequest := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	authRequest.Header.Set("Authorization", "Bearer "+oldToken)
@@ -445,15 +443,14 @@ func TestResetUserPassword_revokes_target_users_existing_token(t *testing.T) {
 
 func TestJWTAuth_allows_legacy_token_only_for_password_version_zero(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "legacy-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (8,'legacy','hash','user',1,0)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -466,7 +463,7 @@ func TestJWTAuth_allows_legacy_token_only_for_password_version_zero(t *testing.T
 		t.Fatalf("sign token: %v", err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg))
+	router.Use(jwtAuth(db.DB, cfg))
 	router.GET("/protected", noContent)
 	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	request.Header.Set("Authorization", "Bearer "+signed)
@@ -478,7 +475,7 @@ func TestJWTAuth_allows_legacy_token_only_for_password_version_zero(t *testing.T
 }
 
 // ensurePasswordVersionColumn 钉夹具契约：users.password_version 在场。
-// SYSMW-72-C（第 72 轮审计）：现行架构 db.Initialize 建库即含该列
+// 现行架构 db.Initialize 建库即含该列
 // （v2.1.8 迁移内联），原 ALTER 补列分支不可达已删——列缺席即夹具错误，
 // 直接失败暴露而非静默修补。
 func ensurePasswordVersionColumn(t *testing.T) {
@@ -521,6 +518,9 @@ func newReadOnlyGuardTestRouter(t *testing.T, isMaster bool, role string) *gin.E
 	router.POST("/api/v1/rules/cert-info", noContent)
 	router.POST("/api/v1/config/preview", noContent)
 	router.POST("/api/v1/certificates/jobs/current", noContent)
+	router.POST("/api/v1/certificate-configs/test", noContent)
+	router.POST("/api/v1/certificate-configs/:id/test", noContent)
+	router.POST("/api/v1/ca-providers/:id/test", noContent)
 	router.POST("/api/v1/future-write", noContent)
 	return router
 }
@@ -601,14 +601,16 @@ func TestReadOnlyGuard_blocks_non_admin_jwt_after_authentication(t *testing.T) {
 		t.Fatalf("seed database: %v", err)
 	}
 	cfg := &config.Config{JWTSecret: "test-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
+	// 三句柄一律经单源恢复（只还原 db.DB 会把已关闭/已删目录的
+	// MetricsDB/AuditDB 留给后续用例，-shuffle 下表现为随机假红）。
 	t.Cleanup(func() {
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		_ = db.Close()
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id, username, password_hash, role, is_enabled) VALUES (7, 'viewer', 'x', 'user', 1)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -621,7 +623,7 @@ func TestReadOnlyGuard_blocks_non_admin_jwt_after_authentication(t *testing.T) {
 		t.Fatalf("sign token: %v", err)
 	}
 	router := gin.New()
-	router.Use(jwtAuth(cfg), readOnlyGuard(database))
+	router.Use(jwtAuth(db.DB, cfg), readOnlyGuard(database))
 	router.POST("/api/v1/rules", noContent)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/rules", nil)
 	request.Header.Set("Authorization", "Bearer "+signed)
@@ -785,17 +787,68 @@ func TestReadOnlyGuard_writeRouteClassificationIsIndependentFromAuditPolicy(t *t
 	}
 }
 
-// L5-02（第 65 轮）：从节点 MCP 写工具调用→403 实际接线回归钉（曾仅守卫级
-// 通用测试，无「POST /mcp 经守卫组」端到端形状——v1.POST("/mcp") 注册于
-// adminOnly/readOnlyGuard 组之外，写保护依赖 loopback 转发重入间接达成）。
-func TestReadOnlyGuard_SlaveMcpWriteRouteRejected(t *testing.T) {
+// 从节点 MCP 写工具的保护是「loopback 转发重入目标写路由 → readOnlyGuard
+// 403」，中间件级形态由 TestReadOnlyGuard_preserves_slave_write_rejection 覆盖，
+// 端到端形态（真实 listener + 完整 router + 管理员 mcp Key）见
+// TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard（mcp_test.go）。
+// 不再单列「名实不符」的转发目标用例：它只发普通 POST /rules、JSON-RPC body
+// 是死数据，与上述两例重复，却让人误以为 MCP 从端写保护有独立回归钉。
+
+// 证书配置「测试」两条路由已移出只读白名单
+// ——它们会经 dnsproviders.Validate 真实 Present+CleanUp DNS TXT 记录（非纯读
+// 探测），从节点与只读 API Key 不得触发。CA 提供商
+// 测试同步移出——ZeroSSL 缺 EAB 时会真实写 ca_providers.credentials。
+func TestReadOnlyGuard_slaveCannotRunCertificateConfigTests(t *testing.T) {
 	router := newReadOnlyGuardTestRouter(t, false, "admin")
-	body := `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"create_rule","arguments":{}}}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/rules", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("从节点 MCP 转发目标写路由应 403, got %d body=%s", w.Code, w.Body.String())
+
+	for _, path := range []string{
+		"/api/v1/certificate-configs/test",
+		"/api/v1/certificate-configs/1/test",
+		"/api/v1/ca-providers/1/test",
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("%s status=%d, want 403（从节点不得触发真实写入的测试端点）", path, response.Code)
+		}
+	}
+}
+
+func TestReadOnlyGuard_adminCanRunCertificateConfigTests(t *testing.T) {
+	router := newReadOnlyGuardTestRouter(t, true, "admin")
+	for _, path := range []string{"/api/v1/certificate-configs/test", "/api/v1/certificate-configs/1/test"} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("%s status=%d, want 204（admin 正常）", path, response.Code)
+		}
+	}
+}
+
+// 只读 API Key（同一 readOnlyWriteRoutes 事实源）同样不得触发证书配置测试，
+// 也不得触发 ZeroSSL 缺 EAB 时会写库的 CA 提供商测试。
+func TestAPIKeyReadOnlyGuard_blocksCertificateConfigTests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("auth_type", "api_key")
+		c.Set("api_key_read_only", true)
+		c.Next()
+	})
+	router.Use(apiKeyReadOnlyGuard())
+	router.POST("/api/v1/certificate-configs/test", noContent)
+	router.POST("/api/v1/certificate-configs/:id/test", noContent)
+	router.POST("/api/v1/ca-providers/:id/test", noContent)
+
+	for _, path := range []string{
+		"/api/v1/certificate-configs/test",
+		"/api/v1/certificate-configs/1/test",
+		"/api/v1/ca-providers/1/test",
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("%s status=%d, want 403（只读 Key 不得触发真实写探测）", path, response.Code)
+		}
 	}
 }

@@ -1,6 +1,6 @@
 package db
 
-// 第 57 轮追加问题 RED（用户上报：更新 ip2region 定时更新时间报
+// 历史追加问题 RED（用户上报：更新 ip2region 定时更新时间报
 // 「SQL logic error: no such column: schedule_days」）：
 // security_ip2region_version 的 schedule_days/schedule_time 两列在 fresh DDL
 // 建表语句中存在，但存量库补列迁移（newColumns）漏登记——升级安装该表缺列，

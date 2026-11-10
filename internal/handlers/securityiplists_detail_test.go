@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -88,6 +90,36 @@ func TestGetIPList_returnsEntries(t *testing.T) {
 	}
 }
 
+// 名单详情读路径同属非规范数字 ID 家族门（与 GetSecurityPolicy 同口径）：
+// SQLite 数值亲和会让 '5.0' 命中 id=5 并返回详情，与全部写路径
+// （parsePositiveNumericID → 400）口径分叉。导出端点是已声明的例外
+// （容忍形态，文件名回库内行 ID），不在本门内。
+func TestGetIPList_rejectsNoncanonicalID(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id, name, entries) VALUES (5, 'nc-list', '[]')`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id", h.GetIPList)
+
+	// 规范 ID 仍正常返回
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/ip-lists/5", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canonical id status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	for _, bad := range []string{"5.0", "0x5", "%205", "5e0"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+bad, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("id=%q status=%d body=%s, want 400（读路径须与写路径同门）", bad, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // 用户名单不得与内置威胁名单重名（2026-09-24 用户裁定）——内置重名走专属
 // 409 提示；同库既有通用重名校验含内置行，本测试钉住专属文案分支。
 func TestCreateIPList_rejectsBuiltinName(t *testing.T) {
@@ -111,7 +143,7 @@ func TestCreateIPList_rejectsBuiltinName(t *testing.T) {
 }
 
 // 内置威胁名单引用门禁（2026-09-24 用户裁定）：system=1 名单仅允许 IP ACL
-// 黑名单（deny）引用；信任名单 / ACL 白名单（allow/bypass）/ CRS 排除一律 400。
+// 黑名单（deny）引用；信任名单 / ACL 白名单（allow/绕过）/ CRS 排除一律 400。
 func TestCreatePolicy_rejectsBuiltinListOutsideACLDeny(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -138,9 +170,9 @@ func TestCreatePolicy_rejectsBuiltinListOutsideACLDeny(t *testing.T) {
 	if resp := post(`{"name":"t2","policy_type":"stage1","ip_acl_enabled":true,"ip_acl_mode":"allow","ip_acl_list_refs":"` + refs + `"}`); resp.Code != http.StatusBadRequest {
 		t.Fatalf("ACL allow 引用内置名单应 400, got %d: %s", resp.Code, resp.Body.String())
 	}
-	// ACL bypass 引用内置名单 → 400
-	if resp := post(`{"name":"t2b","policy_type":"stage1","ip_acl_enabled":true,"ip_acl_mode":"bypass","ip_acl_list_refs":"` + refs + `"}`); resp.Code != http.StatusBadRequest {
-		t.Fatalf("ACL bypass 引用内置名单应 400, got %d: %s", resp.Code, resp.Body.String())
+	// ACL 绕过 引用内置名单 → 400
+	if resp := post(`{"name":"t2b","policy_type":"stage1","ip_acl_enabled":true,"ip_acl_mode":"绕过","ip_acl_list_refs":"` + refs + `"}`); resp.Code != http.StatusBadRequest {
+		t.Fatalf("ACL 绕过 引用内置名单应 400, got %d: %s", resp.Code, resp.Body.String())
 	}
 	// ACL 黑名单模式引用内置名单 → 放行（唯一合法用途）
 	if resp := post(`{"name":"t3","policy_type":"stage1","ip_acl_enabled":true,"ip_acl_mode":"deny","ip_acl_list_refs":"` + refs + `"}`); resp.Code != http.StatusOK {
@@ -175,6 +207,11 @@ func TestGetIPList_systemListReadsIplistFile(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 AND name=?`, db.ThreatListNameBySource("ustc")).Scan(&id); err != nil {
 		t.Fatalf("种子威胁名单缺失: %v", err)
 	}
+	// category 可被历史/带外数据改写，且 DB entries 可能是陈旧值；详情路由
+	// 必须按名单名→威胁源，而不是 category 或 DB 残留条目。
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET category='搜索引擎爬虫', entries='[{"value":"9.9.9.9"}]' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}
 	router := gin.New()
@@ -202,6 +239,56 @@ func TestGetIPList_systemListReadsIplistFile(t *testing.T) {
 	}
 	if !strings.Contains(resp2.Body.String(), `"entry_count":0`) {
 		t.Fatalf("文件缺失 entry_count=0: %s", resp2.Body.String()[:min(300, len(resp2.Body.String()))])
+	}
+}
+
+func TestExportIPList_threatUsesFileTruth(t *testing.T) {
+	newBackupTestHandlers(t)
+	wafDir := t.TempDir()
+	restoreWaf := services.OverrideThreatWafDirForTest(wafDir)
+	defer restoreWaf()
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("192.0.2.0/24\n198.51.100.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 AND name=?`, db.ThreatListNameBySource("ustc")).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='[{"value":"9.9.9.9","remark":"stale"}]' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+strconv.FormatInt(id, 10)+"/export", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if got, want := resp.Body.String(), "192.0.2.0/24\n198.51.100.7\n"; got != want {
+		t.Fatalf("threat export=%q, want file truth %q (stale DB entries must be ignored)", got, want)
+	}
+	// 文件名恒为「名单 ID」形态（此前 name 非空只作条件，
+	// 实际仍用 id，死分支误导）。
+	if got, want := resp.Header().Get("Content-Disposition"), `attachment; filename="ip-list-`+strconv.FormatInt(id, 10)+`.txt"`; got != want {
+		t.Fatalf("Content-Disposition=%q, want %q", got, want)
+	}
+}
+
+func TestExportIPList_corruptEntriesReturns500(t *testing.T) {
+	newBackupTestHandlers(t)
+	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES ('corrupt', '{bad', 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+strconv.FormatInt(id, 10)+"/export", nil))
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（畸形 entries 不得 200 空文件）", resp.Code, resp.Body.String())
 	}
 }
 
@@ -239,5 +326,136 @@ func TestListIPLists_emptyEntriesOnSystemRows(t *testing.T) {
 				t.Fatalf("威胁库 entry_count 须取自 threat_sources: got %v want 14189", row["entry_count"])
 			}
 		}
+	}
+}
+
+func TestListIPLists_threatCountScanFailureWarns(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET entry_count='not-a-number' WHERE name='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists", h.ListIPLists)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("auxiliary count scan failure should retain degraded 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(logs.String(), "威胁库条数扫描失败") {
+		t.Fatalf("scan failure must be visible, logs=%q", logs.String())
+	}
+}
+
+// ---- 系统名单置顶（2026-10-14 用户裁定） ----
+
+// Given 系统名单×4（威胁三源+自动封禁）与用户自建列表并存，且用户列表的
+// 更新时间最新（若按更新时间全局排序会排最前）。
+// When GET /security/ip-lists。
+// Then 系统名单恒排在用户列表之前（系统组内按更新时间序——最新更新的系统
+// 名单组内第一），用户组随后。
+func TestListIPLists_systemListsPinnedFirst(t *testing.T) {
+	newBackupTestHandlers(t)
+	for _, name := range []string{"用户甲", "用户乙"} {
+		if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+			VALUES (?, '', '[]', 0, datetime('now'), datetime('now'))`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 一个威胁名单的更新时间顶到组内最新（组内排序判据）；刻意选 id 最大的
+	// 系统名单——旧的 ORDER BY id 序下首行是 id 最小的威胁名单，本判据才会红。
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET updated_at=datetime('now','+1 hour') WHERE system=1 AND name=?`, threatSystemListNameForOrderTest(t)); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists", h.ListIPLists)
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Data []struct {
+			Name   string `json:"name"`
+			System bool   `json:"system"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	rows := payload.Data
+	// 系统名单数量取自种子行（威胁三源 + 自动封禁名单），不硬编码。
+	var wantSystem int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1`).Scan(&wantSystem); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) < wantSystem+2 {
+		t.Fatalf("行数=%d, want ≥%d（%d 系统+2 用户）", len(rows), wantSystem+2, wantSystem)
+	}
+	// 系统行必须是**连续前缀**（置顶形态）——不绑定具体系统名单数量。
+	sysCount := 0
+	seenUser := false
+	for i, row := range rows {
+		if row.System {
+			if seenUser {
+				t.Fatalf("系统名单必须连续置顶：第 %d 行 %q 出现在用户列表之后", i, row.Name)
+			}
+			sysCount++
+			continue
+		}
+		seenUser = true
+	}
+	if sysCount != wantSystem {
+		t.Fatalf("系统名单=%d, want %d（种子表）", sysCount, wantSystem)
+	}
+	if rows[0].Name != threatSystemListNameForOrderTest(t) {
+		t.Fatalf("系统组内应按更新时间序（最新在前），首行=%q", rows[0].Name)
+	}
+}
+
+// threatSystemListNameForOrderTest 取 id 最大的威胁名单名（置顶排序测试的组内
+// 判据名单——选 id 最大者使旧 id 序下它不在首行，判据可红）。
+func threatSystemListNameForOrderTest(t *testing.T) string {
+	t.Helper()
+	var name string
+	if err := db.DB.QueryRow(`SELECT name FROM security_ip_lists WHERE system=1 AND name<>? ORDER BY id DESC LIMIT 1`, services.AutobanPresetListName).Scan(&name); err != nil {
+		t.Fatalf("threat list missing: %v", err)
+	}
+	return name
+}
+
+// 导出文件名恒取**库内行 ID**。此前以 name 非空作条件
+// 却仍用路由段经 safeAtoiOrZero 折算——名称从不参与文件名（死分支），且非规范
+// 路由段 "<id>.0"（SQLite INTEGER 亲和命中该行）会导出成 ip-list-0.txt。
+func TestExportIPList_filenameUsesListRowID(t *testing.T) {
+	newBackupTestHandlers(t)
+	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('导出命名', '[{"value":"198.51.100.1","remark":""}]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
+	// 非规范路由段仍命中该行（亲和），文件名必须回到真实行 ID
+	path := "/security/ip-lists/" + strconv.FormatInt(id, 10) + ".0/export"
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, path, nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", resp.Code, resp.Body.String())
+	}
+	want := `attachment; filename="ip-list-` + strconv.FormatInt(id, 10) + `.txt"`
+	if got := resp.Header().Get("Content-Disposition"); got != want {
+		t.Fatalf("Content-Disposition=%q, want %q（文件名须取库内行 ID，名称不参与）", got, want)
 	}
 }

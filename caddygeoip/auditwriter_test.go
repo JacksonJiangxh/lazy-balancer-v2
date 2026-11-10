@@ -14,10 +14,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/experimental/plugins"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
+	"github.com/corazawaf/coraza/v3/types"
 )
 
 // plugintypesConfigFor 构造指向 path 的审计写插件配置（JSON 格式）。
@@ -194,41 +196,46 @@ func useTestAuditPipeline(t *testing.T) {
 	// 冲刷合并状态是进程级：上一个用例的冲刷时刻会让本用例的
 	// FlushAuditPipelines 落进窗口被快进，必须复位。
 	auditLastFlushNano.Store(0)
-	auditTimingMu.Lock()
-	resetAuditTimingRegistryLockedForTest()
-	auditTimingMu.Unlock()
+	resetAuditTimingRegistryForTest()
 	t.Cleanup(func() {
 		auditQueueSize, auditFlushThreshold, auditFlushInterval = origQueue, origThreshold, origInterval
 		auditTimingWaitLimit, auditTimingPollStep = origWait, origPoll
 		auditTimingEntryTTLNs.Store(origTTL)
-		auditTimingMu.Lock()
-		resetAuditTimingRegistryLockedForTest()
-		auditTimingMu.Unlock()
+		resetAuditTimingRegistryForTest()
 	})
 	closeTestAuditPipelines(t)
 }
 
-// resetAuditTimingRegistryLockedForTest 清空计时注册表全部状态（调用方持
-// auditTimingMu）——条目/建条 FIFO/游标/清扫计数一并复位，避免测试间串扰。
-func resetAuditTimingRegistryLockedForTest() {
-	auditTimingEntries = make(map[string]*auditTimingEntry)
-	auditTimingOrder = nil
-	auditTimingHead = 0
-	auditTimingCreateCount = 0
+// resetAuditTimingRegistryForTest 清空计时注册表全部状态（分片形态：逐片
+// 复位条目/FIFO/游标/保留区并清零原子准入计数）——避免测试间串扰。
+func resetAuditTimingRegistryForTest() {
+	for i := range auditTimingShards {
+		sh := auditTimingShards[i]
+		sh.mu.Lock()
+		sh.entries = make(map[string]*auditTimingEntry)
+		sh.order = nil
+		sh.head = 0
+		sh.retainedPre = map[string]auditRetainedPreEntry{}
+		sh.retainedPreOrder = nil
+		sh.retainedPreHead = 0
+		sh.mu.Unlock()
+	}
 	auditTimingPollCountForTest.Store(0)
 	auditTimingSweepVisitsForTest.Store(0)
-	auditRetainedPreEntries = map[string]auditRetainedPreEntry{}
-	auditRetainedPreOrder = nil
-	auditRetainedPreHead = 0
+	auditTimingLiveEntries.Store(0)
+	auditRetainedPreLive.Store(0)
+	auditTimingCreateCountTotal.Store(0)
 }
 
 // seedAuditTimingEntryForTest 以指定建条时刻直接种入条目（含 FIFO 项——
-// 与生产建条路径同形，保证清扫不变量成立）。
+// 与生产建条路径同形，保证清扫不变量成立；路由到 id 所属分片）。
 func seedAuditTimingEntryForTest(id string, created time.Time) {
-	auditTimingMu.Lock()
-	auditTimingEntries[id] = &auditTimingEntry{created: created}
-	auditTimingOrder = append(auditTimingOrder, auditTimingQueueEntry{id: id, created: created})
-	auditTimingMu.Unlock()
+	sh := auditTimingShardFor(id)
+	sh.mu.Lock()
+	sh.entries[id] = &auditTimingEntry{created: created}
+	sh.order = append(sh.order, auditTimingQueueEntry{id: id, created: created})
+	sh.mu.Unlock()
+	auditTimingLiveEntries.Add(1)
 }
 
 // waitAuditLine 轮询等待临时审计文件出现一行可解析 JSON（上限 2s）。
@@ -309,7 +316,7 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	// 生产时序：ProcessLogging（audit Write 先入队）先于计时写点。
 	tx.ProcessLogging()
 	// blocked_counter 同位写点：决策已出，纯评估耗时入注册表，随后终态标记。
-	auditTimingRecord(id, "end", 42)
+	auditTimingRecord(id, timingSegmentEnd, 42)
 	auditTimingClose(id)
 	// 栅栏放行：drain 此刻才执行 Format→查表，必见已终态条目（保序，零调度依赖）。
 	close(fence.release)
@@ -570,7 +577,7 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 	// 改原：tx.Close reset 变量集合（headers/body 归零、事务归还 sync.Pool），
 	// 随后计时终态，最后才放行 drain 侧格式化。
 	tx.Close()
-	auditTimingRecord(id, "end", 77)
+	auditTimingRecord(id, timingSegmentEnd, 77)
 	auditTimingClose(id)
 	close(fmtr.release)
 
@@ -980,7 +987,7 @@ func TestAuditWriter_closeKeepsProcessSingletonPipeline(t *testing.T) {
 	const id1 = "1111111111111111"
 	const id2 = "2222222222222222"
 	id1Tx := driveProbeTx(t, waf, id1)
-	auditTimingRecord(id1, "end", 42)
+	auditTimingRecord(id1, timingSegmentEnd, 42)
 	auditTimingClose(id1)
 	lines := waitAuditLines(t, logPath, 1)
 	if !strings.Contains(lines[0], id1Tx) {
@@ -1006,7 +1013,7 @@ func TestAuditWriter_closeKeepsProcessSingletonPipeline(t *testing.T) {
 	}
 
 	// 关闭后写入：仍由活 drain 消费并注入计时（注入在 drain 侧等待终态）。
-	auditTimingRecord(id2, "end", 7)
+	auditTimingRecord(id2, timingSegmentEnd, 7)
 	auditTimingClose(id2)
 	id2Tx := driveProbeTx(t, waf, id2)
 	if err := w.Write(nil); err != nil {
@@ -1206,6 +1213,33 @@ func TestInjectAuditTiming(t *testing.T) {
 	if out := injectAuditTiming(bad, auditTimingSnapshot{preUs: 1, preSet: true}); string(out) != string(bad) {
 		t.Fatalf("malformed JSON must be returned unchanged, got %s", out)
 	}
+
+	// 字节保真：插入必须是字节级拼接——HTML 敏感字符不得被转义成 \u003c
+	// （重编码会让行体最多放大 6×），顶层键序不得被重排。
+	rawBody := `{"transaction":{"request":{"body":"a<b>c&d"}},"messages":[{"m":"x"}]}`
+	out = injectAuditTiming([]byte(rawBody), auditTimingSnapshot{preUs: 7, preSet: true})
+	if strings.Contains(string(out), `\u003c`) || strings.Contains(string(out), `\u0026`) {
+		t.Fatalf("注入不得重编码/转义原行: %s", out)
+	}
+	if !strings.HasPrefix(string(out), `{"transaction":`) {
+		t.Fatalf("注入不得重排顶层键序: %s", out)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("注入后必须是合法 JSON: %s", out)
+	}
+	doc = nil
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("注入行解码: %v", err)
+	}
+	if string(doc["transaction"]) != `{"request":{"body":"a<b>c&d"}}` {
+		t.Fatalf("transaction 必须逐字节保留: %s", doc["transaction"])
+	}
+
+	// 行尾空白/换行：注入后输出为单行对象（行分隔由 appendLine 统一追加），
+	// 与重编码时代的输出形态一致，不产生双换行。
+	if out := injectAuditTiming([]byte("{\"k\":1}\n"), auditTimingSnapshot{endUs: 3, endSet: true}); strings.HasSuffix(string(out), "\n") {
+		t.Fatalf("注入后不得保留 formatter 行尾换行（避免双换行）: %q", out)
+	}
 }
 
 // 注册表钉：record→wait（未终态，超时返回部分快照）→close→wait 立即返回完整快照。
@@ -1226,14 +1260,14 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 		t.Fatalf("unknown entry must yield empty snapshot: %+v", snap)
 	}
 
-	auditTimingRecord(id, "pre", 11)
+	auditTimingRecord(id, timingSegmentPre, 11)
 	// 未终态：wait 走满超时并返回部分快照（pre 在场）
 	snap = auditTimingWait(id, 30*time.Millisecond)
 	if !snap.preSet || snap.preUs != 11 || snap.closed {
 		t.Fatalf("partial snapshot = %+v; want pre=11 unclosed", snap)
 	}
 
-	auditTimingRecord(id, "end", 22)
+	auditTimingRecord(id, timingSegmentEnd, 22)
 	auditTimingClose(id)
 	auditTimingPollCountForTest.Store(0)
 	snap = auditTimingWait(id, time.Second)
@@ -1248,7 +1282,7 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 	if snap := auditTimingWait("", time.Millisecond); snap.preSet || snap.endSet {
 		t.Fatal("empty id must short-circuit")
 	}
-	auditTimingRecord("", "pre", 1)
+	auditTimingRecord("", timingSegmentPre, 1)
 	auditTimingClose("")
 }
 
@@ -1259,13 +1293,11 @@ func TestAuditTimingRegistry_sweep(t *testing.T) {
 	seedAuditTimingEntryForTest(stale, time.Now().Add(-time.Hour))
 
 	for i := range 128 { // 跨过 sweep 周期（64）多批
-		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbb%04x", i), "pre", int64(i))
+		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbb%04x", i), timingSegmentPre, int64(i))
 	}
 
-	auditTimingMu.Lock()
-	_, staleExists := auditTimingEntries[stale]
-	count := len(auditTimingEntries)
-	auditTimingMu.Unlock()
+	staleExists := auditTimingEntryForTest(stale) != nil
+	count := auditTimingEntryCountForTest()
 	if staleExists {
 		t.Fatal("expired entry must be swept")
 	}
@@ -1292,10 +1324,8 @@ func TestAuditTimingRegistry_sweepClosesWaitedEntry(t *testing.T) {
 	if auditTimingPollCountForTest.Load() == 0 {
 		t.Fatal("wait did not observe the seeded unclosed entry")
 	}
-	auditTimingMu.Lock()
-	auditTimingSweepLocked(time.Now())
-	_, exists := auditTimingEntries[id]
-	auditTimingMu.Unlock()
+	auditTimingSweepExpired(time.Now())
+	exists := auditTimingEntryForTest(id) != nil
 	if exists {
 		t.Fatal("expired entry must still be removed from the registry")
 	}
@@ -1323,18 +1353,18 @@ func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
 	}
 	const fresh = 5000
 	for i := range fresh {
-		auditTimingRecord(fmt.Sprintf("%016x", 0x10000+i), "pre", 0)
+		auditTimingRecord(fmt.Sprintf("%016x", 0x10000+i), timingSegmentPre, 0)
 	}
 
-	auditTimingMu.Lock()
-	entries := len(auditTimingEntries)
-	auditTimingMu.Unlock()
+	entries := auditTimingEntryCountForTest()
 	if entries < fresh {
 		t.Fatalf("fresh entries must survive, got %d", entries)
 	}
-	// 期间触发约 fresh/64≈78 次清扫：检查量 ≈ 过期条目数 + 每次一条未过期队首。
-	// 旧实现每次全表扫描 ⇒ 约 Σn/64 ≈ 19 万次检查。
-	if visits := auditTimingSweepVisitsForTest.Load(); visits > expired+2*(fresh/64) {
+	// 期间触发约 fresh/64≈78 次摊销清扫：每次清扫逐片检查队首（16 片 = 每次至
+	// 多 16 次 O(1) 队首检查，分片形态的常数因子），过期条目按队首弹出一次。
+	// 检查量 ≈ 过期条目数 + 清扫次数×片数——仍随「过期条目数」而非注册表规模
+	// 增长（旧单锁全表扫描形态 = Σn/64 ≈ 19 万次检查，远超本阈值）。
+	if visits := auditTimingSweepVisitsForTest.Load(); visits > expired+2*(fresh/64)*auditTimingShardCount {
 		t.Fatalf("sweep visited %d queue entries; want O(expired) not O(registry)", visits)
 	}
 }
@@ -1345,15 +1375,13 @@ func TestAuditTimingClose_requiresExistingEntry(t *testing.T) {
 	useTestAuditPipeline(t)
 	auditTimingClose("dddddddddddddddd")
 
-	auditTimingMu.Lock()
-	_, created := auditTimingEntries["dddddddddddddddd"]
-	count := len(auditTimingEntries)
-	auditTimingMu.Unlock()
+	created := auditTimingEntryForTest("dddddddddddddddd") != nil
+	count := auditTimingEntryCountForTest()
 	if created || count != 0 {
 		t.Fatalf("close must not create entries, got %d entries", count)
 	}
 
-	auditTimingRecord("eeeeeeeeeeeeeeee", "pre", 5)
+	auditTimingRecord("eeeeeeeeeeeeeeee", timingSegmentPre, 5)
 	auditTimingClose("eeeeeeeeeeeeeeee")
 	if snap := auditTimingLookupForTest(t, "eeeeeeeeeeeeeeee"); !snap.closed {
 		t.Fatal("close must mark an existing entry as terminal")
@@ -1523,7 +1551,7 @@ func TestAuditTimingRegistry_periodicSweep(t *testing.T) {
 
 	// 种入已过期条目（不经建条路径——建条驱动的清扫不触发）。
 	seedAuditTimingEntryForTest("00000000000000aa", time.Now().Add(-2*time.Duration(auditTimingEntryTTLNs.Load())))
-	startAuditTimingSweeperForTest()
+	startAuditTimingSweeper()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1595,19 +1623,16 @@ func TestAuditTimingRegistry_retainsPreAcrossEntryTTL(t *testing.T) {
 	t.Cleanup(func() { auditPreRetentionTTLNs.Store(origRetention) })
 
 	const id = "eeeeeeeeeeeeeeee"
-	auditTimingRecord(id, "pre", 1234)
+	auditTimingRecord(id, timingSegmentPre, 1234)
 	// 越过条目 TTL（useTestAuditPipeline 置 50ms）后清扫：模拟长请求仍在途中。
 	time.Sleep(80 * time.Millisecond)
-	auditTimingMu.Lock()
-	auditTimingSweepLocked(time.Now())
-	_, stillThere := auditTimingEntries[id]
-	auditTimingMu.Unlock()
-	if stillThere {
+	auditTimingSweepExpired(time.Now())
+	if auditTimingEntryForTest(id) != nil {
 		t.Fatal("expired timing entry must be swept")
 	}
 
 	// 终态分段迟到（重建条目）：pre 必须从预检保留区回填。
-	auditTimingRecord(id, "end", 999)
+	auditTimingRecord(id, timingSegmentEnd, 999)
 	snap := auditTimingWait(id, 20*time.Millisecond)
 	if !snap.preSet || snap.preUs != 1234 {
 		t.Fatalf("pre segment lost across entry TTL: %+v（长请求必须保留预检段）", snap)
@@ -1625,13 +1650,11 @@ func TestAuditTimingRegistry_preRetentionExpires(t *testing.T) {
 	t.Cleanup(func() { auditPreRetentionTTLNs.Store(origRetention) })
 
 	const id = "ffffffffffffffff"
-	auditTimingRecord(id, "pre", 7)
+	auditTimingRecord(id, timingSegmentPre, 7)
 	time.Sleep(80 * time.Millisecond)
-	auditTimingMu.Lock()
-	auditTimingSweepLocked(time.Now())                  // 条目过期 → pre 转保留区
-	auditTimingSweepLocked(time.Now().Add(time.Minute)) // 保留期同样过期 → 回收
-	retained := len(auditRetainedPreEntries)
-	auditTimingMu.Unlock()
+	auditTimingSweepExpired(time.Now())                  // 条目过期 → pre 转保留区
+	auditTimingSweepExpired(time.Now().Add(time.Minute)) // 保留期同样过期 → 回收
+	retained := auditRetainedPreLiveForTest()
 	if retained != 0 {
 		t.Fatalf("retained pre entries=%d, want 0（保留期到期必须回收）", retained)
 	}
@@ -1670,19 +1693,27 @@ func TestJSONStringEscapedLen_matchesEncodingJSON(t *testing.T) {
 }
 
 // 快照 headers 有界口径（与 part C/E 同 64KiB 上限）：伪造的客户端丢弃计数
-// 键在首个受信触点剥离；超限按序列化体积降序丢条目并以合成键记数。
+// 键在首个受信触点剥离；超限按序列化体积降序丢条目并以合成键记数。返回的
+// 精确字节数必须与实际序列化体积一致（差 ≤1 字节的上界），入队预算据此执法。
 func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 	t.Run("上限内深拷贝且剥离伪造标记", func(t *testing.T) {
 		src := map[string][]string{
 			"Host":                {"a.example.com"},
 			"_lb_dropped_headers": {"999"},
 		}
-		got := snapshotAuditHeaders(src)
+		got, exact := snapshotAuditHeaders(src)
 		if _, ok := got[auditSnapshotDroppedHeadersKey]; ok {
 			t.Fatalf("客户端伪造的丢弃计数键必须剥离: %v", got)
 		}
 		if len(got) != 1 || got["Host"][0] != "a.example.com" {
 			t.Fatalf("真实头必须保留: %v", got)
+		}
+		raw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exact < int64(len(raw)) || exact > int64(len(raw))+1 {
+			t.Fatalf("精确字节=%d, want %d..%d（须与序列化体积一致）", exact, len(raw), len(raw)+1)
 		}
 		src["Host"][0] = "mutated"
 		if got["Host"][0] != "a.example.com" {
@@ -1696,13 +1727,16 @@ func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 			"User-Agent": {"probe"},
 			"X-Big":      {strings.Repeat("B", auditHeadersMaxBytes)},
 		}
-		got := snapshotAuditHeaders(src)
+		got, exact := snapshotAuditHeaders(src)
 		raw, err := json.Marshal(got)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(raw) > auditHeadersMaxBytes {
 			t.Fatalf("快照 headers 序列化 %d 字节，超过 %d 上限", len(raw), auditHeadersMaxBytes)
+		}
+		if exact < int64(len(raw)) || exact > int64(len(raw))+1 {
+			t.Fatalf("截断后精确字节=%d, want %d..%d（上界不得超过 1 字节）", exact, len(raw), len(raw)+1)
 		}
 		if _, ok := got["X-Big"]; ok {
 			t.Fatal("最大条目必须首先丢弃")
@@ -1714,6 +1748,232 @@ func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 			t.Fatalf("丢弃计数键=%v, want [\"1\"]", got[auditSnapshotDroppedHeadersKey])
 		}
 	})
+}
+
+// 头部密集形态的字节估算必须用快照侧已算出的精确序列化字节：5000 条三字符
+// header（请求+响应各一份）实际序列化 ~131KiB，旧实现按每条 (键 48 + 值 16)
+// 固定开销重估成 ~700KiB（5.7×），在按字节预算执法/单条上限判定下会把真实
+// ~131KiB 的头部密集高价值行误判成超限。钉两点：估算不低于实际、不夸大实际
+// （旧固定开销口径的数倍高估不得回归），且入队不因估算失真丢行。
+func TestEstimateAuditSnapshotBytes_headerDenseExactBytesUnderItemCap(t *testing.T) {
+	// 5000 个互不相同的三字符键（aaa..，26 进制）。
+	headers := make(map[string][]string, 5000)
+	for i := range 5000 {
+		n := i
+		key := []byte{'a', 'a', 'a'}
+		for pos := 2; pos >= 0; pos-- {
+			key[pos] = byte('a' + n%26)
+			n /= 26
+		}
+		headers[string(key)] = []string{string(key)}
+	}
+	reqHeaders, reqExact := snapshotAuditHeaders(headers)
+	respHeaders, respExact := snapshotAuditHeaders(headers)
+	if reqExact <= 0 || respExact <= 0 {
+		t.Fatalf("精确字节缺失: req=%d resp=%d", reqExact, respExact)
+	}
+	// 5000 条 14 字节条目 = 70KB > 64KiB 上限 → 两侧各被裁剪到上限内。
+	if reqExact > auditHeadersMaxBytes || respExact > auditHeadersMaxBytes {
+		t.Fatalf("快照 header 字节 req=%d resp=%d 超过 %d 上限", reqExact, respExact, auditHeadersMaxBytes)
+	}
+	snap := &auditSnapshot{}
+	snap.Transaction_.Request_ = &auditSnapshotRequest{Headers_: reqHeaders, HeadersBytes_: reqExact}
+	snap.Transaction_.Response_ = &auditSnapshotResponse{Headers_: respHeaders, HeadersBytes_: respExact}
+
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := estimateAuditSnapshotBytes(snap)
+	if got < int64(len(serialized)) {
+		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", got, len(serialized))
+	}
+	// 旧口径（48/16 固定开销）对照：同一快照会被估成 ~5.7×——精确估算必须
+	// 显著低于该高估（比值下界 3×），否则「按条固定开销」回归会再次把真实
+	// ~131KiB 估算成数百 KiB 挤压队列预算与单条上限。
+	var legacy int64 = auditSnapshotFixedBytes
+	for _, hs := range []map[string][]string{reqHeaders, respHeaders} {
+		for k, vs := range hs {
+			legacy += int64(len(k)) + 48
+			for _, v := range vs {
+				legacy += int64(len(v)) + 16
+			}
+		}
+	}
+	if legacy < 3*got {
+		t.Fatalf("夹具无效：旧固定开销口径估算 %d 未显著高于精确估算 %d（应 ≥3×）", legacy, got)
+	}
+	if got > auditItemMaxBytes {
+		t.Fatalf("精确估算 %d > 单条上限 %d（整行仍会被丢弃）", got, auditItemMaxBytes)
+	}
+
+	// 入队路径：不因估算失真丢弃该行。
+	p := &auditPipeline{
+		target: filepath.Join(t.TempDir(), "audit.log"),
+		queue:  make(chan lbAuditItem, 2),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"header-dense"}`)}})
+	if dropped := p.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped=%d, want 0（头部密集行不得因估算失真被整行丢弃）", dropped)
+	}
+	if length := len(p.queue); length != 1 {
+		t.Fatalf("queue length=%d, want 1", length)
+	}
+}
+
+// 转义密集体的最坏形态：64KiB 全 `&`（表单体天然密集）在 JSON 转义口径下
+// 展开为 384KiB/段。单条上限必须按最坏转义比推导——旧「四段原始字节+余量」
+// 的 320KiB 上限让请求/响应体仅体一项就超限，整条安全事件被丢弃（攻击者
+// 可用体字符分布让自身事件不留库）。钉：估算 ≥ 实际序列化、≤ 单条上限，
+// 且入队零丢弃。
+func TestEstimateAuditSnapshotBytes_escapeDenseBodiesUnderItemCap(t *testing.T) {
+	dense := strings.Repeat("&", auditBodyMaxBytes)
+	if got, truncated := snapshotAuditBody(dense); truncated || len(got) != auditBodyMaxBytes {
+		t.Fatalf("夹具无效：64KiB 原始体不应被体截断（len=%d truncated=%v）", len(got), truncated)
+	}
+	snap := &auditSnapshot{}
+	snap.Transaction_.Request_ = &auditSnapshotRequest{Body_: dense}
+	snap.Transaction_.Response_ = &auditSnapshotResponse{Body_: dense}
+
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := estimateAuditSnapshotBytes(snap)
+	if got < int64(len(serialized)) {
+		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", got, len(serialized))
+	}
+	// 旧上限（四段原始字节 + 余量 = 320KiB）必被越限——夹具有效性反证。
+	const legacyItemCap int64 = 320 * 1024
+	if got <= legacyItemCap {
+		t.Fatalf("夹具无效：转义密集体估算 %d 本应越过旧上限 %d", got, legacyItemCap)
+	}
+	if got > auditItemMaxBytes {
+		t.Fatalf("转义密集体估算 %d > 单条上限 %d（整行仍会被丢弃）", got, auditItemMaxBytes)
+	}
+
+	p := &auditPipeline{
+		target: filepath.Join(t.TempDir(), "audit.log"),
+		queue:  make(chan lbAuditItem, 2),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"escape-dense"}`)}})
+	if dropped := p.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped=%d, want 0（64KiB 全 `&` 体不得整行丢弃）", dropped)
+	}
+	if length := len(p.queue); length != 1 {
+		t.Fatalf("queue length=%d, want 1", length)
+	}
+}
+
+// headerProbe* 是只携带 headers 的最小 AuditLog 实现（快照精确字节接线单测）：
+// 嵌入 nil 接口补足不可命名的 Args() 等方法，覆盖快照实际读取的方法。
+type headerProbeAuditLog struct{ tx headerProbeTx }
+
+func (l headerProbeAuditLog) Parts() types.AuditLogParts { return nil }
+func (l headerProbeAuditLog) Transaction() plugintypes.AuditLogTransaction {
+	return l.tx
+}
+func (l headerProbeAuditLog) Messages() []plugintypes.AuditLogMessage { return nil }
+
+type headerProbeTx struct {
+	plugintypes.AuditLogTransaction
+	req  headerProbeReq
+	resp headerProbeResp
+}
+
+func (t headerProbeTx) Timestamp() string       { return "" }
+func (t headerProbeTx) UnixTimestamp() int64    { return 0 }
+func (t headerProbeTx) ID() string              { return "tx-header-probe" }
+func (t headerProbeTx) ClientIP() string        { return "" }
+func (t headerProbeTx) ClientPort() int         { return 0 }
+func (t headerProbeTx) HostIP() string          { return "" }
+func (t headerProbeTx) HostPort() int           { return 0 }
+func (t headerProbeTx) ServerID() string        { return "" }
+func (t headerProbeTx) HighestSeverity() string { return "" }
+func (t headerProbeTx) IsInterrupted() bool     { return false }
+func (t headerProbeTx) Request() plugintypes.AuditLogTransactionRequest {
+	return t.req
+}
+func (t headerProbeTx) Response() plugintypes.AuditLogTransactionResponse {
+	return t.resp
+}
+func (t headerProbeTx) Producer() plugintypes.AuditLogTransactionProducer { return nil }
+
+type headerProbeReq struct {
+	plugintypes.AuditLogTransactionRequest
+	headers map[string][]string
+}
+
+func (r headerProbeReq) Method() string               { return "GET" }
+func (r headerProbeReq) Protocol() string             { return "HTTP/1.1" }
+func (r headerProbeReq) URI() string                  { return "/probe" }
+func (r headerProbeReq) HTTPVersion() string          { return "HTTP/1.1" }
+func (r headerProbeReq) Headers() map[string][]string { return r.headers }
+func (r headerProbeReq) Body() string                 { return "" }
+func (r headerProbeReq) Files() []plugintypes.AuditLogTransactionRequestFiles {
+	return nil
+}
+func (r headerProbeReq) Length() int32 { return 0 }
+
+type headerProbeResp struct {
+	plugintypes.AuditLogTransactionResponse
+	headers map[string][]string
+}
+
+func (r headerProbeResp) Protocol() string             { return "HTTP/1.1" }
+func (r headerProbeResp) Status() int                  { return 200 }
+func (r headerProbeResp) Headers() map[string][]string { return r.headers }
+func (r headerProbeResp) Body() string                 { return "" }
+
+// 快照构建必须把精确 header 字节写入 HeadersBytes_（入队估算的唯一来源）：
+// 请求/响应两侧都要。
+func TestSnapshotTransaction_recordsExactHeaderBytes(t *testing.T) {
+	reqHeaders := map[string][]string{"Host": {"a.example.com"}, "X-Probe": {"1"}}
+	respHeaders := map[string][]string{"Content-Type": {"text/html"}}
+	al := headerProbeAuditLog{tx: headerProbeTx{
+		req:  headerProbeReq{headers: reqHeaders},
+		resp: headerProbeResp{headers: respHeaders},
+	}}
+	snap := snapshotAuditLog(al)
+	check := func(name string, hs map[string][]string, exact int64) {
+		t.Helper()
+		if exact == 0 {
+			t.Fatalf("%s HeadersBytes_ 未写入", name)
+		}
+		raw, err := json.Marshal(hs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exact < int64(len(raw)) || exact > int64(len(raw))+1 {
+			t.Fatalf("%s 精确字节=%d, want %d..%d", name, exact, len(raw), len(raw)+1)
+		}
+	}
+	if req := snap.Transaction_.Request_; req == nil {
+		t.Fatal("请求快照缺失")
+	} else {
+		check("请求侧", req.Headers_, req.HeadersBytes_)
+		// 字节记账字段不得进入 JSON（json:"-"，审计行信封零变化）。
+		full, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(full), "HeadersBytes") {
+			t.Fatalf("HeadersBytes_ 不得进入 JSON: %s", full)
+		}
+	}
+	if resp := snap.Transaction_.Response_; resp == nil {
+		t.Fatal("响应快照缺失")
+	} else {
+		check("响应侧", resp.Headers_, resp.HeadersBytes_)
+	}
 }
 
 // 队列字节预算：条数上限不界字节——大快照洪峰下按字节收敛驻留。
@@ -1760,9 +2020,9 @@ func TestAuditPipeline_enqueueDropsWhenByteBudgetExceeded(t *testing.T) {
 		t.Fatalf("queue length=%d, want 1（被丢弃条不占队）", got)
 	}
 
-	// 超单条上限的快照即使空队也直接丢弃。
+	// 超单条上限的快照即使空队也直接丢弃（2MiB 体 > 1MiB 单条上限）。
 	huge := &auditSnapshot{}
-	huge.Transaction_.Request_ = &auditSnapshotRequest{Body_: strings.Repeat("y", 400*1024)}
+	huge.Transaction_.Request_ = &auditSnapshotRequest{Body_: strings.Repeat("y", 2<<20)}
 	p.enqueue(lbAuditItem{snap: huge, formatter: cannedFormatter{body: []byte(`{"row":"HHH999"}`)}})
 	if got := p.dropped.Load(); got != 2 {
 		t.Fatalf("dropped=%d, want 2（单条超限丢弃）", got)
@@ -1863,14 +2123,14 @@ func TestAuditFlushCoalescing_claimWindow(t *testing.T) {
 	})
 	auditLastFlushNano.Store(0)
 
-	if !claimAuditFlush(time.Now()) {
+	if !claimAuditFlush() {
 		t.Fatal("首次领取必须成功")
 	}
-	if claimAuditFlush(time.Now()) {
+	if claimAuditFlush() {
 		t.Fatal("窗口内重复领取必须快进")
 	}
 	time.Sleep(30 * time.Millisecond)
-	if !claimAuditFlush(time.Now()) {
+	if !claimAuditFlush() {
 		t.Fatal("窗口过后必须可再次领取")
 	}
 }
@@ -1924,5 +2184,993 @@ func TestSecurityBlockedCounter_cleanupCoalescedAcrossInstances(t *testing.T) {
 	case <-firstDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("首个 Cleanup 未在排空后返回")
+	}
+}
+
+// 合并窗口内被快进（不排空等待）的 Cleanup 仍必须把 bufio 残留刷盘：reload
+// 领到冲刷资格后窗口内进程停止时，停机那次 Cleanup 是唯一收尾机会——省掉的
+// 只能是等待，不能是刷盘，否则最后一批审计行随进程退出静默丢失。
+func TestFlushAuditPipelines_coalescedStillFlushes(t *testing.T) {
+	oldWindow := auditFlushCoalesceWindow
+	auditFlushCoalesceWindow = time.Minute
+	t.Cleanup(func() {
+		auditFlushCoalesceWindow = oldWindow
+		auditLastFlushNano.Store(0)
+	})
+	auditLastFlushNano.Store(0)
+
+	target := filepath.Join(t.TempDir(), "audit.log")
+	p := &auditPipeline{target: target, mode: 0o644}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatalf("openFile: %v", err)
+	}
+	auditPipelinesMu.Lock()
+	auditPipelines[target] = p
+	auditPipelinesMu.Unlock()
+	t.Cleanup(func() {
+		auditPipelinesMu.Lock()
+		delete(auditPipelines, target)
+		auditPipelinesMu.Unlock()
+		p.closeFile()
+	})
+
+	// Given 一次 reload 已领到冲刷资格，随后有行落在 bufio 里（500ms 周期
+	// 刷盘尚未到来）
+	if !claimAuditFlush() {
+		t.Fatal("首个冲刷资格必须领取成功（前置条件）")
+	}
+	p.ioMu.Lock()
+	if _, err := p.bw.WriteString("{\"tail\":1}\n"); err != nil {
+		p.ioMu.Unlock()
+		t.Fatalf("write bufio: %v", err)
+	}
+	p.ioMu.Unlock()
+
+	// When 窗口内的停机 Cleanup
+	start := time.Now()
+	FlushAuditPipelines()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("窗口内 Cleanup 等待 %v；快进分支不得做排空等待", elapsed)
+	}
+
+	// Then 已刷盘（旧实现直接 return，行随进程退出丢弃）
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read audit file: %v", err)
+	}
+	if !strings.Contains(string(data), `{"tail":1}`) {
+		t.Fatalf("审计文件=%q；窗口内快进的 Cleanup 必须刷盘", data)
+	}
+}
+
+// 合并窗口内被快进的 Cleanup 仍须小额有界排空：旧实现只刷 bufio，队列/在途
+// 行（≤2048）随紧随其后的进程停止静默丢失。本用例钉「窗口内 Cleanup 等到
+// 在途行落盘再返回」。
+func TestFlushAuditPipelines_coalescedDrainsInFlightRows(t *testing.T) {
+	oldWindow := auditFlushCoalesceWindow
+	auditFlushCoalesceWindow = time.Minute
+	t.Cleanup(func() {
+		auditFlushCoalesceWindow = oldWindow
+		auditLastFlushNano.Store(0)
+	})
+	auditLastFlushNano.Store(0)
+	useTestAuditPipeline(t)
+
+	target := filepath.Join(t.TempDir(), "audit.log")
+	w := &lbAuditWriter{}
+	if err := w.Init(plugintypesConfigFor(t, target)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	fmtr := &gatedFormatter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		body:    []byte(`{"coalesced-drain":"YES"}`),
+	}
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(fmtr.release) }) }
+	t.Cleanup(releaseGate)
+	w.pipeline.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: fmtr})
+	select {
+	case <-fmtr.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain 未进入在途处理")
+	}
+
+	// Given 上一次 reload 已领到冲刷资格（本次 Cleanup 落在合并窗口内）
+	if !claimAuditFlush() {
+		t.Fatal("首个冲刷资格必须领取成功（前置条件）")
+	}
+	// 在途行 50ms 后处理完：窗口内 Cleanup 的有界排空必须等到它
+	time.AfterFunc(50*time.Millisecond, releaseGate)
+
+	start := time.Now()
+	FlushAuditPipelines()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("窗口内 Cleanup 等待 %v；有界排空必须 ≤%v", elapsed, auditFlushCoalescedDrainWait)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read audit file: %v", err)
+	}
+	if !strings.Contains(string(data), `{"coalesced-drain":"YES"}`) {
+		t.Fatalf("审计文件=%q；窗口内 Cleanup 必须在有界窗口内排空在途行并刷盘", data)
+	}
+}
+
+// estimateTestMessage 与 coraza 内置 Message 同形（导出字段进 JSON），用于
+// 钉「估算 >= 实际序列化字节」。
+type estimateTestMessage struct {
+	Actionset_    string                   `json:"actionset"`
+	Message_      string                   `json:"message"`
+	ErrorMessage_ string                   `json:"error_message"`
+	Data_         *estimateTestMessageData `json:"data"`
+}
+
+func (m estimateTestMessage) Actionset() string    { return m.Actionset_ }
+func (m estimateTestMessage) Message() string      { return m.Message_ }
+func (m estimateTestMessage) ErrorMessage() string { return m.ErrorMessage_ }
+func (m estimateTestMessage) Data() plugintypes.AuditLogMessageData {
+	return m.Data_
+}
+
+type estimateTestMessageData struct {
+	File_     string   `json:"file"`
+	Line_     int      `json:"line"`
+	ID_       int      `json:"id"`
+	Rev_      string   `json:"rev"`
+	Msg_      string   `json:"msg"`
+	Data_     string   `json:"data"`
+	Severity_ int      `json:"severity"`
+	Ver_      string   `json:"ver"`
+	Maturity_ int      `json:"maturity"`
+	Accuracy_ int      `json:"accuracy"`
+	Tags_     []string `json:"tags"`
+	Raw_      string   `json:"raw"`
+}
+
+func (d *estimateTestMessageData) File() string   { return d.File_ }
+func (d *estimateTestMessageData) Line() int      { return d.Line_ }
+func (d *estimateTestMessageData) ID() int        { return d.ID_ }
+func (d *estimateTestMessageData) Rev() string    { return d.Rev_ }
+func (d *estimateTestMessageData) Msg() string    { return d.Msg_ }
+func (d *estimateTestMessageData) Data() string   { return d.Data_ }
+func (d *estimateTestMessageData) Ver() string    { return d.Ver_ }
+func (d *estimateTestMessageData) Maturity() int  { return d.Maturity_ }
+func (d *estimateTestMessageData) Accuracy() int  { return d.Accuracy_ }
+func (d *estimateTestMessageData) Tags() []string { return d.Tags_ }
+func (d *estimateTestMessageData) Raw() string    { return d.Raw_ }
+func (d *estimateTestMessageData) Severity() types.RuleSeverity {
+	return types.RuleSeverity(d.Severity_)
+}
+
+// 估算必须不低于实际序列化字节：enqueue 按估算执法字节预算，低估即意味着
+// 实际驻留可突破 auditQueueByteBudget 数倍（header 洪峰是主要放大器）。
+func TestEstimateAuditSnapshotBytes_isUpperBound(t *testing.T) {
+	mkMsg := func(pad int) estimateTestMessage {
+		return estimateTestMessage{
+			Actionset_: "block",
+			Message_:   "SQL Injection Attack",
+			Data_: &estimateTestMessageData{
+				File_: "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", Line_: 61,
+				ID_: 942100, Rev_: "4", Msg_: "SQLi", Data_: strings.Repeat("x", pad),
+				Severity_: 2, Ver_: "1.0", Maturity_: 4, Accuracy_: 8,
+				Tags_: []string{"application-multi", "language-multi", "attack-sqli"},
+				Raw_:  "SecRule REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/ \"@detectSQLi\"",
+			},
+		}
+	}
+	envelope := func() auditSnapshot {
+		return auditSnapshot{
+			Transaction_: auditSnapshotTransaction{
+				Timestamp_: "23/Oct/2026:10:00:00 +0800", UnixTimestamp_: 1790000000,
+				ID_: "abcdefghijklmnop", ClientIP_: "203.0.113.7", ClientPort_: 51234,
+				HostIP_: "10.0.0.2", HostPort_: 443, ServerID_: "srv-1",
+				Request_: &auditSnapshotRequest{
+					Method_: "GET", Protocol_: "HTTP/1.1", URI_: "/admin",
+					HTTPVersion_: "HTTP/1.1", Length_: 0,
+					Headers_: map[string][]string{"host": {"example.com"}},
+				},
+				Response_: &auditSnapshotResponse{
+					Protocol_: "HTTP/1.1", Status_: 403,
+					Headers_: map[string][]string{"content-type": {"text/html"}},
+				},
+				Producer_: &auditSnapshotProducer{
+					Connector_: "caddy", Version_: "v3.8.1", Server_: "coraza",
+					RuleEngine_: "On", Stopwatch_: "total=1ms",
+					Rulesets_: []string{"crs"},
+				},
+				HighestSeverity_: "CRITICAL", IsInterrupted_: true,
+			},
+		}
+	}
+
+	headerHeavy := envelope()
+	for i := 0; i < 1000; i++ {
+		headerHeavy.Transaction_.Request_.Headers_[fmt.Sprintf("h%d", i)] = []string{"v"}
+	}
+	filesCase := envelope()
+	for i := 0; i < 200; i++ {
+		filesCase.Transaction_.Request_.Files_ = append(filesCase.Transaction_.Request_.Files_,
+			auditSnapshotFile{Name_: "upload.bin", Size_: 1024, Mime_: "application/octet-stream"})
+	}
+	messagesCase := envelope()
+	for i := 0; i < 50; i++ {
+		messagesCase.Messages_ = append(messagesCase.Messages_, mkMsg(64))
+	}
+	// HTML 安全字符在 JSON 里按 \u00XX 六字节转义：URI/body 用原始 len 估算
+	// 会低估至多 6×（攻击者构造 &&&… 即可让单条实际驻留突破预算）。
+	escapeHeavy := envelope()
+	escapeHeavy.Transaction_.Request_.URI_ = "/" + strings.Repeat("&", 4000)
+	escapeHeavy.Transaction_.Request_.Body_ = strings.Repeat("<>", 2000)
+	escapeHeavy.Transaction_.Response_.Body_ = strings.Repeat("&", 4000)
+	escapeHeavy.Messages_ = append(escapeHeavy.Messages_, mkMsg(0))
+
+	cases := []struct {
+		name string
+		snap *auditSnapshot
+	}{
+		{"header 密集", &headerHeavy},
+		{"上传文件", &filesCase},
+		{"多 messages", &messagesCase},
+		{"HTML 转义密集", &escapeHeavy},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			serialized, err := json.Marshal(tc.snap)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got := estimateAuditSnapshotBytes(tc.snap)
+			if got < int64(len(serialized)) {
+				t.Fatalf("估算 %d < 序列化 %d：预算按估算执法，低估即实际驻留可突破上限", got, len(serialized))
+			}
+		})
+	}
+}
+
+// messageOnlyAuditLog 只承载 messages 的最小 AuditLog 实现（截断逻辑单测）。
+// tx 非 nil 时同时携带事务侧内容——messages 动态预算需要 fixed 段参与计算。
+type messageOnlyAuditLog struct {
+	tx   plugintypes.AuditLogTransaction
+	msgs []plugintypes.AuditLogMessage
+}
+
+func (l messageOnlyAuditLog) Parts() types.AuditLogParts { return nil }
+func (l messageOnlyAuditLog) Transaction() plugintypes.AuditLogTransaction {
+	return l.tx
+}
+func (l messageOnlyAuditLog) Messages() []plugintypes.AuditLogMessage { return l.msgs }
+
+// messages 写侧上限：未截断的 messages 集合让单条快照越过 auditItemMaxBytes 被
+// **整行丢弃**（命中规则多的高价值行反而丢失）。动态预算截断后整行保留，并在
+// messages_dropped 显性披露丢弃条数。
+func TestSnapshotAuditLog_truncatesMessagesUnderItemCap(t *testing.T) {
+	// 每条 6KB：200 条未截断共 ~1.2MB，必然越过 1MiB 单条上限（钉子有效性
+	// 反证的分母；截断后 messages 受动态预算约束，小固定段时为 clamp 上界）。
+	raw := make([]plugintypes.AuditLogMessage, 0, 200)
+	for range 200 {
+		raw = append(raw, estimateTestMessage{Message_: strings.Repeat("m", 6000)})
+	}
+	snap := snapshotAuditLog(messageOnlyAuditLog{msgs: raw})
+	maxBytes, maxEntries := auditMessagesBudget(estimateAuditSnapshotFixedBytes(snap))
+	if got := len(snap.Messages_); got > maxEntries {
+		t.Fatalf("messages 保留 %d 条 > 动态条目预算 %d", got, maxEntries)
+	}
+	if snap.MessagesDropped_ != len(raw)-len(snap.Messages_) || snap.MessagesDropped_ == 0 {
+		t.Fatalf("messages_dropped=%d, want %d（丢弃条数须显性披露）",
+			snap.MessagesDropped_, len(raw)-len(snap.Messages_))
+	}
+	var used int64
+	for _, m := range snap.Messages_ {
+		used += estimateAuditMessageBytes(m)
+	}
+	if used > maxBytes {
+		t.Fatalf("messages 估算 %d 字节 > 动态预算 %d", used, maxBytes)
+	}
+
+	// 四段全满（请求/响应体与头各 64KiB）且体取转义最坏比（全 `&`）+ 同一批
+	// messages：动态预算随固定段收缩，整行必须落在单条上限内；同形但未截断的
+	// messages 集合必然超限（钉子有效性反证）。
+	dense := strings.Repeat("&", auditBodyMaxBytes)
+	denseTx := auxProbeTx{
+		req:  auxProbeReq{body: dense, headers: map[string][]string{"h": {dense}}},
+		resp: auxProbeResp{body: dense, headers: map[string][]string{"h": {dense}}},
+	}
+	denseSnap := snapshotAuditLog(messageOnlyAuditLog{tx: denseTx, msgs: raw})
+	if size := estimateAuditSnapshotBytes(denseSnap); size > auditItemMaxBytes {
+		t.Fatalf("截断后 size=%d > 单条上限 %d（整行仍会被丢弃）", size, auditItemMaxBytes)
+	}
+	if denseSnap.MessagesDropped_ == 0 {
+		t.Fatal("大固定段形态必须截断 messages（动态预算收缩失效）")
+	}
+	untruncated := *denseSnap
+	untruncated.Messages_ = raw
+	untruncated.MessagesDropped_ = 0
+	if estimateAuditSnapshotBytes(&untruncated) <= auditItemMaxBytes {
+		t.Fatal("夹具无效：未截断 messages 形态本应超单条上限")
+	}
+
+	// 序列化后 messages_dropped 可见、messages 条数受限。
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(serialized), `"messages_dropped":`) {
+		t.Fatalf("截断标记缺失: %s", serialized[:min(len(serialized), 200)])
+	}
+}
+
+// messages 截断方向必须是「掐中间、保两头」：CRS 的 949xxx/959xxx 评估汇总
+// 消息位于消息序列末尾，异常分只从它的 msg 文本读 "Total Score"——只保开头
+// 会把命中规则多的请求的分数截成 0（而这类请求恰是审计价值最高的）。
+func TestSnapshotAuditLog_keepsThreatEvaluationMessagesWhenTruncated(t *testing.T) {
+	mk := func(id int, msg string) plugintypes.AuditLogMessage {
+		return estimateTestMessage{Message_: msg, Data_: &estimateTestMessageData{ID_: id, Msg_: msg}}
+	}
+	raw := make([]plugintypes.AuditLogMessage, 0, 400)
+	for i := range 400 {
+		raw = append(raw, mk(942000+i, "attack "+strings.Repeat("m", 100)))
+	}
+	raw = append(raw,
+		mk(949110, "Inbound Anomaly Score Exceeded (Total Score: 42)"),
+		mk(959100, "Outbound Anomaly Score Exceeded (Total Score: 3)"),
+	)
+	snap := snapshotAuditLog(messageOnlyAuditLog{msgs: raw})
+	if snap.MessagesDropped_ != len(raw)-len(snap.Messages_) || snap.MessagesDropped_ == 0 {
+		t.Fatalf("messages_dropped=%d, want %d（中间段丢弃条数须显性披露）",
+			snap.MessagesDropped_, len(raw)-len(snap.Messages_))
+	}
+	maxBytes, maxEntries := auditMessagesBudget(estimateAuditSnapshotFixedBytes(snap))
+	if got := len(snap.Messages_); got > maxEntries {
+		t.Fatalf("messages 保留 %d 条 > 动态条目预算 %d", got, maxEntries)
+	}
+	var used int64
+	for _, m := range snap.Messages_ {
+		used += estimateAuditMessageBytes(m)
+	}
+	if used > maxBytes {
+		t.Fatalf("messages 估算 %d 字节 > 动态预算 %d", used, maxBytes)
+	}
+	// 头段保留首条（攻击特征命中的起点），尾段保留评估汇总。
+	if first := snap.Messages_[0]; first.(estimateTestMessage).Data_.ID_ != 942000 {
+		t.Fatalf("头部首条被丢弃：id=%d（截断退化成尾部截断）",
+			first.(estimateTestMessage).Data_.ID_)
+	}
+	kept := make(map[int]bool, len(snap.Messages_))
+	for _, m := range snap.Messages_ {
+		kept[m.Data().ID()] = true
+	}
+	for _, id := range []int{949110, 959100} {
+		if !kept[id] {
+			t.Fatalf("截断丢弃了评估汇总消息 %d：异常分归零/低估且无分数可解释", id)
+		}
+	}
+	if last := snap.Messages_[len(snap.Messages_)-1]; last.Data().ID() != 959100 {
+		t.Fatalf("尾段顺序被破坏：末条 id=%d, want 959100", last.Data().ID())
+	}
+	// 未触发上限的形态必须原序原样保留（不因截断逻辑重排）。
+	small := snapshotAuditLog(messageOnlyAuditLog{msgs: raw[:3]})
+	if small.MessagesDropped_ != 0 || len(small.Messages_) != 3 {
+		t.Fatalf("未超限形态被截断：dropped=%d kept=%d", small.MessagesDropped_, len(small.Messages_))
+	}
+	for i, m := range small.Messages_ {
+		if m.Data().ID() != raw[i].Data().ID() {
+			t.Fatalf("未超限形态顺序改变：第 %d 条 id=%d", i, m.Data().ID())
+		}
+	}
+}
+
+// 分段键常量即审计行字段的 wire 契约（pre_us/end_us）：常量值被改动会改变
+// 已落盘行的语义解释，必须显式钉住；注册表按常量分派（字面量 switch 会在
+// 改值时静默丢分段）。
+func TestAuditTimingSegmentConstants_wireContract(t *testing.T) {
+	if timingSegmentPre != "pre" || timingSegmentEnd != "end" {
+		t.Fatalf("分段键=%q/%q, want pre/end（审计行 pre_us/end_us 字段语义）", timingSegmentPre, timingSegmentEnd)
+	}
+}
+
+// auxProbeAuditLog/auxProbeTx/auxProbeReq/auxProbeResp 是只携带
+// method/uri/body/files/headers 的最小 AuditLog 实现（客户端可控段上限单测）：
+// 嵌入 nil 接口补足不可命名的 Args() 等方法，其余访问器走本地值。
+type auxProbeAuditLog struct{ tx auxProbeTx }
+
+func (l auxProbeAuditLog) Parts() types.AuditLogParts { return nil }
+func (l auxProbeAuditLog) Transaction() plugintypes.AuditLogTransaction {
+	return l.tx
+}
+func (l auxProbeAuditLog) Messages() []plugintypes.AuditLogMessage { return nil }
+
+type auxProbeTx struct {
+	plugintypes.AuditLogTransaction
+	req      auxProbeReq
+	resp     auxProbeResp
+	serverID string
+}
+
+func (t auxProbeTx) Timestamp() string       { return "" }
+func (t auxProbeTx) UnixTimestamp() int64    { return 0 }
+func (t auxProbeTx) ID() string              { return "tx-aux-probe" }
+func (t auxProbeTx) ClientIP() string        { return "" }
+func (t auxProbeTx) ClientPort() int         { return 0 }
+func (t auxProbeTx) HostIP() string          { return "" }
+func (t auxProbeTx) HostPort() int           { return 0 }
+func (t auxProbeTx) ServerID() string        { return t.serverID }
+func (t auxProbeTx) HighestSeverity() string { return "" }
+func (t auxProbeTx) IsInterrupted() bool     { return false }
+func (t auxProbeTx) Request() plugintypes.AuditLogTransactionRequest {
+	return t.req
+}
+func (t auxProbeTx) Response() plugintypes.AuditLogTransactionResponse {
+	if t.resp.headers == nil && t.resp.body == "" {
+		return nil
+	}
+	return t.resp
+}
+func (t auxProbeTx) Producer() plugintypes.AuditLogTransactionProducer { return nil }
+
+type auxProbeReq struct {
+	plugintypes.AuditLogTransactionRequest
+	method  string
+	uri     string
+	body    string
+	headers map[string][]string
+	files   []plugintypes.AuditLogTransactionRequestFiles
+}
+
+func (r auxProbeReq) Method() string {
+	if r.method != "" {
+		return r.method
+	}
+	return "POST"
+}
+func (r auxProbeReq) Protocol() string             { return "HTTP/1.1" }
+func (r auxProbeReq) URI() string                  { return r.uri }
+func (r auxProbeReq) HTTPVersion() string          { return "HTTP/1.1" }
+func (r auxProbeReq) Headers() map[string][]string { return r.headers }
+func (r auxProbeReq) Body() string                 { return r.body }
+func (r auxProbeReq) Files() []plugintypes.AuditLogTransactionRequestFiles {
+	return r.files
+}
+func (r auxProbeReq) Length() int32 { return 0 }
+
+type auxProbeResp struct {
+	plugintypes.AuditLogTransactionResponse
+	body    string
+	headers map[string][]string
+}
+
+func (r auxProbeResp) Protocol() string             { return "HTTP/1.1" }
+func (r auxProbeResp) Status() int                  { return 200 }
+func (r auxProbeResp) Headers() map[string][]string { return r.headers }
+func (r auxProbeResp) Body() string                 { return r.body }
+
+// 客户端可控的「非体段」（uri 与 multipart files[].name/mime）必须与体/头同门
+// 封顶且入估算：否则单个 90KiB 全 `&` 文件名（≈540KiB 转义）+ 64KiB 全 `&`
+// 体（384KiB）+ 超长 URI 即可把本行推过 auditItemMaxBytes——被丢弃的恰是
+// 「触发 WAF 的这次请求」自身的安全事件（事件列表/大屏/自动封禁全缺）。
+// 钉：封顶后事件入队零丢弃、files_dropped 显性披露、估算不低于实际序列化。
+func TestSnapshotAuditLog_clientControlledAuxSegmentsStayUnderItemCap(t *testing.T) {
+	dense := strings.Repeat("&", 90*1024)
+	files := make([]plugintypes.AuditLogTransactionRequestFiles, 0, 200)
+	for range 200 {
+		files = append(files, auditSnapshotFile{Name_: dense, Size_: 1, Mime_: dense})
+	}
+	bigURI := "/probe?" + strings.Repeat("&", 60*1024)
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{
+		uri:   bigURI,
+		body:  strings.Repeat("&", auditBodyMaxBytes),
+		files: files,
+	}}})
+	req := snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+
+	// 上限必须真实截断（不是靠估算漏算通过）。门槛写成字面量：用例要在
+	// 未修复基线上也能编译，从而红在断言上（而不是红在符号缺失）。
+	//   uri 8KiB 转义字节 / files 64 条 / 单字段 1KiB 转义字节 /
+	//   条目内容总预算 24KiB 转义字节
+	const (
+		uriCapEscaped   = 8 * 1024
+		filesMaxEntries = 64
+		fieldCapEscaped = 1024
+		filesCapEscaped = 24 * 1024
+		truncatedSuffix = "\n...[TRUNCATED]"
+	)
+	if got := len(req.URI_); got >= len(bigURI) {
+		t.Fatalf("URI 未截断：保留 %d 字节（原始 %d）", got, len(bigURI))
+	}
+	if got := jsonStringEscapedLen(req.URI_); got > uriCapEscaped+len(truncatedSuffix) {
+		t.Fatalf("URI 转义字节 %d 越过 %d 上限", got, uriCapEscaped)
+	}
+	if got := len(req.Files_); got > filesMaxEntries {
+		t.Fatalf("files 保留 %d 条 > 上限 %d", got, filesMaxEntries)
+	}
+	// 截断披露必须出现在 wire 契约上（files_dropped，omitempty）。
+	type filesWire struct {
+		Files []struct {
+			Name string `json:"name"`
+			Mime string `json:"mime"`
+		} `json:"files"`
+		FilesDropped int `json:"files_dropped"`
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire filesWire
+	if err := json.Unmarshal(rawReq, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.FilesDropped == 0 {
+		t.Fatal("files 截断必须显性披露 files_dropped")
+	}
+	var fileEscaped int64
+	for _, f := range req.Files_ {
+		if jsonStringEscapedLen(f.Name()) > fieldCapEscaped+len(truncatedSuffix) ||
+			jsonStringEscapedLen(f.Mime()) > fieldCapEscaped+len(truncatedSuffix) {
+			t.Fatalf("文件名/MIME 转义字节越过单字段上限：name=%d mime=%d",
+				jsonStringEscapedLen(f.Name()), jsonStringEscapedLen(f.Mime()))
+		}
+		fileEscaped += int64(jsonStringEscapedLen(f.Name()) + jsonStringEscapedLen(f.Mime()))
+	}
+	if fileEscaped > filesCapEscaped {
+		t.Fatalf("files 条目内容转义字节 %d > 总预算 %d", fileEscaped, filesCapEscaped)
+	}
+
+	// 估算口径仍是实际序列化的上界，且整条落在单条上限内。
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := estimateAuditSnapshotBytes(snap)
+	if size < int64(len(serialized)) {
+		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", size, len(serialized))
+	}
+	if size > auditItemMaxBytes {
+		t.Fatalf("估算 %d > 单条上限 %d（被构造的这次请求自身事件仍会被整行丢弃）", size, auditItemMaxBytes)
+	}
+
+	// 入队路径：本行必须留在事件里（dropped==0）。
+	p := &auditPipeline{
+		target: filepath.Join(t.TempDir(), "audit.log"),
+		queue:  make(chan lbAuditItem, 2),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"aux-dense"}`)}})
+	if dropped := p.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped=%d, want 0（客户端构造的超长文件名/URI 不得挤掉自身事件）", dropped)
+	}
+	if length := len(p.queue); length != 1 {
+		t.Fatalf("queue length=%d, want 1", length)
+	}
+}
+
+// 未超限形态必须原样保留（封顶只在越限时生效，不改写正常 uri/文件名）。
+func TestSnapshotAuditLog_auxSegmentsPassThroughWhenUnderCap(t *testing.T) {
+	files := []plugintypes.AuditLogTransactionRequestFiles{
+		auditSnapshotFile{Name_: "report.pdf", Size_: 1024, Mime_: "application/pdf"},
+	}
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{
+		uri: "/upload?x=1", files: files,
+	}}})
+	req := snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		URI   string `json:"uri"`
+		Files []struct {
+			Name string `json:"name"`
+			Mime string `json:"mime"`
+		} `json:"files"`
+		FilesDropped int `json:"files_dropped"`
+	}
+	if err := json.Unmarshal(rawReq, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.URI != "/upload?x=1" {
+		t.Fatalf("URI 被改写：%q", wire.URI)
+	}
+	if len(wire.Files) != 1 || wire.FilesDropped != 0 {
+		t.Fatalf("files=%d dropped=%d, want 1/0", len(wire.Files), wire.FilesDropped)
+	}
+	if wire.Files[0].Name != "report.pdf" || wire.Files[0].Mime != "application/pdf" {
+		t.Fatalf("文件条目被改写：%#v", wire.Files[0])
+	}
+}
+
+// 截断原语只在 UTF-8 边界停：上限按转义字节累计，落点却可能切进多字节字符
+// 中间。按字节切的实现会把中文 URI/文件名切成半个字符，落盘 JSON 经 UI 渲染
+// 成替换符——用户看到的是「被损坏」而不是「被截断」。故断言三件事：结果仍是
+// 合法 UTF-8、保留字符数等于「不越过上限的最大前缀」、末尾带截断标记。
+func TestSnapshotClipEscaped_stopsOnRuneBoundary(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		max   int
+		runes int
+	}{
+		// 三字节字符：上限 8 落在第三个「中」（字节 6..9）内部。
+		{"cjk mid-rune", strings.Repeat("中", 3), 8, 2},
+		// 四字节字符：上限 10 落在第三个 emoji（字节 8..12）内部。
+		{"emoji mid-rune", strings.Repeat("😀", 3), 10, 2},
+		// 转义放大 6×：`<`/`>` 每个按 6 字节计，上限 13 只容得下两个字符。
+		{"escaped 6x stops at character", "<><><>", 13, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, truncated := snapshotClipEscaped(tc.in, tc.max)
+			if !truncated {
+				t.Fatalf("未截断：%q（上限 %d 转义字节）", got, tc.max)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("截断结果不是合法 UTF-8：%q", got)
+			}
+			if !strings.HasSuffix(got, auditTruncatedMarker) {
+				t.Fatalf("截断结果缺少显式标记：%q", got)
+			}
+			body := strings.TrimSuffix(got, auditTruncatedMarker)
+			if n := utf8.RuneCountInString(body); n != tc.runes {
+				t.Fatalf("保留 %d 个字符，期望 %d（按字节集会切坏字符）", n, tc.runes)
+			}
+			if n := jsonStringEscapedLen(body); n > tc.max {
+				t.Fatalf("保留内容转义字节 %d 越过上限 %d", n, tc.max)
+			}
+		})
+	}
+}
+
+// 恰好等于上限不得截断（边界判定是 `> max` 而不是 `>= max`）：差一个字节的
+// off-by-one 会把「刚好装满」的正常取值标成 TRUNCATED，取证时误判为丢数据。
+func TestSnapshotClipEscaped_keepsInputThatExactlyFillsTheCap(t *testing.T) {
+	in := strings.Repeat("a", 128)
+	got, truncated := snapshotClipEscaped(in, len(in))
+	if truncated {
+		t.Fatalf("恰好等于上限被截断：%q", got)
+	}
+	if got != in {
+		t.Fatalf("未超限取值被改写：%q", got)
+	}
+
+	// 少一字节上限必须截断，且切口落在「上限-1」：与上一条配对，任何方向的
+	// 边界错位（>= / 提前一字节）都会让两者之一失败。
+	got, truncated = snapshotClipEscaped(in, len(in)-1)
+	if !truncated {
+		t.Fatalf("超限一字节未截断：%q", got)
+	}
+	if want := strings.Repeat("a", len(in)-1) + auditTruncatedMarker; got != want {
+		t.Fatalf("截断切口错位：got %q, want %q", got, want)
+	}
+
+	// 早退形态：空串与非正上限原样返回（上限 0 是「不限额」语义，不是「全截」）。
+	if got, truncated := snapshotClipEscaped("", 16); got != "" || truncated {
+		t.Fatalf("空串被改写：%q truncated=%v", got, truncated)
+	}
+	if got, truncated := snapshotClipEscaped(in, 0); got != in || truncated {
+		t.Fatalf("非正上限未按不限额处理：len=%d truncated=%v", len(got), truncated)
+	}
+}
+
+// 调用点契约：超限 URI 必须以标记结尾（标记缺失时 UI 无法区分「半截」与
+// 「完整」），未超限 URI 必须逐字节原样。
+func TestSnapshotAuditLog_uriSegmentsCarryTruncationMarker(t *testing.T) {
+	overCap := "/probe?" + strings.Repeat("&", 60*1024) // `&` 转义 6×，必然越限
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{uri: overCap}}})
+	req := snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+	if !strings.HasSuffix(req.URI_, auditTruncatedMarker) {
+		t.Fatalf("超限 URI 缺少截断标记（尾部 %q）", tailOf(req.URI_, 24))
+	}
+	if n := jsonStringEscapedLen(req.URI_); n > auditURIMaxEscapedBytes {
+		t.Fatalf("超限 URI 转义字节 %d 越过上限 %d", n, auditURIMaxEscapedBytes)
+	}
+
+	// 未超限形态：同一字段必须原样保留（上面所有截断逻辑不得外溢）。
+	const underCap = "/api/v1/rules?page=2"
+	snap = snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{req: auxProbeReq{uri: underCap}}})
+	req = snap.Transaction_.Request_
+	if req == nil {
+		t.Fatal("请求快照缺失")
+	}
+	if req.URI_ != underCap {
+		t.Fatalf("未超限 URI 被改写：%q", req.URI_)
+	}
+}
+
+// tailOf 返回 s 的末 n 个字节（失败信息用，避免把 60KiB 夹具打印出来）。
+func tailOf(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// files_dropped 是文件条目截断的披露键，估算必须为它留出固定开销：少算这一项，
+// 「截断披露」本身就会把实际序列化体积推过估算口径，而估算正是入队/单条字节
+// 预算的执法值。断言差值与常量逐字节相等，删除该估算项或改小常量都会红。
+func TestEstimateAuditSnapshotBytes_countsFilesDroppedDisclosure(t *testing.T) {
+	build := func(dropped int) *auditSnapshot {
+		return &auditSnapshot{Transaction_: auditSnapshotTransaction{
+			Request_: &auditSnapshotRequest{URI_: "/upload", FilesDropped_: dropped},
+		}}
+	}
+	withoutDrop, withDrop := build(0), build(3)
+	base := estimateAuditSnapshotBytes(withoutDrop)
+	got := estimateAuditSnapshotBytes(withDrop)
+	if diff := got - base; diff != auditFilesDroppedOverhead {
+		t.Fatalf("files_dropped 估算增量 %d，期望 %d（披露键未被计入）", diff, auditFilesDroppedOverhead)
+	}
+	// 上界性：估算不得低于实际序列化体积（含披露键）。
+	raw, err := json.Marshal(withDrop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got < int64(len(raw)) {
+		t.Fatalf("估算 %d < 序列化 %d", got, len(raw))
+	}
+}
+
+// messages_dropped 与 files_dropped 同属截断披露：非零时必须计入固定开销，
+// 零值继续遵循 omitempty；估算在任何丢弃数量下都不得低于实际序列化体积。
+func TestEstimateAuditSnapshotBytes_countsMessagesDroppedDisclosure(t *testing.T) {
+	build := func(dropped int) *auditSnapshot {
+		return &auditSnapshot{MessagesDropped_: dropped}
+	}
+	base := estimateAuditSnapshotBytes(build(0))
+	for _, dropped := range []int{3, 999999999} {
+		withDrop := build(dropped)
+		got := estimateAuditSnapshotBytes(withDrop)
+		if diff := got - base; diff != auditMessagesDroppedOverhead {
+			t.Fatalf("messages_dropped=%d 估算增量 %d，期望 %d（披露键未被计入）", dropped, diff, auditMessagesDroppedOverhead)
+		}
+		raw, err := json.Marshal(withDrop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got < int64(len(raw)) {
+			t.Fatalf("messages_dropped=%d 估算 %d < 序列化 %d", dropped, got, len(raw))
+		}
+	}
+	if got := estimateAuditSnapshotBytes(build(0)); got != base {
+		t.Fatalf("零值重复估算从 %d 变为 %d（omitempty 形态不稳定）", base, got)
+	}
+}
+
+// denseHeaderSet 返回 5000 条三字符键/值互不相同的 header 表：序列化体积
+// ~70KiB，越过 64KiB 快照上限，用于构造「头段打满」的最坏形态夹具。
+func denseHeaderSet() map[string][]string {
+	headers := make(map[string][]string, 5000)
+	for i := range 5000 {
+		n := i
+		key := []byte{'a', 'a', 'a'}
+		for pos := 2; pos >= 0; pos-- {
+			key[pos] = byte('a' + n%26)
+			n /= 26
+		}
+		headers[string(key)] = []string{string(key)}
+	}
+	return headers
+}
+
+// 事务字符串（request.method 与 transaction.server_id）与 uri/files 同属
+// 客户端可控段：不设限时任一项都能把快照推过 auditItemMaxBytes，让「触发
+// WAF 的这次请求」自身的安全事件整行丢弃（事件列表/大屏/自动封禁喂入全缺）。
+// 钉：越限按转义字节封顶并留标记、估算仍 ≥ 实际序列化且 ≤ 单条上限、入队
+// 零丢弃。
+func TestSnapshotAuditLog_transactionStringsStayUnderItemCap(t *testing.T) {
+	denseBody := strings.Repeat("&", auditBodyMaxBytes)
+	denseField := strings.Repeat("&", 90*1024)
+	files := make([]plugintypes.AuditLogTransactionRequestFiles, 0, 200)
+	for range 200 {
+		files = append(files, auditSnapshotFile{Name_: denseField, Size_: 1, Mime_: denseField})
+	}
+	headers := denseHeaderSet()
+	denseFixture := func() auxProbeTx {
+		return auxProbeTx{
+			req: auxProbeReq{
+				uri:     "/probe?" + strings.Repeat("&", 60*1024),
+				body:    denseBody,
+				headers: headers,
+				files:   files,
+			},
+			resp: auxProbeResp{body: denseBody, headers: headers},
+		}
+	}
+	// 上限门槛写字面量：用例要在未修复基线上也能编译，从而红在断言上。
+	const (
+		methodCapEscaped = 64
+		serverCapEscaped = 256
+		truncatedSuffix  = "\n...[TRUNCATED]"
+	)
+	wide := func(ch string) string { return strings.Repeat(ch, 128*1024) }
+	cases := []struct {
+		name     string
+		mutate   func(*auxProbeTx)
+		field    func(*auditSnapshotTransaction) string
+		capBytes int
+	}{
+		{
+			name:     "长 method",
+			mutate:   func(tx *auxProbeTx) { tx.req.method = wide("M") },
+			field:    func(tr *auditSnapshotTransaction) string { return tr.Request_.Method_ },
+			capBytes: methodCapEscaped,
+		},
+		{
+			name:     "长 server_id",
+			mutate:   func(tx *auxProbeTx) { tx.serverID = wide("h") },
+			field:    func(tr *auditSnapshotTransaction) string { return tr.ServerID_ },
+			capBytes: serverCapEscaped,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := denseFixture()
+			tc.mutate(&tx)
+			snap := snapshotAuditLog(auxProbeAuditLog{tx: tx})
+			got := tc.field(&snap.Transaction_)
+			if !strings.HasSuffix(got, truncatedSuffix) {
+				t.Fatalf("截断标记缺失：保留 %d 字节", len(got))
+			}
+			if escaped := jsonStringEscapedLen(got); escaped > tc.capBytes+len(truncatedSuffix) {
+				t.Fatalf("转义字节 %d 越过 %d 上限", escaped, tc.capBytes)
+			}
+
+			serialized, err := json.Marshal(snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			size := estimateAuditSnapshotBytes(snap)
+			if size < int64(len(serialized)) {
+				t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", size, len(serialized))
+			}
+			if size > auditItemMaxBytes {
+				t.Fatalf("估算 %d > 单条上限 %d（被构造的这次请求自身事件仍会被整行丢弃）", size, auditItemMaxBytes)
+			}
+
+			p := &auditPipeline{
+				target: filepath.Join(t.TempDir(), "audit.log"),
+				queue:  make(chan lbAuditItem, 2),
+				done:   make(chan struct{}),
+			}
+			if err := p.openFile(0o644); err != nil {
+				t.Fatal(err)
+			}
+			p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"tx-string-dense"}`)}})
+			if dropped := p.dropped.Load(); dropped != 0 {
+				t.Fatalf("dropped=%d, want 0（客户端构造的超长 method/server_id 不得挤掉自身事件）", dropped)
+			}
+			if length := len(p.queue); length != 1 {
+				t.Fatalf("queue length=%d, want 1", length)
+			}
+		})
+	}
+}
+
+// 未超限的 method/server_id 必须原样保留（封顶只在越限时生效，不改写正常值）。
+func TestSnapshotAuditLog_transactionStringsPassThroughWhenUnderCap(t *testing.T) {
+	snap := snapshotAuditLog(auxProbeAuditLog{tx: auxProbeTx{
+		serverID: "edge-node-1",
+		req:      auxProbeReq{method: "PROPFIND"},
+	}})
+	if got := snap.Transaction_.Request_.Method_; got != "PROPFIND" {
+		t.Fatalf("method 被改写：%q", got)
+	}
+	if got := snap.Transaction_.ServerID_; got != "edge-node-1" {
+		t.Fatalf("server_id 被改写：%q", got)
+	}
+}
+
+// auditItemMaxBytes 的上界推导必须可复算：**非 messages** 客户端可控段上限之和
+// + 余量 + messages 兼容下限 ≤ 单条上限；且 messages 的动态预算在固定段取最坏
+// 形态时被夹到「剩余空间」以内。任何新增客户端可控段（或放宽既有上限）若不同步
+// 扩容，本门立即失败——否则「封顶后仍整行丢弃」的同族缺陷会以新字段形式回归。
+//
+// 为什么不再把 messages 的 clamp 上界（128KiB）直接加进总和：动态预算的正是
+// 「固定段越大、messages 越小」，两者之和恒 ≤ 单条上限（见 auditMessagesBudget）。
+// 静态相加只对**互不排斥**的段有意义，而 messages 与固定段是互相挤压关系。
+func TestAuditItemMaxBytes_coversAllClientControlledSegments(t *testing.T) {
+	const reserve int64 = 48 * 1024
+	marker := int64(len(auditTruncatedMarker))
+	fixedWorst := 2*(6*int64(auditBodyMaxBytes)+marker) + // 请求/响应体（64KiB 全 `&` + 标记）
+		2*int64(auditHeadersMaxBytes) + // 请求/响应头（快照侧已按转义字节封顶）
+		int64(auditMethodMaxEscapedBytes) + // 内容预算已扣除标记长度
+		int64(auditServerIDMaxEscapedBytes) +
+		int64(auditURIMaxEscapedBytes) +
+		int64(auditFilesMaxEscapedBytes) +
+		int64(auditFilesMaxEntries)*auditFileEntryOverhead // files 条目固定开销
+	if fixedWorst+reserve+auditMessagesMinBytes > auditItemMaxBytes {
+		t.Fatalf("非 messages 段上限之和 %d + 余量 %d + messages 下限 %d > 单条上限 %d",
+			fixedWorst, reserve, auditMessagesMinBytes, auditItemMaxBytes)
+	}
+	// 动态预算必须把 messages 夹在「最坏固定段之后的剩余空间」以内：fixedWorst
+	// 取满时预算只能落在下限附近，绝不能仍给 128KiB（否则整行必被丢弃）。
+	budgetBytes, budgetEntries := auditMessagesBudget(fixedWorst)
+	if fixedWorst+budgetBytes+reserve > auditItemMaxBytes {
+		t.Fatalf("最坏固定段 %d + messages 预算 %d + 余量 %d > 单条上限 %d",
+			fixedWorst, budgetBytes, reserve, auditItemMaxBytes)
+	}
+	if budgetBytes > auditMessagesMaxBytesCeiling || budgetEntries > auditMessagesMaxEntriesCeiling {
+		t.Fatalf("动态预算 %d/%d 越过 clamp 上界 %d/%d",
+			budgetBytes, budgetEntries, auditMessagesMaxBytesCeiling, auditMessagesMaxEntriesCeiling)
+	}
+	// 夹具有效性：最坏形态下预算必须已收缩到 clamp 上界之下（否则本门对
+	// 「大 body + messages 挤爆整行」失去区分力）。
+	if budgetBytes >= auditMessagesMaxBytesCeiling {
+		t.Fatalf("最坏固定段下 messages 预算 %d 未收缩（上界 %d）", budgetBytes, auditMessagesMaxBytesCeiling)
+	}
+	// 非 messages 段之后剩余空间必须小于 16KiB（条目固定开销与插件侧字符串的
+	// 既有实测余量）。放宽到 ≥16KiB 说明出现了未被任何段声明的空间，新客户端
+	// 可控段会在不报错的情况下挤占它。
+	if slack := auditItemMaxBytes - fixedWorst - reserve - auditMessagesMinBytes; slack >= 16*1024 || slack < 0 {
+		t.Fatalf("余量口径漂移：非 messages 段 + 余量 + messages 下限后仍余 %d 字节未被任何段声明", slack)
+	}
+}
+
+// 请求路径上的字节估算只关心「转义后长度」，绝大多数取值（URI/方法/协议/
+// 版本/ASCII body）不含任何转义触发字节，整串可直接取 len——快路径必须先
+// 扫出「转义后长度不变」的前缀长度，命中触发字节才进入逐字节转义分支。
+func TestJSONStringEscapeFreePrefixLen(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"", 0},
+		{"GET", 3},
+		{"/api/v1/rules?x=1&y=2", 17}, // '&' 是触发字节
+		{"a\"b", 1},
+		{"a\\b", 1},
+		{"a<b", 1},
+		{"a>b", 1},
+		{"a\nb", 1},
+		{"a\x00b", 1},
+		{"a\x7fb", 3}, // DEL 不在 json.Marshal 的转义集内
+		{"中文", 0},     // 非 ASCII 交回慢路径判定（U+2028/非法 UTF-8 需特殊处理）
+		{"abc中", 3},   // 前缀可快跳过，非 ASCII 处停
+		{strings.Repeat("a", 64), 64},
+	}
+	for _, tc := range cases {
+		if got := jsonStringEscapeFreePrefixLen(tc.in); got != tc.want {
+			t.Fatalf("jsonStringEscapeFreePrefixLen(%q)=%d, want %d", tc.in, got, tc.want)
+		}
+		// 前缀长度必须与「整串转义长度」自洽：前缀部分逐字节计 1。
+		if prefix := jsonStringEscapeFreePrefixLen(tc.in); prefix < len(tc.in) {
+			quoted, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("json.Marshal(%q): %v", tc.in, err)
+			}
+			if got, want := jsonStringEscapedLen(tc.in), len(quoted)-2; got != want {
+				t.Fatalf("jsonStringEscapedLen(%q)=%d, want %d", tc.in, got, want)
+			}
+		}
+	}
+}
+
+func BenchmarkJSONStringEscapedLen_plainASCII64KiB(b *testing.B) {
+	body := strings.Repeat("abcdefghij", auditBodyMaxBytes/10)
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if n := jsonStringEscapedLen(body); n != len(body) {
+			b.Fatalf("len=%d, want %d", n, len(body))
+		}
+	}
+}
+
+func BenchmarkJSONStringEscapedLen_escapedASCII64KiB(b *testing.B) {
+	body := strings.Repeat(`a<b>c&d"e\f`, auditBodyMaxBytes/10)
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = jsonStringEscapedLen(body)
 	}
 }

@@ -11,11 +11,12 @@ import (
 func TestBuildCorazaDirectives_logActionOmitsScoreSetvar(t *testing.T) {
 	// Given a policy whose custom rule action is "log"（仅记录）
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CustomRules: json.RawMessage(`[{"id":1,"name":"仅记录规则","enabled":true,"action":"log","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/log"}]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 
 	// Then it emits pass,log with a message but NO anomaly-score setvar
 	if !strings.Contains(directives, `pass,log,msg:'自定义规则 仅记录规则 命中'`) {
@@ -33,16 +34,42 @@ func TestBuildCorazaDirectives_logActionOmitsScoreSetvar(t *testing.T) {
 func TestBuildCorazaDirectives_passActionKeepsScoreSetvar(t *testing.T) {
 	// Given a policy whose custom rule action is "pass"（放行计分）
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CustomRules: json.RawMessage(`[{"id":2,"name":"放行计分规则","enabled":true,"action":"pass","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/pass"}]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 
 	// Then it records the event AND accumulates the anomaly score
 	if !strings.Contains(directives, `pass,log,setvar:tx.inbound_anomaly_score_pl1=+5,msg:'自定义规则 放行计分规则 命中'`) {
 		t.Fatalf("pass action must accumulate anomaly score:\n%s", directives)
 	}
+}
+
+func TestBuildCorazaDirectives_skipsOnlyInvalidScoreOrAction(t *testing.T) {
+	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CustomRules: json.RawMessage(`[
+			{"id":81,"name":"负分坏规则","enabled":true,"action":"block","score":-5,"conditions":[{"target":"uri","operator":"contains","pattern":"/bad-score"}]},
+			{"id":82,"name":"非法动作坏规则","enabled":true,"action":"evil","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/bad-action"}]},
+			{"id":83,"name":"合法规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/good"}]},
+			{"id":84,"name":"旧版缺省规则","enabled":true,"target":"uri","operator":"contains","pattern":"/legacy"}
+		]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+	for _, invalid := range []string{"负分坏规则", "非法动作坏规则", "+-5"} {
+		if strings.Contains(directives, invalid) {
+			t.Fatalf("invalid score/action rule must be skipped (%q):\n%s", invalid, directives)
+		}
+	}
+	for _, valid := range []string{"合法规则", "旧版缺省规则"} {
+		if !strings.Contains(directives, valid) {
+			t.Fatalf("valid sibling %q must still emit:\n%s", valid, directives)
+		}
+	}
+	compileForEngineGate(t, directives)
 }
 
 func TestValidateCustomRuleConditions_rejectsInvalidTarget(t *testing.T) {
@@ -107,6 +134,68 @@ func TestValidateCustomRulePattern_operatorAwareTrailingBackslashMessage(t *test
 	if err == nil || !strings.Contains(err.Error(), "结尾锚定") {
 		t.Fatalf("regex trailing backslash must suggest anchor/empty-group, got %v", err)
 	}
+}
+
+// customRuleEmissionIssue 的三条发射守卫（单条坏规则不得拖垮整站）：
+// 负 id（与引擎 body processor id 冲突/负 SecRule id）、规则名控制字符/双引号
+// （提前闭合 msg 动作）、非 regex 运算符的 %{...} 宏（语义静默动态化且畸形宏
+// 使整份配置编译失败）。每条同时钉 direct 判定与渲染级跳过（产物仍可编译）。
+func TestCustomRuleEmissionIssue_guards(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    models.CustomRule
+		wantSub string
+	}{
+		{
+			name:    "负 id",
+			rule:    models.CustomRule{ID: -9990, Name: "坏id", Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "/x"}}},
+			wantSub: "规则 id 为负数",
+		},
+		{
+			name:    "规则名双引号",
+			rule:    models.CustomRule{ID: 7, Name: `闭合"攻击`, Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "/x"}}},
+			wantSub: "规则名称含控制字符或双引号",
+		},
+		{
+			name:    "规则名控制字符",
+			rule:    models.CustomRule{ID: 8, Name: "换行\n注入", Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "/x"}}},
+			wantSub: "规则名称含控制字符或双引号",
+		},
+		{
+			name:    "非 regex 宏",
+			rule:    models.CustomRule{ID: 9, Name: "宏规则", Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "%{tx.var}"}}},
+			wantSub: "该运算符不支持 %{...} 宏语法",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if issue := customRuleEmissionIssue(tc.rule); !strings.Contains(issue, tc.wantSub) {
+				t.Fatalf("customRuleEmissionIssue=%q, want 含 %q", issue, tc.wantSub)
+			}
+		})
+	}
+
+	// 渲染级：坏规则不得进入发射产物，且（合法规则存在时）产物仍被引擎接受。
+	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
+		Mode:             "custom_only",
+		CustomRules: json.RawMessage(`[
+			{"id":-9990,"name":"负id","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/neg"}]},
+			{"id":8,"name":"闭合\"注入","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/quote"}]},
+			{"id":9,"name":"宏规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"%{tx.var}"}]},
+			{"id":10,"name":"合法规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/ok"}]}
+		]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+	for _, forbidden := range []string{"负id", `闭合"注入`, "宏规则"} {
+		if strings.Contains(directives, forbidden) {
+			t.Fatalf("坏规则不得发射（%q 泄漏进产物）:\n%s", forbidden, directives)
+		}
+	}
+	if !strings.Contains(directives, "id:10010,") {
+		t.Fatalf("合法规则必须发射（emit id=DB id+10000）:\n%s", directives)
+	}
+	compileForEngineGate(t, directives)
 }
 
 func TestValidateCustomRulesJSON_rejectsPlaceholderEntry(t *testing.T) {
@@ -199,5 +288,80 @@ func TestEscapeCorazaPattern_stripsControlCharsAndPreservesLiteralBackslashN(t *
 	}
 	if !strings.Contains(got, `\n`) {
 		t.Fatalf("literal two-char \\n sequence must be preserved, got %q", got)
+	}
+}
+
+// 安全域字段级上限（与全局请求体上限分离）：custom_rules 引用数、单规则条件数、
+// pattern 字节数都在写侧 fail-closed 封顶——此前唯一约束是全局请求体上限
+// （默认 128MB），单条策略即可把列表/详情响应与每次渲染解析放大到不可用。
+// 覆盖目标（N 放行 / N+1 拒绝）、去重口径与三种载荷形状（引用数组/内嵌/
+// 旧版单条件）。
+func TestValidateCustomRules_fieldLevelLimits(t *testing.T) {
+	refs := make([]int, customRuleMaxRefs)
+	for i := range refs {
+		refs[i] = i + 1
+	}
+	payload, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCustomRulesJSON(string(payload)); err != nil {
+		t.Fatalf("引用数=上限(%d)必须放行: %v", customRuleMaxRefs, err)
+	}
+
+	// 去重后计数：重复 ID 不放大引用集合。
+	duplicated := make([]int, customRuleMaxRefs*2)
+	for i := range duplicated {
+		duplicated[i] = i%customRuleMaxRefs + 1
+	}
+	payload, err = json.Marshal(duplicated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCustomRulesJSON(string(payload)); err != nil {
+		t.Fatalf("重复引用去重后仍在上限内必须放行: %v", err)
+	}
+
+	over := make([]int, customRuleMaxRefs+1)
+	for i := range over {
+		over[i] = i + 1
+	}
+	payload, err = json.Marshal(over)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCustomRulesJSON(string(payload)); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("引用数=上限+1(%d)必须拒绝, got %v", customRuleMaxRefs+1, err)
+	}
+
+	// 条件数边界：N 放行 / N+1 拒绝。
+	conditions := make([]models.CustomRuleCondition, customRuleMaxConditions)
+	for i := range conditions {
+		conditions[i] = models.CustomRuleCondition{Target: "uri", Operator: "contains", Pattern: "/x"}
+	}
+	if err := ValidateCustomRuleConditions(conditions); err != nil {
+		t.Fatalf("条件数=上限(%d)必须放行: %v", customRuleMaxConditions, err)
+	}
+	conditions = append(conditions, models.CustomRuleCondition{Target: "uri", Operator: "contains", Pattern: "/y"})
+	if err := ValidateCustomRuleConditions(conditions); err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("条件数=上限+1 必须拒绝并给出数值, got %v", err)
+	}
+
+	// pattern 字节边界：N 放行 / N+1 拒绝（内嵌与旧版单条件形状同门）。
+	atLimit := strings.Repeat("a", customRuleMaxPatternBytes)
+	if err := ValidateCustomRuleConditions([]models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: atLimit}}); err != nil {
+		t.Fatalf("pattern=%d 字节必须放行: %v", customRuleMaxPatternBytes, err)
+	}
+	tooLong := strings.Repeat("a", customRuleMaxPatternBytes+1)
+	if err := ValidateCustomRuleConditions([]models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: tooLong}}); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("pattern=上限+1 必须拒绝, got %v", err)
+	}
+	embedded := `[{"id":1,"name":"内嵌","enabled":true,"conditions":[{"target":"uri","operator":"contains","pattern":"` + tooLong + `"}]}]`
+	if err := ValidateCustomRulesJSON(embedded); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("内嵌形状超长 pattern 必须拒绝, got %v", err)
+	}
+	legacy := `[{"id":1,"name":"旧版","enabled":true,"target":"uri","operator":"contains","pattern":"` + tooLong + `"}]`
+	if err := ValidateCustomRulesJSON(legacy); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("旧版单条件形状超长 pattern 必须拒绝, got %v", err)
 	}
 }

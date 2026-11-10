@@ -180,13 +180,16 @@ func TestCRSUpdateRun_rollbackRestoresPreviousLiveSetup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-901.conf")); !os.IsNotExist(err) {
 		t.Fatal("new rules should be rolled back")
 	}
-	if reloads != 1 {
-		t.Fatalf("reloads=%d, want 1 (reload after restore)", reloads)
+	// 树从未交换、live 未被触碰（失败发生在备份阶段）：收尾既不还原也不重载
+	// ——reload 门必须反映「树未变更」，Caddy 从未见过新树，自动更新失败重试
+	// 不得每轮空转一次全量重载
+	if reloads != 0 {
+		t.Fatalf("reloads=%d, want 0 (pre-swap backup failure: nothing was swapped, Caddy never saw the new tree)", reloads)
 	}
 
 	// And the overrides freshly written during the failed attempt is removed:
 	// restoring it would re-apply the same custom lines alongside the restored
-	// setup（R37 S3）
+	// setup
 	if _, err := os.Stat(filepath.Join(m.crsDir, "zz-user-overrides.conf")); !os.IsNotExist(err) {
 		t.Fatal("zz-user-overrides.conf written during the failed attempt should be removed on rollback")
 	}
@@ -197,7 +200,7 @@ func TestCRSUpdateRun_rollbackRestoresPreviousLiveSetup(t *testing.T) {
 
 // TestRestoreBackup_restoreFailureKeepsOverridesBak 验证 overrides 内容还原失败时
 // 保留 .bak——唯一恢复副本不得在失败路径被销毁，否则「旧 setup + 新 overrides」
-// 双重应用状态失去恢复副本、不可自愈（R38 三-1，对照 setup 段失败即保留的行为）。
+// 双重应用状态失去恢复副本、不可自愈（三-1，对照 setup 段失败即保留的行为）。
 func TestRestoreBackup_restoreFailureKeepsOverridesBak(t *testing.T) {
 	// Given backups in place and a restore target occupied by a directory
 	// (copyFile's WriteFile fails with EISDIR)
@@ -212,12 +215,14 @@ func TestRestoreBackup_restoreFailureKeepsOverridesBak(t *testing.T) {
 	writeTestFile(t, crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"), "# 更新前 overrides\nSecRuleARCustom 1")
 
 	// When the backup is restored
-	m.overridesBakCreated = true // 本运行已创建 bak（R39 1.1）：还原失败时保留 .bak
+	m.overridesBakCreated = true // 本运行已创建 bak：还原失败时保留.bak
+	m.rulesBakCreated = true     // 本运行已创建 rules.bak
+	m.setupBakCreated = true     // 本运行已创建 setup.bak
 	m.restoreBackup()
 
 	// Then the failed overrides restore keeps the only recovery copy
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak")); err != nil {
-		t.Fatal("zz-user-overrides.conf.bak 不得在还原失败时被删除（R38 三-1）")
+		t.Fatal("zz-user-overrides.conf.bak 不得在还原失败时被删除")
 	}
 	// And the independent setup/rules restore still completes
 	setup, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.conf"))
@@ -230,7 +235,7 @@ func TestRestoreBackup_restoreFailureKeepsOverridesBak(t *testing.T) {
 }
 
 // TestRestoreBackup_emptyMarkerRemoveFailureKeepsMarker 验证空 .bak 标记分支的
-// os.Remove(overrides) 失败时同样保留标记，下次还原可重试（R38 三-1）。
+// os.Remove(overrides) 失败时同样保留标记，下次还原可重试。
 func TestRestoreBackup_emptyMarkerRemoveFailureKeepsMarker(t *testing.T) {
 	// Given backups in place and a freshly created overrides path that cannot
 	// be removed (non-empty directory → ENOTEMPTY)
@@ -245,21 +250,21 @@ func TestRestoreBackup_emptyMarkerRemoveFailureKeepsMarker(t *testing.T) {
 	writeTestFile(t, crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"), "")
 
 	// When the backup is restored
-	m.overridesBakCreated = true // 本运行已创建 bak（R39 1.1）：消费空标记时移除失败则保留
+	m.overridesBakCreated = true // 本运行已创建 bak：消费空标记时移除失败则保留
 	m.restoreBackup()
 
 	// Then the empty marker survives so a later restore can retry
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak")); err != nil {
-		t.Fatal("空标记不得在移除失败时被消费（R38 三-1）")
+		t.Fatal("空标记不得在移除失败时被消费")
 	}
 }
 
 // TestCRSUpdateRun_staleOverridesBakNotConsumedOnEmptyDiffFailure 验证陈旧
-// overrides.bak 不被空 diff 运行消费（R38 三-2 由 R39 1.1 闭合）：上次运行在
-// reload 成功与清理之间崩溃留下的 N-1 版 .bak，在本运行 diff 为空（无迁移、无
+// overrides.bak 不被空 diff 运行消费（三-2 由 1.1 闭合）：上次运行在
+// reload 成功与清理之间崩溃留下的版.bak，在本运行 diff 为空（无迁移、无
 // 新备份）且安装失败时，restoreBackup 不消费它——overrides 保持更新前内容、
 // 不被两版本前的陈旧备份还原；.bak 原样保留（陈旧 bak 永不消费，保全副本语义
-// 优先，R39 1.1 取代 R38 的运行开始即清理）。
+// 优先， 1.1 取代 运行开始即清理）。
 func TestCRSUpdateRun_staleOverridesBakNotConsumedOnEmptyDiffFailure(t *testing.T) {
 	// Given a live setup identical to the stock baseline (empty diff) plus a
 	// stale overrides backup left by a crashed previous run
@@ -289,20 +294,20 @@ func TestCRSUpdateRun_staleOverridesBakNotConsumedOnEmptyDiffFailure(t *testing.
 		t.Fatalf("update_status=%q, want failed", status)
 	}
 	// And the overrides were not polluted by the two-versions-stale backup:
-	// restoreBackup leaves overrides untouched（陈旧 bak 未被消费，R39 1.1）
+	// restoreBackup leaves overrides untouched（陈旧 bak 未被消费， 1.1）
 	data, err := os.ReadFile(filepath.Join(m.crsDir, "zz-user-overrides.conf"))
 	if err != nil || string(data) != "# 当前 overrides\nSecRuleARCustom 2" {
 		t.Fatalf("zz-user-overrides.conf=%q,%v, want untouched current content（陈旧 bak 不得还原两版本前内容）", data, err)
 	}
-	// 陈旧 .bak 原样保留：R39 1.1 改为永不消费跨运行 bak（保全语义优先），
-	// 替代 R38 的「运行开始即清理」——该清理会毁掉三-1 保全的唯一恢复副本。
+	// 陈旧.bak 原样保留： 1.1 改为永不消费跨运行 bak（保全语义优先），
+	// 替代 「运行开始即清理」——该清理会毁掉三-1 保全的唯一恢复副本。
 	bakData, err := os.ReadFile(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"))
 	if err != nil || string(bakData) != "# 两版本前的 overrides\nSecRuleARCustom 1" {
-		t.Fatalf("stale zz-user-overrides.conf.bak=%q,%v, want preserved（R39 1.1）", bakData, err)
+		t.Fatalf("stale zz-user-overrides.conf.bak=%q,%v, want preserved", bakData, err)
 	}
 }
 
-// TestRestoreBackup_degenerateRulesBakSkipped 验证 R49 B-N2(b)：rules.bak 不
+// TestRestoreBackup_degenerateRulesBakSkipped 验证：rules.bak 不
 // 含任何 .conf 文件（空/退化树——如旧版本备份拷贝中途失败留下的部分树）时
 // restoreBackup 拒绝消费：live 规则树原样保留，WAF 不会被静默削弱；退化
 // .bak 留在原地供排查，setup 还原不受影响。
@@ -316,11 +321,13 @@ func TestRestoreBackup_degenerateRulesBakSkipped(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.conf"), "# clobbered")
 
 	// When 尝试还原备份
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（守卫——守卫之后仍由退化门拦截）
+	m.setupBakCreated = true // 本运行已创建 setup.bak
 	m.restoreBackup()
 
 	// Then live 规则树未被退化 bak 替换，退化 bak 留在原地（未消费）
 	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf")); err != nil {
-		t.Fatal("live rules must be untouched when rules.bak is degenerate (R49 B-N2)")
+		t.Fatal("live rules must be untouched when rules.bak is degenerate")
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak")); err != nil {
 		t.Fatal("degenerate rules.bak should be left in place (not consumed)")
@@ -332,7 +339,7 @@ func TestRestoreBackup_degenerateRulesBakSkipped(t *testing.T) {
 	}
 }
 
-// TestRestoreBackup_moveTreeFailureKeepsLiveIntact 验证 R49 B-N2(c)：
+// TestRestoreBackup_moveTreeFailureKeepsLiveIntact 验证
 // moveTree(rules.bak→rules) 失败时 live 规则树不得为空——旧实现先
 // RemoveAll(rulesPath) 再搬移，搬移失败即 live 全空、WAF 静默全关。修复后
 // 先把 live 挪到 rules.old，搬移失败时清理残影并挪回，live 永不落空。
@@ -350,6 +357,7 @@ func TestRestoreBackup_moveTreeFailureKeepsLiveIntact(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule init")
 
 	// When 尝试还原备份且搬移失败
+	m.rulesBakCreated = true // 本运行已创建 rules.bak
 	m.restoreBackup()
 
 	// Then live 规则树从 rules.old 完整挪回（无 bak 残影混入），rules.old 被
@@ -405,7 +413,7 @@ func TestCRSUpdateRun_installsStockSetupWhenNoneExists(t *testing.T) {
 
 // TestRestoreBackup_restoresSetupAndLeavesArtifactsWithoutBak 验证无 overrides
 // 备份标记（本次运行未写 overrides）时，restoreBackup 不动 overrides 与 stock
-// 基线（R37 S3：恢复只撤销本次迁移的写入）。
+// 基线。
 func TestRestoreBackup_restoresSetupAndLeavesArtifactsWithoutBak(t *testing.T) {
 	// Given backups in place, clobbered live files, and migration artifacts
 	m := newTestCRSManager(t)
@@ -418,6 +426,8 @@ func TestRestoreBackup_restoresSetupAndLeavesArtifactsWithoutBak(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.stock.conf"), "# stock")
 
 	// When the backup is restored
+	m.rulesBakCreated = true // 本运行已创建 rules.bak
+	m.setupBakCreated = true // 本运行已创建 setup.bak
 	m.restoreBackup()
 
 	// Then rules and setup are back and the backups consumed
@@ -451,7 +461,7 @@ func TestRestoreBackup_restoresSetupAndLeavesArtifactsWithoutBak(t *testing.T) {
 }
 
 // TestRestoreBackup_restoresPreexistingOverridesFromBak 验证 overrides 在更新前
-// 已存在（.bak 有内容）时，restoreBackup 恢复更新前内容并消费 .bak（R37 S3）。
+// 已存在（.bak 有内容）时，restoreBackup 恢复更新前内容并消费.bak。
 func TestRestoreBackup_restoresPreexistingOverridesFromBak(t *testing.T) {
 	// Given backups in place, clobbered live files, and a content .bak
 	m := newTestCRSManager(t)
@@ -463,7 +473,7 @@ func TestRestoreBackup_restoresPreexistingOverridesFromBak(t *testing.T) {
 	writeTestFile(t, crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"), "# 更新前 overrides\nSecRuleARCustom 1")
 
 	// When the backup is restored
-	m.overridesBakCreated = true // 本运行已创建 bak（R39 1.1）：内容 .bak 可被消费
+	m.overridesBakCreated = true // 本运行已创建 bak：内容.bak 可被消费
 	m.restoreBackup()
 
 	// Then the overrides file is back to its pre-update content and the .bak consumed
@@ -477,7 +487,7 @@ func TestRestoreBackup_restoresPreexistingOverridesFromBak(t *testing.T) {
 }
 
 // TestRestoreBackup_removesFreshlyCreatedOverrides 验证 overrides 由本次迁移新建
-// （空 .bak 标记）时，restoreBackup 删除该文件——恢复后的配置与更新前一致（R37 S3）。
+// （空.bak 标记）时，restoreBackup 删除该文件——恢复后的配置与更新前一致。
 func TestRestoreBackup_removesFreshlyCreatedOverrides(t *testing.T) {
 	// Given backups in place, clobbered live files, and an empty .bak marker
 	m := newTestCRSManager(t)
@@ -489,7 +499,7 @@ func TestRestoreBackup_removesFreshlyCreatedOverrides(t *testing.T) {
 	writeTestFile(t, crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"), "")
 
 	// When the backup is restored
-	m.overridesBakCreated = true // 本运行已创建 bak（R39 1.1）：空标记可被消费
+	m.overridesBakCreated = true // 本运行已创建 bak：空标记可被消费
 	m.restoreBackup()
 
 	// Then the freshly created overrides file is removed
@@ -498,5 +508,41 @@ func TestRestoreBackup_removesFreshlyCreatedOverrides(t *testing.T) {
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak")); !os.IsNotExist(err) {
 		t.Fatal("zz-user-overrides.conf.bak should be consumed")
+	}
+}
+
+// 写序不变量：stock 基线先写、生效 setup 后写（两步各自原子，崩溃只会落在
+// 两者之间）。反向序残留「新 setup + 旧 stock」，下次迁移把上游默认行当自定义
+// 行写入 overrides → 重复 SecRule id → 更新永久失败。两文件内容同源，运行期
+// 无法从终态区分顺序，故以源码注册序钉住；同时钉住 stock-first 残留态的
+// 迁移语义（只保用户自定义行）。
+func TestSwapCRSTreeFromStaging_writesStockBeforeSetup(t *testing.T) {
+	fn := serviceFunctionFromFile(t, "crsinstall.go", "swapCRSTreeFromStaging")
+	order := crsStockSetupWriteOrder(fn)
+	if len(order) != 2 || order[0] != "stockPath" || order[1] != "setupPath" {
+		t.Fatalf("copyFile calls=%v, want real AST order stockPath → setupPath", order)
+	}
+}
+
+// stock-first 残留态的迁移语义：新 stock 中存在的上游默认行不得进入
+// overrides（重复 SecRule id 会让 coraza 拒绝配置再生成），用户自定义行保留。
+// 注释行（旧 stock 头部）随 diff 进入 overrides 无害（coraza 忽略注释）。
+func TestExtractSetupDiff_stockFirstResidualKeepsOnlyUserLines(t *testing.T) {
+	newStock := []string{"# new default", `SecAction "id:900001,phase:1,pass"`}
+	oldSetup := []string{"# old default", `SecAction "id:900001,phase:1,pass"`, `SecAction "id:900999,phase:1,pass,setvar:'tx.custom=1'"`}
+	got := extractSetupDiff(newStock, oldSetup)
+	for _, line := range got {
+		if strings.Contains(line, "id:900001") {
+			t.Fatalf("diff=%v 含上游默认行（重复应用会撞 SecRule id）", got)
+		}
+	}
+	custom := 0
+	for _, line := range got {
+		if strings.Contains(line, "id:900999") {
+			custom++
+		}
+	}
+	if custom != 1 {
+		t.Fatalf("diff=%v, want 恰含 1 条用户自定义行（id:900999）", got)
 	}
 }

@@ -6,7 +6,7 @@
           <el-icon class="title-icon"><Notebook /></el-icon>
           规则集
         </h2>
-        <p class="page-desc">管理 WAF 规则来源：OWASP CRS 规则库、IP 地理库、威胁情报库、自定义规则与 IP 地址列表</p>
+        <p class="page-desc">管理 WAF 规则来源：OWASP CRS 规则库、IP 地理库、威胁情报库、爬虫地址库、自定义规则与 IP 地址列表</p>
       </div>
     </div>
 
@@ -39,19 +39,25 @@
         <el-table-column label="版本" width="120">
           <template #default="{ row }"><span class="lib-version">{{ row.version }}</span></template>
         </el-table-column>
-        <el-table-column label="条目数" width="110" align="right">
+        <!-- 本列对 CRS/威胁/爬虫是条目数，对 IP 地理库是库文件大小——
+             列名必须两义都覆盖，否则字节数会被读成条目数 -->
+        <el-table-column label="数量 / 大小" width="120" align="right">
           <template #default="{ row }"><span class="lib-count">{{ row.count }}</span></template>
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <!-- 失败 hover 长文案已撤（2026-09-25 用户裁定）：用户直接看更新日志，
                  状态标签自身已表达失败态 -->
-            <el-tag :type="crsStatusTagType(row.status)" size="small" effect="light">{{ crsStatusLabel(row.status) }}</el-tag>
+            <el-tag v-if="row.status" :type="libraryStatusTagType(row.status)" size="small" effect="light">{{ libraryStatusLabel(row.status) }}</el-tag>
+            <span v-else class="text-secondary">—</span>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
           <template #default="{ row }">
-            <el-switch :model-value="row.autoUpdate" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleLibAutoUpdate(row, v)" />
+            <!-- 库状态读取失败/首次响应未落地时开关态不可信——显示「—」并禁用，
+                 不得按本地默认 true 冒充「已开启」 -->
+            <span v-if="!row.autoUpdateKnown" class="text-secondary" title="库状态未知（读取失败），开关态不可信">—</span>
+            <el-switch v-else :model-value="row.autoUpdate" :loading="autoUpdateSaving.has(row.key)" :disabled="isReadOnly || isSlaveNode || autoUpdateSaving.has(row.key)" @change="(v: string | number | boolean) => toggleLibAutoUpdate(row as LibRow, v === true)" />
           </template>
         </el-table-column>
         <el-table-column v-if="!isSlaveNode" label="上次更新" width="150">
@@ -62,7 +68,7 @@
         </el-table-column>
         <el-table-column label="操作" width="170" align="center">
           <template #default="{ row }">
-            <el-button size="small" link type="primary" @click="openLibDialog(row)">更新详情</el-button>
+            <el-button size="small" link type="primary" @click="openLibDialog(row as LibRow)">更新详情</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -71,6 +77,15 @@
       </div>
     </el-card>
 
+    <el-alert v-if="rulesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>{{ rules.length === 0 ? 'CRS 规则文件加载失败，「暂无规则文件」不代表真实状态' : 'CRS 规则文件加载失败：当前显示的是上次成功结果（与分页/搜索条件不符）' }}</span>
+          <el-button link type="danger" :loading="loadingRules" @click="fetchRules">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card>
       <el-tabs v-model="activeTab">
         <el-tab-pane label="CRS 规则" name="rules">
@@ -78,7 +93,7 @@
             <el-input v-model="searchQuery" placeholder="搜索规则文件名或分类" clearable :prefix-icon="Search" class="search-input" @clear="searchRules" @keyup.enter="searchRules" />
           </div>
           <el-table :data="rules" v-loading="loadingRules" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="" @row-click="openRuleContent" style="cursor: pointer">
-            <template #empty><el-empty description="暂无规则文件" :image-size="60" /></template>
+            <template #empty><el-empty :description="rulesLoadError ? '加载失败，请重试' : '暂无规则文件'" :image-size="60" /></template>
             <el-table-column prop="filename" label="文件名" min-width="320" show-overflow-tooltip />
             <el-table-column prop="category" label="分类" width="160">
               <template #default="{ row }"><el-tag size="small" effect="plain" type="info">{{ row.category }}</el-tag></template>
@@ -98,25 +113,49 @@
           </div>
         </el-tab-pane>
       <el-tab-pane label="自定义规则" name="custom">
+            <el-alert v-if="customRulesError || usersError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+              <template #title>
+                <div class="polling-error-title">
+                  <span>{{ customRulesError ? '自定义规则加载失败：表格为空不代表没有规则' : '用户名册加载失败：更新者列显示为 -（规则数据不受影响）' }}</span>
+                  <el-button link type="danger" :loading="loadingCustom" @click="retryCustomRules">立即重试</el-button>
+                </div>
+              </template>
+            </el-alert>
             <div class="table-toolbar">
               <el-button v-if="!isReadOnly" type="primary" :icon="Plus" @click="openRuleDialog()">新建规则</el-button>
             </div>
             <el-table :data="customRulesPaged" v-loading="loadingCustom" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
-            <template #empty><el-empty description="暂无自定义规则" :image-size="60" /></template>
+            <template #empty>
+              <el-empty v-if="!customRulesError" description="暂无自定义规则" :image-size="60" />
+              <span v-else class="text-secondary">加载失败</span>
+            </template>
             <el-table-column prop="name" label="规则名称" min-width="150">
               <template #default="{ row }">
-                <el-link type="primary" @click="openRuleDialog(row)">{{ row.name }}</el-link>
+                <AccessibleLink type="primary" @click="openRuleDialog(row as CustomRule)">{{ row.name }}</AccessibleLink>
               </template>
             </el-table-column>
             <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
-            <el-table-column label="条件" min-width="250">
+            <!-- 条件关系（AND/OR）独立成窄列：与条件内容同列时标签挤占文本宽度，
+                 长正则被压成折行/错位（2026-10-27 用户裁定）。 -->
+            <el-table-column label="条件关系" width="140" align="center">
               <template #default="{ row }">
-                <el-tag v-for="(cond, i) in row.conditions" :key="i" size="small" effect="plain" style="margin-right: 4px;">{{ cond.target }} {{ cond.operator }} {{ cond.pattern }}</el-tag>
+                <el-tag size="small" effect="light" :type="row.condition_logic === 'or' ? 'warning' : 'info'">{{ row.condition_logic === 'or' ? '任一满足（OR）' : '同时满足（AND）' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="条件" min-width="320" class-name="rule-cond-cell">
+              <template #default="{ row }">
+                <!-- 逐条单行 chip：长正则省略 + tooltip 全文，多条按行排布不挤压
+                     （样式在 styles/main.css 的 .cond-chip-list/.cond-chip） -->
+                <div class="cond-chip-list">
+                  <el-tooltip v-for="cond in row.conditions" :key="`${cond.target} ${cond.header_name ?? ''} ${cond.operator} ${cond.pattern}`" :content="`${conditionTargetLabel(cond.target, cond.header_name)} ${cond.operator} ${cond.pattern}`" placement="top" :show-after="200">
+                    <el-tag size="small" effect="plain" class="cond-chip">{{ conditionTargetLabel(cond.target, cond.header_name) }} {{ cond.operator }} {{ cond.pattern }}</el-tag>
+                  </el-tooltip>
+                </div>
               </template>
             </el-table-column>
             <el-table-column label="动作" width="80" align="center">
               <template #default="{ row }">
-                <!-- W2：三态映射与编辑器（拦截/仅记录/放行计分）语义对齐——
+                <!-- 三态映射与编辑器（拦截/仅记录/放行计分）语义对齐——
                      pass 会累加异常分参与 949 评分拦截，与 log（仅记录）不可混示 -->
                 <el-tag :type="customActionView(row.action).type" size="small" effect="light">{{ customActionView(row.action).label }}</el-tag>
               </template>
@@ -134,8 +173,8 @@
             </el-table-column>
             <el-table-column label="操作" width="140" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" link type="primary" @click="openRuleDialog(row)">{{ isReadOnly ? '查看' : '编辑' }}</el-button>
-                <el-button size="small" link type="danger" :disabled="isReadOnly" @click="deleteCustomRule(row)">删除</el-button>
+                <el-button size="small" link type="primary" @click="openRuleDialog(row as CustomRule)">{{ isReadOnly ? '查看' : '编辑' }}</el-button>
+                <el-button size="small" link type="danger" :disabled="isReadOnly" @click="deleteCustomRule(row as CustomRule)">删除</el-button>
             </template>
             </el-table-column>
           </el-table>
@@ -144,16 +183,28 @@
           </div>
         </el-tab-pane>
         <el-tab-pane label="IP 地址列表" name="ip-lists">
+            <el-alert v-if="ipListsError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+              <template #title>
+                <div class="polling-error-title">
+                  <span>IP 地址列表加载失败：表格为空不代表没有名单</span>
+                  <el-button link type="danger" :loading="loadingIpLists" @click="retryIpLists">立即重试</el-button>
+                </div>
+              </template>
+            </el-alert>
           <div class="table-toolbar ip-list-toolbar">
             <el-input v-model="ipListSearch" placeholder="搜索名称或分类" clearable :prefix-icon="Search" class="search-input" />
             <el-button v-if="!isReadOnly" type="primary" :icon="Plus" @click="openIpListDialog()">新建列表</el-button>
           </div>
           <el-table :data="ipListsPaged" v-loading="loadingIpLists" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
-            <template #empty><el-empty description="暂无 IP 地址列表" :image-size="60" /></template>
+            <template #empty>
+              <el-empty v-if="!ipListsError" description="暂无 IP 地址列表" :image-size="60" />
+              <span v-else class="text-secondary">加载失败</span>
+            </template>
             <el-table-column prop="name" label="名称" min-width="150">
               <template #default="{ row }">
-                <el-link type="primary" @click="openIpListDialog(row)">{{ row.name }}</el-link>
-                <el-tag v-if="row.system" size="small" type="warning" effect="plain" style="margin-left: 6px;">内置</el-tag>
+                <AccessibleLink type="primary" @click="openIpListDialog(row as IPListRow)">{{ row.name }}</AccessibleLink>
+                <el-tag v-if="row.preset_autoban" size="small" type="danger" effect="plain" style="margin-left: 6px;">自动封禁</el-tag>
+                <el-tag v-else-if="row.system" size="small" type="warning" effect="plain" style="margin-left: 6px;">内置</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="分类" width="120" align="center">
@@ -162,14 +213,20 @@
                 <template v-else>—</template>
               </template>
             </el-table-column>
-            <el-table-column label="条目数" width="90" align="center">
-              <template #default="{ row }">{{ row.entry_count }}</template>
+            <el-table-column label="条目数" width="100" align="center">
+              <template #default="{ row }">
+                {{ row.entry_count }}
+                <el-tooltip v-if="row.preset_autoban" content="含已到期条目：到期即自动解封，此处为名单总条数（含待清理的到期项）" placement="top">
+                  <el-icon class="count-tip"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </template>
             </el-table-column>
             <el-table-column label="引用" width="90" align="center">
               <template #default="{ row }">
-                <el-tooltip v-if="row.ref_policies.length > 0" placement="top" popper-class="ip-list-refs-popper" :popper-options="popperViewportSafe">
+                <el-tooltip v-if="row.ref_policies.length > 0 || row.trusted_proxy_referenced" placement="top" popper-class="ip-list-refs-popper" :popper-options="popperViewportSafe">
                   <template #content>
-                    <div v-for="p in row.ref_policies" :key="p.id">{{ p.name }}</div>
+                    <div v-for="p in row.ref_policies" :key="p.id">{{ p.name }}<template v-if="!p.enabled">（已禁用，不阻止删除）</template></div>
+                    <div v-if="row.trusted_proxy_referenced">{{ row.trusted_proxy_scope || '受信代理网段' }}</div>
                   </template>
                   <span>{{ row.ref_count }}</span>
                 </el-tooltip>
@@ -184,8 +241,8 @@
             </el-table-column>
             <el-table-column label="操作" width="140" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" link type="primary" @click="openIpListDialog(row)">{{ isReadOnly || row.system ? '查看' : '编辑' }}</el-button>
-                <el-button v-if="!row.system" size="small" link type="danger" :disabled="isReadOnly" @click="deleteIpList(row)">删除</el-button>
+                <el-button size="small" link type="primary" @click="openIpListDialog(row as IPListRow)">{{ isReadOnly || (row.system && !row.preset_autoban) ? '查看' : '编辑' }}</el-button>
+                <el-button v-if="!row.system" size="small" link type="danger" :disabled="isReadOnly" @click="deleteIpList(row as IPListRow)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -196,26 +253,39 @@
       </el-tabs>
     </el-card>
 
-    <el-dialog v-model="contentDialogVisible" :title="currentFilename" width="min(900px, 94vw)" top="5vh">
-      <div v-loading="loadingContent"><SyntaxHighlight :content="currentContent" language="apacheconf" /></div>
+    <el-dialog v-model="contentDialogVisible" width="min(900px, 94vw)" top="5vh">
+      <template #header>
+        <DialogHeader :icon="Notebook" title="规则文件预览" :subtitle="currentFilename" />
+      </template>
+      <DialogSectionHeader title="规则内容" />
+      <div v-loading="loadingContent" class="dialog-panel dialog-panel--flush"><SyntaxHighlight :content="currentContent" language="apacheconf" /></div>
     </el-dialog>
 
-    <el-dialog v-model="ruleDialogVisible" width="min(760px, 94vw)" class="custom-rule-dialog" top="6vh">
+    <el-dialog v-model="ruleDialogVisible" width="min(880px, 94vw)" class="custom-rule-dialog" top="6vh" :close-on-click-modal="false" :close-on-press-escape="!savingRule" :show-close="!savingRule">
       <template #header>
         <DialogHeader :icon="Filter" :title="editingRuleId ? (isReadOnly ? '查看自定义规则' : '编辑自定义规则') : '新建自定义规则'"
-          subtitle="按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件为 AND 关系" tone="danger" />
+          subtitle="按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件可同时满足或任一满足" tone="danger" />
       </template>
-      <el-form :model="ruleForm" label-width="80px" label-position="right" :disabled="isReadOnly">
+      <el-form :model="ruleForm" label-width="80px" label-position="right" :disabled="isReadOnly || savingRule">
+        <!-- 值与后端写侧门同源（internal/handlers/security.go：名称 ≤100 rune、
+             描述 ≤500 rune）——超长只能等 400 的旧形态没有字段级定位 -->
         <el-form-item label="名称" required>
-          <el-input v-model="ruleForm.name" placeholder="规则名称" />
+          <el-input v-model="ruleForm.name" placeholder="规则名称" :maxlength="SECURITY_NAME_MAX_RUNES" show-word-limit />
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="ruleForm.description" placeholder="规则描述" />
+          <el-input v-model="ruleForm.description" placeholder="规则描述" :maxlength="SECURITY_DESCRIPTION_MAX_RUNES" show-word-limit />
+        </el-form-item>
+        <el-form-item label="条件关系" for="radio---7">
+          <input type="text" id="radio---7" aria-hidden="true" tabindex="-1" autocomplete="off" style="display:none">
+          <el-radio-group v-model="ruleForm.condition_logic" aria-label="条件关系">
+            <el-radio value="and">同时满足（AND）</el-radio>
+            <el-radio value="or">任一满足（OR）</el-radio>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="条件">
           <div style="width: 100%">
             <div v-for="(cond, idx) in ruleForm.conditions" :key="idx" class="rule-condition-row">
-              <el-select v-model="cond.target" style="width: 120px" size="small">
+              <el-select v-model="cond.target" style="width: 120px" size="small" @change="onConditionTargetChange(cond)">
                 <el-option label="请求路径" value="uri" />
                 <el-option label="请求参数" value="args" />
                 <el-option label="请求头" value="headers" />
@@ -228,32 +298,55 @@
                 <el-option label="完全匹配" value="equals" />
                 <el-option label="前缀匹配" value="starts_with" />
               </el-select>
+              <el-input
+                v-if="cond.target === 'headers'"
+                v-model="cond.header_name"
+                class="header-name-input"
+                placeholder="头名，如 Content-Encoding"
+                size="small"
+                maxlength="64"
+                :class="{ 'is-error': !headerNameSaveAllowed(cond.header_name) }"
+              />
               <div class="pattern-col">
                 <div class="pattern-input-row">
-                  <el-input v-model="cond.pattern" :placeholder="patternPlaceholder(cond)" size="small" :class="{ 'is-error': cond.operator === 'regex' && !isValidRegex(cond.pattern) }" />
+                  <el-input v-model="cond.pattern" :placeholder="patternPlaceholder(cond)" size="small" :class="{ 'is-error': (cond.operator === 'regex' && !isValidRegex(cond.pattern)) || patternOverLimit(cond.pattern) }" />
                   <el-icon v-if="cond.operator === 'regex' && !isValidRegex(cond.pattern)" class="regex-error-icon"><WarningFilled /></el-icon>
+                  <el-icon v-else-if="patternOverLimit(cond.pattern)" class="regex-error-icon"><WarningFilled /></el-icon>
                 </div>
+                <!-- 与后端写侧门同口径：4KiB 按 UTF-8 字节计（中文字符 3 字节），
+                     按字符数看不出超限，故给出实时字节数 -->
+                <div v-if="patternOverLimit(cond.pattern)" class="form-tip-line port-warning">
+                  匹配内容不能超过 {{ CUSTOM_RULE_MAX_PATTERN_BYTES }} 字节（当前 {{ patternByteLength(cond.pattern) }} 字节）
+                </div>
+                <div v-if="cond.target === 'body'" class="form-tip-line">
+                  匹配请求体解析后的参数值（JSON 请求体按扁平化键值匹配，如嵌套字段取其值；不支持跨键的原始 JSON 语法匹配）
+                </div>
+                <div v-else-if="cond.target === 'headers' && cond.header_name" class="form-tip-line">
+                  仅匹配头「{{ cond.header_name }}」的值；留空头名则匹配全部头的值
+                </div>
+              </div>
+              <el-button link type="danger" size="small" :disabled="isReadOnly || savingRule" @click="removeCondition(idx)">删除</el-button>
                 <div v-if="cond.target === 'user_agent'" class="preset-section">
-                  <div class="preset-header" @click="uaCollapsed[idx] = !uaCollapsed[idx]">
+                  <button type="button" class="preset-header" :aria-expanded="!uaCollapsed[idx]" @click="uaCollapsed[idx] = !uaCollapsed[idx]">
                     <span class="preset-toggle">{{ uaCollapsed[idx] ? '▶' : '▼' }} 快捷标签</span>
-                  </div>
+                  </button>
                   <div v-show="!uaCollapsed[idx]" class="preset-tags-block">
                     <div v-for="g in UA_PRESET_GROUPS" :key="g.label" class="preset-group">
                       <span class="preset-group-label">{{ g.label }}</span>
                       <div class="preset-group-tags">
-                        <el-tag v-for="t in g.values" :key="t.value" size="small" effect="plain" class="preset-tag" @click="cond.pattern = t.value">{{ t.label }}</el-tag>
+                        <el-tag v-for="t in g.values" :key="t.value" size="small" effect="plain" class="preset-tag" role="button" tabindex="0" @click="cond.pattern = t.value" @keydown.enter.prevent="activateOnce($event, () => { cond.pattern = t.value })" @keydown.space.prevent="activateOnce($event, () => { cond.pattern = t.value })">{{ t.label }}</el-tag>
                       </div>
                     </div>
-                    <div class="preset-hint">标签写入真实 UA 片段（contains 精确匹配，区分大小写）</div>
+                    <div class="info-note-bar"><span class="info-note-desc">标签写入真实 UA 片段（contains 精确匹配，区分大小写）</span></div>
                   </div>
                 </div>
                 <div v-if="cond.operator === 'regex'" class="preset-section">
-                  <div class="preset-header" @click="regexCollapsed[idx] = !regexCollapsed[idx]">
+                  <button type="button" class="preset-header" :aria-expanded="!regexCollapsed[idx]" @click="regexCollapsed[idx] = !regexCollapsed[idx]">
                     <span class="preset-toggle">{{ regexCollapsed[idx] ? '▶' : '▼' }} 正则模板与测试</span>
-                  </div>
+                  </button>
                   <div v-show="!regexCollapsed[idx]" class="regex-extras">
                     <div class="regex-presets">
-                      <el-link v-for="p in REGEX_PRESETS" :key="p.label" type="primary" underline="never" class="regex-preset-link" @click="cond.pattern = p.value">{{ p.label }}</el-link>
+                      <el-button v-for="p in REGEX_PRESETS" :key="p.label" link type="primary" size="small" class="regex-preset-link" @click="cond.pattern = p.value">{{ p.label }}</el-button>
                     </div>
                     <div class="regex-tester">
                       <el-input v-model="regexTestStrings[idx]" placeholder="输入测试字符串" size="small" class="regex-test-input" />
@@ -261,17 +354,20 @@
                     </div>
                   </div>
                 </div>
-              </div>
-              <el-button link type="danger" size="small" :disabled="isReadOnly" @click="removeCondition(idx)">删除</el-button>
             </div>
-            <el-button v-if="!isReadOnly" size="small" type="primary" plain class="add-condition-btn" @click="ruleForm.conditions.push({ target: 'uri', operator: 'contains', pattern: '' })">
-              + 添加条件
-            </el-button>
+            <div class="add-condition-row">
+              <el-button v-if="!isReadOnly" size="small" type="primary" plain class="add-condition-btn" :disabled="!canAddCondition(ruleForm.conditions.length) || savingRule" @click="ruleForm.conditions.push({ target: 'uri', operator: 'contains', pattern: '' })">
+                + 添加条件
+              </el-button>
+              <!-- 条件数上限与后端 customRuleMaxConditions 同源：超出只能提交后吃 400 -->
+              <span class="form-tip-inline">{{ ruleForm.conditions.length }}/{{ CUSTOM_RULE_MAX_CONDITIONS }}</span>
+            </div>
           </div>
         </el-form-item>
         <!-- 原生表单行（2026-10-11 用户裁定：对齐统一走 el-form-item；Firefox
              label-for 控制台告警为 EP 上游已知形态，非用户可见） -->
-        <el-form-item label="动作">
+        <el-form-item label="动作" for="radio---8">
+          <input type="text" id="radio---8" aria-hidden="true" tabindex="-1" autocomplete="off" style="display:none">
           <el-radio-group v-model="ruleForm.action" aria-label="动作">
             <el-radio value="block">拦截</el-radio>
             <el-radio value="log">仅记录</el-radio>
@@ -294,54 +390,86 @@
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="ruleDialogVisible = false">取消</el-button>
-        <el-button type="primary" :disabled="isReadOnly" :loading="savingRule" @click="saveCustomRule">保存</el-button>
+        <el-button :disabled="savingRule" @click="ruleDialogVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="isReadOnly || savingRule" :loading="savingRule" @click="saveCustomRule">保存</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="ipListDialogVisible" width="min(900px, 94vw)" class="ip-list-dialog" top="6vh">
+    <el-dialog v-model="ipListDialogVisible" width="min(900px, 94vw)" class="ip-list-dialog" top="6vh" :close-on-click-modal="false" :close-on-press-escape="!savingIpList" :show-close="!savingIpList">
       <template #header>
         <DialogHeader :icon="List" :title="editingIpListId ? (ipListDialogReadOnly ? '查看 IP 地址列表' : '编辑 IP 地址列表') : '新建 IP 地址列表'"
           subtitle="可复用 IP/CIDR 集合，供安全策略引用（黑白名单 / 信任名单）" />
       </template>
-      <el-form :model="ipListForm" label-width="80px" label-position="right" :disabled="ipListDialogReadOnly" v-loading="loadingIpListDetail">
+      <div v-if="ipListDetailFailed" class="info-note-bar">
+        <span class="info-note-desc">名单条目加载失败：为避免以空条目覆盖原列表，保存与条目增删/导入已禁用；请先重新加载。</span>
+        <el-button size="small" type="primary" plain @click="reloadIpListDetail">重新加载</el-button>
+      </div>
+      <el-form :model="ipListForm" label-width="80px" label-position="right" v-loading="loadingIpListDetail" :disabled="savingIpList">
+        <!-- 自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
+             前端直接禁用灰态——禁止修改的字段不可输入，而非提交后报 400 -->
         <el-form-item label="名称" required>
-          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit />
+          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset || savingIpList" />
         </el-form-item>
         <el-form-item label="分类">
-          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%">
+          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%" :disabled="ipListDialogReadOnly || editingIpListPreset || savingIpList">
             <el-option v-for="c in IP_LIST_CATEGORIES" :key="c" :label="c" :value="c" />
           </el-select>
           <div class="form-tip-line">预设分类可直接选择，也可自定义（≤32 字符）</div>
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit />
+          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset || savingIpList" />
         </el-form-item>
         <el-form-item label="条目" required>
           <div class="entries-block">
-            <el-table :data="ipListEntriesPaged" size="small" max-height="360" empty-text="">
+            <div class="entries-head-bar">
+              <DialogSectionHeader title="名单条目" />
+            <div v-if="ipListForm.entries.length > 0" class="ip-query-bar">
+              <el-input v-model="ipListQueryInput" placeholder="输入 IP 或关键词" clearable size="small" class="ip-query-input" @keyup.enter="applyIpListQuery" @clear="clearIpListQuery" />
+              <el-radio-group v-model="ipListQueryMode" size="small">
+                <el-radio-button value="cidr">CIDR 匹配</el-radio-button>
+                <el-radio-button value="fuzzy">模糊搜索</el-radio-button>
+              </el-radio-group>
+              <el-button type="primary" size="small" :disabled="!ipListQueryInput.trim()" @click="applyIpListQuery">搜索</el-button>
+            </div>
+            </div>
+            <div class="dialog-panel dialog-panel--flush">
+              <el-table :data="ipListEntriesPaged" size="small" max-height="360" empty-text="">
               <template #empty><el-empty description="暂无条目，点击下方按钮添加" :image-size="50" /></template>
-              <el-table-column label="#" width="70" align="right">
-                <template #default="{ $index }"><span class="ip-entry-index">{{ ipListEntryPageStart + $index + 1 }}</span></template>
+              <el-table-column label="#" width="50" align="right">
+                <template #default="{ $index }"><span class="ip-entry-index">{{ (ipListPagedIndexes[$index] ?? 0) + 1 }}</span></template>
               </el-table-column>
-              <el-table-column label="IP / CIDR" min-width="260">
+              <el-table-column label="IP / CIDR" min-width="230">
                 <template #default="{ row }">
                   <span v-if="ipListDialogReadOnly" class="ip-entry-text">{{ row.value }}</span>
-                  <el-input v-else v-model="row.value" placeholder="如 192.168.1.0/24" size="small" :class="{ 'ip-entry-invalid': !isValidCidr(row.value) }" />
+                  <el-input v-else v-model="row.value" placeholder="如 192.168.1.0/24" size="small" :class="{ 'is-error': !isValidCidr(row.value) }" />
                 </template>
               </el-table-column>
-              <el-table-column label="备注" min-width="160">
+              <el-table-column label="备注" min-width="140">
                 <template #default="{ row }">
                   <span v-if="ipListDialogReadOnly" class="ip-entry-text">{{ row.remark }}</span>
                   <el-input v-else v-model="row.remark" placeholder="可选备注" size="small" maxlength="100" />
                 </template>
               </el-table-column>
-              <el-table-column v-if="!ipListDialogReadOnly" label="" width="80" align="center">
+              <!-- 自动封禁名单条目展示加入时间/剩余（到期时间由剩余列表达；删除条目即解封）-->
+              <template v-if="editingIpListPreset">
+                <el-table-column label="加入时间" width="170" align="center" class-name="ip-entry-created">
+                  <template #default="{ row }">{{ formatDate(row.created_at) || '—' }}</template>
+                </el-table-column>
+                <el-table-column label="剩余时长" width="90" align="center">
+                  <template #default="{ row }">
+                    <el-tag v-if="!row.expires_at" size="small" effect="plain" type="info">永久</el-tag>
+                    <el-tag v-else-if="autobanEntryExpired(row.expires_at)" size="small" effect="plain" type="info">已到期</el-tag>
+                    <span v-else class="text-secondary">{{ autobanEntryRemaining(row.expires_at) }}</span>
+                  </template>
+                </el-table-column>
+              </template>
+              <el-table-column v-if="!ipListDialogReadOnly" label="" width="60" align="center">
                 <template #default="{ $index }">
-                  <el-button link type="danger" size="small" @click="removeIpListEntry(ipListEntryPageStart + $index)">删除</el-button>
+                  <el-button link type="danger" size="small" :disabled="savingIpList" @click="removeIpListEntry(ipListPagedIndexes[$index] ?? -1)">删除</el-button>
                 </template>
               </el-table-column>
-            </el-table>
+              </el-table>
+            </div>
             <div v-if="ipListForm.entries.length > ipListEntryPageSize" class="entries-pagination">
               <el-pagination
                 v-model:current-page="ipListEntryPage"
@@ -352,29 +480,54 @@
               />
             </div>
             <div class="entries-toolbar">
-              <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain @click="addIpListEntry">
+              <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed || savingIpList" @click="addIpListEntry">
                 + 添加条目
               </el-button>
               <div class="entries-toolbar-right">
-                <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain @click="triggerImportEntries">导入</el-button>
+                <el-button v-if="!ipListDialogReadOnly" size="small" type="primary" plain :disabled="ipListDetailFailed || savingIpList" @click="triggerImportEntries">导入</el-button>
                 <el-button size="small" type="primary" plain @click="exportIpListEntries">导出</el-button>
               </div>
             </div>
             <input ref="importEntriesInput" type="file" accept=".txt,.csv" class="entries-import-input" @change="onImportEntriesFileChange" />
-            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 500 条，全站列表总数上限 200 个，格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
+            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 {{ IP_LIST_MAX_ENTRIES }} 条（已到期条目不计入），用户创建的名单最多 200 个（内置名单不占额度），格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
           </div>
         </el-form-item>
       </el-form>
       <template #footer>
         <template v-if="ipListDialogReadOnly">
-          <el-button @click="ipListDialogVisible = false">关闭</el-button>
+          <el-button :disabled="savingIpList" @click="ipListDialogVisible = false">关闭</el-button>
         </template>
         <template v-else>
-          <el-button @click="ipListDialogVisible = false">取消</el-button>
-          <el-button type="primary" :loading="savingIpList" @click="saveIpList">保存</el-button>
+          <el-button :disabled="savingIpList" @click="ipListDialogVisible = false">取消</el-button>
+          <el-tooltip v-if="ipListDetailFailed" content="名单条目加载失败：保存会以空条目覆盖列表，已禁用；请重试加载" placement="top">
+            <span>
+              <el-button type="primary" disabled>保存</el-button>
+            </span>
+          </el-tooltip>
+
+          <el-button v-else type="primary" :loading="savingIpList" :disabled="!canSaveIpList(loadingIpListDetail, ipListDetailFailed)" @click="saveIpList">保存</el-button>
         </template>
       </template>
     </el-dialog>
+
+<!-- 导入重复条目弹窗（点导入即判定，不写表不执行导入）：简易样式 -->
+<el-dialog v-model="importDuplicateVisible" title="导入条目重复" width="min(640px, 94vw)" append-to-body :close-on-click-modal="false">
+  <el-table :data="importDuplicates" size="small" max-height="300">
+    <el-table-column label="行号" width="70" align="center">
+      <template #default="{ row }">{{ row.lineNo }}</template>
+    </el-table-column>
+    <el-table-column label="地址 / CIDR" min-width="180">
+      <template #default="{ row }"><span class="ip-entry-mono">{{ row.value }}</span></template>
+    </el-table-column>
+    <el-table-column label="该行备注" min-width="160">
+      <template #default="{ row }">{{ row.remark || '—' }}</template>
+    </el-table-column>
+  </el-table>
+  <div class="info-note-bar"><span class="info-note-desc">重复 {{ importDuplicates.length }} 条导入时跳过（以 IP 为准，同 IP 不同备注按首条为准）；其余新条目已渲染到下方条目列表，保存后生效{{ pendingInvalidCount ? `；另有 ${pendingInvalidCount} 条非法行跳过（第 ${pendingInvalidLineNos} 行）` : '' }}。</span></div>
+  <template #footer>
+    <el-button type="primary" @click="importDuplicateVisible = false">知道了</el-button>
+  </template>
+</el-dialog>
 
     <el-dialog
       v-model="updateDialogVisible"
@@ -391,13 +544,17 @@
         :days="crsInfo.schedule_days"
         :time="crsInfo.schedule_time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="crsScheduleHint"
         :saving="savingCRSSchedule"
         :tz="scheduleTz"
         @save="saveCRSSchedule"
       />
-      <div ref="updateLogRef" class="update-log-container">
-        <pre v-if="updateLog" class="update-log-content">{{ updateLog }}</pre>
-        <el-empty v-else description="暂无更新日志" :image-size="60" />
+      <DialogSectionHeader title="更新日志" />
+      <div class="dialog-panel dialog-panel--flush">
+        <div ref="updateLogRef" class="update-log-container">
+          <pre v-if="updateLog" class="update-log-content">{{ updateLog }}</pre>
+          <el-empty v-else description="暂无更新日志" :image-size="60" />
+        </div>
       </div>
       <template #footer>
         <div style="display: flex; align-items: center;">
@@ -419,17 +576,56 @@
       <template #header>
         <DialogHeader :icon="Location" title="更新 IP 库" subtitle="IP2Region 地理归属数据库的更新任务与更新日志" tone-class="lib-icon--ip" />
       </template>
+
+      <DialogSectionHeader title="数据源" />
+      <div class="dialog-panel dialog-panel--flush library-sources-panel">
+        <el-table :data="ip2regionSourceRows" size="small" class="threat-source-table">
+          <el-table-column label="来源" min-width="260">
+            <template #default="{ row }">
+              <div class="lib-name-text">
+                <div class="lib-name-main">{{ row.name }}</div>
+                <div v-if="row.sub" class="lib-name-sub">{{ row.sub }}</div>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="条目数" width="100" align="right">
+            <template #default="{ row }">{{ row.entries ? formatInt(row.entries) : '—' }}</template>
+          </el-table-column>
+          <el-table-column label="版本" width="110">
+            <template #default="{ row }"><span class="lib-version">{{ row.version || '未更新' }}</span></template>
+          </el-table-column>
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tag v-if="!row.enabled" type="info" size="small" effect="light">已关闭</el-tag>
+              <el-tag v-else :type="ip2regionSourceTagType(row.status)" size="small" effect="light">{{ ip2regionSourceLabel(row.status) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="自动更新" width="90" align="center">
+            <template #default="{ row }">
+              <el-switch v-if="row.kind === 'v4'" :model-value="row.enabled" :disabled="isReadOnly || isSlaveNode" @change="(v: string | number | boolean) => toggleLibAutoUpdate({ key: 'ip2region', name: 'IP 地理库' } as LibRow, v === true)" />
+              <el-switch v-else :model-value="row.enabled" :disabled="isReadOnly || isSlaveNode || savingIP2RegionV6" :loading="savingIP2RegionV6" @change="(v: string | number | boolean) => toggleIP2RegionV6(v === true)" />
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <div v-if="ip2regionInfo.v6_enabled && ip2regionInfo.v6_message" class="dialog-panel ip2region-sources"><span class="info-note-bar"><span class="info-note-desc">{{ ip2regionInfo.v6_message }}</span></span></div>
+
       <RuleLibScheduleEditor
         :days="ip2regionInfo.schedule_days"
         :time="ip2regionInfo.schedule_time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="ip2regionScheduleHint"
         :saving="savingIP2RegionSchedule"
         :tz="scheduleTz"
         @save="saveIP2RegionSchedule"
       />
-      <div ref="ip2regionUpdateLogRef" class="update-log-container">
-        <pre v-if="ip2regionUpdateLog" class="update-log-content">{{ ip2regionUpdateLog }}</pre>
-        <el-empty v-else description="暂无更新日志" :image-size="60" />
+
+      <DialogSectionHeader title="更新日志" />
+      <div class="dialog-panel dialog-panel--flush">
+        <div ref="ip2regionUpdateLogRef" class="update-log-container">
+          <pre v-if="ip2regionUpdateLog" class="update-log-content">{{ ip2regionUpdateLog }}</pre>
+          <el-empty v-else description="暂无更新日志" :image-size="60" />
+        </div>
       </div>
       <template #footer>
         <div style="display: flex; align-items: center;">
@@ -451,7 +647,9 @@
       <template #header>
         <DialogHeader :icon="Aim" title="更新威胁情报库" subtitle="三个内置恶意 IP 源的更新任务与更新日志" tone-class="lib-icon--threat" />
       </template>
-      <el-table :data="threatSources" size="small" class="threat-source-table">
+      <DialogSectionHeader title="威胁情报来源" />
+      <div class="dialog-panel dialog-panel--flush library-sources-panel">
+        <el-table :data="threatSources" size="small" class="threat-source-table">
         <el-table-column label="来源" min-width="260">
           <!-- 标题加粗 + 更新地址次行（与规则库表格「名称+描述」两行同构，
                2026-09-24 用户裁定替代独立更新地址列） -->
@@ -463,33 +661,39 @@
           </template>
         </el-table-column>
         <el-table-column label="条目数" width="100" align="right">
-          <template #default="{ row }">{{ row.entry_count ? row.entry_count.toLocaleString() : '—' }}</template>
+          <template #default="{ row }">{{ row.entry_count ? formatInt(row.entry_count) : '—' }}</template>
         </el-table-column>
         <el-table-column label="版本" width="110">
           <template #default="{ row }"><span class="lib-version">{{ row.version || '未更新' }}</span></template>
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="crsStatusTagType(row.update_status)" size="small" effect="light">{{ crsStatusLabel(row.update_status) }}</el-tag>
+            <el-tag v-if="!row.update_enabled" type="info" size="small" effect="light">已关闭</el-tag>
+            <el-tag v-else :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
           <template #default="{ row }">
-            <el-switch v-model="row.update_enabled" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleThreatFlag(row, 'update_enabled', v)" />
+            <el-switch v-model="row.update_enabled" :loading="sourceFlagPending('threat', row.id)" :disabled="isReadOnly || isSlaveNode || sourceFlagPending('threat', row.id)" @change="(v: string | number | boolean) => toggleThreatFlag(row as ThreatSource, v === true)" />
           </template>
         </el-table-column>
-      </el-table>
+        </el-table>
+      </div>
       <RuleLibScheduleEditor
         :days="threatSchedule.days"
         :time="threatSchedule.time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="threatScheduleHint"
         :saving="savingThreatSchedule"
         :tz="scheduleTz"
         @save="saveThreatSchedule"
       />
-      <div ref="threatUpdateLogRef" class="update-log-container update-log-container--compact">
-        <pre v-if="threatUpdateLog" class="update-log-content">{{ threatUpdateLog }}</pre>
-        <el-empty v-else description="暂无更新日志" :image-size="60" />
+      <DialogSectionHeader title="更新日志" />
+      <div class="dialog-panel dialog-panel--flush">
+        <div ref="threatUpdateLogRef" class="update-log-container update-log-container--compact">
+          <pre v-if="threatUpdateLog" class="update-log-content">{{ threatUpdateLog }}</pre>
+          <el-empty v-else description="暂无更新日志" :image-size="60" />
+        </div>
       </div>
       <template #footer>
         <div style="display: flex; align-items: center;">
@@ -500,26 +704,110 @@
       </template>
     </el-dialog>
 
+    <el-dialog
+      v-model="crawlerUpdateDialogVisible"
+      width="min(900px, 94vw)"
+      top="8vh"
+      destroy-on-close
+      @opened="onCrawlerUpdateDialogOpened"
+      @closed="onCrawlerUpdateDialogClosed"
+    >
+      <template #header>
+        <DialogHeader :icon="Link" title="爬虫地址更新" subtitle="四个官方爬虫 IP 源的更新任务与更新日志" tone-class="lib-icon--crawler" />
+      </template>
+      <DialogSectionHeader title="爬虫地址来源" />
+      <div class="dialog-panel dialog-panel--flush library-sources-panel">
+        <el-table :data="crawlerSources" size="small" class="threat-source-table">
+        <el-table-column label="来源" min-width="260">
+          <template #default="{ row }">
+            <div class="lib-name-text">
+              <div class="lib-name-main">{{ row.display_name }}</div>
+              <div class="lib-name-sub threat-source-url">{{ row.url }}</div>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="条目数" width="100" align="right">
+          <template #default="{ row }">{{ row.entry_count ? formatInt(row.entry_count) : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="版本" width="110">
+          <template #default="{ row }"><span class="lib-version">{{ row.version || '未更新' }}</span></template>
+        </el-table-column>
+        <el-table-column label="状态" width="110">
+          <template #default="{ row }">
+            <el-tag v-if="!row.update_enabled" type="info" size="small" effect="light">已关闭</el-tag>
+            <el-tag v-else :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="自动更新" width="90" align="center">
+          <template #default="{ row }">
+            <el-switch v-model="row.update_enabled" :loading="sourceFlagPending('crawler', row.id)" :disabled="isReadOnly || isSlaveNode || sourceFlagPending('crawler', row.id)" @change="(v: string | number | boolean) => toggleCrawlerFlag(row as ThreatSource, v === true)" />
+          </template>
+        </el-table-column>
+        </el-table>
+      </div>
+      <RuleLibScheduleEditor
+        :days="crawlerSchedule.days"
+        :time="crawlerSchedule.time"
+        :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="crawlerScheduleHint"
+        :saving="savingCrawlerSchedule"
+        :tz="scheduleTz"
+        @save="saveCrawlerSchedule"
+      />
+      <DialogSectionHeader title="更新日志" />
+      <div class="dialog-panel dialog-panel--flush">
+        <div ref="crawlerUpdateLogRef" class="update-log-container update-log-container--compact">
+          <pre v-if="crawlerUpdateLog" class="update-log-content">{{ crawlerUpdateLog }}</pre>
+          <el-empty v-else description="暂无更新日志" :image-size="60" />
+        </div>
+      </div>
+      <template #footer>
+        <div style="display: flex; align-items: center;">
+          <LogStorageBar log-key="crawlerbot_update" style="margin-right: auto" />
+          <el-button @click="crawlerUpdateDialogVisible = false">关闭</el-button>
+          <el-button v-if="!crawlerUpdateRunning" type="primary" :disabled="isReadOnly || isSlaveNode" :loading="startingCrawlerUpdate" @click="confirmCrawlerUpdate">立即更新</el-button>
+        </div>
+      </template>
+    </el-dialog>
+
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
-import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled } from '@element-plus/icons-vue'
+import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled, Link, InfoFilled } from '@element-plus/icons-vue'
+import LogStorageBar from '@/components/LogStorageBar.vue'
 import { formatDate } from '@/utils/date'
-import { compareVersion, IP_LIST_CATEGORIES} from '@/utils/securityStages'
+import { autobanEntryExpired, autobanEntryRemaining } from '@/utils/autobanEntry'
+import { IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
+import { crsRuleCountLabel, libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
+import { updaterName } from '@/utils/updaterName'
+import { hasOwn } from '@/utils/hasOwn'
+import { SECURITY_DESCRIPTION_MAX_RUNES, SECURITY_NAME_MAX_RUNES } from '@/utils/securityLimits'
+import { DEEP_LINK_PARAMS } from '@/utils/deepLink'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import DialogSectionHeader from '@/components/DialogSectionHeader.vue'
+import AccessibleLink from '@/components/common/AccessibleLink.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
+import { formatInt } from '@/utils/formatInt'
 import { showSaveResult } from '@/utils/saveResult'
-import { isValidCidr } from '@/utils/ruleValidation'
+import { cidrContains, isValidCidr } from '@/utils/ipAddress'
+import { IP_LIST_MAX_ENTRIES, canSaveIpList, mergeConcurrentBanEntries, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
+import { CUSTOM_RULE_MAX_CONDITIONS, CUSTOM_RULE_MAX_PATTERN_BYTES, canAddCondition, conditionTargetLabel, headerNameSaveAllowed, patternByteLength, patternOverLimit } from '@/utils/customRuleLimits'
+import {formatIpListEntryLine, parseIpListEntryLine} from '@/utils/ipListCsv'
+import { computeImportOutcome } from '@/utils/ipListImport'
 import { popperViewportSafe } from '@/utils/popper'
+import { activateOnce } from '@/utils/keyboardActivate'
+import { saveBlob } from '@/utils/download'
 import { useAuthStore } from '@/stores/auth'
 
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { useLibUpdateDialog } from '@/composables/useLibUpdateDialog'
+import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import type { APIResponse, UserListItem } from '@/types'
 // —— 威胁情报库（v2.3.x 第二张规则来源卡）——
 interface ThreatSource {
@@ -530,29 +818,100 @@ interface ThreatSource {
 }
 const threatSources = ref<ThreatSource[]>([])
 const threatAutoUpdate = ref(true)
-const threatMergedCount = ref(0)
 const threatSchedule = ref({ days: [1, 2, 3, 4, 5, 6, 7] as number[], time: '04:00' })
 
 const fetchThreatLib = async () => {
+  const seq = ++threatLibInfoSeq
   try {
-    const res = await request.get<APIResponse<{ sources: ThreatSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/threat-lib')
+    // 回刷由 60s 定时与操作后补拉触发：失败态已由健康标签/排程提示承载，
+    // 不再每次失败都弹全局 toast（后端抖动期每分钟四条）。
+    const res = await request.get<APIResponse<{ sources: ThreatSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/threat-lib', { silent: true })
+    if (seq !== threatLibInfoSeq) return
     if (res.data) {
       threatSources.value = res.data.sources
-      threatMergedCount.value = res.data.total_entries
       threatAutoUpdate.value = res.data.auto_update !== false
       if (res.data.schedule_days?.length) threatSchedule.value = { days: res.data.schedule_days, time: res.data.schedule_time || '04:00' }
     }
-  } catch { /* 只读拉取失败静默（页面其余区域不受影响） */ }
+    threatLibError.value = false
+    threatLibLoaded.value = true
+  } catch {
+    if (seq !== threatLibInfoSeq) return
+    // 只读拉取失败：不打断页面，但健康标签必须显性为「加载失败」
+    threatLibError.value = true
+    threatLibLoaded.value = true
+  }
 }
 
-const toggleThreatFlag = async (row: ThreatSource, field: 'update_enabled', val: boolean) => {
-  try {
-    await request.put(`/security/threat-lib/${row.id}/flags`, { [field]: val })
-    mfaAwareSuccess('已更新')
-  } catch {
-    row[field] = !val // 失败回滚开关
+type SourceFlagLibrary = 'threat' | 'crawler'
+const sourceFlagSaving = ref(new Set<string>())
+const sourceFlagRequestSeq = new Map<string, number>()
+const sourceFlagKey = (library: SourceFlagLibrary, id: number): string => `${library}:${id}`
+const sourceFlagPending = (library: SourceFlagLibrary, id: number): boolean => sourceFlagSaving.value.has(sourceFlagKey(library, id))
+
+// 同一来源只允许一个在途写；序号保证过期失败不会回滚后续选择。
+// 回拉也留在占位期内，避免旧详情响应覆盖下一次乐观置值。
+const toggleSourceFlag = async (
+  library: SourceFlagLibrary,
+  row: ThreatSource,
+  val: boolean,
+  refresh: () => Promise<void>,
+): Promise<void> => {
+  const key = sourceFlagKey(library, row.id)
+  if (sourceFlagSaving.value.has(key)) return
+  if (!val) {
+    try {
+      await ElMessageBox.confirm(`将停止来源「${row.display_name || row.name}」的自动更新，已下载条目保留但不再自动更新。确认关闭？`, '关闭自动更新', {
+        type: 'warning', confirmButtonText: '确认关闭', cancelButtonText: '取消',
+      })
+    } catch { row.update_enabled = !val; return }
   }
-  fetchThreatLib()
+  const requestSeq = (sourceFlagRequestSeq.get(key) ?? 0) + 1
+  sourceFlagRequestSeq.set(key, requestSeq)
+  sourceFlagSaving.value.add(key)
+  try {
+    try {
+      await request.put(`/security/${library}-lib/${row.id}/flags`, { update_enabled: val })
+      mfaAwareSuccess('已更新')
+    } catch {
+      if (sourceFlagRequestSeq.get(key) === requestSeq) row.update_enabled = !val
+    }
+    await refresh()
+  } finally {
+    if (sourceFlagRequestSeq.get(key) === requestSeq) sourceFlagSaving.value.delete(key)
+  }
+}
+
+const toggleThreatFlag = async (row: ThreatSource, val: boolean): Promise<void> => {
+  await toggleSourceFlag('threat', row, val, fetchThreatLib)
+}
+
+// —— 爬虫地址库（独立源表/总闸/排程/日志，与威胁情报库完全分离）——
+type CrawlerSource = ThreatSource
+const crawlerSources = ref<CrawlerSource[]>([])
+const crawlerAutoUpdate = ref(true)
+const crawlerSchedule = ref({ days: [1, 2, 3, 4, 5, 6, 7] as number[], time: '04:00' })
+
+const fetchCrawlerLib = async () => {
+  const seq = ++crawlerLibInfoSeq
+  try {
+    const res = await request.get<APIResponse<{ sources: CrawlerSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/crawler-lib', { silent: true })
+    if (seq !== crawlerLibInfoSeq) return
+    if (res.data) {
+      crawlerSources.value = res.data.sources
+      crawlerAutoUpdate.value = res.data.auto_update !== false
+      if (res.data.schedule_days?.length) crawlerSchedule.value = { days: res.data.schedule_days, time: res.data.schedule_time || '04:00' }
+    }
+    crawlerLibError.value = false
+    crawlerLibLoaded.value = true
+  } catch {
+    if (seq !== crawlerLibInfoSeq) return
+    crawlerLibError.value = true
+    crawlerLibLoaded.value = true
+  }
+}
+
+const toggleCrawlerFlag = async (row: CrawlerSource, val: boolean): Promise<void> => {
+  await toggleSourceFlag('crawler', row, val, fetchCrawlerLib)
 }
 
 // —— 规则库统一表（v2.3.2）：CRS/IP2Region/威胁三源五行同一口径 ——
@@ -566,6 +925,9 @@ interface LibRow {
   count: string
   status: string
   autoUpdate: boolean
+  // 读取失败/首次响应未落地时 autoUpdate 是本地默认值而非库值——
+  // 开关必须显示「未知」并禁用，不得冒充「已开启」。
+  autoUpdateKnown: boolean
   lastChecked: string
   nextUpdate: string
 }
@@ -574,42 +936,72 @@ const libRows = computed<LibRow[]>(() => {
   const rows: LibRow[] = [
     {
       key: 'crs', icon: Lock, iconClass: 'lib-icon--crs', name: 'CRS 规则库', sub: 'OWASP Core Rule Set',
-      version: crsInfo.value.available === false ? '未安装' : (crsInfo.value.version || '—'),  // 缺失态文案与 IP 库统一「未安装」（2026-09-24 用户裁定）
-      count: total.value ? total.value.toLocaleString() + ' 文件' : '—',
-      status: crsInfo.value.available === false ? 'missing' : crsInfo.value.update_status,
+      // 读取失败时版本/条目显示 —（行保留，不冒充默认值）
+      version: crsInfoError.value ? '—' : crsInfo.value.available === false ? '未安装' : (crsInfo.value.version || '—'),  // 缺失态文案与 IP 库统一「未安装」（2026-09-24 用户裁定）
+      // 库容量=GET /security/crs 的 rule_count（服务端全量）；分页 total 只反映
+      // 当前搜索条件下的结果集，二者不可共用。
+      // rule_count 是 SecRule 指令条数（后端 countSecRules 只数 SecRule 行），
+      // 不是文件数——文案必须是「条规则」（单源 crsRuleCountLabel，有行为测试）。
+      count: crsInfoError.value ? '—' : crsRuleCountLabel(crsInfo.value.rule_count),
+      autoUpdateKnown: !crsInfoError.value && crsInfoLoaded.value,
+      status: crsInfoError.value ? 'failed' : crsInfo.value.available === false ? 'missing' : crsInfo.value.update_status,
       autoUpdate: crsInfo.value.auto_update,
       lastChecked: formatDate(crsInfo.value.last_checked) || '—',
       nextUpdate: formatDate(crsInfo.value.next_update) || '—',
     },
     {
       key: 'ip2region', icon: Location, iconClass: 'lib-icon--ip', name: 'IP 地理库', sub: 'IP 地理归属数据库',
-      version: ip2regionInfo.value.available === false ? '未安装' : ip2regionVersionLabel.value,
-      count: ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' && ip2regionInfo.value.version !== 'bundled' ? ip2regionInfo.value.db_size.toLocaleString() : '—',
-      status: ip2regionInfo.value.available === false ? 'missing' : (ip2regionStatusForTag.value === 'not-installed' ? 'idle' : ip2regionStatusForTag.value),
+      version: ip2regionInfoError.value ? '—' : ip2regionInfo.value.available === false ? '未安装' : ip2regionVersionLabel.value,
+      // db_size 是库文件字节数——必须带单位（B/KB/MB）呈现，不得让
+      // 用户把字节数读成条目数（条目口径见「数量/大小」列名的「大小」段）。
+      count: !ip2regionInfoError.value && ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' ? formatSize(ip2regionInfo.value.db_size) : '—',
+      autoUpdateKnown: !ip2regionInfoError.value && ip2regionInfoLoaded.value,
+      status: ip2regionInfoError.value ? 'failed' : ip2regionInfo.value.available === false ? 'missing' : ip2regionStatusForTag.value,
       autoUpdate: ip2regionInfo.value.auto_update,
       lastChecked: formatDate(ip2regionInfo.value.last_checked) || '—',
       nextUpdate: formatDate(ip2regionInfo.value.next_update) || '—',
     },
   ]
-  // 威胁情报库=父行（三源为子集）：版本=最近更新日期，条目=三源合计，
-  // 状态聚合（任一失败>更新中>成功>未更新），开关=全开/全关。
-  if (threatSources.value.length > 0) {
-    const srcs = threatSources.value
-    const totalEntries = srcs.reduce((sum, x) => sum + x.entry_count, 0)
-    const latestVersion = srcs.map(x => x.version).filter(Boolean).sort(compareVersion).pop() || ''
-    const anyFailed = srcs.find(x => x.update_status === 'failed')
-    const anyRunning = srcs.some(x => x.update_status === 'running')
-    const status = anyRunning ? 'running' : anyFailed ? 'failed' : latestVersion ? 'success' : 'idle'
+  // 威胁情报库与爬虫地址库共用「多源聚合成一行」单源
+  // 与安全总览同一实现（utils/securityLibraries），空源/无版本为 never（未更新），
+  // 不再折叠为 idle「已最新」。
+  // 零源也出占位行（状态「未配置」）：卡头健康标签已显示未配置，缺行会让用户
+  // 找不到该库的更新详情/排程入口（行消失=入口消失）。首次响应未落地前不出行。
+  const summarize = (srcs: ThreatSource[]) => summarizeLibrarySources(srcs, formatDate)
+  if (threatLibError.value || threatLibLoaded.value) {
+    const configured = threatSources.value.length > 0
+    const summary = threatLibError.value
+      ? { totalEntries: 0, latestVersion: '', status: 'failed', lastChecked: '—', nextUpdate: '—' }
+      : summarize(threatSources.value)
     rows.push({
       key: 'threat', icon: Aim, iconClass: 'lib-icon--threat',
       name: '威胁情报库',
-      sub: 'IP 威胁名单，可被黑名单策略引用',  // 来源明细见「更新详情」弹框（2026-09-24：名称列收窄后三源名折行断词，撤）
-      version: latestVersion || '未更新',
-      count: totalEntries > 0 ? totalEntries.toLocaleString() + ' 条' : '—',
-      status,
+      sub: 'IP 威胁名单，可被黑名单策略引用',
+      version: configured ? (summary.latestVersion || '未更新') : '—',
+      count: configured && summary.totalEntries > 0 ? formatInt(summary.totalEntries) + ' 条' : '—',
+      status: threatLibError.value ? 'failed' : configured ? summary.status : 'not-configured',
       autoUpdate: threatAutoUpdate.value,
-      lastChecked: srcs.map(x => formatDate(x.last_checked)).filter(Boolean).sort().pop() || '—',
-      nextUpdate: srcs.map(x => formatDate(x.next_update)).filter(Boolean).sort().shift() || '—',
+      autoUpdateKnown: threatLibLoaded.value && !threatLibError.value,
+      lastChecked: configured ? summary.lastChecked : '—',
+      nextUpdate: configured ? summary.nextUpdate : '—',
+    })
+  }
+  if (crawlerLibError.value || crawlerLibLoaded.value) {
+    const configured = crawlerSources.value.length > 0
+    const summary = crawlerLibError.value
+      ? { totalEntries: 0, latestVersion: '', status: 'failed', lastChecked: '—', nextUpdate: '—' }
+      : summarize(crawlerSources.value)
+    rows.push({
+      key: 'crawler', icon: Link, iconClass: 'lib-icon--crawler',
+      name: '爬虫地址库',
+      sub: 'Google/OpenAI/Bing/360 官方爬虫 IP 段',
+      version: configured ? (summary.latestVersion || '未更新') : '—',
+      count: configured && summary.totalEntries > 0 ? formatInt(summary.totalEntries) + ' 条' : '—',
+      status: crawlerLibError.value ? 'failed' : configured ? summary.status : 'not-configured',
+      autoUpdate: crawlerAutoUpdate.value,
+      autoUpdateKnown: crawlerLibLoaded.value && !crawlerLibError.value,
+      lastChecked: configured ? summary.lastChecked : '—',
+      nextUpdate: configured ? summary.nextUpdate : '—',
     })
   }
   return rows
@@ -618,53 +1010,63 @@ const libRows = computed<LibRow[]>(() => {
 // 卡头库健康标签组（2026-09-24 用户裁定）：逐库彩色标签，异常 danger/
 // 正常 success；缺库（后端渲染层已停用全部安全规则，见
 // SecurityLibrariesAvailable）时模板追加红色警示后缀。
-const libHealthTags = computed<Array<{ label: string; type: 'success' | 'danger' | 'warning' }>>(() => {
-  const tags: Array<{ label: string; type: 'success' | 'danger' | 'warning' }> = [
-    crsInfo.value.available === false
-      ? { label: 'CRS 规则库 · 缺失', type: 'danger' }
-      : { label: 'CRS 规则库 · 正常', type: 'success' },
-    ip2regionInfo.value.available === false
-      ? { label: 'IP 地理库 · 缺失', type: 'danger' }
-      : { label: 'IP 地理库 · 正常', type: 'success' },
-  ]
-  // FR66-3：running 分支补齐（与 libRows 聚合同口径——running 优先于 failed）：
-  // 任一源更新中显示「更新中」warning，不再误标「正常」
-  const threatUpdating = threatSources.value.some(x => x.update_status === 'running')
-  const threatFail = threatSources.value.filter(x => x.update_status === 'failed').length
-  tags.push(threatUpdating
-    ? { label: '威胁情报库 · 更新中', type: 'warning' }
-    : threatFail > 0
-      ? { label: `威胁情报库 · ${threatFail} 源更新失败`, type: 'warning' }
-      : { label: '威胁情报库 · 正常', type: 'success' })
-  return tags
-})
+const libHealthTags = computed(() => [
+  // 健康标签单源（utils/securityLibraries）——IP 库未安装时
+  // 显示「未安装」警示，不再与版本列「未安装」/状态列「已最新」互相矛盾。
+  libraryHealthTag('CRS 规则库', {
+    // 首次响应未落地不得冒充「正常」——loaded 三态
+    loaded: crsInfoLoaded.value,
+    loadError: crsInfoError.value,
+    available: crsInfo.value.available,
+    status: crsInfoError.value ? 'failed' : crsInfo.value.update_status,
+  }),
+  libraryHealthTag('IP 地理库', {
+    loaded: ip2regionInfoLoaded.value,
+    loadError: ip2regionInfoError.value,
+    available: ip2regionInfo.value.available,
+    status: ip2regionInfoError.value ? 'failed' : ip2regionStatusForTag.value,
+  }),
+  librarySourceHealthTag('威胁情报库', threatSources.value, threatLibError.value, threatLibLoaded.value),
+  librarySourceHealthTag('爬虫地址库', crawlerSources.value, crawlerLibError.value, crawlerLibLoaded.value),
+])
 const libSummaryWarn = computed(() => crsInfo.value.available === false || ip2regionInfo.value.available === false)
 
-// 自动更新开关：按行分发到三个库的既有端点（开关状态以服务端为准，
-// 失败由对应 fetch 回滚）。
-const toggleLibAutoUpdate = (row: LibRow, val: boolean) => {
-  if (row.key === 'crs') {
-    crsInfo.value.auto_update = val
-    toggleAutoUpdate(val)
-  } else if (row.key === 'ip2region') {
-    ip2regionInfo.value.auto_update = val
-    toggleIP2RegionAutoUpdate(val)
-  } else if (row.key === 'threat') {
-    // 父开关=任务级总闸（整任务启停）；逐源微调在更新弹框内（update_enabled
-    // 决定任务更新哪些源）——两者解耦，不再逐源循环写（曾连弹三次提示）。
-    toggleThreatAutoUpdate(val)
-  }
+// 自动更新开关：按行分发到四个库的既有端点。统一乐观置值 + 在途标记
+// （此前威胁/爬虫要等响应才置值，点击后开关纹丝不动，用户会重复点击）。
+const autoUpdateSaving = ref(new Set<string>())
+const applyLibAutoUpdate = async (key: string, val: boolean): Promise<void> => {
+  if (key === 'crs') await request.put('/security/crs/auto-update', { auto_update: val })
+  else if (key === 'ip2region') await request.put('/security/ip2region/auto-update', { auto_update: val })
+  else if (key === 'threat') await request.put('/security/threat-lib/auto-update', { auto_update: val })
+  else if (key === 'crawler') await request.put('/security/crawler-lib/auto-update', { auto_update: val })
 }
-
-// 任务级总闸开关（单次写 + 单次提示）。
-const toggleThreatAutoUpdate = async (val: boolean) => {
+const toggleLibAutoUpdate = async (row: LibRow, val: boolean): Promise<void> => {
+  if (autoUpdateSaving.value.has(row.key)) return
+  if (!val) {
+    try {
+      await ElMessageBox.confirm(`将停止「${row.name}」的自动更新，当前版本保留但不再自动更新。确认关闭？`, '关闭自动更新', {
+        type: 'warning', confirmButtonText: '确认关闭', cancelButtonText: '取消',
+      })
+    } catch { return }
+  }
+  autoUpdateSaving.value.add(row.key)
+  const previous = row.autoUpdate
+  setLibAutoUpdateShown(row.key, val)
   try {
-    await request.put('/security/threat-lib/auto-update', { auto_update: val })
-    threatAutoUpdate.value = val
+    await applyLibAutoUpdate(row.key, val)
     mfaAwareSuccess('已更新')
   } catch {
-    fetchThreatLib() // 失败回滚显示值
+    // 失败回滚显示值（服务端为准；各库 fetch 亦会回填）
+    setLibAutoUpdateShown(row.key, previous)
+  } finally {
+    autoUpdateSaving.value.delete(row.key)
   }
+}
+const setLibAutoUpdateShown = (key: string, val: boolean): void => {
+  if (key === 'crs') crsInfo.value.auto_update = val
+  else if (key === 'ip2region') ip2regionInfo.value.auto_update = val
+  else if (key === 'threat') threatAutoUpdate.value = val
+  else if (key === 'crawler') crawlerAutoUpdate.value = val
 }
 
 // 更新/日志按钮：打开对应库的更新弹框（autoStart=false 时仅查看日志）。
@@ -675,11 +1077,13 @@ const openLibDialog = (row: LibRow) => {
     manualIP2RegionUpdate()
   } else if (row.key === 'threat') {
     threatDialog.open()
+  } else if (row.key === 'crawler') {
+    crawlerDialog.open()
   }
 }
 
 
-// —— 威胁库更新弹框（useLibUpdateDialog 统一范式，F62-11；状态/日志拉取失败静默，与原实现一致）——
+// 威胁库更新弹框（useLibUpdateDialog 统一范式，；状态/日志拉取失败静默，与原实现一致）——
 const threatUpdateLogRef = ref<HTMLDivElement | null>(null)
 const threatDialog = useLibUpdateDialog<ThreatUpdateInfo>({
   apiPrefix: '/security/threat-lib',
@@ -699,12 +1103,35 @@ const {
   onClosed: onThreatUpdateDialogClosed,
   confirmUpdate: confirmThreatUpdate,
 } = threatDialog
+
+// —— 爬虫地址库独立更新弹框（同一 composable，独立状态/日志/轮询会话）——
+const crawlerUpdateLogRef = ref<HTMLDivElement | null>(null)
+const crawlerDialog = useLibUpdateDialog<ThreatUpdateInfo>({
+  apiPrefix: '/security/crawler-lib',
+  logContainer: crawlerUpdateLogRef,
+  isRunning: (info) => info?.running === true,
+  isFinished: (info) => info.running !== true,
+  isSuccess: (info) => info.outcome === 'success',
+  onSuccess: fetchCrawlerLib,
+  onOpen: () => { ensureScheduleTz() },
+})
+const {
+  visible: crawlerUpdateDialogVisible,
+  logs: crawlerUpdateLog,
+  updating: crawlerUpdateRunning,
+  starting: startingCrawlerUpdate,
+  onOpened: onCrawlerUpdateDialogOpened,
+  onClosed: onCrawlerUpdateDialogClosed,
+  confirmUpdate: confirmCrawlerUpdate,
+} = crawlerDialog
 interface CRSRuleFile { filename: string; category: string; size: number; updated_at: string }
-interface CustomRuleCondition { target: string; operator: string; pattern: string }
-interface CustomRule { id: number; name: string; description: string; conditions: CustomRuleCondition[]; action: string; score: number; enabled: boolean; updated_at: string; updated_by: number }
-interface IPListEntry { value: string; remark: string }
-interface IPListRefPolicy { id: number; name: string }
-interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_policies: IPListRefPolicy[]; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean }
+interface CustomRuleCondition { target: string; operator: string; pattern: string; header_name?: string }
+interface CustomRule { id: number; name: string; description: string; conditions: CustomRuleCondition[]; condition_logic: 'and' | 'or'; action: string; score: number; enabled: boolean; updated_at: string; updated_by: number }
+// 自动封禁名单条目携带加入时间/到期时间（UTC 墙钟串，formatDate 消费）
+interface IPListEntry { value: string; remark: string; created_at?: string; expires_at?: string }
+// enabled=引用策略的启用态：禁用策略的引用只作展示（不阻止删除，409 门只计启用）
+interface IPListRefPolicy { id: number; name: string; enabled: boolean }
+interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_count_enabled?: number; ref_policies: IPListRefPolicy[]; trusted_proxy_referenced?: boolean; trusted_proxy_scope?: string; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean; preset_autoban?: boolean }
 interface CRSUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface IP2RegionUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface ThreatUpdateInfo { running: boolean; trigger: string; started_at: string; finished_at: string; outcome: string }
@@ -714,39 +1141,93 @@ const isSlaveNode = computed(() => authStore.isSlaveNode)
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const users = ref<UserListItem[]>([])
-const getUpdaterName = (userId?: number) => {
-  if (!userId || userId === 0) return '-'
-  const user = users.value.find(u => u.id === userId)
-  return user?.display_name || user?.username || '-'
+// 更新者显示名走 utils/updaterName 单源
+const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
+
+const crsInfo = ref({ version: '', auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, rule_count: 0, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
+
+const ip2regionInfo = ref({ version: '', db_size: 0, auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00', v6_enabled: false, v6_version: '', v6_db_size: 0, v6_updated_at: '', v6_update_status: 'idle', v6_message: '' })
+
+// —— IPv6 数据源（单任务双源：v6 源状态/版本/开关，关闭显示「未启用」）——
+const savingIP2RegionV6 = ref(false)
+const ip2regionSourceRows = computed(() => [
+  {
+    kind: 'v4', name: 'IPv4 数据源', sub: '',
+    entries: ip2regionInfo.value.db_size,
+    version: ip2regionSourceVersion(ip2regionInfo.value.version),
+    status: ip2regionInfo.value.update_status,
+    enabled: ip2regionInfo.value.auto_update,
+  },
+  {
+    kind: 'v6', name: 'IPv6 数据源',
+    sub: ip2regionInfo.value.v6_enabled ? '' : '未启用（开启后 IPv6 客户端与 IPv4 同语义解析，关闭时按「海外」处理）',
+    entries: ip2regionInfo.value.v6_enabled ? ip2regionInfo.value.v6_db_size : 0,
+    version: ip2regionInfo.value.v6_enabled ? ip2regionSourceVersion(ip2regionInfo.value.v6_version) : '',
+    status: ip2regionInfo.value.v6_update_status,
+    enabled: ip2regionInfo.value.v6_enabled,
+  },
+])
+
+const ip2regionSourceVersion = (v: string) => {
+  if (!v || v === 'unknown') return '未安装'
+  if (v === 'bundled') return '内置版本'
+  return v
 }
-
-const crsStageLabels: Record<string, string> = {
-  running: '更新中',
-  checking: '检查更新',
-  downloading: '下载规则库',
-  installing: '安装规则库',
-  reloading: '重载配置',
-  success: '已最新',
-  failed: '更新失败',
-  idle: '已最新',
+const ip2regionSourceLabel = (status: string) => {
+  switch (status) {
+    case 'success': return '正常'
+    case 'failed': return '失败'
+    case 'cancelled': return '已取消'
+    case 'skipped': return '已跳过'
+    default: return '待更新'
+  }
 }
-const crsStatusLabel = (s: string): string => s === 'missing' ? '缺失' : (crsStageLabels[s] || s || '—')
-
-const crsStatusTagType = (s: string): 'success' | 'warning' | 'danger' | 'info' => {
-  if (s === 'missing') return 'danger'
-  if (!s || s === 'idle') return 'info'
-  if (s === 'checking' || s === 'downloading' || s === 'installing' || s === 'reloading' || s === 'running') return 'warning'
-  if (s === 'success' || s === '已最新') return 'success'
-  if (s === 'failed' || s === '更新失败') return 'danger'
-  if (s.includes('失败') || s.includes('错误')) return 'danger'
-  if (s.includes('最新')) return 'success'
-  if (s.includes('中')) return 'warning'
-  return 'info'
+const ip2regionSourceTagType = (status: string) => {
+  if (status === 'success') return 'success' as const
+  if (status === 'failed') return 'danger' as const
+  if (status === 'cancelled' || status === 'skipped') return 'warning' as const
+  return 'info' as const
 }
-
-const crsInfo = ref({ version: '', auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
-
-const ip2regionInfo = ref({ version: '', db_size: 0, auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
+const toggleIP2RegionV6 = async (val: boolean | string | number) => {
+  if (ip2regionInfo.value.v6_enabled === val) return
+  savingIP2RegionV6.value = true
+  try {
+    const res = await request.put<APIResponse<{ message?: string }>>('/security/ip2region/v6-enabled', { enabled: !!val })
+    if (res.data?.message && res.data.message !== '已更新') {
+      ElMessage.warning(res.data.message)
+    } else {
+      mfaAwareSuccess(`IPv6 地理库已${val ? '开启' : '关闭'}`)
+    }
+  } catch { /* request 层已提示；下方刷新回读权威值 */ } finally {
+    savingIP2RegionV6.value = false
+    fetchIP2RegionInfo()
+  }
+}
+// 读取失败标记：读取失败≠库缺失，更≠正常——标签与表格行都要显性
+// 表达「加载失败」，不能用默认值（available:true/空源列表）冒充正常态。
+const crsInfoError = ref(false)
+const ip2regionInfoError = ref(false)
+const threatLibError = ref(false)
+const crawlerLibError = ref(false)
+// 加载三态——首次响应落地（成功或失败）前健康标签显示「加载中」，
+// 初值 available:true/空源列表不得冒充「正常」。
+const crsInfoLoaded = ref(false)
+const ip2regionInfoLoaded = ref(false)
+const threatLibLoaded = ref(false)
+const crawlerLibLoaded = ref(false)
+// 四库信息回刷的请求序号（按库各自一条）：60s 定时回刷与用户操作后的补拉会
+// 并发，响应乱序落地会把新版本/新排程覆盖回旧值。每库只允许最新一代写回。
+let crsInfoSeq = 0
+let ip2regionInfoSeq = 0
+let threatLibInfoSeq = 0
+let crawlerLibInfoSeq = 0
+// 库信息未落地/读取失败时排程未知：编辑器禁用并显性提示，
+// 不得用默认值（周一–周日 04:00）冒充库内排程被保存覆盖。
+const SCHEDULE_UNKNOWN_HINT = '排程未知：库信息读取失败，请关闭后重新加载'
+const crsScheduleHint = computed(() => (!crsInfoLoaded.value || crsInfoError.value) ? SCHEDULE_UNKNOWN_HINT : '')
+const ip2regionScheduleHint = computed(() => (!ip2regionInfoLoaded.value || ip2regionInfoError.value) ? SCHEDULE_UNKNOWN_HINT : '')
+const threatScheduleHint = computed(() => (!threatLibLoaded.value || threatLibError.value) ? SCHEDULE_UNKNOWN_HINT : '')
+const crawlerScheduleHint = computed(() => (!crawlerLibLoaded.value || crawlerLibError.value) ? SCHEDULE_UNKNOWN_HINT : '')
 const ip2regionVersionLabel = computed(() => {
   if (ip2regionInfo.value.version === 'bundled') return '内置版本（未更新）'
   return (ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown') ? ip2regionInfo.value.version : '未安装'
@@ -770,27 +1251,30 @@ const currentFilename = ref('')
 const currentContent = ref('')
 
 const customRules = ref<CustomRule[]>([])
+// 列表加载失败显性化（原空 catch，失败与「暂无自定义规则」不可区分）
+const customRulesError = ref(false)
 const customPage = ref(1)
 const customPageSize = ref(10)
-// 分页夹紧+切片：useClampedPagination 单一范式（第 52 轮 P5-3）——删除末页
+// 分页夹紧+切片：useClampedPagination 单一范式——删除末页
 // 末条后自动回夹，不再空页。
 const { pagedItems: customRulesPaged } = useClampedPagination(customRules, customPage, customPageSize)
 const loadingCustom = ref(false)
 const ruleDialogVisible = ref(false)
 const editingRuleId = ref<number | null>(null)
 const savingRule = ref(false)
-const ruleForm = ref({ name: '', description: '', conditions: [] as CustomRuleCondition[], action: 'block', score: 5, enabled: true })
+const ruleForm = ref({ name: '', description: '', conditions: [] as CustomRuleCondition[], condition_logic: 'and' as 'and' | 'or', action: 'block', score: 5, enabled: true })
 
-// 自定义规则动作三态视图（W2）：block=拦截 / log=仅记录 / pass=放行计分，
-// 与编辑器 radio 及后端发射语义（pass 累加异常分、log 不累分）一一对应；
-// 未知动作兜底原样展示（info），不与任何已知语义混淆。
 const CUSTOM_ACTION_VIEWS: Record<string, { label: string; type: 'danger' | 'info' | 'warning' }> = {
   block: { label: '拦截', type: 'danger' },
   log: { label: '仅记录', type: 'info' },
   pass: { label: '放行计分', type: 'warning' },
 }
+// 自定义规则动作三态视图：block=拦截 / log=仅记录 / pass=放行计分，
+// 与编辑器 radio 及后端发射语义（pass 累加异常分、log 不累分）一一对应；
+// 未知动作兜底原样展示（info），不与任何已知语义混淆。查表过 hasOwn：
+// action 来自库值，命中原型键时裸下标会把 Object.prototype 上的函数当标签渲染。
 const customActionView = (action: string): { label: string; type: 'danger' | 'info' | 'warning' } =>
-  CUSTOM_ACTION_VIEWS[action] ?? { label: action || '—', type: 'info' }
+  (hasOwn(CUSTOM_ACTION_VIEWS, action) ? CUSTOM_ACTION_VIEWS[action] : { label: action || '—', type: 'info' })
 
 // —— 可复用 IP 地址列表（第三个标签页）——
 // 分类预设：与安全策略「提取为列表」共用同一组选项
@@ -805,39 +1289,114 @@ const ipListsFiltered = computed(() => {
   if (!query) return ipLists.value
   return ipLists.value.filter((l) => l.name.toLowerCase().includes(query) || (l.category || '').toLowerCase().includes(query))
 })
-// IP 地址列表同款（第 52 轮 P3-8）：删除末页末条后自动回夹——此前仅搜索有
+// IP 地址列表同款：删除末页末条后自动回夹——此前仅搜索有
 // 复位 watch，删除路径无收敛，越界 slice 返回空数组呈空白表格。
 const { pagedItems: ipListsPaged } = useClampedPagination(ipListsFiltered, ipListPage, ipListPageSize)
 // 搜索收窄后高页码会落在空页，回到第 1 页
 watch(ipListSearch, () => { ipListPage.value = 1 })
 const ipListDialogVisible = ref(false)
 // 内置名单（威胁情报库 system=1）弹框恒只读（管理员同）——内容只读查看/导出。
-const ipListDialogReadOnly = computed(() => isReadOnly.value || editingIpListSystem.value)
+// 例外：自动封禁预置名单条目可改（手动封禁/删除条目——删除即解封，
+// 2026-10-15 用户裁定：无抑制窗口，IP 重新达标会被再次封禁）。
+const editingIpListPreset = ref(false)
+const ipListDialogReadOnly = computed(() => isReadOnly.value || (editingIpListSystem.value && !editingIpListPreset.value))
 const editingIpListId = ref<number | null>(null)
 const savingIpList = ref(false)
+// 打开弹框时服务端已有的条目值快照：保存前的最终复核据此区分「任务并发新增」
+// 与「用户在弹框里主动删除」——前者必须保留（否则提前解封），后者按用户意图移除。
+const ipListOpenSnapshot = ref<string[]>([])
 const ipListForm = ref<{ name: string; description: string; category: string; entries: IPListEntry[] }>({ name: '', description: '', category: '', entries: [] })
 
+const ipListsError = ref(false)
 const fetchIpLists = async () => {
   loadingIpLists.value = true
-  try { const res = await request.get<APIResponse<IPListRow[]>>('/security/ip-lists'); ipLists.value = res.data || [] } catch {} finally { loadingIpLists.value = false }
+  try {
+    const res = await request.get<APIResponse<IPListRow[]>>('/security/ip-lists')
+    ipLists.value = res.data || []
+    ipListsError.value = false
+  } catch {
+    ipListsError.value = true
+  } finally { loadingIpLists.value = false }
 }
+const retryIpLists = (): void => { void fetchIpLists() }
 
 const editingIpListSystem = ref(false)
 const loadingIpListDetail = ref(false)
+// 详情加载失败：entries 为空且保存可用 → 全量 PUT 会清空名单
+const ipListDetailFailed = ref(false)
+const ipListDetailRowId = ref<number | null>(null)
 const ipListEntryPage = ref(1)
 const ipListEntryPageSize = 200
-const ipListEntryPageStart = computed(() => (ipListEntryPage.value - 1) * ipListEntryPageSize)
-// 分页只切窗口（slice 共享底层数组引用——编辑直接写回 ipListForm.entries，
-// 跨页修改随保存整体提交）；只读形态纯文本渲染，万级条目不再实例化 input。
+// ── 条目查询与导入流（2026-11-02 交互重设计）──
+// 查询：CIDR 匹配与模糊搜索共用输入框+模式单选+搜索按钮（点按钮才出结果，
+// 不实时），搜索区靠右对齐；弹框打开时重置，切换列表不残留。
+const importDuplicateVisible = ref(false)
+const importDuplicates = ref<Array<{ lineNo: number; value: string; remark: string }>>([])
+const pendingInvalidCount = ref(0)
+const pendingInvalidLineNos = ref('')
+const ipListQueryInput = ref('')
+const ipListQueryMode = ref<'cidr' | 'fuzzy'>('cidr')
+const ipListQueryApplied = ref('')
+const ipListQueryAppliedMode = ref<'cidr' | 'fuzzy'>('cidr')
+
+const ipEntrySearchHit = (row: IPListEntry): boolean => {
+  if (ipListQueryApplied.value.trim() === '') return true
+  const q = ipListQueryApplied.value.trim()
+  if (ipListQueryAppliedMode.value === 'cidr') return cidrContains(row.value.trim(), q)
+  const ql = q.toLowerCase()
+  return row.value.toLowerCase().includes(ql) || row.remark.toLowerCase().includes(ql)
+}
+
+const ipListEntriesFiltered = computed(() => {
+  const rows = ipListForm.value.entries
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => ipEntrySearchHit(entry))
+  return rows
+})
+
+// 过滤后行对应的 entries 本体索引：删除与序号列必须映射回原位置
+const ipListPagedIndexes = computed(() =>
+  ipListEntriesFiltered.value.slice((ipListEntryPage.value - 1) * ipListEntryPageSize, ipListEntryPage.value * ipListEntryPageSize).map(({ index }) => index))
+
+// 分页只切窗口（映射回 entries 本体引用——编辑直接写回 ipListForm.entries）
 const ipListEntriesPaged = computed(() =>
-  ipListForm.value.entries.slice(ipListEntryPageStart.value, ipListEntryPageStart.value + ipListEntryPageSize))
+  ipListPagedIndexes.value.map((index) => ipListForm.value.entries[index]))
+
+
+const applyIpListQuery = (): void => {
+  const applied = ipListQueryInput.value.trim()
+  ipListQueryApplied.value = applied
+  ipListQueryAppliedMode.value = ipListQueryMode.value
+  ipListEntryPage.value = 1
+  const label = ipListQueryMode.value === 'cidr' ? 'CIDR 匹配' : '模糊搜索'
+  const hits = ipListEntriesFiltered.value.length
+  if (hits === 0) {
+    ElMessage.warning(`${label}：未找到匹配条目`)
+  } else {
+    mfaAwareSuccess(`${label}：命中 ${hits} 条`)
+  }
+}
+
+const clearIpListQuery = (): void => {
+  ipListQueryInput.value = ''
+  ipListQueryApplied.value = ''
+  ipListQueryAppliedMode.value = 'cidr'
+  ipListEntryPage.value = 1
+}
+
+const resetIpListQueryState = (): void => {
+  clearIpListQuery()
+  importDuplicateVisible.value = false
+  importDuplicates.value = []
+}
 
 const addIpListEntry = (): void => {
   ipListForm.value.entries.push({ value: '', remark: '' })
   ipListEntryPage.value = Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize)
 }
 
-// FE71-2：删除末页末条后页码越界会落在空页（空白表格）——splice 后回夹最大页
+// 删除末页末条后页码越界会落在空页（空白表格）——splice 后回夹最大页
+
 //（同 useClampedPagination 的 maxPage 夹紧口径，entries 切片另有共享数组注释见上）
 const removeIpListEntry = (index: number): void => {
   ipListForm.value.entries.splice(index, 1)
@@ -845,50 +1404,133 @@ const removeIpListEntry = (index: number): void => {
   if (ipListEntryPage.value > maxPage) ipListEntryPage.value = maxPage
 }
 
-// FR66-1：乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
+// 自动封禁名单弹框的到期展示 ——
+
+// 到期判定/剩余时长口径单源 utils/autobanEntry（与 IP 快捷处置弹框共用）。
+
+
+// 乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
 // 快速关开/切换名单时在途详情响应晚到，不再覆盖当前弹框（含「新建」空表单被
 // 旧名单条目覆盖的形态）
 let ipListDetailSeq = 0
 const openIpListDialog = async (row?: IPListRow) => {
   const requestSeq = ++ipListDetailSeq
   editingIpListSystem.value = row?.system === true
+  editingIpListPreset.value = row?.preset_autoban === true
   ipListEntryPage.value = 1
+  // 弹框切换/重开必须重置查询与导入暂存（2026-11-02 用户反馈：残留上一弹框输入）
+  resetIpListQueryState()
   editingIpListId.value = row?.id ?? null
   if (!row) {
     // seq 已自增：在途详情响应作废且其 finally 不再清 loading——新建表单自身
     // 复位，否则继承上一会话的 v-loading 转圈
     loadingIpListDetail.value = false
-    ipListForm.value = { name: '', description: '', category: '', entries: [{ value: '', remark: '' }] }
+    ipListDetailFailed.value = false
+    ipListDetailRowId.value = null
+    ipListForm.value = { name: '', description: '', category: '', entries: [] }
+    ipListOpenSnapshot.value = []
     ipListDialogVisible.value = true
     return
   }
   // 列表载荷不再内联 entries（大名单瘦身）——弹框按需拉详情。
   ipListForm.value = { name: row.name, description: row.description, category: row.category, entries: [] }
+  ipListDetailRowId.value = row.id
+  ipListDetailFailed.value = false
   ipListDialogVisible.value = true
   loadingIpListDetail.value = true
   try {
-    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`)
+    // 全局拦截器已 toast——本请求 silent，失败提示只用本地那条带
+    // 「已禁用保存」动作信息的文案（否则同一次失败弹两条 error）。
+    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`, { silent: true })
     if (requestSeq !== ipListDetailSeq) return
     if (res.data && ipListDialogVisible.value) {
-      ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark }))
+      // 自动封禁名单条目保留 created_at/expires_at（保存随全量写回，
+      // 任务 merge 的到期语义与弹框到期列依赖这两字段）
+      ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
+      ipListOpenSnapshot.value = ipListForm.value.entries.map((e) => e.value)
     }
   } catch {
     if (requestSeq !== ipListDetailSeq) return
-    ElMessage.error('加载列表条目失败')
+    // 失败态显性化并禁用保存：空 entries 下保存=全量清空名单
+    ipListDetailFailed.value = true
+    ElMessage.error('加载列表条目失败，已禁用保存；请重新加载')
   } finally {
     if (requestSeq === ipListDetailSeq) loadingIpListDetail.value = false
   }
 }
 
+/** 详情重试（仅重拉条目，不回填名称/分类等已在表单中的字段）。 */
+const reloadIpListDetail = async (): Promise<void> => {
+  const id = ipListDetailRowId.value
+  if (id == null) return
+  // 重试会用服务端条目整表替换：已有未保存条目（含加载成功后又失败、用户继续
+  // 补录的形态）必须先确认，不得静默丢弃。
+  if (ipListForm.value.entries.length > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `重新加载将用服务端条目覆盖当前 ${ipListForm.value.entries.length} 条（含未保存的新增/编辑），确定继续？`,
+        '重新加载确认',
+        { type: 'warning', confirmButtonText: '重新加载', cancelButtonText: '取消' },
+      )
+    } catch { return }
+  }
+  const requestSeq = ++ipListDetailSeq
+  loadingIpListDetail.value = true
+  try {
+    // 同 openIpListDialog——silent + 本地文案，避免双 toast。
+    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
+    if (requestSeq !== ipListDetailSeq) return
+    ipListForm.value.entries = (res.data?.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
+    ipListOpenSnapshot.value = ipListForm.value.entries.map((e) => e.value)
+    ipListDetailFailed.value = false
+    ipListEntryPage.value = 1
+    ElMessage.success('已加载最新条目')
+  } catch {
+    if (requestSeq !== ipListDetailSeq) return
+    ipListDetailFailed.value = true
+    ElMessage.error('加载列表条目失败，请稍后重试')
+  } finally {
+    if (requestSeq === ipListDetailSeq) loadingIpListDetail.value = false
+  }
+}
+
+/**
+ * 内置名单保存前的最终复核（保存流程里最后一个异步步骤，紧邻 PUT）：
+ * 重取详情，把「打开弹框后由任务新增、本次载荷又没有」的封禁条目原样并入载荷。
+ *
+ * 旧实现的差集发生在最后一次确认框之前——用户在该确认框停留期间新封禁的 IP 仍会
+ * 被整表替换掉（提前解封），故差集必须落到确认之后。无法核对时中止保存
+ * （fail-closed：不能拿未知状态做全表覆盖）。打开快照里的条目不计入「并发新增」，
+ * 用户主动删除的封禁仍可移除。
+ */
+const mergeFreshAutobanEntries = async (id: number, entries: IPListEntry[]): Promise<IPListEntry[] | null> => {
+  let serverEntries: IPListEntry[] = []
+  try {
+    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
+    serverEntries = res.data?.entries || []
+  } catch {
+    ElMessage.error('无法核对最新封禁条目，已中止保存（避免解封刚封禁的 IP）；请稍后重试')
+    return null
+  }
+  const merged = mergeConcurrentBanEntries(serverEntries, entries, ipListOpenSnapshot.value)
+  if (merged.preserved.length > 0) {
+    const preview = merged.preserved.slice(0, 5).join('、') + (merged.preserved.length > 5 ? ' 等' : '')
+    ElMessage.warning(`保存期间新增的 ${merged.preserved.length} 条封禁条目已保留（${preview}），不会随本次保存移除`)
+  }
+  return merged.entries
+}
+
 const saveIpList = async () => {
+  if (savingIpList.value) return
   const name = ipListForm.value.name.trim()
   if (!name) { ElMessage.warning('请输入列表名称'); return }
   if (name.length > 50) { ElMessage.warning('列表名称不能超过 50 字符'); return }
   if (ipListForm.value.category.length > 32) { ElMessage.warning('分类不能超过 32 字符'); return }
   if (ipListForm.value.description.length > 200) { ElMessage.warning('描述不能超过 200 字符'); return }
+
   // 值与备注均为空的行视为未填写的占位行，保存时静默丢弃
   const entries = ipListForm.value.entries
-    .map((e) => ({ value: e.value.trim(), remark: e.remark.trim() }))
+    .map((e) => ({ value: e.value.trim(), remark: e.remark.trim(), created_at: e.created_at || undefined, expires_at: e.expires_at || undefined }))
     .filter((e) => e.value !== '' || e.remark !== '')
   const invalidEntry = entries.find((e) => e.value === '' || !isValidCidr(e.value))
   if (invalidEntry) {
@@ -897,20 +1539,43 @@ const saveIpList = async () => {
       : '存在未填写条目值的行，请补全或删除空行')
     return
   }
-  // 允许空列表保存（第 60 轮用户裁定）：后端 validateIPListShape 不要求非空；
-  // allow 模式策略引用的清空由后端 N1 守卫 409 拦截（fail-open 防护）
-  if (entries.length > 500) { ElMessage.warning('每个列表最多 500 条条目'); return }
+  // 允许空列表保存（用户裁定）：后端 validateIPListShape 不要求非空；
+  // allow 模式策略引用的清空由后端守卫 409 拦截（fail-open 防护）
+  // 上限按**生效**条目计（与后端 validateIPListShape 及手动追加上限同口径）：
+  // 已到期条目不渲染、保存时由后端剔除，若按原始条数计，自动封禁关闭后滞留
+  // 的到期条目会把整表保存顶到上限（用户只能逐行删除）。
+  const expiredEntryCount = entries.filter((e) => !!e.expires_at && autobanEntryExpired(e.expires_at)).length
+  const activeEntryCount = entries.length - expiredEntryCount
+  if (activeEntryCount > IP_LIST_MAX_ENTRIES) { ElMessage.warning(`每个列表最多 ${IP_LIST_MAX_ENTRIES} 条生效条目（已到期条目不计入，当前 ${activeEntryCount} 条）`); return }
+  // 已有名单 + 0 条：全量 PUT 会清空——必须二次确认且文案明示
+  if (needsEmptyListConfirm(editingIpListId.value, entries.length)) {
+    try {
+      await ElMessageBox.confirm(`将清空列表「${name}」的全部条目（保存后不可恢复），确定继续？`, '清空确认', { type: 'warning', confirmButtonText: '清空并保存' })
+    } catch { return }
+  }
   const action = editingIpListId.value ? '保存' : '创建'
+  const expiredNote = expiredEntryCount > 0 ? `，其中 ${expiredEntryCount} 条已到期（保存后自动移除）` : ''
   try {
-    await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目）？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目${expiredNote}）？`, '确认', { type: 'warning' })
   } catch { return }
+  // 并发新增核对必须落在最后一次确认之后。保存占位先于复核取得，
+  // 使核对 GET 与 PUT 在途期间表单均保持冻结。
   savingIpList.value = true
   try {
+    let payloadEntries: IPListEntry[] = entries
+    if (editingIpListPreset.value && editingIpListId.value) {
+      const merged = await mergeFreshAutobanEntries(editingIpListId.value, entries)
+      if (merged === null) return
+      payloadEntries = merged
+    }
     // entries 与其余名单字段同口径：JSON 数组文本（后端 CreateIPListRequest.Entries 为 string）
-    const body = { name, description: ipListForm.value.description.trim(), category: ipListForm.value.category.trim(), entries: JSON.stringify(entries) }
+    const body = { name, description: ipListForm.value.description.trim(), category: ipListForm.value.category.trim(), entries: JSON.stringify(payloadEntries) }
     const res = editingIpListId.value
       ? await request.put(`/security/ip-lists/${editingIpListId.value}`, body)
       : await request.post('/security/ip-lists', body)
+    // 名单直编是共享条目缓存的另一写入口（此前仅 IPLocationAction
+    // 失效缓存）——不失效时策略向导/处置弹层会继续读旧条目。
+    invalidateSharedEntriesCache()
     showSaveResult(res, '保存成功'); ipListDialogVisible.value = false; fetchIpLists()
   } catch (error: unknown) {
     // 409 重名 / 400 条目非法等已由全局拦截器 toast，这里仅记录避免 unhandled rejection
@@ -920,7 +1585,7 @@ const saveIpList = async () => {
 
 const deletingIpListId = ref<number | null>(null)
 const deleteIpList = (row: IPListRow) => {
-  // 重入守卫（U9-66-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 重入守卫（同 SecurityPolicies deletingPolicyId 范式）：快速双击
   // 不再叠加双确认框→双 DELETE 误报
   if (deletingIpListId.value !== null) return
   deletingIpListId.value = row.id
@@ -928,6 +1593,8 @@ const deleteIpList = (row: IPListRow) => {
     .then(async () => {
       // 被策略引用时后端返回 409（含引用策略名的 message 由全局拦截器 toast）
       const del = await request.delete(`/security/ip-lists/${row.id}`)
+      // 删除同样使条目缓存失效。
+      invalidateSharedEntriesCache()
       showSaveResult(del, '已删除'); fetchIpLists()
     }).catch(() => { /* 用户取消:不动列表;HTTP 失败已由全局拦截器 toast */ })
     .finally(() => { deletingIpListId.value = null })
@@ -940,15 +1607,10 @@ const triggerImportEntries = (): void => {
   importEntriesInput.value?.click()
 }
 
-// 行格式：第一列 IP/CIDR，第二列备注（可空）；分隔符为半角逗号或空白（取第一段分隔，其余归入备注）
-const parseEntryLine = (line: string): { value: string; remark: string } | null => {
-  const match = line.match(/^([^,\s]+)(?:[,\s]+(.*))?$/)
-  if (!match) return null
-  const value = (match[1] ?? '').trim()
-  if (!isValidCidr(value)) return null
-  const remark = (match[2] ?? '').trim().slice(0, 100)
-  return { value, remark }
-}
+// 行格式：第一列 IP/CIDR，第二列备注（可空）；支持 CSV 双引号字段与 `""`
+// 反转义（与导出单源：utils/ipListCsv，往返一致）
+const parseEntryLine = (line: string): { value: string; remark: string } | { error: 'remark_too_long' } | null =>
+  parseIpListEntryLine(line, isValidCidr)
 
 const onImportEntriesFileChange = (event: Event): void => {
   const input = event.target as HTMLInputElement
@@ -956,40 +1618,29 @@ const onImportEntriesFileChange = (event: Event): void => {
   input.value = '' // 复位以支持再次选择同一文件
   if (!file) return
   const reader = new FileReader()
-  reader.onload = () => { importEntriesFromText(typeof reader.result === 'string' ? reader.result : '') }
+  reader.onload = () => {
+    const text = typeof reader.result === 'string' ? reader.result : ''
+    const importLines = text.split(/\r?\n/)
+      .map((l, i) => ({ no: i + 1, text: l.trim() }))
+      .filter((l) => l.text !== '')
+    const existingValues = new Set(ipListForm.value.entries.map((e) => e.value.trim()).filter((v) => v !== ''))
+    const outcome = computeImportOutcome(existingValues, importLines, (t) => parseEntryLine(t))
+    // 新条目直接渲染进条目表（跳到首个新增条目所在页）；重复条目弹窗点名
+    ipListForm.value.entries.push(...outcome.newEntries)
+    pendingInvalidCount.value = outcome.invalidLines.length
+    pendingInvalidLineNos.value = outcome.invalidLines.slice(0, 10).join('、') + (outcome.invalidLines.length > 10 ? ' 等' : '')
+    if (outcome.duplicates.length > 0) {
+      importDuplicates.value = outcome.duplicates
+      importDuplicateVisible.value = true
+    } else {
+      mfaAwareSuccess(`导入完成：成功 ${outcome.newEntries.length} 条，保存后生效`)
+      return
+    }
+  }
   reader.onerror = () => { ElMessage.error('读取文件失败，请重试') }
   reader.readAsText(file)
 }
 
-const importEntriesFromText = (text: string): void => {
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== '')
-  if (lines.length === 0) {
-    ElMessage.error('文件为空或没有可解析的内容，已取消导入')
-    return
-  }
-  // 与保存口径一致：值与备注均为空的占位行先行移除，导入后表格不留空行
-  ipListForm.value.entries = ipListForm.value.entries.filter((e) => e.value.trim() !== '' || e.remark.trim() !== '')
-  const existing = new Set(ipListForm.value.entries.map((e) => e.value.trim()).filter((v) => v !== ''))
-  let success = 0
-  let invalid = 0
-  let duplicate = 0
-  for (const line of lines) {
-    const parsed = parseEntryLine(line)
-    if (!parsed) { invalid++; continue }
-    if (existing.has(parsed.value)) { duplicate++; continue }
-    existing.add(parsed.value)
-    ipListForm.value.entries.push({ value: parsed.value, remark: parsed.remark })
-    success++
-  }
-  ipListEntryPage.value = Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize)
-  if (success === 0) {
-    ElMessage.error(duplicate > 0
-      ? `没有可导入的新条目（非法 ${invalid} 条 / 重复 ${duplicate} 条）`
-      : '文件中未解析到合法的 IP/CIDR 条目，已取消导入')
-    return
-  }
-  ElMessage.success(`导入完成：成功 ${success} 条，跳过 ${invalid + duplicate} 条（非法 ${invalid} / 重复 ${duplicate}）`)
-}
 
 const exportIpListEntries = (): void => {
   const entries = ipListForm.value.entries
@@ -999,18 +1650,11 @@ const exportIpListEntries = (): void => {
     ElMessage.warning('当前没有可导出的条目')
     return
   }
-  // 备注含逗号/引号时按 CSV 规则双引号包裹并转义内部引号
-  const escapeRemark = (remark: string): string => /[",]/.test(remark) ? `"${remark.replace(/"/g, '""')}"` : remark
-  // 首字符写入 UTF-8 BOM，避免 Excel 直接打开中文备注乱码
-  const csv = `\uFEFF${entries.map((e) => `${e.value},${escapeRemark(e.remark)}`).join('\r\n')}`
+  // 首字符写入 UTF-8 BOM，避免 Excel 直接打开中文备注乱码；字段级 CSV
+  // 转义与导入解析同源（utils/ipListCsv）
+  const csv = `\uFEFF${entries.map((e) => formatIpListEntryLine(e.value, e.remark)).join('\r\n')}`
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = 'ip-list.csv'
-  link.click()
-  // Safari 下立即回收 objectURL 会截断下载文件，延迟释放（与 BasicSettings/Keys 导出一致）
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
+  saveBlob(blob, 'ip-list.csv')
 }
 
 const PATTERN_PLACEHOLDERS: Record<string, string> = {
@@ -1022,10 +1666,11 @@ const PATTERN_PLACEHOLDERS: Record<string, string> = {
 }
 const patternPlaceholder = (cond: CustomRuleCondition): string => {
   if (cond.operator === 'regex') return '如 ^/admin/.*$'
-  return PATTERN_PLACEHOLDERS[cond.target] ?? '匹配值'
+  // 同表查表过 hasOwn（target 来自库值，原型键不得渲染函数源码）
+  return hasOwn(PATTERN_PLACEHOLDERS, cond.target) ? PATTERN_PLACEHOLDERS[cond.target] : '匹配值'
 }
 
-// User-Agent 快捷预设：标签为用户友好文案，value 为真实 UA 中的准确片段
+// 快捷预设：标签为用户友好文案，value 为真实 UA 中的准确片段
 // （@contains 大小写敏感，value 必须与线上 UA 实际大小写一致才能命中）
 const UA_PRESET_GROUPS: ReadonlyArray<{ label: string; values: ReadonlyArray<{ label: string; value: string }> }> = [
   { label: '攻击工具', values: [
@@ -1074,6 +1719,15 @@ const regexTestStrings = ref<Record<number, string>>({})
 const uaCollapsed = ref<Record<number, boolean>>({})
 const regexCollapsed = ref<Record<number, boolean>>({})
 
+// 三个按条件下标索引的会话态必须在每次打开弹框时清空——原实现跨
+// 规则复用，先编辑规则 A 输入测试串再打开规则 B，同下标条件会显示 A 的测试串
+// 与「匹配/不匹配」结果，误导正则调试。
+const resetRuleDialogSession = (): void => {
+  regexTestStrings.value = {}
+  uaCollapsed.value = {}
+  regexCollapsed.value = {}
+}
+
 const regexResultClass = (cond: CustomRuleCondition, idx: number): string => {
   if (!cond.pattern) return ''
   const { re, valid } = buildJSRegex(cond.pattern)
@@ -1097,14 +1751,32 @@ const isValidRegex = (pattern: string): boolean => {
   return buildJSRegex(pattern).valid
 }
 
+// 正则预览编译结果按 pattern 记忆化：模板对同一条件同时求 class/text/isValid
+// （输入事件触发高频重渲染），原实现每次都做三段试编译。上限 50 条防长会话
+// 无界增长；编译只产出 i/m/s flag（无 g/y），RegExp 复用无 lastIndex 状态。
+const REGEX_PREVIEW_CACHE_LIMIT = 50
+const regexPreviewCache = new Map<string, { re: RegExp | null; valid: boolean }>()
+
 function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
-	// SR15-P3① + F-2/F-3(第 16 轮):合法性以后端 RE2(coraza)为准。
+  const cached = regexPreviewCache.get(pattern)
+  if (cached) return cached
+  const compiled = compileJSRegex(pattern)
+  if (regexPreviewCache.size >= REGEX_PREVIEW_CACHE_LIMIT) {
+    const oldest = regexPreviewCache.keys().next().value
+    if (oldest !== undefined) regexPreviewCache.delete(oldest)
+  }
+  regexPreviewCache.set(pattern, compiled)
+  return compiled
+}
+
+function compileJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
+	// +:合法性以后端 RE2(coraza)为准。
 	// RE2 支持:组合内联 flag(?im)/中置 flag(a(?i)b)/flag 组((?i:...))/
 	// 命名组((?P<name>))/flag 取反((?-i));不支持 lookaround/反向引用。
 	if (/\(\?<?[=!]/.test(pattern) || /\\[1-9]/.test(pattern) || /\\k</.test(pattern)) {
 		return { re: null, valid: false }
 	}
-	// SR17-2(第 17 轮):lead 捕获含取反 '-'——白名单 {i,m,s,U,-} 真正
+	// lead 捕获含取反 '-'——白名单 {i,m,s,U,-} 真正
 	// 生效(此前捕获组不含 '-',取反形态连 lead 都匹配不上)。
 	const lead = pattern.match(/^\(\?([-a-zA-Z]+)\)/)
 	if (lead && !/^(?:[imsU]+(?:-[imsU]+)?|-[imsU]+)$/.test(lead[1])) {
@@ -1113,7 +1785,7 @@ function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
 	let src = pattern
 	let flags = ''
 	if (lead) {
-		// SR18-2+SR19-5(第 19 轮):RE2 取反语义——'-' 后的 flag 关闭、前缀
+		// +:RE2 取反语义——'-' 后的 flag 关闭、前缀
 		// 开启;JS 无原生取反,预览近似:'-' 前的正向 flag 照收(!negated
 		// 守卫),'-' 后的跳过(不重置累积——(?i-s) 保留 i、丢弃 s,比全清
 		// 更接近 RE2);纯取反((?-i))不加任何 flag(全默认)。
@@ -1125,9 +1797,9 @@ function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
 		src = src.slice(lead[0].length)
 	}
 	src = src.replace(/\(\?P</g, '(?<')
-	// F-2:中置内联 flag((?i)a(?m)b)——JS 不识别,剥离后重试(RE2 合法)。
+	// 中置内联 flag((?i)a(?m)b)——JS 不识别,剥离后重试(RE2 合法)。
 	const midFlagStripped = src.replace(/\(\?(?:[imsU]+(?:-[imsU]+)?|-[imsU]+)\)(?=[^)]|$)/g, '')
-	// F-3:flag 组((?i:...))——JS 不识别,替换为普通分组后再试;真语法错误
+	// flag 组((?i:...))——JS 不识别,替换为普通分组后再试;真语法错误
 	// (未闭合括号等)在三段试编译全失败后判 invalid,不再被兜底掩盖。
 	const flagGroupsOpened = src.replace(/\(\?[-imsU]+:/g, '(')
 	const candidates = [src, midFlagStripped, flagGroupsOpened]
@@ -1141,7 +1813,27 @@ function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
 	return { re: null, valid: false }
 }
 
-const fetchCRS = async () => { try { const res = await request.get<APIResponse<typeof crsInfo.value>>('/security/crs'); if (res.data) crsInfo.value = res.data } catch {} }
+const fetchCRS = async () => {
+  const seq = ++crsInfoSeq
+  try {
+    const res = await request.get<APIResponse<typeof crsInfo.value>>('/security/crs', { silent: true })
+    if (seq !== crsInfoSeq) return
+    if (res.data) crsInfo.value = res.data
+    crsInfoError.value = false
+    crsInfoLoaded.value = true
+  } catch {
+    if (seq !== crsInfoSeq) return
+    // 读取失败：标签/行状态显性化，不沿用默认值伪装正常
+    crsInfoError.value = true
+    crsInfoLoaded.value = true
+  }
+}
+
+// 切走「请求头」后残留 header_name 会被后端拒收（header_name 仅 target=headers
+// 时支持），且 400 文案指向用户已不可见的字段——切换即清。
+const onConditionTargetChange = (cond: CustomRuleCondition) => {
+  if (cond.target !== 'headers') cond.header_name = undefined
+}
 
 const removeCondition = (idx: number) => {
   ruleForm.value.conditions.splice(idx, 1)
@@ -1154,7 +1846,7 @@ const removeCondition = (idx: number) => {
     else if (n > idx) next[n - 1] = prev[n]
   }
   regexTestStrings.value = next
-  // 第 60 轮 P5：折叠态键同步重排（同 regexTestStrings 口径，否则删除后整体错位）
+  // 折叠态键同步重排（同 regexTestStrings 口径，否则删除后整体错位）
   for (const src of [uaCollapsed, regexCollapsed]) {
     const p = src.value
     const n2: Record<number, boolean> = {}
@@ -1168,15 +1860,59 @@ const removeCondition = (idx: number) => {
 }
 // 搜索提交先回到第 1 页:高页码叠加收窄后的结果集会落在空页上
 const searchRules = () => { page.value = 1; fetchRules() }
-// F-47-33：CRS 标签服务端分页 size-change 不复位 page——高页码叠加放大 pageSize
+// CRS 标签服务端分页 size-change 不复位 page——高页码叠加放大 pageSize
 // 会请求越界 offset(空表停留在空页);对齐本文件自定义规则/IP 列表「size-change 回第 1 页」口径
 const onRulesSizeChange = () => { page.value = 1; fetchRules() }
+// 乱序响应守卫：翻页/搜索快速切换时，慢响应晚到不得覆盖当前页
+let rulesRequestSeq = 0
+const rulesLoadError = ref(false)
 const fetchRules = async () => {
+  const requestSeq = ++rulesRequestSeq
   loadingRules.value = true
-  try { const p = new URLSearchParams({ page: String(page.value), page_size: String(pageSize.value) }); if (searchQuery.value) p.set('search', searchQuery.value); const res = await request.get<APIResponse<{ rules: CRSRuleFile[]; total: number }>>(`/security/crs/rules?${p}`); rules.value = res.data?.rules || []; total.value = res.data?.total || 0 } catch {} finally { loadingRules.value = false }
+  try {
+    const p = new URLSearchParams({ page: String(page.value), page_size: String(pageSize.value) })
+    if (searchQuery.value) p.set('search', searchQuery.value)
+    const res = await request.get<APIResponse<{ rules: CRSRuleFile[]; total: number }>>(`/security/crs/rules?${p}`)
+    if (requestSeq !== rulesRequestSeq) return
+    rules.value = res.data?.rules || []
+    total.value = res.data?.total || 0
+    rulesLoadError.value = false
+  } catch {
+    // 失败一律进入可见错误态（全局拦截器只 toast 一次）：已有数据时保留上一页
+    // 结果，但横幅明示「当前显示的是上次成功结果」——分页器/搜索框已切到新
+    // 条件而内容仍是旧页时，不再无提示地错配。过期请求的失败不污染当前态。
+    if (requestSeq !== rulesRequestSeq) return
+    rulesLoadError.value = true
+  } finally {
+    if (requestSeq === rulesRequestSeq) loadingRules.value = false
+  }
 }
-const fetchCustomRules = async () => { loadingCustom.value = true; try { const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules'); customRules.value = res.data || [] } catch {} finally { loadingCustom.value = false } }
-const fetchUsers = async () => { try { const res = await request.get<APIResponse<UserListItem[]>>('/users'); users.value = res.data || [] } catch {} }
+const fetchCustomRules = async () => {
+  loadingCustom.value = true
+  try {
+    const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules')
+    customRules.value = res.data || []
+    customRulesError.value = false
+  } catch {
+    customRulesError.value = true
+  } finally { loadingCustom.value = false }
+}
+const retryCustomRules = (): void => {
+  void fetchCustomRules()
+  if (usersError.value) void fetchUsers()
+}
+// 用户名册失败只影响「更新者」列（显示 '-'），不冒充规则数据空态——
+// 与自定义规则错误共用横幅但文案区分。
+const usersError = ref(false)
+const fetchUsers = async () => {
+  try {
+    const res = await request.get<APIResponse<UserListItem[]>>('/users')
+    users.value = res.data || []
+    usersError.value = false
+  } catch {
+    usersError.value = true
+  }
+}
 
 let ruleContentSeq = 0
 const openRuleContent = async (row: CRSRuleFile) => {
@@ -1197,24 +1933,40 @@ const openRuleContent = async (row: CRSRuleFile) => {
     if (requestSeq === ruleContentSeq) loadingContent.value = false
   }
 }
-const toggleAutoUpdate = async (val: boolean) => { try { await request.put('/security/crs/auto-update', { auto_update: val }); mfaAwareSuccess('已更新') } catch { crsInfo.value.auto_update = !val } }
-const fetchIP2RegionInfo = async () => { try { const res = await request.get<APIResponse<typeof ip2regionInfo.value>>('/security/ip2region'); if (res.data) ip2regionInfo.value = res.data } catch {} }
-const toggleIP2RegionAutoUpdate = async (val: boolean) => { try { await request.put('/security/ip2region/auto-update', { auto_update: val }); mfaAwareSuccess('已更新') } catch { ip2regionInfo.value.auto_update = !val } }
+const fetchIP2RegionInfo = async () => {
+  const seq = ++ip2regionInfoSeq
+  try {
+    const res = await request.get<APIResponse<typeof ip2regionInfo.value>>('/security/ip2region', { silent: true })
+    if (seq !== ip2regionInfoSeq) return
+    if (res.data) ip2regionInfo.value = res.data
+    ip2regionInfoError.value = false
+    ip2regionInfoLoaded.value = true
+  } catch {
+    if (seq !== ip2regionInfoSeq) return
+    ip2regionInfoError.value = true
+    ip2regionInfoLoaded.value = true
+  }
+}
 
 // —— 定时更新排程（三库同构：星期多选 + 时间；保存即重排下次更新，时区遵循基础设置）——
 const scheduleTz = ref('')
 let scheduleTzLoaded = false
+let scheduleTzLoading = false
 const ensureScheduleTz = async () => {
-  if (scheduleTzLoaded) return
-  scheduleTzLoaded = true
+  if (scheduleTzLoaded || scheduleTzLoading) return
+  scheduleTzLoading = true
   try {
     const res = await request.get<APIResponse<{ timezone?: string }>>('/config', { silent: true })
     scheduleTz.value = res.data?.timezone || ''
-  } catch { /* 说明行降级为「…」，不影响设置功能 */ }
+    scheduleTzLoaded = true
+  } catch { /* 失败不闩死：下次打开弹框重试 */ } finally {
+    scheduleTzLoading = false
+  }
 }
 
 const savingCRSSchedule = ref(false)
 const saveCRSSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (crsScheduleHint.value) { ElMessage.warning(crsScheduleHint.value); return }
   savingCRSSchedule.value = true
   try {
     await request.put('/security/crs/schedule', { days, time })
@@ -1225,6 +1977,7 @@ const saveCRSSchedule = async ({ days, time }: { days: number[]; time: string })
 
 const savingIP2RegionSchedule = ref(false)
 const saveIP2RegionSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (ip2regionScheduleHint.value) { ElMessage.warning(ip2regionScheduleHint.value); return }
   savingIP2RegionSchedule.value = true
   try {
     await request.put('/security/ip2region/schedule', { days, time })
@@ -1235,6 +1988,7 @@ const saveIP2RegionSchedule = async ({ days, time }: { days: number[]; time: str
 
 const savingThreatSchedule = ref(false)
 const saveThreatSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (threatScheduleHint.value) { ElMessage.warning(threatScheduleHint.value); return }
   savingThreatSchedule.value = true
   try {
     await request.put('/security/threat-lib/schedule', { days, time })
@@ -1243,7 +1997,18 @@ const saveThreatSchedule = async ({ days, time }: { days: number[]; time: string
   } catch { /* 全局拦截器已 toast */ } finally { savingThreatSchedule.value = false }
 }
 
-// —— CRS 规则库更新弹框（useLibUpdateDialog 统一范式，F62-11）——
+const savingCrawlerSchedule = ref(false)
+const saveCrawlerSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (crawlerScheduleHint.value) { ElMessage.warning(crawlerScheduleHint.value); return }
+  savingCrawlerSchedule.value = true
+  try {
+    await request.put('/security/crawler-lib/schedule', { days, time })
+    mfaAwareSuccess('定时更新设置已保存')
+    await fetchCrawlerLib()
+  } catch { /* 全局拦截器已 toast */ } finally { savingCrawlerSchedule.value = false }
+}
+
+// CRS 规则库更新弹框（useLibUpdateDialog 统一范式）——
 const updateLogRef = ref<HTMLDivElement | null>(null)
 const crsDialog = useLibUpdateDialog<CRSUpdateInfo>({
   apiPrefix: '/security/crs',
@@ -1266,7 +2031,7 @@ const {
   confirmUpdate,
 } = crsDialog
 
-// —— IP2Region 库更新弹框（useLibUpdateDialog 统一范式，F62-11）——
+// IP2Region 库更新弹框（useLibUpdateDialog 统一范式）——
 const ip2regionUpdateLogRef = ref<HTMLDivElement | null>(null)
 const ip2regionDialog = useLibUpdateDialog<IP2RegionUpdateInfo>({
   apiPrefix: '/security/ip2region',
@@ -1290,22 +2055,35 @@ const {
 } = ip2regionDialog
 
 const openRuleDialog = (row?: CustomRule) => {
+  resetRuleDialogSession()
   editingRuleId.value = row?.id ?? null
   if (row) {
     // 存量空条件规则：自动补一条空条件行，让用户可见地修正而非卡在无法保存的死角
-    const conditions = row.conditions.length ? [...row.conditions] : [{ target: 'uri', operator: 'contains', pattern: '' }]
-    ruleForm.value = { name: row.name, description: row.description, conditions, action: row.action, score: row.score, enabled: row.enabled }
+    // 逐条深拷贝——浅拷贝数组会让弹框 v-model 直接改写
+    // 列表行对象（取消/保存失败后表格展示未落库的修改态）。
+    const conditions = row.conditions.length ? row.conditions.map((c) => ({ ...c })) : [{ target: 'uri', operator: 'contains', pattern: '' }]
+    ruleForm.value = { name: row.name, description: row.description, conditions, condition_logic: row.condition_logic ?? 'and', action: row.action, score: row.score, enabled: row.enabled }
   } else {
-    ruleForm.value = { name: '', description: '', conditions: [{ target: 'uri', operator: 'contains', pattern: '' }], action: 'block', score: 5, enabled: true }
+    ruleForm.value = { name: '', description: '', conditions: [{ target: 'uri', operator: 'contains', pattern: '' }], condition_logic: 'and', action: 'block', score: 5, enabled: true }
   }
   ruleDialogVisible.value = true
 }
 
 const saveCustomRule = async () => {
+  if (isReadOnly.value || savingRule.value) return
   if (!ruleForm.value.name.trim()) { ElMessage.warning('请输入规则名称'); return }
   if (!ruleForm.value.conditions.length) { ElMessage.warning('至少需要一个匹配条件'); return }
+  // 上限与后端写侧门同源（条件数/pattern 字节）：不前置拦截只能等 400，且无字段定位。
+  if (ruleForm.value.conditions.length > CUSTOM_RULE_MAX_CONDITIONS) {
+    ElMessage.error(`自定义规则最多支持 ${CUSTOM_RULE_MAX_CONDITIONS} 个匹配条件（当前 ${ruleForm.value.conditions.length} 个）`)
+    return
+  }
   for (const cond of ruleForm.value.conditions) {
     if (!cond.pattern.trim()) { ElMessage.error('每个条件必须填写匹配值'); return }
+    if (patternOverLimit(cond.pattern)) {
+      ElMessage.error(`匹配内容不能超过 ${CUSTOM_RULE_MAX_PATTERN_BYTES} 字节（当前「${cond.pattern.slice(0, 20)}…」${patternByteLength(cond.pattern)} 字节）`)
+      return
+    }
     if (cond.pattern.endsWith('\\')) {
       ElMessage.error(cond.operator === 'regex'
         ? '正则匹配内容不能以反斜杠结尾，可用 `\\$` 结尾锚定或末尾追加 `(?:)` 空组表达尾部反斜杠'
@@ -1313,6 +2091,11 @@ const saveCustomRule = async () => {
       return
     }
     if (cond.operator === 'regex' && !isValidRegex(cond.pattern)) { ElMessage.error(`正则表达式语法错误：${cond.pattern}`); return }
+    // 空串放行=匹配全部头的值（与模板提示文案/后端契约一致）；非空必须合法 token。
+    if (cond.target === 'headers' && !headerNameSaveAllowed(cond.header_name)) {
+      ElMessage.error('请求头名仅允许字母、数字与 "-"（1-64 字符），留空则匹配全部头的值');
+      return
+    }
   }
   savingRule.value = true
   try {
@@ -1328,7 +2111,7 @@ const saveCustomRule = async () => {
 
 const deletingCustomRuleId = ref<number | null>(null)
 const deleteCustomRule = (row: CustomRule) => {
-  // 重入守卫（U9-66-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 重入守卫（同 SecurityPolicies deletingPolicyId 范式）：快速双击
   // 不再叠加双确认框→双 DELETE 误报
   if (deletingCustomRuleId.value !== null) return
   deletingCustomRuleId.value = row.id
@@ -1343,64 +2126,88 @@ const deleteCustomRule = (row: CustomRule) => {
     .finally(() => { deletingCustomRuleId.value = null })
 }
 
-// WAF 文件大小：formatBytes 单一事实源（第 52 轮 P3-9）
+// WAF 文件大小：formatBytes 单一事实源
 const formatSize = (b: number) => formatBytes(b)
 
+// 四库信息低频回刷（60s）：后台定时更新完成后卡片不再停留旧版本/旧「已最新」，
+// 更新失败也能自行浮出；隐藏页停表、恢复可见立即补一轮（全站轮询同口径）。
+const refreshLibraryInfo = (): void => {
+  void fetchCRS(); void fetchIP2RegionInfo(); void fetchThreatLib(); void fetchCrawlerLib()
+}
+let libraryRefreshTimer: ReturnType<typeof createVisibilityIntervals> | null = null
+
 onMounted(() => {
-  // FE43-1(第 43 轮):消费 ?tab= 后剥离(与 FE42-1 sp 口径一致,SecurityPolicies.vue
+  // 消费?tab= 后剥离(与 sp 口径一致,SecurityPolicies.vue
   // 先例)——视图切换走 authStore.currentPage 而非 hash 路由,replaceState 仅留
   // pathname 不破坏页面基座;仅当 URL 实际携带 tab 参数时才剥离。
   const query = new URLSearchParams(location.search)
-  const urlTab = query.get('tab')
+  const urlTab = query.get(DEEP_LINK_PARAMS.securityRulesTab)
   if (urlTab && ['rules', 'custom', 'ip-lists'].includes(urlTab)) {
     activeTab.value = urlTab
   }
-  if (query.has('tab')) window.history.replaceState(null, '', window.location.pathname)
-  fetchCRS(); fetchIP2RegionInfo(); fetchRules(); fetchCustomRules(); fetchUsers(); fetchIpLists(); fetchThreatLib()
+  if (query.has(DEEP_LINK_PARAMS.securityRulesTab)) window.history.replaceState(null, '', window.location.pathname)
+  fetchCRS(); fetchIP2RegionInfo(); fetchRules(); fetchCustomRules(); fetchUsers(); fetchIpLists(); fetchThreatLib(); fetchCrawlerLib()
+  libraryRefreshTimer = createVisibilityIntervals({ intervals: [{ tick: refreshLibraryInfo, ms: 60_000 }] })
+  libraryRefreshTimer.start()
 })
 
 onUnmounted(() => {
   // 作废在途响应并暂停轮询（轮询终态清理由 usePollingTask 内置 onUnmounted 兜底）
+  libraryRefreshTimer?.stop()
+  libraryRefreshTimer = null
   crsDialog.dispose()
   ip2regionDialog.dispose()
-  threatDialog.dispose() // U9-F2（第 65 轮）：与两兄弟对齐（曾缺席）
+  threatDialog.dispose() // 与两兄弟对齐（曾缺席）
+  crawlerDialog.dispose()
 })
 </script>
 
 <style scoped>
-/* SYSRENDER33-1(第 33 轮审计,P2):全局表格居中规则(main.css inline-flex
-   nowrap+overflow hidden)把条件列多标签裁剪成单行——3/4 条件不可见。本列
-   恢复换行展示(居中保持,scoped 属性选择器特异性高于全局规则)。 */
-:deep(.el-table .cell:has(.el-tag)) { flex-wrap: wrap; row-gap: 4px; }
+.count-tip { font-size: 12px; vertical-align: -1px; margin-left: 2px; color: var(--text-secondary); cursor: help; }
+/* 条件列（rule-cond-cell）的多条件布局已收敛到 styles/main.css
+   （.rule-cond-cell/.cond-chip-list/.cond-chip 与其他表格全局规则同源），
+   本页不再保留本地覆盖。 */
 
 .crs-card :deep(.el-card__header) .crs-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
 .crs-card :deep(.el-card__header) .crs-header-title { display: flex; align-items: center; gap: 12px; }
 .rule-condition-row {
   display: flex; gap: 10px; margin-bottom: 10px; align-items: flex-start; flex-wrap: wrap;
-  padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;
+  padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb;
   position: relative; transition: border-color 0.2s;
 }
 .rule-condition-row:hover { border-color: #d1d5db; }
-.rule-condition-row .el-button--danger { margin-left: auto; }
+.rule-condition-row .el-button--danger { margin-left: auto; align-self: flex-start; }
 
 /* 弹框头库专属色（DialogHeader tone-class 透传；:deep 穿透子组件——本页弹框未 append-to-body） */
 :deep(.dh-icon.lib-icon--crs) { background: #eff6ff; color: #3b82f6; }
 :deep(.dh-icon.lib-icon--ip) { background: #f0fdfa; color: #0d9488; }
 :deep(.dh-icon.lib-icon--threat) { background: #fff1f2; color: #e11d48; }
+:deep(.dh-icon.lib-icon--crawler) { background: #fff7ed; color: #ea580c; }
+.add-condition-row { display: flex; align-items: center; gap: 8px; }
 .add-condition-btn { margin-top: 4px; }
 .pattern-col { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px; }
 .pattern-input-row { display: flex; align-items: center; gap: 6px; }
-.preset-section { margin-top: 4px; }
-.preset-header { cursor: pointer; padding: 2px 0; user-select: none; }
+/* 头名输入宽度（原内联样式收敛）；类名兼作 securityRuleHeaderName 钉测的语义锚 */
+.header-name-input { width: 180px; flex: none; }
+/* 正则语法错误/超限警示图标：警示黄（与 regex-test-result.regex-invalid 同色） */
+.regex-error-icon { color: #f59e0b; flex: none; }
+.preset-section { flex: 1 1 100%; min-width: 0; width: 100%; margin-top: 4px; }
+.preset-header {
+  cursor: pointer; padding: 2px 0; user-select: none;
+  display: inline-flex; align-items: center; width: 100%;
+  background: none; border: 0; font: inherit; text-align: left;
+}
+.preset-header:focus-visible,
+.preset-tag:focus-visible,
+.regex-preset-link:focus-visible { outline: 2px solid #409eff; outline-offset: 2px; border-radius: 2px; }
 .preset-toggle { font-size: 12px; color: #6b7280; }
-.preset-tags-block { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; background: #fff; border: 1px dashed #e5e7eb; border-radius: 4px; margin-left: 0; }
+.preset-tags-block { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; background: #fff; border: 1px dashed #e5e7eb; margin-left: 0; }
 .preset-group { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
 .preset-group-label { font-size: 12px; color: #6b7280; flex: 0 0 56px; text-align: right; line-height: 1; }
-.preset-hint { font-size: 12px; color: #9ca3af; margin-top: 6px; line-height: 1.4; }
 .preset-group-tags { display: inline-flex; flex-wrap: wrap; gap: 4px; flex: 1; align-items: center; }
 .preset-group-tags .el-tag { margin: 0; }
 .preset-group-tags .preset-tag { cursor: pointer; }
-.regex-extras { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; background: #fff; border: 1px dashed #e5e7eb; border-radius: 4px; }
+.regex-extras { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; width: 100%; padding: 6px 8px; background: #fff; border: 1px dashed #e5e7eb; box-sizing: border-box; }
 .regex-presets { display: flex; flex-wrap: wrap; align-items: center; column-gap: 12px; row-gap: 4px; }
 .regex-preset-link { font-size: 12px; }
 .regex-tester { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -1417,12 +2224,16 @@ onUnmounted(() => {
 .entries-toolbar-right { margin-left: auto; }
 .entries-import-input { display: none; }
 .ip-entry-text { font-family: 'SF Mono', 'Monaco', 'Menlo', monospace; font-size: 13px; }
+.entries-head-bar { display: flex; align-items: center; gap: 12px; margin: 0 0 8px; }
+.entries-head-bar :deep(.dsh-head) { margin: 0; flex: none; }
+.entries-head-bar :deep(.dsh-head h3) { white-space: nowrap; }
+.ip-query-bar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin: 0; margin-left: auto; min-width: 0; }
+.ip-query-bar .ip-query-input { width: 260px; flex: none; }
+.ip-query-bar .el-radio-group, .ip-query-bar .el-button { flex: none; }
 .ip-entry-index { color: #9ca3af; font-variant-numeric: tabular-nums; }
 .entries-pagination { display: flex; justify-content: flex-end; margin-top: 8px; }
-.ip-entry-invalid :deep(.el-input__wrapper) { box-shadow: 0 0 0 1px var(--el-color-danger, #ef4444) inset; }
-.rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
-/* 弹框表单右缘留白（字段贴右边距视觉失衡，2026-09-24 用户反馈） */
-.ip-list-dialog .el-form { padding-right: 20px; }
+/* 名单条目非法红框由 main.css 全局 .el-input.is-error 规则承担 */
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 .threat-source-url {
   display: inline-block;
   max-width: 100%;
@@ -1435,8 +2246,11 @@ onUnmounted(() => {
   color: #64748b;
 }
 
-.threat-source-table { margin-bottom: 12px; }
-.update-log-container { min-height: 320px; max-height: 480px; overflow: auto; background: #1e293b; border-radius: 6px; padding: 16px; }
+.threat-source-table { margin-bottom: 0; }
+.library-sources-panel { margin-bottom: 12px; }
+.update-log-container { min-height: 320px; max-height: 480px; overflow: auto; background: #1e293b; padding: 12px; }
+
+.ip2region-sources { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
 .lib-summary-tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .lib-health-tag { margin: 0; }
 .lib-summary-warn-text { color: #dc2626; font-weight: 600; font-size: 12px; margin-left: 4px; }
@@ -1447,6 +2261,7 @@ onUnmounted(() => {
 .lib-icon--crs { background: #eff6ff; color: #3b82f6; }
 .lib-icon--ip { background: #f0fdfa; color: #0d9488; }
 .lib-icon--threat { background: #fff1f2; color: #e11d48; }
+.lib-icon--crawler { background: #fff7ed; color: #ea580c; }
 .lib-name-text { min-width: 0; }
 .update-log-container--compact { min-height: 200px; max-height: 240px; }
 .lib-name-main { font-weight: 600; color: var(--el-text-color-primary); }
@@ -1458,8 +2273,11 @@ onUnmounted(() => {
 
 <!-- el-tooltip popper 挂载到 body，scoped 样式无法命中，单独非 scoped 块 -->
 <style>
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 .ip-list-refs-popper { line-height: 1.6; max-width: 280px; }
-/* el-dialog 的 class 落在 .el-dialog 元素上（$attrs 手动绑定，非组件根），
-   scoped 选择器无法命中，与上面 popper 同放非 scoped 块。
-   统一加大弹框四向 padding（16→24px），条目表格不再贴右侧边缘，左右留白对称。 */
+/* 自动封禁名单「加入时间」单元格不换行：formatDate 输出 "YYYY-MM-DD HH:mm:ss"，
+   列宽不足时 el-table 单元格会折成两行（2026-10-28 用户反馈）。单元格 td 由
+   el-table 内部渲染、dialog class 又经 attrs 绑定，scoped 选择器命不中，故放
+   非 scoped 块（与本块其余弹框/popper 规则同因）。 */
+.ip-entry-created { white-space: nowrap; }
 </style>

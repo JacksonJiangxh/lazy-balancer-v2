@@ -45,7 +45,7 @@ func TestUpdateCertificateConfig_validatesEffectiveCredentials(t *testing.T) {
 	tests := []struct {
 		name, path, body string
 	}{
-		{name: "credentials only", path: "/certificate-configs/1", body: `{"dns_credentials":{"auth_mode":"dnspod","app_id":"new-id"}}`},
+		{name: "credentials only", path: "/certificate-configs/1", body: `{"dns_credentials":{"auth_mode":"dnspod","app_id":"new-id","app_token":""}}`},
 		{name: "provider only", path: "/certificate-configs/2", body: `{"dns_provider":"dnspod"}`},
 	}
 	for _, tt := range tests {
@@ -59,6 +59,232 @@ func TestUpdateCertificateConfig_validatesEffectiveCredentials(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUpdateCertificateConfig_legacyEmptyCredentialsAllowNonCredentialUpdates(t *testing.T) {
+	put := func(h *Handlers, id int64, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		router := gin.New()
+		router.PUT("/certificate-configs/:id", h.UpdateCertificateConfig)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, "/certificate-configs/"+strconv.FormatInt(id, 10), strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		return response
+	}
+	seed := func(t *testing.T, credentials any, enabled int) (*Handlers, int64) {
+		t.Helper()
+		h := newBackupTestHandlers(t)
+		result, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('legacy','dnspod',?,?)`, credentials, enabled)
+		if err != nil {
+			t.Fatalf("seed legacy config: %v", err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h, id
+	}
+
+	t.Run("NULL rename", func(t *testing.T) {
+		h, id := seed(t, nil, 1)
+		response := put(h, id, `{"name":"renamed"}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want rename 200", response.Code, response.Body.String())
+		}
+		var name string
+		var isNull int
+		if err := db.DB.QueryRow(`SELECT name, dns_credentials IS NULL FROM certificate_configs WHERE id=?`, id).Scan(&name, &isNull); err != nil {
+			t.Fatal(err)
+		}
+		if name != "renamed" || isNull != 1 {
+			t.Fatalf("updated row name=%q credentials_null=%d, want renamed/NULL", name, isNull)
+		}
+	})
+
+	t.Run("empty string disable", func(t *testing.T) {
+		h, id := seed(t, "", 1)
+		response := put(h, id, `{"enabled":false}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want disable 200", response.Code, response.Body.String())
+		}
+		var enabled int
+		if err := db.DB.QueryRow(`SELECT enabled FROM certificate_configs WHERE id=?`, id).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 0 {
+			t.Fatalf("enabled=%d, want 0", enabled)
+		}
+	})
+
+	t.Run("empty credentials cannot be enabled", func(t *testing.T) {
+		h, id := seed(t, "", 0)
+		response := put(h, id, `{"enabled":true}`)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "请选择认证方式") {
+			t.Fatalf("status=%d body=%s, want provider credential validation 400", response.Code, response.Body.String())
+		}
+		var enabled int
+		if err := db.DB.QueryRow(`SELECT enabled FROM certificate_configs WHERE id=?`, id).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 0 {
+			t.Fatalf("invalid empty config was enabled")
+		}
+	})
+
+	t.Run("malformed stored JSON is storage corruption", func(t *testing.T) {
+		h, id := seed(t, "not-json", 1)
+		response := put(h, id, `{"name":"renamed"}`)
+		// 库内凭证非 JSON 是存储损坏（带外改库/旧版本遗留），与保存前测试端点
+		// 的 storage_corrupted 同口径 500——不得报 400 让运维反复重填。
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "存储的 DNS 凭证已损坏") {
+			t.Fatalf("status=%d body=%s, want storage corruption 500", response.Code, response.Body.String())
+		}
+	})
+}
+
+// 前端编辑遗留空凭据配置时按表单形态提交（未编辑任何字段 → 空对象）：
+// 空对象与省略等价，不得让「改名/禁用」被旧空值阻断；只含认证方式而无任何
+// 凭证值的载荷仍必须过 provider 校验（不得放宽为任意 auth_mode-only 放行）。
+func TestUpdateCertificateConfig_legacyEmptyCredentialsEmptyObjectPayload(t *testing.T) {
+	put := func(h *Handlers, id int64, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		router := gin.New()
+		router.PUT("/certificate-configs/:id", h.UpdateCertificateConfig)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, "/certificate-configs/"+strconv.FormatInt(id, 10), strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		return response
+	}
+	seed := func(t *testing.T, credentials any) (*Handlers, int64) {
+		t.Helper()
+		h := newBackupTestHandlers(t)
+		result, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('legacy','dnspod',?,1)`, credentials)
+		if err != nil {
+			t.Fatalf("seed legacy config: %v", err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h, id
+	}
+	readCredentials := func(t *testing.T, id int64) string {
+		t.Helper()
+		var credentials string
+		if err := db.DB.QueryRow(`SELECT COALESCE(dns_credentials,'') FROM certificate_configs WHERE id=?`, id).Scan(&credentials); err != nil {
+			t.Fatal(err)
+		}
+		return credentials
+	}
+
+	for _, stored := range []struct {
+		name  string
+		value any
+	}{{"NULL", nil}, {"empty string", ""}} {
+		t.Run(stored.name+" rename with empty object", func(t *testing.T) {
+			h, id := seed(t, stored.value)
+			response := put(h, id, `{"name":"renamed","dns_credentials":{}}`)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want rename 200", response.Code, response.Body.String())
+			}
+			var name string
+			if err := db.DB.QueryRow(`SELECT name FROM certificate_configs WHERE id=?`, id).Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			if name != "renamed" || readCredentials(t, id) != "" {
+				t.Fatalf("row name=%q credentials=%q, want renamed/empty", name, readCredentials(t, id))
+			}
+		})
+	}
+
+	t.Run("empty object disable", func(t *testing.T) {
+		h, id := seed(t, "")
+		response := put(h, id, `{"enabled":false,"dns_credentials":{}}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want disable 200", response.Code, response.Body.String())
+		}
+		var enabled int
+		if err := db.DB.QueryRow(`SELECT COALESCE(enabled,1) FROM certificate_configs WHERE id=?`, id).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 0 {
+			t.Fatalf("enabled=%d, want 0", enabled)
+		}
+	})
+
+	t.Run("auth_mode-only payload still rejected", func(t *testing.T) {
+		h, id := seed(t, "")
+		response := put(h, id, `{"name":"renamed","dns_credentials":{"auth_mode":"dnspod"}}`)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want provider validation 400", response.Code, response.Body.String())
+		}
+		if credentials := readCredentials(t, id); credentials != "" {
+			t.Fatalf("credentials=%q, want unchanged empty（被拒载荷不得落库）", credentials)
+		}
+	})
+
+	t.Run("empty object cannot enable", func(t *testing.T) {
+		h, id := seed(t, "")
+		if _, err := db.DB.Exec(`UPDATE certificate_configs SET enabled=0 WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		response := put(h, id, `{"enabled":true,"dns_credentials":{}}`)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "请选择认证方式") {
+			t.Fatalf("status=%d body=%s, want provider validation 400", response.Code, response.Body.String())
+		}
+	})
+}
+
+func TestCertificateConfigReferenceGuards_formatListedReferencesConsistently(t *testing.T) {
+	seed := func(t *testing.T) *Handlers {
+		t.Helper()
+		h := newRuleFeatureTestHandlers(t)
+		if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'refs','dnspod','{"mode":"tencent","secret_id":"id","secret_key":"key"}',1)`); err != nil {
+			t.Fatal(err)
+		}
+		domains := []string{"one.example", "two.example", "", "four.example", "five.example", "six.example"}
+		for i, domain := range domains {
+			id := "lb_ref" + strconv.Itoa(i+1)
+			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,acme_config_id)
+				VALUES (?,?,'http',?,8443,'weighted_round_robin',1,1,'acme_dns',1)`, id, id, domain); err != nil {
+				t.Fatalf("seed reference %s: %v", id, err)
+			}
+		}
+		return h
+	}
+	const listed = "one.example (lb_ref1)、two.example (lb_ref2)、lb_ref3、four.example (lb_ref4)、five.example (lb_ref5) 等 6 条规则"
+
+	t.Run("disable", func(t *testing.T) {
+		h := seed(t)
+		router := gin.New()
+		router.PUT("/configs/:id", h.UpdateCertificateConfig)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, "/configs/1", strings.NewReader(`{"enabled":false}`))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "6 条启用中的 ACME 规则引用") || !strings.Contains(response.Body.String(), listed) {
+			t.Fatalf("status=%d body=%s, want six-reference disable message", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), "six.example") {
+			t.Fatalf("more than five references listed: %s", response.Body.String())
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		h := seed(t)
+		router := gin.New()
+		router.DELETE("/configs/:id", h.DeleteCertificateConfig)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/configs/1", nil))
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "6 条负载规则引用") || !strings.Contains(response.Body.String(), listed) {
+			t.Fatalf("status=%d body=%s, want six-reference delete message", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), "six.example") {
+			t.Fatalf("more than five references listed: %s", response.Body.String())
+		}
+	})
 }
 
 func TestIssueCertificate_records_queue_unavailable_failure(t *testing.T) {
@@ -83,6 +309,8 @@ func TestIssueCertificate_rejects_partial_rule_selector_without_creating_jobs(t 
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.POST("/certificates/issue", h.IssueCertificate)
@@ -122,8 +350,9 @@ func TestIssueCertificate_records_each_rule_and_batch_failure(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
-	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
+	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`
 		INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enabled, enable_tls, tls_source)
 		VALUES ('lb_disabled', 'disabled', 'http', 'disabled.example', 8443, 0, 1, 'acme_dns'),
@@ -163,7 +392,7 @@ func TestIssueCertificate_records_each_rule_and_batch_failure(t *testing.T) {
 		})
 	}
 	response := httptest.NewRecorder()
-	// C-19（2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
+	// （2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("all-task failure status=%d body=%s, want 500", response.Code, response.Body.String())
@@ -174,7 +403,7 @@ func TestIssueCertificate_records_each_rule_and_batch_failure(t *testing.T) {
 		t.Fatalf("force batch query failure: %v", err)
 	}
 	response = httptest.NewRecorder()
-	// C-19（2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
+	// （2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("batch query status=%d body=%s, want 500", response.Code, response.Body.String())
@@ -186,6 +415,8 @@ func TestIssueCertificate_rejects_recent_running_job_without_requeue(t *testing.
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`
 		INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
@@ -220,6 +451,8 @@ func TestIssueCertificate_targeted_dual_domain_rule_queues_complete_domain_set(t
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules
 		(caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
@@ -252,6 +485,8 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`
 		INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source) VALUES
@@ -259,7 +494,7 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 			('lb_batch_download','download','http','download.example',9443,1,1,'acme_dns');
 		INSERT INTO cert_jobs (rule_id,domain,status,message,updated_at) VALUES
 			('lb_batch_order','order.example','creating_order','active message',datetime('now')),
-			-- CERT44-2：批量路径已套用冷却门，已部署任务须回拨越过 2 分钟守卫才重排队。
+			-- 批量路径已套用冷却门，已部署任务须回拨越过 2 分钟守卫才重排队。
 			('lb_batch_download','download.example','downloaded','active message',datetime('now','-10 minutes'));
 	`); err != nil {
 		t.Fatalf("seed running jobs: %v", err)
@@ -268,11 +503,11 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 	router.POST("/certificates/issue", h.IssueCertificate)
 	response := httptest.NewRecorder()
 
-	// C-19（2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
+	// （2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 
 	// 执行中的任务（creating_order）保持不变；已部署任务（downloaded）按
-	// R29 A-M1 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
+	// 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
@@ -316,7 +551,7 @@ func assertLatestCertificateAudit(t *testing.T, wantScope, wantResult string) {
 }
 
 func TestMaskedDNSCredentialsRoundtrip(t *testing.T) {
-	// R72 二十六次 D4：非 admin GET 到掩码 → 原样回传保存 → 按「未提交」处理；
+	// 非 admin GET 到掩码 → 原样回传保存 → 按「未提交」处理；
 	// 真实新值正常提交；显式清空语义保留。
 	if !isMaskedDNSCredentials(map[string]string{"id": "***", "token": "***"}) {
 		t.Fatal("all-sentinel map must be detected as masked")
@@ -336,7 +571,7 @@ func TestMaskedDNSCredentialsRoundtrip(t *testing.T) {
 	}
 }
 
-// C-04（2026-09-05 证书域审计裁定）：删除 DNS 提供商配置前必须检查
+// （2026-09-05 证书域审计裁定）：删除 DNS 提供商配置前必须检查
 // lb_rules.acme_config_id 引用（全部规则，不限 enabled）——被引用时 409 并列出
 // 引用规则，避免删除后下一次续签/首签静默失败（"未选择可用的 DNS 提供商"）。
 func TestDeleteCertificateConfig_blocked_when_referenced_by_rules(t *testing.T) {
@@ -412,7 +647,7 @@ func latestDNSConfigTestAudit(t *testing.T) (string, string) {
 	return action, detail
 }
 
-// C-16（2026-09-05 证书域审计裁定）：无 id 的保存前凭证测试（前端 saveConfig
+// （2026-09-05 证书域审计裁定）：无 id 的保存前凭证测试（前端 saveConfig
 // 先调 /certificate-configs/test）此前审计 detail 落「配置 0」——改为语义化来源
 // 标注「来源：保存前测试」；有 id 路径保留「配置 N」。
 func TestCertificateConfigPreSaveTest_audit_marks_source_instead_of_config_zero(t *testing.T) {
@@ -479,7 +714,7 @@ func TestCertificateConfigPreSaveTest_audit_marks_source_instead_of_config_zero(
 	})
 }
 
-// C-19（2026-09-05 证书域审计裁定）：批量签发须显式确认——请求体必填其一：
+// （2026-09-05 证书域审计裁定）：批量签发须显式确认——请求体必填其一
 // caddy_id（单规则定向）或 {"all":true}（全量重签，含已签发任务，消耗 CA 配额）；
 // 空 body / {} 不再隐式触发全量重签；两者同传以 caddy_id 为准。
 func TestIssueCertificate_bulk_requires_explicit_all_confirmation(t *testing.T) {
@@ -487,6 +722,8 @@ func TestIssueCertificate_bulk_requires_explicit_all_confirmation(t *testing.T) 
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`
 		INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enabled, enable_tls, tls_source)
@@ -555,7 +792,7 @@ func TestIssueCertificate_bulk_requires_explicit_all_confirmation(t *testing.T) 
 	})
 }
 
-// R39-9(C4):DNS 凭证最小可见性从「属主非 admin」扩为「属主非 admin 或
+// DNS 凭证最小可见性从「属主非 admin」扩为「属主非 admin 或
 // Key 只读」——admin 的只读 API Key(机器身份)不得经列表端点读明文凭证;
 // admin JWT 路径不受影响(2026-09-05 用户裁定的 CA 凭证明文口径不在本端点)。
 func TestListCertificateConfigs_masksCredentials_forReadOnlyAPIKey(t *testing.T) {
@@ -617,7 +854,7 @@ func TestListCertificateConfigs_masksCredentials_forReadOnlyAPIKey(t *testing.T)
 	})
 }
 
-// （SYS-R5，第 69 轮：自 apikeys_current_test.go 迁回——本族为证书配置端点
+// （自 apikeys_current_test.go 迁回——本族为证书配置端点
 // NULL 凭据主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestCertificateConfigEndpointsHandleNullDNSCredentials(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -653,4 +890,45 @@ func TestCertificateConfigEndpointsHandleNullDNSCredentials(t *testing.T) {
 			t.Fatalf("status=%d body=%s, want credential validation error instead of 404", recorder.Code, recorder.Body.String())
 		}
 	})
+}
+
+// 创建契约：省略 enabled 的 POST 按「配置默认可用」落库 enabled=1（*bool 区分
+// 未提交与显式 false）；显式 false 仍落 0。旧 bool 零值让脚本/MCP 通道漏带
+// enabled 时静默创建禁用配置。
+func TestCreateCertificateConfig_omittedEnabledDefaultsToEnabled(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	router := gin.New()
+	router.POST("/certificate-configs", h.CreateCertificateConfig)
+
+	post := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/certificate-configs", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	omitResponse := post(t, `{"name":"omit-enabled","dns_provider":"dnspod","dns_credentials":{"api_token":"12345,abcdef"}}`)
+	if omitResponse.Code != http.StatusCreated {
+		t.Fatalf("omit enabled: status=%d body=%s, want 201", omitResponse.Code, omitResponse.Body.String())
+	}
+	falseResponse := post(t, `{"name":"explicit-disabled","dns_provider":"dnspod","dns_credentials":{"api_token":"12345,abcdef"},"enabled":false}`)
+	if falseResponse.Code != http.StatusCreated {
+		t.Fatalf("explicit false: status=%d body=%s, want 201", falseResponse.Code, falseResponse.Body.String())
+	}
+
+	var omitEnabled, falseEnabled int
+	if err := db.DB.QueryRow(`SELECT enabled FROM certificate_configs WHERE name='omit-enabled'`).Scan(&omitEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow(`SELECT enabled FROM certificate_configs WHERE name='explicit-disabled'`).Scan(&falseEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if omitEnabled != 1 {
+		t.Fatalf("省略 enabled 落库 enabled=%d, want 1（默认可用）", omitEnabled)
+	}
+	if falseEnabled != 0 {
+		t.Fatalf("显式 enabled=false 落库 enabled=%d, want 0", falseEnabled)
+	}
 }

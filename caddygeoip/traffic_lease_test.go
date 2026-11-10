@@ -357,3 +357,38 @@ func TestTrafficCollectorAdmin_deleteReportsLiveState(t *testing.T) {
 		t.Fatalf("末租约释放后状态=%s, want enabled=false leases=0", got)
 	}
 }
+
+// admin 端点的错误响应体是 JSON，Content-Type 必须是 application/json——
+// http.Error 会覆写成 text/plain + nosniff，声明与内容不一致。
+func TestServeTrafficCollector_errorsKeepJSONContentType(t *testing.T) {
+	resetTrafficState(t)
+	cases := []struct {
+		name   string
+		method string
+		body   string
+		want   int
+	}{
+		{name: "invalid body", method: http.MethodPost, body: "not-json", want: http.StatusBadRequest},
+		{name: "method not allowed", method: http.MethodPut, body: "", want: http.StatusMethodNotAllowed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			var req *http.Request
+			if tc.body == "" {
+				req = httptest.NewRequest(tc.method, "/lb/traffic-collector", nil)
+			} else {
+				req = httptest.NewRequest(tc.method, "/lb/traffic-collector", strings.NewReader(tc.body))
+			}
+			if err := serveTrafficCollector(rec, req); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != tc.want {
+				t.Fatalf("status=%d, want %d", rec.Code, tc.want)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("Content-Type=%q, want application/json（错误体是 JSON）", ct)
+			}
+		})
+	}
+}

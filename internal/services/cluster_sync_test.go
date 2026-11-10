@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -44,24 +46,36 @@ func TestVerifySnapshotConsistency_allows_zero_upstream_rule_with_warning(t *tes
 	}
 
 	// When
-	err := verifySnapshotConsistency(snapshot)
+	buf := captureLogf(t)
+	verifySnapshotConsistency(snapshot)
 
-	// Then：不再拒绝快照，生成端会跳过该规则并告警
-	if err != nil {
-		t.Fatalf("zero-upstream snapshot rejected: %v", err)
+	// Then：不再拒绝快照（函数本身只留痕、无失败通道），但仍必须留下可定位
+	// 告警（用例名承诺的 warning）；只断言「没有错误」时告警被删也全绿。
+	logged := buf.String()
+	if !strings.Contains(logged, "没有上游") || !strings.Contains(logged, "lb_drift") {
+		t.Fatalf("logs=%q, want 零上游规则 lb_drift 的告警", logged)
+	}
+	if strings.Contains(logged, "lb_healthy") || strings.Contains(logged, "lb_disabled") {
+		t.Fatalf("logs=%q, want 仅告警启用且零上游的规则", logged)
 	}
 }
 
+// syncDrainLifecycle 在 lifecycleRecorder 基类上注入真实行为：StartSync 拉起
+// 同步、StopSync 先落排空观察点再停止（stopOnce 保证只关一次）。
 type syncDrainLifecycle struct {
+	lifecycleRecorder
 	sync        *SyncService
 	stopEntered chan struct{}
+	stopOnce    sync.Once
 }
 
-func (l *syncDrainLifecycle) StartACME() {}
-func (l *syncDrainLifecycle) StopACME()  {}
-func (l *syncDrainLifecycle) StartSync() { l.sync.Start() }
+func (l *syncDrainLifecycle) StartSync() {
+	l.lifecycleRecorder.StartSync()
+	l.sync.Start()
+}
 func (l *syncDrainLifecycle) StopSync() {
-	close(l.stopEntered)
+	l.lifecycleRecorder.StopSync()
+	l.stopOnce.Do(func() { close(l.stopEntered) })
 	l.sync.Stop()
 }
 
@@ -77,12 +91,17 @@ func waitSyncTest[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
-func waitSyncBarrier(ch <-chan struct{}) {
+// waitSyncBarrier 等待并发确定性同步点：超时必须 Fatal（与 waitSyncTest 的
+// 失败口径一致）——静默返回会把「对端未到达同步点」降级为无守卫的竞态通过，
+// 用例在错误交错下假绿。
+func waitSyncBarrier(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
 	case <-ch:
 	case <-timer.C:
+		t.Fatal("timed out waiting for synchronization barrier")
 	}
 }
 
@@ -96,7 +115,7 @@ func TestSyncService_RegisterWithMaster_acceptsHTTP(t *testing.T) {
 }
 
 func TestSyncService_RegisterWithMaster_rejectsOversizedResponseBody(t *testing.T) {
-	// R52 N2：注册响应与快照拉取同威胁模型（主节点是该链路唯一对端），
+	// 注册响应与快照拉取同威胁模型（主节点是该链路唯一对端），
 	// 超大响应体不得全量解码入内存，超限按既有解析失败路径处理。
 	// Given：上限被调低，响应为超限但整体合法的 JSON
 	old := maxRegistrationResponseBytes
@@ -140,7 +159,7 @@ func TestSyncService_RegisterWithMaster_decodesResponseWithinLimit(t *testing.T)
 }
 
 func TestSyncService_pollRegistration_ignoresOversizedStatusResponse(t *testing.T) {
-	// R52 N2：注册状态轮询响应同样必须有上限——无 LimitReader 时超限但合法
+	// 注册状态轮询响应同样必须有上限——无 LimitReader 时超限但合法
 	// 的 approved 响应会解码成功并推进 confirm 流程。
 	// Given
 	old := maxRegistrationResponseBytes
@@ -226,7 +245,10 @@ func TestSyncService_do_rejectsCertificateFingerprintMismatchBeforeSendingToken(
 	}
 }
 
-func TestSyncService_do_doesNotFollowHTTPRedirectOrForwardCredentials(t *testing.T) {
+// 只覆盖「降级到 http 的 301 不跟随」形态（本用例的 Location 目标是
+// httptest 明文服务，与请求主机同名）。窄口径重定向的升级重放与跨主机拒绝
+// 由 DoWithSameHostTLSUpgradeRedirect 的专项用例覆盖。
+func TestSyncService_do_doesNotFollowDowngradeRedirectOrForwardCredentials(t *testing.T) {
 	received := make(chan http.Header, 1)
 	plaintext := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		received <- request.Header.Clone()
@@ -343,11 +365,16 @@ func TestSyncService_Pull_persistsEveryFailure(t *testing.T) {
 	if pullErr == nil || !strings.Contains(stored, pullErr.Error()) {
 		t.Fatalf("pull error=%v stored=%q", pullErr, stored)
 	}
+	// 未完成审批属客户端可修正的校验类失败（错误码随上报下发给主节点）。
+	if code := syncErrorCode(pullErr); code != models.SyncErrorCodeValidationFailed {
+		t.Fatalf("code=%q, want validation_failed", code)
+	}
 }
 
 func TestSyncService_Pull_persistsFailureAfterParentContextCanceled(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // Pull 只属于从节点语境
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -362,6 +389,10 @@ func TestSyncService_Pull_persistsFailureAfterParentContextCanceled(t *testing.T
 	// Then
 	if pullErr == nil || !strings.Contains(stored, pullErr.Error()) {
 		t.Fatalf("pull error=%v stored=%q", pullErr, stored)
+	}
+	// 父 ctx 取消使同步状态读取失败 → 传输域（自愈类，保留后置副作用标记）。
+	if code := syncErrorCode(pullErr); code != models.SyncErrorCodeTransportError {
+		t.Fatalf("code=%q, want transport_error（父 ctx 取消形态）", code)
 	}
 }
 
@@ -453,15 +484,28 @@ func TestSyncService_do_repeatedRequestsDoNotContinuouslyIncreaseGoroutines(t *t
 		}
 	}
 
+	// 全进程 goroutine 计数阈值断言在同一进程内不可靠（其它用例遗留的定时器/
+	// 空闲连接 goroutine 会被计入波动）。改为传输层定向差分：泄漏形态=每请求
+	// 一条不复用的连接（body 未关闭/连接未复用），其标志是
+	// persistConn.readLoop goroutine 随请求数线性累积——预热后增量必须为 0。
+	countReadLoops := func() int {
+		t.Helper()
+		buf := make([]byte, 2<<20)
+		n := runtime.Stack(buf, true)
+		return strings.Count(string(buf[:n]), "net/http.(*persistConn).readLoop")
+	}
+
 	request()
-	baseline := runtime.NumGoroutine()
+	request()
+	baseline := countReadLoops()
 	for range 60 {
 		request()
 	}
 	runtime.GC()
-	time.Sleep(100 * time.Millisecond)
-	if increase := runtime.NumGoroutine() - baseline; increase > 15 {
-		t.Fatalf("goroutines increased by %d after repeated requests", increase)
+	// 连接回收是异步的：轮询等待增量归零，而不是钉固定睡眠窗。
+	waitForCond(t, 2*time.Second, func() bool { return countReadLoops() <= baseline })
+	if leaked := countReadLoops() - baseline; leaked > 0 {
+		t.Fatalf("transport read loops increased by %d after repeated requests（每请求泄漏一条连接 goroutine）", leaked)
 	}
 }
 
@@ -483,7 +527,7 @@ func TestSyncService_Pull_applies_old_response_after_new_snapshot_applied(t *tes
 		if number == 1 {
 			version = 1
 			close(oldRequestEntered)
-			waitSyncBarrier(releaseOldResponse)
+			waitSyncBarrier(t, releaseOldResponse)
 		}
 		response.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(response).Encode(map[string]any{"data": signedTestSnapshot(version, token)})
@@ -562,6 +606,48 @@ func TestVerifySnapshotIntegrity_acceptsMasterVersionRegressionWithWarning(t *te
 	}
 }
 
+func TestSyncService_Pull_demotedMaster403RecoversWithoutTokenRevocation(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var promoted atomic.Bool
+	const token = "cluster-token"
+	snapshot := signedTestSnapshot(1, token)
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/cluster/sync/snapshot":
+			if !promoted.Load() {
+				response.WriteHeader(http.StatusForbidden)
+				_, _ = response.Write([]byte(`{"code":403,"message":"该操作仅允许在主节点执行"}`))
+				return
+			}
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(models.APIResponse{Code: 0, Data: snapshot})
+		default:
+			response.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer master.Close()
+	caddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) { response.WriteHeader(http.StatusOK) }))
+	defer caddy.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token=? WHERE id=1", master.URL, token); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(caddy.URL))
+	if _, err := service.Pull(context.Background()); err == nil || errors.Is(err, errSyncTokenRevoked) {
+		t.Fatalf("demoted master error=%v, want non-terminal retryable failure", err)
+	}
+	promoted.Store(true)
+	if _, err := service.Pull(context.Background()); err != nil {
+		t.Fatalf("pull after re-promotion: %v", err)
+	}
+	var applied int
+	if err := database.QueryRow("SELECT applied_version FROM global_config WHERE id=1").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("applied_version=%d, want recovery to version 1", applied)
+	}
+}
+
 func TestVerifySnapshotIntegrity_classifiesAuthenticHigherMinReaderVersion(t *testing.T) {
 	// Given
 	const token = "cluster-token"
@@ -579,6 +665,30 @@ func TestVerifySnapshotIntegrity_classifiesAuthenticHigherMinReaderVersion(t *te
 	}
 	if got := syncErrorCode(err); got != models.SyncErrorCodeSchemaTooNew {
 		t.Fatalf("sync error code=%q, want %q", got, models.SyncErrorCodeSchemaTooNew)
+	}
+}
+
+func TestVerifySnapshotIntegrity_rejectsTamperedOuterMinReaderWithoutTerminalSchemaError(t *testing.T) {
+	// Given：canonical 与签名均合法，仅外层 min_reader_version 被在途篡改。
+	const token = "cluster-token"
+	snapshot := signTestSnapshot(models.ClusterSnapshot{
+		Version: 1, SchemaVersion: CurrentSnapshotSchema, MinReaderVersion: CurrentSnapshotSchema,
+	}, token)
+	snapshot.MinReaderVersion = CurrentSnapshotSchema + 1
+
+	// When
+	err := verifySnapshotIntegrity(snapshot, token, 0)
+
+	// Then：终止性版本判定只能使用完成 canonical 一致性绑定的值。
+	var schemaTooNew *SnapshotSchemaTooNewError
+	if err == nil || errors.As(err, &schemaTooNew) {
+		t.Fatalf("tampered outer min-reader error=%v, want non-terminal validation failure", err)
+	}
+	if got := syncErrorCode(err); got != models.SyncErrorCodeValidationFailed {
+		t.Fatalf("sync error code=%q, want %q", got, models.SyncErrorCodeValidationFailed)
+	}
+	if !strings.Contains(err.Error(), "元数据不一致") {
+		t.Fatalf("error=%v, want canonical metadata mismatch", err)
 	}
 }
 
@@ -720,7 +830,13 @@ func TestSyncService_run_stopsAfterReportingHigherMasterSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cluster := NewClusterService(database, nil, "")
+	cluster := NewClusterService(database, "")
+	// ReportNode 现在带 SQL 级主节点角色条件（降级竞态不可写）。
+	// 本用例在同一库上模拟「主节点接收从节点上报」，必须先把角色落成主节点，
+	// 否则会被角色守卫按降级拒绝（从端上报本身由 HTTP requireMaster 先行门禁）。
+	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
 	if err := cluster.ReportNode(context.Background(), int(nodeID), report, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -855,7 +971,12 @@ func TestSyncService_Pull_manualSuccessClearsHigherSchemaTerminalError(t *testin
 	higherSchema.Store(true)
 	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		if higherSchema.Load() {
-			_ = json.NewEncoder(response).Encode(map[string]any{"data": models.ClusterSnapshot{SchemaVersion: CurrentSnapshotSchema + 1}})
+			// 必须签名（canonical 与签名自洽）：未签名快照会先命中「缺少签名」，
+			// 终止 schema 分支从未被验证——删掉该分支测试仍绿。
+			terminal := signedTestSnapshot(1, token)
+			terminal.MinReaderVersion = CurrentSnapshotSchema + 1
+			terminal = signTestSnapshot(terminal, token)
+			_ = json.NewEncoder(response).Encode(map[string]any{"data": terminal})
 			return
 		}
 		_ = json.NewEncoder(response).Encode(map[string]any{"data": signedTestSnapshot(1, token)})
@@ -869,6 +990,11 @@ func TestSyncService_Pull_manualSuccessClearsHigherSchemaTerminalError(t *testin
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(caddy.URL))
 	if _, err := service.Pull(context.Background()); err == nil {
 		t.Fatal("higher schema pull unexpectedly succeeded")
+	} else {
+		var schemaTooNew *SnapshotSchemaTooNewError
+		if !errors.As(err, &schemaTooNew) {
+			t.Fatalf("err=%v, want SnapshotSchemaTooNewError（终止类语义）", err)
+		}
 	}
 	higherSchema.Store(false)
 
@@ -930,7 +1056,7 @@ func TestSyncService_Pull_rejectsSchemaV1SnapshotWithoutWritingDatabase(t *testi
 	}
 
 	// Then
-	// Round 35 S-11: 移除 v1/v2 legacy 回退后，v1 快照因缺少 canonical_payload
+	// 移除 v1/v2 legacy 回退后，v1 快照因缺少 canonical_payload
 	// 在签名校验阶段被拒绝。验证关键不变量：拒绝发生 + 本地数据未被覆盖。
 	if pullErr == nil || username != "local-user" {
 		t.Fatalf("pull error=%v local username=%q", pullErr, username)
@@ -955,12 +1081,17 @@ func TestSyncService_Promote_drains_blocked_manual_pull_without_applying(t *test
 	syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(master.URL))
 	beforeApply := make(chan struct{})
 	releaseApply := make(chan struct{})
+	// 屏障 hook 必须幂等：该 hook 由 Pull 调用，而同一实例可能有引擎 daemon 的
+	// 后台 run 循环或重试轮进来（多一次调用不得 panic——close of closed channel
+	// 会直接崩掉整个测试进程）
+	var beforeApplyOnce sync.Once
 	syncService.beforeApplySnapshot = func() {
-		close(beforeApply)
-		waitSyncBarrier(releaseApply)
+		beforeApplyOnce.Do(func() { close(beforeApply) })
+		waitSyncBarrier(t, releaseApply)
 	}
 	lifecycle := &syncDrainLifecycle{sync: syncService, stopEntered: make(chan struct{})}
-	cluster := NewClusterService(database, lifecycle, "")
+	cluster := NewClusterService(database, "")
+	wireClusterLifecycleEngineForTest(t, lifecycle, false)
 	pullDone := make(chan error, 1)
 	go func() {
 		_, err := syncService.Pull(context.Background())
@@ -1003,7 +1134,7 @@ func TestSyncService_Stop_returns_when_run_is_waiting_before_pull_admission(t *t
 	service := &SyncService{}
 	service.beforeBeginPull = func() {
 		close(beforeAdmission)
-		waitSyncBarrier(releaseAdmission)
+		waitSyncBarrier(t, releaseAdmission)
 	}
 	service.afterStopAdmission = func() { close(admissionStopped) }
 	service.runFn = func(ctx context.Context) {
@@ -1023,7 +1154,7 @@ func TestSyncService_Stop_returns_when_run_is_waiting_before_pull_admission(t *t
 }
 
 func TestSyncService_StartStop_resetsWafRepullFailures(t *testing.T) {
-	// R40 N-1 回归：角色切换/Stop-Start 复用同一 SyncService 实例时，
+	// 回归：角色切换/ 复用同一 SyncService 实例时，
 	// wafRepullFailures 必须清零，否则陈旧计数会让新会话首次漂移重拉被降频延迟。
 	service := &SyncService{}
 	service.runFn = func(ctx context.Context) { <-ctx.Done() }
@@ -1042,7 +1173,7 @@ func TestSyncService_StartStop_resetsWafRepullFailures(t *testing.T) {
 }
 
 func TestSyncService_Halted_concurrentPullAndResume_noCounterRace(t *testing.T) {
-	// R41 F-1 回归：Halted 态下手动 Pull 与 Resume 并发时，wafRepullFailures
+	// 回归：Halted 态下手动 Pull 与 Resume 并发时，wafRepullFailures
 	// 的复位（startLocked，持 s.mu）与读取（Pull defer → recordSyncError，
 	// 持 pullMu）无共同互斥锁——计数器必须原子访问；旧实现（裸 int）在本
 	// 测试下 go test -race 必然报数据竞争。
@@ -1087,7 +1218,7 @@ func TestSyncService_Halted_concurrentPullAndResume_noCounterRace(t *testing.T) 
 }
 
 func TestSyncService_Pull_onMaster_skipsSyncErrorPersistence(t *testing.T) {
-	// R41 S-1 回归：主节点经 API/MCP 调到 Pull 时错误只返回调用方，不得经
+	// 回归：主节点经 API/MCP 调到 Pull 时错误只返回调用方，不得经
 	// recordSyncError 写入 last_sync_error（该错误无自动清除路径）。
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec("UPDATE global_config SET is_master=1, last_sync_error='' WHERE id=1"); err != nil {
@@ -1218,7 +1349,7 @@ func dbConsistentWafDriftFixture(t *testing.T, clusterSvc *ClusterService, versi
 }
 
 func TestSyncService_Pull_refetchesFullSnapshotOnWafFileDrift(t *testing.T) {
-	// N-01 端到端：apply 期安全数据拉取/落盘失败仅记日志不返回错误
+	// 端到端：apply 期安全数据拉取/落盘失败仅记日志不返回错误
 	// （cluster_apply.go），记录哈希已提交但本地文件未收敛；主节点无新变更
 	// → 下轮 304。304 分支的 WAF 兜底必须比对 cluster_applied_sections 的
 	// waf_files 节哈希与本地文件态，不一致则 since_version=0 全量重拉并
@@ -1233,14 +1364,12 @@ func TestSyncService_Pull_refetchesFullSnapshotOnWafFileDrift(t *testing.T) {
 	masterXdb := filepath.Join(masterTree, "ip2region.xdb")
 	os.WriteFile(masterXdb, []byte("master-xdb-bytes"), 0644)
 
-	oldLive, oldXdb := crsLiveDir, ip2regionLivePath
-	crsLiveDir, ip2regionLivePath = filepath.Join(masterTree, "crs"), masterXdb
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(masterTree, "crs"), masterXdb))
 	ref := BuildWafFileRef()
 	bundle := BuildWafFileBundle()
 	// 模拟 apply 期失败后的从节点：本地文件树为空（从未收敛）。
 	slaveTree := t.TempDir()
-	crsLiveDir, ip2regionLivePath = filepath.Join(slaveTree, "crs"), filepath.Join(slaveTree, "ip2region.xdb")
-	defer func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb }()
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(slaveTree, "crs"), filepath.Join(slaveTree, "ip2region.xdb")))
 	os.MkdirAll(crsLiveDir, 0755)
 	if ref == nil || bundle == nil {
 		t.Fatal("master ref/bundle must build")
@@ -1310,7 +1439,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	// 主 v3.17.0audit / 从 v3.16.0audit，xdb 字节相同），漂移判定
 	// wafFilesDrifted（节哈希含标签）为 true，而应用侧门控
 	// wafFilesRefDiffers（仅内容 sha）为 false —— fetchWafFiles 分支
-	// 被短路，R57 A-#4 的 rewriteVersionIfMissingOrStale 永不执行，
+	// 被短路，rewriteVersionIfMissingOrStale 永不执行，
 	// 304 分支兜底重拉 → 应用跳过 → 死循环（每周期全量重拉 + 主节点
 	// 「同步下发」审计刷屏）。修复后应用侧门控以漂移态开路，标签收敛。
 	clusterSvc, database := newClusterTestService(t)
@@ -1323,15 +1452,13 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	os.WriteFile(masterXdb, []byte("same-xdb-bytes"), 0644)
 	os.WriteFile(masterXdb+".version", []byte("v3.17.0audit"), 0644)
 
-	oldLive, oldXdb := crsLiveDir, ip2regionLivePath
-	crsLiveDir, ip2regionLivePath = filepath.Join(masterTree, "crs"), masterXdb
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(masterTree, "crs"), masterXdb))
 	ref := BuildWafFileRef()
 	bundle := BuildWafFileBundle()
 
 	// 从节点：内容与主节点完全一致（tar/xdb sha 相同），仅 .version 标签陈旧。
 	slaveTree := t.TempDir()
-	crsLiveDir, ip2regionLivePath = filepath.Join(slaveTree, "crs"), filepath.Join(slaveTree, "ip2region.xdb")
-	defer func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb }()
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(slaveTree, "crs"), filepath.Join(slaveTree, "ip2region.xdb")))
 	os.MkdirAll(filepath.Join(crsLiveDir, "rules"), 0755)
 	os.WriteFile(filepath.Join(crsLiveDir, "rules", "a.conf"), []byte("SecRule X 1"), 0644)
 	os.WriteFile(filepath.Join(crsLiveDir, "VERSION"), []byte("v4.28.0"), 0644)
@@ -1407,7 +1534,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	}
 
 	// 收敛后：不得再次拉取安全数据包（标签已收敛，门控关闭）。
-	// 第二轮可能因夹具合成节哈希与本地重建口径的固有分叉做一次性 E3
+	// 第二轮可能因夹具合成节哈希与本地重建口径的固有分叉做一次性
 	// 漂移重放（生产真实快照节收敛后无此轮）；关键是重放也不再拉包、
 	// 标签保持收敛，且随后一轮必须是净 304——循环终止。
 	fetchesAfterConvergence := len(wafFetches)
@@ -1436,7 +1563,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 }
 
 func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testing.T) {
-	// F-1 端到端：apply 期安全数据拉取持续失败时，304 分支的 WAF 兜底重拉
+	// 端到端：apply 期安全数据拉取持续失败时，304 分支的 WAF 兜底重拉
 	// 每 60s 一轮无限循环打主从负载。连续 ≥wafRepullMaxFailures 轮未收敛后
 	// 必须：1) last_sync_error 上表面「安全数据持续同步失败（已连续 N 轮未收敛）」
 	// （节点页面可见）；2) 兜底重拉降频为每 wafRepullEvery 轮一次；3) 恢复
@@ -1451,14 +1578,21 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	masterXdb := filepath.Join(masterTree, "ip2region.xdb")
 	os.WriteFile(masterXdb, []byte("master-xdb-bytes"), 0644)
 
-	oldLive, oldXdb := crsLiveDir, ip2regionLivePath
-	crsLiveDir, ip2regionLivePath = filepath.Join(masterTree, "crs"), masterXdb
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(masterTree, "crs"), masterXdb))
+	// 安全节应用后置会重建爬虫运行快照（写进程级默认路径
+	// /app/data/crawler-ip-lists.json）。测试宿主不存在该目录时重建恒失败，
+	// crawlerSnapshotFailures 会在本用例的 9 轮内达到阈值，
+	// persistCrawlerSnapshotFailure 的文案随即覆盖 last_sync_error，
+	// 抢走本用例要断言的 WAF 持续失败文案。指向临时目录让该副作用成功
+	// （无爬虫名单行时写空集合），本用例只钉 WAF 兜底重拉的状态机与可见性。
+	oldCrawlerFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldCrawlerFile })
 	ref := BuildWafFileRef()
 	bundle := BuildWafFileBundle()
 	// 从节点本地文件树为空（从未收敛），持续拉取失败期间保持分叉。
 	slaveTree := t.TempDir()
-	crsLiveDir, ip2regionLivePath = filepath.Join(slaveTree, "crs"), filepath.Join(slaveTree, "ip2region.xdb")
-	defer func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb }()
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(slaveTree, "crs"), filepath.Join(slaveTree, "ip2region.xdb")))
 	os.MkdirAll(crsLiveDir, 0755)
 	if ref == nil || bundle == nil {
 		t.Fatal("master ref/bundle must build")
@@ -1511,13 +1645,12 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	defer caddyServer.Close()
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir(), CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 
-	lastSyncError := func() string {
+	lastSyncError := func() (string, models.SyncErrorCode) {
 		var stored string
 		if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
 			t.Fatal(err)
 		}
-		msg, _ := decodeSyncError(stored)
-		return msg
+		return decodeSyncError(stored)
 	}
 	pullRound := func(round int, wantRepull bool) {
 		t.Helper()
@@ -1551,15 +1684,17 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 		}
 		pullRound(round, true)
 	}
-	if msg := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") || !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullMaxFailures)) {
+	if msg, code := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") || !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullMaxFailures)) {
 		t.Fatalf("last_sync_error=%q, want 持续失败文案（已连续 %d 轮未收敛）", msg, wafRepullMaxFailures)
+	} else if code != models.SyncErrorCodeTransportError {
+		t.Fatalf("code=%q, want transport_error（持续失败属自愈类，须保留后置副作用标记）", code)
 	}
 
 	// 降频期：兜底重拉被跳过，每轮只有一次 304 请求，持续失败消息保持可见。
 	for service.wafRepullFailures.Load() < wafRepullEvery-1 {
 		round++
 		pullRound(round, false)
-		if msg := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") {
+		if msg, _ := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") {
 			t.Fatalf("round %d last_sync_error=%q, want 持续失败文案保持可见", round, msg)
 		}
 	}
@@ -1567,7 +1702,7 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	// 下一轮：计数器达到 wafRepullEvery，重拉一次并刷新计数文案。
 	round++
 	pullRound(round, true)
-	if msg := lastSyncError(); !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullEvery)) {
+	if msg, _ := lastSyncError(); !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullEvery)) {
 		t.Fatalf("last_sync_error=%q, want 已连续 %d 轮未收敛", msg, wafRepullEvery)
 	}
 
@@ -1586,7 +1721,7 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	if service.wafRepullFailures.Load() != 0 {
 		t.Fatalf("wafRepullFailures=%d after convergence, want 0", service.wafRepullFailures.Load())
 	}
-	if msg := lastSyncError(); msg != "" {
+	if msg, _ := lastSyncError(); msg != "" {
 		t.Fatalf("last_sync_error=%q after convergence, want cleared", msg)
 	}
 	if got, err := os.ReadFile(filepath.Join(crsLiveDir, "rules", "a.conf")); err != nil || string(got) != "SecRule X 1" {
@@ -1604,7 +1739,7 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 }
 
 func TestSyncService_driftedSections_bypassesStaleSnapshotCache(t *testing.T) {
-	// I-1 回归：本地规则在同步之外被删改但不递增 cluster_version，快照缓存
+	// 回归：本地规则在同步之外被删改但不递增 cluster_version，快照缓存
 	// 键（version/所有权/开关）不变 → 命中缓存会返回陈旧快照掩盖漂移。
 	// driftedSections 必须绕过缓存、直接重建本地快照才能检测到漂移。
 	_, database := newClusterTestService(t)
@@ -1612,7 +1747,7 @@ func TestSyncService_driftedSections_bypassesStaleSnapshotCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 预热快照缓存：记录与主节点一致的 rules 已应用哈希。
-	cluster := NewClusterService(database, nil, "")
+	cluster := NewClusterService(database, "")
 	snap, _, err := cluster.Snapshot(context.Background(), 0, "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -1631,7 +1766,7 @@ func TestSyncService_driftedSections_bypassesStaleSnapshotCache(t *testing.T) {
 }
 
 func TestSyncService_driftedSections_skipsDisabledSwitch(t *testing.T) {
-	// I-2 回归：曾同步过的节随后开关关闭 + 本地改动，若漂移检测不看开关会
+	// 回归：曾同步过的节随后开关关闭 + 本地改动，若漂移检测不看开关会
 	// 每轮都报告漂移并全量重拉，而 apply 又跳过该节 → 永久死循环。
 	_, database := newClusterTestService(t)
 	// 系统数据恒同步(2026-09-11 裁定)不可关——用 rules 验证开关跳过语义。
@@ -1652,7 +1787,7 @@ func TestSyncService_driftedSections_skipsDisabledSwitch(t *testing.T) {
 	if _, err := database.Exec("UPDATE global_config SET sync_rules=1 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	cluster := NewClusterService(database, nil, "")
+	cluster := NewClusterService(database, "")
 	snap, _, err := cluster.Snapshot(context.Background(), 0, "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -1667,7 +1802,7 @@ func TestSyncService_driftedSections_skipsDisabledSwitch(t *testing.T) {
 }
 
 func TestSyncService_run_clampsInvalidSyncInterval(t *testing.T) {
-	// R42 发现1 防御：存量库可能残留 sync_interval<=0，run 循环必须 clamp 到 60s，
+	// 发现1 防御：存量库可能残留 sync_interval<=0，run 循环必须 clamp 到 60s，
 	// 否则 time.NewTimer(<=0) 立即触发 → 零间隔 Pull 风暴。
 	_, database := newClusterTestService(t)
 	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -1706,7 +1841,7 @@ func TestSyncService_run_clampsInvalidSyncInterval(t *testing.T) {
 }
 
 func TestSyncService_run_clampsSubMinimumSyncInterval(t *testing.T) {
-	// R43 A-1：R42 前存量库可残留 sync_interval ∈ [1,9]（低于校验下限 10 但 >=1），
+	// 前存量库可残留 sync_interval ∈ [1,9]（低于校验下限 10 但 >=1），
 	// 经 buildSnapshot→updateSnapshotSettings 逐字下发后从节点 run 循环若不 clamp
 	// 会以秒级频率 Pull master（Pull 风暴）。clamp 下限必须与校验下限一致。
 	_, database := newClusterTestService(t)
@@ -1749,7 +1884,7 @@ func TestSyncService_run_clampsSubMinimumSyncInterval(t *testing.T) {
 }
 
 func TestDecodeSnapshotEnvelope_rejectsBodyOverSizeLimit(t *testing.T) {
-	// R51 发现4：Pull 快照响应体必须有大小上限——恶意/膨胀主节点下发的超大
+	// 发现4：Pull 快照响应体必须有大小上限——恶意/膨胀主节点下发的超大
 	// body 不得全量解码入内存，超限按解析失败（ValidationFailed）处理。
 	// Given：上限被调低，合法 envelope 超过该上限
 	old := maxSnapshotResponseBytes
@@ -1767,7 +1902,7 @@ func TestDecodeSnapshotEnvelope_rejectsBodyOverSizeLimit(t *testing.T) {
 }
 
 func TestDecodeSnapshotEnvelope_overflowNamesByteLimit(t *testing.T) {
-	// R52 N1：超限必须与网络截断/损坏区分——LimitReader 静默截断会让两者
+	// 超限必须与网络截断/损坏区分——LimitReader 静默截断会让两者
 	// 共用「unexpected EOF」，节点页面无法分辨主节点异常膨胀与链路故障。
 	// Given
 	old := maxSnapshotResponseBytes
@@ -1839,7 +1974,7 @@ func startRunLoopTestMaster(t *testing.T, snapshot any) (master *httptest.Server
 }
 
 func TestSyncService_Run_schemaTooOldDoesNotHalt_retriesNextCycle(t *testing.T) {
-	// E-F1 回归：v3 从节点拉到签名合法的 v2 主节点快照（SchemaTooOld）是可自愈
+	// 回归：v3 从节点拉到签名合法的 v2 主节点快照（SchemaTooOld）是可自愈
 	// 的降级错误——主节点升级后自动恢复（与同类的 v2 无 canonical 形态一致，
 	// cluster_sync.go:1116-1118 刻意非终止）。滚动升级先升从节点时若进 Halted
 	// 终态，主节点升级后从节点不会自动恢复，只能人工 Resume/改模式/重启。
@@ -1891,7 +2026,7 @@ func TestSyncService_Run_schemaTooOldDoesNotHalt_retriesNextCycle(t *testing.T) 
 }
 
 func TestSyncService_Run_schemaTooNewStillHalts(t *testing.T) {
-	// E-F1 回归护栏：min_reader_version 超出本节点支持范围的签名合法快照仍是
+	// 回归护栏：min_reader_version 超出本节点支持范围的签名合法快照仍是
 	// 终止错误——无法安全解析 canonical_payload，必须 Halted 等待本节点升级，
 	// 不得降级重试（cluster_sync.go:1122-1127 的语义不变）。
 	// Given：从节点 + 主节点下发签名合法、min_reader_version 超前的快照
@@ -1943,17 +2078,15 @@ func TestSyncService_Run_schemaTooNewStillHalts(t *testing.T) {
 	}
 }
 
-// SL7-1(第 7 轮 P1):主节点无 WAF 文件(applied 节哈希=nullRef 基准)+
+// 主节点无 WAF 文件(applied 节哈希=nullRef 基准)+
 // 从节点残留文件 → 漂移检测必须豁免(false),否则 404 重拉死循环。
 func TestWafFilesDrifted_nullRefAppliedHashExempt(t *testing.T) {
 	_, database := newClusterTestService(t)
 	// 模拟主节点无文件的已应用哈希(payload=纯 ref=nil → sha256("null"))
 	seedAppliedWafRefHash(t, database, wafFilesNullRefHash)
 	// 从节点残留一个文件(本地 ref 非 nil)
-	oldCrs, oldXdb := crsLiveDir, ip2regionLivePath
 	tmp := t.TempDir()
-	crsLiveDir, ip2regionLivePath = filepath.Join(tmp, "crs"), filepath.Join(tmp, "ip2region.xdb")
-	defer func() { crsLiveDir, ip2regionLivePath = oldCrs, oldXdb }()
+	t.Cleanup(OverrideWafLivePathsForTest(filepath.Join(tmp, "crs"), filepath.Join(tmp, "ip2region.xdb")))
 	os.MkdirAll(filepath.Join(crsLiveDir, "rules"), 0755)
 	os.WriteFile(filepath.Join(crsLiveDir, "rules", "a.conf"), []byte("residual"), 0644)
 
@@ -2010,4 +2143,179 @@ func TestSyncService_do_followsSameHostTLSUpgradeRedirect(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("redirect target never received the request")
 	}
+}
+
+func countAuditRows(t *testing.T, database *sql.DB, action, resource string) int {
+	t.Helper()
+	if database == nil {
+		t.Fatal("audit database not initialized")
+	}
+	var count int
+	if err := database.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action=? AND resource=?", action, resource).Scan(&count); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	return count
+}
+
+// 同一失败内容只写一条操作审计；内容变化重记；恢复后清空状态。
+func TestSyncFailureAudit_throttlesIdenticalFailuresAndRerecords(t *testing.T) {
+	newClusterTestService(t)
+	sync := NewSyncService(nil, nil, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	auditDB := db.AuditDB
+
+	// When：同一失败内容记录三次
+	record := func(detail string) {
+		if sync.syncFailureAuditDue("同步失败", "集群同步", detail) {
+			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
+		}
+	}
+	for range 3 {
+		record("版本：7 签名校验失败")
+	}
+	// Then：只留一条
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 1 {
+		t.Fatalf("identical failures wrote %d audit rows, want 1", got)
+	}
+
+	// When：失败内容变化（版本递增/错误形态变化）
+	record("版本：8 签名校验失败")
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 2 {
+		t.Fatalf("changed failure content rows=%d, want 2", got)
+	}
+
+	// When：同步恢复后再次失败（状态被清空）
+	sync.resetSyncFailureAuditThrottle()
+	record("版本：8 签名校验失败")
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 3 {
+		t.Fatalf("failure after recovery rows=%d, want 3", got)
+	}
+
+	// 类别隔离：安全数据/重载失败不与被抑制的集群同步内容互相吞并
+	if sync.syncFailureAuditDue("同步失败", "安全数据", "拉取安全数据失败: x") {
+		RecordAuditLog("system", "同步失败", "安全数据", "拉取安全数据失败: x", "")
+	}
+	if sync.syncFailureAuditDue("重载失败", "Caddy服务", "同步应用后自动重载失败: y") {
+		RecordAuditLog("system", "重载失败", "Caddy服务", "同步应用后自动重载失败: y", "")
+	}
+	if got := countAuditRows(t, auditDB, "同步失败", "安全数据"); got != 1 {
+		t.Fatalf("security data failure rows=%d, want 1", got)
+	}
+	if got := countAuditRows(t, auditDB, "重载失败", "Caddy服务"); got != 1 {
+		t.Fatalf("reload failure rows=%d, want 1", got)
+	}
+}
+
+// 多类别交替失败（安全数据失败与重载失败同轮先后出现）时每类仍只写一条：
+// 单槽键在 A→B→A→B 交替下每轮各记一条，按类别记键后互不干扰。
+func TestSyncFailureAudit_throttlesAlternatingCategoriesIndependently(t *testing.T) {
+	newClusterTestService(t)
+	sync := NewSyncService(nil, nil, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	auditDB := db.AuditDB
+
+	record := func(action, category, detail string) {
+		if sync.syncFailureAuditDue(action, category, detail) {
+			RecordAuditLog("system", action, category, detail, "")
+		}
+	}
+	for range 3 {
+		record("同步失败", "安全数据", "拉取安全数据失败: x")
+		record("重载失败", "Caddy服务", "同步应用后自动重载失败: y")
+	}
+	if got := countAuditRows(t, auditDB, "同步失败", "安全数据"); got != 1 {
+		t.Fatalf("alternating security data failures wrote %d audit rows, want 1", got)
+	}
+	if got := countAuditRows(t, auditDB, "重载失败", "Caddy服务"); got != 1 {
+		t.Fatalf("alternating reload failures wrote %d audit rows, want 1", got)
+	}
+
+	// 同类别内容变化仍重记（节流只抑制同一失败内容）。
+	record("同步失败", "安全数据", "拉取安全数据失败: y")
+	if got := countAuditRows(t, auditDB, "同步失败", "安全数据"); got != 2 {
+		t.Fatalf("changed security data failure rows=%d, want 2", got)
+	}
+}
+
+// 集成面：主节点持续返回签名无效快照时，两轮 Pull 只写一条审计。
+func TestSyncService_Pull_throttlesRepeatedIntegrityFailureAudit(t *testing.T) {
+	_, database := newClusterTestService(t)
+	const token = "cluster-token"
+	now := time.Now().UTC()
+	broken := signedTestSnapshot(7, token)
+	broken.Signature = strings.Repeat("0", 64)
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{"data": broken})
+	}))
+	defer master.Close()
+	if _, err := database.Exec("INSERT OR REPLACE INTO nodes (id,name,ip_address,port,status,is_approved,cluster_token_hash,last_seen) VALUES (1,'master','127.0.0.1',443,'online',1,?,?)", tokenHash(token), now.Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token=? WHERE id=1", master.URL, token); err != nil {
+		t.Fatal(err)
+	}
+	sync := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	auditDB := db.AuditDB
+
+	for i := range 2 {
+		if _, err := sync.Pull(context.Background()); err == nil {
+			t.Fatalf("pull %d accepted a tampered snapshot", i)
+		}
+	}
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 1 {
+		t.Fatalf("two failed pulls wrote %d audit rows, want 1 (audit throttle)", got)
+	}
+}
+
+// 按库登记全部同步服务实例，支持显式注销；注销后 Promote/BecomeSlave
+// 的排干面随之收缩（不再只排干最后注册的一个）。
+func TestSyncDrainers_registersAllInstancesAndUnregisters(t *testing.T) {
+	_, database := newClusterTestService(t)
+	first := NewSyncService(database, nil, nil)
+	second := NewSyncService(database, nil, nil)
+
+	drainers := syncDrainersFor(database)
+	if len(drainers) < 2 {
+		t.Fatalf("registered drainers=%d, want >=2 (per-database slice)", len(drainers))
+	}
+	found := map[*SyncService]bool{}
+	for _, drainer := range drainers {
+		found[drainer] = true
+	}
+	if !found[first] || !found[second] {
+		t.Fatal("both services must be registered (last-registered overwrite regression)")
+	}
+
+	unregisterSyncDrainer(first)
+	drainers = syncDrainersFor(database)
+	if len(drainers) != 1 || drainers[0] != second {
+		t.Fatalf("after unregister drainers=%v, want only second service", drainers)
+	}
+	unregisterSyncDrainer(second)
+	if got := syncDrainersFor(database); len(got) != 0 {
+		t.Fatalf("registry not cleaned: %v", got)
+	}
+
+	// clusterServices 同样支持逐个注销。
+	clusterA := NewClusterService(database, "")
+	clusterB := NewClusterService(database, "")
+	unregisterClusterService(clusterA)
+	remaining := clusterServicesFor(database)
+	for _, service := range remaining {
+		if service == clusterA {
+			t.Fatal("unregistered cluster service still returned")
+		}
+	}
+	foundB := false
+	for _, service := range remaining {
+		if service == clusterB {
+			foundB = true
+		}
+	}
+	if !foundB {
+		t.Fatal("unregister must only remove the target instance")
+	}
+	unregisterClusterService(clusterB)
 }

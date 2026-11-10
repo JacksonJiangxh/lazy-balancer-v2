@@ -1,11 +1,13 @@
 package services
 
-// R57: ip2region 最新版本查询的代理回退 + 下载 URL/进度日志测试。
+// ip2region 最新版本查询的代理回退 + 下载 URL/进度日志测试。
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"net/http/httptest"
@@ -91,7 +93,7 @@ func TestFetchIP2RegionLatestTag_bothFailErrorNamesBothURLs(t *testing.T) {
 }
 
 func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
-	// Given 内存下载服务：显式 Content-Length + 分块 flush 模拟流式到达
+	// Given 内存下载服务：显式 + 分块 flush 模拟流式到达
 	body := bytes.Repeat([]byte("i"), 8*1024)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -126,8 +128,14 @@ func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
 	}
 
 	// Then 文件完整落盘
-	if info, err := os.Stat(dest); err != nil || info.Size() != int64(len(body)) {
-		t.Fatalf("downloaded file size=%d,%v, want %d", info.Size(), err, len(body))
+	// 分开断言：err != nil 时 info 为 nil，旧写法在 Fatalf 实参里再解引用
+	// info.Size() 直接 panic，掩盖「下载未落盘」的真实原因。
+	info, statErr := os.Stat(dest)
+	if statErr != nil {
+		t.Fatalf("下载文件未落盘: %v", statErr)
+	}
+	if info.Size() != int64(len(body)) {
+		t.Fatalf("downloaded file size=%d, want %d", info.Size(), len(body))
 	}
 
 	// And 更新日志包含：开始行（完整代理 URL+预计大小）与完成行（字节+耗时）
@@ -151,5 +159,67 @@ func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
 	}
 	if !strings.Contains(logContent, string(IP2RegionStatusDownloading)) {
 		t.Fatalf("log lines must use the downloading stage:\n%s", logContent)
+	}
+}
+
+// ---- 下载完整性门（Content-Length 回读 / 落盘同步）----
+
+// ip2RegionRoundTripFunc 把函数适配为 http.RoundTripper（合成响应，不经网络；
+// 包内已有同形 helper，此名避免重复声明）。
+type ip2RegionRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f ip2RegionRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// 中间层截断：响应声明 Content-Length 大于实际可读字节时不得把 staging 文件
+// 当成功（安装段会 rename 它进 live 路径）。
+func TestDownloadIP2RegionXDB_rejectsTruncatedBodyAgainstDeclaredLength(t *testing.T) {
+	oldClient := ip2RegionDownloadClient
+	ip2RegionDownloadClient = &http.Client{Transport: ip2RegionRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Body:          io.NopCloser(strings.NewReader("short-body")),
+			ContentLength: 1024,
+			Header:        make(http.Header),
+		}, nil
+	})}
+	t.Cleanup(func() { ip2RegionDownloadClient = oldClient })
+	oldSync := ip2RegionDownloadSync
+	ip2RegionDownloadSync = func(f *os.File) error { return f.Sync() }
+	t.Cleanup(func() { ip2RegionDownloadSync = oldSync })
+
+	dest := filepath.Join(t.TempDir(), "ip2region_v4.xdb")
+	err := defaultDownloadIP2RegionXDB(context.Background(), "v9.9.9", dest, nil)
+	if err == nil {
+		t.Fatal("声明长度与实际字节不一致必须拒收（截断文件不得当成功）")
+	}
+	if !strings.Contains(err.Error(), "疑似截断") {
+		t.Fatalf("错误须点名截断形态: %v", err)
+	}
+	if info, serr := os.Stat(dest); serr != nil || info.Size() != int64(len("short-body")) {
+		t.Fatalf("部分落盘内容=%v,%v（staging 内容保持原样供上层清理）", info, serr)
+	}
+}
+
+// 落盘同步失败（掉电持久性门）必须上抛，不得把未 fsync 的 staging 文件当成功。
+func TestDownloadIP2RegionXDB_rejectsSyncFailure(t *testing.T) {
+	oldClient := ip2RegionDownloadClient
+	ip2RegionDownloadClient = &http.Client{Transport: ip2RegionRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := "xdb-payload"
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+			Header:        make(http.Header),
+		}, nil
+	})}
+	t.Cleanup(func() { ip2RegionDownloadClient = oldClient })
+	oldSync := ip2RegionDownloadSync
+	ip2RegionDownloadSync = func(*os.File) error { return errors.New("injected sync failure") }
+	t.Cleanup(func() { ip2RegionDownloadSync = oldSync })
+
+	dest := filepath.Join(t.TempDir(), "ip2region_v4.xdb")
+	err := defaultDownloadIP2RegionXDB(context.Background(), "v9.9.9", dest, nil)
+	if err == nil || !strings.Contains(err.Error(), "落盘同步失败") {
+		t.Fatalf("同步失败必须上抛落盘同步错误, got %v", err)
 	}
 }

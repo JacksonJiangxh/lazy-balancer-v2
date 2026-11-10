@@ -61,9 +61,11 @@ func TestRegisterClusterNode_rejects_oversized_body(t *testing.T) {
 }
 
 func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T) {
-	// Given：无效令牌 + 攻击者注入的 name/ip（超长 + 换行）
+	// Given：无效令牌 + 攻击者注入的 name/ip（换行注入；长度在 binding max=100
+	// 之内——超长名现在由 binding 直接 400，见
+	// TestRegisterClusterNode_rejectsOversizedName）
 	h := newBackupTestHandlers(t)
-	attackerName := "evil-" + strings.Repeat("x", 200) + "\nINJECTED"
+	attackerName := "evil-" + strings.Repeat("x", 40) + "\nINJECTED"
 	body := fmt.Sprintf(`{"token":"definitely-invalid","name":%q,"ip_address":"10.0.0.1","port":8000}`, attackerName)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -73,7 +75,7 @@ func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T)
 	// When
 	h.RegisterClusterNode(ctx)
 
-	// Then：401 且审计详情不含攻击者输入（R35-6/8）
+	// Then：401 且审计详情不含攻击者输入
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%s, want 401", recorder.Code, recorder.Body.String())
 	}
@@ -92,7 +94,7 @@ func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T)
 	}
 }
 
-// （SYS-R5，第 69 轮：自 apikeys_current_test.go 迁回——本族为集群注册校验
+// （自 apikeys_current_test.go 迁回——本族为集群注册校验
 // 主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestRegisterClusterNodeRejectsInvalidAddressAndPort(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -116,5 +118,22 @@ func TestRegisterClusterNodeRejectsInvalidAddressAndPort(t *testing.T) {
 				t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
 			}
 		})
+	}
+}
+
+// GET /cluster/register/:id/status 必须与同族机器端点（register/
+// confirm/snapshot/waf-files/report）一致带主节点门——降级节点残留注册行
+// 不得继续应答 approved/重发集群令牌。
+func TestGetClusterRegistrationStatus_rejectsSlaveNode(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.GET("/cluster/register/:id/status", h.GetClusterRegistrationStatus)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cluster/register/1/status", nil))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403 (master-only)", recorder.Code, recorder.Body.String())
 	}
 }

@@ -2,15 +2,16 @@ package acme
 
 import (
 	"context"
+	"net"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-// W1/W2（第 72 轮，用户裁定）：waitForDNS 放行判据锚定「准确公共 DNS 已命中」——
+// （用户裁定）：waitForDNS 放行判据锚定「准确公共 DNS 已命中」——
 // 权威全 miss 而公共递归共识命中（≥2 台 × 连续 2 轮）即放行。生产实证形态：
 // 权威全部「无 TXT 记录」而 nslookup 公共递归已命中（CNAME 委托/NS 变更/集群
 // 分裂三形态），LE 验证均能跟随实际 DNS 状态成功，客户端死等权威即恒超时。
@@ -67,7 +68,7 @@ func setupPropagationSeams(t *testing.T, authServers []string) *captureLogger {
 	return logger
 }
 
-// W1 主形态：权威全部 NODATA（生产「全 miss」实证形态）+ 3 台递归恒命中 →
+// 主形态：权威全部 NODATA（生产「全 miss」实证形态）+ 3 台递归恒命中 →
 // 连续 2 轮共识即放行。未实现共识放行时 waitForDNS 烧满预算超时（RED）。
 func TestIssuer_waitForDNS_recursiveConsensusReleasesWhenAuthoritativeBlind(t *testing.T) {
 	const expected = "consensus-value"
@@ -99,7 +100,7 @@ func TestIssuer_waitForDNS_recursiveConsensusReleasesWhenAuthoritativeBlind(t *t
 	}
 }
 
-// W1 混合形态：权威部分命中部分 miss（authReady 恒假=滞后+分歧混合），
+// 混合形态：权威部分命中部分 miss（authReady 恒假=滞后+分歧混合），
 // 递归共识命中同样放行（用户裁定确认②）。
 func TestIssuer_waitForDNS_partialAuthoritativeHits_stillReleaseOnConsensus(t *testing.T) {
 	const expected = "partial-auth-value"
@@ -127,7 +128,7 @@ func TestIssuer_waitForDNS_partialAuthoritativeHits_stillReleaseOnConsensus(t *t
 	}
 }
 
-// M9 回归钉：单台递归命中（即便恒定多轮）不构成共识，不得放行——
+// 回归钉：单台递归命中（即便恒定多轮）不构成共识，不得放行——
 // 公共递归缓存可取自已刷新单台，CA 问滞后权威时挑战仍会失败。
 func TestIssuer_waitForDNS_singleResolverHit_does_not_release(t *testing.T) {
 	const expected = "single-hit-value"
@@ -140,7 +141,7 @@ func TestIssuer_waitForDNS_singleResolverHit_does_not_release(t *testing.T) {
 
 	issuer := &Issuer{Logger: &captureLogger{}}
 	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond); err == nil {
-		t.Fatalf("single-resolver hit must NOT release (M9 anti-quota-burn guard)")
+		t.Fatalf("single-resolver hit must NOT release (历史修复 anti-quota-burn guard)")
 	}
 }
 
@@ -165,7 +166,7 @@ func TestIssuer_waitForDNS_authoritativeFullHit_releases(t *testing.T) {
 	}
 }
 
-// W2：权威存活台全 miss 持续超过诊断阈值 → 显式诊断日志（两方清单）；
+// 权威存活台全 miss 持续超过诊断阈值 → 显式诊断日志（两方清单）；
 // 预算耗尽的错误信息同样携带权威/递归清单——生产排障 30 秒自明根因。
 func TestIssuer_waitForDNS_divergenceDiagnosedAndTimeoutListsBothSides(t *testing.T) {
 	const expected = "divergence-value"
@@ -194,7 +195,7 @@ func TestIssuer_waitForDNS_divergenceDiagnosedAndTimeoutListsBothSides(t *testin
 	}
 }
 
-// 防御：共识阈值接缝不得被生产代码改写为 1（M9 底线的机器可验证形态）。
+// 防御：共识阈值接缝不得被生产代码改写为 1。
 func TestPropagationConsensusDefaults(t *testing.T) {
 	if propagationConsensusMinHits < 3 {
 		t.Fatalf("propagationConsensusMinHits=%d < 3 would weaken the anti-cache-premature-release guard (2026-10-13 user ruling: 2→3)", propagationConsensusMinHits)
@@ -202,5 +203,167 @@ func TestPropagationConsensusDefaults(t *testing.T) {
 	if propagationConsensusMinRounds < 2 {
 		t.Fatalf("propagationConsensusMinRounds=%d < 2 would release on a single poll round", propagationConsensusMinRounds)
 	}
-	var _ atomic.Bool // 占位：保持 atomic 导入供后续时间接缝扩展使用
+}
+
+// 单台×单轮兜底只允许在「从未发现权威」形态生效。
+// 域名本来没有可用 NS（解析失败/无 NS）时递归是唯一信号，单台命中即放行。
+func TestIssuer_waitForDNS_noAuthoritativeEver_singleResolverReleases(t *testing.T) {
+	const expected = "no-auth-value"
+	const fqdn = "_acme-challenge.noauth.example.com."
+	recHit := startFakeDNSServer(t, txtResponder(true, expected))
+	logger := setupPropagationSeams(t, nil) // resolveAuthoritativeNSFn 恒返回 nil
+	propagationRecursiveResolvers = []string{recHit}
+
+	issuer := &Issuer{Logger: logger}
+	start := time.Now()
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 3*time.Second); err != nil {
+		t.Fatalf("无可用权威时单台递归命中应放行: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("无权威兜底放行耗时 %v（应首轮即放行）", elapsed)
+	}
+}
+
+// 曾有权威但本轮全部探针失败的窗口不得退化为
+// 单台×单轮放行——那会绕过 3×2 共识（缓存超前会被当成真传播，CA 验证失败
+// 消耗 5 次/时配额）。此形态必须继续等共识直到超时。
+func TestIssuer_waitForDNS_allAuthoritativeTransientlyFailed_doesNotBypassConsensus(t *testing.T) {
+	const expected = "transient-fail-value"
+	const fqdn = "_acme-challenge.transient.example.com."
+	recHit := startFakeDNSServer(t, txtResponder(true, expected))
+	// 127.0.0.1:1 无监听 → 每轮探针失败，权威清单被清空（模拟瞬时全失败）
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	propagationRecursiveResolvers = []string{recHit}
+
+	issuer := &Issuer{Logger: logger}
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond); err == nil {
+		t.Fatalf("曾有权威后全失败时单台递归命中不得放行（会绕过 3×2 共识）")
+	}
+}
+
+// 回归形状：曾有权威、全失败，但递归多台共识达标 → 仍按共识放行
+// （裁定口径不变，只是不再接受单台证据）。
+func TestIssuer_waitForDNS_allAuthoritativeTransientlyFailed_consensusStillReleases(t *testing.T) {
+	const expected = "transient-consensus-value"
+	const fqdn = "_acme-challenge.transientconsensus.example.com."
+	rec1 := startFakeDNSServer(t, txtResponder(true, expected))
+	rec2 := startFakeDNSServer(t, txtResponder(true, expected))
+	rec3 := startFakeDNSServer(t, txtResponder(true, expected))
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	propagationRecursiveResolvers = []string{rec1, rec2, rec3}
+
+	issuer := &Issuer{Logger: logger}
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 3*time.Second); err != nil {
+		t.Fatalf("权威全瞬时失败时 3 台×2 轮共识仍应放行: %v", err)
+	}
+}
+
+// 空解析器清单是装配错误：必须显式报错，不得在 resolvers[0] 处 panic
+// （panic 会沿签发 goroutine 上抛终止整个 worker）。
+func TestIssuer_waitForDNS_emptyResolverListReturnsError(t *testing.T) {
+	origRecList := propagationRecursiveResolvers
+	t.Cleanup(func() { propagationRecursiveResolvers = origRecList })
+	propagationRecursiveResolvers = nil
+
+	issuer := &Issuer{Logger: &captureLogger{}}
+	err := issuer.waitForDNS(context.Background(), "_acme-challenge.empty.example.com.", "value", time.Second)
+	if err == nil {
+		t.Fatal("空解析器清单必须显式报错")
+	}
+	if !strings.Contains(err.Error(), "递归解析器") {
+		t.Fatalf("error=%v, want 缺少递归解析器清单的显式错误", err)
+	}
+}
+
+// 权威一轮全失败（RTT 抖动/限流）后清单不得永久变空——按上限重发现
+// 权威 NS，次轮探测新清单命中即放行（快路径自愈；递归共识判据不变）。
+func TestIssuer_waitForDNS_rediscoversAuthoritativeAfterTotalProbeFailure(t *testing.T) {
+	const expected = "rediscovery-value"
+	const fqdn = "_acme-challenge.rediscover.example.com."
+	authGood := startFakeDNSServer(t, txtResponder(true, expected))
+	recMiss := startFakeDNSServer(t, txtResponder(false, expected))
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	var mu sync.Mutex
+	resolveCalls := 0
+	resolveAuthoritativeNSFn = func(ctx context.Context, name, bootstrap string) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		resolveCalls++
+		if resolveCalls == 1 {
+			return []string{"127.0.0.1:1"} // 首轮全失败（无监听）
+		}
+		return []string{authGood}
+	}
+	propagationRecursiveResolvers = []string{recMiss}
+
+	issuer := &Issuer{Logger: logger}
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 3*time.Second); err != nil {
+		t.Fatalf("权威全瞬时失败后重发现恢复必须放行: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if resolveCalls < 2 {
+		t.Fatalf("resolve calls=%d, want ≥2（全失败后重新发现权威清单）", resolveCalls)
+	}
+}
+
+// 重发现次数有上限：重发现清单持续失败时不得无限重试（对 DNS 加压），
+// 烧满传播预算后如实报超时。
+func TestIssuer_waitForDNS_rediscoveryCapped(t *testing.T) {
+	const expected = "rediscovery-cap-value"
+	const fqdn = "_acme-challenge.rediscovercap.example.com."
+	recMiss := startFakeDNSServer(t, txtResponder(false, expected))
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	var mu sync.Mutex
+	resolveCalls := 0
+	resolveAuthoritativeNSFn = func(ctx context.Context, name, bootstrap string) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		resolveCalls++
+		return []string{"127.0.0.1:1"}
+	}
+	propagationRecursiveResolvers = []string{recMiss}
+
+	issuer := &Issuer{Logger: logger}
+	err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond)
+	if err == nil {
+		t.Fatal("重发现清单持续失败时必须报传播超时")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if resolveCalls != 1+maxAuthRediscoveries {
+		t.Fatalf("resolve calls=%d, want %d（首次发现 + %d 次重发现上限）", resolveCalls, 1+maxAuthRediscoveries, maxAuthRediscoveries)
+	}
+}
+
+// 共识门只统计「命中台数」——解析器清单必须比 MinHits 有可达余量，否则境内
+// 可达解析器不足时（境外解析器被墙/被投毒的常见网络）共识永不成立，
+// 「权威全 miss、递归已传播」场景退化为烧满 5min 预算超时。
+func TestPropagationResolverListSustainsConsensus(t *testing.T) {
+	if len(propagationRecursiveResolvers) < propagationConsensusMinHits+2 {
+		t.Fatalf("解析器清单 %d 台对 MinHits=%d 无余量：任一解析器不可达即令共识不可达",
+			len(propagationRecursiveResolvers), propagationConsensusMinHits)
+	}
+	seen := make(map[string]struct{}, len(propagationRecursiveResolvers))
+	for _, resolver := range propagationRecursiveResolvers {
+		if _, err := net.ResolveUDPAddr("udp", resolver); err != nil {
+			t.Fatalf("解析器 %q 非法: %v", resolver, err)
+		}
+		if _, duplicated := seen[resolver]; duplicated {
+			t.Fatalf("解析器 %q 重复：去重后清单台数被高估", resolver)
+		}
+		seen[resolver] = struct{}{}
+	}
+	// 境内可达解析器（前五台）必须自身足以满足共识门：中国大陆网络下
+	// 境外解析器常不可达，此处按地址段显式钉死可达集合。
+	domestic := []string{"223.5.5.5:53", "119.29.29.29:53", "114.114.114.114:53", "180.76.76.76:53", "1.2.4.8:53"}
+	present := 0
+	for _, resolver := range domestic {
+		if _, ok := seen[resolver]; ok {
+			present++
+		}
+	}
+	if present < propagationConsensusMinHits {
+		t.Fatalf("境内可达解析器仅 %d 台 (< MinHits=%d)：共识门在最需要的网络里失效", present, propagationConsensusMinHits)
+	}
 }

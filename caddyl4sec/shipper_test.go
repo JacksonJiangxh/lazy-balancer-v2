@@ -1,0 +1,660 @@
+package caddyl4sec
+
+import (
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// startUnixIngestServer 起一个 unix socket 上的 /security-events/ingest 假面板：
+// 固定应答 status 并捕获请求（与生产同路径/同方法/同 Content-Type 面）。
+// socket 路径取 os.TempDir 短名——macOS sun_path 上限 104 字节，t.TempDir
+// 的长随机路径会 bind: invalid argument。
+func startUnixIngestServer(t *testing.T, status int) (socket string, bodies func() []string) {
+	t.Helper()
+	path := filepath.Join(os.TempDir(), "l4sec-"+time.Now().Format("150405.000000000")+".sock")
+	captured := make(chan string, 16)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/security-events/ingest", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured <- r.Header.Get("Content-Type") + "\x00" + string(body)
+		w.WriteHeader(status)
+	})
+	srv := &http.Server{Handler: mux}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("unix listen: %v", err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = os.Remove(path)
+	})
+	return path, func() []string {
+		select {
+		case s := <-captured:
+			return []string{s}
+		default:
+			return nil
+		}
+	}
+}
+
+// setSpoolDirForTest 把 spool 目录重定向到临时目录（save/restore）。
+func setSpoolDirForTest(t *testing.T, dir string) {
+	t.Helper()
+	old := l4SpoolDir
+	l4SpoolDir = dir
+	t.Cleanup(func() { l4SpoolDir = old })
+}
+
+func linesFromBody(body string) []string {
+	trimmed := strings.TrimSuffix(body, "\n")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+// TestShipperIPCSuccess 主路径：攒批行按 ndjson 投递，204=成功，零落盘。
+func TestShipperIPCSuccess(t *testing.T) {
+	socket, bodies := startUnixIngestServer(t, http.StatusNoContent)
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", socket)
+	setSpoolDirForTest(t, filepath.Join(t.TempDir(), "spool"))
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+
+	l1 := buildL4EventLine(2, "IP 黑名单拒绝", "r1", "203.0.113.1", time.Unix(1, 11), [4]byte{1, 2, 3, 4}, true)
+	l2 := buildL4EventLine(4, "IP 黑名单", "r1", "203.0.113.2", time.Unix(1, 12), [4]byte{5, 6, 7, 8}, true)
+	p.enqueueEvent(l1)
+	p.enqueueEvent(l2)
+	p.flushQuiescedForTest()
+
+	sent, failed, spooled, spoolErrs := p.shipperCounters()
+	if sent != 2 || failed != 0 || spooled != 0 || spoolErrs != 0 {
+		t.Fatalf("shipper counters sent/failed/spooled/spoolErrs = %d/%d/%d/%d, want 2/0/0/0", sent, failed, spooled, spoolErrs)
+	}
+	got := bodies()
+	if len(got) != 1 {
+		t.Fatalf("ingest requests = %d, want 1（攒批）", len(got))
+	}
+	parts := strings.SplitN(got[0], "\x00", 2)
+	if parts[0] != "application/x-ndjson" {
+		t.Fatalf("Content-Type = %q, want application/x-ndjson（跨进程契约）", parts[0])
+	}
+	if lines := linesFromBody(parts[1]); len(lines) != 2 || !strings.HasPrefix(lines[0], `{"transaction"`) {
+		t.Fatalf("body lines = %d, want 2 ndjson lines, got %q", len(linesFromBody(parts[1])), parts[1])
+	}
+	entries, err := os.ReadDir(l4SpoolDir)
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("spool dir must stay empty on success, got %v", entries)
+	}
+}
+
+// TestShipperFailureSpoolsSealed 5xx → 整批落 spool（active→sealed 命名契约：
+// active-<pid>-<seq>.jsonl → sealed-<unixnano>.jsonl，每行一条）。
+func TestShipperFailureSpoolsSealed(t *testing.T) {
+	socket, _ := startUnixIngestServer(t, http.StatusServiceUnavailable)
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", socket)
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	setSpoolDirForTest(t, spoolDir)
+	p := acquirePipelineForTest()
+
+	line := buildL4EventLine(7, "IP 白名单拒绝", "r2", "198.51.100.7", time.Unix(2, 22), [4]byte{9, 9, 9, 9}, true)
+	p.enqueueEvent(line)
+	p.flushQuiescedForTest()
+	if err := p.stopAndCloseForTest(); err != nil {
+		t.Fatalf("stopAndClose: %v", err)
+	}
+
+	_, failed, spooled, spoolErrs := p.shipperCounters()
+	if failed != 1 || spooled != 1 || spoolErrs != 0 {
+		t.Fatalf("failed/spooled/spoolErrs = %d/%d/%d, want 1/1/0", failed, spooled, spoolErrs)
+	}
+	// close 后目录里只剩 sealed（active 已封存）
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), "sealed-") || !strings.HasSuffix(entries[0].Name(), ".jsonl") {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("spool entries = %v, want exactly one sealed-*.jsonl", names)
+	}
+	raw, err := os.ReadFile(filepath.Join(spoolDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read sealed file: %v", err)
+	}
+	if lines := linesFromBody(string(raw)); len(lines) != 1 || !strings.Contains(lines[0], `"X-LB-Protocol":["tcp"]`) {
+		t.Fatalf("sealed content = %q, want the enqueued event line", raw)
+	}
+}
+
+// TestShipper400PermanentReject 永久拒绝（400/413）不进 spool（毒批会无限
+// 重试）——按丢弃计数（真丢口径）。
+func TestShipper400PermanentReject(t *testing.T) {
+	socket, _ := startUnixIngestServer(t, http.StatusBadRequest)
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", socket)
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	setSpoolDirForTest(t, spoolDir)
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+
+	p.enqueueEvent(buildL4EventLine(2, "IP 黑名单拒绝", "r3", "203.0.113.3", time.Unix(3, 33), [4]byte{0, 0, 0, 1}, true))
+	p.flushQuiescedForTest()
+
+	_, failed, spooled, _ := p.shipperCounters()
+	if failed != 1 || spooled != 0 {
+		t.Fatalf("failed/spooled = %d/%d, want 1/0", failed, spooled)
+	}
+	if p.dropped.Load() != 1 {
+		t.Fatalf("pipeline dropped = %d, want 1（永久拒绝=真丢口径）", p.dropped.Load())
+	}
+	if entries, err := os.ReadDir(spoolDir); err == nil && len(entries) != 0 {
+		t.Fatal("400 must not spool (poison batch)")
+	}
+}
+
+// TestSpoolBudgetFullDrops spool 字节预算耗尽 → 余下行无文件兜底，按
+// spool_errors + dropped 计数（真丢必须可观测）。
+func TestSpoolBudgetFullDrops(t *testing.T) {
+	socket, _ := startUnixIngestServer(t, http.StatusServiceUnavailable)
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", socket)
+	// spool 字节预算经 env 收窄（与面板侧同一 env 契约；预放 1MiB 残留必超限）
+	t.Setenv("LB_SECURITY_EVENTS_SPOOL_MAX_BYTES", "64")
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	setSpoolDirForTest(t, spoolDir)
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+	defer restoreTunables(setTunablesForTest(64, 1<<20, 10*time.Millisecond))
+
+	if err := os.MkdirAll(spoolDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// 目录预放超预算残留：预算按目录现存文件跨代核算（64B 预算 < 1MiB 残留）
+	if err := os.WriteFile(filepath.Join(spoolDir, "preexisting.jsonl"), make([]byte, 1<<20), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	line := buildL4EventLine(2, "IP 黑名单拒绝", "r4", "203.0.113.4", time.Unix(4, 44), [4]byte{0, 0, 0, 2}, true)
+	p.enqueueEvent(line)
+	p.flushQuiescedForTest()
+
+	_, _, spooled, spoolErrs := p.shipperCounters()
+	if spooled != 0 || spoolErrs != 1 {
+		t.Fatalf("spooled/spoolErrs = %d/%d, want 0/1（spool 满转真丢计数）", spooled, spoolErrs)
+	}
+	if p.dropped.Load() != 1 {
+		t.Fatalf("pipeline dropped = %d, want 1", p.dropped.Load())
+	}
+}
+
+// TestQueuePerLineCapAndBudget 单行超上限 → 立即丢弃计数，不占准入位
+// （pending 归零，风暴自防不放大驻留）。
+func TestQueuePerLineCapAndBudget(t *testing.T) {
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", "")
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+
+	huge := make([]byte, l4LineMaxBytes+1)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	p.enqueueEvent(huge)
+	if p.dropped.Load() != 1 || p.ring.depth() != 0 {
+		t.Fatalf("dropped/depth = %d/%d, want 1/0（超单行上限即丢）", p.dropped.Load(), p.ring.depth())
+	}
+}
+
+// TestSpoolDirEnvOverride 面板侧补采目录经 LB_SECURITY_EVENTS_L4_SPOOL_DIR
+// 覆盖——写侧必须消费同一 env（跨进程契约对称：写读分叉会让补采扫空目录）。
+func TestSpoolDirEnvOverride(t *testing.T) {
+	// socket 指向不存在路径即可：shipper 构造期不拨号（投递才拨），需要
+	// IPC 启用形态才会构造 shipper 并打开 spool。
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", filepath.Join(t.TempDir(), "noop.sock"))
+	override := filepath.Join(t.TempDir(), "spool-l4-override")
+	t.Setenv("LB_SECURITY_EVENTS_L4_SPOOL_DIR", override)
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+
+	// spool 目录在 shipper 构造期打开——env 生效即目录被创建（0700）
+	if _, err := os.Stat(override); err != nil {
+		t.Fatalf("shipper did not open env-overridden spool dir %s: %v", override, err)
+	}
+	if p.shipper == nil || p.shipper.spool == nil || p.shipper.spool.dir != override {
+		t.Fatalf("shipper spool dir = %+v, want %s", p.shipper, override)
+	}
+}
+
+// TestSpoolIdleSeal 静默超窗的 active 文件按 idle 封存（补采端只消费 sealed
+// ——不按时间封存会让兜底条目滞留到进程退出）。
+func TestSpoolIdleSeal(t *testing.T) {
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	s := openL4Spool(spoolDir, 1<<20, 1000)
+	if _, err := s.appendLines([][]byte{[]byte(`{"k":1}`)}); err != nil {
+		t.Fatalf("appendLines: %v", err)
+	}
+	if err := s.sealIfIdle(time.Now().Add(l4SpoolIdleSeal+time.Second), l4SpoolIdleSeal); err != nil {
+		t.Fatalf("sealIfIdle: %v", err)
+	}
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), "sealed-") {
+		t.Fatalf("entries = %v, want sealed file", entries)
+	}
+}
+
+// TestDisabledIPCDropsWithoutFiles IPC 显式关闭（env 空串）→ 事件行计数丢弃、
+// 不创建任何 spool/文件痕迹（纯文件兜底仅 HTTP 审计链支持）。
+func TestDisabledIPCDropsWithoutFiles(t *testing.T) {
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", "")
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	setSpoolDirForTest(t, spoolDir)
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+
+	p.enqueueEvent(buildL4EventLine(4, "IP 黑名单", "r5", "203.0.113.5", time.Unix(5, 55), [4]byte{7, 7, 7, 7}, true))
+	p.flushQuiescedForTest()
+	if p.dropped.Load() != 1 {
+		t.Fatalf("dropped = %d, want 1", p.dropped.Load())
+	}
+	if _, err := os.Stat(spoolDir); !os.IsNotExist(err) {
+		t.Fatalf("disabled IPC must not create spool dir, stat err = %v", err)
+	}
+}
+
+// TestPipelineSinkReceivesSyntheticLine 全链形状：handler 产出的行原样到达
+// 投递缝（handler→队列→drain→submit），geoip 段位/文案在行内。
+func TestPipelineSinkReceivesSyntheticLine(t *testing.T) {
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", "")
+	resetConnStatsForTest()
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+
+	got := make(chan []byte, 1)
+	p.setSubmitSinkForTest(func(line []byte) { got <- line })
+
+	h := newHandlerForTest(t, &L4SecHandler{RuleCaddyID: "r-sink", Reason: "geoip", PolicyID: 11})
+	if err := h.Handle(newTestConn("8.8.8.8"), &nextCapture{}); err != nil {
+		t.Fatalf("Handle = %v", err)
+	}
+	p.flushQuiescedForTest()
+	select {
+	case line := <-got:
+		if !strings.Contains(string(line), `"id":800011`) || !strings.Contains(string(line), "GeoIP 区域拦截") {
+			t.Fatalf("line missing geoip segment attribution: %s", line)
+		}
+	default:
+		t.Fatal("sink never received the synthetic line")
+	}
+}
+
+// TestL4SpoolResetSealsActiveFile：写错误路径重置句柄时必须封存 active——
+// 遗留的 active-*.jsonl 在写侧存活期间永不被补采且持续占用兜底预算；
+// 封存（rename→sealed-*）让已落盘行进入补采可达面。
+func TestL4SpoolResetSealsActiveFile(t *testing.T) {
+	dir := t.TempDir()
+	sp := openL4Spool(dir, 1<<20, 1000)
+	line := []byte(`{"k":"v"}`)
+	if n, err := sp.appendLines([][]byte{line, line, line}); err != nil || n != 3 {
+		t.Fatalf("appendLines = %d, %v; want 3, nil", n, err)
+	}
+	sp.mu.Lock()
+	sp.resetWriterLocked()
+	sp.mu.Unlock()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	var actives, sealeds int
+	for _, e := range entries {
+		switch {
+		case strings.HasPrefix(e.Name(), "active-"):
+			actives++
+		case strings.HasPrefix(e.Name(), "sealed-"):
+			sealeds++
+		}
+	}
+	if actives != 0 {
+		t.Fatalf("reset 后仍有 %d 个 active 文件（遗留不补采+吃预算）", actives)
+	}
+	if sealeds != 1 {
+		t.Fatalf("reset 后 sealed=%d, want 1", sealeds)
+	}
+}
+
+// closeActiveForTest 真实故障注入：关闭 spool 当前 active 的底层文件——
+// 后续 Write/Flush 返回真实错误（file already closed），不 mock bufio。
+// 同包测试直达内部句柄。
+func closeActiveForTest(t *testing.T, sp *l4Spool) {
+	t.Helper()
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.active == nil {
+		t.Fatal("active file missing before fault injection")
+	}
+	if err := sp.active.Close(); err != nil {
+		t.Fatalf("close active: %v", err)
+	}
+}
+
+// TestL4SpoolStickyErrorHonestLoss：真实故障注入（关闭底层文件）。批末 flush
+// 失败必须：(a) 错误携带丢失行数（上批滞留 + 本批行数，粘性错误下缓冲不可
+// 恢复）；(b) 恢复性——下一次 appendLines 在新 active 上成功且只含新行
+// （旧批确实已丢，但被如实计数，绝不静默）。
+func TestL4SpoolStickyErrorHonestLoss(t *testing.T) {
+	dir := t.TempDir()
+	sp := openL4Spool(dir, 1<<20, 1000)
+	line := []byte(`{"k":"v"}`)
+
+	// 基线批：正常落盘（批末 flush 成功，滞留=0）。
+	if n, err := sp.appendLines([][]byte{line, line}); err != nil || n != 2 {
+		t.Fatalf("baseline appendLines = %d, %v; want 2, nil", n, err)
+	}
+	closeActiveForTest(t, sp)
+
+	// 本批 3 行全部交给 bufio（缓冲未满，不触碰文件），批末 flush 真实失败。
+	_, err := sp.appendLines([][]byte{line, line, line})
+	if err == nil {
+		t.Fatal("appendLines must fail after real file close")
+	}
+	var lossErr *l4SpoolLossError
+	if !errors.As(err, &lossErr) {
+		t.Fatalf("error %T (%v) must carry loss accounting", err, err)
+	}
+	// 丢失 = 上批滞留（0，已成功 flush）+ 本批 3 行。
+	if lossErr.Lost != 3 {
+		t.Fatalf("carried lost = %d, want 3 (whole batch handed to buffer, flush failed)", lossErr.Lost)
+	}
+
+	// 恢复性：错误后下一次 appendLines 成功（新 active），新文件只含新行。
+	if n, err := sp.appendLines([][]byte{[]byte(`{"k":"new"}`)}); err != nil || n != 1 {
+		t.Fatalf("recovery appendLines = %d, %v; want 1, nil", n, err)
+	}
+	data, err := os.ReadFile(mustActivePath(t, sp))
+	if err != nil {
+		t.Fatalf("read new active: %v", err)
+	}
+	if got := strings.Count(string(data), "\n"); got != 1 || !strings.Contains(string(data), `"k":"new"`) {
+		t.Fatalf("new active content = %q, want only the new line (old batch honestly lost)", data)
+	}
+}
+
+// TestL4SpoolOpenActiveFailureRejectsBatch：首行即错形态——active 无法建立
+// （目录缺失）时整批在入口被拒：written=0、无任何行交给缓冲（pendingLines=0）。
+func TestL4SpoolOpenActiveFailureRejectsBatch(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "spool")
+	sp := openL4Spool(dir, 1<<20, 1000)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove dir: %v", err)
+	}
+	n, err := sp.appendLines([][]byte{[]byte(`{"k":"v"}`), []byte(`{"k":"v2"}`)})
+	if err == nil {
+		t.Fatal("appendLines must fail when active cannot be created")
+	}
+	if n != 0 {
+		t.Fatalf("written = %d, want 0 (nothing accepted)", n)
+	}
+	sp.mu.Lock()
+	pending := sp.pendingLines
+	sp.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pendingLines = %d, want 0 (no line handed over)", pending)
+	}
+}
+
+// TestL4SpoolMidBatchFlushFailureCountsBuffered：批内缓冲滞留后写失败——
+// 16KiB 行填满 32KiB 缓冲，第二行逼出真实落盘失败。滞留行（已交缓冲）与
+// 本批未尝试行都计入错误携带的丢失数，随后缓冲被放弃。
+func TestL4SpoolMidBatchFlushFailureCountsBuffered(t *testing.T) {
+	dir := t.TempDir()
+	sp := openL4Spool(dir, 8<<20, 1000)
+	line := []byte(`{"k":"v"}`)
+	if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+		t.Fatalf("baseline appendLines = %d, %v; want 1, nil", n, err)
+	}
+	closeActiveForTest(t, sp)
+
+	// 3×16KiB 行：第 1 行进缓冲（滞留），第 2 行触发缓冲落盘真实失败。
+	big := []byte(strings.Repeat("x", 16<<10))
+	n, err := sp.appendLines([][]byte{big, big, big})
+	if err == nil {
+		t.Fatal("appendLines must fail on real flush error")
+	}
+	var lossErr *l4SpoolLossError
+	if !errors.As(err, &lossErr) {
+		t.Fatalf("error %T (%v) must carry loss accounting", err, err)
+	}
+	if n != 1 {
+		t.Fatalf("written = %d, want 1 (only the buffered prefix line)", n)
+	}
+	// 丢失 = 滞留 1 行 + 本批未确认 2 行。
+	if lossErr.Lost != 3 {
+		t.Fatalf("carried lost = %d, want 3 (1 buffered + 2 unconfirmed)", lossErr.Lost)
+	}
+}
+
+// TestL4SpoolRotateFlushFailureHonestLoss：轮转阈值触发时 flush 真实失败
+// （单行阈值迫使批内首行写完即轮转）——滞留 + 本批未尝试行整批计入丢失，
+// active 被封存（无遗留），下一次写入在新 active 上恢复。
+func TestL4SpoolRotateFlushFailureHonestLoss(t *testing.T) {
+	dir := t.TempDir()
+	sp := openL4Spool(dir, 8<<20, 1000)
+	sp.mu.Lock()
+	sp.rotateBytes = 1 // 单行阈值：每行写完即触发轮转
+	sp.mu.Unlock()
+	line := []byte(`{"k":"v"}`)
+
+	// 基线：建立健康 active（首行写完即轮转一次，flush 成功落盘）。
+	if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+		t.Fatalf("baseline appendLines = %d, %v; want 1, nil", n, err)
+	}
+	closeActiveForTest(t, sp)
+
+	// 本批 2 行：第 1 行交缓冲后触发轮转 → flush 真实失败。
+	_, err := sp.appendLines([][]byte{line, line})
+	if err == nil {
+		t.Fatal("appendLines must fail when rotate flush fails for real")
+	}
+	var lossErr *l4SpoolLossError
+	if !errors.As(err, &lossErr) {
+		t.Fatalf("error %T (%v) must carry loss accounting", err, err)
+	}
+	// 丢失 = 滞留 1 行（第 1 行已交缓冲）+ 本批未尝试 1 行。
+	if lossErr.Lost != 2 {
+		t.Fatalf("carried lost = %d, want 2 (1 buffered at rotate + 1 unattempted)", lossErr.Lost)
+	}
+
+	// 恢复性：下一次写入在新 active 上成功（轮转链重建）。
+	if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+		t.Fatalf("recovery appendLines = %d, %v; want 1, nil", n, err)
+	}
+}
+
+// TestL4ShipperSpoolWriteFailureHonestCounters：shipper 层诚实核算——post
+// 失败 + spool 写真实失败（关闭 active 注入）→ 失败批一行都不算 spooled，
+// dropped/spool_errors 含整批与滞留。
+func TestL4ShipperSpoolWriteFailureHonestCounters(t *testing.T) {
+	socket, _ := startUnixIngestServer(t, http.StatusServiceUnavailable)
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	setSpoolDirForTest(t, spoolDir)
+	shipper := newL4Shipper(socket)
+	defer func() { _ = shipper.spool.close() }()
+	dropped := 0
+	shipper.onDrop = func(reason string, n int) { dropped += n }
+
+	line := []byte(`{"k":"v"}`)
+	// 基线批：spool 正常接收（spooled=1）。
+	shipper.spill([][]byte{line}, errors.New("ipc down"))
+	if _, _, spooled, spoolErrs := shipper.counters(); spooled != 1 || spoolErrs != 0 {
+		t.Fatalf("baseline spooled/spoolErrs = %d/%d, want 1/0", spooled, spoolErrs)
+	}
+
+	// 真实故障注入：关闭 spool active 底层文件。
+	closeActiveForTest(t, shipper.spool)
+
+	// 失败批：spool 写真实失败——整批计入丢弃，spooled 不增加。
+	shipper.spill([][]byte{line, line}, errors.New("ipc down"))
+	sent, failed, spooled, spoolErrs := shipper.counters()
+	if sent != 0 || failed != 0 {
+		t.Fatalf("sent/failed = %d/%d, want 0/0 (spill is post-failure path)", sent, failed)
+	}
+	if spooled != 1 {
+		t.Fatalf("spooled = %d, want 1 (failed batch never counts as spooled)", spooled)
+	}
+	if spoolErrs != 2 {
+		t.Fatalf("spoolErrs = %d, want 2 (whole failed batch + retention)", spoolErrs)
+	}
+	if dropped != 2 {
+		t.Fatalf("dropped = %d, want 2 (honest loss, no silent retry promise)", dropped)
+	}
+}
+
+func mustActivePath(t *testing.T, sp *l4Spool) string {
+	t.Helper()
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.activePath == "" {
+		t.Fatal("active path empty")
+	}
+	return sp.activePath
+}
+
+// TestSpoolBudgetFullPartialBatchHonestSplit：预算中途耗尽——已写入行经批末
+// flush 落盘（必然被补采）按 spooled 如实计入；仅未写入行计丢。不得把已落盘
+// 行整批虚计为 dropped。
+func TestSpoolBudgetFullPartialBatchHonestSplit(t *testing.T) {
+	socket, _ := startUnixIngestServer(t, http.StatusServiceUnavailable)
+	t.Setenv("LB_SECURITY_EVENTS_IPC_SOCKET", socket)
+	// 预算 700B：约容 2 行（行 ~291B），第 3 行触发中途耗尽。
+	t.Setenv("LB_SECURITY_EVENTS_SPOOL_MAX_BYTES", "700")
+	spoolDir := filepath.Join(t.TempDir(), "spool")
+	setSpoolDirForTest(t, spoolDir)
+	p := acquirePipelineForTest()
+	defer p.resetForTest()
+	defer restoreTunables(setTunablesForTest(8, 1<<20, 10*time.Millisecond))
+
+	if err := os.MkdirAll(spoolDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		line := buildL4EventLine(int64(i), "IP 黑名单拒绝", "r", "203.0.113.4", time.Unix(int64(i), 44), [4]byte{0, 0, 0, byte(i)}, true)
+		p.enqueueEvent(line)
+	}
+	p.flushQuiescedForTest()
+
+	_, _, spooled, spoolErrs := p.shipperCounters()
+	if spooled < 1 {
+		t.Fatalf("spooled=%d, want ≥1（已落盘行必须按 spooled 如实计入，不得虚计为丢）", spooled)
+	}
+	if spoolErrs < 1 {
+		t.Fatalf("spoolErrs=%d, want ≥1（未写入行计丢）", spoolErrs)
+	}
+	if spooled+spoolErrs != 3 {
+		t.Fatalf("spooled+spoolErrs=%d, want 3（整批三行两态守恒）", spooled+spoolErrs)
+	}
+}
+
+// TestL4SpoolBudgetRefreshThrottledWithinWindow 预算核算节流：节流窗口内
+// 连续 append 批次复用上次目录扫描结果（每批全量 ReadDir+lstat 在高频批次
+// 下是纯开销）；窗口过期后下一批恢复实测。时钟经 l4Spool.now 注入缝推进
+// 窗口，不 sleep；扫描次数经 l4SpoolRefreshScanHook 计数（生产恒 nil）。
+func TestL4SpoolBudgetRefreshThrottledWithinWindow(t *testing.T) {
+	dir := t.TempDir()
+	sp := openL4Spool(dir, 1<<20, 1000)
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	sp.mu.Lock()
+	sp.now = func() time.Time { return now }
+	sp.mu.Unlock()
+
+	scans := 0
+	l4SpoolRefreshScanHook = func() { scans++ }
+	defer func() { l4SpoolRefreshScanHook = nil }()
+
+	line := []byte(`{"k":"v"}`)
+	if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+		t.Fatalf("首批 appendLines = %d, %v; want 1, nil", n, err)
+	}
+	if scans != 1 {
+		t.Fatalf("首批扫描次数 = %d, want 1（首次预算必须实测）", scans)
+	}
+	for i := 2; i <= 6; i++ {
+		if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+			t.Fatalf("窗口内第 %d 批 appendLines = %d, %v; want 1, nil", i, n, err)
+		}
+	}
+	if scans != 1 {
+		t.Fatalf("窗口内连续 5 批后扫描次数 = %d, want 1（应复用上次核算，不逐批 ReadDir+lstat）", scans)
+	}
+	now = base.Add(l4SpoolBudgetRefreshInterval + time.Second)
+	if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+		t.Fatalf("窗口过期批 appendLines = %d, %v; want 1, nil", n, err)
+	}
+	if scans != 2 {
+		t.Fatalf("窗口过期后扫描次数 = %d, want 2（节流不得吞掉到期刷新）", scans)
+	}
+}
+
+// TestL4SpoolBudgetExhaustedRefreshesDespiteWindow 预算临界不受节流约束：
+// 节流窗口内的陈旧核算超限也必须强制实测一次——面板补采删除 sealed 文件
+// 释放的空间必须立即可见，不得因节流窗口把有空间的 spool 误判满。
+func TestL4SpoolBudgetExhaustedRefreshesDespiteWindow(t *testing.T) {
+	dir := t.TempDir()
+	sp := openL4Spool(dir, 230, 1000)
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	sp.mu.Lock()
+	sp.now = func() time.Time { return now }
+	sp.rotateBytes = 200 // 收窄轮转：批内即封存第一个文件，制造面板可回收面
+	sp.mu.Unlock()
+
+	scans := 0
+	l4SpoolRefreshScanHook = func() { scans++ }
+	defer func() { l4SpoolRefreshScanHook = nil }()
+
+	// 基线批：20 行×11B=220B，批内 209B 触发轮转封存 209B + 新 active 11B，
+	// 批末 flush 全部落盘；节流窗口内的陈旧核算 totalBytes=220。
+	line := []byte("0123456789")
+	lines := make([][]byte, 20)
+	for i := range lines {
+		lines[i] = line
+	}
+	if n, err := sp.appendLines(lines); err != nil || n != 20 {
+		t.Fatalf("基线批 appendLines = %d, %v; want 20, nil", n, err)
+	}
+	sealed := ""
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "sealed-") {
+			sealed = filepath.Join(dir, e.Name())
+		}
+	}
+	if sealed == "" {
+		t.Fatalf("基线批未产生 sealed 文件（轮转注入失效）: %v", entries)
+	}
+	// 外部回收：面板补采后删除 sealed（真实回收面，非 mock）。
+	if err := os.Remove(sealed); err != nil {
+		t.Fatal(err)
+	}
+	// 陈旧核算 220+11=231 > 230 必 trip 预算检查；强制实测后目录仅剩
+	// active 11B → 11+11=22 ≤ 230，必须放行而非误判满。
+	if n, err := sp.appendLines([][]byte{line}); err != nil || n != 1 {
+		t.Fatalf("预算临界批 appendLines = %d, %v; want 1, nil（外部回收释放的空间必须立即可见）", n, err)
+	}
+	if scans != 2 {
+		t.Fatalf("扫描次数 = %d, want 2（基线刷新+临界强制刷新——耗尽路径不受节流约束）", scans)
+	}
+}

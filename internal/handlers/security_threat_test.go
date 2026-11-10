@@ -88,12 +88,107 @@ func TestThreatLib_getListsSourcesWithTotal(t *testing.T) {
 	}
 }
 
+func TestThreatLib_listLookupFailureReturns500(t *testing.T) {
+	// Given 源主表可读但内置名单表故障。
+	router := newThreatTestRouter(t)
+	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When/Then 名单 ID 解析必须 fail-visible，不得退化为 list_id=0 的 200。
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/security/threat-lib", nil))
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "读取内置名单失败") {
+		t.Fatalf("status=%d body=%s, want list lookup 500", response.Code, response.Body.String())
+	}
+}
+
+func TestThreatLib_excludesCrawlerAddressSources(t *testing.T) {
+	// Given：历史合并形态在威胁源表残留爬虫地址库源行
+	router := newThreatTestRouter(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,url,update_enabled,entry_count)
+		VALUES (1039,'googlebot','Google 官方爬虫 IP','https://example.com/google.json',1,170)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/threat-lib", nil))
+
+	// Then：威胁情报库管理面只暴露三个威胁源，爬虫地址库走独立端点
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if strings.Contains(body, `"name":"googlebot"`) {
+		t.Fatalf("威胁情报库响应混入爬虫地址库源: %s", body)
+	}
+	var payload struct {
+		Data struct {
+			Sources []struct {
+				Name string `json:"name"`
+			} `json:"sources"`
+			TotalEntries int `json:"total_entries"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.Sources) != 3 || payload.Data.TotalEntries != 0 {
+		t.Fatalf("威胁源数量/合计被爬虫源污染: sources=%d total=%d", len(payload.Data.Sources), payload.Data.TotalEntries)
+	}
+}
+
+func TestThreatLib_usesThreatSystemListRegistry(t *testing.T) {
+	original := db.ThreatSystemLists()
+	extended := append([]db.ThreatSystemList{}, original...)
+	extended = append(extended, db.ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
+	restore := db.SetThreatSystemListsForTest(extended)
+	t.Cleanup(restore)
+	router := newThreatTestRouter(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,url,update_enabled,entry_count)
+		VALUES (1040,'future_source','未来威胁源','https://example.com/future.txt',1,7)`); err != nil {
+		t.Fatal(err)
+	}
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/threat-lib", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Sources []struct {
+				Name   string `json:"name"`
+				ListID int    `json:"list_id"`
+			} `json:"sources"`
+			TotalEntries int `json:"total_entries"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.Sources) != len(extended) || payload.Data.TotalEntries != 7 {
+		t.Fatalf("registry-driven sources=%d total=%d, want %d/7: %s", len(payload.Data.Sources), payload.Data.TotalEntries, len(extended), resp.Body.String())
+	}
+	last := payload.Data.Sources[len(payload.Data.Sources)-1]
+	if last.Name != "future_source" || last.ListID == 0 {
+		t.Fatalf("future registry source missing list link: %+v", last)
+	}
+}
+
 func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 	// Given
 	router := newThreatTestRouter(t)
 	var id int
 	var origURL string
 	if err := db.DB.QueryRow(`SELECT id, url FROM security_threat_sources WHERE name='ustc'`).Scan(&id, &origURL); err != nil {
+		t.Fatal(err)
+	}
+	// 关闭前留下失败态与未来排程槽：关闭必须清掉瞬时失败态与过期槽，
+	// 否则列表继续显示「更新失败」，重新启用也无法武装首槽。
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources
+		SET update_status='failed', message='下载或解析失败', next_update='2099-01-01 00:00:00', consecutive_failures=3
+		WHERE id=?`, id); err != nil {
 		t.Fatal(err)
 	}
 
@@ -109,9 +204,10 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	var updateEnabled bool
-	var url, name string
-	if err := db.DB.QueryRow(`SELECT update_enabled, url, name FROM security_threat_sources WHERE id=?`, id).
-		Scan(&updateEnabled, &url, &name); err != nil {
+	var url, name, status, message, nextUpdate string
+	var failures int
+	if err := db.DB.QueryRow(`SELECT update_enabled, url, name, update_status, message, COALESCE(next_update,''), consecutive_failures FROM security_threat_sources WHERE id=?`, id).
+		Scan(&updateEnabled, &url, &name, &status, &message, &nextUpdate, &failures); err != nil {
 		t.Fatal(err)
 	}
 	if updateEnabled {
@@ -119,6 +215,34 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 	}
 	if url != origURL || name != "ustc" {
 		t.Fatalf("伪造字段被写入: url=%q name=%q", url, name)
+	}
+	if status != "idle" {
+		t.Errorf("关闭后 update_status=%q want idle（残留失败态会继续显示更新失败）", status)
+	}
+	if message != "已关闭自动更新" {
+		t.Errorf("关闭后 message=%q want 已关闭自动更新", message)
+	}
+	if nextUpdate != "" {
+		t.Errorf("关闭后 next_update=%q want 空（重新启用才能武装首槽）", nextUpdate)
+	}
+	if failures != 0 {
+		t.Errorf("关闭后 consecutive_failures=%d want 0", failures)
+	}
+
+	// When：重新启用 → 关闭提示清除，开关恢复
+	req = httptest.NewRequest(http.MethodPut, "/security/threat-lib/"+strconv.Itoa(id)+"/flags", strings.NewReader(`{"update_enabled":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp = httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("re-enable status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT update_enabled, message FROM security_threat_sources WHERE id=?`, id).
+		Scan(&updateEnabled, &message); err != nil {
+		t.Fatal(err)
+	}
+	if !updateEnabled || message != "" {
+		t.Errorf("重新启用后 update_enabled=%v message=%q want true/空", updateEnabled, message)
 	}
 }
 
@@ -226,8 +350,8 @@ func TestThreatLib_autoUpdateMasterSwitch(t *testing.T) {
 	}
 }
 
-// F49-P5-7：威胁库自动更新总开关与逐源开关端点从节点一律 403（与
-// UpdateCRSAutoUpdate 同口径 R57 B-#4——从节点状态行在集群同步段内，
+// 威胁库自动更新总开关与逐源开关端点从节点一律 403（与
+// UpdateCRSAutoUpdate 同口径 ——从节点状态行在集群同步段内，
 // 本地写会被下次快照覆盖），且不得产生任何写。
 func TestThreatLib_slaveGatesRejected403(t *testing.T) {
 	// Given 从节点

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 第 47 轮 F-47-1：导入/还原经 restoreTable 按 dump 行**显式写入 id**，而自定义
+// 导入/还原经 restoreTable 按 dump 行**显式写入 id**，而自定义
 // 规则发射 id = DB id + 10000——DB id ≥ 790000 时发射 id 撞入 GeoIP 预检段
 // （800000-899999），渲染侧 `security.go:670` 跳过发射并仅告警 → 规则在 UI 显示
 // 启用却不生效，违反「只有可渲染配置可落库」不变量。导入侧此前对 id 无任何区间门
@@ -35,5 +35,64 @@ func TestValidateImportedSecurityCustomRules_rejectsUnrenderableID(t *testing.T)
 	// 缺 id（省略/NULL，由 AUTOINCREMENT 分配）不拒
 	if err := validateImportedSecurityCustomRules([]map[string]any{row(nil)}); err != nil {
 		t.Fatalf("缺 id 行不得被拒（AUTOINCREMENT 分配）: %v", err)
+	}
+	// 非正 id 拒绝（与 nodes 门对齐）：SQLite INTEGER PRIMARY KEY 接受 0/负
+	// rowid，显式写入后发射 id（+10000）落在 10000/负数域，形成非预期 coraza
+	// 规则 id；省略该键仍由自增分配。
+	for _, invalid := range []any{float64(0), float64(-1), "0", "-7"} {
+		if err := validateImportedSecurityCustomRules([]map[string]any{row(invalid)}); err == nil {
+			t.Fatalf("非正 id=%v 必须被拒", invalid)
+		} else if !strings.Contains(err.Error(), "正整数") {
+			t.Fatalf("错误信息须点名「正整数」要求: %v", err)
+		}
+	}
+}
+
+func TestValidateImportedSecurityCustomRules_conditionLogicCompatibility(t *testing.T) {
+	row := func(logic any) map[string]any {
+		m := map[string]any{
+			"name": "logic", "action": "block", "score": float64(5),
+			"conditions": `[{"target":"uri","operator":"contains","pattern":"/x"}]`,
+		}
+		if logic != nil {
+			m["condition_logic"] = logic
+		}
+		return m
+	}
+	for _, tc := range []struct {
+		name  string
+		logic any
+	}{
+		{"旧备份缺列", nil}, {"显式 AND", "and"}, {"显式 OR", "or"}, {"NULL 兼容", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := row(tc.logic)
+			if tc.name == "NULL 兼容" {
+				r["condition_logic"] = nil
+			}
+			if err := validateImportedSecurityCustomRules([]map[string]any{r}); err != nil {
+				t.Fatalf("合法/旧形态 condition_logic 被拒: %v", err)
+			}
+		})
+	}
+	for _, invalid := range []any{"xor", "", float64(1)} {
+		if err := validateImportedSecurityCustomRules([]map[string]any{row(invalid)}); err == nil {
+			t.Fatalf("非法 condition_logic=%v 必须拒绝", invalid)
+		}
+	}
+}
+
+func TestValidateImportedSecurityCustomRules_descriptionLimitMatchesSavePath(t *testing.T) {
+	row := func(description string) map[string]any {
+		return map[string]any{
+			"name": "limited", "description": description, "action": "block", "score": float64(5),
+			"conditions": `[{"target":"uri","operator":"contains","pattern":"/x"}]`,
+		}
+	}
+	if err := validateImportedSecurityCustomRules([]map[string]any{row(strings.Repeat("界", securityDescriptionMaxRunes+1))}); err == nil {
+		t.Fatal("导入必须复用保存侧 description 长度门，超长行不得落库后才让后续编辑恒 400")
+	}
+	if err := validateImportedSecurityCustomRules([]map[string]any{row(strings.Repeat("界", securityDescriptionMaxRunes))}); err != nil {
+		t.Fatalf("长度边界的合法 description 不得被拒: %v", err)
 	}
 }

@@ -22,6 +22,7 @@ func resetTrafficState(t *testing.T) {
 	trafficMu.Unlock()
 	trafficSecondState.Store(0)
 	trafficSampleN.Store(1)
+	trafficCountryDropped.Store(0)
 	trafficEventSeq.Store(0)
 	trafficLeasesMu.Lock()
 	trafficLeases = map[string]trafficLease{}
@@ -156,6 +157,12 @@ func TestTrafficRecord_normalizesOverseasAliases(t *testing.T) {
 }
 
 func TestTrafficRecord_countryCapacity(t *testing.T) {
+	// 满员丢弃必须可观测（计数 + 节流告警）：否则大屏国家流量少计而零信号。
+	oldInterval := crawlerSnapshotThrottle.interval
+	crawlerSnapshotThrottle.interval = 0 // 不节流：断言每次丢弃都有告警
+	t.Cleanup(func() { crawlerSnapshotThrottle.interval = oldInterval })
+	logBase := crawlerSnapshotLogCallsForTest.Load()
+
 	// Given: 国名桶达到硬上限，且其中一个已有桶随后继续命中。
 	resetTrafficState(t)
 	const limit = 512
@@ -176,6 +183,13 @@ func TestTrafficRecord_countryCapacity(t *testing.T) {
 	if _, exists := trafficCountries["overflow"]; exists {
 		t.Fatal("new country beyond the capacity must be dropped")
 	}
+	if got := trafficCountryDropped.Load(); got != 1 {
+		t.Fatalf("dropped counter=%d, want 1（满员丢弃不得无声）", got)
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load() - logBase; got != 1 {
+		t.Fatalf("满员丢弃告警=%d 条, want 1（首报即记，不节流时逐次）", got)
+	}
+	// 已有国家在满员后继续精确计数（丢弃只作用于新键）。
 	e := trafficCountries["country-000"]
 	if e == nil || e.normal.Load() != 1 || e.attack.Load() != 1 {
 		t.Fatalf("existing country at capacity=%+v, want attack=1 normal=1", e)
@@ -356,9 +370,9 @@ func TestTrafficSnapshotJSON_toleratesInvalidUTF8CountryKey(t *testing.T) {
 }
 
 // 快照形状契约：consumers（internal/handlers 的 trafficSnapshot）只解码
-// countries/sample_n；采集是否活跃由 app 侧 available 布尔表达（按 admin
-// 可达性合成），插件再发射 enabled 是零消费的死字段——发而不用的字段会
-// 误导调用方以为该端点是开关状态源。
+// countries/sample_n/collecting；admin 可达性由 app 侧 available 合成，插件
+// 不发射 enabled（开关真源是租约端点）。collecting=采集租约当前是否有效——
+// 无租约时累计计数冻结，缺该字段会让「累计不变」被误读为「无流量」。
 func TestTrafficSnapshotJSON_omitsUnconsumedEnabledField(t *testing.T) {
 	resetTrafficState(t)
 	trafficRecord("China", false)
@@ -367,7 +381,46 @@ func TestTrafficSnapshotJSON_omitsUnconsumedEnabledField(t *testing.T) {
 	if strings.Contains(raw, `"enabled"`) {
 		t.Fatalf("traffic snapshot must not emit the unconsumed enabled field: %s", raw)
 	}
-	if !strings.Contains(raw, `"countries"`) || !strings.Contains(raw, `"sample_n"`) {
+	if !strings.Contains(raw, `"countries"`) || !strings.Contains(raw, `"sample_n"`) || !strings.Contains(raw, `"collecting"`) {
 		t.Fatalf("snapshot lost its contract fields: %s", raw)
+	}
+}
+
+// 采集租约状态是快照的一等字段：无租约期间计数冻结，快照必须如实披露
+// collecting=false（否则「累计不变」与「无流量」不可区分）。
+func TestTrafficSnapshotJSON_collectorStateFollowsLease(t *testing.T) {
+	resetTrafficState(t)
+	// Given：无租约（采集关闭）
+	trafficCollectorEnabled.Store(false)
+
+	readCollecting := func(t *testing.T) bool {
+		t.Helper()
+		var payload struct {
+			Collecting bool `json:"collecting"`
+		}
+		if err := json.Unmarshal(trafficSnapshotJSON(), &payload); err != nil {
+			t.Fatalf("decode snapshot: %v", err)
+		}
+		return payload.Collecting
+	}
+	if readCollecting(t) {
+		t.Fatal("无租约时 collecting 必须为 false")
+	}
+
+	// When：申请租约
+	if err := acquireTrafficLease("snapshot-lease", time.Second, 1); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseTrafficLease("snapshot-lease") })
+	// Then：collecting=true
+	if !readCollecting(t) {
+		t.Fatal("持有租约时 collecting 必须为 true")
+	}
+
+	// When：释放租约
+	releaseTrafficLease("snapshot-lease")
+	// Then：回落 false
+	if readCollecting(t) {
+		t.Fatal("释放租约后 collecting 必须回落 false")
 	}
 }

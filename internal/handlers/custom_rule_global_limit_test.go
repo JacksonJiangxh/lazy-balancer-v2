@@ -50,8 +50,8 @@ func validCustomRulePayload(name string) map[string]any {
 	}
 }
 
-// U3-1（第 65 轮）/U3-F1（第 66 轮常量化）：全局 200 条上限的目标形状钉测试
-// ——上限行为第 65 轮已存在（基线钉，R-1 豁免 RED，见修复报告），第 66 轮
+// 全局 200 条上限的目标形状钉测试
+// 上限行为历史已存在（基线钉，豁免 RED，见修复报告），历史
 // 常量化 securityCustomRuleMaxGlobalCount 不改变阈值与文案语义。
 func TestCreateSecurityCustomRule_rejectsAtGlobalCountLimit(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -93,7 +93,7 @@ func TestCreateSecurityCustomRule_allowsAtLimitMinusOne(t *testing.T) {
 	}
 }
 
-// customRuleCountFailConnector 注入「规则计数查询失败」的主库故障（U3-F2
+// customRuleCountFailConnector 注入「规则计数查询失败」的主库故障
 // fail-closed 形状）——Begin/INSERT 照常成功，仅命中 security_custom_rules
 // 计数的查询失败。
 type customRuleCountFailConnector struct{}
@@ -140,7 +140,7 @@ type customRuleFakeResult struct{}
 func (customRuleFakeResult) LastInsertId() (int64, error) { return 1, nil }
 func (customRuleFakeResult) RowsAffected() (int64, error) { return 1, nil }
 
-// U3-F2（第 66 轮）：计数查询失败必须拒绝创建（fail-closed）——此前
+// 计数查询失败必须拒绝创建（fail-closed）——此前
 // `err == nil && ruleCount >= 200` 使 DB 故障静默跳过上限检查继续创建
 // （fail-open）；计数移入 BeginTx 事务内后同型故障返回 500，不再有绕过
 // 上限的通道。
@@ -155,6 +155,6 @@ func TestCreateSecurityCustomRule_countQueryFailureFailsClosed(t *testing.T) {
 
 	rec := postJSON(t, router, "/security/custom-rules", validCustomRulePayload("故障期规则"))
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status=%d body=%s, want 500 (count query failure must fail closed, not bypass the limit)", rec.Code, rec.Body.String())
+		t.Fatalf("status=%d body=%s, want 500 (count query failure must fail closed, not 绕过 the limit)", rec.Code, rec.Body.String())
 	}
 }

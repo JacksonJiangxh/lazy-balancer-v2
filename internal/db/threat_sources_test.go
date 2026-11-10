@@ -62,3 +62,36 @@ func TestThreatSourcesTable_seeded(t *testing.T) {
 		t.Fatalf("count=%d after re-seed, want 3", count)
 	}
 }
+
+// 内置威胁源的下载端定义（url/format）必须随启动收敛到种子单源：只比对
+// display_name 时，内置 URL 或解析格式的修订永远到不了存量库。用户可改列
+// （update_enabled 等）不参与收敛，保持原值。
+func TestThreatSources_seedConvergesCanonicalURLAndFormat(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	canonical, ok := CanonicalThreatSource("ustc")
+	if !ok {
+		t.Fatal("内置种子缺少 ustc")
+	}
+
+	if _, err := database.Exec(`UPDATE security_threat_sources SET url='https://legacy.example/block.txt', format='json', update_enabled=0 WHERE name='ustc'`); err != nil {
+		t.Fatalf("simulate drifted row: %v", err)
+	}
+	if err := createTables(); err != nil {
+		t.Fatalf("re-create tables: %v", err)
+	}
+
+	var url, format string
+	var updateEnabled bool
+	if err := database.QueryRow(`SELECT url, format, update_enabled FROM security_threat_sources WHERE name='ustc'`).Scan(&url, &format, &updateEnabled); err != nil {
+		t.Fatalf("read ustc row: %v", err)
+	}
+	if url != canonical.URL || format != canonical.Format {
+		t.Fatalf("ustc endpoint = %q/%q, want %q/%q", url, format, canonical.URL, canonical.Format)
+	}
+	if updateEnabled {
+		t.Fatal("用户可改列 update_enabled 必须保持原值 0，不得被种子覆盖")
+	}
+}

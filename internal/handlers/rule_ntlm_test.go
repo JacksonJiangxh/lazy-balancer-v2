@@ -51,6 +51,7 @@ func TestCreateRule_rejects_ntlm_with_non_cookie_strategy(t *testing.T) {
 	response := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-poll","protocol":"http","domain":"ntlm-poll.example.test","listen_port":18001,
 		"strategy":"weighted_round_robin","ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -65,6 +66,7 @@ func TestCreateRule_rejects_ntlm_on_tcp_rule(t *testing.T) {
 	response := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-tcp","protocol":"tcp","listen_port":18002,
 		"ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -98,6 +100,8 @@ func TestUpdateRule_rejects_strategy_change_while_ntlm_on(t *testing.T) {
 	caddyID := ntlmCreateAndWait(t, router, `{
 		"name":"ntlm-edit","protocol":"http","domain":"ntlm-edit.example.test","listen_port":18003,
 		"strategy":"cookie","ntlm_compatible":1,
+		"tcp_try_duration":-1,"upstream_force_http1":1,"proxy_flush_interval":-1,"upstream_keepalive_timeout":300,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -129,6 +133,8 @@ func TestCreateRule_persists_ntlm_and_getrule_returns_it(t *testing.T) {
 	created := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-ok","protocol":"http","domain":"ntlm-ok.example.test","listen_port":18005,
 		"strategy":"cookie","ntlm_compatible":1,
+		"tcp_try_duration":-1,"upstream_force_http1":1,"proxy_flush_interval":-1,"upstream_keepalive_timeout":300,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 	if created.Code != http.StatusCreated && created.Code != http.StatusOK {
@@ -170,6 +176,8 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 	caddyID := ntlmCreateAndWait(t, router, `{
 		"name":"ntlm-off","protocol":"http","domain":"ntlm-off.example.test","listen_port":18006,
 		"strategy":"cookie","ntlm_compatible":1,
+		"tcp_try_duration":-1,"upstream_force_http1":1,"proxy_flush_interval":-1,"upstream_keepalive_timeout":300,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -198,6 +206,19 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 	if after != 0 {
 		t.Fatalf("ntlm_compatible after off=%d, want 0", after)
 	}
+	// ntlm=0 不负责复位接管四列（设计契约：UI 的 restoreNtlmDefaults 才复位；
+	// 后端不静默改写用户显式/存量的代理参数）。
+	var tryDuration, forceHTTP1, flushInterval, keepalive int
+	if err := db.DB.QueryRow(`SELECT COALESCE(tcp_try_duration,0), COALESCE(upstream_force_http1,0),
+		COALESCE(proxy_flush_interval,0), COALESCE(upstream_keepalive_timeout,0)
+		FROM lb_rules WHERE listen_port=18006`).
+		Scan(&tryDuration, &forceHTTP1, &flushInterval, &keepalive); err != nil {
+		t.Fatalf("read takeover columns: %v", err)
+	}
+	if tryDuration != -1 || forceHTTP1 != 1 || flushInterval != -1 || keepalive != 300 {
+		t.Fatalf("ntlm=0 不得复位接管四列: td=%d force=%d flush=%d keepalive=%d, want -1/1/-1/300",
+			tryDuration, forceHTTP1, flushInterval, keepalive)
+	}
 }
 
 // ---- ④ 导入携带 ntlm 字段 ----
@@ -205,8 +226,9 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 func TestConfigBackup_export_import_roundtrip_preserves_ntlm(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, strategy, ntlm_compatible, enabled)
-		VALUES ('lb_ntlmbak', 'ntlm-backup', 'http', 'ntlm-backup.example.test', 8080, 'cookie', 1, 1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, strategy, ntlm_compatible, enabled,
+		tcp_try_duration, upstream_force_http1, proxy_flush_interval, upstream_keepalive_timeout)
+		VALUES ('lb_ntlmbak', 'ntlm-backup', 'http', 'ntlm-backup.example.test', 8080, 'cookie', 1, 1, -1, 1, -1, 300)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, enabled) VALUES ('lb_ntlmbak', '127.0.0.1', 9000, 1, 1)`); err != nil {
@@ -275,7 +297,7 @@ func TestImportConfigBackup_rejects_ntlm_with_invalid_shape(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			backup := completeBackupJSON(t, map[string][]map[string]any{"lb_rules": {testCase.rule}})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"lb_rules": {testCase.rule}}, EmptyConfigIfNil: true})
 			response := httptest.NewRecorder()
 			importRequest := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
 			importRequest.Header.Set("Content-Type", "application/json")
@@ -284,5 +306,49 @@ func TestImportConfigBackup_rejects_ntlm_with_invalid_shape(t *testing.T) {
 				t.Fatalf("import status=%d body=%.300s, want 400 containing %q", response.Code, response.Body.String(), testCase.want)
 			}
 		})
+	}
+}
+
+// TCP 行的 ntlm_compatible 是死列（TCP 规则创建/导入显式携带即 400）。
+// 存量/直改 DB 的残留 1 不得让任何无关编辑恒 400（死端），也不得被用户显式
+// 携带的 1 静默改写成 0（意图丢失）。形态一：未携带 → 200 且存量 1 自愈归零；
+// 形态二：显式携带 1 → 400 点名 NTLM，且库值保持 0（未落库）。
+func TestUpdateRule_tcpExplicitNTLMRejectedAndStaleValueSelfHeals(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,ntlm_compatible)
+		VALUES ('lb_tcpntlm','tcp-ntlm','','tcp','',18021,'weighted_round_robin',1,1)`); err != nil {
+		t.Fatalf("seed tcp rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tcpntlm','127.0.0.1',9000,1,1,'tcp')`); err != nil {
+		t.Fatalf("seed tcp upstream: %v", err)
+	}
+
+	// ① 未携带 ntlm：存量死值自愈归零，编辑成功。
+	response := serveJSON(t, router, http.MethodPut, "/rules/lb_tcpntlm", `{"name":"tcp-ntlm-renamed","protocol":"tcp"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("omitted ntlm update status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var ntlm int
+	if err := db.DB.QueryRow(`SELECT COALESCE(ntlm_compatible,0) FROM lb_rules WHERE caddy_id='lb_tcpntlm'`).Scan(&ntlm); err != nil {
+		t.Fatal(err)
+	}
+	if ntlm != 0 {
+		t.Fatalf("存量 ntlm 死值未自愈: ntlm_compatible=%d, want 0", ntlm)
+	}
+
+	// ② 显式携带 1：保存门 400 点名，不静默弃置。
+	response = serveJSON(t, router, http.MethodPut, "/rules/lb_tcpntlm", `{"ntlm_compatible":1,"protocol":"tcp"}`)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "NTLM") {
+		t.Fatalf("explicit ntlm update status=%d body=%s, want 400 with NTLM message", response.Code, response.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT COALESCE(ntlm_compatible,0) FROM lb_rules WHERE caddy_id='lb_tcpntlm'`).Scan(&ntlm); err != nil {
+		t.Fatal(err)
+	}
+	if ntlm != 0 {
+		t.Fatalf("被拒的显式 ntlm 不得落库: ntlm_compatible=%d, want 0", ntlm)
 	}
 }

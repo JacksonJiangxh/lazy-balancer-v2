@@ -6,16 +6,14 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
 func TestResolvePolicyCustomRules_idsLoadFromDB(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, description, conditions, action, score, enabled) VALUES ('链式验证规则','', '[{"target":"uri","operator":"contains","pattern":"/admin"}]', 'block', 5, 1)`); err != nil {
 		t.Fatal(err)
 	}
@@ -32,14 +30,11 @@ func TestResolvePolicyCustomRules_legacyEmbeddedObjects(t *testing.T) {
 	}
 }
 
-// Round 34 G: IN 占位符分块——引用数超过单批上限（测试收窄为 2）时全部解析，
+// 历史 G: IN 占位符分块——引用数超过单批上限（测试收窄为 2）时全部解析，
 // 不再整查询超限失败导致 WAF 自定义规则静默丢失。
 func TestResolvePolicyCustomRules_chunkedIDsAcrossBatches(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	oldChunk := policyCustomRuleChunkSize
 	policyCustomRuleChunkSize = 2
 	t.Cleanup(func() { policyCustomRuleChunkSize = oldChunk })
@@ -63,15 +58,12 @@ func TestResolvePolicyCustomRules_chunkedIDsAcrossBatches(t *testing.T) {
 	}
 }
 
-// Round 35 F-5: 分块查询失败时其 id 不得计入悬空引用日志——此前
+// 分块查询失败时其 id 不得计入悬空引用日志——此前
 // dropped=len(ids)-len(rules) 把「查询失败」误报为「规则已删除」；
 // 失败块单独留痕，悬空口径只统计查询成功分块。
 func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	oldChunk := policyCustomRuleChunkSize
 	policyCustomRuleChunkSize = 2
 	t.Cleanup(func() { policyCustomRuleChunkSize = oldChunk })
@@ -100,17 +92,38 @@ func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testi
 	}
 }
 
+func TestResolvePolicyCustomRules_logsRowScanFailure(t *testing.T) {
+	initServicesDB(t)
+	// SQLite 接受 INTEGER 列中的文本；扫描到 int 时注入真实转换失败。
+	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id,name,conditions,action,score,enabled) VALUES (91,'坏行','[]','block','not-an-integer',1)`); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	rules := resolvePolicyCustomRules(json.RawMessage(`[91]`), nil)
+	if len(rules) != 0 {
+		t.Fatalf("bad row must be skipped, got %+v", rules)
+	}
+	if !strings.Contains(logs.String(), "扫描") || !strings.Contains(logs.String(), "91") {
+		t.Fatalf("row Scan failure must be visible with rule id:\n%s", logs.String())
+	}
+}
+
 func TestBuildCorazaDirectives_customRuleDenyOmitsStatusCode(t *testing.T) {
 	// Given a blocking policy with a custom block rule carrying a custom status code
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["9"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["9"]`),
 		CustomRules: json.RawMessage(`[{"id":12,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/blocked"}]}]`),
 	}
 
 	// When directives are built
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 
 	// Then the deny action carries no status override; the block page's status governs
 	if !strings.Contains(directives, `deny,log,setvar:tx.inbound_anomaly_score_pl1=+5,msg:'自定义规则 拒绝规则 命中'`) {
@@ -123,11 +136,12 @@ func TestBuildCorazaDirectives_customRuleDenyOmitsStatusCode(t *testing.T) {
 
 func TestBuildCorazaDirectives_userAgentTargetUsesColonNotation(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["9"]`),
-		CustomRules:   json.RawMessage(`[{"id":9,"name":"ua","enabled":true,"action":"pass","score":1,"conditions":[{"target":"user_agent","operator":"contains","pattern":"sqlmap"}]}]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["9"]`),
+		CustomRules:      json.RawMessage(`[{"id":9,"name":"ua","enabled":true,"action":"pass","score":1,"conditions":[{"target":"user_agent","operator":"contains","pattern":"sqlmap"}]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "REQUEST_HEADERS:User-Agent") {
 		t.Fatalf("user_agent target must use colon notation:\n%s", directives)
 	}
@@ -136,15 +150,16 @@ func TestBuildCorazaDirectives_userAgentTargetUsesColonNotation(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_equalsOperatorEmitsStreq（审计 H1）：equals 语义
+// TestBuildCorazaDirectives_equalsOperatorEmitsStreq：equals 语义
 // 收紧为大小写敏感精确匹配 @streq——此前误用 @pm（短语匹配：大小写不敏感 +
 // 空格分词，「等于 /admin」实际是「包含单词 admin」），与 UI「等于」承诺不符。
 func TestBuildCorazaDirectives_equalsOperatorEmitsStreq(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:        "blocking",
-		CustomRules: json.RawMessage(`[{"id":11,"name":"等于规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"equals","pattern":"/admin"}]}]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CustomRules:      json.RawMessage(`[{"id":11,"name":"等于规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"equals","pattern":"/admin"}]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, `SecRule REQUEST_URI "@streq /admin"`) {
 		t.Fatalf("equals must emit case-sensitive exact match @streq:\n%s", directives)
 	}
@@ -230,6 +245,18 @@ func TestEmitCustomRules_invalidRuleLogsSkipAndSparesCleanRules(t *testing.T) {
 	originalWriter := log.Writer()
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(originalWriter) })
+	// 结构性 skip 告警走进程级 60s 限流：同包前一用例
+	// （TestEmitCustomRules_invalidTargetOrOperatorSkipsWholeRule）用同一组
+	// rule id/名称触发过同文案，不隔离限流状态会让本用例按执行顺序变红。
+	auditFailureLogMu.Lock()
+	savedThrottle := auditFailureLogTimes
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	t.Cleanup(func() {
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = savedThrottle
+		auditFailureLogMu.Unlock()
+	})
 
 	// Given dirty rules interleaved with a fully valid chained rule
 	var sb strings.Builder
@@ -263,7 +290,7 @@ func TestEmitCustomRules_invalidRuleLogsSkipAndSparesCleanRules(t *testing.T) {
 	}
 }
 
-// N15-F1：多条件链式规则的 setvar 必须绑定到链条末条。coraza v3 在起始条
+// 多条件链式规则的 setvar 必须绑定到链条末条。coraza v3 在起始条
 // 算子命中时立即执行其非破坏性动作（internal/corazawaf/rule.go matchVariable
 // 注释「We run non-disruptive actions even if there is no chain match」）——
 // 起始条命中而后续条件未命中时链条整体不匹配，但起始条上的 setvar 已累加
@@ -329,7 +356,7 @@ func TestEmitCustomRules_multiConditionSetvarOnLastChainElement(t *testing.T) {
 	}
 }
 
-// N15-F1 对照组：单条件规则的发射形状不变（setvar 仍在唯一条目上）。
+// 对照组：单条件规则的发射形状不变（setvar 仍在唯一条目上）。
 func TestEmitCustomRules_singleConditionSetvarStaysOnRule(t *testing.T) {
 	var sb strings.Builder
 	rules := []models.CustomRule{
@@ -396,5 +423,44 @@ func TestEmitCustomRules_bodyTargetScansParsedBodyCollections(t *testing.T) {
 	want := `SecRule REQUEST_BODY|ARGS_POST|ARGS_POST_NAMES|XML:/*|XML://@* "@contains evil"`
 	if !strings.Contains(got, want) {
 		t.Fatalf("body target must scan parsed body collections (JSON processor leaves REQUEST_BODY empty):\n%s", got)
+	}
+}
+
+// 发射守卫复用保存侧 validateCustomRulePattern——空/纯空白
+// pattern 的规则必须整条跳过（@contains "" 等于匹配一切，绝不能落成无条件
+// deny），合法规则不受影响。
+func TestEmitCustomRules_emptyPatternSkipped(t *testing.T) {
+	base := func(id int, pattern string) models.CustomRule {
+		return models.CustomRule{
+			ID: id, Name: "r", Enabled: true, Action: "block", Score: 5,
+			Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: pattern}},
+		}
+	}
+	var sb strings.Builder
+	emitCustomRules(&sb, []models.CustomRule{
+		base(1, ""),
+		base(2, "   "),
+		base(3, "\t"),
+		base(4, "/ok"),
+	}, 403)
+	out := sb.String()
+	for _, id := range []string{"id:10001", "id:10002", "id:10003"} {
+		if strings.Contains(out, id) {
+			t.Fatalf("empty/blank pattern rule %s must be skipped:\n%s", id, out)
+		}
+	}
+	if !strings.Contains(out, "id:10004") {
+		t.Fatalf("valid rule must still be emitted:\n%s", out)
+	}
+	// 合法规则渲染形状（回归）：必须真实产出，且含目标算子——空输出也是失败
+	// （旧断言 `!= "" && !contains` 让空输出静默通过）。
+	var sb2 strings.Builder
+	emitCustomRules(&sb2, []models.CustomRule{base(4, "/ok")}, 403)
+	rendered := sb2.String()
+	if rendered == "" {
+		t.Fatal("valid rule must be emitted, got empty output")
+	}
+	if !strings.Contains(rendered, `@contains /ok`) {
+		t.Fatalf("valid rule shape changed:\n%s", rendered)
 	}
 }

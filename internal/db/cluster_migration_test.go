@@ -22,11 +22,7 @@ func TestInitialize_migrates_cluster_columns_and_token_table(t *testing.T) {
 	if err := legacy.Close(); err != nil {
 		t.Fatalf("close legacy database: %v", err)
 	}
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+	preserveDatabaseHandles(t)
 
 	// When
 	if err := Initialize(dir); err != nil {
@@ -84,6 +80,7 @@ func TestInitialize_migrates_cluster_columns_and_token_table(t *testing.T) {
 // 策略迁移 custom_only(行为零突变);off 且无启用自定义规则的策略保持 off。
 func TestMigrateSecurityPolicyCustomOnlyMode(t *testing.T) {
 	dir := t.TempDir()
+	preserveDatabaseHandles(t)
 	if err := Initialize(dir); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
@@ -149,11 +146,12 @@ func TestMigrateSecurityPolicyCustomOnlyMode(t *testing.T) {
 	}
 }
 
-// S3(2026-09-10 审计):迁移 SQL 对畸形 custom_rules JSON 无容错——json_each 抛
+// (2026-09-10 审计):迁移 SQL 对畸形 custom_rules JSON 无容错——json_each 抛
 // malformed JSON 会让 runMigrations 失败→启动失败。修复后畸形行跳过(不迁移不
 // 炸),其余行照常迁移。
 func TestMigrateSecurityPolicyCustomOnlyMode_toleratesMalformedJSON(t *testing.T) {
 	dir := t.TempDir()
+	preserveDatabaseHandles(t)
 	if err := Initialize(dir); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
@@ -184,12 +182,13 @@ func TestMigrateSecurityPolicyCustomOnlyMode_toleratesMalformedJSON(t *testing.T
 	}
 }
 
-// B-1(第 4 轮审计 P1):导入归一 SQL 缺 json_type 门——顶层字符串形状使
+// 导入归一 SQL 缺 json_type 门——顶层字符串形状使
 // json_each→json_extract 抛 malformed JSON→整包导入 500 回滚。
 // 迁移路径(db.go)已有双门,导入路径必须同口径。
 // 此测试直接跑与 config_backup.go 导入归一同款 SQL 形状,验证顶层字符串不炸。
 func TestImportNormalization_jsonTypeGateBlocksTopLevelString(t *testing.T) {
 	dir := t.TempDir()
+	preserveDatabaseHandles(t)
 	if err := Initialize(dir); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
@@ -200,14 +199,8 @@ func TestImportNormalization_jsonTypeGateBlocksTopLevelString(t *testing.T) {
 	if _, err := DB.Exec(`INSERT INTO security_policies (name, mode, custom_rules) VALUES ('正常启用','off','[{"id":1,"enabled":true,"action":"block","score":5}]')`); err != nil {
 		t.Fatal(err)
 	}
-	// 与 config_backup.go:1776-1782 同款 SQL + json_type 双门
-	_, err := DB.Exec(`UPDATE security_policies SET mode='custom_only'
-WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALESCE(custom_rules,'[]')) IN ('array','object') AND EXISTS (
-  SELECT 1 FROM json_each(COALESCE(custom_rules,'[]')) je
-  WHERE json_extract(je.value,'$.enabled')=1
-     OR (json_type(je.value)='integer' AND EXISTS (
-          SELECT 1 FROM security_custom_rules r
-          WHERE r.id=je.value AND COALESCE(r.enabled,1)=1)))`)
+	// 导入与启动迁移共用同一 SQL 常量，测试不得再文本复刻第三份。
+	_, err := DB.Exec(SecurityPolicyCustomOnlyModeNormalizationSQL)
 	if err != nil {
 		t.Fatalf("导入归一双门 SQL 对顶层字符串不得报错: %v", err)
 	}
@@ -230,11 +223,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 // cluster_applied_sections 收敛为严格同步节行;重启幂等不回灌。
 func TestMigrateDropMergedSyncSwitchColumns_movesWafBookkeepingToColumns(t *testing.T) {
 	dir := t.TempDir()
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+	preserveDatabaseHandles(t)
 	if err := Initialize(dir); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}

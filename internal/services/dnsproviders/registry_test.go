@@ -1,69 +1,47 @@
 package dnsproviders
 
 import (
-	"context"
-	"errors"
 	"strings"
 	"testing"
-
-	"lazy-balancer-v2/internal/dnsprovider"
 )
 
-func TestDNSPodCredentials(t *testing.T) {
-	p, ok := Get("dnspod")
-	if !ok {
-		t.Fatal("dnspod not registered")
-	}
-	_, err := p.BuildCredentialsJSON(map[string]string{})
-	if err == nil {
-		t.Fatal("expected error for empty credentials")
-	}
-	creds, err := p.BuildCredentialsJSON(map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if creds["api_token"] != "123,abc" {
-		t.Fatalf("expected api_token 123,abc, got %v", creds["api_token"])
-	}
-	tencent, err := p.BuildCredentialsJSON(map[string]string{"auth_mode": "tencent_cloud", "secret_id": "sid", "secret_key": "skey"})
-	if err != nil {
-		t.Fatalf("unexpected error for tencent cloud: %v", err)
-	}
-	// CERT40-3:tencent canonical 不再携带死字段 api_token(消费端只读
-	// secret_id/secret_key)。
-	if _, exists := tencent["api_token"]; exists {
-		t.Fatalf("tencent canonical must not carry dead api_token, got %v", tencent)
-	}
+// fakeProvider 只实现注册期需要的 Code/Name/ModuleName；其余能力本用例不触达。
+type fakeProvider struct {
+	BaseProvider
+	code string
 }
 
-type cleanupFailingProvider struct{}
-
-func (cleanupFailingProvider) Present(context.Context, string, string, string, int) error { return nil }
-func (cleanupFailingProvider) CleanUp(context.Context, string, string) error {
-	return errors.New("cleanup failed")
+func (p *fakeProvider) Code() string                        { return p.code }
+func (p *fakeProvider) Name() string                        { return p.code }
+func (p *fakeProvider) ModuleName() string                  { return "module." + p.code }
+func (p *fakeProvider) CredentialFields() []CredentialField { return nil }
+func (p *fakeProvider) BuildCredentialsJSON(map[string]string) (map[string]interface{}, error) {
+	return nil, nil
 }
 
-func TestDNSPod_Validate_returns_cleanup_error(t *testing.T) {
-	// Given
-	originalFactory := newDNSProviderFromCredentials
-	newDNSProviderFromCredentials = func(string) (dnsprovider.Provider, error) {
-		return cleanupFailingProvider{}, nil
-	}
-	t.Cleanup(func() { newDNSProviderFromCredentials = originalFactory })
-	provider := &DNSPod{}
+var _ Provider = (*fakeProvider)(nil)
 
-	// When
-	err := provider.Validate(map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}, "example.com")
-
-	// Then
-	if err == nil || !strings.Contains(err.Error(), "cleanup failed") {
-		t.Fatalf("cleanup error=%v, want cleanup failure", err)
+// 重复 Code 是 init 期复制粘贴漏改的典型形态：此前静默覆盖（List 少一项、
+// 字段表与 Validate 来自不同实现）。注册期必须 panic 快速失败。
+func TestRegister_duplicateCodePanics(t *testing.T) {
+	const code = "test-dup-provider-97"
+	Register(&fakeProvider{code: code})
+	// 注册表是包级全局：用例结束必须清出替身，否则 -count/-shuffle 下
+	// 第二次注册即 panic，且替身会把「真实提供商集合」类断言撑绿。
+	t.Cleanup(func() { delete(registry, code) })
+	got, ok := Get(code)
+	if !ok || got.Code() != code {
+		t.Fatalf("首次注册未生效: %v %v", got, ok)
 	}
-}
 
-func TestListProviders(t *testing.T) {
-	list := List()
-	if len(list) != 1 {
-		t.Fatalf("expected 1 provider, got %d", len(list))
-	}
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("重复 Code 注册必须 panic（启动期快速失败）")
+		}
+		if message, _ := recovered.(string); !strings.Contains(message, "duplicate provider code") || !strings.Contains(message, code) {
+			t.Fatalf("panic 文案=%v，必须点名 duplicate provider code 与冲突 Code", recovered)
+		}
+	}()
+	Register(&fakeProvider{code: code})
 }

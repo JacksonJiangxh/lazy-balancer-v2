@@ -50,30 +50,59 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
+	// 特权服务控制的所有失败早退（编号非法/体解析失败/
+	// 动作不支持/票据签发失败）此前零审计，越权探测与故障签发在操作日志中不可见。
+	// 统一经 recordAudit 留痕「失败」；动作串经 registerAuditField 截断去控制字符。
+	auditFailure := func(nodeID int, detail string) {
+		// 路径参数未清洗：已认证管理员可经 %0A 等注入换行/控制字符伪造审计
+		// 段落。与 action/operator 同源走 registerAuditField（去控制字符 +
+		// 128B 截断），可打印原值保留供取证。
+		nodePart := "节点 " + registerAuditField(c.Param("id"))
+		if nodeID > 0 {
+			nodePart = fmt.Sprintf("节点 %d", nodeID)
+		}
+		recordAudit(c, "服务控制", "节点服务", services.FormatAuditDetail(nodePart, detail, "结果：失败"))
+	}
 	nodeID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || nodeID <= 0 {
+		auditFailure(nodeID, "节点编号无效")
 		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
 		return
 	}
 	var req models.ClusterNodeServiceRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		auditFailure(nodeID, "请求格式错误")
 		clusterError(c, http.StatusBadRequest, "请求格式错误", err)
 		return
 	}
 	if !models.IsValidClusterServiceAction(req.Action) {
+		auditFailure(nodeID, "动作："+registerAuditField(req.Action)+"（不支持）")
 		clusterError(c, http.StatusBadRequest, "不支持的服务控制动作", nil)
 		return
 	}
 	issued, err := h.clusterService.IssueServiceControlTicket(c.Request.Context(), nodeID, req.Action, time.Now())
 	if err != nil {
+		// 服务层降级竞态：handler 角色门通过后节点簿记已降级——与 requireMaster
+		// 门同源 403（携带 X-LB-Error-Code），不得折叠成 404/500。
+		if errors.Is(err, services.ErrNotMasterNode) {
+			auditFailure(nodeID, "签发票据失败（动作："+registerAuditField(req.Action)+"）")
+			clusterMasterForbidden(c, err)
+			return
+		}
 		status := http.StatusInternalServerError
+		message := "签发服务控制票据失败"
 		switch {
 		case errors.Is(err, services.ErrNodeNotFound):
 			status = http.StatusNotFound
+		case errors.Is(err, services.ErrNodeTokenPending):
+			// 已批准但令牌尚未交付：节点存在、只是暂不可签发——409 + 单源文案。
+			status = http.StatusConflict
+			message = err.Error()
 		case errors.Is(err, services.ErrInvalidServiceAction):
 			status = http.StatusBadRequest
 		}
-		clusterError(c, status, "签发服务控制票据失败", err)
+		auditFailure(nodeID, "签发票据失败（动作："+registerAuditField(req.Action)+"）")
+		clusterError(c, status, message, err)
 		return
 	}
 	message, err := h.callClusterServiceControl(c.Request.Context(), issued.URL, req.Action, issued.Ticket, currentUsername(c))
@@ -82,7 +111,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 		result = "失败"
 	}
 	recordAudit(c, "服务控制", "节点服务", services.FormatAuditDetail(
-		// CL10-N14:补节点 ID(nodes.name 无 UNIQUE,仅名无法定位行)。
+		// 补节点 ID(nodes.name 无 UNIQUE,仅名无法定位行)。
 		fmt.Sprintf("节点 %d（%s）", nodeID, issued.NodeName), "操作："+req.Action, "结果："+result))
 	if err != nil {
 		var rejected *clusterServiceControlRejection
@@ -90,7 +119,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 			c.JSON(http.StatusBadGateway, models.APIResponse{Code: http.StatusBadGateway, Message: rejected.message})
 			return
 		}
-		// C-3：指纹不匹配必须与通用不可达区分下发——否则前端无法提示
+		// 指纹不匹配必须与通用不可达区分下发——否则前端无法提示
 		//「清除该节点证书指纹」补救通道（该信息此前只进服务端日志）。
 		if errors.Is(err, services.ErrClusterPinMismatch) {
 			clusterError(c, http.StatusBadGateway, "从节点证书指纹不匹配（该节点管理面板证书可能已更换），可清除该节点证书指纹后重试", err)
@@ -113,24 +142,35 @@ func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, actio
 		return "", fmt.Errorf("构造服务控制请求: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
-	// CL42-2（第 42 轮审计）：从节点启用管理 HTTPS 后明文端口 301——按集群同步
+	// 从节点启用管理 HTTPS 后明文端口 301——按集群同步
 	// 同一契约对同主机 https Location 重放一次，否则票据调用在空 body 上报解析
 	// 错误、服务控制全线不可用。
-	response, err := services.DoWithSameHostTLSUpgradeRedirect(clusterServiceControlClientFactory(h.cfg.DataDir), request)
+	// 客户端按请求构造（工厂是测试注入点），其 Transport 自带连接池
+	// 且 IdleConnTimeout=90s——此前无关闭动作，每次控制调用都会留下一批空闲
+	// 连接与读循环 goroutine 直到空闲超时。用完即关闭空闲连接（body 已读完后
+	// 才执行，不影响本次请求）。
+	client := clusterServiceControlClientFactory(h.cfg.DataDir)
+	defer client.CloseIdleConnections()
+	response, err := services.DoWithSameHostTLSUpgradeRedirect(client, request)
 	if err != nil {
 		return "", fmt.Errorf("调用从节点服务控制: %w", err)
 	}
 	defer response.Body.Close()
-	// CL44-4（第 44 轮审计）：同主机 https 升级已由 DoWithSameHostTLSUpgradeRedirect
+	// 同主机 https 升级已由 DoWithSameHostTLSUpgradeRedirect
 	// 重放，残留 3xx（跨主机/反代重定向）的空 body 落进 JSON 解析只会报
 	// 「unexpected end of JSON input」——与集群同步 Pull/Register 3xx 分支同款
 	// 可行动指引，在读 body 前拦截。
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		return "", fmt.Errorf("从节点返回 %d 重定向(%s)——从节点启用 HTTPS 后请将该节点的访问地址改为 https://，或修正反向代理配置后重试", response.StatusCode, response.Header.Get("Location"))
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, clusterServiceControlMaxBytes))
+	body, err := io.ReadAll(io.LimitReader(response.Body, clusterServiceControlMaxBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("读取从节点响应: %w", err)
+	}
+	// 与同族读端点一致的 limit+1 探测：超限显式报错，不把截断体交给 JSON
+	// 解析（只会得到「unexpected end of JSON input」并掩盖真实原因）。
+	if int64(len(body)) > clusterServiceControlMaxBytes {
+		return "", fmt.Errorf("从节点响应超过 %dKB 读取上限", clusterServiceControlMaxBytes>>10)
 	}
 	var slaveResponse models.APIResponse
 	if err := json.Unmarshal(body, &slaveResponse); err != nil {
@@ -153,10 +193,13 @@ func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, actio
 // （start/stop/restart Caddy、重启应用），全部路径记录从节点审计，
 // 票据正文不落任何日志。
 func (h *Handlers) ClusterServiceControl(c *gin.Context) {
+	if !h.requireClusterService(c) {
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, clusterServiceControlMaxBytes)
 	var req models.ClusterServiceControlRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// CLUSTER-3（第 72 轮审计）：解析失败时 Action 多为零值空串，审计
+		// 解析失败时 Action 多为零值空串，审计
 		// 「操作：」段落空——无法区分「动作未知的畸形请求」。部分绑定成功的
 		// 形态保留实际动作，空串以「<解析失败>」占位符显式留痕。
 		action := req.Action
@@ -172,9 +215,20 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: http.StatusBadRequest, Message: "不支持的服务控制动作"})
 		return
 	}
+	// 导入窗口内的 Caddy 启停会与导入会话互抢 caddyOpMu（导入自
+	// beginConfigImport 起到 close() 全程持有该锁）：主节点侧票据调用 60s 超时
+	// 判失败、从节点稍后锁释放仍执行——双向审计相反且终态不可知。与本族写
+	// 端点同口径 409 fast-fail。位置在票据校验前（窗口内拒绝不得消费一次性
+	// 票据，主节点重试不必重新注册），且仅收 caddy 动作——restart_app 的进程
+	// 退出本身会终结导入会话，不存在「超时判失败后仍执行」的双向错位。
+	if req.Action != models.ClusterServiceActionRestartApp {
+		if rejectWriteDuringImport(c, "执行服务控制（配置导入进行中）") {
+			return
+		}
+	}
 	if err := h.clusterService.ValidateServiceControlTicket(c.Request.Context(), req.Ticket, req.Action, time.Now()); err != nil {
 		if errors.Is(err, services.ErrInvalidServiceControlTicket) {
-			recordClusterServiceControlAudit(c, req.Action, "失败：票据校验未通过")
+			recordClusterServiceControlAudit(c, req.Action, "失败：票据校验未通过（"+serviceControlTicketFailureReason(err)+"）")
 			clusterError(c, http.StatusUnauthorized, "服务控制票据无效或已过期", err)
 			return
 		}
@@ -183,7 +237,9 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		return
 	}
 	if req.Action == models.ClusterServiceActionRestartApp {
-		recordClusterServiceControlAudit(c, req.Action, "已接受：服务即将重启")
+		// 与 caddy 分支同口径带 operator——空 operator 回退「主节点」，
+		// 非空则记录主节点侧实际操作人（此前 restart_app 恒匿名）。
+		recordClusterServiceControlAuditBy(c, req.Action, "已接受：服务即将重启", req.Operator)
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "服务正在重启"})
 		go func() {
 			time.Sleep(clusterServiceExitDelay)
@@ -197,10 +253,26 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}
-	// F65:成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
+	// 成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
 	// 实际执行细节(原仅记「成功」,消息只回传主节点不落从节点审计)
 	recordClusterServiceControlAuditBy(c, req.Action, "成功："+message, req.Operator)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})
+}
+
+// serviceControlTicketFailureReason 把票据校验的细分哨兵翻成审计可读原因：
+// 运维据此区分「票据已使用（重放，无需重新注册）」与「签名错误（节点集群
+// 凭证不一致，需重新注册）」等不同补救路径。
+func serviceControlTicketFailureReason(err error) string {
+	switch {
+	case errors.Is(err, services.ErrServiceControlSignature):
+		return "签名错误"
+	case errors.Is(err, services.ErrServiceControlExpired):
+		return "已过期"
+	case errors.Is(err, services.ErrServiceControlReplay):
+		return "已使用"
+	default:
+		return "无效"
+	}
 }
 
 // executeClusterCaddyAction 与本机 /caddy/start|stop|restart handler 同一锁序
@@ -242,16 +314,22 @@ func recordClusterServiceControlAudit(c *gin.Context, action, result string) {
 }
 
 // recordClusterServiceControlAuditBy 带 operator 版——从节点审计记录主节点侧
-// 实际操作人(经票据保护的转发链传递);空串回退「主节点」(兼容旧主节点)。
+// 操作人。已知边界：operator 是持票方自述字段（不在票据签名载荷内），只影响
+// 审计归属文案、不改变可执行动作；空串回退「主节点」（兼容旧主节点）。
+//
+// result 落盘前必须经 services.RedactCaddyAdminEndpoint：Caddy 应用失败的原文
+// 来自指向 admin 端点的 *url.Error（请求地址 + 拨号地址），而操作审计是全员
+// 可读面——把内部控制面地址与端口写给只读用户等于拓扑披露。返回给主节点
+// 管理员的响应仍保留原文（上方调用点直接回 err.Error()），排障契约不变。
 func recordClusterServiceControlAuditBy(c *gin.Context, action, result, operator string) {
-	// CL44-3（第 44 轮审计）：action/operator 来自请求体，须先经 registerAuditField
+	// action/operator 来自请求体，须先经 registerAuditField
 	// 清洗（去控制字符、截断 128B）再拼接，防伪造换行/超长注入审计详情。
 	op := registerAuditField(operator)
 	if op == "" {
 		op = "主节点"
 	}
 	services.RecordAuditLog(op, "服务控制", "节点服务",
-		services.FormatAuditDetail("来源：主节点", "操作："+registerAuditField(action), "结果："+result), c.ClientIP())
+		services.FormatAuditDetail("来源：主节点", "操作："+registerAuditField(action), "结果："+services.RedactCaddyAdminEndpoint(result)), c.ClientIP())
 }
 
 // currentUsername 从 gin context 取 JWT/API Key 中间件注入的操作人用户名。

@@ -2,132 +2,19 @@ package services
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 
 	"lazy-balancer-v2/internal/db"
 )
 
 var certDir = "/app/certs"
-
-// CertDir 返回引用型证书允许的根目录（tls_source="file" 白名单边界）。
-func CertDir() string { return certDir }
-
-// ReferencedCertificate 引用型证书（tls_source="file"）的校验结果：
-// 归一后的路径 + 已读取的 PEM 内容（仅供调用方校验与预检，不落库）。
-type ReferencedCertificate struct {
-	CertPath string
-	KeyPath  string
-	CertPEM  string
-	KeyPEM   string
-}
-
-// ResolveReferencedCertPath 校验并归一引用型证书文件路径（2026-10-09）：
-//   - 绝对路径、位于 certDir 内（前缀 + 分隔符边界，防 /app/certs-evil 绕过）；
-//   - 拒绝空串、目录、含 NUL 的路径；
-//   - 文件须存在且为常规文件；
-//   - 解析符号链接后再次校验边界（防目录内软链指向容器任意文件）。
-//
-// 返回归一路径用于展示与落库（保持用户输入语义），安全性由真实路径校验保证。
-func ResolveReferencedCertPath(rawPath string) (string, error) {
-	trimmed := strings.TrimSpace(rawPath)
-	if trimmed == "" {
-		return "", fmt.Errorf("证书文件路径不能为空")
-	}
-	if strings.ContainsRune(trimmed, 0) {
-		return "", fmt.Errorf("证书文件路径含非法字符")
-	}
-	cleaned := filepath.Clean(trimmed)
-	if !filepath.IsAbs(cleaned) {
-		return "", fmt.Errorf("证书文件路径必须是绝对路径")
-	}
-	base := filepath.Clean(certDir)
-	if !pathWithinBase(cleaned, base) {
-		return "", fmt.Errorf("证书文件路径必须位于 %s 目录内", base)
-	}
-	info, err := os.Stat(cleaned)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("证书文件不存在: %s", cleaned)
-		}
-		return "", fmt.Errorf("读取证书文件失败: %w", err)
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("证书文件路径不能是目录: %s", cleaned)
-	}
-	// 符号链接逃逸：目录与文件均解析为真实路径后复核边界（目录本身为软链时
-	// 以解析后的真实目录为基准，避免误判）。
-	realPath, err := filepath.EvalSymlinks(cleaned)
-	if err != nil {
-		return "", fmt.Errorf("解析证书文件路径失败: %w", err)
-	}
-	if realBase, baseErr := filepath.EvalSymlinks(base); baseErr == nil {
-		base = realBase
-	}
-	if !pathWithinBase(realPath, base) {
-		return "", fmt.Errorf("证书文件路径（解析符号链接后）必须位于 %s 目录内", base)
-	}
-	return cleaned, nil
-}
-
-// pathWithinBase 判定 path 是否位于 base 内（严格边界：base 本身不计入）。
-func pathWithinBase(path, base string) bool {
-	if path == base {
-		return false
-	}
-	return strings.HasPrefix(path, base+string(os.PathSeparator))
-}
-
-// LoadReferencedCertificate 校验引用型证书的证书/私钥两个路径并读取内容，
-// 同时校验二者能配成合法密钥对（与物化路径同口径，提前失败以免 Caddy 加载期报错）。
-func LoadReferencedCertificate(certPath, keyPath string) (ReferencedCertificate, error) {
-	resolvedCert, err := ResolveReferencedCertPath(certPath)
-	if err != nil {
-		return ReferencedCertificate{}, fmt.Errorf("证书文件：%w", err)
-	}
-	resolvedKey, err := ResolveReferencedCertPath(keyPath)
-	if err != nil {
-		return ReferencedCertificate{}, fmt.Errorf("私钥文件：%w", err)
-	}
-	certPEM, err := os.ReadFile(resolvedCert)
-	if err != nil {
-		return ReferencedCertificate{}, fmt.Errorf("读取证书文件失败: %w", err)
-	}
-	keyPEM, err := os.ReadFile(resolvedKey)
-	if err != nil {
-		return ReferencedCertificate{}, fmt.Errorf("读取私钥文件失败: %w", err)
-	}
-	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
-		return ReferencedCertificate{}, fmt.Errorf("证书与私钥不匹配: %w", err)
-	}
-	return ReferencedCertificate{
-		CertPath: resolvedCert,
-		KeyPath:  resolvedKey,
-		CertPEM:  string(certPEM),
-		KeyPEM:   string(keyPEM),
-	}, nil
-}
-
-// ReferencedCertFileDigest 返回引用型证书文件对的内容指纹（含文件不存在标记）。
-// 供「外部更新证书文件 → 自动重载」的变更检测使用：与上次快照比对，不同即视为
-// 证书已更新。
-func ReferencedCertFileDigest(certPath, keyPath string) string {
-	certData, certErr := os.ReadFile(certPath)
-	keyData, keyErr := os.ReadFile(keyPath)
-	if certErr != nil || keyErr != nil {
-		return fmt.Sprintf("missing:%v:%v", certErr != nil, keyErr != nil)
-	}
-	sum := sha256.Sum256(append(append([]byte{}, certData...), keyData...))
-	return hex.EncodeToString(sum[:])
-}
 
 // SetCertDirForTest 重定向证书物化目录，仅供测试隔离使用（返回还原函数）。
 func SetCertDirForTest(dir string) func() {
@@ -136,36 +23,109 @@ func SetCertDirForTest(dir string) func() {
 	return func() { certDir = old }
 }
 
-// 序列化证书对文件操作，避免并发写入、恢复或删除产生撕裂的 cert/key 组合。
-var certWriteMu sync.Mutex
+// certWriteMu 保护证书文件操作的层级互斥：读锁（RLock）覆盖按规则并行的
+// 写/删/快照/物化，写锁（Lock）只留给「跨规则快照回滚」（RestoreCertFiles
+// 全有全无，必须排斥一切并发文件操作）。全局互斥时代 /load 渲染 N 条
+// ACME 规则在同一锁内串行 N 组 fsync（机械盘合计数百 ms～秒级），跨规则
+// 部署/删除彼此阻塞，per-rule DeployLock 因此无实际收益。
+var certWriteMu sync.RWMutex
 
-var certificateDeployLocks sync.Map
-var certificateDeployLocksMu sync.Mutex
+// certRuleFileLocks 按 ruleID 串行化同一规则的 cert/key 文件操作
+// （内容比对→tmp→rename 序列不得与同规则并发写交错产生撕裂组合）。
+// 条目在最后一个持有者释放后回收（见 refCountedLockTable）——键空间是
+// 「当前在途操作数」而非历史规则总数。
+var certRuleFileLocks refCountedLockTable
 
-type certificateDeployLock struct {
-	mu   sync.Mutex
-	refs int
+// refCountedLockTable 是按 key 引用计数的互斥锁表。与「sync.Map + LoadOrStore
+// 只增不删」的旧形态不同，最后一个持有者释放后条目即回收：规则可反复创建/删除
+// （caddy_id 随机生成），只增不删的表会按历史规则总数线性增长。refs 在 acquire
+// 内与「查找/创建条目」同一临界区自增（含阻塞等待者），只要有人持有或等待条目
+// 就不会被回收——同 key 因此不会出现两把不同锁的并发窗口。查找与登记分属两处
+// 是本表唯一需要防止的形态（见 acquire 注释）。
+type refCountedLockTable struct {
+	mu    sync.Mutex
+	locks sync.Map // key -> *refCountedLock
 }
 
-// DeployLock serializes the complete deployment and rollback transaction for
-// one rule while allowing unrelated rules to deploy concurrently.
-func DeployLock(ruleID string) func() {
-	certificateDeployLocksMu.Lock()
-	value, _ := certificateDeployLocks.LoadOrStore(ruleID, &certificateDeployLock{})
-	lock := value.(*certificateDeployLock)
-	lock.refs++
-	certificateDeployLocksMu.Unlock()
+type refCountedLock struct {
+	table *refCountedLockTable
+	key   string
+	mu    sync.Mutex
+	refs  int
+}
 
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
-		certificateDeployLocksMu.Lock()
-		lock.refs--
-		if lock.refs == 0 {
-			certificateDeployLocks.Delete(ruleID)
-		}
-		certificateDeployLocksMu.Unlock()
+// acquire 原子地取得 key 的锁条目：查找/创建与引用登记在同一个表级临界区内
+// 完成，返回的锁尚未持有，调用方须再调用 Lock 阻塞获取。
+//
+// 两步必须在同一临界区：若先返回指针、稍后才登记引用，最后一个持有者可能在
+// 其间把 refs 减到 0 并回收条目——迟到的获取者拿到的旧锁已不在表里，第三者
+// 随即建出新锁，同 key 因此出现两把并存的锁（per-rule 互斥失效）。
+func (t *refCountedLockTable) acquire(key string) *refCountedLock {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	value, _ := t.locks.LoadOrStore(key, &refCountedLock{table: t, key: key})
+	lock := value.(*refCountedLock)
+	lock.refs++
+	return lock
+}
+
+// Lock 只阻塞在条目自身的互斥量上：引用已在 acquire 时登记（覆盖持有 + 等待
+// 全体），回收判定因此安全——本方法不再触碰表锁，也不存在锁序反转。
+func (l *refCountedLock) Lock() {
+	l.mu.Lock()
+}
+
+func (l *refCountedLock) Unlock() {
+	l.mu.Unlock()
+	l.table.mu.Lock()
+	l.refs--
+	if l.refs == 0 {
+		l.table.locks.Delete(l.key)
 	}
+	l.table.mu.Unlock()
+}
+
+// lockCertRuleFile 返回单规则的 per-rule 文件锁。调用方必须先持
+// certWriteMu.RLock（锁序：certWriteMu → per-rule，单向不逆）。
+func lockCertRuleFile(ruleID string) *refCountedLock {
+	return certRuleFileLocks.acquire(ruleID)
+}
+
+// lockCertRuleFiles 按序取多条规则的 per-rule 锁（排序+去重防死锁/自锁），
+// 返回统一解锁函数。调用方必须先持 certWriteMu.RLock。
+func lockCertRuleFiles(ruleIDs []string) func() {
+	unique := make([]string, 0, len(ruleIDs))
+	seen := make(map[string]struct{}, len(ruleIDs))
+	for _, ruleID := range ruleIDs {
+		if _, ok := seen[ruleID]; ok {
+			continue
+		}
+		seen[ruleID] = struct{}{}
+		unique = append(unique, ruleID)
+	}
+	sort.Strings(unique)
+	locks := make([]*refCountedLock, 0, len(unique))
+	for _, ruleID := range unique {
+		lock := lockCertRuleFile(ruleID)
+		lock.Lock()
+		locks = append(locks, lock)
+	}
+	return func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].Unlock()
+		}
+	}
+}
+
+var certificateDeployLocks refCountedLockTable
+
+// DeployLock serializes the complete deployment and rollback transaction for
+// one rule while allowing unrelated rules to deploy concurrently. 条目随最后
+// 持有者释放回收（refCountedLockTable），与 certRuleFileLocks 同一实现。
+func DeployLock(ruleID string) func() {
+	lock := certificateDeployLocks.acquire(ruleID)
+	lock.Lock()
+	return lock.Unlock
 }
 
 type CertFileSnapshot struct {
@@ -177,6 +137,23 @@ type CertFileSnapshot struct {
 type CertPairSnapshot struct {
 	Cert CertFileSnapshot
 	Key  CertFileSnapshot
+}
+
+// certPairMatchesSnapshot 是「磁盘证书对是否已与期望一致」的唯一判据：内容逐
+// 字节相等，且证书 0644、私钥 0600。三条链路共用同一判据——写侧
+// writeCertPairFiles 据此跳过写盘、materializeCertPair 据此给出 changed（启动
+// 恢复计数/审计只统计真正写过的对）、MaterializeCertPairs 据此确定差异集与
+// 回滚快照范围。
+//
+// 判据单源是硬约束（守卫：certstore_zero_write_single_source_test.go）。历史上
+// 三处各写一份，任一处漏掉权限比对就让「重复物化修复权限」的契约在该链路上
+// 静默失效，而其余链路仍绿。内容与权限必须**同时**满足才零写：内容一致但权限
+// 被外部改错时必须重写修复。
+func certPairMatchesSnapshot(cert, key CertFileSnapshot, certPEM, keyPEM string) bool {
+	return cert.Exists && cert.Mode == 0644 &&
+		key.Exists && key.Mode == 0600 &&
+		bytes.Equal(cert.Data, []byte(certPEM)) &&
+		bytes.Equal(key.Data, []byte(keyPEM))
 }
 
 type CertFilesSnapshot map[string]CertPairSnapshot
@@ -201,6 +178,14 @@ func safeRuleID(ruleID string) bool {
 	return true
 }
 
+// ValidCertRuleID 报告 ruleID 是否满足证书文件路径字母表（非空、≤64、仅
+// [a-z0-9_-]），与 safeRuleID 完全同源。导出供导入口等跨包调用方复用同一
+// 字母表（v2 导入允许含 '.' 的 caddy_id，证书物化路径却拒绝——
+// 必须在导入校验阶段 fail-fast 点名，而不是在证书阶段整体回滚）。
+func ValidCertRuleID(ruleID string) bool {
+	return safeRuleID(ruleID)
+}
+
 func CertFilePaths(ruleID string) (certPath, keyPath string) {
 	if !safeRuleID(ruleID) {
 		return "", ""
@@ -209,71 +194,91 @@ func CertFilePaths(ruleID string) (certPath, keyPath string) {
 }
 
 func WriteCertFiles(ruleID, certPEM, keyPEM string) error {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
-	if err := os.MkdirAll(certDir, 0755); err != nil {
-		return fmt.Errorf("创建证书目录: %w", err)
-	}
+	_, err := writeCertFiles(ruleID, certPEM, keyPEM)
+	return err
+}
+
+// writeCertFiles 是 WriteCertFiles 的带 changed 形态：changed=false 表示磁盘已是
+// 期望的内容与权限（零写，见 certPairMatchesSnapshot）。调用方需要「是否真正
+// 写盘」时（启动物化的恢复计数）走本函数，复位/部署等只关心错误的路径走
+// WriteCertFiles。
+func writeCertFiles(ruleID, certPEM, keyPEM string) (bool, error) {
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	ruleLock := lockCertRuleFile(ruleID)
+	ruleLock.Lock()
+	defer ruleLock.Unlock()
 	certPath, keyPath := CertFilePaths(ruleID)
 	if certPath == "" {
-		return fmt.Errorf("非法的规则编号: %q", ruleID)
+		return false, fmt.Errorf("非法的规则编号: %q", ruleID)
 	}
-	return writeCertPair(certPath, keyPath, certPEM, keyPEM)
+	if err := os.MkdirAll(certDir, 0755); err != nil {
+		return false, fmt.Errorf("创建证书目录: %w", err)
+	}
+	return writeCertPairFiles(certPath, keyPath, certPEM, keyPEM)
 }
 
 func writeCertPair(certPath, keyPath, certPEM, keyPEM string) error {
-	previousCert, err := os.ReadFile(certPath)
-	certExisted := err == nil
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("读取原证书: %w", err)
+	_, err := writeCertPairFiles(certPath, keyPath, certPEM, keyPEM)
+	return err
+}
+
+// writeCertPairFiles 落盘一对证书文件并返回是否真正写入。零写判据单源
+// （certPairMatchesSnapshot），磁盘快照只读一次——此前先 ReadFile 比对内容、
+// 再 Stat 比对权限、再 Stat 取回滚用权限，启动路径
+// （materializeCertPair → WriteCertFiles → writeCertPair）因此对同一对文件
+// 读两遍。快照同时提供回滚所需的原内容与原权限。
+func writeCertPairFiles(certPath, keyPath, certPEM, keyPEM string) (bool, error) {
+	cert, err := snapshotCertFile(certPath)
+	if err != nil {
+		return false, fmt.Errorf("读取原证书: %w", err)
 	}
-	// CL9-N14(第 9 轮审计,含权限修复契约修正):内容一致且权限正确才零写
-	// ——旧内容本已读出,比对几乎免费;跳过可免每次 apply 的 tmp+fsync+
-	// rename 写放大。权限被外部改错时仍重写(既有契约:重复物化修复权限,
-	// TestMaterializeCertPairs_restores_permissions 钉住)。
-	if previousKey, kerr := os.ReadFile(keyPath); kerr == nil &&
-		string(previousCert) == certPEM && string(previousKey) == keyPEM {
-		if certInfo, serr := os.Stat(certPath); serr == nil && certInfo.Mode().Perm() == 0644 {
-			if keyInfo, kerr2 := os.Stat(keyPath); kerr2 == nil && keyInfo.Mode().Perm() == 0600 {
-				return nil
-			}
-		}
+	key, err := snapshotCertFile(keyPath)
+	if err != nil {
+		// 私钥不可读（EACCES/IO）：无法判定零写，按「需要重写」继续——tmp+rename
+		// 会用正确权限重建私钥，是修复路径而非失败（与既有口径一致：证书侧读失败
+		// 仍上抛，私钥侧历史上是宽松读取）。
+		key = CertFileSnapshot{}
+	}
+	previousCert := cert.Data
+	certExisted := cert.Exists
+	// 内容一致且权限正确才零写：跳过可免每次 apply 的 tmp+fsync+rename 写放大。
+	// 权限被外部改错时仍重写（既有契约：重复物化修复权限，
+	// TestMaterializeCertPairs_restores_permissions 钉住）。
+	if certPairMatchesSnapshot(cert, key, certPEM, keyPEM) {
+		return false, nil
 	}
 	previousMode := os.FileMode(0644)
 	if certExisted {
-		info, statErr := os.Stat(certPath)
-		if statErr != nil {
-			return fmt.Errorf("读取原证书权限: %w", statErr)
-		}
-		previousMode = info.Mode().Perm()
+		previousMode = cert.Mode
 	}
 
 	certTmp, keyTmp := certPath+".tmp", keyPath+".tmp"
 	if err := writeSyncedFile(certTmp, []byte(certPEM), 0644); err != nil {
-		return fmt.Errorf("写入证书: %w", err)
+		return false, fmt.Errorf("写入证书: %w", err)
 	}
 	if err := writeSyncedFile(keyTmp, []byte(keyPEM), 0600); err != nil {
-		return errors.Join(fmt.Errorf("写入私钥: %w", err), removeTemporaryCertFile(certTmp))
+		return false, errors.Join(fmt.Errorf("写入私钥: %w", err), removeTemporaryCertFile(certTmp))
 	}
 	if err := os.Rename(certTmp, certPath); err != nil {
-		return errors.Join(fmt.Errorf("部署证书: %w", err), removeTemporaryCertFile(certTmp), removeTemporaryCertFile(keyTmp))
+		return false, errors.Join(fmt.Errorf("部署证书: %w", err), removeTemporaryCertFile(certTmp), removeTemporaryCertFile(keyTmp))
 	}
 	if err := os.Rename(keyTmp, keyPath); err != nil {
 		deployErr := fmt.Errorf("部署私钥: %w", err)
 		cleanupErr := removeTemporaryCertFile(keyTmp)
 		if certExisted {
 			if restoreErr := writeSyncedFile(certPath, previousCert, previousMode); restoreErr != nil {
-				return errors.Join(deployErr, cleanupErr, fmt.Errorf("恢复原证书: %w", restoreErr))
+				return false, errors.Join(deployErr, cleanupErr, fmt.Errorf("恢复原证书: %w", restoreErr))
 			}
 		} else if removeErr := os.Remove(certPath); removeErr != nil && !os.IsNotExist(removeErr) {
-			return errors.Join(deployErr, cleanupErr, fmt.Errorf("删除新证书: %w", removeErr))
+			return false, errors.Join(deployErr, cleanupErr, fmt.Errorf("删除新证书: %w", removeErr))
 		}
-		return errors.Join(deployErr, cleanupErr)
+		return false, errors.Join(deployErr, cleanupErr)
 	}
 	if err := syncParentDir(certPath); err != nil {
-		return fmt.Errorf("同步证书目录: %w", err)
+		return false, fmt.Errorf("同步证书目录: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func writeSyncedFile(path string, data []byte, mode os.FileMode) error {
@@ -309,8 +314,11 @@ func removeTemporaryCertFile(path string) error {
 }
 
 func RemoveCertFiles(ruleID string) error {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	ruleLock := lockCertRuleFile(ruleID)
+	ruleLock.Lock()
+	defer ruleLock.Unlock()
 
 	certPath, keyPath := CertFilePaths(ruleID)
 	if certPath == "" {
@@ -327,8 +335,10 @@ func RemoveCertFiles(ruleID string) error {
 }
 
 func SnapshotCertFiles(ruleIDs []string) (CertFilesSnapshot, error) {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	unlock := lockCertRuleFiles(ruleIDs)
+	defer unlock()
 	return snapshotCertFilesLocked(ruleIDs)
 }
 
@@ -355,6 +365,8 @@ func snapshotCertFilesLocked(ruleIDs []string) (CertFilesSnapshot, error) {
 	return snapshot, nil
 }
 
+// RestoreCertFiles 恢复整份快照（任一失败→全部回滚）。跨规则回滚必须全局
+// 互斥：写锁排斥一切并发文件操作（其余路径均持 RLock + per-rule 锁）。
 func RestoreCertFiles(snapshot CertFilesSnapshot) error {
 	certWriteMu.Lock()
 	defer certWriteMu.Unlock()
@@ -405,8 +417,14 @@ func restoreCertFilesBestEffortLocked(snapshot CertFilesSnapshot) error {
 }
 
 func MaterializeCertPairs(materials []CertMaterial) (CertFilesSnapshot, error) {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	materialRuleIDs := make([]string, 0, len(materials))
+	for _, material := range materials {
+		materialRuleIDs = append(materialRuleIDs, material.RuleID)
+	}
+	unlock := lockCertRuleFiles(materialRuleIDs)
+	defer unlock()
 
 	lastMaterialByRule := make(map[string]int, len(materials))
 	for i, material := range materials {
@@ -434,7 +452,9 @@ func MaterializeCertPairs(materials []CertMaterial) (CertFilesSnapshot, error) {
 		if err != nil {
 			return nil, fmt.Errorf("快照私钥 %s: %w", material.RuleID, err)
 		}
-		if cert.Exists && cert.Mode == 0644 && key.Exists && key.Mode == 0600 && bytes.Equal(cert.Data, []byte(material.CertPEM)) && bytes.Equal(key.Data, []byte(material.KeyPEM)) {
+		// 零写判据与写侧/启动物化同源（certPairMatchesSnapshot）：内容与权限都
+		// 一致的对不进差异集，也就不占快照/回滚面。
+		if certPairMatchesSnapshot(cert, key, material.CertPEM, material.KeyPEM) {
 			continue
 		}
 		snapshot[material.RuleID] = CertPairSnapshot{Cert: cert, Key: key}
@@ -488,73 +508,18 @@ func restoreCertFile(path string, snapshot CertFileSnapshot) error {
 	return syncParentDir(path)
 }
 
-// IngestMissingReferencedCerts 启动期回填：引用型证书（tls_source="file"）的
-// 运行时唯一信任源是数据库——旧版本升级、旧备份还原或 v2 导入产生的「只有
-// 摄取源路径、内容为空」的行，在本机源文件可读时摄取回填内容；不可读则保留
-// 空内容并留痕（渲染按无证、EnableRule 门拒绝启用，用户重新保存即修复）。
-//   - 返回成功回填的规则数（0=无可回填行或全部失败，调用方按需留警告）。
-//
-// 幂等：内容已非空的行不命中。
-func IngestMissingReferencedCerts() int {
-	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
-		FROM lb_rules WHERE enable_tls=1 AND tls_source='file'
-		AND COALESCE(tls_cert,'')='' AND COALESCE(tls_key,'')=''
-		AND COALESCE(tls_cert_path,'')<>'' AND COALESCE(tls_key_path,'')<>''`)
-	if err != nil {
-		Logf("warn", "certstore: query referenced certs missing content failed: %v", err)
-		return 0
-	}
-	type pending struct{ certPath, keyPath string }
-	pendings := map[string]pending{}
-	order := []string{}
-	for rows.Next() {
-		var caddyID, certPath, keyPath string
-		if err := rows.Scan(&caddyID, &certPath, &keyPath); err != nil {
-			continue
-		}
-		pendings[caddyID] = pending{certPath, keyPath}
-		order = append(order, caddyID)
-	}
-	rows.Close()
-	if len(order) == 0 {
-		return 0
-	}
-	sort.Strings(order)
-	recovered := 0
-	for _, caddyID := range order {
-		p := pendings[caddyID]
-		referenced, loadErr := LoadReferencedCertificate(p.certPath, p.keyPath)
-		if loadErr != nil {
-			Logf("warn", "certstore: referenced cert ingest skipped for %s (source files unavailable): %v", caddyID, loadErr)
-			continue
-		}
-		if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id=?`, referenced.CertPEM, referenced.KeyPEM, caddyID); err != nil {
-			Logf("error", "certstore: referenced cert ingest write failed for %s: %v", caddyID, err)
-			continue
-		}
-		RecordAuditLog("system", "证书摄取", "负载规则", FormatAuditDetail(AuditRulePart(caddyID), "启动回填：源文件内容已入库"), "")
-		recovered++
-	}
-	if recovered > 0 {
-		TaskLogf("startup:config-load", "certs", "引用证书内容回填完成：%d 条规则", recovered)
-	}
-	return recovered
-}
-
 func MaterializeAllCertsFromDB() {
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		Logf("error", "certstore: create cert dir failed: %v", err)
 		return
 	}
-	// 引用型证书内容回填先行（升级/还原后「有路径无内容」的行先摄取，再统一物化）。
-	IngestMissingReferencedCerts()
 	manualRecovered := 0
 	acmeRecovered := 0
 
-	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source IN ('manual','file') AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
+	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source='manual' AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
 	if err != nil {
 		Logf("error", "certstore: query manual certs failed: %v", err)
-		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动/引用证书", AuditResultPart("query_failed")), "")
+		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动证书", AuditResultPart("query_failed")), "")
 	} else {
 		for rows.Next() {
 			var ruleID, certPEM, keyPEM string
@@ -562,10 +527,11 @@ func MaterializeAllCertsFromDB() {
 				Logf("error", "certstore: scan manual cert failed: %v", err)
 				continue
 			}
-			if err := materializeCertPair(ruleID, certPEM, keyPEM); err != nil {
-				Logf("error", "certstore: write manual cert %s failed: %v", ruleID, err)
-				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动/引用证书", AuditResultPart("io_error")), "")
-			} else {
+			changed, materializeErr := materializeCertPair(ruleID, certPEM, keyPEM)
+			if materializeErr != nil {
+				Logf("error", "certstore: write manual cert %s failed: %v", ruleID, materializeErr)
+				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动证书", AuditResultPart("io_error")), "")
+			} else if changed {
 				manualRecovered++
 			}
 		}
@@ -575,75 +541,42 @@ func MaterializeAllCertsFromDB() {
 		rows.Close()
 	}
 
-	// CL23-2(第 23 轮审计):多行规则(同 rule_id 多 cert_jobs 行)必须按
-	// certJobRuleApplicable 同语义过滤——否则灾备物化内容取决于扫描顺序,
-	// 可能重建旧域证书。取每 rule_id 最新行且校验域名适用。
-	rows2, err := db.DB.Query(`SELECT j.rule_id, j.cert_pem, j.key_pem, COALESCE(j.domain,''), COALESCE(r.domain,'') FROM cert_jobs j
-		JOIN lb_rules r ON r.caddy_id=j.rule_id
-		WHERE j.status IN ('downloaded','issued') AND COALESCE(j.cert_pem,'')!='' AND COALESCE(j.key_pem,'')!=''
-		  AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
-		ORDER BY j.rule_id, j.updated_at DESC, j.id DESC`)
-	if err != nil {
-		Logf("error", "certstore: query ACME certs failed: %v", err)
+	// 每规则取「最新且域名适用」的一行（同 rule_id 多 cert_jobs 行）——选择与
+	// 6h 文件对账同源（latestApplicableACMECertMaterials）：物化内容不取决于
+	// 扫描顺序，也不会重建旧域证书。
+	materials, _, selectErr := latestApplicableACMECertMaterials(context.Background(), db.DB, "certstore")
+	if selectErr != nil {
+		Logf("error", "certstore: query ACME certs failed: %v", selectErr)
 		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：ACME证书", AuditResultPart("query_failed")), "")
 	} else {
-		seenRules := make(map[string]bool)
-		for rows2.Next() {
-			var ruleID, certPEM, keyPEM, jobDomain, ruleDomain string
-			if err := rows2.Scan(&ruleID, &certPEM, &keyPEM, &jobDomain, &ruleDomain); err != nil {
-				Logf("error", "certstore: scan ACME cert failed: %v", err)
-				continue
-			}
-			// 同 rule_id 多行只取首行(ORDER BY updated_at DESC=最新),旧行跳过——
-			// 防旧域/旧材料覆盖新物化(CL23-2)。
-			if seenRules[ruleID] {
-				continue
-			}
-			seenRules[ruleID] = true
-			// CL23-2:域名适用性校验(与 certJobRuleApplicable 同语义)——任务签发
-			// 域名与规则当前域名不一致时物化会写入不匹配证书。
-			if !certJobRuleApplicable(true, ruleDomain, jobDomain) {
-				continue
-			}
-			if err := materializeCertPair(ruleID, certPEM, keyPEM); err != nil {
-				Logf("error", "certstore: write ACME cert %s failed: %v", ruleID, err)
-				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：ACME证书", AuditResultPart("io_error")), "")
-			} else {
+		for _, material := range materials {
+			changed, materializeErr := materializeCertPair(material.RuleID, material.CertPEM, material.KeyPEM)
+			if materializeErr != nil {
+				Logf("error", "certstore: write ACME cert %s failed: %v", material.RuleID, materializeErr)
+				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(material.RuleID), "类型：ACME证书", AuditResultPart("io_error")), "")
+			} else if changed {
 				acmeRecovered++
 			}
 		}
-		if err := rows2.Err(); err != nil {
-			Logf("error", "certstore: iterate ACME certs failed: %v", err)
-		}
-		rows2.Close()
 	}
 	if manualRecovered > 0 || acmeRecovered > 0 {
-		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动/引用证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
+		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
 	}
-	TaskLogf("startup:config-load", "certs", "证书物化完成：手动/引用证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
+	TaskLogf("startup:config-load", "certs", "证书物化完成：手动证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
 }
 
-func materializeCertPair(ruleID, certPEM, keyPEM string) error {
+// materializeCertPair 把库内证书对物化到磁盘，返回是否真正发生了写入。
+// 内容与权限已一致时零写（返回 changed=false）——调用方的恢复计数
+// 与审计/任务日志必须只统计 changed，否则每次启动都报「恢复 N 个」，稀释真正
+// 的恢复事件（运维无法区分「真恢复」与「本来就在」）。
+//
+// changed 由写侧同源给出（writeCertFiles → certPairMatchesSnapshot）：本函数只
+// 做材料自校验，不再自己读一遍磁盘内容/权限、再交给写侧读第二遍——启动路径对
+// 同一对文件的重复读在千规则规模下是成倍的 syscall 与整文件读取。
+func materializeCertPair(ruleID, certPEM, keyPEM string) (bool, error) {
 	if _, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM)); err != nil {
-		return fmt.Errorf("证书与私钥不匹配: %w", err)
+		return false, fmt.Errorf("证书与私钥不匹配: %w", err)
 	}
-	certPath, keyPath := CertFilePaths(ruleID)
-	if certPath == "" {
-		return fmt.Errorf("非法的规则编号: %q", ruleID)
-	}
-	diskCert, certErr := os.ReadFile(certPath)
-	diskKey, keyErr := os.ReadFile(keyPath)
-	if certErr == nil && keyErr == nil && bytes.Equal(diskCert, []byte(certPEM)) && bytes.Equal(diskKey, []byte(keyPEM)) {
-		// CL10-N5:跳过前检查权限(与 writeCertPair/MaterializeCertPairs 同
-		// 契约)——私钥被 chmod 0644 后启动路径此前不修复,直到下次 apply。
-		if certInfo, serr := os.Stat(certPath); serr == nil && certInfo.Mode().Perm() == 0644 {
-			if keyInfo, kerr := os.Stat(keyPath); kerr == nil && keyInfo.Mode().Perm() == 0600 {
-				// CERT-P1（第 69 轮）：删除对磁盘字节的重复 X509KeyPair 解析——
-				// :467 的 bytes.Equal 已证明磁盘字节与 :458 刚验证通过的库内
-				// 字节完全相同，二次解析不可能产生不同结果。
-				return nil
-			}
-		}
-	}
-	return WriteCertFiles(ruleID, certPEM, keyPEM)
+	// 非法规则编号由 writeCertFiles 统一拒绝（与 WriteCertFiles 同错误文案）。
+	return writeCertFiles(ruleID, certPEM, keyPEM)
 }

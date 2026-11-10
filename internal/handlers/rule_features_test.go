@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -75,7 +76,19 @@ func TestRuleFeatures_rejects_invalid_path_rule_inputs(t *testing.T) {
 				Path:      "/health",
 				Upstreams: []models.PathRuleUpstream{{Address: "127.0.0.1", Port: 9090, Weight: -1}},
 			}}},
-			wantError: "权重不能为负数",
+			wantError: "权重必须为不小于 1",
+		},
+		{
+			// 与主池 handlers.go（weight<1 响亮拒绝，0→1 静默归一已裁定废除）
+			// 同口径：0 渲染层虽归一为 1，但保存侧不得让 0 落库（「权重 0=停用」
+			// 直觉落空；API/备份导入/集群快照路径均可带 0）。
+			name: "zero custom upstream weight",
+			input: ruleFeatureInput{Protocol: "http", CustomRoutesEnabled: true, PathRules: []models.PathRule{{
+				MatchType: "prefix",
+				Path:      "/health",
+				Upstreams: []models.PathRuleUpstream{{Address: "127.0.0.1", Port: 9090, Weight: 0}},
+			}}},
+			wantError: "权重必须为不小于 1",
 		},
 	}
 
@@ -178,11 +191,16 @@ func TestValidateRuleFeatures_rejects_tcp_with_dynamic_dns(t *testing.T) {
 	}
 }
 
-func TestDuplicateRule_rejects_TCP_with_cookie_strategy(t *testing.T) {
-	// Given：源规则为 TCP + cookie 策略，复制时必须拒绝（cookie 仅 HTTP 支持）
+// TCP 自愈族：TCP+cookie 源行不再「复制即 400」——
+// 保存族自愈把 HTTP-only 策略归一为默认策略后复制（与此前 400 拒绝的
+// 历史裁定相比，死端被消除；显式创建仍 400，见 CreateRule 门）。
+func TestDuplicateRule_heals_TCP_with_cookie_strategy(t *testing.T) {
+	// Given：源规则为 TCP + cookie 策略（直改 DB/旧导入残留形态）
 	handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 	gin.SetMode(gin.TestMode)
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,strategy,enabled,enable_compress) VALUES ('lb_duptcpcookie','tcp-cookie','tcp',13010,'cookie',1,1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,strategy,enabled,enable_compress,
+		health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold)
+		VALUES ('lb_duptcpcookie','tcp-cookie','tcp',13010,'cookie',1,1,10,2,3,2)`); err != nil {
 		t.Fatalf("seed tcp cookie rule: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_duptcpcookie','127.0.0.1',9000,1,1,'tcp')`); err != nil {
@@ -199,16 +217,16 @@ func TestDuplicateRule_rejects_TCP_with_cookie_strategy(t *testing.T) {
 	// When
 	router.ServeHTTP(response, request)
 
-	// Then
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "TCP 规则仅支持") {
-		t.Fatalf("duplicate tcp+cookie status=%d body=%s, want 400", response.Code, response.Body.String())
+	// Then：201，副本策略归一为默认（cookie 属 HTTP-only）
+	if response.Code != http.StatusCreated {
+		t.Fatalf("duplicate tcp+cookie status=%d body=%s, want 201（自愈）", response.Code, response.Body.String())
 	}
-	var count int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id != 'lb_duptcpcookie'`).Scan(&count); err != nil {
-		t.Fatalf("count duplicated rules: %v", err)
+	var strategy string
+	if err := db.DB.QueryRow(`SELECT strategy FROM lb_rules WHERE caddy_id != 'lb_duptcpcookie'`).Scan(&strategy); err != nil {
+		t.Fatalf("read duplicated strategy: %v", err)
 	}
-	if count != 0 {
-		t.Fatalf("duplicated rule count=%d, want 0", count)
+	if strategy != "weighted_round_robin" {
+		t.Fatalf("duplicated strategy=%q, want weighted_round_robin", strategy)
 	}
 }
 
@@ -218,7 +236,7 @@ func TestCreateRule_rejects_empty_domain_for_HTTP(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"no-domain","protocol":"http","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"no-domain","protocol":"http","listen_port":8080,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -262,7 +280,7 @@ func TestCreateRule_rejects_manual_TLS_without_certificate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"manual-nocert","protocol":"http","domain":"manual-nocert.example.test","listen_port":8443,"enable_tls":true,"tls_source":"manual","upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"manual-nocert","protocol":"http","domain":"manual-nocert.example.test","listen_port":8443,"enable_tls":true,"tls_source":"manual","health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -291,7 +309,7 @@ func TestCreateRule_rejects_unknown_tls_source(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			router := gin.New()
 			router.POST("/rules", handler.CreateRule)
-			body := fmt.Sprintf(`{"name":"tls-source","protocol":"http","domain":%q,"listen_port":0,"enable_tls":true,"tls_source":%q,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, test.domain, test.tlsSource)
+			body := fmt.Sprintf(`{"name":"tls-source","protocol":"http","domain":%q,"listen_port":0,"enable_tls":true,"tls_source":%q,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, test.domain, test.tlsSource)
 			request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -346,6 +364,47 @@ func TestUpdateRule_replaces_path_rules_wholesale_within_rule_save(t *testing.T)
 	}
 }
 
+// 导入/带外写入的原始 path_rules 行（match_type=”）在「部分更新」路径上必须
+// 先归一再进保存门：updateRuleFeatures 此前把库原始行直接喂给
+// validateRuleFeatures，空 match_type 恒 400「匹配类型只能是 prefix 或 exact」
+// ——即使请求体根本不带 path_rules（MCP update_rule 只交 name、PUT 只改端口），
+// 该规则的任何字段都改不动。归一后同一请求必须 200，且落库形态收敛为 prefix
+// （与创建侧 normalizePathRules 单源）。
+func TestUpdateRule_normalizesStoredPathRulesBeforeSaveGate(t *testing.T) {
+	// Given：存量行带 match_type=''（旧版本/导入遗留形态）
+	handler, _ := newRuleFeatureTestHandlersWithCapture(t)
+	gin.SetMode(gin.TestMode)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,health_check_path,enabled,custom_routes_enabled) VALUES ('lb_stalepaths','paths','','http','stale-paths.test',8080,'weighted_round_robin','',1,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_stalepaths','127.0.0.1',9000,1,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO path_rules (rule_id,sort_order,match_type,path) VALUES ('lb_stalepaths',0,'','/api/')`); err != nil {
+		t.Fatalf("seed path rules: %v", err)
+	}
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_stalepaths", strings.NewReader(`{"name":"renamed-stale"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	// When：部分更新，不携带 path_rules
+	router.ServeHTTP(response, request)
+
+	// Then：不得因存量空 match_type 恒 400
+	if response.Code != http.StatusOK {
+		t.Fatalf("partial update status=%d body=%s（存量 match_type='' 不得让无关字段更新恒 400）", response.Code, response.Body.String())
+	}
+	var matchType string
+	if err := db.DB.QueryRow(`SELECT match_type FROM path_rules WHERE rule_id='lb_stalepaths'`).Scan(&matchType); err != nil {
+		t.Fatalf("read stored match_type: %v", err)
+	}
+	if matchType != "prefix" {
+		t.Fatalf("落库 match_type=%q, want prefix（归一结果必须落库，否则下次部分更新再次 400）", matchType)
+	}
+}
+
 func newRuleFeatureTestHandlers(t *testing.T) *Handlers {
 	handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 	return handler
@@ -391,7 +450,7 @@ func newRuleFeatureTestHandlersWithCapture(t *testing.T) (*Handlers, *string) {
 	return &Handlers{
 		cfg:            cfg,
 		caddyService:   services.NewCaddyService(fakeCaddy.URL),
-		clusterService: services.NewClusterService(db.DB, nil, ""),
+		clusterService: services.NewClusterService(db.DB, ""),
 	}, &postedConfig
 }
 
@@ -407,6 +466,7 @@ func TestCreateRule_accepts_API_key_user_ID_and_succeeds_with_all_feature_column
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"全字段 TCP 规则","protocol":"tcp","listen_port":13000,
 		"tcp_health_check_port":9000,"tcp_proxy_protocol":true,"tcp_try_duration":5,"tcp_try_interval":250,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"weight":1,"enabled":true}]
 	}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -439,7 +499,7 @@ func TestDuplicateRule_accepts_API_key_user_ID_and_copies_rule_upstreams_and_pat
 		enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,
 		request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,
 		enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,
-		enable_compress,compress_types,enabled,created_by,updated_by,origin_domain,log_enabled,
+		enable_compress,compress_types,enabled,created_by,updated_by,host_header,log_enabled,
 		custom_routes_enabled,
 		proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay)
 		VALUES ('lb_dupsrc','源规则','','http','dup.example.test',8080,'weighted_round_robin',0,0,'','ipv4',
@@ -496,8 +556,8 @@ func TestCreateRule_persists_requested_DNS_family(t *testing.T) {
 			handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 			router := gin.New()
 			router.POST("/rules", handler.CreateRule)
-			// N+12 G8-S1：TCP+dynamic_dns 保存侧已拒绝，dns_family 持久化改用 HTTP 载体。
-			body := strings.NewReader(fmt.Sprintf(`{"name":"dns-%s","protocol":"http","domain":"dns-%s.example.test","listen_port":%d,"dynamic_dns":true,"dns_family":"%s","upstreams":[{"host":"example.test","port":9000,"enabled":true}]}`, test.family, test.family, test.port, test.family))
+			// TCP+dynamic_dns 保存侧已拒绝，dns_family 持久化改用 HTTP 载体。
+			body := strings.NewReader(fmt.Sprintf(`{"name":"dns-%s","protocol":"http","domain":"dns-%s.example.test","listen_port":%d,"dynamic_dns":true,"dns_family":"%s","health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"example.test","port":9000,"enabled":true}]}`, test.family, test.family, test.port, test.family))
 			request := httptest.NewRequest(http.MethodPost, "/rules", body)
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -529,7 +589,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 		{
 			name: "TCP rule",
 			body: func(*testing.T) string {
-				return `{"name":"tcp-no-ca","protocol":"tcp","listen_port":13003,"ca_provider_id":999,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+				return `{"name":"tcp-no-ca","protocol":"tcp","listen_port":13003,"ca_provider_id":999,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 			},
 			port: 13003,
 		},
@@ -543,6 +603,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 				payload, err := json.Marshal(map[string]any{
 					"name": "manual-no-ca", "protocol": "http", "domain": "manual.example.test", "listen_port": 13004,
 					"enable_tls": true, "tls_source": "manual", "tls_cert": certPEM, "tls_key": keyPEM,
+					"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 					"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 				})
 				if err != nil {
@@ -555,7 +616,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 		{
 			name: "HTTP rule without TLS",
 			body: func(*testing.T) string {
-				return `{"name":"http-no-ca","protocol":"http","domain":"plain.example.test","listen_port":13005,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+				return `{"name":"http-no-ca","protocol":"http","domain":"plain.example.test","listen_port":13005,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 			},
 			port: 13005,
 		},
@@ -563,9 +624,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Given
-			oldCertDir := testServicesCertDir
-			testServicesCertDir = t.TempDir()
-			t.Cleanup(func() { testServicesCertDir = oldCertDir })
+			t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 			handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 			if _, err := db.DB.Exec("UPDATE ca_providers SET enabled=0"); err != nil {
 				t.Fatalf("disable CA providers: %v", err)
@@ -611,10 +670,12 @@ func TestCreateRule_resolves_default_CA_provider_for_ACME(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	startCertQueueDispatchForTest(t)
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	requestBody := fmt.Sprintf(`{"name":"default-ca","protocol":"http","domain":"default-ca.example.test","listen_port":13006,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)
+	requestBody := fmt.Sprintf(`{"name":"default-ca","protocol":"http","domain":"default-ca.example.test","listen_port":13006,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(requestBody))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -680,7 +741,7 @@ func TestReplacePathRulesTx_replaces_all_rows_and_preserves_nullable_upstreams(t
 	}
 }
 
-// Round 35 F-1: loader 与渲染侧同口径（NULL 视禁用）——此前 COALESCE(enabled,1)
+// loader 与渲染侧同口径（NULL 视禁用）——此前 COALESCE(enabled,1)
 // 把遗留 NULL 行视为启用，UI 显示与生成配置分裂。
 func TestLoadUpstreamsBatch_defaults_NULL_enabled_to_false(t *testing.T) {
 	// Given
@@ -705,7 +766,7 @@ func TestLoadUpstreamsBatch_defaults_NULL_enabled_to_false(t *testing.T) {
 	}
 }
 
-// Round 35 F-1: 存量库的 NULL enabled 上游在初始化迁移后归一化为 0（NULL 视禁用），
+// 存量库的 NULL enabled 上游在初始化迁移后归一化为 0（NULL 视禁用），
 // 不再存在 NULL 行；迁移幂等，重跑无副作用。
 func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 	// Given 模拟迁移前的存量库：先初始化建表，再回退为可空 enabled 并写入 NULL 行
@@ -748,7 +809,7 @@ func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 	}
 }
 
-// Round 36 F-A: 存量库的 NULL enabled 规则在初始化迁移后归一化为 0（NULL 视禁用，
+// 存量库的 NULL enabled 规则在初始化迁移后归一化为 0（NULL 视禁用，
 // 与渲染侧 WHERE enabled=1 口径一致），不再存在 NULL 行；迁移幂等，重跑无副作用。
 func TestMigration_lbRulesEnabledNullNormalizedToDisabled(t *testing.T) {
 	// Given 模拟迁移前的存量库：先初始化建表，再回退为可空 enabled 并写入 NULL 行
@@ -789,7 +850,7 @@ func TestMigration_lbRulesEnabledNullNormalizedToDisabled(t *testing.T) {
 	}
 }
 
-// Round 36 F-A: 列表/详情读取点（lbRuleListColumns + scanLbRules，即 ListRules/GetRule
+// 列表/详情读取点（lbRuleListColumns + scanLbRules，即 ListRules/GetRule
 // 路径）与渲染侧同口径（NULL 视禁用）——此前 COALESCE(enabled,1) 把遗留 NULL 行视为
 // 启用，UI 显示与生成配置分裂。
 func TestListRules_defaults_NULL_enabled_to_false(t *testing.T) {
@@ -859,8 +920,6 @@ func simulateLegacyNullableLbRules(t *testing.T, database *sql.DB) {
 		server_tokens_hidden INTEGER DEFAULT 0,
 		ntlm_compatible INTEGER DEFAULT 0,
 		upstream_force_http1 INTEGER DEFAULT 0,
-		chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
-		chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
 		custom_routes_enabled BOOLEAN NOT NULL DEFAULT 0,
 		proxy_dial_timeout INTEGER NOT NULL DEFAULT 0,
 		proxy_response_header_timeout INTEGER NOT NULL DEFAULT 0,
@@ -869,13 +928,11 @@ func simulateLegacyNullableLbRules(t *testing.T, database *sql.DB) {
 		proxy_stream_timeout INTEGER NOT NULL DEFAULT 0,
 		proxy_flush_interval INTEGER NOT NULL DEFAULT 0,
 		proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
-		origin_domain TEXT NOT NULL DEFAULT '',
+		host_header VARCHAR(255),
 		health_check_host TEXT NOT NULL DEFAULT '',
 		enable_tls BOOLEAN DEFAULT FALSE,
 		tls_cert TEXT,
 		tls_key TEXT,
-		tls_cert_path VARCHAR(512) NOT NULL DEFAULT '',
-		tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
 		tls_http_redirect BOOLEAN DEFAULT FALSE,
 		tls_source VARCHAR(20) DEFAULT 'manual',
 		acme_config_id INTEGER DEFAULT 0,
@@ -937,7 +994,7 @@ func initializeRuleFeatureTestDB(t *testing.T) *sql.DB {
 	return database
 }
 
-// LBH-A-P1（第 69 轮 P3）：预校验渲染输入必须回填本日新特性列——
+// 预校验渲染输入必须回填本日新特性列——
 // toPathRuleConfigs 此前丢 response_mode/response_status/response_body/
 // response_content_type/redirect_to 五列，EnableRule/启动聚合预检把直返/301
 // 路径规则当转发链渲染，与真实渲染（static_response 单 handler 路由）分叉。
@@ -966,15 +1023,15 @@ func TestToPathRuleConfigs_carriesResponseFields(t *testing.T) {
 	}
 }
 
-// LBH-A-P1 同族：预检 SingleRuleConfig 回填 origin_domain（逐上游回源域名，
-// 真实渲染经 map 处理器消费）与 origin_domain/health_check_host/enable_compress
+// 同族：预检 SingleRuleConfig 回填 origin_domain（逐上游回源域名，
+// 真实渲染经 map 处理器消费）与 host_header/health_check_host/enable_compress
 // 族；TLS 材料/开关为有意保留的空口子集（GenerateSingleRuleCaddyConfig 单规则
 // 形态约定，钉零防误回填）。
 func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	// Given
 	rule := models.LbRule{
 		CaddyID: "lb_precheck", Protocol: "http", Domain: "precheck.test", ListenPort: 8080,
-		Strategy: "weighted_round_robin", OriginDomain: "backend.example", HealthCheckHost: "probe.example",
+		Strategy: "weighted_round_robin", HostHeader: "backend.example", HealthCheckHost: "probe.example",
 		EnableCompress: true, CompressTypes: "zstd",
 		Upstreams: []models.Upstream{
 			{Host: "10.0.0.1", Port: 8443, Weight: 1, Enabled: true, Protocol: "https", OriginDomain: "origin.example"},
@@ -985,14 +1042,15 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	}
 
 	// When
-	config := precheckRuleConfig(rule)
+	// 全局请求体上限由调用方传入（聚合校验一次读取）。
+	config := precheckRuleConfig(rule, 128)
 
 	// Then：新特性列全保真
 	if len(config.Upstreams) != 1 || config.Upstreams[0].OriginDomain != "origin.example" {
 		t.Fatalf("upstreams 丢 origin_domain: %+v", config.Upstreams)
 	}
-	if config.OriginDomain != "backend.example" || config.HealthCheckHost != "probe.example" {
-		t.Fatalf("丢 origin_domain/health_check_host: %q/%q", config.OriginDomain, config.HealthCheckHost)
+	if config.HostHeader != "backend.example" || config.HealthCheckHost != "probe.example" {
+		t.Fatalf("丢 host_header/health_check_host: %q/%q", config.HostHeader, config.HealthCheckHost)
 	}
 	if !config.EnableCompress || config.CompressTypes != "zstd" {
 		t.Fatalf("丢压缩配置: %v/%q", config.EnableCompress, config.CompressTypes)
@@ -1001,7 +1059,173 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 		t.Fatalf("丢路径规则直返列: %+v", config.PathRules)
 	}
 	// 有意子集钉零：TLS 材料不随预检渲染（单规则形态约定，勿回填）。
-	if config.EnableTLS || config.TLSCert != "" || config.TLSKey != "" {
-		t.Fatalf("预检输入不应携带 TLS 形态: enable_tls=%v", config.EnableTLS)
+	// 该不变量现由类型强制：SingleRuleConfig 不持有 TLS 字段，任何回填都会
+	// 先在编译期失败；此处再用反射钉住字段名，防止有人「以别名字段」绕回
+	// 私钥载荷路径（单规则渲染不得再出现 apps.tls / tls_connection_policies）。
+	configType := reflect.TypeOf(config)
+	for i := range configType.NumField() {
+		switch field := configType.Field(i).Name; field {
+		case "EnableTLS", "TLSSource", "TLSCert", "TLSKey":
+			t.Fatalf("SingleRuleConfig 重新引入了 TLS 字段 %s：单规则渲染不得承载证书/私钥", field)
+		}
 	}
+}
+
+// 聚合校验一次读取全局 request_body_max_size_mb，不随规则数线性加点查。
+func TestValidateEnabledStoredRuleConfigs_readsGlobalBodyLimitOnce(t *testing.T) {
+	newBackupTestHandlers(t)
+	for i := range 3 {
+		id := fmt.Sprintf("lb_a87_body_%d", i)
+		domain := fmt.Sprintf("body%d.example.test", i)
+		if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,
+			health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enabled,enable_tls)
+			VALUES (?,?,'http',?,8080,'weighted_round_robin','/',10,2,3,2,1,0)`, id, id, domain); err != nil {
+			t.Fatalf("seed rule: %v", err)
+		}
+		if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES (?,'127.0.0.1',9000,1,1,'http')`, id); err != nil {
+			t.Fatalf("seed upstream: %v", err)
+		}
+	}
+	probe := &prepareProbe{}
+	wrapHandlerDBWithProbe(t, probe)
+
+	if err := validateEnabledStoredRuleConfigs(context.Background()); err != nil {
+		t.Fatalf("aggregate validation: %v", err)
+	}
+	if count := probe.count("SELECT request_body_max_size_mb FROM global_config"); count != 1 {
+		t.Fatalf("全局请求体上限读取 %d 次, want 1（N 条规则不得 N 次点查）", count)
+	}
+}
+
+// 关系批量查询按 500 分块——IN (...) 占位符不再随规则数无限增长。
+func TestRuleRelationBatchQueriesChunkLargeRuleSets(t *testing.T) {
+	newBackupTestHandlers(t)
+	ids := make([]string, 1200)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("lb_a87_chunk_%d", i)
+	}
+	probe := &prepareProbe{}
+	wrapHandlerDBWithProbe(t, probe)
+
+	if _, err := loadUpstreamsBatch(context.Background(), ids); err != nil {
+		t.Fatalf("load upstreams: %v", err)
+	}
+	if count := probe.count("FROM upstreams u WHERE rule_id IN"); count != 3 {
+		t.Errorf("上游批量查询 %d 次, want 3（1200/500 向上取整）", count)
+	}
+	if _, err := loadPathRulesBatch(context.Background(), ids); err != nil {
+		t.Fatalf("load path rules: %v", err)
+	}
+	if count := probe.count("FROM path_rules WHERE rule_id IN"); count != 3 {
+		t.Errorf("路径规则批量查询 %d 次, want 3（1200/500 向上取整）", count)
+	}
+}
+
+// 主动健康检查未启用时其专属字段（path/host/port）渲染零消费——
+// 保存侧归一清零并返回被清字段名（审计披露）；启用时零触碰。
+func TestNormalizeInactiveHealthCheckFields(t *testing.T) {
+	path, host, port := "/health", "probe.example.test", 8081
+	cleared := normalizeInactiveHealthCheckFields(false, &path, &host, &port)
+	if path != "" || host != "" || port != 0 {
+		t.Fatalf("active=false 必须清零三字段: path=%q host=%q port=%d", path, host, port)
+	}
+	if len(cleared) != 3 {
+		t.Fatalf("披露字段=%v, want 3 项", cleared)
+	}
+	if hint := inactiveHealthCheckAuditHint(cleared); !strings.Contains(hint, "health_check_path") || !strings.Contains(hint, "tcp_health_check_port") {
+		t.Fatalf("审计披露缺字段名: %q", hint)
+	}
+
+	// active=true：零触碰。
+	path2, host2, port2 := "/health", "probe.example.test", 8081
+	if got := normalizeInactiveHealthCheckFields(true, &path2, &host2, &port2); len(got) != 0 {
+		t.Fatalf("active=true 不得归一: %v", got)
+	}
+	if path2 != "/health" || host2 != "probe.example.test" || port2 != 8081 {
+		t.Fatalf("active=true 不得改值: %q %q %d", path2, host2, port2)
+	}
+	if inactiveHealthCheckAuditHint(nil) != "" {
+		t.Fatal("无清零时披露必须为空")
+	}
+}
+
+// 认证网关身份头规范名归一（写侧单源 normalizeForwardAuthValues）：非规范名
+// （remote-user/REMOTE-USER）落库前收敛为 http.CanonicalHeaderKey 规范形——
+// Caddy 响应头占位符注册键恒为规范形（Go http.Header），非规范名经引擎后
+// 静默失注入（认证照常放行、后端收不到身份头、无任何报错）。归一只动大小写
+// 与项首尾空白（分隔空格形态同收敛）；项内空白/冒号/CRLF 原样保留仍由既有门
+// 拒绝；重复检测随规范化后进行（remote-user 与 Remote-User 判重复）。
+func TestCreateRule_canonicalizesForwardAuthCopyHeaders(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+	create := func(name, domain string, port int, headers string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{
+			"name":%q,"protocol":"http","domain":%q,"listen_port":%d,
+			"forward_auth_enabled":1,"forward_auth_upstream":"http://gw.internal:7000",
+			"forward_auth_uri":"/api/authz","forward_auth_copy_headers":%q,
+			"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
+			"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
+		}`, name, domain, port, headers)
+		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	t.Run("非规范名保存后读回规范形", func(t *testing.T) {
+		response := create("fa-canonical", "fa-canonical.example.test", 13011, "remote-user,REMOTE-GROUPS,remote-email")
+		if response.Code != http.StatusCreated && response.Code != http.StatusOK {
+			t.Fatalf("create status=%d body=%s, want 2xx（小写形态本就该放行保存）", response.Code, response.Body.String())
+		}
+		var stored string
+		if err := db.DB.QueryRow(`SELECT forward_auth_copy_headers FROM lb_rules WHERE listen_port=13011`).Scan(&stored); err != nil {
+			t.Fatalf("read created rule: %v", err)
+		}
+		if stored != "Remote-User,Remote-Groups,Remote-Email" {
+			t.Fatalf("落库身份头=%q, want 规范形（非规范名经引擎会静默失注入）", stored)
+		}
+	})
+
+	t.Run("规范化后重复判 400", func(t *testing.T) {
+		response := create("fa-dup", "fa-dup.example.test", 13012, "remote-user,Remote-User")
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "重复") {
+			t.Fatalf("mixed-case duplicate status=%d body=%s, want 400 重复（同一头的两种写法）", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("非法字符仍拒绝（归一不洗白）", func(t *testing.T) {
+		response := create("fa-bad", "fa-bad.example.test", 13013, "remote-user,Remote User")
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "非法字符") {
+			t.Fatalf("malformed header status=%d body=%s, want 400 非法字符（CanonicalHeaderKey 对非法 token 原样返回，门不得放过）", response.Code, response.Body.String())
+		}
+	})
+
+	// 空格分隔形态（「remote-user, remote-email」用户常见输入）：归一必须先
+	// 逐项 TrimSpace 再 canonical 化——前导空格是非法 token 字节，不剥离则
+	// CanonicalHeaderKey 原样返回，落库值带空白/非规范名，渲染拼出的占位符
+	// 键恒 miss（认证照常放行、身份头静默失注入、无报错）。
+	t.Run("带空格形态保存后读回规范形", func(t *testing.T) {
+		response := create("fa-space", "fa-space.example.test", 13014, " remote-user , remote-email ")
+		if response.Code != http.StatusCreated && response.Code != http.StatusOK {
+			t.Fatalf("create status=%d body=%s, want 2xx（分隔空格形态本就该放行保存）", response.Code, response.Body.String())
+		}
+		var stored string
+		if err := db.DB.QueryRow(`SELECT forward_auth_copy_headers FROM lb_rules WHERE listen_port=13014`).Scan(&stored); err != nil {
+			t.Fatalf("read created rule: %v", err)
+		}
+		if stored != "Remote-User,Remote-Email" {
+			t.Fatalf("落库身份头=%q, want 规范形（分隔空格与首尾空白须剥离后 canonical 化）", stored)
+		}
+	})
+
+	t.Run("空格分隔混合大小写重复判 400", func(t *testing.T) {
+		response := create("fa-space-dup", "fa-space-dup.example.test", 13015, "remote-user, Remote-User")
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "重复") {
+			t.Fatalf("space-separated duplicate status=%d body=%s, want 400 重复（同一头的两种写法经规范化后判重）", response.Code, response.Body.String())
+		}
+	})
 }

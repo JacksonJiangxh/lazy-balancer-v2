@@ -1,8 +1,8 @@
 package handlers
 
-// 第 66 轮审计修复——L6-66-01（users 空表拒绝）、L6-66-03（预览单侧缺失
-// 建模）、L6-66-04（CRS 日志时序）、F-B1（未登记威胁条目告警）、L6-66-02
-// handlers 侧探针（applyLbbakWafFiles 文件相位入 wafFileMu）。
+// 覆盖：lbbak 导入/导出的文件相位与 WAF/Caddy 锁序（生产链用例），旁路契约
+// 包括 users 空表拒绝、预览单侧 WAF 文件缺失建模、CRS 日志时序、manifest
+// 未登记威胁条目告警。
 
 import (
 	"archive/tar"
@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,7 +29,7 @@ import (
 )
 
 // buildLbbakWithExtraThreatEntry 手工组包：manifest 只登记 config.json，
-// tar 内额外携带 manifest 未登记的 threat/ustc.iplist 条目（F-B1 形态——
+// tar 内额外携带 manifest 未登记的 threat/ustc.iplist 条目（形态——
 // 旧备份/损坏包可能产出，导入不拒绝但必须告警）。
 func buildLbbakWithExtraThreatEntry(t *testing.T, backupJSON string, threatData []byte) []byte {
 	t.Helper()
@@ -92,44 +93,12 @@ func decodeValidateResponse(t *testing.T, rec *httptest.ResponseRecorder) import
 	return envelope.Data
 }
 
-// ── L6-66-02 handlers 侧：applyLbbakWafFiles 文件相位必须受 wafFileMu 互斥 ──
+// 锁序不变量由生产链用例 TestLbbakImport_acquiresWafLockBeforeCaddyOpLock 承担
+// （预持 CaddyOpLock + WafFileLock().TryLock() 探针 + 真实导出包导入）；此前这里
+// 另定义了一个测试专属包装（自行加锁后调 InLock 变体）来「证明」阻塞，只能
+// 证明测试包装加了锁，属自证，已删除。
 
-// Given wafFileMu 被预持（模拟并发的三库更新器文件相位）。
-// When applyLbbakWafFiles 执行威胁库 .iplist 落盘+编译文件相位。
-// Then 必须阻塞至锁释放。
-func TestApplyLbbakWafFiles_blocks_while_waf_file_lock_held(t *testing.T) {
-	_ = newBackupTestHandlers(t) // 初始化 db.AuditDB（recordAudit 落审计）与 caddy stub
-	dir := t.TempDir()
-	restore := services.OverrideThreatWafDirForTest(dir)
-	defer restore()
-	taskengine.SetLogDir(t.TempDir())
-	t.Cleanup(func() { taskengine.SetLogDir("") })
-
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/config/import", nil)
-
-	payload := &lbbakPayload{ThreatIplists: map[string][]byte{"ustc": []byte("1.2.3.4\n")}}
-	services.WafFileLock().Lock()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, _, _ = applyLbbakWafFiles(c, "导入", payload, "test-tag")
-	}()
-	select {
-	case <-done:
-		services.WafFileLock().Unlock()
-		t.Fatal("applyLbbakWafFiles 在 wafFileMu 被预持期间完成——lbbak 文件相位未入锁")
-	case <-time.After(300 * time.Millisecond):
-	}
-	services.WafFileLock().Unlock()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("锁释放后 applyLbbakWafFiles 10s 内未完成")
-	}
-}
-
-// ── L6-67-01（第 67 轮）：lbbak 导出侧 BuildWafFileBundle 读相位必须受 wafFileMu 互斥 ──
+// lbbak 导出侧 BuildWafFileBundle 读相位必须受 wafFileMu 互斥
 
 // Given wafFileMu 被预持（模拟并发的三库更新器/lbbak 导入文件写相位）。
 // When buildLbbakExport 勾选「安全防护」分类（触发 BuildWafFileBundle 读 CRS
@@ -138,6 +107,11 @@ func TestApplyLbbakWafFiles_blocks_while_waf_file_lock_held(t *testing.T) {
 // bundle（manifest sha256 按内存字节自洽仍通过，还原后 WAF 静默降级）。
 // 回归形状：锁释放后导出完成且载荷完整（无锁竞争时导出正常产出）。
 func TestBuildLbbakExport_blocks_while_waf_file_lock_held(t *testing.T) {
+	withIsolatedGlobal(t)
+	snapshotStarted := make(chan struct{}, 1)
+	oldSnapshotHook := configBackupExportAfterDBSnapshot
+	configBackupExportAfterDBSnapshot = func() { snapshotStarted <- struct{}{} }
+	t.Cleanup(func() { configBackupExportAfterDBSnapshot = oldSnapshotHook })
 	h := newBackupTestHandlers(t)
 	crsDir, _ := overrideTestWafPaths(t)
 	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
@@ -165,6 +139,11 @@ func TestBuildLbbakExport_blocks_while_waf_file_lock_held(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 	services.WafFileLock().Unlock()
+	select {
+	case <-snapshotStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("锁释放后导出未进入 DB 快照完成点——正向屏障失效")
+	}
 	var res exportResult
 	select {
 	case res = <-done:
@@ -180,14 +159,172 @@ func TestBuildLbbakExport_blocks_while_waf_file_lock_held(t *testing.T) {
 	}
 }
 
-// ── L6-66-04：CRS 分阶段流水「reloading/success」必须落在 commit 成功之后 ──
+func TestBuildLbbakExport_holdsWafLockAcrossDBSnapshot(t *testing.T) {
+	withIsolatedGlobal(t)
+	h := newBackupTestHandlers(t)
+	crsDir, _ := overrideTestWafPaths(t)
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldHook := configBackupExportAfterDBSnapshot
+	configBackupExportAfterDBSnapshot = func() {
+		locker, ok := services.WafFileLock().(interface {
+			TryLock() bool
+			Unlock()
+		})
+		if !ok {
+			t.Error("WAF lock does not expose TryLock")
+			return
+		}
+		if locker.TryLock() {
+			locker.Unlock()
+			t.Error("DB snapshot completed without holding WAF file lock")
+		}
+	}
+	t.Cleanup(func() { configBackupExportAfterDBSnapshot = oldHook })
+
+	payload, _, _, includesWafFiles, err := h.buildLbbakExport(context.Background(), []string{"security"})
+
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !includesWafFiles || len(payload) == 0 {
+		t.Fatalf("export missing WAF files: includes=%v len=%d", includesWafFiles, len(payload))
+	}
+}
+
+func TestLbbakImport_waitsForWafLockBeforeDBTransaction(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	crsDir, _ := overrideTestWafPaths(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (6,'local-admin-lockorder','hash','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exportRec := httptest.NewRecorder()
+	g.ServeHTTP(exportRec, httptest.NewRequest(http.MethodGet, "/config/export?sections=rules,waf_files", nil))
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	payload := exportRec.Body.Bytes()
+
+	prelockReached := make(chan struct{})
+	oldPrelockHook := configImportBeforePrelockHook
+	configImportBeforePrelockHook = func() { close(prelockReached) }
+	t.Cleanup(func() { configImportBeforePrelockHook = oldPrelockHook })
+	services.WafFileLock().Lock()
+	importDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/config/import?sections=rules,waf_files", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		g.ServeHTTP(rec, req)
+		importDone <- rec.Code
+	}()
+	// 已确证导入到达 WAF prelock、尚未开启 DB 事务；DB 探针不再依赖 300ms
+	// 猜测 goroutine 已阻塞。
+	select {
+	case <-prelockReached:
+	case <-time.After(5 * time.Second):
+		services.WafFileLock().Unlock()
+		t.Fatal("import did not reach WAF prelock")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, dbErr := db.DB.ExecContext(ctx, `UPDATE global_config SET log_level=log_level WHERE id=1`)
+	cancel()
+	services.WafFileLock().Unlock()
+
+	var importCode int
+	select {
+	case importCode = <-importDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("import did not finish after releasing WAF lock")
+	}
+	if dbErr != nil {
+		t.Fatalf("DB writer blocked while import waited for WAF lock (DB tx -> wafFileMu order): %v", dbErr)
+	}
+	if importCode != http.StatusOK {
+		t.Fatalf("import status=%d, want 200", importCode)
+	}
+}
+
+// 导入必须先暂停/排空任务再取 WAF 文件锁；若先取锁，
+// 等待该锁的更新任务无法被取消，排空必然超时并可能在提交后旧写覆盖。
+func TestLbbakImport_pausesSchedulingBeforeWafLock(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	te := services.TaskEngine()
+	if err := te.Register(taskengine.Descriptor{
+		ID: "waf-lock-order-probe", Family: "test", Name: "WAF lock order probe",
+		Kind: taskengine.KindOneshot,
+		Run:  func(taskengine.RunContext) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g := newBackupSectionRouter(h)
+	overrideTestWafPaths(t)
+	body := buildTestLbbak(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("x"))
+	services.WafFileLock().Lock()
+	unlocked := false
+	unlockWaf := func() {
+		if !unlocked {
+			services.WafFileLock().Unlock()
+			unlocked = true
+		}
+	}
+	defer unlockWaf()
+
+	done := make(chan int, 1)
+	go func() { done <- postLbbakImport(g, t, body, "").Code }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		err := te.Trigger("waf-lock-order-probe", "manual", "test")
+		if errors.Is(err, taskengine.ErrSchedulingPaused) {
+			paused = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !paused {
+		unlockWaf()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("导入在等待 WAF 锁前未暂停调度（锁序仍为 WAF→排空）")
+	}
+	unlockWaf()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("import status=%d, want 200", code)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("releasing WAF lock did not let import finish")
+	}
+}
+
+// CRS 分阶段流水「reloading/success」必须落在 commit 成功之后
 
 // Given lbbak 备份（含 CRS 文件）导入，Caddy stub 拒绝一切请求使 session.commit
 // 失败（POST /load 被拒→Caddy 拒绝→400 回滚）。
 // When 导入执行完毕。
-// Then 任务日志 tasks/crs.log 只允许有「installing」（文件确实落盘），不得有
-// 「reloading」/「success」行（commit 已失败，重载与更新从未发生）。
-func TestLbbakImport_commit_failure_does_not_log_crs_success(t *testing.T) {
+// Then 普通 HTTP 导入不是 CRS 更新任务，不得写 tasks/crs.log。
+func TestLbbakImport_commit_failure_does_not_write_crs_task_log(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
 	crsDir, _ := overrideTestWafPaths(t)
@@ -236,21 +373,23 @@ func TestLbbakImport_commit_failure_does_not_log_crs_success(t *testing.T) {
 	}
 
 	logBytes, err := os.ReadFile(taskengine.TaskLogPath("crs"))
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read tasks/crs.log: %v", err)
 	}
-	log := string(logBytes)
-	if !strings.Contains(log, "installing") {
-		t.Fatalf("文件相位 installing 行应在（文件已落盘）: %s", log)
+	if len(logBytes) > 0 {
+		t.Fatalf("普通 HTTP 导入不得写 CRS 任务日志: %s", logBytes)
 	}
-	if strings.Contains(log, "reloading") || strings.Contains(log, "CRS 已随备份导入更新") {
-		t.Fatalf("commit 失败后任务日志不得出现 reloading/success 行: %s", log)
+	var securityDataAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE resource='安全数据' AND detail LIKE '%规则库数据库%'`).Scan(&securityDataAudits); err != nil {
+		t.Fatal(err)
+	}
+	if securityDataAudits != 0 {
+		t.Fatalf("回滚导入留下安全数据成功审计 %d 条, want 0", securityDataAudits)
 	}
 }
 
-// 回归形状：commit 成功时「reloading/success」流水仍必须出现在任务日志
-// （移位不得变成丢失——成功导入的完整流水与自动更新器同款）。
-func TestLbbakImport_commit_success_logs_crs_reload_and_success(t *testing.T) {
+// 回归形状：commit 成功仍写安全数据审计，但普通 HTTP 导入不得写 CRS 任务日志。
+func TestLbbakImport_commit_success_uses_audit_not_crs_task_log(t *testing.T) {
 	h := newBackupTestHandlers(t) // 默认 caddy stub 接受 /load → commit 成功
 	g := newBackupSectionRouter(h)
 	crsDir, _ := overrideTestWafPaths(t)
@@ -279,16 +418,22 @@ func TestLbbakImport_commit_success_logs_crs_reload_and_success(t *testing.T) {
 		t.Fatalf("import status=%d body=%s, want 200", importRec.Code, importRec.Body.String())
 	}
 	logBytes, err := os.ReadFile(taskengine.TaskLogPath("crs"))
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read tasks/crs.log: %v", err)
 	}
-	log := string(logBytes)
-	if !strings.Contains(log, "installing") || !strings.Contains(log, "reloading") || !strings.Contains(log, "CRS 已随备份导入更新") {
-		t.Fatalf("成功导入的 CRS 流水应含 installing/reloading/success 三行: %s", log)
+	if len(logBytes) > 0 {
+		t.Fatalf("普通 HTTP 导入不得写 CRS 任务日志: %s", logBytes)
+	}
+	var auditCount int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE resource='安全数据' AND detail LIKE '%规则库数据库%'`).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("安全数据审计行=%d, want 1（移除任务日志不得影响审计）", auditCount)
 	}
 }
 
-// ── F-B1：manifest 未登记的 threat/*.iplist 条目必须告警（不拒绝） ──
+// manifest 未登记的 threat/*.iplist 条目必须告警（不拒绝）
 
 // Given lbbak 包内含 manifest 未登记的 threat/ustc.iplist 条目。
 // When 导入执行。
@@ -303,7 +448,7 @@ func TestLbbakImport_unregistered_threat_entry_warns(t *testing.T) {
 	taskengine.SetLogDir(t.TempDir())
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, nil), []byte("1.2.3.4\n5.6.7.8\n"))
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("1.2.3.4\n5.6.7.8\n"))
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("未登记威胁条目不应拒绝导入（老备份兼容）, got %d body=%s", rec.Code, rec.Body.String())
@@ -313,17 +458,136 @@ func TestLbbakImport_unregistered_threat_entry_warns(t *testing.T) {
 	}
 }
 
+// 未选择安全防护分类时条目并未落盘，警告不得宣称「已按原样落盘」。
+func TestLbbakImport_unregisteredThreatSkippedBySectionsWarnsNotImported(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	overrideTestWafPaths(t)
+	dir := t.TempDir()
+	restore := services.OverrideThreatWafDirForTest(dir)
+	defer restore()
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (6,'local-admin-unregistered','hash','admin',1)`); err != nil {
+		t.Fatalf("seed local admin: %v", err)
+	}
+
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("1.2.3.4\n"))
+	rec := postLbbakImport(g, t, body, "?sections=rules")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "未登记") || !strings.Contains(rec.Body.String(), "未导入") {
+		t.Fatalf("响应应明确条目未导入: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "已按原样落盘") {
+		t.Fatalf("未选安全防护分类仍宣称已落盘: %s", rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "threat-ustc.iplist")); !os.IsNotExist(err) {
+		t.Fatalf("skipped threat file exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+// 预览端点对未登记威胁条目给出同一告警（预览/导入口径一致）。
+
 // Given 同形态 lbbak 包投递预览端点。
 // When 预览执行。
 // Then 预览 warnings 同样携带未登记告警（预览/导入口径一致）。
 func TestLbbakValidate_unregistered_threat_entry_warns(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, nil), []byte("1.2.3.4\n"))
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("1.2.3.4\n"))
 	rec := postLbbakValidate(t, h, body, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("validate status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "未登记") {
 		t.Fatalf("预览应携带 manifest 未登记条目告警: %s", rec.Body.String())
+	}
+}
+
+// 导入路径的持锁序以实际实现为准：排空 → wafFileMu → CaddyOpLock。
+// Given CaddyOpLock（=caddyOpMu 共享实例）被预持。
+// When 含 WAF 文件相位的 lbbak 导入启动。
+// Then 导入必须先取得 wafFileMu 才阻塞在 CaddyOpLock 上——这是可观测的锁序
+// 判据（若实现先取 CaddyOpLock，此刻 wafFileMu 仍空闲）。反向嵌套
+// （持 CaddyOpLock 再取 wafFileMu）即 AB-BA。
+func TestLbbakImport_acquiresWafLockBeforeCaddyOpLock(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	crsDir, _ := overrideTestWafPaths(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (6,'local-admin-lockorder-b','hash','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exportRec := httptest.NewRecorder()
+	g.ServeHTTP(exportRec, httptest.NewRequest(http.MethodGet, "/config/export?sections=rules,waf_files", nil))
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	payload := exportRec.Body.Bytes()
+
+	services.CaddyOpLock.Lock()
+	released := false
+	unlockCaddy := func() {
+		if !released {
+			services.CaddyOpLock.Unlock()
+			released = true
+		}
+	}
+	defer unlockCaddy()
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/config/import?sections=rules,waf_files", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		g.ServeHTTP(rec, req)
+		done <- rec.Code
+	}()
+
+	locker, ok := services.WafFileLock().(interface {
+		TryLock() bool
+		Unlock()
+	})
+	if !ok {
+		unlockCaddy()
+		<-done
+		t.Fatal("WAF lock does not expose TryLock")
+	}
+	wafHeld := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !locker.TryLock() {
+			wafHeld = true
+			break
+		}
+		locker.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !wafHeld {
+		unlockCaddy()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+		}
+		t.Fatal("CaddyOpLock 被预持期间导入未持有 wafFileMu——持锁序反了（CaddyOpLock→wafFileMu 即 AB-BA）")
+	}
+
+	unlockCaddy()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("import status=%d, want 200（锁序正确时导入应正常完成）", code)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("释放 CaddyOpLock 后导入 20s 内未完成")
 	}
 }

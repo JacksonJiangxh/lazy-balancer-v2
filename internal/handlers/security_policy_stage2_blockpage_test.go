@@ -58,3 +58,66 @@ func TestStage2Policy_blockPageIDRoundTrip(t *testing.T) {
 		t.Fatalf("更新后 block_page_id=%d, want 9002", pageID)
 	}
 }
+
+// 写侧拦截状态码归一对齐：状态码只在「非 stage2 ∧ 已绑定自定义拦截页」时被
+// 渲染消费（stage2 限流恒 429；无页策略的 deny 恒 403）。Create 已归一，
+// 但 Update 的部分更新（只提交 block_status_code）曾原样落库——同一条 DB 形态
+// 只能经 PUT 产生，详情/列表于是宣称一个不生效的状态码。
+func TestUpdateSecurityPolicy_blockStatusCodeNormalization(t *testing.T) {
+	t.Run("非 stage2 无拦截页时归零", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityRouter(t)
+		id := createTestPolicy(t, router, map[string]any{"name": "acl-no-page", "policy_type": "stage1"})
+
+		rec := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"block_status_code": 404})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+
+		var pageID, status int
+		if err := db.DB.QueryRow(`SELECT COALESCE(block_page_id,0), COALESCE(block_status_code,0) FROM security_policies WHERE id=?`, id).Scan(&pageID, &status); err != nil {
+			t.Fatal(err)
+		}
+		if pageID != 0 || status != 0 {
+			t.Fatalf("(block_page_id, block_status_code)=(%d,%d), want (0,0)（无页即无码，与 Create 同口径）", pageID, status)
+		}
+	})
+
+	t.Run("有拦截页时保留状态码", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityRouter(t)
+		id := createTestPolicy(t, router, map[string]any{"name": "acl-with-page", "policy_type": "stage1"})
+
+		rec := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"block_page_id": 9001, "block_status_code": 404})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+
+		var pageID, status int
+		if err := db.DB.QueryRow(`SELECT COALESCE(block_page_id,0), COALESCE(block_status_code,0) FROM security_policies WHERE id=?`, id).Scan(&pageID, &status); err != nil {
+			t.Fatal(err)
+		}
+		if pageID != 9001 || status != 404 {
+			t.Fatalf("(block_page_id, block_status_code)=(%d,%d), want (9001,404)", pageID, status)
+		}
+	})
+
+	t.Run("stage2 限流恒 429（状态码归零）", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityRouter(t)
+		id := createTestPolicy(t, router, map[string]any{"name": "rl-page", "policy_type": "stage2", "rate_limit_enabled": true, "rate_limit_rps": 100, "rate_limit_burst": 50, "block_page_id": 9001})
+
+		rec := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"block_status_code": 404})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+
+		var status int
+		if err := db.DB.QueryRow(`SELECT COALESCE(block_status_code,0) FROM security_policies WHERE id=?`, id).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != 0 {
+			t.Fatalf("stage2 block_status_code=%d, want 0（限流拦截恒 429）", status)
+		}
+	})
+}

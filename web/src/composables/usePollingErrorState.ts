@@ -5,7 +5,7 @@ const INITIAL_CONTRACT_BACKOFF_MS = 30_000
 const MAX_CONTRACT_BACKOFF_MS = 300_000
 const VISIBLE_ERROR_UPDATE_INTERVAL_MS = 30_000
 
-export interface PollingErrorState {
+interface PollingErrorState {
   readonly errorMessage: Readonly<Ref<string | null>>
   readonly lastErrorAt: Readonly<Ref<string>>
   readonly retryAt: Readonly<Ref<string>>

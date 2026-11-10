@@ -3,15 +3,25 @@ package dnsproviders
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
-	"strings"
-	"time"
 
 	"lazy-balancer-v2/internal/dnsprovider"
 )
 
 var newDNSProviderFromCredentials = dnsprovider.NewProviderFromCredentials
+
+// warnLog 是本包的告警输出接缝：包边界不允许导入 services 的分级
+// Logf，默认写标准库 log 并保留原有 "warn: " 前缀形态；services 侧在 init
+// 注入 Logf("warn", ...)，使告警与全局日志级别过滤/JSON 输出同形态（此前
+// 直接 log.Printf 的残留在 warn 以上级别过滤或 JSON 输出场景会丢失/形态分叉）。
+var warnLog = func(format string, args ...any) { log.Printf("warn: "+format, args...) }
+
+// SetWarnLogger 注入分级告警输出（生产由 services 包 init 调用；nil 忽略）。
+func SetWarnLogger(fn func(format string, args ...any)) {
+	if fn != nil {
+		warnLog = fn
+	}
+}
 
 func init() { Register(&DNSPod{}) }
 
@@ -24,12 +34,20 @@ func (d *DNSPod) Name() string       { return "DNSPod (腾讯云)" }
 func (d *DNSPod) ModuleName() string { return "dns.providers.dnspod" }
 
 func (d *DNSPod) CredentialFields() []CredentialField {
+	// visible_when/option_labels：字段可见性与选项文案
+	// 由后端元数据下发，前端不再硬编码两种认证模式的字段名。
+	visibleOnly := func(mode string) map[string][]string {
+		return map[string][]string{"auth_mode": {mode}}
+	}
 	return []CredentialField{
-		{Name: "auth_mode", Label: "认证方式", Type: "select", Required: true, Placeholder: "dnspod"},
-		{Name: "app_id", Label: "App ID", Type: "text", Required: false, Placeholder: "DNSPod 账号的 App ID（旧版）"},
-		{Name: "app_token", Label: "App Token", Type: "password", Required: false, Placeholder: "DNSPod 账号的 API Token（旧版）"},
-		{Name: "secret_id", Label: "SecretId", Type: "text", Required: false, Placeholder: "腾讯云 API SecretId（新版）"},
-		{Name: "secret_key", Label: "SecretKey", Type: "password", Required: false, Placeholder: "腾讯云 API SecretKey（新版）"},
+		{
+			Name: "auth_mode", Label: "认证方式", Type: "select", Required: true, Placeholder: "dnspod",
+			OptionLabels: map[string]string{"dnspod": "DNSPod API", "tencent_cloud": "腾讯云 API"},
+		},
+		{Name: "app_id", Label: "App ID", Type: "text", Required: false, Placeholder: "DNSPod 账号的 App ID（旧版）", VisibleWhen: visibleOnly("dnspod")},
+		{Name: "app_token", Label: "App Token", Type: "password", Required: false, Placeholder: "DNSPod 账号的 API Token（旧版）", VisibleWhen: visibleOnly("dnspod")},
+		{Name: "secret_id", Label: "SecretId", Type: "text", Required: false, Placeholder: "腾讯云 API SecretId（新版）", VisibleWhen: visibleOnly("tencent_cloud")},
+		{Name: "secret_key", Label: "SecretKey", Type: "password", Required: false, Placeholder: "腾讯云 API SecretKey（新版）", VisibleWhen: visibleOnly("tencent_cloud")},
 	}
 }
 
@@ -40,44 +58,40 @@ func (d *DNSPod) CredentialFieldOptions(field string) []string {
 	return nil
 }
 
-// buildCredentials 校验并产出规范凭据 map（LBS-B-R3，第 69 轮：内核直返
+// buildCredentials 校验并产出规范凭据 map（内核直返
 // map——曾先 Marshal 成 JSON 串、BuildCredentialsJSON 再 Unmarshal 回 map
-// 的序列化往返，仅为类型转换且 Unmarshal 不可能失败）。
+// 的序列化往返，仅为类型转换）。
+//
+// 推断/归一逻辑不在本函数：`dnsprovider.CanonicalCredentials` 是「原始凭证 →
+// 规范凭据」的唯一实现，保存前验证（本函数）与签发链 provider 构造共用它。
+// 两侧曾各写一份推断，导致同一份库内 JSON 在「测试」与「签发」上结论相反。
+// 同时接受 UI 形态（auth_mode + 表单字段，存储形态）与 canonical 形态
+// （mode + api_token / mode + secret 对，本函数产物）——产出可回喂。
 func (d *DNSPod) buildCredentials(creds map[string]string) (map[string]string, error) {
-	mode := creds["auth_mode"]
-	if mode == "" {
-		if creds["secret_id"] != "" && creds["secret_key"] != "" {
-			mode = "tencent_cloud"
-		} else if creds["app_id"] != "" && creds["app_token"] != "" {
-			mode = "dnspod"
-		}
+	canonical, err := (dnsprovider.CredentialEnvelope{
+		Mode:            creds["mode"],
+		AuthMode:        creds["auth_mode"],
+		APIToken:        creds["api_token"],
+		AppID:           creds["app_id"],
+		AppToken:        creds["app_token"],
+		SecretID:        creds["secret_id"],
+		SecretKey:       creds["secret_key"],
+		AccessKeyID:     creds["access_key_id"],
+		AccessKeySecret: creds["access_key_secret"],
+	}).Canonical()
+	if err != nil {
+		return nil, err
 	}
-
-	switch mode {
-	case "tencent_cloud":
-		if creds["secret_id"] == "" || creds["secret_key"] == "" {
-			return nil, fmt.Errorf("腾讯云认证方式需要提供 SecretId 和 SecretKey")
-		}
-		// CERT40-3:canonical 不再携带 api_token 拼接值——tencent 模式消费端
-		// (factory.go)只读 secret_id/secret_key,拼接串是零消费死字段。
-		return map[string]string{
-			"mode":       "tencent",
-			"secret_id":  creds["secret_id"],
-			"secret_key": creds["secret_key"],
-		}, nil
-	case "dnspod":
-		if creds["app_id"] == "" || creds["app_token"] == "" {
-			return nil, fmt.Errorf("DNSPod 认证方式需要提供 App ID 和 App Token")
-		}
-		// AD-2（第 70 轮）：app_id+app_token→api_token 拼接为双实现——本处
-		// （UI 面 canonical 产出）与 internal/dnsprovider/factory.go 的 legacy
-		// 归一化（协议面消费）互为镜像；任一侧改字段名/拼接格式须双侧同步。
-		return map[string]string{
-			"mode":      "dnspod",
-			"api_token": creds["app_id"] + "," + creds["app_token"],
-		}, nil
+	if canonical.Mode == "dnspod" {
+		return map[string]string{"mode": "dnspod", "api_token": canonical.APIToken}, nil
 	}
-	return nil, fmt.Errorf("请选择认证方式")
+	// canonical 的 tencent 形态不再携带 api_token 拼接值——tencent 模式消费端
+	// 只读 secret_id/secret_key，拼接串是零消费死字段。
+	return map[string]string{
+		"mode":       canonical.Mode,
+		"secret_id":  canonical.SecretID,
+		"secret_key": canonical.SecretKey,
+	}, nil
 }
 
 func (d *DNSPod) BuildCredentialsJSON(creds map[string]string) (map[string]interface{}, error) {
@@ -92,7 +106,10 @@ func (d *DNSPod) BuildCredentialsJSON(creds map[string]string) (map[string]inter
 	return result, nil
 }
 
-func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
+// dnsProviderValidateTimeout / retryEnvelopeFactor 与共享探针（validate_probe.go）
+// 同源——本文件仅保留 Validate 的 provider 构造，探针预算常量定义在探针侧。
+
+func (d *DNSPod) Validate(ctx context.Context, creds map[string]string, testDomain string) error {
 	m, err := d.buildCredentials(creds)
 	if err != nil {
 		return err
@@ -103,25 +120,5 @@ func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	domain := strings.TrimSpace(testDomain)
-	if domain == "" {
-		return fmt.Errorf("测试域名不能为空")
-	}
-	if !strings.HasSuffix(domain, ".") {
-		domain += "."
-	}
-	challengeName := "_acme-challenge.lb-test." + domain
-	if err := provider.Present(ctx, domain, challengeName, "lazy-balancer-test", 600); err != nil {
-		return fmt.Errorf("DNS 写入测试失败: %w", err)
-	}
-	if err := provider.CleanUp(ctx, domain, challengeName); err != nil {
-		// CERT42-6（第 42 轮审计）：清理失败时测试 TXT 记录可能已残留——记告警
-		// 并在错误文案点名手动清理路径；返回错误语义不变（验证仍判失败）。
-		log.Printf("warn: dnspod 验证清理失败，测试记录 %s 可能残留，请手动清理: %v", challengeName, err)
-		return fmt.Errorf("DNS 清理测试失败: %w（测试记录可能已残留，请登录 DNS 控制台手动清理 %s TXT 记录）", err, strings.TrimSuffix(challengeName, "."))
-	}
-	return nil
+	return runValidateProbe(ctx, provider, testDomain, "dnspod")
 }

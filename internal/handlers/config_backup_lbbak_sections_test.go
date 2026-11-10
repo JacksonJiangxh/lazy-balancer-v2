@@ -1,10 +1,10 @@
 package handlers
 
-// 第 39 轮审计修复(簇 A·备份导入管线)行为规格:
-// R39-1 lbbak 导入分类选择(query sections)、R39-11 password_version 吊销收窄、
-// BE-C1-1 解压炸弹上限、R39-12 .version 伴生文件保留、R39-13 落盘失败警告、
-// BE-C1-6 仅全局配置导出拒绝、BE-C1-10 单侧文件-版本表绑定、R39-14 ACME 引用
-// 预检警告、LB-A2-2 NULL 归一 5→2。
+// (簇 A·备份导入管线)行为规格
+// lbbak 导入分类选择(query sections)、 password_version 吊销收窄、
+// 解压炸弹上限、.version 伴生文件保留、落盘失败警告、
+// 仅全局配置导出拒绝、单侧文件-版本表绑定、 ACME 引用
+// 预检警告、 NULL 归一 5→2。
 
 import (
 	"archive/tar"
@@ -62,10 +62,14 @@ func overrideTestWafPaths(t *testing.T) (crsDir, xdbPath string) {
 	}
 	xdbPath = filepath.Join(t.TempDir(), "ip2region.xdb")
 	t.Cleanup(services.OverrideWafLivePathsForTest(crsDir, xdbPath))
+	// 导入链会把备份里的真实 xdb 经 services.Reload 装进进程级 searcher：
+	// 用例结束必须复位，否则后续「无 xdb」形态的归属地断言在 -shuffle 下
+	// 读到上一个用例的库（顺序依赖假红）。复位先于路径还原（LIFO）。
+	t.Cleanup(services.ResetIP2RegionSearcherForTest)
 	return crsDir, xdbPath
 }
 
-// R39-1:lbbak 导入的 ?sections= 必须生效——未选分类的表与 waf 文件都不得动。
+// lbbak 导入的?sections= 必须生效——未选分类的表与 waf 文件都不得动。
 func TestLbbakImport_sectionsQueryScoped(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -78,9 +82,10 @@ func TestLbbakImport_sectionsQueryScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "imp1", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, []byte("NEW-XDB-PAYLOAD"))
 
 	rec := postLbbakImport(g, t, body, "?sections=rules")
@@ -105,7 +110,7 @@ func TestLbbakImport_sectionsQueryScoped(t *testing.T) {
 	}
 }
 
-// R39-11:password_version 吊销收窄为「选中系统数据」——仅规则导入不吊销,
+// password_version 吊销收窄为「选中系统数据」——仅规则导入不吊销,
 // 含系统数据导入吊销且响应携带提示。
 func TestLbbakImport_passwordVersionBumpScoped(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -115,9 +120,10 @@ func TestLbbakImport_passwordVersionBumpScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "imp2", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, nil)
 
 	// 仅 rules:password_version 不动,响应无吊销提示
@@ -138,7 +144,7 @@ func TestLbbakImport_passwordVersionBumpScoped(t *testing.T) {
 	if _, err := db.DB.Exec(`DELETE FROM lb_rules WHERE caddy_id='imp2'`); err != nil {
 		t.Fatal(err)
 	}
-	body2 := buildTestLbbak(t, completeBackupJSON(t, nil), nil)
+	body2 := buildTestLbbak(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), nil)
 	rec = postLbbakImport(g, t, body2, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("full import: %d %s", rec.Code, rec.Body.String())
@@ -177,8 +183,9 @@ func craftLbbakRaw(t *testing.T, entries map[string][]byte) []byte {
 	return buf.Bytes()
 }
 
-// BE-C1-1:parseLbbak 条目数与总解压字节上限。
+// parseLbbak 条目数与总解压字节上限。
 func TestParseLbbak_entryAndTotalCaps(t *testing.T) {
+	withIsolatedGlobal(t)
 	// 条目数上限(>64 拒绝)
 	entries := map[string][]byte{}
 	for i := 0; i < 65; i++ {
@@ -199,14 +206,16 @@ func TestParseLbbak_entryAndTotalCaps(t *testing.T) {
 	}
 }
 
-// R39-12:含 xdb 的 lbbak 导入(字节未变)不得删除 .version 伴生文件——
-// 版本 tag 从备份表区传入。
+// 含 xdb 的 lbbak 导入(字节未变)不得删除.version 伴生文件——
+// 版本 tag 从备份表区传入。夹具必须是真实可装载 xdb（此前 "XDB-BYTES"
+// 在装载校验即被拒、FailedXdb=true → ApplyWafFileBundle 根本不触碰 .version，
+// 「字节未变保留 sidecar」分支零覆盖）。
 func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
 	_, xdbPath := overrideTestWafPaths(t)
 
-	xdb := []byte("XDB-BYTES")
+	xdb := validXdbBytes(t)
 	if err := os.WriteFile(xdbPath, xdb, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -214,9 +223,10 @@ func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip2region_version": {{"id": 1, "version": "tag-keep", "auto_update": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, xdb)
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
@@ -228,7 +238,7 @@ func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 	}
 }
 
-// R39-13:规则库文件落盘失败必须进入响应 warnings(不得静默纯成功)。
+// 规则库文件落盘失败必须进入响应 warnings(不得静默纯成功)。
 func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -239,22 +249,25 @@ func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(xdbPath + ".sync") })
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip2region_version": {{"id": 1, "version": "t", "auto_update": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, []byte("DIFFERENT-XDB"))
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import should still succeed: %d %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "规则库文件落盘失败") {
+	// 坏 xdb 在落盘前即被装载验证拒绝，响应必须同时明示「无法装载」
+	// 与版本记录同批丢弃（文件未落盘 → 记录不得存活）。
+	if !strings.Contains(rec.Body.String(), "无法装载") || !strings.Contains(rec.Body.String(), "版本记录已丢弃") {
 		t.Fatalf("waf file apply failure must surface in response warnings: %s", rec.Body.String())
 	}
 }
 
 // 三分类合并(2026-09-19 用户裁定):legacy 分类键 global_config 是「系统数据」
 // (users)的别名、waf_files 是「安全防护」(security)的别名——旧书签/脚本的
-// ?sections= 导出必须成功且携带对应表族,不再 400(BE-C1-6 死备份哨兵随
+// ?sections= 导出必须成功且携带对应表族,不再 400( 死备份哨兵随
 // 分类合并撤销:users 恒有表,「仅全局配置」形态不可达)。
 func TestExportConfigBackup_legacySectionAliases(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -319,7 +332,7 @@ func TestExportConfigBackup_legacySectionAliases(t *testing.T) {
 
 // 三分类合并勘误(2026-09-19):users 分类备份(系统数据表族+全局配置区)
 // 必须可导入。旧「全量形态」探测器以「含 users 表」判定全量,把分类备份
-// 误判为全量并以「缺少 lb_rules」拒绝——恰好制造 BE-C1-6 要消灭的死备份
+// 误判为全量并以「缺少 lb_rules」拒绝——恰好制造要消灭的死备份
 // 形态(旧五分类模型下 users-only 导出同样中招,新增 users=系统数据含全局
 // 配置后触发面扩大到 global_config 别名导出)。
 func TestImportConfigBackup_usersCategoryBackupImports(t *testing.T) {
@@ -353,7 +366,7 @@ func TestImportConfigBackup_usersCategoryBackupImports(t *testing.T) {
 	}
 }
 
-// BE-C1-10:单侧 waf 文件缺失时对应版本表跳过并警告(xdb 在、CRS 缺 →
+// 单侧 waf 文件缺失时对应版本表跳过并警告(xdb 在、CRS 缺 →
 // security_crs_version 不被空表覆盖)。
 func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -365,9 +378,10 @@ func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip2region_version": {{"id": 1, "version": "tag-x", "auto_update": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, []byte("ONLY-XDB"))
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
@@ -383,7 +397,7 @@ func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 	}
 }
 
-// R39-14:「系统数据」分类导入替换 ACME 配置表时,live 启用规则的悬挂引用
+// 「系统数据」分类导入替换 ACME 配置表时,live 启用规则的悬挂引用
 // 必须以警告显性化(不阻断)。
 func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -394,9 +408,10 @@ func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"certificate_configs": {},
-	})
+	}, EmptyConfigIfNil: true})
+
 	// JSON 注入 sections=users(系统数据)
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(backup), &parsed); err != nil {
@@ -417,7 +432,7 @@ func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 	}
 }
 
-// LB-A2-2:NULL health_check_timeout 归一为 2(与写侧/渲染/快照通道同口径)。
+// NULL health_check_timeout 归一为 2(与写侧/渲染/快照通道同口径)。
 func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -426,9 +441,10 @@ func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (5,'local-admin','x','admin',1)`); err != nil {
 		t.Fatal(err)
 	}
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "nullh", "name": "n", "protocol": "http", "domain": "c.example.com", "listen_port": 80, "enabled": 1, "health_check_timeout": nil}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(backup), &parsed); err != nil {
 		t.Fatal(err)
@@ -447,5 +463,66 @@ func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	db.DB.QueryRow(`SELECT COALESCE(health_check_timeout,-1) FROM lb_rules WHERE caddy_id='nullh'`).Scan(&got)
 	if got != 2 {
 		t.Fatalf("NULL health_check_timeout must normalize to 2, got %d", got)
+	}
+}
+
+// 导入同时替换 CRS 规则树时，策略的组号/规则 ID
+// 存在性不得按导入前 live 索引判定（基准不同代）——降级为形状校验并进警告。
+// 对照：纯 JSON 备份（不替换规则树）仍按 live 索引 400。
+func TestValidateImport_crsTreeReplacementSkipsLiveIndexExistence(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	policyRow := map[string]any{
+		"id": 1, "name": "crs-policy", "mode": "blocking", "enabled": 1,
+		"crs_rule_groups": `["42"]`,
+	}
+	backupJSON := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"security_policies": {policyRow}}, Config: nil, Sections: []string{"security"}, EmptyConfigIfNil: true})
+
+	// 对照：纯 JSON 备份不携带 CRS 文件 → 按 live 索引（测试环境无规则目录）
+	// 判「规则组不存在」。
+	plain := postValidateBytes(t, h, []byte(backupJSON))
+	if plain.Valid || !strings.Contains(plain.Error, "规则组不存在于当前 CRS") {
+		t.Fatalf("plain json valid=%v error=%q, want invalid 且点名组号不存在", plain.Valid, plain.Error)
+	}
+
+	// 携带 CRS tar 的 lbbak：同一策略行必须放行，并给出「未按当前规则库校验」警告。
+	payload, err := buildLbbakPayload([]byte(backupJSON), &services.WafFileBundle{
+		CRSVersion: "test-crs", CRSSha256: "deadbeef", CRSTarGz: []byte("dummy-crs-tar"),
+	})
+	if err != nil {
+		t.Fatalf("buildLbbakPayload: %v", err)
+	}
+	response := postValidateBytes(t, h, payload)
+	if !response.Valid {
+		t.Fatalf("lbbak preview valid=false error=%q, want valid (live 索引不参与判定)", response.Error)
+	}
+	found := false
+	for _, warning := range response.Warnings {
+		if strings.Contains(warning, "未按当前规则库做存在性校验") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings=%v, want CRS 基准降级提示", response.Warnings)
+	}
+}
+
+// 带外 NULL enabled 的证书配置行：运行期按 COALESCE(enabled,1) 视同可用
+// （backupCAProviderExistsPostImport / acmeImportRefIndex 同口径），引用解析
+// 必须一致，否则 acmeDanglingRules 会对实际可用的引用误报「悬挂」。
+func TestAcmeRefResolvablePostImport_nullEnabledLiveRowIsResolvable(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (42,'null-enabled','dnspod','{}',NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// live 分支（备份未携带该表）。
+	if !acmeRefResolvablePostImport(nil, "certificate_configs", 42) {
+		t.Fatal("NULL enabled 的 live 行必须视为可解析（COALESCE(enabled,1) 口径）")
+	}
+	// 显式禁用仍不可解析（口径放宽不得吞掉真实悬挂）。
+	if _, err := db.DB.Exec(`UPDATE certificate_configs SET enabled=0 WHERE id=42`); err != nil {
+		t.Fatal(err)
+	}
+	if acmeRefResolvablePostImport(nil, "certificate_configs", 42) {
+		t.Fatal("显式 enabled=0 必须判定不可解析")
 	}
 }

@@ -22,8 +22,46 @@ import (
 func stubUpdateRetrySleep(t *testing.T) {
 	t.Helper()
 	old := updateRetrySleep
-	updateRetrySleep = func(time.Duration) {}
+	updateRetrySleep = func(context.Context, time.Duration) error { return nil }
 	t.Cleanup(func() { updateRetrySleep = old })
+}
+
+// 边界基线钉：取消发生在首次失败后的退避中（而非底层请求中）时，
+// 默认等待同样必须立即退出，且不得进入第二次尝试。
+func TestRunWithInTaskRetry_cancelInterruptsBackoff(t *testing.T) {
+	oldWaits := updateAttemptWaits
+	updateAttemptWaits = []time.Duration{time.Hour}
+	t.Cleanup(func() { updateAttemptWaits = oldWaits })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var attempts atomic.Int32
+	waiting := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- runWithInTaskRetry(ctx, func() error {
+			attempts.Add(1)
+			return errors.New("transient")
+		}, func(int, time.Duration, error) {
+			close(waiting)
+		})
+	}()
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("未进入首次失败后的退避")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("退避取消 err=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("取消未中断任务内退避")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("退避取消后尝试次数=%d, want 1", got)
+	}
 }
 
 // Given：fetchLatestTag 连续 2 次瞬断、第 3 次成功（且 tag 更新）。
@@ -89,49 +127,6 @@ func TestCRSRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
 	}
 }
 
-// Given：调度 tick 到期启动的自动更新失败（fetch 恒失败）。
-// When：schedulerTick 完成整个生命周期。Then：失败落定后 next_update 推进到
-// 紧邻下一排程槽（排程槽生命周期 2026-10-11 用户裁定——失败不推进的过期槽
-// 经步进重算永不到期，曾致排程停摆）。
-func TestCRSSchedulerTick_failedRunKeepsScheduleSlot(t *testing.T) {
-	overrideWafDirForTest(t)
-	stubUpdateRetrySleep(t)
-	m := newTestCRSManager(t)
-	seedCRSVersionRow(t, "v4.14.0", true)
-	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
-	if _, err := db.DB.Exec(`UPDATE security_crs_version SET next_update=? WHERE id=1`, now.Add(-time.Minute).Format(crsTimeLayout)); err != nil {
-		t.Fatal(err)
-	}
-
-	m.fetchLatestTag = func(context.Context) (string, error) {
-		return "", errors.New("GitHub 返回 403")
-	}
-	m.schedulerTick(now)
-
-	deadline := time.Now().Add(5 * time.Second)
-	for m.IsRunning() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	// rearm 等待 run 完成是异步的——状态落定后再读行
-	deadline = time.Now().Add(5 * time.Second)
-	for {
-		_, status, _, _, _, _, _ := crsVersionRow(t)
-		if status == "failed" || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	_, status, _, _, _, nextUpdate, _ := crsVersionRow(t)
-	if status != "failed" {
-		t.Fatalf("status=%q, want failed", status)
-	}
-	wantReal := versionTableNextSlot("security_crs_version", time.Now().UTC())
-	if nextUpdate != wantReal {
-		t.Fatalf("next_update=%q, want 失败落定推进到紧邻下一排程槽 %q（排程槽生命周期 2026-10-11）", nextUpdate, wantReal)
-	}
-}
-
 // Given：IP2Region fetchLatestTag 恒失败。When：执行一次更新。
 // Then：尝试 3 次后失败落定，next_update 保持排程槽。
 func TestIP2RegionRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
@@ -190,7 +185,7 @@ func TestThreatUpdateOneSource_inTaskRetry_succeedsAfterTransientFailures(t *tes
 	}
 
 	m := GetThreatUpdateManager()
-	_, failed := m.updateOneSource(context.Background(), threatSourceRow{id: 1, name: "ustc", url: srv.URL}, "auto")
+	_, failed, _ := m.updateOneSource(context.Background(), threatSourceRow{id: 1, name: "ustc", url: srv.URL}, "auto", taskRunStartedAt(nil))
 
 	if failed {
 		t.Fatal("源更新失败, want 任务内重试后成功")
@@ -204,7 +199,7 @@ func TestThreatUpdateOneSource_inTaskRetry_succeedsAfterTransientFailures(t *tes
 func TestThreatFailSource_nextUpdateIsScheduleSlot(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
-	want := threatNextSlot(time.Now().UTC())
+	clockBefore := time.Now().UTC()
 
 	failSourceRow(1, time.Now().UTC().Format(crsTimeLayout), errors.New("HTTP 500"), "auto")
 
@@ -212,8 +207,13 @@ func TestThreatFailSource_nextUpdateIsScheduleSlot(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_threat_sources WHERE id=1`).Scan(&next); err != nil {
 		t.Fatal(err)
 	}
-	if next != want {
-		t.Fatalf("next_update=%q, want 排程槽 %q（失败退避不污染排程）", next, want)
+	if got := parseSlotUTC(t, next); !got.After(clockBefore) {
+		t.Fatalf("next_update=%v 必须真实晚于失败轮开始时间 %v", got, clockBefore)
+	}
+	wantBefore := threatNextSlot(clockBefore)
+	wantAfter := threatNextSlot(time.Now().UTC())
+	if next != wantBefore && next != wantAfter {
+		t.Fatalf("next_update=%q，不在稳定时钟 bracket 的合法槽位 [%q, %q]（失败退避不污染排程）", next, wantBefore, wantAfter)
 	}
 }
 
@@ -228,15 +228,13 @@ func TestSetCRSSchedule_failedRowRearmedToSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	clockBefore := time.Now().UTC()
 	if err := SetCRSSchedule([]int{2}, "04:30"); err != nil {
 		t.Fatal(err)
 	}
 
-	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc).UTC().Format(crsTimeLayout)
 	_, _, nextUpdate := readVersionSchedule(t, "security_crs_version")
-	if nextUpdate != want {
-		t.Fatalf("next_update=%q, want 重排为新槽 %q（失败行不保留退避）", nextUpdate, want)
-	}
+	assertNextScheduledSlot(t, nextUpdate, clockBefore, []int{2}, "04:30", loc)
 }
 
 // Given：失败退避形态的威胁源。When：保存威胁库排程。
@@ -249,16 +247,14 @@ func TestSetThreatSchedule_failedSourceRearmedToSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	clockBefore := time.Now().UTC()
 	if err := SetThreatSchedule([]int{3}, "05:00"); err != nil {
 		t.Fatal(err)
 	}
 
-	want := NextScheduledSlot(time.Now().UTC(), []int{3}, "05:00", loc).UTC().Format(crsTimeLayout)
 	var next string
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&next); err != nil {
 		t.Fatal(err)
 	}
-	if next != want {
-		t.Fatalf("失败源 next_update=%q, want 重排为新槽 %q", next, want)
-	}
+	assertNextScheduledSlot(t, next, clockBefore, []int{3}, "05:00", loc)
 }

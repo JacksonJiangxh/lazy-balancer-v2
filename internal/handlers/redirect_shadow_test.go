@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -17,9 +18,7 @@ import (
 // 同域名直接监听 80 的规则会被遮蔽为死规则——保存/启用两条路径都必须拒绝。
 func TestRuleDomainConflict_redirectShadow(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
@@ -55,10 +54,10 @@ func TestRuleDomainConflict_redirectShadow(t *testing.T) {
 		return response
 	}
 	port80Body := func(name, domain string) string {
-		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":80,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain)
+		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":80,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain)
 	}
 	tlsRedirectBody := func(name, domain string) string {
-		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":443,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"tls_http_redirect":true,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, certPEM, keyPEM)
+		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":443,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"tls_http_redirect":true,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, certPEM, keyPEM)
 	}
 
 	t.Run("create port-80 rule shadowed by existing TLS redirect rule rejected", func(t *testing.T) {
@@ -113,13 +112,11 @@ func TestRuleDomainConflict_redirectShadow(t *testing.T) {
 	})
 }
 
-// Round 29 G-5: 存量冲突组合（导入态 80 规则 + 跳转规则并存）下，仅改名称的更新
+// 存量冲突组合（导入态 80 规则 + 跳转规则并存）下，仅改名称的更新
 // 不应被遮蔽检查 400 阻塞；相关字段（域名）变化时遮蔽检查仍须生效。
 func TestUpdateRule_name_only_change_passes_with_legacy_shadow_combo(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -173,14 +170,12 @@ func TestUpdateRule_name_only_change_passes_with_legacy_shadow_combo(t *testing.
 	})
 }
 
-// R38 C-2: 域名冲突检查须与遮蔽检查同样加变更门控——导入遗留的「一启用一禁用
-// 同域名」组合中，禁用方仅改名等无关更新不应被 400 卡死（ruleDomainConflict 只
+// 域名冲突检查须与遮蔽检查同样加变更门控——导入遗留的「一启用一禁用
+// 同域名」组合中，禁用方仅改名等无关更新不应被 400 卡死（enabledRuleDomainConflict 只
 // 统计 enabled=1 的规则）；域名/启用态真正变化时检查仍须生效。
 func TestUpdateRule_domain_conflict_check_gated_on_change(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -233,14 +228,12 @@ func TestUpdateRule_domain_conflict_check_gated_on_change(t *testing.T) {
 	})
 }
 
-// R39 C-2: shadowRelevantChanged 门控须含 enabled 变化——仅提交 {"enabled":true}
+// shadowRelevantChanged 门控须含 enabled 变化——仅提交 {"enabled":true}
 // 启用一条「443 跳转规则」时，若同域名存在启用中的 80 直听规则，遮蔽检查必须
 // 触发（与 EnableRule 端点口径一致），否则跳转路由会把 80 规则遮蔽成死规则。
 func TestUpdateRule_enable_trigger_redirect_shadow_check(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -278,15 +271,13 @@ func TestUpdateRule_enable_trigger_redirect_shadow_check(t *testing.T) {
 	}
 }
 
-// R40 F-1: 遮蔽/域名冲突门控的启用态条件收敛为仅启用方向——存量冲突组合
+// 遮蔽/域名冲突门控的启用态条件收敛为仅启用方向——存量冲突组合
 // （80 直听启用 + 443 TLS+跳转启用同域名；或同域名同端口双启用）下禁用任一方
 // 不应被 400 误拦（禁用方不渲染，检查无意义，与 DisableRule 端点口径一致）；
 // 启用方向仍须触发检查。
 func TestUpdateRule_disable_direction_skips_conflict_checks(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -380,14 +371,12 @@ func TestUpdateRule_disable_direction_skips_conflict_checks(t *testing.T) {
 	})
 }
 
-// R41 C-2: 遮蔽门控增加启用状态前置——仅当「新状态启用 或 原状态启用」时才可能产生
+// 遮蔽门控增加启用状态前置——仅当「新状态启用 或 原状态启用」时才可能产生
 // 运行时影响。禁用中规则（新旧均 disabled）不渲染，改 TLS/跳转/端口/域名应放行；
 // 启用方向仍二次把关（上方"启用方向仍触发遮蔽检查"用例覆盖）。
 func TestUpdateRule_disabled_rule_skips_shadow_gate(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
