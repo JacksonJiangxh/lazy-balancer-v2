@@ -96,9 +96,8 @@ const ACTION_TONE_EXCEPTIONS: Record<string, AuditActionTone> = {
   '库自愈': 'warning',
   // ── success（无关键词可派生）──
   '创建': 'success',
-  // 证书摄取（引用型证书看门狗）：源文件外部更新后新内容成功入库——
-  // 与「自动检测」同族的例行自愈成功动作，success 呈现；摄取失败由
-  // 「失败」关键词派生 danger。
+  // 证书摄取：例行自愈成功动作（success）；摄取失败由「失败」关键词派生 danger。
+  // 详见 docs/fork-notes/frontend.md §7
   '证书摄取': 'success',
   '启用': 'success',
   '审批': 'success',

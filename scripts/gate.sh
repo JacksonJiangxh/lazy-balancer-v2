@@ -25,9 +25,9 @@ step() { printf '\n== %s ==\n' "$1"; }
 
 # ---- 1) go build × 7 模块 ----
 step "1/5 go build x7 modules"
-modules=(. ./caddychain ./caddygeoip ./wafiplist ./caddydeps ./caddyl4sec ./geoipnames)
+gate_modules=(. ./caddychain ./caddygeoip ./wafiplist ./caddydeps ./caddyl4sec ./geoipnames)
 build_ok=0
-for m in "${modules[@]}"; do
+for m in "${gate_modules[@]}"; do
   if (cd "$m" && go build ./... >/dev/null 2>&1); then
     build_ok=$((build_ok + 1))
   else

@@ -124,9 +124,8 @@ func LoadReferencedCertificate(certPath, keyPath string) (ReferencedCertificate,
 	}, nil
 }
 
-// ReferencedCertFileDigest 返回引用型证书文件对的内容指纹（含文件不存在标记）。
-// 供「外部更新证书文件 → 自动重载」的变更检测使用：与上次快照比对，不同即视为
-// 证书已更新。
+// ReferencedCertFileDigest 返回引用型证书文件对的内容指纹（供外部更新 → 自动重载的变更检测）。
+// 详见 docs/fork-notes/tls-file-source.md §2
 func ReferencedCertFileDigest(certPath, keyPath string) string {
 	certData, certErr := os.ReadFile(certPath)
 	keyData, keyErr := os.ReadFile(keyPath)
@@ -622,13 +621,8 @@ func restoreCertFile(path string, snapshot CertFileSnapshot) error {
 	return syncParentDir(path)
 }
 
-// IngestMissingReferencedCerts 启动期回填：引用型证书（tls_source="file"）的
-// 运行时唯一信任源是数据库——旧版本升级、旧备份还原或 v2 导入产生的「只有
-// 摄取源路径、内容为空」的行，在本机源文件可读时摄取回填内容；不可读则保留
-// 空内容并留痕（渲染按无证、EnableRule 门拒绝启用，用户重新保存即修复）。
-//   - 返回成功回填的规则数（0=无可回填行或全部失败，调用方按需留警告）。
-//
-// 幂等：内容已非空的行不命中。
+// IngestMissingReferencedCerts 启动期回填「只有摄取源路径、内容为空」的引用型证书行（幂等）。
+// 详见 docs/fork-notes/tls-file-source.md §3
 func IngestMissingReferencedCerts() int {
 	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
 		FROM lb_rules WHERE enable_tls=1 AND tls_source='file'

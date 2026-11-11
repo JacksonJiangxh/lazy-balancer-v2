@@ -654,11 +654,8 @@ func enabledRuleDomainConflict(domain string, listenPort int, excludeCaddyID str
 	return queryRuleDomainConflict(domain, listenPort, excludeCaddyID, " AND enabled = 1")
 }
 
-// queryRedirectShadowConflict 检查 HTTP 默认口（HTTP_PORT，出厂 80）的跳转遮蔽：
-// 启用中的 TLS+HTTP 跳转规则会在该口服务器头部生成 terminal 跳转路由
-// （caddy.go redirectRoutes），同域名直接监听该口的规则会被遮蔽为死规则。两个
-// 方向同判：保存该口规则时查跳转规则占用；保存/启用 TLS+跳转规则时查该口规则
-// 占用。返回冲突规则描述与冲突域名。
+// queryRedirectShadowConflict 检查 HTTP 默认口的跳转遮蔽冲突（两个方向同判）。
+// 详见 docs/fork-notes/tls-file-source.md §6
 func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHTTPRedirect bool, excludeCaddyID string) (string, string, error) {
 	candidates := normalizedRuleDomains(domain)
 	if len(candidates) == 0 {
@@ -1387,9 +1384,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "协议不能为空"})
 		return
 	}
-	// HTTP 规则的端口兜底（端口为 0=未指定）：TLS 开 → HTTPS 默认口（出厂 443），
-	// 否则 → HTTP 默认口（出厂 80）。部署侧改 HTTP_PORT/HTTPS_PORT 后向导与 API
-	// 的缺省落点随动（ISSUE #7）；显式传了端口则原样使用，不做任何改写。
+	// HTTP 规则的端口兜底（端口 0=未指定）：TLS 开→HTTPS 默认口，否则→HTTP 默认口。
+	// 详见 docs/fork-notes/tls-file-source.md §7
 	if req.Protocol == "http" && req.ListenPort == 0 {
 		if req.EnableTLS {
 			req.ListenPort = services.DefaultHTTPSPort()
@@ -1501,9 +1497,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	if req.Strategy == "" {
 		req.Strategy = "weighted_round_robin"
 	}
-	// 链式回退（2026-10-09）：0 值兜底默认参数（UI 不提供 0=关闭语义，避免
-	// 配置分叉；参考项目 speculativeMs=0 关闭语义不引入）。默认按 N=6 封顶 +
-	// 浏览器 60s 等待约束设计：5×3000+30000=45s < 60s（预算公式见 caddy.go）。
+	// 链式回退：0 值兜底默认参数（UI 不提供 0=关闭语义，避免配置分叉）。
+	// 详见 docs/fork-notes/tls-file-source.md §8
 	if req.Strategy == "chain_fallback" {
 		if req.ChainRaceIntervalMS == 0 {
 			req.ChainRaceIntervalMS = 3000
@@ -1546,9 +1541,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			services.Logf("warn", "CreateRule manual TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
 		}
 	}
-	// 引用型证书：文件只是采集来源——校验路径边界与文件有效性后，把读取到的
-	// PEM 内容摄取入库（tls_cert/tls_key，与 manual 同列）；路径列保留作摄取源
-	// 记录（看门狗据此检测外部更新并同步回写 DB）。
+	// 引用型证书：文件只是采集来源——校验后把 PEM 内容摄取入库，路径列留作摄取源记录。
+	// 详见 docs/fork-notes/tls-file-source.md §4
 	if req.EnableTLS && req.TLSSource == "file" {
 		certPath, keyPath, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(req.TLSCertPath, req.TLSKeyPath, req.Domain)
 		if err != nil {
@@ -3035,9 +3029,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
-	// 引用型证书：同模式可沿用存量路径（前端编辑回填已带），跨模式必须显式提供
-	// （空路径由校验层响亮拒绝）；通过后归一落库，并把读取到的 PEM 内容摄取入库
-	// （文件只是采集来源，运行时唯一信任源是数据库）。
+	// 引用型证书：同模式可沿用存量路径，跨模式必须显式提供（空路径由校验层拒绝）。
+	// 详见 docs/fork-notes/tls-file-source.md §4
 	if (*req.EnableTLS || req.TLSCertPath != "" || req.TLSKeyPath != "") && req.TLSSource == "file" {
 		certPath, keyPath := req.TLSCertPath, req.TLSKeyPath
 		if existingRule.TLSSource == "file" {

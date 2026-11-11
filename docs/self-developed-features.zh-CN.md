@@ -8,7 +8,12 @@
 > 登记原则：**一能力一条**，写清「能力名 / 代码位置 / 设计裁定出处 / 防复发约束 /
 > 机械可核符号」。符号必须能 grep 到，供后续派活直接引用。
 >
-> 最近更新：2026-11-11 · TASK-2026-1111-02（第 4 项登记）
+> 最近更新：2026-11-11 · TASK-2026-1111-03（注释外置，长解释迁到 `docs/fork-notes/`）
+>
+> **注释外置后的查找方式**：代码里我方补丁处只留「一句话结论 + `详见 docs/fork-notes/xxx.md §N`」，
+> 长解释（设计理由、反例、取舍）**逐字**保存在 `docs/fork-notes/`（索引见其 `README.md`）。
+> 锚点可跳转由 `bash scripts/check-doc-anchors.sh` 机械校验（**锚点失效 = 红**）。
+> 追平动手前建议先读对应模块的 fork-notes，比读代码里的散注释快。
 
 ---
 
@@ -16,10 +21,19 @@
 
 | # | 能力 | 关键符号（grep 可核） | 裁定出处 |
 |---|---|---|---|
-| 1 | **链式回退**（`chain_fallback`） | `chain_proxy` · `buildChainProxyConfig` · `caddychain/` | 2026-10-09 |
-| 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `tls_cert_path` · `tls_key_path` | — |
+| 1 | **链式回退**（`chain_fallback`） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `caddychain/` | 2026-10-09 |
+| 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
 | 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` | — |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
+
+> **本表的第二用途（2026-11-11 TASK-2026-1111-03 增补）**：`scripts/fork-diff.sh`
+> 把上文「关键符号」列与下文每项「代码位置」条目**机械解析**成归属判据，用来给
+> 差异清单里的每个文件打 `self_dev_feature` 标签。因此：
+> ① 每个符号必须能 `grep` 命中真实源码（否则该项永远判不出来）；
+> ② 符号要选**本能力独有**的拼写（如 `chain_race_interval_ms`），别选 `manual`、
+> `text/plain` 这类通用词——脚本对长度 < 8 或全小写且无下划线的词不作符号处理，
+> 正是为避免误命中。
+> 变更本表后请重跑 `bash scripts/fork-diff.sh 0cd475ed main` 并核对归属变化。
 
 ---
 
@@ -46,9 +60,11 @@
 
 - **能力名**：证书来源可选「引用磁盘文件」，而非只能内嵌 PEM 或走 ACME。
 - **代码位置**：
-  - `internal/services/certstore.go` → `ResolveReferencedCertPath`
+  - `internal/services/certstore.go` → `ResolveReferencedCertPath` /
+    `LoadReferencedCertificate` / `IngestMissingReferencedCerts`
+  - 写侧摄取：`internal/handlers/helpers.go` → `validateReferencedCertificateFiles`
   - DB 列：`lb_rules.tls_cert_path` / `lb_rules.tls_key_path`
-  - 前端：规则编辑「证书来源」下拉的 `file` 选项
+  - 前端：规则编辑「证书来源」下拉的 `file` 选项（`web/src/utils/ruleValidation.ts`）
 - **设计裁定出处**：`tls_source` 三态（`manual` / `acme_dns` / `file`）为自研扩展；
   `manual` 与 `acme_dns` 跟随上游语义。
 - **关键设计点**：引用路径在渲染期解析为 Caddy 可直接加载的 `load_files` 形态，证书

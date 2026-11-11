@@ -113,10 +113,8 @@ type proxyPortsResponse struct {
 	PanelPort int `json:"panel_port"`
 }
 
-// GetProxyPorts 返回部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT，
-// ISSUE #7）。前端新建规则向导的默认 listen_port、TLS 联动与保留端口校验
-// 读此值，避免「compose 改了变量、面板新建规则还默认 80」的割裂。全部认证用户
-// 可见（只读配置，无敏感信息）。
+// GetProxyPorts 返回部署侧代理默认口与面板口（供前端向导默认值与保留端口校验）。
+// 详见 docs/fork-notes/handlers-misc.md §2
 func (h *Handlers) GetProxyPorts(c *gin.Context) {
 	httpPort, httpsPort := services.DefaultHTTPPort(), services.DefaultHTTPSPort()
 	panelPort := 8000
