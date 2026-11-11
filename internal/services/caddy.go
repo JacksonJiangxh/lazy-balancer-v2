@@ -2125,75 +2125,6 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		return map[string]interface{}{caddyConfigGenerationErrorKey: err.Error()}
 	}
 
-	type lbRule struct {
-		CaddyID                       string
-		Name                          string
-		Protocol                      string
-		Domain                        string
-		ListenPort                    int
-		Strategy                      string
-		DynamicDNS                    bool
-		EnableDnsServer               bool
-		DnsServer                     string
-		DnsFamily                     string
-		HealthCheckPath               string
-		HealthCheckInterval           int
-		HealthCheckTimeout            int
-		HealthCheckUnhealthyThreshold int
-		HealthCheckHealthyThreshold   int
-		EnableTLS                     bool
-		TLSSource                     string
-		TLSCert                       string
-		TLSKey                        string
-		TLSHTTPRedirect               bool
-		EnableCompress                bool
-		CompressTypes                 string
-		EnableActiveHealthCheck       bool
-		TCPHealthCheckPort            int
-		TCPProxyProtocol              bool
-		TCPTryDuration                int
-		TCPTryInterval                int
-		RequestBodyMaxSizeMB          int
-		UpstreamKeepaliveTimeout      int
-		ServerTokensHidden            int
-		NTLMCompatible                int
-		UpstreamForceHTTP1            int
-		// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底）。
-		ChainRaceIntervalMS        int
-		ChainRequestTimeoutMS      int
-		ForwardAuthEnabled         int
-		ForwardAuthUpstream        string
-		ForwardAuthURI             string
-		ForwardAuthCopyHeaders     string
-		CustomRoutesEnabled        bool
-		ProxyDialTimeout           int
-		ProxyResponseHeaderTimeout int
-		ProxyReadTimeout           int
-		ProxyWriteTimeout          int
-		ProxyStreamTimeout         int
-		ProxyFlushInterval         int
-		ProxyStreamCloseDelay      int
-		PathRules                  []PathRuleConfig
-		HostHeader                 string
-		HealthCheckHost            string
-		LogEnabled                 bool
-	}
-
-	type upstream struct {
-		Host           string
-		Port           int
-		Weight         int
-		Enabled        bool
-		Protocol       string
-		MaxConnections int
-		OriginDomain   string
-	}
-
-	type ruleWithUpstreams struct {
-		rule      lbRule
-		upstreams []upstream
-	}
-
 	// lb_rules.id 为可空遗留列（生产形态恒 NULL），ORDER BY id 语义
 	// 退化；rowid 显式化——行为与现状等价（NULL 排序实践上即 rowid 序）。
 	// Load all enabled rules into memory first to avoid holding cursor while querying upstreams/global_config
@@ -2290,6 +2221,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	}
 
 	if hasCustomRoutes {
+		// 自定义路由上游的回源 Host 解析上下文（董事长自研，2026-10-10 裁定）：
+		// 地址在统一上游集合里 → 用「该地址所属规则」的上游集合整体计划（逐上游
+		// 优先、规则级兜底）；不在集合里 → 只有规则级一档，空则用自身地址。数据源
+		// 与主链同一张表，避免第二套配置真相；自定义路由子表不新增任何字段。
+		pathResolver := buildPathUpstreamHostResolver(rulesByID)
 		pathRows, pathErr := store.Query(`
 		SELECT p.rule_id, p.sort_order, p.match_type, p.path, p.upstream_path, p.upstreams_json, p.response_mode, p.response_status, p.response_body, p.response_content_type, p.redirect_to
 			FROM path_rules p JOIN lb_rules r ON r.caddy_id = p.rule_id
@@ -2313,7 +2249,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 				continue
 			}
 			if upstreamsJSON.Valid {
-				pathUpstreams, unmarshalErr := decodePathUpstreams(upstreamsJSON.String)
+				pathUpstreams, unmarshalErr := decodePathUpstreamsWithResolver(upstreamsJSON.String, pathResolver, r.rule.HostHeader)
 				if unmarshalErr != nil {
 					closeErr := pathRows.Close()
 					return generationFailure("decode path upstreams for rule %s: %v", ruleID, errors.Join(unmarshalErr, closeErr))
@@ -3524,8 +3460,13 @@ type UpstreamConfig struct {
 	Protocol       string
 	Enabled        bool
 	MaxConnections int
-	// 逐上游回源域名：非空时经 map 处理器（{lb.upstream_host}/{lb.upstream_sni}）
-	// 驱动该上游回源 Host 头与 HTTPS SNI；空=跟随 HostHeader/现状默认。
+	// 逐上游回源 Host（董事长自研第 4 项，DB 列名保持 `upstreams.origin_domain`
+	// 以零迁移，语义为「自研版的三级回退第一档」）：非空时压过规则级
+	// HostHeader，驱动该上游回源 Host 头与 HTTPS SNI；空=回退规则级/自身 dial
+	// 地址。混合态经 lb_upstream_host 处理器（{lb.upstream_host}/
+	// {lb.upstream_sni}）在请求期下发，**绝不透传客户端 Host**。
+	// 自定义路由链（path_rules.upstreams_json）的该字段由
+	// pathUpstreamHostResolver 在渲染期内部推导，不落库、不给前端加字段。
 	OriginDomain string
 }
 
@@ -4275,12 +4216,339 @@ func joinUpstreamAddress(host string, port int) string {
 }
 
 // stripOriginPort 剥离 host:port 形态的端口（SNI 不得含端口）；无端口形态
-// （含裸 IPv6 字面量）原样返回。渲染期预计算 map outputs 第二值专用。
+// （含裸 IPv6 字面量）原样返回。回源 Host 计划（静态态 TLS server_name）与
+// 自研求值路径共用；与自研版 stripPortForSNI 语义等价（本任务吸收上游已修
+// 的「SNI 静态路径剥端口」能力，见 TASK-2026-1111-02 §3.1）。
 func stripOriginPort(host string) string {
 	if hostOnly, _, err := net.SplitHostPort(host); err == nil {
 		return hostOnly
 	}
 	return host
+}
+
+// upstreamHostPlan 逐上游回源 Host 三级回退计划（董事长自研第 4 项核心能力，
+// 2026-10-09 立项；自定义路由链 2026-10-10 同源复用：自定义路由的上游行各自
+// 携带推导出的回源 Host）。登记见 docs/self-developed-features.zh-CN.md。
+//
+// 四态互斥（有启用上游时恒居其一）：
+//   - staticHost：全统一静态值（含仅规则级 host_header 生效的场景）——直接
+//     下发，不发射 handler、不需要占位符；
+//   - usePlaceholder：全回退——Host={http.reverse_proxy.upstream.hostport}
+//     （等价每上游用自身 dial 地址），**恒不用 {http.request.hostport}**；
+//   - overrideMap：混合——dial→回源 Host 映射（未收录上游由处理器未命中兜底
+//     回上游自身地址）；Host={lb.upstream_host}，由 lb_upstream_host 处理器
+//     在请求期惰性下发；
+//   - sniTarget：TLS server_name 目标（静态值剥端口 / {lb.upstream_sni} /
+//     ""=维持规则级 HostHeader 现状语义——全回退时规则级亦空，等价 Caddy 以
+//     dial host 兜底）。
+//
+// 三级回退优先级：上游级 > 规则级 > 上游自身 dial 地址。**绝不透传客户端
+// Host**——这是本自研实现相对上游 map 方案的关键区分（上游纯 http 池 + 规则
+// 级为空时回退 {http.request.hostport} = 客户端 Host，属缺陷，见
+// docs/upstream-origin-host-compare.zh-CN.md §2.4）。
+type upstreamHostPlan struct {
+	staticHost     string
+	usePlaceholder bool
+	overrideMap    map[string]string
+	sniTarget      string
+}
+
+// resolveUpstreamHostPlan 计算启用上游集合的回源 Host 计划。DynamicDNS 规则经
+// buildHTTPHandleChain 前置校验强制单启用上游（ErrDynamicDNSUpstreamCount），
+// 且动态解析 IP 逐请求变化、dial 不可预知——单上游恒落入全回退/全统一两态，
+// 混合映射天然不出现，无需特判。
+//
+// 入参 upstreams 为「已解析逐上游回源 Host」的上游集合：主链来自 upstreams 表
+// （origin_domain 列，语义为自研版的逐上游回源 Host，列名保持不改以零迁移），
+// 自定义路由链（2026-10-10）来自 path_rules.upstreams_json 的推导结果——两条
+// 链共用本函数与同一三级回退口径，避免第二套解析分叉。
+func resolveUpstreamHostPlan(rule SingleRuleConfig, upstreams []UpstreamConfig) upstreamHostPlan {
+	if len(upstreams) == 0 {
+		return upstreamHostPlan{}
+	}
+	// 逐上游有效值：上游自定义 > 规则级；两者皆空记 ""（回退自身地址）。
+	effective := make([]string, len(upstreams))
+	allSame := true
+	for i, u := range upstreams {
+		host := strings.TrimSpace(u.OriginDomain)
+		if host == "" {
+			host = strings.TrimSpace(rule.HostHeader)
+		}
+		effective[i] = host
+		if i > 0 && host != effective[0] {
+			allSame = false
+		}
+	}
+	if allSame {
+		if effective[0] == "" {
+			// 三级回退第三档：上游级与规则级皆空 → 每上游用自身 dial 地址。
+			return fallbackHostPlan()
+		}
+		// 静态统一值：SNI 剥端口（RFC 6066 无端口语义），Host 头保留端口原样。
+		return upstreamHostPlan{staticHost: effective[0], sniTarget: stripOriginPort(effective[0])}
+	}
+	// 混合态：收录全部「有效值非空」的上游——含**只命中规则级第二档**的上游。
+	// 这一点必须与全统一态口径一致：若只收录第一档，那台「上游留空、规则级非空」
+	// 的上游会被处理器未命中兜底到自身 dial 地址，规则级回退在那台机上静默失效
+	// （正是三级回退第二档的语义丢失）。dial 与 Caddy 的
+	// {http.reverse_proxy.upstream.hostport} 同格式：net.JoinHostPort，见
+	// joinUpstreamAddress。仅「三级全空」的上游不收录，由处理器未命中兜底回
+	// 自身地址——**绝不透传客户端 Host**。
+	overrides := make(map[string]string, len(upstreams))
+	for i, u := range upstreams {
+		if effective[i] == "" {
+			continue
+		}
+		overrides[joinUpstreamAddress(u.Host, u.Port)] = effective[i]
+	}
+	if len(overrides) == 0 {
+		// 防御：值集合不一致却无静态项（理论不可达：至少一个非空）。回退
+		// 占位符语义，绝不产出空 Host。
+		return fallbackHostPlan()
+	}
+	return upstreamHostPlan{overrideMap: overrides, sniTarget: "{lb.upstream_sni}"}
+}
+
+// fallbackHostPlan 三级回退第三档的唯一构造出口（全回退态）。
+//
+// 语义：上游级与规则级都没配回源 Host → 每上游以**自身 dial 地址**作为回源
+// Host（{http.reverse_proxy.upstream.hostport}）。这不是「用默认值替换无效库
+// 值」，而是把合法配置状态映射到第三档；显式拒绝两类错误产物：空 Host，以及
+// 客户端 Host（{http.request.hostport}）——后者正是上游 map 方案的缺陷。
+// 收为单出口是刻意的：回退语义只有一处可改，避免两处分支各自漂移。
+func fallbackHostPlan() upstreamHostPlan {
+	return upstreamHostPlan{usePlaceholder: true}
+}
+
+// hostPlanValueFor 从回源 Host 计划里取指定上游的有效值（含最终回退档的解析）：
+// 静态档统一取值；混合档查 overrideMap（未收录项=该上游回退自身地址）；全回退
+// 档返回空串表示「用自身地址」，调用侧按 joinUpstreamAddress 兜底。
+// 自定义路由上游（path_rules.upstreams_json）的逐行值由此函数派生。
+func hostPlanValueFor(plan upstreamHostPlan, host string, port int) (string, bool) {
+	if plan.staticHost != "" {
+		return plan.staticHost, true
+	}
+	if plan.overrideMap != nil {
+		if value, ok := plan.overrideMap[joinUpstreamAddress(host, port)]; ok {
+			return value, true
+		}
+		return "", true
+	}
+	if plan.usePlaceholder {
+		return "", true
+	}
+	return "", false
+}
+
+// lbRule / upstream / ruleWithUpstreams 生成期内存形态（lb_rules / upstreams
+// 行的渲染视图）。**原为 generateCaddyConfigFromStore 的函数内局部类型**，因
+// 自定义路由回源 Host 解析器 buildPathUpstreamHostResolver（董事长自研第 4 项
+// P 组）需在包级函数里读取「规则 + 其上游集合」，故提升为包级类型——定义体
+// 逐字未变，语义与填充路径完全一致（同一函数内 SELECT → append → 渲染）。
+type lbRule struct {
+	CaddyID                       string
+	Name                          string
+	Protocol                      string
+	Domain                        string
+	ListenPort                    int
+	Strategy                      string
+	DynamicDNS                    bool
+	EnableDnsServer               bool
+	DnsServer                     string
+	DnsFamily                     string
+	HealthCheckPath               string
+	HealthCheckInterval           int
+	HealthCheckTimeout            int
+	HealthCheckUnhealthyThreshold int
+	HealthCheckHealthyThreshold   int
+	EnableTLS                     bool
+	TLSSource                     string
+	TLSCert                       string
+	TLSKey                        string
+	TLSHTTPRedirect               bool
+	EnableCompress                bool
+	CompressTypes                 string
+	EnableActiveHealthCheck       bool
+	TCPHealthCheckPort            int
+	TCPProxyProtocol              bool
+	TCPTryDuration                int
+	TCPTryInterval                int
+	RequestBodyMaxSizeMB          int
+	UpstreamKeepaliveTimeout      int
+	ServerTokensHidden            int
+	NTLMCompatible                int
+	UpstreamForceHTTP1            int
+	// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底）。
+	ChainRaceIntervalMS        int
+	ChainRequestTimeoutMS      int
+	ForwardAuthEnabled         int
+	ForwardAuthUpstream        string
+	ForwardAuthURI             string
+	ForwardAuthCopyHeaders     string
+	CustomRoutesEnabled        bool
+	ProxyDialTimeout           int
+	ProxyResponseHeaderTimeout int
+	ProxyReadTimeout           int
+	ProxyWriteTimeout          int
+	ProxyStreamTimeout         int
+	ProxyFlushInterval         int
+	ProxyStreamCloseDelay      int
+	PathRules                  []PathRuleConfig
+	HostHeader                 string
+	HealthCheckHost            string
+	LogEnabled                 bool
+}
+
+// upstream 启用上游行（upstreams 表视图）。OriginDomain 即
+// `upstreams.origin_domain` 列，语义为自研版三级回退的第一档，见
+// UpstreamConfig.OriginDomain 注释。
+type upstream struct {
+	Host           string
+	Port           int
+	Weight         int
+	Enabled        bool
+	Protocol       string
+	MaxConnections int
+	OriginDomain   string
+}
+
+// ruleWithUpstreams 生成期规则与其启用上游集合的绑定（包级可见性理由见上）。
+type ruleWithUpstreams struct {
+	rule      lbRule
+	upstreams []upstream
+}
+
+// upstreamHostKey 统一「主机:端口」键（小写主机 + 端口），索引与查询同源拼写。
+func upstreamHostKey(host string, port int) string {
+	return strings.ToLower(net.JoinHostPort(strings.TrimSpace(host), fmt.Sprintf("%d", port)))
+}
+
+// pathUpstreamHostResolver 自定义路由上游（path_rules.upstreams_json 里的
+// address:port）的回源 Host 解析入口。自定义路由前端不携带该字段（董事长
+// 2026-10-10 裁定 `0c8ec276` 原话：「自定义路由的规则设定不该出现任何额外
+// 字段，回源 Host 全程是内部逻辑」），渲染期按「该地址是否出现在统一上游集合
+// 里」分派给两类解析器：
+//   - hoisted：地址在上游表里——用该上游所属规则的上游集合整体计划（与规则
+//     主链同一函数、同一三级回退），即逐上游 Host 优先、规则级兜底；
+//   - orphan：地址不在上游表里（外部/第三方地址）——Host 只有规则级（规则
+//     基础设置里的后端域名）一档，仍空才用自身地址。
+//
+// 两类都只回退到「规则级」与「自身地址」，**绝不透传客户端 Host**。
+// 归属：董事长核心自研第 4 项（P 组），登记见
+// docs/self-developed-features.zh-CN.md。
+type pathUpstreamHostResolver struct {
+	hoisted func(host string, port int) (string, bool)
+	orphan  func(ruleHostHeader string) string
+}
+
+// hostFor 解析单个自定义路由上游的回源 Host（ruleHostHeader 为当前规则级后端域名）。
+func (r *pathUpstreamHostResolver) hostFor(host string, port int, ruleHostHeader string) string {
+	if r == nil {
+		return ""
+	}
+	if r.hoisted != nil {
+		if value, ok := r.hoisted(host, port); ok {
+			return value
+		}
+	}
+	if r.orphan != nil {
+		return r.orphan(ruleHostHeader)
+	}
+	return ""
+}
+
+// buildPathUpstreamHostResolver 组装自定义路由上游的回源 Host 解析上下文。
+// 数据源为统一上游集合（upstreams 表 + 其规则级 host_header），键为「主机:端口」：
+//   - hoisted：地址命中集合 → 取「该地址所属规则」的上游集合整体计划里的对应值；
+//   - orphan：地址不在集合 → 只有规则级一档；规则级也为空 → 自身地址。
+//
+// 同一 host:port 命中多行/多规则时取首个命中（确定性：按规则集合顺序），此时
+// 取值来源可能与实际转发的那条不同——属配置歧义，由用户侧消歧（同一地址配成
+// 两台上游本身即属可疑配置），不阻断渲染。
+func buildPathUpstreamHostResolver(rulesByID map[string]*ruleWithUpstreams) *pathUpstreamHostResolver {
+	type ownerRef struct {
+		upstreams []UpstreamConfig
+		ruleHost  string
+	}
+	ownersByKey := make(map[string]ownerRef)
+	for _, entry := range rulesByID {
+		if entry == nil || entry.rule.Protocol != "http" {
+			continue
+		}
+		ups := make([]UpstreamConfig, 0, len(entry.upstreams))
+		for _, u := range entry.upstreams {
+			protocol := u.Protocol
+			if protocol == "" {
+				protocol = "http"
+			}
+			ups = append(ups, UpstreamConfig{
+				Host: u.Host, Port: u.Port, Weight: u.Weight, Protocol: protocol, Enabled: u.Enabled,
+				MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain,
+			})
+		}
+		for _, u := range entry.upstreams {
+			key := upstreamHostKey(u.Host, u.Port)
+			if _, seen := ownersByKey[key]; !seen {
+				ownersByKey[key] = ownerRef{upstreams: ups, ruleHost: entry.rule.HostHeader}
+			}
+		}
+	}
+	hoisted := func(host string, port int) (string, bool) {
+		owner, ok := ownersByKey[upstreamHostKey(host, port)]
+		if !ok || len(owner.upstreams) == 0 {
+			return "", false
+		}
+		return hostPlanValueFor(resolveUpstreamHostPlan(SingleRuleConfig{HostHeader: owner.ruleHost}, owner.upstreams), host, port)
+	}
+	// orphan 只依赖「规则级后端域名」，逐规则取值——解析器本身无状态，闭包由
+	// 调用点给出当前规则（同一份索引被所有规则复用，避免每规则重建）。
+	return &pathUpstreamHostResolver{
+		hoisted: hoisted,
+		orphan: func(ruleHostHeader string) string {
+			return strings.TrimSpace(ruleHostHeader)
+		},
+	}
+}
+
+// decodePathUpstreamsWithResolver 解析 path_rules.upstreams_json 并当场定下行内
+// 回源 Host。自定义路由的该字段全部由渲染期内部推导（董事长 2026-10-10 裁定：
+// 规则设定不新增额外字段，只有内部逻辑）：
+//   - 存储行里的 host_header 被**有意忽略**——外部负载（备份导入、API/MCP 直写）
+//     无法保证与统一上游集合一致，而回源 Host 属上游属性，配置真相只在 upstreams
+//     表；忽略它还让本特性的渲染与「前端回拨的旧值」解耦（同一份规则集合恒等价）；
+//   - 解析结果由 resolver 分派：地址在统一上游集合里走集合整体计划（逐上游优先、
+//     规则级兜底），不在集合里只走规则级、再空用自身地址（joinUpstreamAddress）。
+//
+// resolver 为 nil（无规则上下文的调用方）时行内留空，落到规则级/自身地址，
+// 与「地址不在统一上游集合里」同口径。
+func decodePathUpstreamsWithResolver(raw string, resolver *pathUpstreamHostResolver, ruleHostHeader string) ([]UpstreamConfig, error) {
+	var stored []struct {
+		Address  string `json:"address"`
+		Port     int    `json:"port"`
+		Weight   int    `json:"weight"`
+		Protocol string `json:"protocol"`
+		// HostHeader：外部负载里可能存在的历史值，有意不读取。
+		HostHeader string `json:"host_header"`
+	}
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		return nil, err
+	}
+	upstreams := make([]UpstreamConfig, 0, len(stored))
+	for _, item := range stored {
+		protocol := item.Protocol
+		if protocol == "" {
+			protocol = "http"
+		}
+		var hostHeader string
+		if resolver != nil {
+			hostHeader = strings.TrimSpace(resolver.hostFor(item.Address, item.Port, ruleHostHeader))
+		}
+		upstreams = append(upstreams, UpstreamConfig{
+			Host: strings.TrimSpace(item.Address), Port: item.Port, Weight: item.Weight, Protocol: protocol, Enabled: true,
+			OriginDomain: hostHeader,
+		})
+	}
+	return upstreams, nil
 }
 
 // blockStatusForPolicy 返回策略段的中断抬码（阶段化模型）：该策略在生成上下
@@ -4334,27 +4602,10 @@ func buildBlockPageAttributionRoute(synthetic int, hosts []string, content strin
 	}
 }
 
+// decodePathUpstreams 无推导上下文的解析入口（测试与「无规则上下文」调用方）：
+// 行内回源 Host 一律留空 → 规则级/自身地址，与历史行为逐字节一致。
 func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
-	var stored []struct {
-		Address  string `json:"address"`
-		Port     int    `json:"port"`
-		Weight   int    `json:"weight"`
-		Protocol string `json:"protocol"`
-	}
-	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
-		return nil, err
-	}
-	upstreams := make([]UpstreamConfig, 0, len(stored))
-	for _, item := range stored {
-		protocol := item.Protocol
-		if protocol == "" {
-			protocol = "http"
-		}
-		upstreams = append(upstreams, UpstreamConfig{
-			Host: strings.TrimSpace(item.Address), Port: item.Port, Weight: item.Weight, Protocol: protocol, Enabled: true,
-		})
-	}
-	return upstreams, nil
+	return decodePathUpstreamsWithResolver(raw, nil, "")
 }
 
 // firstPolicyWithBlockPage 按绑定序返回首个「拦截页内容非空」的策略与其页内容
@@ -4993,12 +5244,6 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	upstreamList := make([]interface{}, 0, len(enabledUpstreams))
 	upstreamWeights := make([]int, 0, len(enabledUpstreams))
 	hasHTTPSUpstream := false
-	// 逐上游回源域名（2026-10-10，原生 map 方案）：dial→origin_domain 收敛表。
-	// 仅静态模式收录——dynamic_dns 池 dial=解析后 IP（请求期才确定），静态映射
-	// 永不命中（校验侧另 400 拒绝，此处为渲染守卫）；同 dial 重复条目首现生效
-	// （map Validate 拒绝重复 input，map.go:107-115——保存侧查重之外的防御）。
-	originDomains := make(map[string]string, len(enabledUpstreams))
-	originDialOrder := make([]string, 0, len(enabledUpstreams))
 	for _, upstream := range enabledUpstreams {
 		weight := upstream.Weight
 		if weight <= 0 {
@@ -5034,18 +5279,28 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			if upstream.MaxConnections > 0 {
 				entry["max_requests"] = upstream.MaxConnections
 			}
-			if upstream.OriginDomain != "" {
-				if _, dup := originDomains[dial]; !dup {
-					originDomains[dial] = upstream.OriginDomain
-					originDialOrder = append(originDialOrder, dial)
-				}
-			}
 			upstreamList = append(upstreamList, entry)
 		}
 		if upstream.Protocol == "https" {
 			hasHTTPSUpstream = true
 		}
 	}
+
+	// ── 逐上游回源 Host 三级回退（董事长自研第 4 项，2026-10-09）──────────
+	// 优先级：上游自定义 origin_domain > 规则级 host_header > 上游自身 host:port。
+	// Caddy 单个 reverse_proxy 的请求头操作为 handler 级——同一负载池共享一个
+	// Host 值：全统一态用静态值；全回退态用
+	// {http.reverse_proxy.upstream.hostport}（等价每上游用自身地址）；混合态
+	// （上游间取值不一致）由 lb_upstream_host 处理器（caddygeoip 模块
+	// http.handlers.lb_upstream_host）在请求期按选中上游惰性下发——负载均衡/
+	// 健康检查/重试语义不变。TLS server_name 同源取值（混合态走
+	// {lb.upstream_sni}，处理器侧剥端口）。
+	//
+	// 与上游 map 方案的关键区分：**任何回退态都不使用
+	// {http.request.hostport}**（那等于透传客户端 Host，属上游缺陷）。见
+	// docs/upstream-origin-host-compare.zh-CN.md §2.4 与
+	// docs/self-developed-features.zh-CN.md 第 4 项。
+	hostPlan := resolveUpstreamHostPlan(rule, enabledUpstreams)
 
 	// 链式回退（2026-10-09）：strategy=chain_fallback 渲染为自定义 chain_proxy
 	// 处理器（caddychain 模块）——上游按权重降序组成回退链，竞速 + 兜底截断 +
@@ -5175,15 +5430,19 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		}
 		transportConfig := map[string]interface{}{"protocol": protocol}
 		if hasHTTPSUpstream {
-			// 逐上游回源域名在场时 SNI 改走占位符（server_name 占位符逐连接展开
-			// 实证，httptransport.go:427-446）。已知限制：主动健康检查 probe 用
-			// 全新 replacer（healthchecks.go:442），占位符不展开→probe 不发 SNI；
-			// 项目恒 insecure_skip_verify，TLS 层不断（严格 SNI 多租户上游为边角）。
-			// 静态路径同样剥端口（2026-10-10 用户裁定）：SNI 无端口语义（RFC 6066），
-			// host_header 带端口时原样透传是畸形值；Host 头侧（:3760+）保留端口原样。
+			// SNI 取自回源 Host 计划的 sniTarget（四态同源）：静态统一态=该值剥端口
+			// （SNI 无端口语义，RFC 6066；Host 头侧保留端口原样）；混合态=
+			// {lb.upstream_sni}（server_name 占位符逐连接展开实证，
+			// httptransport.go:427-446，处理器侧剥端口）；全回退态=""（维持规则级
+			// HostHeader 现状语义，等价 Caddy 以 dial host 兜底）。
+			// 已知限制：主动健康检查 probe 用全新 replacer（healthchecks.go:442），
+			// 占位符不展开→probe 不发 SNI；项目恒 insecure_skip_verify，TLS 层不断
+			// （严格 SNI 多租户上游为边角）。
 			serverName := stripOriginPort(rule.HostHeader)
-			if len(originDomains) > 0 {
-				serverName = "{lb.upstream_sni}"
+			if hostPlan.sniTarget != "" {
+				serverName = hostPlan.sniTarget
+			} else if hostPlan.staticHost != "" {
+				serverName = stripOriginPort(hostPlan.staticHost)
 			}
 			transportConfig["tls"] = map[string]interface{}{
 				"insecure_skip_verify": true,
@@ -5228,12 +5487,16 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	proxyRequestHeaders := map[string]interface{}{
 		"delete": lbInternalControlHeaders,
 	}
-	// 回源域名在场时 Host 头改走 map 占位符（defaults 已烘焙 host_header/透传
-	// 回退链）；否则维持静态 host_header 或透传现状。
-	if len(originDomains) > 0 {
+	// 回源 Host 下发（三级回退计划；有启用上游时四态必居其一——恒显式设置 Host，
+	// 全回退态从「透传客户端 Host」改为「每上游用自身 host:port」，与程序定位
+	// 一致：默认即以回源目标身份访问）。
+	switch {
+	case hostPlan.overrideMap != nil:
 		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{lb.upstream_host}"}}
-	} else if rule.HostHeader != "" {
-		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{rule.HostHeader}}
+	case hostPlan.staticHost != "":
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{hostPlan.staticHost}}
+	case hostPlan.usePlaceholder:
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{http.reverse_proxy.upstream.hostport}"}}
 	}
 	proxyConfig["headers"] = map[string]interface{}{"request": proxyRequestHeaders}
 	if effectiveServerTokensHidden {
@@ -5246,43 +5509,15 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
 		})
 	}
-	// 逐上游回源域名（2026-10-10）：内建 http.handlers.map 晚绑定查表——Source
-	// {http.reverse_proxy.upstream.hostport} 在占位符被使用时才求值（map.go:138），
-	// 恰为 reverse_proxy 选中上游后（reverseproxy.go:663-692：每次 attempt 先 Set
-	// 上游占位符再展开 headers/transport，重试换上游逐次重展开）。defaults 回退链
-	// 精确复现现状：Host=host_header 或池形态回退；SNI=host_header 剥端口或 dial
-	// 主机名（stdlib 空 server_name 默认）。originDialOrder 保持上游 SELECT 序。
-	// Host 回退按池形态分流——{http.request.
-	// hostport} 绑原始请求（replacer.go:128-129），在 TLS 池恒为客户端 Host，
-	// 不等于现状的 transport 注入 hostport；TLS 池改 {http.reverse_proxy.
-	// upstream.hostport}（reverseproxy.go:664-668 先于 userOps 设置，可用）。
-	if len(originDialOrder) > 0 {
-		hostFallback := rule.HostHeader
-		if hostFallback == "" {
-			if hasHTTPSUpstream {
-				hostFallback = "{http.reverse_proxy.upstream.hostport}"
-			} else {
-				hostFallback = "{http.request.hostport}"
-			}
-		}
-		sniFallback := stripOriginPort(rule.HostHeader)
-		if sniFallback == "" {
-			sniFallback = "{http.reverse_proxy.upstream.host}"
-		}
-		mappings := make([]map[string]interface{}, 0, len(originDialOrder))
-		for _, dial := range originDialOrder {
-			origin := originDomains[dial]
-			mappings = append(mappings, map[string]interface{}{
-				"input":   dial,
-				"outputs": []string{origin, stripOriginPort(origin)},
-			})
-		}
+	// 混合态：lb_upstream_host（caddygeoip 模块）须先于 reverse_proxy 执行——
+	// 请求期向 replacer 注册惰性占位符提供者 {lb.upstream_host}/{lb.upstream_sni}，
+	// reverse_proxy 选中上游后求值（每次 attempt 先 Set 上游占位符再展开
+	// headers/transport，重试换上游逐次重展开）。未收录上游由处理器未命中兜底
+	// 回自身地址，**绝不透传客户端 Host**。
+	if hostPlan.overrideMap != nil {
 		handleChain = append(handleChain, map[string]interface{}{
-			"handler":      "map",
-			"source":       "{http.reverse_proxy.upstream.hostport}",
-			"destinations": []string{"{lb.upstream_host}", "{lb.upstream_sni}"},
-			"mappings":     mappings,
-			"defaults":     []string{hostFallback, sniFallback},
+			"handler": "lb_upstream_host",
+			"hosts":   hostPlan.overrideMap,
 		})
 	}
 	handleChain = append(handleChain, proxyConfig)
