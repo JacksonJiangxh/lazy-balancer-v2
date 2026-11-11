@@ -217,13 +217,11 @@ func run() error {
 	caddyReloader := func() error {
 		return caddyService.GenerateAndApplyConfigForce()
 	}
-	// 代理默认监听口注入渲染层（HTTP_PORT/HTTPS_PORT，ISSUE #7）：兜底站监听口、
-	// HTTP→HTTPS 跳转 Location 判定、规则侧保留端口判定同源。只影响默认语义，
-	// 不动存量规则的 listen_port（那是持久化数据，保存时以面板值为准）。
+	// 代理默认监听口注入渲染层（兜底站/跳转判定/保留端口判定同源；只影响默认语义）。
+	// 详见 docs/fork-notes/watchdog-and-server.md §4
 	services.SetDefaultProxyPorts(cfg.HTTPPort, cfg.HTTPSPort)
-	// 引用型证书（tls_source="file"）外部更新自动摄取：看门狗检出 /app/certs 内
-	// 源文件变化后读取校验并回写 DB（运行时唯一信任源是数据库），再复用同一强制
-	// 重载执行体（物化路径不变导致渲染 JSON 同字节，必须 force）。
+	// 引用型证书外部更新自动摄取：看门狗回写 DB 后复用同一强制重载执行体（必须 force）。
+	// 详见 docs/fork-notes/watchdog-and-server.md §5
 	services.SetReferencedCertReload(caddyReloader)
 	// CA 证书队列走 InLock 变体——部署临界区按全局锁序
 	// CaddyOpLock → DeployLock 先持 CaddyOpLock（与规则补偿恢复链同序，

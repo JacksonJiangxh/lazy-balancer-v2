@@ -23,29 +23,12 @@ const (
 	upstreamSNIPlaceholder = "lb.upstream_sni"
 )
 
-// UpstreamHostOverride 逐上游回源 Host 覆盖处理器（http.handlers.lb_upstream_host）。
-//
-// 背景：Caddy 单个 reverse_proxy 的请求头操作是 handler 级配置——同一负载池的
-// 所有上游共享一个 Host 值（静态串或 {http.reverse_proxy.upstream.hostport}
-// 占位符），无法表达「同一规则内不同上游使用不同静态回源 Host」。本处理器在
-// 请求期向 replacer 注册惰性占位符，求值时机恰为 reverse_proxy 选中上游之后
-// （reverseproxy.go v2.11.x：先 repl.Set("http.reverse_proxy.upstream.hostport")
-// 再应用 headers/transport 占位符），此时按选中的 hostport 查表下发对应回源
-// Host——使「上游自定义 > 规则级 > 上游自身」三级回退在单一负载池内成立，
-// 负载均衡/健康检查/重试语义不变。
-//
-// 稳定设计：零 Provision/零失败模式；未配置映射或 replacer 上下文缺失时纯
-// 透传；未命中映射回退上游自身地址（绝不产出空 Host、绝不透传客户端 Host）；
-// next 原样透传。
-//
-// 归属：**董事长核心自研第 4 项**（回源 Host 逐上游自定义），登记见
-// docs/self-developed-features.zh-CN.md。禁止以「上游同需求两实现」为由切回
-// Caddy 内建 http.handlers.map 方案（上游实现存在三处缺陷，见
-// docs/upstream-origin-host-compare.zh-CN.md §2.4）。
+// UpstreamHostOverride 逐上游回源 Host 覆盖处理器（lb_upstream_host）。
+// 要点：请求期惰性占位符，在 reverse_proxy 选中上游后按 hostport 查表下发；禁切回内建 map 方案。
+// 详见 docs/fork-notes/caddygeoip-handler.md §2
 type UpstreamHostOverride struct {
-	// Hosts 上游 dial（host:port，与 {http.reverse_proxy.upstream.hostport}
-	// 输出同格式）→ 回源 Host 的映射；仅收录「有效回源 Host 非上游自身」的
-	// 条目，未收录的上游由未命中兜底走自身地址（回退语义第三级）。
+	// Hosts 上游 dial(host:port) → 回源 Host 映射；仅收录「有效回源 Host 非上游自身」的条目。
+	// 详见 docs/fork-notes/caddygeoip-handler.md §3
 	Hosts map[string]string `json:"hosts,omitempty"`
 }
 

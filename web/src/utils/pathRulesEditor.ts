@@ -106,11 +106,9 @@ export const applyResponseMode = (rule: PathRule): void => {
  */
 export const pathRuleResponseError = (rule: PathRule): string => {
   if (rule.response_mode === 'redirect') {
-    // 注意：redirect 模式**不读 rule.response_status**——该值在 redirect 表单里
-    // 不展示（applyResponseMode 切换模式时不清它），读到的常是切换前的残留值
-    // （如 static 的 200）。渲染侧恒写 301，故此处只校验跳转目标本身；状态码
-    // 口径由「直接返回」模式的 static 分支与后端保存门负责。
-    // 形状判定查原串（仅空判用 trim）：后端按原串判定——`" http://x"`
+    // redirect 不读 rule.response_status（残留值会误伤）；形状判定查原串。
+    // 详见 docs/fork-notes/frontend.md §6
+    // 后端按原串判定——`" http://x"`
     // 若前端 trim 后放行，会在离开该步时被整组拒绝（late failure 复发）。
     const raw = rule.redirect_to ?? ''
     if (!raw.trim()) return '301 跳转需要填写跳转地址'

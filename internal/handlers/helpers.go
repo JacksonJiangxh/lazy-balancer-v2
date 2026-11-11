@@ -95,10 +95,8 @@ func validateTLSCertificate(certPEM, keyPEM string) error {
 	return err
 }
 
-// validateReferencedCertificateFiles 校验引用型证书（tls_source="file"）的文件
-// 路径与内容：路径须位于程序可读写证书目录内、文件存在可读、且证书与私钥配对
-// 合法。返回归一后的路径、已读取的 PEM 内容（保存时摄取入库——文件只是采集
-// 来源，运行时唯一信任源是数据库）与质量警告（不阻断，与 manual 同口径）。
+// validateReferencedCertificateFiles 校验引用型证书路径与配对合法性，返回归一路径、PEM 内容与质量警告。
+// 详见 docs/fork-notes/handlers-misc.md §1
 func validateReferencedCertificateFiles(certPath, keyPath, domain string) (certResolved, keyResolved, certPEM, keyPEM string, warnings []string, err error) {
 	referenced, loadErr := services.LoadReferencedCertificate(certPath, keyPath)
 	if loadErr != nil {

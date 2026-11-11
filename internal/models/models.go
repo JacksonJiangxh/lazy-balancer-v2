@@ -164,11 +164,8 @@ type LbRule struct {
 	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
 	NTLMCompatible     int `json:"ntlm_compatible"`
 	UpstreamForceHTTP1 int `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
-	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
-	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
-	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
-	// 该路。0 值在写侧（CreateRule/UpdateRule）与渲染侧兜底 3000/30000
-	//（预算公式：(N−1)×race+timeout ≤ 60s，按 N=6 封顶设计，见 caddy.go）。
+	// 链式回退竞速参数（仅 HTTP）：0 值在写侧与渲染侧兜底 3000/30000。
+	// 详见 docs/fork-notes/model-fields.md §1
 	ChainRaceIntervalMS   int `json:"chain_race_interval_ms"`
 	ChainRequestTimeoutMS int `json:"chain_request_timeout_ms"`
 	// 认证网关（forward_auth）：1=该规则全部请求先经认证网关校验（GET 子请求，
@@ -200,9 +197,8 @@ type LbRule struct {
 	CAProviderID    int    `json:"ca_provider_id"`
 	TLSCert         string `json:"tls_cert,omitempty"`
 	TLSKey          string `json:"tls_key,omitempty"`
-	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：/app/certs 内成品
-	// 证书文件的摄取源路径——保存时读取并校验，PEM 内容入库（tls_cert/tls_key，
-	// 与 manual 同列）；数据库是运行时唯一信任源，路径仅供看门狗检测外部更新。
+	// TLSCertPath/TLSKeyPath 引用型证书的摄取源路径（PEM 内容入库，DB 是运行时唯一信任源）。
+	// 详见 docs/fork-notes/model-fields.md §2
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
 	TLSKeyPath  string `json:"tls_key_path,omitempty"`
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key

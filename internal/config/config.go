@@ -32,11 +32,8 @@ type Config struct {
 	StaticDir string `json:"static_dir"`
 	Version   string `json:"version"`
 
-	// Proxy 默认监听口（HTTP_PORT / HTTPS_PORT env，默认 80/443）。
-	// host 网络下这俩就是 Caddy 实际绑定的端口，"换端口"=换监听口，不是端口转发。
-	// 语义范围（2026-10-10 用户裁定）：仅影响「默认值/兜底语义」——新建规则向导
-	// 默认值、TLS 联动、80/443 保留端口判定、空域名兜底站、HTTP→HTTPS 跳转的
-	// Location 自引用判定；存量规则的 listen_port 是持久化数据，不随之迁移。
+	// Proxy 默认监听口：host 网络下即 Caddy 实际绑定口；只影响默认值/兜底语义，不迁移存量。
+	// 详见 docs/fork-notes/ports-and-config.md §2
 	HTTPPort  int `json:"http_port"`
 	HTTPSPort int `json:"https_port"`
 

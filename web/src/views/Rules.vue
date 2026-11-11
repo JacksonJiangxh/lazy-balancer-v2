@@ -1643,9 +1643,8 @@ class CertInfoRefreshError extends Error {
 }
 
 const rules = ref<Rule[]>([])
-// 部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT，ISSUE #7）。
-// 出厂默认与后端一致；onMounted 拉取 /system/ports 后覆盖——保证「compose 改了
-// 变量、面板向导默认值随动」不割裂。只影响默认语义，不迁移存量规则的 listen_port。
+// 部署侧代理默认口与面板口；onMounted 拉取 /system/ports 后覆盖，只影响默认语义。
+// 详见 docs/fork-notes/frontend.md §8
 const proxyPorts = ref({ http_port: 80, https_port: 443, panel_port: 8000 })
 const fetchProxyPorts = async () => {
   try {
@@ -2451,9 +2450,8 @@ let preTcpSnapshot: { listenPort: number; enableTls: boolean } | null = null
 // （用户裁定）：启用 TLS 时端口直接默认 HTTPS 口（不仅是提示）——
 // 编辑态与创建态统一，开启分支必须先于 userExplicitPort 短路（2026-10-13
 // 生产实证：短路前置导致编辑态拨 TLS 永不改端口）。用户随后手动改端口即置
-// userExplicitPort，关闭方向的自动回 HTTP 口仍受其约束（既有语义）。
-// 自维护合并（圈层规则）：上游此处硬编码 443/80，本仓口径须走 proxyPorts
-// 动态默认口（默认端口换位能力，见 internal/services/default_ports.go）。
+// 自维护合并：上游此处硬编码 443/80，本仓须走 proxyPorts 动态默认口。
+// 详见 docs/fork-notes/frontend.md §8
 watch(() => wizardForm.enable_tls, (newVal, oldVal) => {
   if (hydratingWizard) return
   const defHttp = proxyPorts.value.http_port
@@ -2562,9 +2560,8 @@ watch(() => wizardForm.enable_active_health_check, (newVal) => {
 // 真实判据在服务端（validateRuleListenPortForSave 校验本进程面板端口 +
 // caddy_admin_url 端口 + 2019）：自定义部署（如面板 8443、admin 不落 2019）时
 // 这里可能漏拦/误拦，保存结果以服务端 400 为准（下方提示文案已声明）。
-// 管理口 / HTTP(S) 保留口随部署配置（/system/ports）：管理口含面板实际口与固定
-// 的 Caddy admin 2019；保留口取 HTTP_PORT/HTTPS_PORT（出厂 80/443）。computed
-// 以随 /system/ports 异步返回更新——向导校验实时用最新值。
+// 管理口 / 保留口随 /system/ports 异步更新（向导校验实时用最新值）。
+// 详见 docs/fork-notes/frontend.md §8
 const adminPorts = computed(() => [proxyPorts.value.panel_port, 8000, 2019])
 const httpReservedPorts = computed(() => [proxyPorts.value.http_port, proxyPorts.value.https_port])
 
@@ -2636,9 +2633,8 @@ const portWarning = computed(() => {
   return ''
 })
 
-// stalePortHint：编辑存量规则时，若其已存端口既非 HTTP 默认口也非 HTTPS 默认口
-// （说明部署侧换过口号或该规则建于换口前），提示保存语义——避免用户误以为改
-// compose 变量后老规则会自动跟着变（ISSUE #7：不自动迁移，手动改后保存即覆盖）。
+// stalePortHint：存量端口与当前默认口不符时提示「不自动迁移，改后保存即覆盖」。
+// 详见 docs/fork-notes/frontend.md §8
 const stalePortHint = computed(() => {
   if (!editingRule.value) return ''
   const stored = wizardForm.listen_port

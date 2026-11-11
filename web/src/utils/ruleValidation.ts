@@ -56,15 +56,9 @@ export const pathDuplicateKey = (matchType: 'prefix' | 'exact', raw: string): st
   `${matchType}:${matchType === 'prefix' ? canonicalPathKey('prefix', raw) : raw.trim()}`
 
 
-// 直接返回的状态码白名单（与后端 validStaticResponseStatuses /
-// services.staticResponseStatusCodes 三处同集，由 parity 钉测双向核验）。
-// 数组形态 + 标准全称单源自此导出——编辑器下拉（PathRulesEditor）只 import，
-// 禁止在组件侧再抄一份（曾双源：下拉可选但保存被拒）。
-//
-// 2026-11-11 TASK-2026-1111-01：按董事长自研口径从 11 码扩至 **19 码**——补入
-// 3xx 五码 + 405/429/504，并保留 201（存量兼容：201 规则在旧白名单内，
-// 移出会让存量数据连改名都保存不了；后端保存时仅打 warn 日志提醒
-// 「Created 应创建资源并给 Location，静态短路不创建资源，建议改用 200」）。
+// 直接返回的状态码白名单：19 码，与后端三处同集（parity 钉测双向核验）。
+// 单源自此导出，编辑器下拉只 import，禁在组件侧再抄一份（曾双源：下拉可选但保存被拒）。
+// 详见 docs/fork-notes/frontend.md §1
 export const STATIC_RESPONSE_STATUSES: readonly number[] = [
   200, 201, 204,
   301, 302, 303, 307, 308,
@@ -83,9 +77,8 @@ export const STATIC_RESPONSE_STATUS_REASONS: Readonly<Record<number, string>> = 
 /** 重定向类状态码判定（3xx）：与后端 services.StaticResponseIsRedirectStatus 同口径。 */
 export const isRedirectResponseStatus = (status: number): boolean => status >= 300 && status < 400
 
-/**
- * 响应体是否被允许（204/304 与全部 3xx 不允许，RFC 9110）——与后端
- * services.StaticResponseBodyAllowed 同口径。
+/** 响应体是否被允许（204/304 与全部 3xx 不允许，RFC 9110）——与后端同口径。
+ *  详见 docs/fork-notes/frontend.md §2
  */
 export const isResponseBodyAllowed = (status: number): boolean =>
   status !== 204 && status !== 304 && !isRedirectResponseStatus(status)
@@ -93,9 +86,8 @@ export const isResponseBodyAllowed = (status: number): boolean =>
 /** 响应体长度上限（按码点计），与后端 staticResponseBodyMaxRunes 同值。 */
 export const STATIC_RESPONSE_BODY_MAX_RUNES = 4096
 
-/**
- * 跳转目标形状判定——与后端 isValidStaticRedirectTarget 同口径：http(s)://
- * 绝对地址（大小写不敏感）或 / 开头站内路径，且不含空格与控制字符。
+/** 跳转目标形状判定——与后端 isValidStaticRedirectTarget 同口径。
+ *  详见 docs/fork-notes/frontend.md §3
  */
 export const isValidRedirectTargetShape = (target: string): boolean => {
   // eslint-disable-next-line no-control-regex
@@ -165,9 +157,8 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     // 'forward' 为 UI 选择器哨兵（el-select 空串选项不显示标签），与 '' 同义
     const responseMode = rule.response_mode === 'forward' ? '' : (rule.response_mode ?? '')
     if (responseMode === 'static') {
-      // 与后端 validateStaticResponseModeFields 逐条同口径（顺序也一致：
-      // 状态码 → 禁体码 → 长度 → 控制字符 → 格式 → 跳转目标），保证行内红框
-      // 与保存被拒是同一句话，不出现「前端放行、保存 400」的晚失败。
+      // 与后端 validateStaticResponseModeFields 逐条同口径同顺序，避免「前端放行、保存 400」。
+      // 详见 docs/fork-notes/frontend.md §4
       const status = rule.response_status || 200
       if (!STATIC_RESPONSE_STATUS_SET[status]) return `第 ${rowNumber} 条路径：直接返回的状态码 ${status} 不在常用集合`
       const body = rule.response_body ?? ''
@@ -190,10 +181,8 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
       continue
     }
     if (responseMode === 'redirect') {
-      // redirect 恒 301（渲染侧恒写 301）。**不读 rule.response_status**：该字段在
-      // redirect 表单里不展示（applyResponseMode 切模式时不清它），读到的常是
-      // 切换前的残留值（如 static 的 200），据此报错会误伤合法配置。后端保存门
-      // 对显式非 301 值有权威拒绝（API/MCP 直写面），UI 面无需重复。
+      // redirect 恒 301；不读 rule.response_status（切换模式残留值会误伤合法配置）。
+      // 详见 docs/fork-notes/frontend.md §5
       const target = rule.redirect_to ?? ''
       if (!target.trim()) return `第 ${rowNumber} 条路径：301 跳转需要填写跳转地址`
       // 形状校验与后端 isValidStaticRedirectTarget 同源（多拒空格）

@@ -61,13 +61,8 @@ func ResetConfigDrift() {
 	ResetReferencedCertWatch()
 }
 
-// 引用型证书（tls_source="file"）外部更新自动摄取（摄取入库语义）：引用文件只是
-// 采集来源——保存时已把 PEM 内容入库，运行时唯一信任源是数据库。看门狗（主节点，
-// 60s 节拍）检测 /app/certs 内源文件的内容指纹变化，变化后读取并校验新内容回写
-// DB（tls_cert/tls_key，审计留痕），再触发强制重载：物化路径不变导致渲染 JSON
-// 同字节，普通 apply 会被 errSameConfig 短路（caddy changeConfig），必须 force
-// 变体让 Caddy 重新 provision TLS 证书。文件缺失/配对无效时跳过本轮摄取并留痕，
-// DB 保留上次有效内容（last-good），下轮重试。
+// 引用型证书外部更新自动摄取：看门狗检出指纹变化 → 校验回写 DB → 强制重载（必须 force）。
+// 详见 docs/fork-notes/watchdog-and-server.md §1
 var (
 	referencedCertWatchMu    sync.Mutex
 	referencedCertWatchState = map[string]string{}
@@ -87,9 +82,8 @@ func ResetReferencedCertWatch() {
 	referencedCertWatchReady = false
 }
 
-// checkReferencedCertFiles 扫描引用型证书规则，逐条比对证书/私钥源文件的内容
-// 指纹；检出变化即摄取新内容回写 DB（校验失败/文件缺失跳过并留痕），任一回写
-// 成功后触发强制重载。首扫仅建基线不摄取——避免启动/升主即产生一次多余重载。
+// checkReferencedCertFiles 逐条比对证书源文件指纹，变化即摄取回写并强制重载（首扫仅建基线）。
+// 详见 docs/fork-notes/watchdog-and-server.md §2
 func checkReferencedCertFiles() {
 	if db.DB == nil {
 		return
@@ -307,9 +301,8 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	if !isMaster {
 		return nil
 	}
-	// 引用型证书文件变化检测（外部更新 /app/certs 内成品证书后自动摄取入库并重载）：
-	// 与一致性检查同节拍、同主节点门（从节点 Caddy 无需本地证书热更），复用
-	// 上方同一次角色查询——不另发 is_master 查询。
+	// 引用型证书文件变化检测：与一致性检查同节拍、同主节点门，复用同一次角色查询。
+	// 详见 docs/fork-notes/watchdog-and-server.md §3
 	checkReferencedCertFiles()
 	defer func() {
 		if r := recover(); r != nil {
