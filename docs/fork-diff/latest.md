@@ -10,26 +10,26 @@
 | 项 | 值 |
 |---|---|
 | 基线（上游） | `0cd475ed` = `0cd475ed8b2e8bd130ef5a4c5ef2392db9962076` |
-| 目标（我们） | `HEAD` = `66e0edcc75c8423a72f15d03136e05c2c625591e` |
+| 目标（我们） | `HEAD` = `416d462c5671344ad4e7f83fde5a0adf518a9476` |
 | 上游下一版（可选） | 未提供（`upstream_also_touched` 全为 null） |
-| **差异文件数** | **100** |
-| 新增 / 删除行 | **+17283 / −564** |
-| 变更块（hunk）总数 | **261** |
+| **差异文件数** | **111** |
+| 新增 / 删除行 | **+18250 / −573** |
+| 变更块（hunk）总数 | **271** |
 | 自研项编号（登记文件解析） | 1,2,3,4 |
 
 ## 二、按变更类型
 
 | 类型 | 文件数 |
 |---|---|
-| A | 49 |
+| A | 60 |
 | M | 51 |
 
 ## 三、按自研归属（`self_dev_feature`）
 
 | 归属 | 文件数 | 含义 |
 |---|---|---|
-| docs | 18 | 文档 / 台账 |
-| infra | 14 | 基建 / CI / 工具链 / 依赖 |
+| docs | 28 | 文档 / 台账 |
+| infra | 15 | 基建 / CI / 工具链 / 依赖 |
 | none | 54 | 非自研：上游文件上的自维护补丁或追平适配 |
 | self_dev:1 | 8 | 自研能力本体或其挂点（命中登记符号/路径） |
 | self_dev:2 | 3 | 自研能力本体或其挂点（命中登记符号/路径） |
@@ -40,12 +40,12 @@
 
 | 域 | 文件数 | 新增 | 删除 | hunk |
 |---|---|---:|---:|---:|
-| backend | 19 | 1850 | 292 | 120 |
+| backend | 19 | 1609 | 299 | 119 |
 | deps | 3 | 732 | 0 | 3 |
-| docs | 17 | 6034 | 0 | 16 |
-| frontend | 7 | 280 | 50 | 43 |
-| infra | 13 | 2254 | 2 | 15 |
-| module | 4 | 906 | 0 | 4 |
+| docs | 27 | 7153 | 0 | 26 |
+| frontend | 7 | 264 | 52 | 43 |
+| infra | 14 | 2376 | 2 | 16 |
+| module | 4 | 889 | 0 | 4 |
 | specs | 1 | 348 | 0 | 1 |
 | test | 36 | 4879 | 220 | 59 |
 
@@ -75,21 +75,31 @@
 | `caddychain/lane.go` | A | module | self_dev:1 | 1 | 384 | 0 | — |
 | `caddychain/tunnel.go` | A | module | self_dev:1 | 1 | 146 | 0 | — |
 | `caddygeoip/caddy_decode_generated_config_test.go` | A | test | none | 1 | 308 | 0 | — |
-| `caddygeoip/upstream_host.go` | A | module | self_dev:4 | 1 | 102 | 0 | — |
+| `caddygeoip/upstream_host.go` | A | module | self_dev:4 | 1 | 85 | 0 | — |
 | `caddygeoip/upstream_host_test.go` | A | test | none | 1 | 216 | 0 | — |
-| `cmd/server/main.go` | M | backend | none | 1 | 8 | 0 | — |
+| `cmd/server/main.go` | M | backend | none | 1 | 6 | 0 | — |
 | `docs/fork-diff/drill-log.md` | A | docs | docs | 1 | 221 | 0 | — |
-| `docs/fork-diff/latest.json` | A | docs | docs | 1 | 112 | 0 | — |
-| `docs/fork-diff/latest.md` | A | docs | docs | 1 | 166 | 0 | — |
-| `docs/fork-minimization-analysis.zh-CN.md` | A | docs | docs | 1 | 383 | 0 | — |
+| `docs/fork-diff/latest.json` | A | docs | docs | 1 | 120 | 0 | — |
+| `docs/fork-diff/latest.md` | A | docs | docs | 1 | 174 | 0 | — |
+| `docs/fork-minimization-analysis.zh-CN.md` | A | docs | docs | 1 | 474 | 0 | — |
+| `docs/fork-notes/README.md` | A | docs | docs | 1 | 29 | 0 | — |
+| `docs/fork-notes/caddygeoip-handler.md` | A | docs | docs | 1 | 59 | 0 | — |
+| `docs/fork-notes/db-migrations.md` | A | docs | docs | 1 | 72 | 0 | — |
+| `docs/fork-notes/frontend.md` | A | docs | docs | 1 | 94 | 0 | — |
+| `docs/fork-notes/handlers-misc.md` | A | docs | docs | 1 | 45 | 0 | — |
+| `docs/fork-notes/model-fields.md` | A | docs | docs | 1 | 27 | 0 | — |
+| `docs/fork-notes/ports-and-config.md` | A | docs | docs | 1 | 34 | 0 | — |
+| `docs/fork-notes/render-chain.md` | A | docs | docs | 1 | 368 | 0 | — |
+| `docs/fork-notes/static-response-validation.md` | A | docs | docs | 1 | 126 | 0 | — |
+| `docs/fork-notes/tls-file-source.md` | A | docs | docs | 1 | 91 | 0 | — |
+| `docs/fork-notes/watchdog-and-server.md` | A | docs | docs | 1 | 49 | 0 | — |
 | `docs/self-developed-features.zh-CN.md` | A | docs | docs | 1 | 174 | 0 | — |
 | `docs/sysconf-gov-20261013-01-\346\202\254\347\251\272\345\274\225\347\224\250\345\244\204\347\275\256\350\241\250.md` | A | docs | docs | 0 | 285 | 0 | — |
-| `docs/upstream-catchup-guide-appendix.zh-CN.md` | A | docs | docs | 1 | 120 | 0 | — |
-| `docs/upstream-catchup-guide.zh-CN.md` | A | docs | docs | 1 | 175 | 0 | — |
+| `docs/upstream-catchup-guide.zh-CN.md` | A | docs | docs | 1 | 313 | 0 | — |
 | `docs/upstream-merge.zh-CN.md` | A | docs | docs | 1 | 766 | 0 | — |
 | `docs/upstream-origin-host-compare.zh-CN.md` | A | docs | docs | 1 | 649 | 0 | — |
 | `go.mod` | M | deps | infra | 1 | 2 | 0 | — |
-| `internal/config/config.go` | M | backend | none | 6 | 63 | 1 | — |
+| `internal/config/config.go` | M | backend | none | 6 | 60 | 1 | — |
 | `internal/config/config_test.go` | M | test | none | 1 | 10 | 0 | — |
 | `internal/config/ports_test.go` | A | test | none | 1 | 58 | 0 | — |
 | `internal/db/db.go` | M | backend | none | 11 | 164 | 5 | — |
@@ -100,15 +110,15 @@
 | `internal/handlers/b_core_regression_01_test.go` | M | test | none | 1 | 4 | 0 | — |
 | `internal/handlers/general_regression_09_test.go` | M | test | none | 1 | 1 | 1 | — |
 | `internal/handlers/handlers.go` | M | backend | none | 1 | 4 | 4 | — |
-| `internal/handlers/helpers.go` | M | backend | self_dev:2 | 2 | 21 | 3 | — |
+| `internal/handlers/helpers.go` | M | backend | self_dev:2 | 2 | 19 | 3 | — |
 | `internal/handlers/rule_chain_fallback_test.go` | A | test | none | 1 | 164 | 0 | — |
-| `internal/handlers/rule_features.go` | M | backend | none | 17 | 271 | 52 | — |
+| `internal/handlers/rule_features.go` | M | backend | none | 17 | 215 | 52 | — |
 | `internal/handlers/rule_features_static_response_test.go` | A | test | none | 1 | 342 | 0 | — |
 | `internal/handlers/rule_features_test.go` | M | test | none | 1 | 4 | 0 | — |
 | `internal/handlers/rule_pathrule_response_test.go` | M | test | none | 2 | 16 | 6 | — |
 | `internal/handlers/rule_tls_file_source_test.go` | A | test | none | 1 | 206 | 0 | — |
-| `internal/handlers/rules.go` | M | backend | none | 27 | 143 | 35 | — |
-| `internal/handlers/system.go` | M | backend | none | 1 | 30 | 0 | — |
+| `internal/handlers/rules.go` | M | backend | none | 27 | 136 | 35 | — |
+| `internal/handlers/system.go` | M | backend | none | 1 | 28 | 0 | — |
 | `internal/handlers/system_test.go` | M | test | none | 2 | 94 | 0 | — |
 | `internal/handlers/tcp_dead_fields_parity_test.go` | M | test | none | 1 | 2 | 0 | — |
 | `internal/mcpserver/mcp_routes_parity_test.go` | M | test | none | 1 | 1 | 0 | — |
@@ -116,25 +126,26 @@
 | `internal/mcpserver/server.go` | M | backend | none | 1 | 2 | 2 | — |
 | `internal/middleware/cluster_version.go` | M | backend | none | 2 | 4 | 0 | — |
 | `internal/middleware/middleware.go` | M | backend | none | 1 | 1 | 0 | — |
-| `internal/models/models.go` | M | backend | none | 7 | 41 | 12 | — |
+| `internal/models/models.go` | M | backend | none | 7 | 37 | 12 | — |
 | `internal/models/update_rule_clear_semantics_test.go` | M | test | none | 1 | 2 | 0 | — |
 | `internal/services/audit_action_mapping_test.go` | M | test | none | 1 | 3 | 2 | — |
-| `internal/services/caddy.go` | M | backend | self_dev:1,4 | 28 | 734 | 170 | — |
+| `internal/services/caddy.go` | M | backend | self_dev:1,4 | 27 | 592 | 177 | — |
 | `internal/services/caddy_chain_fallback_test.go` | A | test | none | 1 | 170 | 0 | — |
 | `internal/services/caddy_emit_config_validate_test.go` | A | test | none | 1 | 194 | 0 | — |
 | `internal/services/caddy_path_upstream_host_test.go` | A | test | none | 1 | 570 | 0 | — |
 | `internal/services/caddy_pathrule_response_test.go` | M | test | none | 3 | 176 | 4 | — |
 | `internal/services/caddy_upstream_origin_test.go` | M | test | self_dev:4 | 8 | 626 | 159 | — |
-| `internal/services/certstore.go` | M | backend | self_dev:2 | 5 | 174 | 5 | — |
+| `internal/services/certstore.go` | M | backend | self_dev:2 | 5 | 168 | 5 | — |
 | `internal/services/certstore_referenced_test.go` | A | test | none | 1 | 399 | 0 | — |
 | `internal/services/cluster_snapshot.go` | M | backend | none | 1 | 2 | 0 | — |
-| `internal/services/configwatchdog.go` | M | backend | none | 2 | 122 | 0 | — |
-| `internal/services/default_ports.go` | A | backend | self_dev:3 | 1 | 48 | 0 | — |
+| `internal/services/configwatchdog.go` | M | backend | none | 2 | 115 | 0 | — |
+| `internal/services/default_ports.go` | A | backend | self_dev:3 | 1 | 38 | 0 | — |
 | `internal/services/default_ports_test.go` | A | test | none | 1 | 158 | 0 | — |
 | `internal/services/enginerole_regression_01_test.go` | M | test | none | 1 | 1 | 1 | — |
 | `internal/services/render_anti_fallback_scan_test.go` | M | test | none | 6 | 65 | 8 | — |
 | `internal/services/rule_write_columns.go` | M | backend | none | 4 | 14 | 0 | — |
 | `internal/services/rule_write_columns_test.go` | M | test | none | 3 | 13 | 2 | — |
+| `scripts/check-doc-anchors.sh` | A | infra | infra | 1 | 122 | 0 | — |
 | `scripts/check-no-audit-artifacts.sh` | M | infra | infra | 1 | 15 | 1 | — |
 | `scripts/fork-diff.sh` | A | infra | infra | 1 | 617 | 0 | — |
 | `scripts/gate.sh` | A | infra | infra | 1 | 120 | 0 | — |
@@ -143,11 +154,11 @@
 | `scripts/verify-generated-config-decodes.sh` | A | infra | infra | 1 | 60 | 0 | — |
 | `web/src/components/rules/PathRulesEditor.vue` | M | frontend | none | 2 | 9 | 2 | — |
 | `web/src/types/rules.ts` | M | frontend | none | 6 | 19 | 0 | — |
-| `web/src/utils/auditActionTone.ts` | M | frontend | none | 1 | 4 | 0 | — |
-| `web/src/utils/pathRulesEditor.ts` | M | frontend | none | 2 | 37 | 5 | — |
-| `web/src/utils/ruleValidation.ts` | M | frontend | self_dev:2 | 2 | 67 | 12 | — |
+| `web/src/utils/auditActionTone.ts` | M | frontend | none | 1 | 3 | 0 | — |
+| `web/src/utils/pathRulesEditor.ts` | M | frontend | none | 2 | 35 | 5 | — |
+| `web/src/utils/ruleValidation.ts` | M | frontend | self_dev:2 | 2 | 58 | 14 | — |
 | `web/src/utils/strategyLabels.ts` | M | frontend | none | 3 | 7 | 2 | — |
-| `web/src/views/Rules.vue` | M | frontend | self_dev:1 | 27 | 137 | 29 | — |
+| `web/src/views/Rules.vue` | M | frontend | self_dev:1 | 27 | 133 | 29 | — |
 | `web/tests/pathRulesEditor.spec.ts` | M | test | none | 2 | 4 | 4 | — |
 | `web/tests/ruleValidation.spec.ts` | M | test | none | 5 | 135 | 27 | — |
 | `web/tests/rulesUi.spec.ts` | M | test | none | 1 | 3 | 1 | — |
@@ -163,7 +174,7 @@
 | `internal/handlers/rule_features.go` | none | 17 | — | — |
 | `internal/handlers/rules.go` | none | 27 | — | — |
 | `internal/models/models.go` | none | 7 | — | — |
-| `internal/services/caddy.go` | self_dev:1,4 | 28 | — | path:internal/services/caddy.go |
+| `internal/services/caddy.go` | self_dev:1,4 | 27 | — | path:internal/services/caddy.go |
 | `internal/services/caddy_upstream_origin_test.go` | self_dev:4 | 8 | — | path:internal/services/caddy_upstream_origin_test.go |
 | `internal/services/certstore.go` | self_dev:2 | 5 | — | path:internal/services/certstore.go |
 | `internal/services/render_anti_fallback_scan_test.go` | none | 6 | — | — |

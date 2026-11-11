@@ -472,3 +472,39 @@ H2 整体推迟到下次真实追平——届时能拿到真实用户库，一�
 > （形如 `0x0030 68 65 73...` 的 hexdump，内含文件名/行号偏移）。
 > 剥离后**差异为 0 行**；未剥离时差异 192 行，**逐行检查确认全部是上述调试数据块，无一条机器指令**。
 
+### 7.5 重跑 O1（O2-6）：改造后新清单 vs §2.3 预测
+
+`bash scripts/fork-diff.sh 0cd475ed <r2 HEAD>` → **111 个差异路径**（`+18250 / −573`，`hunk 271`）。
+
+| 指标 | §2.3 预测（做完 H1） | 实测（r2 提交后） | 结论 |
+|---|---:|---:|---|
+| 差异文件数 | 92（不变） | **111** | ⚠️ **不降反升 +19** — 全是本轮**新增的资产**：11 份 `docs/fork-notes/*.md` + `scripts/check-doc-anchors.sh` + 台账增量。**文件数本就该涨**（§〇 结论 5：文件数是结果不是目标） |
+| 生产代码 hunk 数 | ≈95 | **125**（13 改造文件口径 126→125） | ❌ **预测不成立**，见 §7.1 第 1 条 |
+| 生产代码新增行 | ≈1466 | **约 3413 中 1670 落在 11 主文件** | ✅ 方向正确（11 主文件 −256 行） |
+| 生产代码注释占比 | ≈6% | **约 6%**（607→351 行 / 1670 行） | ✅ 命中 |
+| 总新增行 | ≈14089 | **18250** | ⚠️ 高于预测——因本轮把 11 份外置文档也计入了差异（知识从代码搬到了文档，总量守恒甚至微增，这是外置的**本质代价**） |
+
+> **诚实结论**：H1 达到的是「注释占比 26%→6%」这个目标，**没有**达到「hunk 数减半」。
+> 原因是外置不改变补丁的**侵入位置数量**，只改变每个位置的**文本体量**。
+> 下次追平的真实收益预期应改为：**同行冲突时的手工合并成本下降，而非冲突块数量下降**。
+
+### 7.6 本节的数字如何复核
+
+```bash
+# 7.1 的 11 主文件前后对比（前=66e0edcc，后=工作区/HEAD）
+git diff -U0 0cd475ed 66e0edcc -- internal/services/caddy.go internal/handlers/rule_features.go \
+  internal/db/db.go internal/handlers/rules.go internal/models/models.go internal/services/certstore.go \
+  internal/services/configwatchdog.go caddygeoip/upstream_host.go internal/services/default_ports.go \
+  internal/config/config.go web/src/views/Rules.vue | grep -cE '^\+[[:space:]]*(//|/\*|\*|#)'
+
+# 7.3 的「上游旧库无自维护列」
+git show 9c759716:internal/db/db.go | grep -c 'tls_cert_path\|chain_race_interval_ms'   # → 0
+
+# 7.4 的汇编等价（口径：指令部分）
+go build -a -gcflags='-S' ./internal/services/ > /tmp/a.asm 2>&1
+diff <(sed -E 's#\(\/[^)]*\)##g' /tmp/before.asm | grep -vE '^[[:space:]]+0x[0-9a-f]+ [0-9a-f]{2} ') \
+     <(sed -E 's#\(\/[^)]*\)##g' /tmp/a.asm     | grep -vE '^[[:space:]]+0x[0-9a-f]+ [0-9a-f]{2} ')   # → 无输出
+
+# 7.5 的新清单
+bash scripts/fork-diff.sh 0cd475ed HEAD
+```
