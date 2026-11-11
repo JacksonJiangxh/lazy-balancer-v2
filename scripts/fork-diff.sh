@@ -441,9 +441,9 @@ emit_json() {
 
   printf '{\n'
   printf '  "schema_version": 1,\n'
-  printf '  "base_ref": "%s",\n' "$(json_escape "$BASE_REF")"
+  printf '  "base_ref": "%s",\n' "$(json_escape "$(git rev-parse --verify "$BASE_REF^{commit}" 2>/dev/null || echo "$BASE_REF")")"
   printf '  "base_sha": "%s",\n' "$BASE_SHA"
-  printf '  "target_ref": "%s",\n' "$(json_escape "$TARGET_REF")"
+  printf '  "target_ref": "%s",\n' "$(json_escape "$(git rev-parse --verify "$TARGET_REF^{commit}" 2>/dev/null || echo "$TARGET_REF")")"
   printf '  "target_sha": "%s",\n' "$TARGET_SHA"
   if [ -n "$NEXT_SHA" ]; then
     printf '  "upstream_next_ref": "%s",\n' "$(json_escape "$UPSTREAM_NEXT")"
