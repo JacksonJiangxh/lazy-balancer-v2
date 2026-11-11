@@ -270,6 +270,37 @@ func TestPathRuleRoute_staticMode3xxRendersLocationNoBody(t *testing.T) {
 // Given: static 模式 + 204（白名单内）
 // When: 渲染
 // Then: 无 body、无 Content-Type（RFC 9110：204 不得带消息体）
+// 201 存量兼容（r2 总经理裁决）：存量 201 规则必须按原状渲染——201 属「带体、
+// 无 Location」的普通成功响应（StaticResponseBodyAllowed(201) 为 true），不得被
+// 当作 3xx 写 Location、也不得被当作 401/405 补必备头。渲染侧 v2.4.2 从未拦截
+// 201，本次改造不得让它变成另一种响应。
+func TestPathRuleRoute_staticMode201RendersBodyNoLocation(t *testing.T) {
+	h := renderOneStatic(t, PathRuleConfig{
+		SortOrder: 0, MatchType: "exact", Path: "/created", ResponseMode: "static",
+		ResponseStatus: 201, ResponseBody: "created", ResponseContentType: "text/plain",
+	})
+	if h["status_code"] != 201 {
+		t.Fatalf("status_code=%#v, want 201（存量 201 必须原状渲染）", h["status_code"])
+	}
+	if h["body"] != "created" {
+		t.Fatalf("201 必须携带响应体，got %#v", h["body"])
+	}
+	headers, _ := h["headers"].(map[string]interface{})
+	if _, has := headers["Location"]; has {
+		t.Fatalf("201 不得写 Location（201 非 3xx），got %#v", headers["Location"])
+	}
+	if _, has := headers["WWW-Authenticate"]; has {
+		t.Fatalf("201 不得写 WWW-Authenticate（仅 401），got %#v", headers["WWW-Authenticate"])
+	}
+	if _, has := headers["Allow"]; has {
+		t.Fatalf("201 不得写 Allow（仅 405），got %#v", headers["Allow"])
+	}
+	ct, ok := headers["Content-Type"].([]string)
+	if !ok || len(ct) != 1 || ct[0] != "text/plain; charset=utf-8" {
+		t.Fatalf("201 Content-Type=%#v, want [text/plain; charset=utf-8]", headers["Content-Type"])
+	}
+}
+
 func TestPathRuleRoute_staticMode204NoBodyNoContentType(t *testing.T) {
 	h := renderOneStatic(t, PathRuleConfig{
 		SortOrder: 0, MatchType: "exact", Path: "/noop", ResponseMode: "static", ResponseStatus: 204,
@@ -329,10 +360,10 @@ func TestPathRuleRoute_staticModeContentTypeCharset(t *testing.T) {
 
 // Given: 静态响应状态码清单
 // When: 取 StaticResponseStatusCodes
-// Then: 17 码、升序、含 3xx 五码与 405/429/504、不含 201
+// Then: 19 码、升序、含 3xx 五码与 405/429/504、含存量兼容的 201
 func TestStaticResponseStatusCodes(t *testing.T) {
 	codes := StaticResponseStatusCodes()
-	want := []int{200, 204, 301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 410, 429, 500, 502, 503, 504}
+	want := []int{200, 201, 204, 301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 410, 429, 500, 502, 503, 504}
 	if len(codes) != len(want) {
 		t.Fatalf("len=%d, want %d: %v", len(codes), len(want), codes)
 	}
@@ -341,8 +372,13 @@ func TestStaticResponseStatusCodes(t *testing.T) {
 			t.Fatalf("codes[%d]=%d, want %d（全表 %v）", i, codes[i], want[i], codes)
 		}
 	}
-	if StaticResponseIsSupportedStatus(201) {
-		t.Fatal("201 必须不在支持集合（Created 语义要求创建资源并给 Location，静态短路不创建资源）")
+	// 201 保留（r2 总经理裁决：存量兼容优先）。渲染侧本就未拦截 201——
+	// 它属「带体、无 Location」的普通成功响应，StaticResponseBodyAllowed(201) 为 true。
+	if !StaticResponseIsSupportedStatus(201) {
+		t.Fatal("201 必须在支持集合（存量 201 规则连改名都要能保存；保存时仅 warn 提醒语义）")
+	}
+	if !StaticResponseBodyAllowed(201) {
+		t.Fatal("201 必须允许响应体（201 不是 204/304/3xx）")
 	}
 	// 副本语义：调用方改动不得污染内部切片
 	codes[0] = 999

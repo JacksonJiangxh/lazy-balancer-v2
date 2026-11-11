@@ -4,7 +4,7 @@ package handlers
 // response_mode ∈ {''转发, static 静态响应, redirect 301 跳转}。
 //
 // 2026-11-11 TASK-2026-1111-01 强健度改造后口径：
-// static = 17 码白名单（含 3xx；选 3xx 须填跳转目标、该码不得带体）+ 响应体
+// static = 19 码白名单（含 3xx 与存量兼容的 201；选 3xx 须填跳转目标、该码不得带体）+ 响应体
 // ≤4096 字符 + 控制字符门 + 格式 {plain/json/html} + 非 3xx 禁 redirect_to；
 // redirect = 恒 301、目标必填（/ 开头相对路径或 http(s) 绝对 URL，不含空格与
 // 控制字符），禁 body/上游。逐条判据见 rule_features_static_response_test.go。

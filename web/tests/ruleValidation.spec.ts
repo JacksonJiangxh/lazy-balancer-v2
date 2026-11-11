@@ -199,9 +199,9 @@ test('直接返回：三处状态码白名单同集（前端 / handlers / servic
   )
   assert.deepEqual(serviceCodes, handlerCodes, 'services 权威集合必须与 handlers 校验白名单同集')
 
-  const expected = [200, 204, 301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 410, 429, 500, 502, 503, 504]
-  assert.deepEqual(handlerCodes, expected, '17 码集合口径（含 3xx 五码 + 405/429/504，不含 201）')
-  assert.equal(handlerCodes.includes(201), false, '201 必须已移出（Created 语义不适用于静态短路）')
+  const expected = [200, 201, 204, 301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 410, 429, 500, 502, 503, 504]
+  assert.deepEqual(handlerCodes, expected, '19 码集合口径（含 3xx 五码 + 405/429/504 + 存量兼容的 201）')
+  assert.equal(handlerCodes.includes(201), true, '201 必须保留（存量 201 规则连改名都要能保存；后端仅 warn）')
 
   // 响应体上限同源：前端常量必须等于后端 const
   const goConst = /const staticResponseBodyMaxRunes = (\d+)/.exec(repoCode('internal/handlers/rule_features.go'))
@@ -211,8 +211,8 @@ test('直接返回：三处状态码白名单同集（前端 / handlers / servic
   assert.equal(validatePathRules([rule({ response_mode: 'static' })]), null, '缺省状态码按 200')
 })
 
-test('直接返回：17 码逐一放行 / 非法码拒绝 / 3xx 缺目标拒绝 / 非 3xx 带目标拒绝', () => {
-  // 17 码逐一：3xx 必须带跳转目标，且不得带体；其余码不得带跳转目标
+test('直接返回：19 码逐一放行 / 非法码拒绝 / 3xx 缺目标拒绝 / 非 3xx 带目标拒绝', () => {
+  // 19 码逐一：3xx 必须带跳转目标，且不得带体；其余码不得带跳转目标
   for (const status of STATIC_RESPONSE_STATUSES) {
     const base = { response_mode: 'static' as const, response_status: status }
     if (isRedirectResponseStatus(status)) {
@@ -248,8 +248,8 @@ test('直接返回：17 码逐一放行 / 非法码拒绝 / 3xx 缺目标拒绝 
     validatePathRules([rule({ response_mode: 'static', response_status: 204, response_body: 'x' })]),
     '第 1 条路径：状态码 204 按 RFC 9110 不得携带响应内容（请清空内容）',
   )
-  // 非法码
-  for (const bad of [201, 418, 451, 999]) {
+  // 非法码（201 已回归白名单做存量兼容，不再列入）
+  for (const bad of [202, 418, 451, 999]) {
     assert.equal(
       validatePathRules([rule({ response_mode: 'static', response_status: bad })]),
       `第 1 条路径：直接返回的状态码 ${bad} 不在常用集合`,

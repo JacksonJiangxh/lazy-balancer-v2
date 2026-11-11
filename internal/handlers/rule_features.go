@@ -680,7 +680,7 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		}
 		// 直接返回/301 跳转（2026-10-10 用户裁定；2026-11-11 TASK-2026-1111-01 强健度
 		// 提回自研口径）：模式枚举 + 按模式字段门 + 与转发配置互斥。
-		// static=16 码白名单（含 3xx）+ 响应体上限 + 控制字符门 + 格式白名单，
+		// static=19 码白名单（含 3xx 与 201）+ 响应体上限 + 控制字符门 + 格式白名单，
 		// 选 3xx 时跳转目标必填；redirect=恒 301、目标必填且形状合法。
 		// 判据单源在 validateStaticResponsePathRule（与渲染侧 services 同口径），
 		// 校验失败文案带行号由本函数补——两个模式共用同一份判定，避免双写分叉。
@@ -696,6 +696,9 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			if pathRule.Upstreams != nil || pathRule.UpstreamPath != "" {
 				return fmt.Errorf("第 %d 条路径规则：直接返回模式与上游配置互斥（不访问上游）", index+1)
 			}
+			// 201 语义提醒（r2 总经理裁决：放行而非硬拒）。存量 201 规则必须
+			// 能被任何编辑保存，故此处只打 warn 日志、不返回错误。
+			warnStaticResponse201Semantics(index, pathRule)
 		case "redirect":
 			// redirect 恒 301：状态码为死配置（渲染侧恒写 301），非 301 值显性拒绝
 			// 而非静默忽略——避免「填了 302 实际发 301」的误配。
@@ -794,7 +797,7 @@ type storedPathRule struct {
 
 // validStaticResponseStatuses 直接返回的状态码白名单
 // （2026-10-10 用户裁定初版 11 码；2026-11-11 TASK-2026-1111-01 按董事长自研口径
-// 扩至 17 码）。
+// 扩至 19 码）。
 //
 // **单源纪律**：本表内容必须与 services.staticResponseStatusCodes 逐值同集，
 // 由 parity 钉测（rule_features_static_response_test.go）机械核验。校验与渲染
@@ -802,15 +805,54 @@ type storedPathRule struct {
 // services → handlers，而校验需要 O(1) 查表。渲染侧另有
 // services.StaticResponseIsSupportedStatus 供其它调用方复用。
 //
-// 与上游 v2.4.2 的 11 码差异：去掉 201（Created 是「已创建资源 + Location」
-// 语义，静态短路不创建资源，保留只会诱导误配），补入 3xx 五码 + 405/429/504。
+// 与上游 v2.4.2 的 11 码差异：补入 3xx 五码 + 405/429/504，并保留 201。
 // 3xx 进白名单的前提是渲染侧真实写 Location 并按 RFC 9110 不带响应体
 // （见 services.buildStaticResponseHandler）。
+//
+// **201 口径（r2 按总经理裁决修订）**：201 曾于 r1 被移出白名单，风控官 P1-2
+// 指出该改法会让「存量 201 规则连改名都存不了」——因本表在 validateRuleFeatures
+// 内对整条规则的每条 path_rule 执行，任何一次编辑都会整体被拒。现改回**放行**：
+// 201 属「带体、无 Location」的普通成功响应（StaticResponseBodyAllowed(201) 为
+// true，天然成立），渲染侧 v2.4.2 从未拦截。仅在新写入时给 warn 级提示提醒语义
+// 偏差（见 warnStaticResponse201Semantics），**提醒而非拦截**。
 var validStaticResponseStatuses = map[int]bool{
-	200: true, 204: true,
+	200: true, 201: true, 204: true,
 	301: true, 302: true, 303: true, 307: true, 308: true,
 	400: true, 401: true, 403: true, 404: true, 405: true, 410: true, 429: true,
 	500: true, 502: true, 503: true, 504: true,
+}
+
+// staticResponseDeprecatedSemantics 登记「可保存但语义可疑」的状态码及提示文案。
+//
+// 与白名单的关系：本表是白名单的**子集**，不是第二道门——命中不拦截、只打
+// warn 日志（services.Logf("warn", ...)）。设计动机：201 在 RFC 9110 §15.3.2
+// 里是「服务端已按请求创建资源并应返回其位置」，而静态短路响应不创建任何资源，
+// 用它表达「成功」属语义误用；但存量数据里可能已有 201 规则（v2.4.2 的 11 码
+// 白名单本就含 201），硬拒会让用户「连改名都存不了」。故取「放行 + 提醒」。
+var staticResponseDeprecatedSemantics = map[int]string{
+	201: "201 语义为已创建资源（应带 Location 指向新资源），静态短路不创建资源，建议改用 200",
+}
+
+// warnStaticResponse201Semantics 对命中 staticResponseDeprecatedSemantics 的
+// 静态响应状态码打 warn 级日志。**纯提示，不参与任何拒绝判定**——保存流程在
+// 校验通过后调用，日志失败绝不影响保存结果。
+//
+// 定位信息只有行号 + 匹配方式 + 路径：ruleFeatureInput 不带规则名（校验入口是
+// 纯特性门，不持有规则标识），日志里用「路径规则」定位足够用户找到那一行。
+func warnStaticResponse201Semantics(index int, pathRule models.PathRule) {
+	if pathRule.ResponseMode != "static" {
+		return
+	}
+	status := pathRule.ResponseStatus
+	if status == 0 {
+		status = 200
+	}
+	hint, exists := staticResponseDeprecatedSemantics[status]
+	if !exists {
+		return
+	}
+	services.Logf("warn", "第 %d 条路径规则（%s %s）使用状态码 %d：%s",
+		index+1, pathRule.MatchType, pathRule.Path, status, hint)
 }
 
 // staticResponseBodyMaxRunes 响应体长度上限（按 Unicode 码点计，与前端

@@ -61,18 +61,19 @@ export const pathDuplicateKey = (matchType: 'prefix' | 'exact', raw: string): st
 // 数组形态 + 标准全称单源自此导出——编辑器下拉（PathRulesEditor）只 import，
 // 禁止在组件侧再抄一份（曾双源：下拉可选但保存被拒）。
 //
-// 2026-11-11 TASK-2026-1111-01：按董事长自研口径从 11 码扩至 17 码——补入
-// 3xx 五码 + 405/429/504，去掉 201（Created 语义要求创建资源并给 Location，
-// 静态短路不创建任何资源，保留只会诱导误配）。
+// 2026-11-11 TASK-2026-1111-01：按董事长自研口径从 11 码扩至 **19 码**——补入
+// 3xx 五码 + 405/429/504，并保留 201（存量兼容：201 规则在旧白名单内，
+// 移出会让存量数据连改名都保存不了；后端保存时仅打 warn 日志提醒
+// 「Created 应创建资源并给 Location，静态短路不创建资源，建议改用 200」）。
 export const STATIC_RESPONSE_STATUSES: readonly number[] = [
-  200, 204,
+  200, 201, 204,
   301, 302, 303, 307, 308,
   400, 401, 403, 404, 405, 410, 429,
   500, 502, 503, 504,
 ]
 
 export const STATIC_RESPONSE_STATUS_REASONS: Readonly<Record<number, string>> = {
-  200: 'OK', 204: 'No Content',
+  200: 'OK', 201: 'Created', 204: 'No Content',
   301: 'Moved Permanently', 302: 'Found', 303: 'See Other', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
   400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
   405: 'Method Not Allowed', 410: 'Gone', 429: 'Too Many Requests',

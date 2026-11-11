@@ -173,7 +173,7 @@ DB 为唯一事实源，看门狗回写 DB」。涉及 `tls_cert_path` / `tls_ke
 | 响应体/类型 | `response_body` / `content_type` | `response_body` / `response_content_type` |
 | 能力粒度 | 一个 `respond` 管「静态响应 + 3xx 跳转」 | 拆成 `static` 与 `redirect` 两模式 |
 | 校验 | `validateStaticResponsePathRule` | 内联 switch + 状态码白名单 |
-| 状态码白名单 | **16 码**（200/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | **11 码**（200/201/204/400/401/403/404/410/500/502/503，**无 3xx**）|
+| 状态码白名单 | **16 码**（历史口径，200/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | **11 码**（200/201/204/400/401/403/404/410/500/502/503，**无 3xx**）|
 | 响应体长度 | 无上限 | ≤64 字符（`rule_features.go:438`）|
 | 指标 | 我们补过 `lb_rule_metrics` | 上游在链首也补了 `lb_rule_metrics` |
 
@@ -617,8 +617,8 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 
 | 维度 | 上游 v2.4.2 原值 | 本轮（自研口径） | 落点 |
 |---|---|---|---|
-| 状态码白名单 | 11 码（无 3xx） | **17 码**（200/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | `services.staticResponseStatusCodes`、`handlers.validStaticResponseStatuses` |
-| 201 Created | 在白名单 | **移出**（Created 语义要求创建资源并给 Location，静态短路无资源可创建） | 同上 |
+| 状态码白名单 | 11 码（无 3xx） | **19 码**（200/201/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | `services.staticResponseStatusCodes`、`handlers.validStaticResponseStatuses` |
+| 201 Created | 在白名单 | **保留（存量豁免）**：r1 曾移出，致存量 201 规则连改名都保存不了；r2 按总经理裁决回归白名单，保存时仅打 `warn` 级日志提醒「Created 应创建资源并给 Location，静态短路不创建资源，建议改用 200」 | 同上 + `warnStaticResponse201Semantics` |
 | `static` 模式 3xx | 不放行 | 放行，**跳转目标必填** | `validateStaticResponseModeFields` |
 | 3xx/204 响应体 | 未按 RFC 区分 | **禁体**（RFC 9110） | 同上 + `services.StaticResponseBodyAllowed` |
 | 非 3xx 带跳转目标 | — | **显性拒绝**（误配报错，不静默忽略） | 同上 |
@@ -634,21 +634,23 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 **控制字符双面**：响应体放行常规空白（HTML/JSON 多行排版必需），跳转目标拒全部
 含空格与控制字符（Location 头裸空格必被客户端截断，属明确误配）。
 
-**存量兼容**：旧 11 码内除 201 外全部仍放行；201 存量配置保存时得显式报错与改名
-建议，**渲染行为不变**（残留 201 行仍按原状态码渲染）。`redirect` 模式零回归。
+**存量兼容**：旧 11 码内 11 码**全部**仍放行（含 201）；201 存量配置保存时仅得一条
+`warn` 级提示（提醒语义偏差、建议改 200），**不拦截保存**，**渲染行为不变**（201 属
+「带体、无 Location」的普通成功响应，`StaticResponseBodyAllowed(201)` 为 true）。
+`redirect` 模式零回归。
 
 ### 11.3 验证（分支 `feat/TASK-2026-1111-01-static-response`）
 
 - **构建/静态**：`go build ./...` + `go vet ./...` 全绿；`scripts/gate.sh` **PASS**
   （build×7 / vet / 冲突标记 0 / 上游 2095 路径 missing=0 / 版本锚点九处）。
 - **后端钉测**：`internal/handlers/rule_features_static_response_test.go` 覆盖
-  17 码逐一放行、非法码拒绝、3xx 缺目标拒绝、非 3xx 带目标拒绝、4096 界值（含
+  19 码逐一放行、非法码拒绝、3xx 缺目标拒绝、非 3xx 带目标拒绝、4096 界值（含
   中文/代理对按码点计）、控制字符门、跳转目标形状、3xx/204 禁体、redirect 只能
-  301、存量兼容、转发模式零影响；`internal/services/caddy_pathrule_response_test.go`
+  301、存量兼容（含 201 改名可保存）、转发模式零影响；`internal/services/caddy_pathrule_response_test.go`
   新增 3xx 渲染（Location + 无体 + 无 Content-Type）、204 无体、405/401 必备头、
-  charset 兜底、17 码清单副本语义。
+  charset 兜底、19 码清单副本语义。
 - **前端**：`npx vue-tsc --noEmit` 零错误；`npm test` **1601 pass / 0 fail**
-  （新增三处白名单同集 parity、17 码边界、4096 界值、控制字符、形状同源）。
+  （新增三处白名单同集 parity、19 码边界、4096 界值、控制字符、形状同源）。
 - **失败集合基线比对**：`go test ./internal/... ./cmd/...` 失败集合与上游
   `0cd475ed` 原始检出逐条一致（4 处，全部在上游 worktree 同样复现，无我侧独有失败）。
 - **机械门**：`scripts/gate.sh` 挂 pre-commit，本轮提交实跑放行；未使用 `--no-verify`。

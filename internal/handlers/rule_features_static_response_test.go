@@ -12,8 +12,9 @@ import (
 //
 // 背景：上游 v2.4.2 把静态响应收窄为「3 模式 + 11 码 + ≤64 字符」，3xx 只能走
 // redirect 且 response_status 恒写 200（死值）。本轮按董事长自研口径把校验与
-// 渲染的强健度提回：17 码（含 3xx）、static 允许 3xx 且跳转目标必填、非 3xx 带
-// 目标显性拒绝、3xx/204 禁体、响应体上限 4096、控制字符门、跳转目标强校验。
+// 渲染的强健度提回：19 码（含 3xx；201 为存量兼容保留）、static 允许 3xx 且跳转
+// 目标必填、非 3xx 带目标显性拒绝、3xx/204 禁体、响应体上限 4096、控制字符门、
+// 跳转目标强校验。
 //
 // 本文件按 §1 S1–S11 逐条钉死；S12/S13 的 parity 与回归由既有套件覆盖。
 
@@ -45,7 +46,7 @@ func redirectRuleInput(pathRule models.PathRule) ruleFeatureInput {
 	}
 }
 
-// S1 · 17 码逐一通过：白名单内每个状态码在填入合法跳转目标（仅 3xx）后均应放行。
+// S1 · 19 码逐一通过：白名单内每个状态码在填入合法跳转目标（仅 3xx）后均应放行。
 func TestValidateRuleFeatures_staticAllSupportedStatusesAccepted(t *testing.T) {
 	for _, status := range services.StaticResponseStatusCodes() {
 		pathRule := models.PathRule{ResponseStatus: status}
@@ -61,9 +62,9 @@ func TestValidateRuleFeatures_staticAllSupportedStatusesAccepted(t *testing.T) {
 	}
 }
 
-// S1 · 非法码拒绝（含上游旧白名单里的 201，以及任意未收录值）。
+// S1 · 非法码拒绝（不含 201——201 已回归白名单做存量兼容，见下方 S10 用例）。
 func TestValidateRuleFeatures_staticRejectsUnsupportedStatuses(t *testing.T) {
-	for _, status := range []int{201, 202, 206, 300, 304, 418, 451, 505, 999} {
+	for _, status := range []int{202, 206, 300, 304, 418, 451, 505, 999} {
 		err := validateRuleFeatures(staticRuleInput(models.PathRule{ResponseStatus: status}))
 		if err == nil {
 			t.Fatalf("status %d 必须被拒绝", status)
@@ -71,6 +72,37 @@ func TestValidateRuleFeatures_staticRejectsUnsupportedStatuses(t *testing.T) {
 		if !strings.Contains(err.Error(), "不在支持范围") {
 			t.Fatalf("status %d: 错误文案须点名「不在支持范围」，got %q", status, err.Error())
 		}
+	}
+}
+
+// S10 · 201 存量豁免（r2 总经理裁决）：201 放行且保留原渲染行为（带体、无 Location）。
+// 关键断言——存量 201 规则（含 ResponseBody）改名后仍必须能保存：201 曾被 r1 移出
+// 白名单，导致任何一次编辑（连改名）都被整体拒绝，构成实质存量破坏。
+func TestValidateRuleFeatures_staticAccepts201ForLegacyCompatibility(t *testing.T) {
+	// ① 201 裸配置放行（无体）
+	if err := validateRuleFeatures(staticRuleInput(models.PathRule{ResponseStatus: 201})); err != nil {
+		t.Fatalf("201 必须放行（存量兼容），得到: %v", err)
+	}
+	// ② 201 + 响应体放行：201 属「带体、无 Location」的普通成功响应，
+	//    StaticResponseBodyAllowed(201) 为 true 天然成立。
+	if err := validateRuleFeatures(staticRuleInput(models.PathRule{
+		ResponseStatus: 201, ResponseBody: "created", ResponseContentType: "text/plain",
+	})); err != nil {
+		t.Fatalf("201 + 响应体必须放行（201 允许带体），得到: %v", err)
+	}
+	// ③ 存量 201 规则「仅改名不改响应字段」场景：路径与上游改掉、响应字段原样
+	//    回写，必须通过——这是 P1-2 的核心破坏面（连改名都存不了）。
+	if err := validateRuleFeatures(staticRuleInput(models.PathRule{
+		Path: "/renamed", ResponseStatus: 201, ResponseBody: "legacy body",
+	})); err != nil {
+		t.Fatalf("存量 201 规则改名后必须仍可保存，得到: %v", err)
+	}
+	// ④ 201 不被误当 3xx：携带跳转目标仍须显性拒绝（201 非重定向）。
+	err := validateRuleFeatures(staticRuleInput(models.PathRule{
+		ResponseStatus: 201, RedirectTo: "https://example.com/x",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "不应填写跳转地址") {
+		t.Fatalf("201 携带跳转目标必须被拒绝（201 非重定向），got %v", err)
 	}
 }
 
@@ -271,10 +303,10 @@ func TestValidateRuleFeatures_redirectModeOnly301(t *testing.T) {
 
 // S10 · 存量数据兼容：旧 11 码内的 static 配置行为不变（不做任何迁移也仍可保存）。
 func TestValidateRuleFeatures_legacyStatusesStillAccepted(t *testing.T) {
-	// 上游旧白名单 11 码 —— 其中 200/204/400/401/403/404/410/500/502/503 必须仍放行。
-	// 201 是唯一被移出的一项（见 S1 拒绝用例）：它属「口径收紧」而非存量破坏——
-	// 存量 201 配置在保存时会得到显式报错与改名建议，而不是静默改变渲染行为。
-	for _, status := range []int{200, 204, 400, 401, 403, 404, 410, 500, 502, 503} {
+	// 上游旧白名单 11 码 —— 200/201/204/400/401/403/404/410/500/502/503 **全部**必须
+	// 仍放行。201 曾于 r1 被移出，r2 按总经理裁决回归（见
+	// TestValidateRuleFeatures_staticAccepts201ForLegacyCompatibility）。
+	for _, status := range []int{200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503} {
 		pathRule := models.PathRule{ResponseStatus: status}
 		// 204 按 RFC 9110 不得带体（旧校验未拦，但那属旧校验的漏，不是合法
 		// 存量形态）；其余码带体是常规用法。
