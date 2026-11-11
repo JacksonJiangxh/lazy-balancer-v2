@@ -669,3 +669,98 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 - **坑 4（反兜底清单腐化）**：`buildStaticResponseHandler` 的内容类型缺省从函数内字面量
   改为单源函数返回后，`render_anti_fallback_scan_test.go` 的允许清单条目按「已消失」报红。
   该扫描是双向核对（清单→源码 + 源码→清单），改实现必须同步改清单。
+---
+
+## 十二、回源 Host 恢复自研实现 + 登记为核心自研（2026-11-11 · TASK-2026-1111-02）
+
+### 12.1 背景与裁定
+
+§11 给出「保持自研方案」的建议后，董事长于 2026-11-11 明确裁定：
+
+> 「回源 Host 采用我的自研，并记录为我的核心自研」
+
+即：撤销 2026-10-11 `5ee2a96a` 的「同需求两实现统一采纳上游」临时裁定，把渲染链
+恢复为自研实现，并把该能力**正式登记为第 4 项核心自研**（与链式回退 / 引用型证书 /
+端口换位并列）。
+
+### 12.2 手法：自研为骨，逐段替换（**未**用 `git revert`）
+
+自研版基于 v2.3.5 结构，而 v2.4.2 对 `caddy.go` 改了 +3248 行——直接 revert 会撞三大
+改动。做法是**以当前 v2.4.2 渲染函数为骨**，逐段替换：
+
+| 步骤 | 内容 |
+|---|---|
+| 1 | 新增 `caddygeoip/upstream_host.go`（`http.handlers.lb_upstream_host`），请求期惰性注册 `{lb.upstream_host}` / `{lb.upstream_sni}` |
+| 2 | 恢复 `upstreamHostPlan` 四态 + `resolveUpstreamHostPlan` 三级回退 + `fallbackHostPlan` 单出口 |
+| 3 | 删除 `enabledUpstreams` 循环内的 `originDomains` / `originDialOrder` 收敛表构建 |
+| 4 | SNI 段改由 `hostPlan.sniTarget` 同源给出（静态剥端口 / 混合占位符 / 全回退留空） |
+| 5 | Host 头下发改为四态 switch；map 发射段（含 `hostFallback` 池形态分支）整段替换为 `lb_upstream_host` 发射 |
+| 6 | 恢复 `pathUpstreamHostResolver` / `buildPathUpstreamHostResolver` / `hostPlanValueFor` / `decodePathUpstreamsWithResolver`，接回 path rules 加载点 |
+| 7 | `decodePathUpstreams` 退化为薄委托（无上下文入口） |
+
+**替换面比预想小的关键原因**：两套方案**共用同一对占位符名** `{lb.upstream_host}` /
+`{lb.upstream_sni}`，因此库值改由 handler 提供 → 前端零改动、DB 零改动。
+
+### 12.3 吸收上游已修的两点（自研版当年没有的，未丢）
+
+1. **`health_check_host`**（规则级健康检查域名）：保留，probe Host 优先级
+   `health_check_host` > `host_header`，**不读**逐上游 `origin_domain`
+   （probe 为 handler 级，无法逐上游）。钉测
+   `TestBuildHTTPHandleChain_healthCheckHostOverridesProbeHost` 三档覆盖。
+2. **SNI 静态路径剥端口**：`stripOriginPort` 与自研 `stripPortForSNI` 等价，
+   直接沿用上游实现。钉测 `TestBuildHTTPHandleChain_staticCustomHostSNIStripsPort`。
+
+### 12.4 一处语义澄清（与自研原版的差异，刻意为之）
+
+**混合态映射收录范围**：自研原版注释写「仅收录有效值非上游自身」的条目，但实现
+（`if effective[i] == "" { continue }`）实际收录了**全部有效值非空**的上游——即包含
+「上游留空、命中规则级第二档」的上游。
+
+本轮明确采用**实现语义**（收录全部有效值非空），并在注释里写清理由：若只收录第一档，
+那台「上游留空、规则级非空」的上游会被处理器未命中兜底到自身 dial 地址，**规则级
+回退（第二档）在那台机上静默失效**。这是三级回退语义的完整性要求，不是风格问题。
+钉测 `TestBuildHTTPHandleChain_mixedEmitsUpstreamHostHandler` 锁死。
+
+### 12.5 验证（分支 `feat/TASK-2026-1111-02-origin-host-selfdev`）
+
+- **构建/门禁**：`scripts/gate.sh` **PASS**（build×7 / vet / 冲突标记 0 / 上游 2095
+  路径 missing=0 / 版本锚点九处）。
+- **H 组钉测**（`caddy_upstream_origin_test.go`）：混合态 handler 位置在 reverse_proxy
+  之前、全回退恒 `{http.reverse_proxy.upstream.hostport}`（http/https 两种池）、
+  静态态不发射 handler、SNI 剥端口、健康检查域名三档、禁用上游不参与、DynamicDNS
+  单上游、TrimSpace 归一。
+- **H2 机械扫描**：`TestUpstreamHost_noClientHostFallbackAnywhere`（全仓可执行载体
+  零出现）+ `TestUpstreamHost_mapPlanFullyRemoved`（map 形态零残留）。
+- **P 组钉测**（`caddy_path_upstream_host_test.go`）：hoisted 第一档/第二档、orphan、
+  规则级空落第三档且不透传客户端 Host、持久化脏值被忽略、混布折叠、跨规则归属、
+  chain_fallback 同口径、**DB→渲染端到端四路径**。
+- **caddygeoip 模块**：8 项单测全绿（含「绝不透传客户端 Host」「SNI 剥端口」
+  「模块已注册」）。
+- **前端**：`npx vue-tsc --noEmit` 零错误；`npm test` **1601 pass / 0 fail**
+  （零改动即通过，印证共用占位符名的判断）。
+
+### 12.6 本轮踩坑
+
+- **坑 1（局部类型提升）**：`lbRule` / `upstream` / `ruleWithUpstreams` 原是
+  `generateCaddyConfigFromStore` 的**函数内局部类型**，新解析器需要在包级函数里读
+  「规则 + 其上游集合」，必须提升为包级类型。提升后定义体逐字未变。
+- **坑 2（自动改写脚本毁文件）**：用脚本批量改写测试里的场景构造时，把字段字面量
+  改成了 `rule.Field = x,` 形态导致语法错误——**结构性编辑宁可逐个手工 replace，
+  不要用正则批量转换**（与 `卡-20261110-02` 同族）。
+- **坑 3（反兜底清单双向核对）**：删掉 map 方案后，allowlist 里
+  `hostFallback` / `sniFallback` / `serverName` 三条按「已消失」报红；同时新增函数
+  必须登记 `antiFallbackScanTargets`。印证 `卡-20261111-02` 的「清单与源码必须同步」
+  与 §11.4 坑 4。**额外收获**：把两处 `usePlaceholder` 出口收编成 `fallbackHostPlan`
+  单出口后，allowlist 不再需要为该形态背条目——**收窄实现比放宽清单更划算**。
+
+### 12.7 follow-up（范围外，未改）
+
+1. `internal/services/caddy_pathrule_response_test.go` 存在既有 gofmt 未收口
+   （非本任务引入，`gofmt -l` 可查）。
+2. `caddygeoip` 的 `TestJSONStringEscapedLen_matchesEncodingJSON` 在基线
+   `bdb7b67f` 上同样失败（属上游主体内容，建议单独立项）。
+3. `internal/services` 的 `TestApplySnapshot_ruleLogCleanupFailureDoesNotFailSync`
+   与 `TestTaskLogsHousekeeping_countsMetadataFailures`、`internal/handlers` 的
+   `TestCaddyProcessControlAllowedOutsideImportWindow` /
+   `TestGetClusterWafFiles_409DuringImportWindow`——四处均在基线 worktree 上复现，
+   属既有失败，无我侧独有失败。

@@ -610,3 +610,40 @@ git show 3f1c3346 -- internal/services/caddy.go | grep -A6 "hostFallback :="
 | 面板配套完整度的描述 | ✅ 实测（`grep` 全仓确认文档/接口说明缺口） |
 
 > **唯一一处 ⚠️ 推断已明确标注**：即「官方版留空上游会拿到用户域名」这一条的**实际运行后果**，是从源码语义推出来的，没有跑真实流量验证。这个推断的依据是 Caddy 官方对 `{http.request.hostport}` 的定义（绑定原始请求），语义明确。如果风控要求必须实测才能采信，我可以在下一轮单独造一个最小复现环境验证——但那需要临时改动渲染代码，得单独派活。
+
+---
+
+## 附录 B · 结论落地记录（2026-11-11 · TASK-2026-1111-02）
+
+**本报告 §9.2 的建议已被董事长采纳并落地执行**——原文「不做任何切换、渲染继续走自研」在
+2026-10-11 曾被临时推翻（`5ee2a96a` 按「同需求两实现」统一采纳上游 map 方案），董事长
+2026-11-11 复评后明确裁定：
+
+> 「回源 Host 采用我的自研，并记录为我的核心自研」
+
+### B.1 落地内容
+
+| 项 | 状态 |
+|---|---|
+| 渲染链 | 已恢复自研 `upstreamHostPlan` 四态 + `lb_upstream_host` handler（`caddygeoip/upstream_host.go`） |
+| 自定义路由推导 | 已恢复 `pathUpstreamHostResolver` / `buildPathUpstreamHostResolver` / `decodePathUpstreamsWithResolver` |
+| `upstreams.origin_domain` 列 | **保留列名与存量数据**（零迁移），语义定为「自研版逐上游回源 Host」 |
+| 上游 map 方案 | 已整体删除（`originDomains` / `originDialOrder` / `http.handlers.map` 发射段） |
+| 缺陷载体 `{http.request.hostport}` | **全仓代码零出现**，由钉测 `TestUpstreamHost_noClientHostFallbackAnywhere` 机械守卫 |
+| 核心自研登记 | 登记为**第 4 项核心自研**，见 `docs/self-developed-features.zh-CN.md` |
+
+### B.2 本报告 §A.5「唯一一处 ⚠️ 推断」的处置
+
+原文标注：「官方版留空上游会拿到用户域名」的实际运行后果为 ⚠️ **推断**（未跑真实流量）。
+
+本轮**仍未做端到端流量实测**，理由不变（该代码路径已从仓库删除，为其专门造环境需
+临时改回渲染代码）。但该推断的**代码层证据链已闭合**：
+
+- 缺陷载体形态（`hostFallback = "{http.request.hostport}"` 分支）已从源码移除；
+- 反向机械判据已落地（全仓代码零出现 + 地图方案形态零残留两枚钉测）；
+- 因此「官方版会拿到用户域名」这一结论在本仓库**不再有可执行的实现路径**，
+  无需再做流量实测即可保证不复现。
+
+> 可信度标注：B.2 的「已移除」为 ✅ 实测（`git diff` + 钉测 PASS）；「不会再复现」
+> 为 ✅ 实测（机械扫描判据）；「若上游未来重新引入该形态」为 ⚠️ 推断（取决于上游
+> 后续提交，须按 `docs/self-developed-features.zh-CN.md` 第 4 项防复发约束复核）。

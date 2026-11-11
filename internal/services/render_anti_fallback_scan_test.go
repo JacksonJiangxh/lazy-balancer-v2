@@ -68,6 +68,11 @@ var antiFallbackScanTargets = map[string][]string{
 		"GenerateSingleRuleCaddyConfig",
 		"generateHTTPRouteObjects",
 		"buildHTTPHandleChain",
+		// 回源 Host 三级回退族（董事长自研第 4 项，TASK-2026-1111-02 恢复）：
+		// 新增渲染函数必须纳入扫描面，Ruling 见 antiFallbackAllowlist 同名条目。
+		"resolveUpstreamHostPlan",
+		"fallbackHostPlan",
+		"buildPathUpstreamHostResolver",
 		// 链式回退渲染族（2026-10-09）：竞速参数 0 值兜底与权重 0→1 是设计
 		// 语义（UI 无 0=关闭形态，兜底值与写侧 CreateRule 同口径），纳入扫描
 		// 面后逐条在 antiFallbackAllowlist 披露 Ruling。
@@ -89,6 +94,9 @@ var antiFallbackScanTargets = map[string][]string{
 		"upstreamPathRewriteHandlers",
 		"blockPageContentType",
 		"decodePathUpstreams",
+		// 2026-11-11 TASK-2026-1111-02：自定义路由上游解析的真身（decodePathUpstreams
+		// 现为薄委托），回源 Host 推导在此完成，必须纳入扫描面。
+		"decodePathUpstreamsWithResolver",
 	},
 	"security.go": {
 		"BuildCorazaDirectives",
@@ -165,11 +173,20 @@ var antiFallbackAllowlist = map[string]map[string]string{
 		// 重试」语义载体（cond 非零值守卫，不在扫描命中面）。
 		`loadBalancing["try_duration"] = "5s"`:    "HTTP 侧 try_duration==0→5s：存量 HTTP 行恒 0（0=默认重试窗口语义），方案 C 协议分叉+UI 已披露——G3 Ruling 披露",
 		`loadBalancing["try_interval"] = "250ms"`: "HTTP 侧 try_interval==0→250ms：同上（与 5s 窗口成对发射）——G3 Ruling 披露",
-		`hcPath = "/"`:                     "主动健康检查路径空串=未配置→/：类型②省略型（字符串缺省，写侧允许空）——G3 Ruling 披露",
-		`serverName = "{lb.upstream_sni}"`: "逐上游回源域名在场时 SNI 改走占位符（逐连接展开实证）——host_header 缺省形态的发射形态切换（占位符 vs 静态值），非无效库值兜底；upstream-sni-host 方案披露——G3 Ruling 披露",
-		`hostFallback = "{http.reverse_proxy.upstream.hostport}"`: "Host 回退 TLS 池形态：host_header 未配置时绑定上游 hostport 占位符（池形态分流），类型②省略型同族——G3 Ruling 披露",
-		`hostFallback = "{http.request.hostport}"`:                "Host 回退常规池形态：host_header 未配置时绑定原始请求 hostport 占位符（现状复现）——G3 Ruling 披露",
-		`sniFallback = "{http.reverse_proxy.upstream.host}"`:      "SNI 回退：host_header 未配置时绑定上游 host 占位符（stdlib 空 server_name 默认的同义载体）——G3 Ruling 披露",
+		`hcPath = "/"`: "主动健康检查路径空串=未配置→/：类型②省略型（字符串缺省，写侧允许空）——G3 Ruling 披露",
+		// 2026-11-11 TASK-2026-1111-02：回源 Host 恢复董事长自研实现后，下列
+		// 三条已随上游 map 方案整体退役（保留注释说明这是刻意删除，非遗忘）
+		//   - `hostFallback = "{http.request.hostport}"`：**永久禁入**形态，它是
+		//     「透传客户端 Host」缺陷的载体（H2 钉测
+		//     TestUpstreamHost_noClientHostFallbackAnywhere 全仓机械断言零出现）；
+		//   - `hostFallback = "{http.reverse_proxy.upstream.hostport}"`：全回退态
+		//     的语义已内聚到 resolveUpstreamHostPlan → usePlaceholder 四态分派，
+		//     渲染函数体不再写字面量；
+		//   - `serverName = "{lb.upstream_sni}"`：SNI 目标改由 hostPlan.sniTarget
+		//     统一给出（静态剥端口 / 混合走占位符 / 全回退留空），不再在渲染体
+		//     内做「有无回源域名」的条件赋值；
+		//   - `sniFallback = "{http.reverse_proxy.upstream.host}"`：同上，随 map
+		//     defaults 一起退役（处理器侧未命中兜底已覆盖该语义）。
 	},
 	// 批 3 Ruling：block_status_code=类型②省略型（0=未设置，跟随默认 403）。
 	// static_response 必须显式携带状态码，「省略」只能以默认值替换实现；写侧
@@ -209,8 +226,28 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	// buildIPPrecheckDirectives 的 `denyStatus = 403` 条目已随规则级阶段页停用
 	// 退役（481 抬码与 denyStatus 参数删除；逐策略链固定显式 status）。
 	// 可达性扫描登记（调用图内辅助函数的赋值形态兜底）：
-	"decodePathUpstreams": {
+	// 2026-11-11 TASK-2026-1111-02：`decodePathUpstreams` 已退化为
+	// `decodePathUpstreamsWithResolver(raw, nil, "")` 的薄委托（无推导上下文
+	// 入口），协议缺省归一（原 `protocol = "http"`）随实现迁到
+	// decodePathUpstreamsWithResolver，故本条目退役、改登记到后者。
+	"decodePathUpstreamsWithResolver": {
 		`protocol = "http"`: "路径规则上游存储投影缺省协议→http：类型②省略型（写侧允许空并在渲染层替换为具体值，否则引擎收到空协议）——可达性 Ruling 披露",
+	},
+	// 董事长核心自研第 4 项（回源 Host 三级回退）的两个新增渲染族函数。
+	// 前者「三段皆空/取值不一致却无静态项 → usePlaceholder」是**语义完备性
+	// 守卫**而非库值兜底：它不是「用默认值替换无效库值」，而是把「上游与规则级
+	// 都没配回源 Host」这一合法配置状态映射为「每上游用自身 dial 地址」（三级
+	// 回退第三档），且显式拒绝产出空 Host / 客户端 Host——正是本自研相对上游
+	// 方案的核心正确性保证（H1/H4）。后者 `protocol = "http"` 与主链
+	// upstreams 表投影同口径（省略型）。
+	// resolveUpstreamHostPlan / fallbackHostPlan 均**无需** allowlist 条目：
+	// 回退语义已收编成 fallbackHostPlan 的单一无条件 return（函数体只有这一条
+	// 语句，不构成「零值守卫 + 字面量赋值」形态，扫描器不命中）。这是刻意设计
+	// ——三级回退第三档只有一个出口，既避免两处分支各自漂移，也让扫描面保持
+	// 零豁免（TASK-2026-1111-02）。二者的正确性由
+	// TestUpstreamHost_noClientHostFallbackAnywhere 与 H1/H4 系列钉测守卫。
+	"buildPathUpstreamHostResolver": {
+		`protocol = "http"`: "自定义路由上游投影缺省协议→http：与主链 upstreams 表投影同口径（类型②省略型）——TASK-2026-1111-02 披露",
 	},
 	"ValidateForwardAuthGatewayAddress": {
 		`port = "80"`:  "认证网关地址省略端口→按 RFC 3986 scheme 缺省端口补全（http→80）：URL 规范语义的省略型（写侧白名单允许无端口形态，dial 必须显式端口），非无效库值兜底——可达性 Ruling 披露",
