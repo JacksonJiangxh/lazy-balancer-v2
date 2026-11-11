@@ -173,7 +173,7 @@ DB 为唯一事实源，看门狗回写 DB」。涉及 `tls_cert_path` / `tls_ke
 | 响应体/类型 | `response_body` / `content_type` | `response_body` / `response_content_type` |
 | 能力粒度 | 一个 `respond` 管「静态响应 + 3xx 跳转」 | 拆成 `static` 与 `redirect` 两模式 |
 | 校验 | `validateStaticResponsePathRule` | 内联 switch + 状态码白名单 |
-| 状态码白名单 | **16 码**（200/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | **11 码**（200/201/204/400/401/403/404/410/500/502/503，**无 3xx**）|
+| 状态码白名单 | **16 码**（历史口径，200/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | **11 码**（200/201/204/400/401/403/404/410/500/502/503，**无 3xx**）|
 | 响应体长度 | 无上限 | ≤64 字符（`rule_features.go:438`）|
 | 指标 | 我们补过 `lb_rule_metrics` | 上游在链首也补了 `lb_rule_metrics` |
 
@@ -584,3 +584,88 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 - **引用型证书 `tls_source=file`**：保存时摄取证书文件内容入库，外部文件更新由看门狗自动同步。
 - **默认端口换位**：`HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 环境变量换掉 80/443/8000，
   兜底站监听口与跳转自引用跟随；新增 `GET /system/ports` API 面。
+
+## 十一、回源 Host 双方案定论 + 静态响应强健度提回（2026-11-11 · TASK-2026-1111-01）
+
+本轮**不追平上游**，处理两件与上游能力直接相关的裁定事项。
+
+### 11.1 回源 Host：官方方案不采用，保持自研口径（只出报告，零代码改动）
+
+董事长 2026-11-11 裁定：自研回源 Host 运行正常符合需求，「官方的方式我没试过不知道
+好不好用 需要你出两者的小白化的基于源码的对比分析报告」。
+
+报告落 `docs/upstream-origin-host-compare.zh-CN.md`（R1–R10），从源码层逐条比对后
+**结论：不切换，保持自研口径的渲染语义**。三条硬理由（证据见报告 §3.5/§3.6/§6）：
+
+1. **官方版部分填写场景会错误下发客户端 Host**：`0cd475ed:internal/services/caddy.go:4930-4942`
+   的 `hostFallback` 在「规则级域名空 + 纯 http 池」分支落到
+   `{http.request.hostport}`（客户端域名），而自研版未命中兜底恒为「该上游自身地址」。
+2. **官方版做不到自定义路由内推导**：`pathUpstreamHostResolver` 的 hoisted/orphan
+   分派（2026-10-10 董事长裁定「内部逻辑、不新增字段」）在原生 map 方案下无对应物。
+3. **官方版的 TLS 回退曾带 bug**：`2ba0f2c7` 原始实现用 `{http.request.hostport}`
+   （`872408c2:internal/services/caddy.go:3786`），后经 `3f1c3346`「第 69 轮全项目审计」
+   才改成分池形态；自研版 `5ee2a96a^:internal/services/caddy.go:4078` 天生取值
+   `{http.reverse_proxy.upstream.hostport}`，无同类问题。
+
+**注意**：`2ba0f2c7` 不在上游 v2.4.2（`0cd475ed`）的祖先链上——该能力从未进入官方
+正式版，当前 main 的面板「回源域名」列是自研代码在支撑。
+
+### 11.2 静态响应/3xx：按董事长自研口径提回强健度（基于上游源码最小化改）
+
+原则：**保留上游 `response_mode` 三值结构**（不恢复 `action` 列，避免二次迁移），
+只把校验与渲染的强健度提回 2026-10-09 自研口径（`5ee2a96a^`）。
+
+| 维度 | 上游 v2.4.2 原值 | 本轮（自研口径） | 落点 |
+|---|---|---|---|
+| 状态码白名单 | 11 码（无 3xx） | **19 码**（200/201/204 + 301/302/303/307/308 + 400/401/403/404/405/410/429 + 500/502/503/504） | `services.staticResponseStatusCodes`、`handlers.validStaticResponseStatuses` |
+| 201 Created | 在白名单 | **保留（存量豁免）**：r1 曾移出，致存量 201 规则连改名都保存不了；r2 按总经理裁决回归白名单，保存时仅打 `warn` 级日志提醒「Created 应创建资源并给 Location，静态短路不创建资源，建议改用 200」 | 同上 + `warnStaticResponse201Semantics` |
+| `static` 模式 3xx | 不放行 | 放行，**跳转目标必填** | `validateStaticResponseModeFields` |
+| 3xx/204 响应体 | 未按 RFC 区分 | **禁体**（RFC 9110） | 同上 + `services.StaticResponseBodyAllowed` |
+| 非 3xx 带跳转目标 | — | **显性拒绝**（误配报错，不静默忽略） | 同上 |
+| 响应体上限 | ≤64 字符 | **≤4096 字符**（取值理由见 `staticResponseBodyMaxRunes` 注释：内存/展示/存储三面权衡） | 同上 |
+| 响应体控制字符 | 不校验 | 放行 `\n\r\t`、拒其余 C0 与 DEL | `validateRespondBodyChars` |
+| 跳转目标校验 | 仅拒 `<0x20`、`0x7f` | **须 `http(s)://` / `/` 开头 + 拒空格与控制字符**（大小写不敏感） | `isValidStaticRedirectTarget` |
+| 3xx 渲染 | 不写 Location（静默空重定向） | 写 Location、不写体、不写 Content-Type | `services.buildStaticResponseHandler` |
+| 缺省内容类型 | `text/plain` | `text/html; charset=utf-8`（`text/*` 补 charset、json 不补） | `services.staticResponseDefaultContentTypeFor` |
+| 405/401 必备头 | 无 | 405→`Allow`、401→`WWW-Authenticate` | 同上 |
+| `redirect` 模式 | 恒 301 + 目标 | **行为零回归**；显式非 301 的 `response_status` 显性拒绝（避免「填 302 实际发 301」） | `handlers` 校验 |
+| 前端下拉 | 11 码硬编码 | 三处同集（前端常量 / handlers 查表 / services 权威），parity 钉测双向核验 | `web/src/utils/ruleValidation.ts` + `web/tests/ruleValidation.spec.ts` |
+
+**控制字符双面**：响应体放行常规空白（HTML/JSON 多行排版必需），跳转目标拒全部
+含空格与控制字符（Location 头裸空格必被客户端截断，属明确误配）。
+
+**存量兼容**：旧 11 码内 11 码**全部**仍放行（含 201）；201 存量配置保存时仅得一条
+`warn` 级提示（提醒语义偏差、建议改 200），**不拦截保存**，**渲染行为不变**（201 属
+「带体、无 Location」的普通成功响应，`StaticResponseBodyAllowed(201)` 为 true）。
+`redirect` 模式零回归。
+
+### 11.3 验证（分支 `feat/TASK-2026-1111-01-static-response`）
+
+- **构建/静态**：`go build ./...` + `go vet ./...` 全绿；`scripts/gate.sh` **PASS**
+  （build×7 / vet / 冲突标记 0 / 上游 2095 路径 missing=0 / 版本锚点九处）。
+- **后端钉测**：`internal/handlers/rule_features_static_response_test.go` 覆盖
+  19 码逐一放行、非法码拒绝、3xx 缺目标拒绝、非 3xx 带目标拒绝、4096 界值（含
+  中文/代理对按码点计）、控制字符门、跳转目标形状、3xx/204 禁体、redirect 只能
+  301、存量兼容（含 201 改名可保存）、转发模式零影响；`internal/services/caddy_pathrule_response_test.go`
+  新增 3xx 渲染（Location + 无体 + 无 Content-Type）、204 无体、405/401 必备头、
+  charset 兜底、19 码清单副本语义。
+- **前端**：`npx vue-tsc --noEmit` 零错误；`npm test` **1601 pass / 0 fail**
+  （新增三处白名单同集 parity、19 码边界、4096 界值、控制字符、形状同源）。
+- **失败集合基线比对**：`go test ./internal/... ./cmd/...` 失败集合与上游
+  `0cd475ed` 原始检出逐条一致（4 处，全部在上游 worktree 同样复现，无我侧独有失败）。
+- **机械门**：`scripts/gate.sh` 挂 pre-commit，本轮提交实跑放行；未使用 `--no-verify`。
+
+### 11.4 本轮踩坑与更正
+
+- **坑 1（归属误判）**：任务书 §2.2 记「上游改成 `{http.reverse_proxy.upstream.hostport}`」，
+  实际该修复属 `3f1c3346`（第 69 轮审计），非 `2ba0f2c7` 自带 —— 已按真实归属写入报告
+  §3.6 与附录 A.3，并在此留痕。
+- **坑 2（共用函数缺省值入参）**：static/redirect 共用的字段门若把 `response_status=0`
+  写死归一为 200，redirect 模式会被判成「200 带跳转目标」而恒拒。改为由调用侧传入
+  `defaultStatus`（static→200、redirect→301），钉测 `TestValidateRuleFeatures_redirectModeOnly301` 锁死。
+- **坑 3（前端读残留字段）**：redirect 表单不展示状态码字段且切模式不清值，前端若据
+  `response_status` 校验「只能 301」会误伤合法配置（残留 200）。前端一律不读该字段，
+  权威校验留在后端保存门。
+- **坑 4（反兜底清单腐化）**：`buildStaticResponseHandler` 的内容类型缺省从函数内字面量
+  改为单源函数返回后，`render_anti_fallback_scan_test.go` 的允许清单条目按「已消失」报红。
+  该扫描是双向核对（清单→源码 + 源码→清单），改实现必须同步改清单。

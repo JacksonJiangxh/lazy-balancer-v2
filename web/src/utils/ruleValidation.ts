@@ -56,15 +56,54 @@ export const pathDuplicateKey = (matchType: 'prefix' | 'exact', raw: string): st
   `${matchType}:${matchType === 'prefix' ? canonicalPathKey('prefix', raw) : raw.trim()}`
 
 
-// 直接返回的常用状态码白名单（与后端 validStaticResponseStatuses 同源）。
+// 直接返回的状态码白名单（与后端 validStaticResponseStatuses /
+// services.staticResponseStatusCodes 三处同集，由 parity 钉测双向核验）。
 // 数组形态 + 标准全称单源自此导出——编辑器下拉（PathRulesEditor）只 import，
 // 禁止在组件侧再抄一份（曾双源：下拉可选但保存被拒）。
-export const STATIC_RESPONSE_STATUSES: readonly number[] = [200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503]
+//
+// 2026-11-11 TASK-2026-1111-01：按董事长自研口径从 11 码扩至 **19 码**——补入
+// 3xx 五码 + 405/429/504，并保留 201（存量兼容：201 规则在旧白名单内，
+// 移出会让存量数据连改名都保存不了；后端保存时仅打 warn 日志提醒
+// 「Created 应创建资源并给 Location，静态短路不创建资源，建议改用 200」）。
+export const STATIC_RESPONSE_STATUSES: readonly number[] = [
+  200, 201, 204,
+  301, 302, 303, 307, 308,
+  400, 401, 403, 404, 405, 410, 429,
+  500, 502, 503, 504,
+]
 
 export const STATIC_RESPONSE_STATUS_REASONS: Readonly<Record<number, string>> = {
   200: 'OK', 201: 'Created', 204: 'No Content',
-  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 410: 'Gone',
-  500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
+  301: 'Moved Permanently', 302: 'Found', 303: 'See Other', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+  405: 'Method Not Allowed', 410: 'Gone', 429: 'Too Many Requests',
+  500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout',
+}
+
+/** 重定向类状态码判定（3xx）：与后端 services.StaticResponseIsRedirectStatus 同口径。 */
+export const isRedirectResponseStatus = (status: number): boolean => status >= 300 && status < 400
+
+/**
+ * 响应体是否被允许（204/304 与全部 3xx 不允许，RFC 9110）——与后端
+ * services.StaticResponseBodyAllowed 同口径。
+ */
+export const isResponseBodyAllowed = (status: number): boolean =>
+  status !== 204 && status !== 304 && !isRedirectResponseStatus(status)
+
+/** 响应体长度上限（按码点计），与后端 staticResponseBodyMaxRunes 同值。 */
+export const STATIC_RESPONSE_BODY_MAX_RUNES = 4096
+
+/**
+ * 跳转目标形状判定——与后端 isValidStaticRedirectTarget 同口径：http(s)://
+ * 绝对地址（大小写不敏感）或 / 开头站内路径，且不含空格与控制字符。
+ */
+export const isValidRedirectTargetShape = (target: string): boolean => {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(target)) return false
+  if (/\s/.test(target)) return false
+  if (target.startsWith('/')) return true
+  const lower = target.toLowerCase()
+  return lower.startsWith('http://') || lower.startsWith('https://')
 }
 
 const STATIC_RESPONSE_STATUS_SET: Readonly<Record<number, true>> = Object.fromEntries(
@@ -126,24 +165,40 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     // 'forward' 为 UI 选择器哨兵（el-select 空串选项不显示标签），与 '' 同义
     const responseMode = rule.response_mode === 'forward' ? '' : (rule.response_mode ?? '')
     if (responseMode === 'static') {
+      // 与后端 validateStaticResponseModeFields 逐条同口径（顺序也一致：
+      // 状态码 → 禁体码 → 长度 → 控制字符 → 格式 → 跳转目标），保证行内红框
+      // 与保存被拒是同一句话，不出现「前端放行、保存 400」的晚失败。
       const status = rule.response_status || 200
       if (!STATIC_RESPONSE_STATUS_SET[status]) return `第 ${rowNumber} 条路径：直接返回的状态码 ${status} 不在常用集合`
-      if ([...rule.response_body ?? ''].length > 64) return `第 ${rowNumber} 条路径：响应内容不能超过 64 个字符`
+      const body = rule.response_body ?? ''
+      if (body !== '' && !isResponseBodyAllowed(status)) return `第 ${rowNumber} 条路径：状态码 ${status} 按 RFC 9110 不得携带响应内容（请清空内容）`
+      if ([...body].length > STATIC_RESPONSE_BODY_MAX_RUNES) return `第 ${rowNumber} 条路径：响应内容不能超过 ${STATIC_RESPONSE_BODY_MAX_RUNES} 个字符`
+      // 放行常规空白（HTML/JSON 多行排版），拒其余控制字符
+      // eslint-disable-next-line no-control-regex
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(body)) return `第 ${rowNumber} 条路径：响应内容含非法控制字符`
       const ct = rule.response_content_type ?? ''
       if (ct !== '' && ct !== 'text/plain' && ct !== 'application/json' && ct !== 'text/html') return `第 ${rowNumber} 条路径：响应格式仅支持纯文本/JSON/HTML`
-      if (rule.redirect_to) return `第 ${rowNumber} 条路径：直接返回与跳转地址互斥`
+      const target = (rule.redirect_to ?? '').trim()
+      if (isRedirectResponseStatus(status)) {
+        if (!target) return `第 ${rowNumber} 条路径：状态码 ${status} 是重定向，必须填写跳转地址`
+        if (!isValidRedirectTargetShape(target)) return `第 ${rowNumber} 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符`
+      } else if (target) {
+        // 非 3xx 携带跳转地址属误配：后端显性拒绝，前端同句提示（不静默忽略）
+        return `第 ${rowNumber} 条路径：状态码 ${status} 不是重定向，不应填写跳转地址（请清空）`
+      }
       if (rule.upstreams !== null || rule.upstream_path) return `第 ${rowNumber} 条路径：直接返回模式与上游配置互斥`
       continue
     }
     if (responseMode === 'redirect') {
+      // redirect 恒 301（渲染侧恒写 301）。**不读 rule.response_status**：该字段在
+      // redirect 表单里不展示（applyResponseMode 切模式时不清它），读到的常是
+      // 切换前的残留值（如 static 的 200），据此报错会误伤合法配置。后端保存门
+      // 对显式非 301 值有权威拒绝（API/MCP 直写面），UI 面无需重复。
       const target = rule.redirect_to ?? ''
       if (!target.trim()) return `第 ${rowNumber} 条路径：301 跳转需要填写跳转地址`
-      // 形状校验查原串（与后端 rule_features.go 同位）——
-      // 此前 trim 后判定，" http://x" 前端放行、后端按原串 400，口径分叉。
-      // eslint-disable-next-line no-control-regex
-      if (/[\x00-\x1f\x7f]/.test(target)) return `第 ${rowNumber} 条路径：跳转地址含非法字符`
-      if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return `第 ${rowNumber} 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径`
-      // 与后端 rule_features.go:464 同句——301 跳转与响应内容互斥
+      // 形状校验与后端 isValidStaticRedirectTarget 同源（多拒空格）
+      if (!isValidRedirectTargetShape(target)) return `第 ${rowNumber} 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符`
+      // 与后端同句——301 跳转与响应内容互斥
       //（UI 正常切换模式会清空内容，此处防回读载荷/残留表单态双携，后端恒 400）。
       if (rule.response_body || rule.response_content_type) return `第 ${rowNumber} 条路径：301 跳转与响应内容互斥（请清空内容/格式）`
       if (rule.upstreams !== null || rule.upstream_path) return `第 ${rowNumber} 条路径：301 跳转模式与上游配置互斥`

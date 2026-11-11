@@ -9,7 +9,11 @@ import assert from 'node:assert/strict'
 
 import {
   pathDuplicateKey,
+  STATIC_RESPONSE_BODY_MAX_RUNES,
   STATIC_RESPONSE_STATUSES,
+  isRedirectResponseStatus,
+  isResponseBodyAllowed,
+  isValidRedirectTargetShape,
   upstreamPathRuleError,
   validatePathRules,
 } from '../src/utils/ruleValidation.ts'
@@ -178,39 +182,141 @@ test('上游路径改写：空串放行，非空须以 / 开头且不含空格 ?
   assert.equal(validatePathRules([rule({ upstream_path: '/v1', upstreams: [upstream()] })]), null)
 })
 
-test('直接返回：状态码白名单与后端同集，响应内容按码点计 64 界值', () => {
-  // 前端数组 = 后端 map 键集（双向相等，非抽样）：任一侧增删一个码即红。
+test('直接返回：三处状态码白名单同集（前端 / handlers / services）', () => {
+  // 三处单源同集，任一增删一个码即红：
+  //   ① 前端 STATIC_RESPONSE_STATUSES
+  //   ② handlers.validStaticResponseStatuses（保存校验的 O(1) 查表）
+  //   ③ services.staticResponseStatusCodes（渲染与 API 契约的权威集合）
   const goBlock = section(repoCode('internal/handlers/rule_features.go'), 'var validStaticResponseStatuses = map[int]bool{', '}')
-  const goCodes = [...goBlock.matchAll(/(\d{3}):\s*true/g)].map((m) => Number(m[1])).sort((a, b) => a - b)
+  const handlerCodes = [...goBlock.matchAll(/(\d{3}):\s*true/g)].map((m) => Number(m[1])).sort((a, b) => a - b)
+  const svcBlock = section(repoCode('internal/services/caddy.go'), 'var staticResponseStatusCodes = []int{', '}')
+  const serviceCodes = [...svcBlock.matchAll(/\b(\d{3})\b/g)].map((m) => Number(m[1])).sort((a, b) => a - b)
+
   assert.deepEqual(
     [...STATIC_RESPONSE_STATUSES].sort((a, b) => a - b),
-    goCodes,
+    handlerCodes,
     '前端白名单必须与后端 validStaticResponseStatuses 同集',
   )
-  assert.deepEqual(goCodes, [200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503])
+  assert.deepEqual(serviceCodes, handlerCodes, 'services 权威集合必须与 handlers 校验白名单同集')
+
+  const expected = [200, 201, 204, 301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 410, 429, 500, 502, 503, 504]
+  assert.deepEqual(handlerCodes, expected, '19 码集合口径（含 3xx 五码 + 405/429/504 + 存量兼容的 201）')
+  assert.equal(handlerCodes.includes(201), true, '201 必须保留（存量 201 规则连改名都要能保存；后端仅 warn）')
+
+  // 响应体上限同源：前端常量必须等于后端 const
+  const goConst = /const staticResponseBodyMaxRunes = (\d+)/.exec(repoCode('internal/handlers/rule_features.go'))
+  assert.ok(goConst, '后端 staticResponseBodyMaxRunes 常量必须存在')
+  assert.equal(STATIC_RESPONSE_BODY_MAX_RUNES, Number(goConst[1]), '前端上限必须与后端同值')
 
   assert.equal(validatePathRules([rule({ response_mode: 'static' })]), null, '缺省状态码按 200')
+})
+
+test('直接返回：19 码逐一放行 / 非法码拒绝 / 3xx 缺目标拒绝 / 非 3xx 带目标拒绝', () => {
+  // 19 码逐一：3xx 必须带跳转目标，且不得带体；其余码不得带跳转目标
   for (const status of STATIC_RESPONSE_STATUSES) {
+    const base = { response_mode: 'static' as const, response_status: status }
+    if (isRedirectResponseStatus(status)) {
+      assert.equal(
+        validatePathRules([rule(base)]),
+        `第 1 条路径：状态码 ${status} 是重定向，必须填写跳转地址`,
+        `${status} 缺目标必须拒绝`,
+      )
+      assert.equal(
+        validatePathRules([rule({ ...base, redirect_to: 'https://example.com/new' })]),
+        null,
+        `${status} + 合法目标应放行`,
+      )
+      assert.equal(
+        validatePathRules([rule({ ...base, redirect_to: '/new', response_body: 'body' })]),
+        `第 1 条路径：状态码 ${status} 按 RFC 9110 不得携带响应内容（请清空内容）`,
+        `${status} 带体必须拒绝`,
+      )
+      continue
+    }
+    const bodyAllowed = isResponseBodyAllowed(status)
+    assert.equal(validatePathRules([rule({ ...base, response_body: bodyAllowed ? 'x' : '' })]), null, `${status} 应放行`)
+    if (status !== 204) {
+      assert.equal(
+        validatePathRules([rule({ ...base, redirect_to: 'https://example.com/x' })]),
+        `第 1 条路径：状态码 ${status} 不是重定向，不应填写跳转地址（请清空）`,
+        `${status} 携带跳转目标必须拒绝（误配显性报错）`,
+      )
+    }
+  }
+  // 204 禁体
+  assert.equal(
+    validatePathRules([rule({ response_mode: 'static', response_status: 204, response_body: 'x' })]),
+    '第 1 条路径：状态码 204 按 RFC 9110 不得携带响应内容（请清空内容）',
+  )
+  // 非法码（201 已回归白名单做存量兼容，不再列入）
+  for (const bad of [202, 418, 451, 999]) {
     assert.equal(
-      validatePathRules([rule({ response_mode: 'static', response_status: status })]),
-      null,
-      `${status} 属常用集合`,
+      validatePathRules([rule({ response_mode: 'static', response_status: bad })]),
+      `第 1 条路径：直接返回的状态码 ${bad} 不在常用集合`,
+      `${bad} 必须拒绝`,
     )
   }
+})
+
+test('直接返回：响应内容按码点计 4096 界值与控制字符门', () => {
+  const max = STATIC_RESPONSE_BODY_MAX_RUNES
+  assert.equal(validatePathRules([rule({ response_mode: 'static', response_body: 'x'.repeat(max) })]), null)
   assert.equal(
-    validatePathRules([rule({ response_mode: 'static', response_status: 418 })]),
-    '第 1 条路径：直接返回的状态码 418 不在常用集合',
+    validatePathRules([rule({ response_mode: 'static', response_body: 'x'.repeat(max + 1) })]),
+    `第 1 条路径：响应内容不能超过 ${max} 个字符`,
   )
-  // 后端用 len([]rune(...))：64 个码点合法、65 拒绝；代理对按 1 个字符算
-  assert.equal(validatePathRules([rule({ response_mode: 'static', response_body: 'x'.repeat(64) })]), null)
   assert.equal(
-    validatePathRules([rule({ response_mode: 'static', response_body: 'x'.repeat(65) })]),
-    '第 1 条路径：响应内容不能超过 64 个字符',
-  )
-  assert.equal(
-    validatePathRules([rule({ response_mode: 'static', response_body: '🙂'.repeat(64) })]),
+    validatePathRules([rule({ response_mode: 'static', response_body: '🙂'.repeat(max) })]),
     null,
-    '长度按码点计——代理对不得按 UTF-16 长度算成 128',
+    '长度按码点计——代理对不得按 UTF-16 长度算成双倍',
+  )
+  // 旧 64 上限必须已放宽
+  assert.equal(
+    validatePathRules([rule({ response_mode: 'static', response_body: 'y'.repeat(200) })]),
+    null,
+    '200 字符应放行（旧 64 上限已放宽）',
+  )
+  // 放行常规空白
+  assert.equal(
+    validatePathRules([rule({ response_mode: 'static', response_body: '<html>\n\t<body>\r\n</body>\n</html>' })]),
+    null,
+    '换行/回车/制表符必须放行（HTML/JSON 多行排版）',
+  )
+  // 拒其余控制字符
+  for (const bad of ['a\x00b', 'a\x07b', 'a\x0bb', 'a\x0cb', 'a\x1bb', 'a\x7fb']) {
+    assert.equal(
+      validatePathRules([rule({ response_mode: 'static', response_body: bad })]),
+      '第 1 条路径：响应内容含非法控制字符',
+      `控制字符 ${JSON.stringify(bad)} 必须拒绝`,
+    )
+  }
+})
+
+test('跳转目标形状：与后端 isValidStaticRedirectTarget 同口径（含拒空格）', () => {
+  for (const ok of ['https://example.com/new', 'http://example.com/x?q=1', '/new', '/new?q=1#f', 'HTTPS://Example.COM/Up']) {
+    assert.equal(isValidRedirectTargetShape(ok), true, `${ok} 应合法`)
+  }
+  for (const bad of ['ftp://example.com/x', 'example.com/x', 'https://exa mple.com/x', '/new path', 'javascript:alert(1)', 'https://e.com/\x01x']) {
+    assert.equal(isValidRedirectTargetShape(bad), false, `${bad} 应非法`)
+  }
+})
+
+test('301 跳转模式：前端不读 response_status（残留值不得误伤），后端保存门权威', () => {
+  // redirect 表单不展示状态码字段，applyResponseMode 切模式时也不清它——读到的
+  // 常是切换前残留值（如 static 的 200）。前端若据此报错会误伤合法配置，故一律
+  // 放行目标合法的 redirect；「只能为 301」由后端 validateRuleFeatures 权威执行
+  // （Go 侧钉测 TestValidateRuleFeatures_redirectModeOnly301 覆盖）。
+  for (const status of [0, 301, 200, 302, 307]) {
+    assert.equal(
+      validatePathRules([rule({ response_mode: 'redirect', response_status: status, redirect_to: 'https://x.com/y' })]),
+      null,
+      `status=${status} 属残留值，前端不得据此拒绝合法 redirect`,
+    )
+  }
+  // 跳转目标本身的校验仍然生效
+  assert.equal(
+    validatePathRules([rule({ response_mode: 'redirect', response_status: 200 })]),
+    '第 1 条路径：301 跳转需要填写跳转地址',
   )
 })
 
@@ -226,9 +332,11 @@ test('直接返回：响应格式枚举与两处互斥', () => {
     validatePathRules([rule({ response_mode: 'static', response_content_type: 'text/xml' })]),
     '第 1 条路径：响应格式仅支持纯文本/JSON/HTML',
   )
+  // 非 3xx + 跳转地址：2026-11-11 起文案点明「该状态码不是重定向」（更可诊断，
+  // 旧句「直接返回与跳转地址互斥」看不出是状态码引起的）
   assert.equal(
     validatePathRules([rule({ response_mode: 'static', redirect_to: 'https://old.example.com' })]),
-    '第 1 条路径：直接返回与跳转地址互斥',
+    '第 1 条路径：状态码 200 不是重定向，不应填写跳转地址（请清空）',
   )
   for (const conflicting of [{ upstream_path: '/v1' }, { upstreams: [upstream()] }]) {
     assert.equal(
@@ -245,15 +353,15 @@ test('301 跳转：目标必填、控制字符、形状、与响应内容/上游
     '第 1 条路径：301 跳转需要填写跳转地址',
     '纯空白同样视为未填',
   )
-  // 控制字符查原串且先于形状判定（与后端逐 rune 判同位）
-  assert.equal(
-    validatePathRules([rule({ response_mode: 'redirect', redirect_to: 'https://x.example.com/\x00' })]),
-    '第 1 条路径：跳转地址含非法字符',
-  )
-  assert.equal(
-    validatePathRules([rule({ response_mode: 'redirect', redirect_to: 'https://x.example.com/\t' })]),
-    '第 1 条路径：跳转地址含非法字符',
-  )
+  // 控制字符与空格统一由形状判定拒绝（2026-11-11 起前后端共用
+  // isValidRedirectTargetShape 单源，含 \t 与其它控制字符同句）
+  for (const bad of ['https://x.example.com/\x00', 'https://x.example.com/\t', 'https://x.example.com/a b']) {
+    assert.equal(
+      validatePathRules([rule({ response_mode: 'redirect', redirect_to: bad })]),
+      '第 1 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符',
+      `${JSON.stringify(bad)} 必须按形状非法拒绝`,
+    )
+  }
   for (const target of ['https://new.example.com', 'http://new.example.com/a', '/relative/path']) {
     assert.equal(
       validatePathRules([rule({ response_mode: 'redirect', redirect_to: target })]),
@@ -264,7 +372,7 @@ test('301 跳转：目标必填、控制字符、形状、与响应内容/上游
   for (const target of ['new.example.com', 'ftp://new.example.com', 'https:/new.example.com']) {
     assert.equal(
       validatePathRules([rule({ response_mode: 'redirect', redirect_to: target })]),
-      '第 1 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径',
+      '第 1 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符',
       `${target} 形状非法`,
     )
   }

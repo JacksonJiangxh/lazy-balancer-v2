@@ -678,47 +678,37 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 			seenExactNorms[normalizedExact] = index + 1
 		}
-		// 直接返回/301 跳转（2026-10-10 用户裁定）：模式枚举 + 按模式字段门 +
-		// 与转发配置互斥。static=常用状态码白名单 + 响应体 ≤64 字符 + 格式
-		// {text/plain,application/json,text/html}；redirect=目标必填且形状合法。
+		// 直接返回/301 跳转（2026-10-10 用户裁定；2026-11-11 TASK-2026-1111-01 强健度
+		// 提回自研口径）：模式枚举 + 按模式字段门 + 与转发配置互斥。
+		// static=19 码白名单（含 3xx 与 201）+ 响应体上限 + 控制字符门 + 格式白名单，
+		// 选 3xx 时跳转目标必填；redirect=恒 301、目标必填且形状合法。
+		// 判据单源在 validateStaticResponsePathRule（与渲染侧 services 同口径），
+		// 校验失败文案带行号由本函数补——两个模式共用同一份判定，避免双写分叉。
 		switch pathRule.ResponseMode {
 		case "":
 			// 转发现状：响应字段为死配置，写侧归一为默认值（replacePathRulesTx），
 			// 此处不拒（旧客户端/备份缺省形态直达）。
 		case "static":
-			// 缺省 0=默认 200（写侧归一同口径）；白名单只拦截显式的非常用值。
-			status := pathRule.ResponseStatus
-			if status == 0 {
-				status = 200
-			}
-			if !validStaticResponseStatuses[status] {
-				return fmt.Errorf("第 %d 条路径规则：直接返回的状态码 %d 不在常用集合（200/201/204/400/401/403/404/410/500/502/503）", index+1, pathRule.ResponseStatus)
-			}
-			if len([]rune(pathRule.ResponseBody)) > 64 {
-				return fmt.Errorf("第 %d 条路径规则：响应内容不能超过 64 个字符", index+1)
-			}
-			if pathRule.ResponseContentType != "" && pathRule.ResponseContentType != "text/plain" &&
-				pathRule.ResponseContentType != "application/json" && pathRule.ResponseContentType != "text/html" {
-				return fmt.Errorf("第 %d 条路径规则：响应格式仅支持 text/plain、application/json、text/html", index+1)
-			}
-			if pathRule.RedirectTo != "" {
-				return fmt.Errorf("第 %d 条路径规则：直接返回与跳转目标互斥（请清空跳转地址）", index+1)
+			// 缺省状态码 0 → 200
+			if err := validateStaticResponseModeFields(index, pathRule, 200); err != nil {
+				return err
 			}
 			if pathRule.Upstreams != nil || pathRule.UpstreamPath != "" {
 				return fmt.Errorf("第 %d 条路径规则：直接返回模式与上游配置互斥（不访问上游）", index+1)
 			}
+			// 201 语义提醒（r2 总经理裁决：放行而非硬拒）。存量 201 规则必须
+			// 能被任何编辑保存，故此处只打 warn 日志、不返回错误。
+			warnStaticResponse201Semantics(index, pathRule)
 		case "redirect":
-			if strings.TrimSpace(pathRule.RedirectTo) == "" {
-				return fmt.Errorf("第 %d 条路径规则：301 跳转需要填写跳转地址", index+1)
+			// redirect 恒 301：状态码为死配置（渲染侧恒写 301），非 301 值显性拒绝
+			// 而非静默忽略——避免「填了 302 实际发 301」的误配。
+			if pathRule.ResponseStatus != 0 && pathRule.ResponseStatus != 301 {
+				return fmt.Errorf("第 %d 条路径规则：301 跳转模式的响应码只能为 301（当前 %d）；如需其他 3xx 请改用「直接返回」模式", index+1, pathRule.ResponseStatus)
 			}
-			for _, r := range pathRule.RedirectTo {
-				if r < 0x20 || r == 0x7f {
-					return fmt.Errorf("第 %d 条路径规则：跳转地址含非法字符", index+1)
-				}
-			}
-			if !strings.HasPrefix(pathRule.RedirectTo, "/") &&
-				!strings.HasPrefix(pathRule.RedirectTo, "http://") && !strings.HasPrefix(pathRule.RedirectTo, "https://") {
-				return fmt.Errorf("第 %d 条路径规则：跳转地址须为 http(s):// 绝对地址或 / 开头路径", index+1)
+			// 缺省状态码 0 → 301（**不是** 200）：共用函数按 status 分派 Location
+			// 必备与禁体规则，若此处也归一 200，redirect 模式会被判成「200 带目标」。
+			if err := validateStaticResponseModeFields(index, pathRule, 301); err != nil {
+				return err
 			}
 			if pathRule.ResponseBody != "" || pathRule.ResponseContentType != "" {
 				return fmt.Errorf("第 %d 条路径规则：301 跳转与响应内容互斥（请清空内容/格式）", index+1)
@@ -805,11 +795,188 @@ type storedPathRule struct {
 	redirectTo          string
 }
 
-// validStaticResponseStatuses 直接返回的常用状态码白名单（2026-10-10 用户裁定）。
+// validStaticResponseStatuses 直接返回的状态码白名单
+// （2026-10-10 用户裁定初版 11 码；2026-11-11 TASK-2026-1111-01 按董事长自研口径
+// 扩至 19 码）。
+//
+// **单源纪律**：本表内容必须与 services.staticResponseStatusCodes 逐值同集，
+// 由 parity 钉测（rule_features_static_response_test.go）机械核验。校验与渲染
+// 之所以各自持表而不直接互调：handlers → services 的依赖方向不能反转成
+// services → handlers，而校验需要 O(1) 查表。渲染侧另有
+// services.StaticResponseIsSupportedStatus 供其它调用方复用。
+//
+// 与上游 v2.4.2 的 11 码差异：补入 3xx 五码 + 405/429/504，并保留 201。
+// 3xx 进白名单的前提是渲染侧真实写 Location 并按 RFC 9110 不带响应体
+// （见 services.buildStaticResponseHandler）。
+//
+// **201 口径（r2 按总经理裁决修订）**：201 曾于 r1 被移出白名单，风控官 P1-2
+// 指出该改法会让「存量 201 规则连改名都存不了」——因本表在 validateRuleFeatures
+// 内对整条规则的每条 path_rule 执行，任何一次编辑都会整体被拒。现改回**放行**：
+// 201 属「带体、无 Location」的普通成功响应（StaticResponseBodyAllowed(201) 为
+// true，天然成立），渲染侧 v2.4.2 从未拦截。仅在新写入时给 warn 级提示提醒语义
+// 偏差（见 warnStaticResponse201Semantics），**提醒而非拦截**。
 var validStaticResponseStatuses = map[int]bool{
 	200: true, 201: true, 204: true,
-	400: true, 401: true, 403: true, 404: true, 410: true,
-	500: true, 502: true, 503: true,
+	301: true, 302: true, 303: true, 307: true, 308: true,
+	400: true, 401: true, 403: true, 404: true, 405: true, 410: true, 429: true,
+	500: true, 502: true, 503: true, 504: true,
+}
+
+// staticResponseDeprecatedSemantics 登记「可保存但语义可疑」的状态码及提示文案。
+//
+// 与白名单的关系：本表是白名单的**子集**，不是第二道门——命中不拦截、只打
+// warn 日志（services.Logf("warn", ...)）。设计动机：201 在 RFC 9110 §15.3.2
+// 里是「服务端已按请求创建资源并应返回其位置」，而静态短路响应不创建任何资源，
+// 用它表达「成功」属语义误用；但存量数据里可能已有 201 规则（v2.4.2 的 11 码
+// 白名单本就含 201），硬拒会让用户「连改名都存不了」。故取「放行 + 提醒」。
+var staticResponseDeprecatedSemantics = map[int]string{
+	201: "201 语义为已创建资源（应带 Location 指向新资源），静态短路不创建资源，建议改用 200",
+}
+
+// warnStaticResponse201Semantics 对命中 staticResponseDeprecatedSemantics 的
+// 静态响应状态码打 warn 级日志。**纯提示，不参与任何拒绝判定**——保存流程在
+// 校验通过后调用，日志失败绝不影响保存结果。
+//
+// 定位信息只有行号 + 匹配方式 + 路径：ruleFeatureInput 不带规则名（校验入口是
+// 纯特性门，不持有规则标识），日志里用「路径规则」定位足够用户找到那一行。
+func warnStaticResponse201Semantics(index int, pathRule models.PathRule) {
+	if pathRule.ResponseMode != "static" {
+		return
+	}
+	status := pathRule.ResponseStatus
+	if status == 0 {
+		status = 200
+	}
+	hint, exists := staticResponseDeprecatedSemantics[status]
+	if !exists {
+		return
+	}
+	services.Logf("warn", "第 %d 条路径规则（%s %s）使用状态码 %d：%s",
+		index+1, pathRule.MatchType, pathRule.Path, status, hint)
+}
+
+// staticResponseBodyMaxRunes 响应体长度上限（按 Unicode 码点计，与前端
+// [...body].length 同口径）。
+//
+// 取值理由（TASK-2026-1111-01 派活要求说明依据）：上游原值 64 字符过紧——
+// 一段带样式的维护页 HTML 或一条结构化 JSON 错误体轻松超 100 字符，用户被迫
+// 写「请稍后再试」这类无信息量的占位串。上限放到 4096 字符（4 KiB 量级）
+// 的依据三条：
+//   ① 内存面：响应体在渲染期作为 Caddy 配置字段常驻，单条规则一条路径一个
+//      字符串——4096 字符 × 每条规则路径数十条 = 百 KB 级，相对 Caddy 配置
+//      与进程常驻内存可忽略；反观放到 1 MiB 会让「配置」变成「静态资源托管」，
+//      那是 vhost/文件服务的职责，不是路径规则短路的职责。
+//   ② 展示面：面板「内容」输入框单行展示、编辑器卡片高度有限；4 KiB 的正文
+//      在输入框内仍需折叠/滚动，再放宽只会恶化编辑体验。
+//   ③ 存储面：path_rules 属集群同步矩阵内的表，行级触发器逐行同步整行内容；
+//      4 KiB 单行对 SQLite 页与同步载荷都安全（同族 block_pages 内容列上限
+//      64 KiB，是整页 HTML 的独立特性，不可类比）。
+// 仍「无硬上限」的诉求由「走上游 + 静态文件」满足；本特性定位是短路响应。
+const staticResponseBodyMaxRunes = 4096
+
+// validateStaticResponseModeFields 是 static 与 redirect 两个模式共用的字段门
+// （2026-11-11 TASK-2026-1111-01 从自研 validateStaticResponsePathRule 提回）：
+// 状态码白名单 → 响应体不进禁用码 → 响应体长度 → 响应体控制字符 → 响应格式
+// → 跳转目标（3xx 必填且形状合法 / 非 3xx 禁携带）。
+//
+// 两个模式共用一份判定的理由：redirect 就是「恒 301 的 static」，若各写一份，
+// 3xx 的 RFC 约束（禁体、Location 必填）必然在其中一处漂移。文案带行号前缀由
+// 本函数直接给出（index+1），调用侧不再包一层。
+// defaultStatus 为 response_status=0 时的缺省归一值：static 模式给 200、
+// redirect 模式给 301。**必须由调用侧传入**——共用函数若写死 200，redirect 模式
+// 会被按「200 + 跳转目标」判成误配（redirect 恒 301 是渲染侧事实）。
+func validateStaticResponseModeFields(index int, pathRule models.PathRule, defaultStatus int) error {
+	// 缺省 0 归一为 defaultStatus；白名单只拦截显式的非常用值。
+	status := pathRule.ResponseStatus
+	if status == 0 {
+		status = defaultStatus
+	}
+	// 双门：本地查表（O(1)，带行号文案）+ services 权威集合（防两表漂移）。
+	// 两表由 parity 钉测保证同集，此处双检是纵深防御，不是冗余。
+	if !validStaticResponseStatuses[status] || !services.StaticResponseIsSupportedStatus(status) {
+		return fmt.Errorf("第 %d 条路径规则：状态码 %d 不在支持范围（%s）",
+			index+1, status, formatStaticResponseStatusList())
+	}
+	bodyAllowed := services.StaticResponseBodyAllowed(status)
+	body := pathRule.ResponseBody
+	// RFC 9110：3xx（重定向）/204/304 不得携带消息体。携带即误配，显性拒绝
+	// 而非渲染期静默丢弃——静默丢弃会让用户以为生效了。
+	if body != "" && !bodyAllowed {
+		return fmt.Errorf("第 %d 条路径规则：状态码 %d 按 RFC 9110 不得携带响应内容（请清空内容）", index+1, status)
+	}
+	if len([]rune(body)) > staticResponseBodyMaxRunes {
+		return fmt.Errorf("第 %d 条路径规则：响应内容不能超过 %d 个字符（当前 %d）",
+			index+1, staticResponseBodyMaxRunes, len([]rune(body)))
+	}
+	// 响应体放行常规空白（HTML/JSON 多行排版需要），拒绝其余控制字符。
+	// 其余控制字符会在 HTTP 响应体里造成客户端解析歧义，且多为误粘贴所致。
+	if err := validateRespondBodyChars(index, body); err != nil {
+		return err
+	}
+	if pathRule.ResponseContentType != "" && pathRule.ResponseContentType != "text/plain" &&
+		pathRule.ResponseContentType != "application/json" && pathRule.ResponseContentType != "text/html" {
+		return fmt.Errorf("第 %d 条路径规则：响应格式仅支持 text/plain、application/json、text/html", index+1)
+	}
+	// 跳转目标：3xx 必填，其余状态码禁携带（误配显性拒绝，不静默忽略）。
+	target := strings.TrimSpace(pathRule.RedirectTo)
+	if services.StaticResponseIsRedirectStatus(status) {
+		if target == "" {
+			return fmt.Errorf("第 %d 条路径规则：状态码 %d 是重定向，必须填写跳转地址", index+1, status)
+		}
+		if !isValidStaticRedirectTarget(target) {
+			return fmt.Errorf("第 %d 条路径规则：跳转地址无效（须以 http://、https:// 或 / 开头，且不含空格与控制字符）", index+1)
+		}
+		return nil
+	}
+	if target != "" {
+		return fmt.Errorf("第 %d 条路径规则：状态码 %d 不是重定向，不应填写跳转地址（请清空）", index+1, status)
+	}
+	return nil
+}
+
+// validateRespondBodyChars 响应体控制字符门：放行 \n \r \t（HTML/JSON 多行
+// 排版必需），拒绝其余 C0 控制字符与 DEL。
+func validateRespondBodyChars(index int, body string) error {
+	for _, c := range body {
+		if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+			return fmt.Errorf("第 %d 条路径规则的响应内容含非法控制字符", index+1)
+		}
+		if c == 0x7f {
+			return fmt.Errorf("第 %d 条路径规则的响应内容含非法控制字符", index+1)
+		}
+	}
+	return nil
+}
+
+// isValidStaticRedirectTarget 校验跳转目标（2026-11-11 提回自研强健口径）：
+// 站内绝对路径（/ 开头）或绝对 URL（http/https，大小写不敏感），且不含空格
+// 与任何控制字符。比上游原判据（仅拒 <0x20 与 0x7f）多拒**空格**——URL 中的
+// 裸空格在 Location 头里必然被客户端截断或转义，属明确的误配形态。
+func isValidStaticRedirectTarget(target string) bool {
+	if strings.ContainsFunc(target, unicode.IsSpace) {
+		return false
+	}
+	for _, c := range target {
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	if strings.HasPrefix(target, "/") {
+		return true
+	}
+	lower := strings.ToLower(target)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+// formatStaticResponseStatusList 生成白名单的可读枚举串（错误文案同源，
+// 避免改集合忘改文案）。按数值升序输出。
+func formatStaticResponseStatusList() string {
+	codes := services.StaticResponseStatusCodes()
+	parts := make([]string, 0, len(codes))
+	for _, code := range codes {
+		parts = append(parts, strconv.Itoa(code))
+	}
+	return strings.Join(parts, "/")
 }
 
 // replacePathRulesTx 以「保留不变行」的方式收敛给定规则的路径规则集合（历史

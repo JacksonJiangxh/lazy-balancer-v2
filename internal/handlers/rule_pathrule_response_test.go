@@ -1,9 +1,13 @@
 package handlers
 
 // 自定义路由「直接返回/301 跳转」（2026-10-10 用户裁定）保存侧校验：
-// response_mode ∈ {''转发, static 静态响应, redirect 301 跳转}；
-// static=常用状态码白名单 + 响应体 ≤64 字符 + 格式 {plain/json/html}，禁 redirect_to/上游；
-// redirect=目标必填（/ 开头相对路径或 http(s) 绝对 URL，拒 CRLF），禁 body/上游。
+// response_mode ∈ {''转发, static 静态响应, redirect 301 跳转}。
+//
+// 2026-11-11 TASK-2026-1111-01 强健度改造后口径：
+// static = 19 码白名单（含 3xx 与存量兼容的 201；选 3xx 须填跳转目标、该码不得带体）+ 响应体
+// ≤4096 字符 + 控制字符门 + 格式 {plain/json/html} + 非 3xx 禁 redirect_to；
+// redirect = 恒 301、目标必填（/ 开头相对路径或 http(s) 绝对 URL，不含空格与
+// 控制字符），禁 body/上游。逐条判据见 rule_features_static_response_test.go。
 
 import (
 	"fmt"
@@ -44,13 +48,19 @@ func TestRulePayload_pathRuleResponseModeValidation(t *testing.T) {
 		// 畸形形状
 		{"未知模式拒绝", `{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"bogus"}`, http.StatusBadRequest, "response_mode", 0, "", ""},
 		{"static 非常用状态码拒绝", `{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","response_status":299}`, http.StatusBadRequest, "状态码", 0, "", ""},
-		{"static 响应体超 64 字符拒绝", fmt.Sprintf(`{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","response_body":%q}`, longBody), http.StatusBadRequest, "64", 0, "", ""},
+		// 2026-11-11 TASK-2026-1111-01：响应体上限 64 → 4096，65 字符已属合法；
+		// 超限用例改按新界值构造（见下 4097 一条）。
+		{"static 响应体 65 字符放行（新上限）", fmt.Sprintf(`{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","response_body":%q}`, longBody), http.StatusCreated, "", 0, "", ""},
+		{"static 响应体超 4096 字符拒绝", fmt.Sprintf(`{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","response_body":%q}`, strings.Repeat("x", 4097)), http.StatusBadRequest, "4096", 0, "", ""},
 		{"static 非法格式拒绝", `{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","response_content_type":"text/xml"}`, http.StatusBadRequest, "格式", 0, "", ""},
-		{"static 带跳转目标拒绝", `{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","redirect_to":"https://a.b"}`, http.StatusBadRequest, "互斥", 0, "", ""},
+		// 非 3xx 携带跳转目标：误配显性拒绝（文案自 2026-11-11 起点明状态码）
+		{"static 带跳转目标拒绝", `{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","redirect_to":"https://a.b"}`, http.StatusBadRequest, "不应填写跳转地址", 0, "", ""},
 		{"static 带上游拒绝", `{"sort_order":0,"match_type":"exact","path":"/x","response_mode":"static","upstreams":[{"address":"127.0.0.1","port":9000}]}`, http.StatusBadRequest, "互斥", 0, "", ""},
 		{"redirect 空目标拒绝", `{"sort_order":0,"match_type":"prefix","path":"/old/","response_mode":"redirect"}`, http.StatusBadRequest, "跳转地址", 0, "", ""},
 		{"redirect CRLF 目标拒绝", `{"sort_order":0,"match_type":"prefix","path":"/old/","response_mode":"redirect","redirect_to":"https://a.b/\r\nX-Evil: 1"}`, http.StatusBadRequest, "跳转地址", 0, "", ""},
-		{"redirect 带响应体拒绝", `{"sort_order":0,"match_type":"prefix","path":"/old/","response_mode":"redirect","redirect_to":"https://a.b/","response_body":"x"}`, http.StatusBadRequest, "互斥", 0, "", ""},
+		// redirect 带响应体：301 属 3xx，按 RFC 9110 先命中「不得携带响应内容」
+		// （比「互斥」更准确点出根因，2026-11-11 起）
+		{"redirect 带响应体拒绝", `{"sort_order":0,"match_type":"prefix","path":"/old/","response_mode":"redirect","redirect_to":"https://a.b/","response_body":"x"}`, http.StatusBadRequest, "不得携带响应内容", 0, "", ""},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
