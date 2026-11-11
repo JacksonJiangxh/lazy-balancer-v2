@@ -106,7 +106,9 @@
           <label class="rule-field" style="flex: 1;">
             <span class="rule-field-label">内容</span>
             <div class="rule-field-control">
-              <el-input v-model="rule.response_body" size="small" maxlength="64" show-word-limit placeholder="不超过 64 个字符，可留空" :aria-label="`路径规则 ${index + 1} 的响应内容`" />
+              <!-- 上限/提示同源取 ruleValidation.STATIC_RESPONSE_BODY_MAX_RUNES，
+                   禁止组件侧写死数字（曾 64 与后端 64 双写，改上限必漏一处） -->
+              <el-input v-model="rule.response_body" size="small" :maxlength="STATIC_RESPONSE_BODY_MAX_RUNES" show-word-limit :placeholder="`不超过 ${STATIC_RESPONSE_BODY_MAX_RUNES} 个字符，可留空`" :aria-label="`路径规则 ${index + 1} 的响应内容`" />
             </div>
           </label>
         </div>
@@ -178,7 +180,12 @@ import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 import DialogSectionHeader from '@/components/DialogSectionHeader.vue'
 import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
-import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, upstreamPathRuleError } from '@/utils/ruleValidation'
+import {
+  STATIC_RESPONSE_BODY_MAX_RUNES,
+  STATIC_RESPONSE_STATUSES,
+  STATIC_RESPONSE_STATUS_REASONS,
+  upstreamPathRuleError,
+} from '@/utils/ruleValidation'
 import {
   applyResponseMode,
   isForwardResponseMode,

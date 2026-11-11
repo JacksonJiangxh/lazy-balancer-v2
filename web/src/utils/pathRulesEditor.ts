@@ -3,7 +3,15 @@
 // 组件只做取值与渲染，判定全部在此——纯函数可被 node 行为求值，避免把
 // 用户可见的重复/遮蔽/模式归一语义埋在 SFC 里只能靠文本钉。
 import type { PathRule } from '@/types'
-import { canonicalPathKey, pathDuplicateKey, pathRuleError } from './ruleValidation.ts'
+import {
+  STATIC_RESPONSE_BODY_MAX_RUNES,
+  canonicalPathKey,
+  isRedirectResponseStatus,
+  isResponseBodyAllowed,
+  isValidRedirectTargetShape,
+  pathDuplicateKey,
+  pathRuleError,
+} from './ruleValidation.ts'
 
 /** 行内错误：字段级（空/非法/上游路径）+ 同类型查重 + 跨类型遮蔽互查。 */
 export const pathRuleRowError = (rules: readonly PathRule[], index: number): string => {
@@ -89,16 +97,40 @@ export const applyResponseMode = (rule: PathRule): void => {
   }
 }
 
-/** 行内校验（与后端 validateRuleFeatures / ruleValidation.ts 同口径）。 */
+/**
+ * 行内校验（与后端 validateRuleFeatures / ruleValidation.ts 同口径）。
+ *
+ * 2026-11-11 TASK-2026-1111-01：static 模式此前**没有任何行内诊断**——选 3xx
+ * 不填跳转地址、非 3xx 填了跳转地址、超长/控制字符内容都只在点保存时被整组
+ * 拒绝且不定位到行（late failure）。现按后端同序补齐。
+ */
 export const pathRuleResponseError = (rule: PathRule): string => {
   if (rule.response_mode === 'redirect') {
-    // 形状判定查原串（仅空判用 trim）：后端 HasPrefix 按原串——`" http://x"`
+    // 注意：redirect 模式**不读 rule.response_status**——该值在 redirect 表单里
+    // 不展示（applyResponseMode 切换模式时不清它），读到的常是切换前的残留值
+    // （如 static 的 200）。渲染侧恒写 301，故此处只校验跳转目标本身；状态码
+    // 口径由「直接返回」模式的 static 分支与后端保存门负责。
+    // 形状判定查原串（仅空判用 trim）：后端按原串判定——`" http://x"`
     // 若前端 trim 后放行，会在离开该步时被整组拒绝（late failure 复发）。
     const raw = rule.redirect_to ?? ''
     if (!raw.trim()) return '301 跳转需要填写跳转地址'
+    if (!isValidRedirectTargetShape(raw)) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符'
+    return ''
+  }
+  if (rule.response_mode === 'static') {
+    const status = rule.response_status || 200
+    const body = rule.response_body ?? ''
+    if (body !== '' && !isResponseBodyAllowed(status)) return `状态码 ${status} 按 RFC 9110 不得携带响应内容（请清空内容）`
+    if ([...body].length > STATIC_RESPONSE_BODY_MAX_RUNES) return `响应内容不能超过 ${STATIC_RESPONSE_BODY_MAX_RUNES} 个字符`
     // eslint-disable-next-line no-control-regex
-    if (/[\x00-\x1f\x7f]/.test(raw)) return '跳转地址含非法字符'
-    if (!raw.startsWith('/') && !raw.startsWith('http://') && !raw.startsWith('https://')) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径'
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(body)) return '响应内容含非法控制字符'
+    const target = (rule.redirect_to ?? '').trim()
+    if (isRedirectResponseStatus(status)) {
+      if (!target) return `状态码 ${status} 是重定向，必须填写跳转地址`
+      if (!isValidRedirectTargetShape(target)) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符'
+    } else if (target) {
+      return `状态码 ${status} 不是重定向，不应填写跳转地址（请清空）`
+    }
   }
   return ''
 }

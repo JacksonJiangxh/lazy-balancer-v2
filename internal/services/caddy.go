@@ -4058,9 +4058,94 @@ func insertUpstreamPathRewrites(handle []interface{}, pathRule PathRuleConfig) [
 	return rewritten
 }
 
+// StaticResponseStatusCodes 直接返回模式支持的状态码清单（前端下拉与 API 文档
+// 同源获取，后端为唯一权威）。
+//
+// 归属：2026-10-09 自研 `respondStatusCodes`（16 码，`5ee2a96a^:internal/services/
+// caddy.go:2961-2966`）；上游 v2.4.2 收窄为 11 码（无 3xx）；2026-11-11
+// TASK-2026-1111-01 按董事长裁定提回自研口径。
+//
+// 集合口径：200/204 成功 + 301/302/303/307/308 重定向（必须带 Location，
+// 按 RFC 9110 不带消息体）+ 400/401/403/404/405/410/429 客户端错误 +
+// 500/502/503/504 服务端错误。
+//
+// 与自研原表的唯一差异：**去掉 201**。201 Created 语义是「服务端已按请求
+// 创建资源并返回其位置」，静态短路响应不创建任何资源，该码在此场景恒属误用；
+// 保留它会诱导用户把「成功」误配成 201 而漏掉 Location 语义。
+var staticResponseStatusCodes = []int{
+	200, 204, // 成功
+	301, 302, 303, 307, 308, // 重定向（响应必须带 Location）
+	400, 401, 403, 404, 405, 410, 429, // 客户端错误
+	500, 502, 503, 504, // 服务端错误
+}
+
+// StaticResponseStatusCodes 返回预置状态码清单副本（API/前端契约同源，
+// 防调用方篡改内部切片）。
+func StaticResponseStatusCodes() []int {
+	out := make([]int, len(staticResponseStatusCodes))
+	copy(out, staticResponseStatusCodes)
+	return out
+}
+
+// StaticResponseIsSupportedStatus 判定状态码是否在预置集合内（保存校验白名单
+// 的服务侧权威实现，handlers 侧只需复用本函数）。
+func StaticResponseIsSupportedStatus(code int) bool {
+	for _, preset := range staticResponseStatusCodes {
+		if preset == code {
+			return true
+		}
+	}
+	return false
+}
+
+// StaticResponseIsRedirectStatus 判定是否重定向类状态码（3xx：必须携带
+// Location，且按 RFC 9110 不带消息体）。
+func StaticResponseIsRedirectStatus(code int) bool {
+	return code >= 300 && code < 400
+}
+
+// StaticResponseBodyAllowed 判定该状态码是否允许响应体（204/304 与全部 3xx
+// 不允许，RFC 9110 §6.4.1/§15.3/§15.4）。
+func StaticResponseBodyAllowed(code int) bool {
+	return code != 204 && code != 304 && !StaticResponseIsRedirectStatus(code)
+}
+
+// staticResponseDefaultContentType 静态响应带体且未指定内容类型时的兜底值。
+// 自研口径为 `text/html; charset=utf-8`（自研 defaultRespondContentType）；
+// 上游为 `text/plain`。取自研值：短路响应最常见用途是维护公告/错误页，
+// 带 charset 的 HTML 是浏览器可直接渲染的形态；显式选了纯文本的用户
+// 仍会写入 text/plain，不受兜底影响。
+const staticResponseDefaultContentType = "text/html; charset=utf-8"
+
+// staticResponseDefaultContentTypeFor 按用户选择的内容类型给出渲染值：
+// 空=兜底 HTML（带 charset）；text/plain 与 application/json 补 charset/
+// 不加参数（json 无 charset 语义，RFC 8259 规定 UTF-8 无需标注）。
+func staticResponseDefaultContentTypeFor(contentType string) string {
+	switch contentType {
+	case "":
+		return staticResponseDefaultContentType
+	case "text/plain", "text/html":
+		// 用户选的是裸类型，补 charset 使中文不乱码（浏览器对 text/* 缺
+		// charset 会回退本地编码猜测）。
+		return contentType + "; charset=utf-8"
+	default:
+		return contentType
+	}
+}
+
 // buildStaticResponseHandler 渲染路径规则的直接返回/301 跳转 handler（全原生
-// http.handlers.static_response）：redirect=301+Location（目标经校验侧形状门）；
-// static=status_code+body+，缺省兜底 200/text/plain。
+// http.handlers.static_response）。
+//
+// 语义（2026-11-11 TASK-2026-1111-01 按董事长自研口径改造）：
+//   - redirect 模式 = 恒 301 + Location + 无体（行为与改造前完全一致，不回归）；
+//   - static 模式 = 按 status 分派必备响应头（3xx→Location、401→WWW-Authenticate、
+//     405→Allow、带体→Content-Type），3xx 与 204 不带体（RFC 9110）；
+//   - 响应体操 placeholder 转义后原样输出（`{` 转义为 `\{`，否则用户 JSON/
+//     模板里的花括号会被 Caddy 占位符替换静默吞掉）。
+//
+// 改造前上游实现的缺陷（本轮修复）：static 模式恒写 Content-Type + body，不看
+// 状态码——选 3xx 时不发 Location（3xx 变成空重定向）、204 仍带体。校验侧虽
+// 未放行 3xx，但 204 是白名单内且原实现给 204 发了 Content-Type 空体。
 // static_response 的 headers 值与 body 在
 // 运行时经 Caddy replacer 展开已知占位符（v2.11.6 staticresp.go:193-208 实证，
 // ReplaceKnown）——redirect_to/body 中的 {http.request.uri} 等会被改写为请求
@@ -4068,6 +4153,8 @@ func insertUpstreamPathRewrites(handle []interface{}, pathRule PathRuleConfig) [
 // （保路径跳转的合法占位符用法），审计不重报。
 func buildStaticResponseHandler(pathRule PathRuleConfig) map[string]interface{} {
 	if pathRule.ResponseMode == "redirect" {
+		// redirect 模式行为不得回归（改造前恒 301 + Location + 无体）：
+		// 状态码虽然恒 301，但 Location 值原样下发（校验侧已保证形状合法）。
 		return map[string]interface{}{
 			"handler":     "static_response",
 			"status_code": 301,
@@ -4078,16 +4165,47 @@ func buildStaticResponseHandler(pathRule PathRuleConfig) map[string]interface{} 
 	if status <= 0 {
 		status = 200
 	}
-	contentType := pathRule.ResponseContentType
-	if contentType == "" {
-		contentType = "text/plain"
-	}
-	return map[string]interface{}{
+	handler := map[string]interface{}{
 		"handler":     "static_response",
 		"status_code": status,
-		"body":        pathRule.ResponseBody,
-		"headers":     map[string]interface{}{"Content-Type": []string{contentType}},
 	}
+	headers := map[string]interface{}{}
+	// 必备响应头按标准状态码语义预设（RFC 9110 §15）。
+	switch {
+	case StaticResponseIsRedirectStatus(status):
+		// 3xx 必备 Location（校验侧保证非空形状合法）。此前上游实现此处缺失，
+		// 导致 3xx 静默变成「无 Location 的空重定向」。
+		headers["Location"] = []string{pathRule.RedirectTo}
+	case status == 401:
+		// RFC 9110 §15.5.2：401 必须携带 WWW-Authenticate。本程序不参与凭据
+		// 校验（静态短路），以通用 Basic 形态占位，满足标准响应形状。
+		headers["WWW-Authenticate"] = []string{`Basic realm="Restricted"`}
+	case status == 405:
+		// RFC 9110 §15.5.6：405 必须携带 Allow。静态响应对全部方法同响应，
+		// 列出常规方法全集供客户端判断。
+		headers["Allow"] = []string{"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"}
+	}
+	if StaticResponseBodyAllowed(status) {
+		headers["Content-Type"] = []string{staticResponseDefaultContentTypeFor(pathRule.ResponseContentType)}
+	}
+	if len(headers) > 0 {
+		handler["headers"] = headers
+	}
+	// 响应体只在允许带体的状态码上输出（校验侧已拒 3xx/204 带体，此处是
+	// 渲染侧第二道防线——外部负载/直写库可绕过保存门）。
+	if StaticResponseBodyAllowed(status) && pathRule.ResponseBody != "" {
+		handler["body"] = escapeCaddyPlaceholders(pathRule.ResponseBody)
+	}
+	return handler
+}
+
+// escapeCaddyPlaceholders 转义响应体中的 `{`——Caddy static_response 的 body
+// 会做占位符替换，且未识别的占位符按 replacer.ReplaceAll 的
+// treatUnknownAsEmpty 语义展开为空串，用户内容里的 JSON/模板花括号会被静默
+// 吞掉。转义为 `\{` 后引擎按字面输出（replacer.go 的 phEscape 分支），
+// 保证所见即所得。
+func escapeCaddyPlaceholders(body string) string {
+	return strings.ReplaceAll(body, "{", `\{`)
 }
 
 func upstreamPathRewriteHandlers(pathRule PathRuleConfig) []interface{} {

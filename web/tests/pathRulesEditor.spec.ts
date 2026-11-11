@@ -116,8 +116,8 @@ test('模式归一：切回转发清空静态/跳转专属字段并复位状态�
 
 test('跳转地址校验：空/相对路径/控制字符被拒，绝对地址与站内路径通过', () => {
   assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: '' })), '301 跳转需要填写跳转地址')
-  assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: 'example.com' })), '跳转地址须为 http(s):// 绝对地址或 / 开头路径')
-  assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: '/a\u0007b' })), '跳转地址含非法字符')
+  assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: 'example.com' })), '跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符')
+  assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: '/a\u0007b' })), '跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符')
   assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: '/new/' })), '')
   assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: 'https://example.com/x' })), '')
   assert.equal(pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: 'http://example.com' })), '')
@@ -129,11 +129,11 @@ test('跳转地址形状按原串判定（前导空格行内即拒，不拖到�
   // 拒绝——正是「行内已修漂移」在行内层复发的形态。
   assert.equal(
     pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: ' http://example.com' })),
-    '跳转地址须为 http(s):// 绝对地址或 / 开头路径',
+    '跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符',
   )
   assert.equal(
     pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: ' /x' })),
-    '跳转地址须为 http(s):// 绝对地址或 / 开头路径',
+    '跳转地址须为 http(s):// 绝对地址或 / 开头路径，且不含空格与控制字符',
   )
   assert.equal(
     pathRuleResponseError(rule({ response_mode: 'redirect', redirect_to: '   ' })),

@@ -97,8 +97,10 @@ func TestPathRuleRoute_staticModeEmitsStaticResponse(t *testing.T) {
 	if h["status_code"] != 418 {
 		t.Fatalf("status_code=%#v, want 418", h["status_code"])
 	}
-	if h["body"] != `{"error":"teapot"}` {
-		t.Fatalf("body=%#v", h["body"])
+	// body 经 escapeCaddyPlaceholders 转义：`{` → `\{`。不转义的话 Caddy
+	// static_response 会把 `{"error":...}` 当占位符展开成空串（用户 JSON 被吞）。
+	if h["body"] != `\{"error":"teapot"}` {
+		t.Fatalf("body=%#v, want 转义后 `\\{\"error\":\"teapot\"}`", h["body"])
 	}
 	headers, ok := h["headers"].(map[string]interface{})
 	if !ok {
@@ -171,9 +173,12 @@ func TestPathRuleRoute_staticModeDefaults(t *testing.T) {
 	if h["status_code"] != 200 {
 		t.Fatalf("status_code=%#v, want 200（缺省兜底）", h["status_code"])
 	}
+	// 2026-11-11 TASK-2026-1111-01：缺省内容类型按自研口径改为带 charset 的
+	// HTML（短路响应最常见用途是维护公告/错误页，浏览器可直接渲染）；上游原值
+	// 是不带 charset 的 text/plain，中文会按本地编码猜。
 	ct := h["headers"].(map[string]interface{})["Content-Type"].([]string)
-	if len(ct) != 1 || ct[0] != "text/plain" {
-		t.Fatalf("Content-Type=%#v, want [text/plain]（缺省兜底）", ct)
+	if len(ct) != 1 || ct[0] != "text/html; charset=utf-8" {
+		t.Fatalf("Content-Type=%#v, want [text/html; charset=utf-8]（缺省兜底）", ct)
 	}
 }
 
@@ -212,5 +217,136 @@ func TestPathRuleRoute_staticChainCountsMetrics(t *testing.T) {
 		if second["handler"] != "static_response" {
 			t.Fatalf("%s handle[1]=%#v, want static_response", suffix, second["handler"])
 		}
+	}
+}
+// ── 2026-11-11 TASK-2026-1111-01：3xx/204 渲染强健度钉测（S1/S7/S8）──
+//
+// 改造前上游实现恒写 Content-Type + body，不看状态码：选 3xx 不发 Location
+// （静默变成空重定向）、204 仍带 Content-Type。以下钉测锁死新语义。
+
+// renderOneStatic 构造单条 static 路径规则并取回 static_response handler。
+func renderOneStatic(t *testing.T, pathRule PathRuleConfig) map[string]interface{} {
+	t.Helper()
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128,
+		CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
+		CustomRoutesEnabled: true,
+		Upstreams:           []UpstreamConfig{{Host: "10.0.0.1", Port: 9000, Weight: 1, Enabled: true}},
+		PathRules:           []PathRuleConfig{pathRule},
+	}
+	return staticResponseOf(t, findPathRoute(buildPathRuleRoutesForTest(t, rule), "path_0"))
+}
+
+// Given: static 模式 + 301 + 跳转目标
+// When: 渲染
+// Then: status_code=301、headers.Location=目标、**无 body**、无 Content-Type
+// （RFC 9110：3xx 不带消息体）
+func TestPathRuleRoute_staticMode3xxRendersLocationNoBody(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		h := renderOneStatic(t, PathRuleConfig{
+			SortOrder: 0, MatchType: "exact", Path: "/moved", ResponseMode: "static",
+			ResponseStatus: status, RedirectTo: "https://new.example.com/x",
+		})
+		if h["status_code"] != status {
+			t.Fatalf("status %d: status_code=%#v", status, h["status_code"])
+		}
+		headers, ok := h["headers"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("status %d: headers missing: %#v", status, h)
+		}
+		loc, ok := headers["Location"].([]string)
+		if !ok || len(loc) != 1 || loc[0] != "https://new.example.com/x" {
+			t.Fatalf("status %d: Location=%#v, want [https://new.example.com/x]", status, headers["Location"])
+		}
+		// 3xx 不得带体：既不能是空串键，也不能有值
+		if body, has := h["body"]; has && body != "" {
+			t.Fatalf("status %d: 3xx 不得携带响应体，got %#v", status, body)
+		}
+		if _, has := headers["Content-Type"]; has {
+			t.Fatalf("status %d: 3xx 不得携带 Content-Type，got %#v", status, headers["Content-Type"])
+		}
+	}
+}
+
+// Given: static 模式 + 204（白名单内）
+// When: 渲染
+// Then: 无 body、无 Content-Type（RFC 9110：204 不得带消息体）
+func TestPathRuleRoute_staticMode204NoBodyNoContentType(t *testing.T) {
+	h := renderOneStatic(t, PathRuleConfig{
+		SortOrder: 0, MatchType: "exact", Path: "/noop", ResponseMode: "static", ResponseStatus: 204,
+	})
+	if h["status_code"] != 204 {
+		t.Fatalf("status_code=%#v, want 204", h["status_code"])
+	}
+	if body, has := h["body"]; has && body != "" {
+		t.Fatalf("204 不得携带响应体，got %#v", body)
+	}
+	headers, _ := h["headers"].(map[string]interface{})
+	if _, has := headers["Content-Type"]; has {
+		t.Fatalf("204 不得携带 Content-Type，got %#v", headers["Content-Type"])
+	}
+}
+
+// Given: static 模式 + 405 / 401
+// When: 渲染
+// Then: 405 带 Allow、401 带 WWW-Authenticate（RFC 9110 §15.5.6 / §15.5.2）
+func TestPathRuleRoute_staticModeRequiredHeaders(t *testing.T) {
+	allow := renderOneStatic(t, PathRuleConfig{
+		SortOrder: 0, MatchType: "exact", Path: "/nope", ResponseMode: "static", ResponseStatus: 405,
+	})
+	allowHeaders, _ := allow["headers"].(map[string]interface{})
+	if _, ok := allowHeaders["Allow"].([]string); !ok {
+		t.Fatalf("405 必须携带 Allow，got %#v", allowHeaders)
+	}
+	unauth := renderOneStatic(t, PathRuleConfig{
+		SortOrder: 0, MatchType: "exact", Path: "/private", ResponseMode: "static", ResponseStatus: 401,
+	})
+	unauthHeaders, _ := unauth["headers"].(map[string]interface{})
+	if _, ok := unauthHeaders["WWW-Authenticate"].([]string); !ok {
+		t.Fatalf("401 必须携带 WWW-Authenticate，got %#v", unauthHeaders)
+	}
+}
+
+// Given: 显式选 text/plain / application/json
+// When: 渲染
+// Then: text/plain 补 charset、application/json 不补（RFC 8259 固定 UTF-8）
+func TestPathRuleRoute_staticModeContentTypeCharset(t *testing.T) {
+	cases := map[string]string{
+		"text/plain":       "text/plain; charset=utf-8",
+		"text/html":        "text/html; charset=utf-8",
+		"application/json": "application/json",
+	}
+	for in, want := range cases {
+		h := renderOneStatic(t, PathRuleConfig{
+			SortOrder: 0, MatchType: "exact", Path: "/ct", ResponseMode: "static",
+			ResponseStatus: 200, ResponseBody: "x", ResponseContentType: in,
+		})
+		ct, _ := h["headers"].(map[string]interface{})["Content-Type"].([]string)
+		if len(ct) != 1 || ct[0] != want {
+			t.Fatalf("%s: Content-Type=%#v, want [%s]", in, ct, want)
+		}
+	}
+}
+
+// Given: 静态响应状态码清单
+// When: 取 StaticResponseStatusCodes
+// Then: 17 码、升序、含 3xx 五码与 405/429/504、不含 201
+func TestStaticResponseStatusCodes(t *testing.T) {
+	codes := StaticResponseStatusCodes()
+	want := []int{200, 204, 301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 410, 429, 500, 502, 503, 504}
+	if len(codes) != len(want) {
+		t.Fatalf("len=%d, want %d: %v", len(codes), len(want), codes)
+	}
+	for i := range want {
+		if codes[i] != want[i] {
+			t.Fatalf("codes[%d]=%d, want %d（全表 %v）", i, codes[i], want[i], codes)
+		}
+	}
+	if StaticResponseIsSupportedStatus(201) {
+		t.Fatal("201 必须不在支持集合（Created 语义要求创建资源并给 Location，静态短路不创建资源）")
+	}
+	// 副本语义：调用方改动不得污染内部切片
+	codes[0] = 999
+	if StaticResponseStatusCodes()[0] != 200 {
+		t.Fatal("StaticResponseStatusCodes 必须返回副本")
 	}
 }
