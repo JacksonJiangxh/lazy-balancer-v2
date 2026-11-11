@@ -121,12 +121,21 @@
   > 3. TLS 回退曾用 `{http.request.hostport}`（`2ba0f2c7`/`872408c2` 引入，
   >    `3f1c3346` 才修）——说明该形态在上游侧反复出问题。
   >
-  > 机械判据（可直接跑，任一为红即视为回归）：
+  > 机械判据（可直接照抄执行，任一为红即视为回归）：
   > - `grep -rn "originDomains\|originDialOrder" internal/services/caddy.go` → **无命中**
-  > - `grep -rn "http.request.hostport" --include=*.go --include=*.ts --include=*.vue .`
-  >   → 仅允许出现在**注释**与钉测 `caddy_upstream_origin_test.go` 内
+  > - `grep -rn "http.request.hostport" --include='*.go' --include='*.ts' --include='*.vue' --include='*.yml' --include='*.yaml' .`
+  >   → 仅允许出现在**注释**与下列**钉测本体**内：
+  >   `internal/services/caddy_upstream_origin_test.go`（H2 扫描器与 needle 常量）、
+  >   `internal/services/caddy_emit_config_validate_test.go`（产物层断言）、
+  >   `caddygeoip/caddy_decode_generated_config_test.go`（解码链侧断言）、
+  >   `internal/services/render_anti_fallback_scan_test.go`（反兜底清单的说明文字）。
+  >   注：`.yml`/`.yaml` 在扫描器内**不享受注释豁免**（YAML 块标量内容行不以 `#`
+  >   开头，按行首 `#` 豁免会留绕过面）。
   > - `go test -run 'TestUpstreamHost_noClientHostFallbackAnywhere|TestUpstreamHost_mapPlanFullyRemoved' ./internal/services/` → PASS
   > - `go test -run 'TestPathRuleUpstreamHost_' ./internal/services/` → PASS
+  > - `/bin/bash scripts/verify-generated-config-decodes.sh` → `VERIFY: PASS`
+  >   （生产渲染链产物 → Caddy 真实解码链：`Route.UnmarshalJSON` → `Route.Provision`
+  >   → `ctx.LoadModule`；证明配置能被加载，比 `caddy validate` 更贴近根因且不依赖外部二进制）
   >
   > **禁止**删除 `caddygeoip/upstream_host.go` 或 `caddygeoip/go.mod` 里的模块注册；
   > `Dockerfile` 的 `xcaddy --with lazy-balancer-v2/caddygeoip=./caddygeoip` 必须在位
@@ -145,5 +154,10 @@
 2. **禁止删条目**：能力废弃时保留条目并标注「已退役（时点 + 裁定）」，说明去向。
 3. **追上游前必读**：`docs/upstream-merge.zh-CN.md` 的追平流程**第一步**即逐项核对
    本文件的防复发约束；漏核导致能力被切回上游，按红线「假装完成」同族处理。
-4. **机械可核**：每条目的「关键符号」必须能被 `grep -rn <符号> --include=*.go .`
+4. **机械可核**：每条目的「关键符号」必须能被 `grep -rn '<符号>' --include='*.go' .`
    命中；符号改名须同步本条（本仓库 CI 不自动校验，靠评审与 `R3` 类钉测）。
+5. **shell 兼容（本仓环境 zsh）**：`grep --include=*.go` 这类**不加引号**的通配在 zsh
+   下会被 glob 展开，直接报 `no matches found: --include=*.go` 并**以 0 退出**——
+   看起来「无命中 = 通过」，实际命令根本没执行。本文件所有 grep 判据一律写成
+   `--include='*.go'`（引号包住通配）或 `rg -g '*.go' '<pattern>' <path>`。
+   同理：`*.ts` / `*.vue` / `*.yml` / `*.yaml` 均须加引号。

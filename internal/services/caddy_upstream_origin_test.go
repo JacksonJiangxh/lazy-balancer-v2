@@ -493,7 +493,12 @@ func TestBuildHTTPHandleChain_healthCheckHostOverridesProbeHost(t *testing.T) {
 //     文档需要引用该占位符来解释「官方版缺陷在哪」——那是资产不是缺陷；把它们
 //     逼成不能提名字反而降低可追溯性（R1/R3 的防复发依赖这些文档）；
 //   - `.npc-teams/` 不扫：任务档案要记录缺陷原文；
-//   - 注释行（`//` / `*` / `/*` / `#` 开头）跳过：同上，可追溯的「禁用理由」合法。
+//   - 注释行跳过：同上，可追溯的「禁用理由」合法——**但注释判定按扩展名分派**
+//     （见 isCommentedLineForExt）：`.yml`/`.yaml` 不享受注释豁免，因为 YAML 块
+//     标量（`|` / `>`）的内容行不以 `#` 开头，若按行首 `#` 豁免，块标量里嵌的
+//     配置片段会被当作注释跳过——H2 的机械保证在该形态下失效（r1 风控 P2-2）。
+//     代价：yml 里写 `# ...` 的说明性注释也会命中，需改写措辞（有意从严：
+//     宁可让人改注释，不留绕过面）。
 func TestUpstreamHost_noClientHostFallbackAnywhere(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
@@ -522,8 +527,17 @@ func TestUpstreamHost_noClientHostFallbackAnywhere(t *testing.T) {
 		default:
 			return nil
 		}
-		if name == "caddy_upstream_origin_test.go" {
-			// 本文件是钉测本体：必须写出该占位符才能断言「不得出现」。
+		// 钉测本体豁免：**断言「该占位符不得出现」的测试文件自己必须写出它**。
+		// 按「文件内出现该 needle 的断言语句 + 文件名以 _test.go 结尾」无法机械
+		// 区分「断言用」与「生产用」，故显式列白 —— 但清单必须最小且带理由，
+		// 新增成员即代码评审可见（比模糊规则更安全）。
+		switch name {
+		case "caddy_upstream_origin_test.go",
+			// 本文件：H2 扫描器与全部 H 组钉子（needle 常量定义在此）。
+			"caddy_emit_config_validate_test.go",
+			// 产物层断言：整份生成配置里零出现（H2 在产物层再兜一次）。
+			"caddy_decode_generated_config_test.go":
+			// Caddy 解码链侧：读产物后先断言零出现，再走模块加载。
 			return nil
 		}
 		body, readErr := os.ReadFile(path)
@@ -535,7 +549,7 @@ func TestUpstreamHost_noClientHostFallbackAnywhere(t *testing.T) {
 				continue
 			}
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "*") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "#") {
+			if isCommentedLineForExt(filepath.Ext(name), trimmed) {
 				continue // 注释/文档说明：可追溯的「禁用理由」，非缺陷载体
 			}
 			rel, _ := filepath.Rel(root, path)
@@ -563,6 +577,164 @@ func itoaLine(n int) string {
 		n /= 10
 	}
 	return string(digits)
+}
+
+// isCommentedLineForExt 按**文件扩展名**判定一行是否为注释（可豁免）。
+//
+// 为什么必须按扩展名分派（r1 风控 P2-2）：Go / TS / Vue / Shell 的行首
+// `//` `*` `/*` `#` 是注释；但 YAML 的块标量（`|` / `>`）内容行**不以 `#` 开头**，
+// 若对 `.yml`/`.yaml` 也套行首 `#` 豁免，块标量里嵌入的配置片段会被当作注释
+// 跳过 → H2「全仓零出现」的机械保证在该形态下失效。
+// 故 `.yml`/`.yaml` **不做注释豁免**（YAML 有意义的载荷一律在扫描面内）。
+func isCommentedLineForExt(ext, trimmed string) bool {
+	switch ext {
+	case ".yml", ".yaml":
+		// 意图明确：不豁免。YAML 的行内注释无法与块标量内容机械区分，
+		// 一律按载荷处理（见上方注释的代价说明）。
+		return false
+	}
+	return strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "*") ||
+		strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "#")
+}
+
+// Given: 各扩展名的注释豁免规则
+// When: 对同样的行内容求值
+// Then: `.yml`/`.yaml` 一律不豁免（块标量绕过面封死）；其余载体按惯例豁免注释
+func TestUpstreamHost_commentExemptionByExtension(t *testing.T) {
+	cases := []struct {
+		name    string
+		ext     string
+		line    string
+		want    bool
+		comment string
+	}{
+		{"go 行注释", ".go", "// 说明", true, ""},
+		{"go 块注释首行", ".go", "/* 说明 */", true, ""},
+		{"go 块注释续行", ".go", "* 续行", true, ""},
+		{"go 可执行行", ".go", `host = "{http.request.hostport}"`, false, ""},
+		{"shell 注释", ".sh", "# 说明", true, ""},
+		{"ts 注释", ".ts", "// 说明", true, ""},
+		{"vue 注释", ".vue", "# 说明", true, ""},
+		{"yaml 行内注释形态也不豁免", ".yml", "# 说明", false,
+			"YAML 的行内注释与块标量内容无法机械区分，全按载荷处理"},
+		{"yaml 块标量内容行", ".yaml", "  host: \"{http.request.hostport}\"", false,
+			"块标量（| / >）内容行不以 # 开头——这正是 r1 的绕过面"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCommentedLineForExt(tc.ext, strings.TrimSpace(tc.line)); got != tc.want {
+				t.Fatalf("isCommentedLineForExt(%q, %q)=%v, want %v %s",
+					tc.ext, tc.line, got, tc.want, tc.comment)
+			}
+		})
+	}
+}
+
+// Given: H2 扫描器的钉测本体豁免清单
+// When: 逐项核对
+// Then: ①清单条目恰为预期的三个（多一个都算悄悄放宽，须评审）；
+// ②每个文件确实存在于仓库内（改名/删除后清单不能静默残留）；
+// ③除这三份以外，没有任何 `*_test.go` 同时含该占位符又不在清单里。
+// ——这条把「豁免清单」本身也纳入机械校验，防止它成为绕过面。
+func TestUpstreamHost_needleExemptionListIsMinimal(t *testing.T) {
+	allow := []string{
+		"caddy_upstream_origin_test.go",
+		"caddy_emit_config_validate_test.go",
+		"caddy_decode_generated_config_test.go",
+	}
+	want := len(allow)
+	if want != 3 {
+		t.Fatalf("豁免清单变更（%d 项）——新增豁免必须在评审中显式确认", want)
+	}
+
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+	allowed := make(map[string]bool, len(allow))
+	for _, name := range allow {
+		allowed[name] = true
+	}
+
+	seen := map[string]bool{}
+	const needle = "{http.request.hostport}"
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		name := info.Name()
+		if info.IsDir() {
+			switch name {
+			case "node_modules", ".git", "dist", "testdata", ".npc-teams":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(name) != ".go" || !strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		// 只看**非注释行**：注释里提缺陷原文是合法资产（主扫描器也放行）。
+		hasPayload := false
+		for _, line := range strings.Split(string(body), "\n") {
+			if !strings.Contains(line, needle) {
+				continue
+			}
+			if isCommentedLineForExt(filepath.Ext(name), strings.TrimSpace(line)) {
+				continue
+			}
+			hasPayload = true
+			break
+		}
+		if !hasPayload {
+			return nil
+		}
+		if allowed[name] {
+			seen[name] = true
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		t.Fatalf("测试文件 %s 在**非注释行**含该占位符但不在豁免清单内——要么它是钉测本体（加进清单并说明理由），要么它把缺陷写进了测试", rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	for _, name := range allow {
+		if !seen[name] {
+			t.Fatalf("豁免清单里的 %s 在仓库中不存在（改名/删除后必须同步清理清单）", name)
+		}
+	}
+}
+
+// Given: 一份带块标量的 YAML 文本（内容行不以 `#` 开头）
+// When: 用扫描器的行判定过一遍
+// Then: 块标量里的 {http.request.hostport} **被判定为载荷**（不再被当注释跳过）
+// ——这是 P2-2 的端到端复核：证明绕过面确实封死了，而不只是规则函数改对了。
+func TestUpstreamHost_yamlBlockScalarIsScanned(t *testing.T) {
+	const needle = "{http.request.hostport}"
+	yamlText := strings.Join([]string{
+		"caddy:",
+		"  route: |",
+		"    handle:",
+		`      - headers: {request: {set: {Host: ["` + needle + `"]}}}`,
+	}, "\n")
+	hits := 0
+	for _, line := range strings.Split(yamlText, "\n") {
+		if !strings.Contains(line, needle) {
+			continue
+		}
+		if isCommentedLineForExt(".yml", strings.TrimSpace(line)) {
+			continue // 被误豁免
+		}
+		hits++
+	}
+	if hits != 1 {
+		t.Fatalf("块标量里的占位符命中数=%d, want 1（0 表示仍被当注释跳过=绕过面未封死）", hits)
+	}
 }
 
 // Given: 渲染链源码
