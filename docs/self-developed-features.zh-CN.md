@@ -17,6 +17,25 @@
 
 ---
 
+## 〇、构建链契约（**非自研功能，但同属"不得跟上游照抄"的本仓资产**）
+
+> 2026-11-11 TASK-2026-1111-04 教训固化。这几条不是功能，但**跟上游照抄会直接让镜像构建挂掉**，
+> 且 Go 测试全绿也拦不住，故与自研能力并列登记。
+
+| 维度 | 上游 v2.4.2 | **本仓必须** | 判据 |
+|---|---|---|---|
+| 前端产物 `web/dist` | GitHub Actions 预构建，Dockerfile 只 `COPY web/dist` | **Dockerfile 自带 `web-builder` 阶段**（`node:22-alpine`） | `grep -c 'AS web-builder' Dockerfile` = 1 |
+| 取前端产物 | `COPY web/dist /app/ui` | `COPY --from=web-builder /app/web/dist /app/ui` | 非注释 `COPY web/dist` 零命中 |
+| `.dockerignore` | 排除 `web/src`、`web/package.json` 等 | **放行**（阶段要 `COPY web ./web`）；只排 `web/node_modules/`、`web/tests/` | `awk '!/^#/ && /^web\//' .dockerignore` 仅两行 |
+| CI 形态 | 外部 CI 先 build | `.cnb.yml` **一条 `docker build`**，无前置 npm | `grep -c 'npm.*build' .cnb.yml`（无前置步骤） |
+
+**为什么**：本仓 CI 是「点按钮 → 一条 `docker build`」。若 Dockerfile 吃上游形态（只 COPY dist），
+干净 checkout 上 `web/dist` 不存在 → `failed to calculate checksum ... "/web/dist": not found`。
+
+**完整方法论**：`docs/upstream-catchup-guide.zh-CN.md` §十 B.6（判据与决策树）+ §十一 C.5（验证命令）。
+
+---
+
 ## 一览表
 
 | # | 能力 | 关键符号（grep 可核） | 裁定出处 |

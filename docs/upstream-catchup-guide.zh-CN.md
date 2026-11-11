@@ -14,16 +14,18 @@
 
 ```
 ① 确认版本        → ② 生成差异清单 → ③ 冲突预判 → ④ 按决策树处置 → ⑤ 过验证门 → ⑥ 归档
-   上游 tag 是哪个     一条命令出账本      哪些文件会撞          五类冲突各有一条规则    八项硬判据      更新清单与对账
+   上游 tag 是哪个     一条命令出账本      哪些文件会撞      六类冲突各有一条规则    九项硬判据      更新清单与对账
 ```
 
-**五条铁律**（违反任何一条 = 这轮白做）：
+**六条铁律**（违反任何一条 = 这轮白做）：
 
 1. **绝不「按目录取一侧」** —— 这招静默丢过上游 819 个新增文件（假追平）。
 2. **没跑差异清单不许开工** —— 靠回忆判断「我们改了什么」必然漏。
 3. **函数级冲突绝不机械取并集** —— 69 个冲突块取并集，8 个文件语法直接崩。
 4. **自研归属只认 `self-developed-features.zh-CN.md`** —— 上游有同需求实现 ≠ 可以切过去。
-5. **验证门没过不许合并** —— 「测试绿」≠「功能对」，要钉测 + 存量库冒烟。
+5. **验证门没过不许合并** —— 「测试绿」≠「功能对」，要钉测 + 存量库冒烟 + **镜像真能构建**。
+6. **`Dockerfile`/CI 脚本不跟上游照抄** —— 上游靠外部 CI 预构建前端，本仓是一条 `docker build`；
+   照抄会让镜像构建挂掉，而所有 Go 测试照旧全绿（§十 B.6、§十一 C.5）。
 
 ---
 
@@ -113,7 +115,7 @@ bash scripts/gate.sh            # 机械门（构建×7 / vet / 冲突标记 / �
 
 ## 六、第五步 · 过验证门（30 分钟，**不许跳**）
 
-**做什么**：跑八项硬判据，**八项全绿才算追平成功**。（完整命令、基线失败集合见 §十一 C）
+**做什么**：跑九项硬判据，**九项全绿才算追平成功**。（完整命令、基线失败集合见 §十一 C）
 
 | # | 验什么 | 命令 | 期望 |
 |---|---|---|---|
@@ -125,12 +127,14 @@ bash scripts/gate.sh            # 机械门（构建×7 / vet / 冲突标记 / �
 | ⑥ | 全量测试失败集合 | `go test ./internal/... ./cmd/...` | 失败数 = 基线数（§十一 C.3） |
 | ⑦ | 前端 | `cd web && npx vue-tsc --noEmit && npm test -- --run` | 类型零错误 + 全 pass |
 | ⑧ | 存量库冒烟 | 上一版二进制建 fixture 库 → 新版启动 | 补列幂等、无 DROP、存量值保留 |
+| ⑨ | **干净 checkout 一条 `docker build` 出镜像** | 见 §十一 C.5 | 构建成功、镜像内含 `/app/ui/index.html` |
 
-**成功判据**：八项期望值全部命中，命令 + 输出摘要记入任务档案。
+**成功判据**：九项期望值全部命中，命令 + 输出摘要记入任务档案。
 
 **失败处置**：③ MISSING>0 = **假追平**（上游新增文件被丢），立即回滚重做；④ 钉测红 = 自研能力被切/挂丢了，
 按符号名回第四步重挂；⑤ 有命中 = 上游缺陷形态混回来，按「防复发约束」逐条改回；⑥ 失败数>基线 = 分辨环境还是真失败；
-⑧ 冒烟异常 = **立即回滚**（最高危）。
+⑧ 冒烟异常 = **立即回滚**（最高危）；
+⑨ 构建失败 = **缺前置（最常见是前端产物）**，按 §十 B.6 判断是补我方阶段还是管道里加步骤——**不要靠本地手工跑一次 build 后把 dist 塞进上下文蒙混**（那只能骗过本地，CI 干净 checkout 照样失败）。
 
 ---
 
@@ -188,7 +192,7 @@ git replace -d <终点>                       # **提交前必须删除**，否�
 在目标文档都有对应标题；`docs/fork-notes/` 下每份文档都在其 `README.md` 索引里。
 **处置**：锚点 MISSING → 补标题或改锚点（**不许删锚点了事**，那等于丢知识）；NOT INDEXED → 补索引行。
 
-## 十、五类冲突 · 机械判据与决策树（附录 B）
+## 十、六类冲突 · 机械判据与决策树（附录 B）
 
 ### B.0 先判定「这个文件属于哪一类」
 ```bash
@@ -257,6 +261,46 @@ git merge-tree --write-tree --merge-base=<真实共同祖先> <起点> <终点> 
 `modify/delete` → 我方改动属跟随性（被迫随上游重构）？是=跟随上游，否=保我方并记录理由。
 **真实样本**：`docs/audit/2026-09-05/` 两文档 modify/delete → 跟随删除（我方无功能依赖）。
 
+### B.6 构建模型冲突（`Dockerfile` / CI 脚本 / `.dockerignore`）★ 2026-11-11 新增
+
+**为什么单列一类**：`Dockerfile` 在差异清单里只是一行 `M Dockerfile`，看不出「构建模型」变了。
+但它承载的是**谁负责产出什么**的契约——上游和本仓的契约可能不同，吃了没标记，直到 CI 跑挂才暴露。
+
+**机械判据**（两条任一命中即命中）：
+```bash
+# ① 上游 Dockerfile 是否少了我们有的构建阶段
+git show <新tag>:Dockerfile | grep -c '^FROM .* AS '   # 上游阶段数
+grep -c '^FROM .* AS ' Dockerfile                       # 我方阶段数
+# ② 上游是否 COPY 了「需要前置构建」的目录（本仓的典型是 web/dist）
+git show <新tag>:Dockerfile | grep -nE '^COPY (web/dist|dist|build)/'
+```
+
+**本仓已知的构建模型契约（务必对齐，别吃上游形态）**：
+
+| 维度 | 上游 v2.4.2 的模型 | **本仓必须保持的模型** | 为什么 |
+|---|---|---|---|
+| 前端产物 `web/dist` | 由 **GitHub Actions 先 `npm build`**，Dockerfile 只 `COPY web/dist` | **Dockerfile 内自带 `web-builder` 阶段**（`node:22-alpine` → `npm ci` → 构建） | 本仓 CI（`.cnb.yml`）是「点按钮 → 一条 `docker build`」，**没有前置 npm 步骤** |
+| 取产物方式 | `COPY web/dist /app/ui` | `COPY --from=web-builder /app/web/dist /app/ui` | 上下文中没有 dist，只能从阶段里取 |
+| `.dockerignore` 对前端源码 | 排除 `web/src`、`web/package.json` 等（只留 dist） | **必须放行**（`web-builder` 要 `COPY web ./web` 才能构建）；只排 `web/node_modules/`、`web/tests/` | 排掉了阶段就无源可建 |
+
+**处置决策树**（机械可判）：
+1. 上游 Dockerfile 的 `COPY` 目标是否由**阶段内**产出？
+   - 是 → 取上游形态（自洽）
+   - 否（依赖外部预构建）→ **保留我方阶段**，不要为了「跟上游一致」而删
+2. 保留/新增当前阶段后，**同步核 `.dockerignore`**：该阶段的每条 `COPY <dir>` 的 `<dir>` 是否都在放行侧？
+3. 阶段命名冲突（双方都有 `AS builder`）→ 改名我方阶段（如 `web-builder`），`COPY --from` 同步
+
+**验证**：`§十一 C.5`（干净 checkout 的 docker build）。**沙箱无 docker 时**：至少在镜像外实跑该阶段的命令链
+（如 `cd web && npm run typecheck:src && npm run build:vite`）并断言产物存在——这能证明命令链有效，但**不能替代 C.5**，
+须在回报里标注「C.5 待 CI 端到端」。
+
+**真实样本（2026-11-11 · TASK-2026-1111-04）**：
+追平 v2.4.2 时 P4 吃了上游 Dockerfile 形态（删了我方 `web-builder` 阶段、改 `COPY web/dist`），
+同时 `.dockerignore` 也随上游排除了前端源码。本地 `go build`/`gate.sh`/前端 `npm test` **全绿**，
+但 CNB 点按钮构建在 `COPY web/dist /app/ui` 处报 `failed to calculate checksum ... "/web/dist": not found`。
+修复：恢复阶段 + 恢复 `.dockerignore` 放行（一条 revert 可回）。
+**教训**：`gate.sh` 的 7 模块 build 只覆盖 Go，**不覆盖镜像构建链**——所以 A 组验收全绿也拦不住它。
+
 ## 十一、验证门命令清单（附录 C）
 
 ### C.1 机械门
@@ -288,6 +332,37 @@ baseline 文件 `diff`，**期望无输出**。已知基线失败：`internal/se
 > **本 fork 自己的历史版本库**（见 `docs/fork-notes/db-migrations.md` §4）。拿不到真实存量库时，
 > 要么推迟到下次真实追平，要么自造形态并在回报里**明确标注「自造，非真实升级路径」**。
 
+### C.5 镜像构建端到端（★ 主干第 ⑨ 项 · 2026-11-11 新增）
+
+**为什么必须单独验**：`gate.sh` 只跑 Go 的 7 模块 build，**完全不碰 `Dockerfile`**。
+而镜像构建链断掉的典型表现是「所有测试绿 + 构建挂」——TASK-2026-1111-04 就是这样漏网的。
+
+**命令（有 docker 的环境）**：
+```bash
+# 在干净 checkout 上（不要在你有 web/dist 的工作区跑——脏上下文会掩盖问题）
+git clone -b <分支> <repo> /tmp/lb-ci && cd /tmp/lb-ci
+docker build -t lb-catchup-check . 2>&1 | tail -20
+docker run --rm --entrypoint sh lb-catchup-check -c 'ls -l /app/ui/index.html /usr/local/bin/caddy /usr/local/bin/lazy-balancer'
+```
+**判据（三条全过）**：① `docker build` 退出码 0 ② `/app/ui/index.html` 存在（前端产物真进了镜像）
+③ `caddy` 与 `lazy-balancer` 两个二进制都在。
+
+**无 docker 时的降级证据（必须标注局限）**：
+```bash
+# 逐段证明「Dockerfile 里每条需要产物的指令，其生产者都在」
+grep -nE '^FROM .* AS |^COPY (web/dist|--from=)' Dockerfile   # 阶段定义与取产物必须配对
+# 实跑该阶段的命令链，断言产物
+cd web && npm run typecheck:src && npm run build:vite && ls -l dist/index.html
+# .dockerignore 是否排掉了阶段要 COPY 的源
+grep -nE '^web/' .dockerignore      # 只允许 node_modules/ 与 tests/
+```
+降级证据能证明「命令链有效 + 阶段配对 + 上下文放行」，**不能证明 docker 真的能构建成功**——
+回报里必须写「C.5 待 CI 端到端验证」，并由人点一次 CI 构建收口（TASK-2026-1111-04 即此路径）。
+
+**本仓红线（勿改）**：`.cnb.yml` 的按钮构建是**一条 `docker build`**，没有前置 npm 步骤。
+因此 `Dockerfile` 必须自带 `web-builder` 阶段；**禁止**改成「CI 先 build → Dockerfile 只 COPY dist」的上游形态。
+若要改成上游形态，必须同时在 `.cnb.yml` 加 npm 构建步骤——那是另一件事，不能顺手改。
+
 ## 十二、演练记录与误判库（附录 D + 主干九）
 
 ### D.1 演练记录
@@ -303,11 +378,14 @@ baseline 文件 `diff`，**期望无输出**。已知基线失败：`internal/se
 | 「函数冲突取并集最快」 | 8 个文件语法崩 | 函数级一律「上游为骨 + 逐函数挂回」 |
 | 「冲突标记清了就完事」 | 13 个隐藏失配（引用已删字段但无标记） | 跑 `go vet`，`undefined` 就是未接线补丁 |
 | 「拿上游旧版二进制建库就能做迁移冒烟」 | 迁移静默 no-op，冒烟空跑却显示通过 | 见 §十一 C.4 的 fixture 来源陷阱 |
+| **「Dockerfile 跟上游一致更省事」** | 上游靠外部 CI 预构建前端，本仓 CI 是一条 `docker build` → **镜像构建直接挂**（`COPY web/dist` 找不到），而 `gate.sh`/全部测试照旧全绿 | 见 §十 B.6 构建模型契约 + §十一 C.5；`.dockerignore` 要同步核 |
 
 ---
 
 ## 十三、给 AI 代理的交办方式
 
-交三样：**本手册**（第一部分定方向 + 第二部分给判据）+ 冲突文件清单
-（`grep '⚠ 是' docs/fork-diff/latest.md` 的结果）+ 对应的 `docs/fork-notes/*.md`（被外置的注释原文）。
+交四样：**本手册**（第一部分定方向 + 第二部分给判据）+ 冲突文件清单
+（`grep '⚠ 是' docs/fork-diff/latest.md` 的结果）+ 对应的 `docs/fork-notes/*.md`（被外置的注释原文）
++ **构建链契约提醒**（`Dockerfile`/`.dockerignore`/CI 脚本属 §十 B.6 类，交付后必须跑 §十一 C.5，
+无 docker 环境须在回报里标注「C.5 待 CI 端到端」，不许当已验证）。
 派活时必须写明：改哪些文件（白名单）、验证门命令、以及「自研归属只认登记文件」这条不可协商的约束。
