@@ -170,6 +170,20 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags="-s -w" -o lazy-balancer && \
     go version -m lazy-balancer | grep -q 'go1.27.3' || { echo ">>> 后端二进制未使用 go1.27.3 构建" >&2; exit 1; }
 
+# 前端构建阶段：把 `cd web && npm run build` 下沉进镜像构建，源码 checkout
+# 后一条 docker build 即可出镜像，CI 与本地都不再有「先手工产 web/dist」的隐式前置。
+# Node 22 是硬要求（web/package.json engines: >=22.18，vite ^8 + vue-tsc ^3）。
+FROM node:22-alpine AS web-builder
+WORKDIR /app
+COPY web/package.json web/package-lock.json ./web/
+RUN --mount=type=cache,target=/root/.npm \
+    cd /app/web && npm ci --no-audit --no-fund
+COPY web ./web
+# typecheck:src（vue-tsc -p tsconfig.json --noEmit）+ build:vite 产出 /app/web/dist。
+# 不用 npm run build：上游 v2.4.2 把 test:coverage 捆进了 build，镜像构建不绑测试域。
+RUN --mount=type=cache,target=/root/.npm \
+    cd /app/web && npm run typecheck:src && npm run build:vite
+
 # Final image
 FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 # 版本号注入（ARG VERSION + ENV APP_VERSION）刻意放在下方 CRS/xdb 下载层之后
@@ -290,7 +304,7 @@ ENV APP_VERSION=${VERSION}
 # 以下各层只随各自产物变化：CRS/xdb 层已在上方固化，不受影响。
 COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy
 COPY --from=backend /app/cmd/server/lazy-balancer /usr/local/bin/lazy-balancer
-COPY web/dist /app/ui
+COPY --from=web-builder /app/web/dist /app/ui
 # Apache-2.0 §4(a)：随分发（镜像）提供许可证副本。
 COPY LICENSE /app/LICENSE
 

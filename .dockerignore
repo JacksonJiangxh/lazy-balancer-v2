@@ -17,27 +17,24 @@ ui/
 .git/
 .gitignore
 .dockerignore
-# 前端依赖与源码不参与镜像构建：Dockerfile 只消费预构建的 web/dist
-# （final 阶段 COPY web/dist /app/ui）。backend 阶段的显式 COPY 清单不含 web/，
-# 故前端源码改动不影响 Go 编译层；但**重新构建的 web/dist 内容变化**仍会让
-# final 阶段的 COPY web/dist 层失效（构建缓存按内容摘要判定）——这是发版必然
-# 开销，不是本文件能消除的。注意 web/dist 必须留在上下文内——Docker 的排除
-# 模式按上下文根相对匹配，下方 dist/ 只匹配根目录 dist，不会波及 web/dist。
+# 前端源码**必须**留在上下文内：Dockerfile 有独立的 web-builder 阶段
+# （node:22-alpine → npm ci → typecheck:src → build:vite 产出 /app/web/dist），
+# final 阶段以 `COPY --from=web-builder` 取产物，故 web/src、web/public/、
+# package.json 等均为构建源（vite publicDir 用默认值 public/，public 资源
+# 拷入 dist——已核 vite.config.ts 未自定义 publicDir，web/public/ 必须放行）。
+# backend 阶段的显式 COPY 清单不含 web/，前端源码改动不影响 Go 编译层；
+# web/dist 若本地已存在也不入镜像——镜像用的是 web-builder 阶段的重建产物。
+# **重建出的 web/dist 内容变化**仍会让 final 阶段的 COPY 层失效（构建缓存
+# 按内容摘要判定）——这是发版必然开销，不是本文件能消除的。注意 web/dist
+# 必须留在上下文内——Docker 的排除模式按上下文根相对匹配，下方 dist/ 只
+# 匹配根目录 dist，不会波及 web/dist。
 # 仓根 node_modules（在仓库根跑 vitest/node 脚本时生成的 .vite/.vitest-cache
-# 转译缓存）——Docker 的排除模式按上下文根锚定，本条只匹根级目录，web/ 内的
-# 依赖目录仍是下方显式一条。
+# 转译缓存）——Docker 的排除模式按上下文根锚定，本条只匹根级目录。web/ 内
+# 只排依赖目录与 tests/（tests 不参与 npm ci/typecheck:src/build:vite，
+# 排除省上下文）。
 node_modules/
 web/node_modules/
-web/src/
 web/tests/
-web/public/
-web/index.html
-web/vite.config.ts
-web/tsconfig.json
-web/tsconfig.node.json
-web/tsconfig.test.json
-web/package.json
-web/package-lock.json
 # Go 测试面不入构建上下文：Dockerfile 的 COPY 面按整目录复制 caddygeoip/ 等
 # （xcaddy 阶段的 COPY caddygeoip/ 与 backend 阶段的显式清单同形），测试源码
 # （16 个 *_test.go ≈290KB，其中 auditwriter_test.go 117KB 且频繁变动）与
