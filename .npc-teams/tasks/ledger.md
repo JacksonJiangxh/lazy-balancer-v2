@@ -13,6 +13,7 @@
 - 每轮上游追平的**唯一事实源**为 GitHub 上游 tag；镜像轨 tip 必须与 tag 树逐字节一致方可作骨。
 - 2026-10-23 的 v2.3.8 追平记录于 `docs/upstream-merge.zh-CN.md` §九；**经 TASK-2026-1110-01 核实为假追平**（该档案 §2.2 有完整判否证据，经验卡 `卡-20261110-01` 已沉淀识别法）。
 - TASK-2026-1110-01 已于 2026-11-11 交付：main @ `78889830` = 上游 v2.4.2（`0cd475ed`）+ 全部自维护能力；对账记录见 `docs/upstream-merge.zh-CN.md` §十。
+- **追平标准化资产（TASK-2026-1111-03 交付）**：①`scripts/fork-diff.sh` 可复现差异清单（双格式/机械归属/冲突预判/--check 漂移检测）②`docs/fork-notes/` 注释外置库（10 文档 + `check-doc-anchors.sh` 锚点门，生产代码注释占比 34%→18%，新增行 −256）③`docs/upstream-catchup-guide.zh-CN.md` 追平作业手册（主干给决策者 + 机械判据给 AI 代理，五类冲突决策树，已实操演练）。**下次上游发版：按手册五步走即可。**
 - **核心自研四项（唯一事实源 `docs/self-developed-features.zh-CN.md`）**：① 链式回退 `chain_fallback` ② 引用型证书 `tls_source=file` ③ 默认端口换位 ④ **逐上游回源自定义 Host**（TASK-2026-1111-02 恢复并正式登记）。后续追上游时**禁止**把第 ④ 项判成「上游同需求两实现」而误切——上游 map 方案有三处缺陷（客户端 Host 透传 / 无自定义路由推导 / TLS 回退曾出 bug），详见 `docs/upstream-origin-host-compare.zh-CN.md`。
 - follow-up 待立项：① certjob 日志目录测试注入修复 ② 守卫误报收窄（路径级→内容级）③ docs/RUNBOOK.md 建档登记质量门留痕 ④ 静态响应面板行内提示与 201 下拉视觉区分（TASK-2026-1111-01 裁决定为 P2）⑤ handlers 包测试 10 分钟超时治理（建议 `:0` 端口 / `t.Parallel()` 方案）。
 - TASK-2026-1111-01 已于 2026-11-11 交付：main @ `bdb7b67f`。交付两份成果——①`docs/upstream-origin-host-compare.zh-CN.md` 回源 Host 双方案小白化对比（结论：保持自研方案，三条源码级硬理由）②静态响应强健度改造（19 码白名单含 3xx、3xx 渲染真实生效、响应体上限 64→4096 码点、控制字符门、跳转目标强校验、三处同集 parity 钉测）。
