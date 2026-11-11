@@ -189,9 +189,14 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	},
 	// 覆盖面扫描新发现：路径规则 static_response 的状态码
 	// 缺省形态（写侧允许 0=未配置，声明默认 200；空字符串守卫不在扫描命中面）。
+	// 2026-11-11 TASK-2026-1111-01：内容类型兜底条目已退役——原实现是函数内
+	// `contentType = "text/plain"` 字面量赋值（扫描命中）；现改为
+	// staticResponseDefaultContentTypeFor(...) 单源函数返回 + 包级常量
+	// staticResponseDefaultContentType，不构成「函数内字面量兜底」，扫描面已无
+	// 命中（条目保留会让本测试按「清单腐化」报红）。省略型语义（空=未配置→
+	// 带 charset 的 HTML）不变，见 buildStaticResponseHandler 的注释披露。
 	"buildStaticResponseHandler": {
-		"status = 200":               "path rule ResponseStatus=0→200：类型②省略型（写侧允许 0=未配置并声明默认），非无效库值兜底——见该处 Ruling 披露",
-		`contentType = "text/plain"`: "path rule ResponseContentType 空=未配置→text/plain：类型②省略型（写侧允许空并声明默认），非无效库值兜底——G3 Ruling 披露",
+		"status = 200": "path rule ResponseStatus=0→200：类型②省略型（写侧允许 0=未配置并声明默认），非无效库值兜底——见该处 Ruling 披露",
 	},
 	"buildTCPProxyHandler": {
 		`strategy = "weighted_round_robin"`: "TCP 负载策略空串=未配置→默认加权轮询：类型②省略型（写侧归一单源，渲染层承担省略替换；cookie 策略对 layer4 不可用另行归一）——G3 Ruling 披露",
