@@ -1292,7 +1292,8 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 			&rule.TLSCertPath, &rule.TLSKeyPath,
 			&rule.TLSHTTPRedirect, &rule.EnableCompress, &rule.CompressTypes, &rule.Enabled, &rule.LogEnabled,
 			&rule.CreatedBy, &rule.CreatedAt, &rule.UpdatedAt, &rule.UpdatedBy,
-			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status); err != nil {
+			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status,
+			&rule.PassthroughUpstream); err != nil {
 			return nil, fmt.Errorf("扫描快照规则: %w", err)
 		}
 		// 与 path_rules/users/api_keys/ACME 逐行

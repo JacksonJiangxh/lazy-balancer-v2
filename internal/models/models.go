@@ -157,6 +157,11 @@ type LbRule struct {
 	TCPProxyProtocol              bool   `json:"tcp_proxy_protocol"`
 	TCPTryDuration                int    `json:"tcp_try_duration"`
 	TCPTryInterval                int    `json:"tcp_try_interval"`
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
+	// 仅 passthrough 协议消费（Layer4 字节流转发，上游自带证书终结）；非透传
+	// 行恒 ''（写侧拒绝携带）。与 tcp_health_check_port/tcp_proxy_protocol/
+	// tcp_try_* 同为透传/TCP 族复用列，渲染接线由 S1-b（caddy.go）承担。
+	PassthroughUpstream           string `json:"passthrough_upstream"`
 	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
@@ -535,6 +540,9 @@ type CreateRuleRequest struct {
 	TCPProxyProtocol              bool   `json:"tcp_proxy_protocol"`
 	TCPTryDuration                int    `json:"tcp_try_duration"`
 	TCPTryInterval                int    `json:"tcp_try_interval"`
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
+	// 仅 passthrough 协议消费；非透传协议显式携带非空值由保存门 400（防脏数据）。
+	PassthroughUpstream           string `json:"passthrough_upstream"`
 	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
@@ -562,7 +570,10 @@ type CreateRuleRequest struct {
 	HostHeader                 string     `json:"host_header"`
 	// 健康检查域名：空=跟随 HostHeader（省略与空串同义，创建语义）。
 	HealthCheckHost string     `json:"health_check_host"`
-	Upstreams       []Upstream `json:"upstreams" binding:"required"`
+	// Upstreams 不再 binding:"required"（JJC-20261112-01 S1-a）：透传规则
+	// upstreams 表零行（上游存 passthrough_upstream 单值列）；「至少一个上游」
+	// 由保存门按协议感知校验（CreateRule/validateRuleUpstreams）。
+	Upstreams       []Upstream `json:"upstreams"`
 	EnableTLS       bool       `json:"enable_tls"`
 	TLSSource       string     `json:"tls_source"`
 	ACMEConfigID    int        `json:"acme_config_id"`
@@ -634,8 +645,12 @@ type UpdateRuleRequest struct {
 	// db.DefaultTCPTryInterval），tcp_health_check_port 0=跟随上游端口。
 	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
 	TCPProxyProtocol         *bool `json:"tcp_proxy_protocol"`
-	TCPTryDuration           *int  `json:"tcp_try_duration"`
-	TCPTryInterval           *int  `json:"tcp_try_interval"`
+	TCPTryDuration           *int `json:"tcp_try_duration"`
+	TCPTryInterval           *int `json:"tcp_try_interval"`
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
+	// 指针化三态：省略（nil）=保留存量；显式空串=清空（非透传协议防脏数据；
+	// 透传协议清空会因必填门 400）；非透传协议显式携带非空值由保存门 400。
+	PassthroughUpstream      *string `json:"passthrough_upstream"`
 	RequestBodyMaxSizeMB     *int  `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout *int  `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden       *int  `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show

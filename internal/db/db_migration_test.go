@@ -2831,9 +2831,11 @@ func createLegacyLbRulesTables(t *testing.T, database *sql.DB, variant legacyLbR
 		proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 		proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
 		-- 真实启动序：ensureNewColumns 先于 PK 重建运行，重建只见补列后形态
-		-- （链式回退竞速参数 2026-10-09 + 引用型证书摄取源路径列 v2.4.2）。
+		-- （链式回退竞速参数 2026-10-09 + 引用型证书摄取源路径列 v2.4.2
+		-- + TLS 透传上游列 JJC-20261112-01 S1-a）。
 		chain_race_interval_ms INTEGER NOT NULL DEFAULT 0, chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
 		tls_cert_path VARCHAR(512) NOT NULL DEFAULT '', tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
+		passthrough_upstream TEXT NOT NULL DEFAULT '',
 		host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
 		tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 		compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,

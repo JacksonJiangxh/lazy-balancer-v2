@@ -162,6 +162,7 @@ func TestRulePayload_inputParityWithModels(t *testing.T) {
 		"ChainRequestTimeoutMS":      "ruleFeatureInput 单源（chain_fallback 值域校验）",
 		"TLSCertPath":                "保存链引用型证书摄取门（validateReferencedCertificateFiles 校验/入库）",
 		"TLSKeyPath":                 "保存链引用型证书摄取门（validateReferencedCertificateFiles 校验/入库）",
+		"PassthroughUpstream":        "ruleFeatureInput 单源（透传防脏门 validateRuleFeatures：非透传协议非空即 400，透传必填/形状校验）",
 	}
 
 	mirror := reflect.TypeOf(rulePayloadInput{})

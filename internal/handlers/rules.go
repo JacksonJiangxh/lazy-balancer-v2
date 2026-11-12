@@ -596,6 +596,9 @@ func validateRuleListenPort(protocol string, port int) error {
 		return fmt.Errorf("端口 %d 为管理端口，不可使用", port)
 	}
 	if protocol == "tcp" && (port == services.DefaultHTTPPort() || port == services.DefaultHTTPSPort()) {
+		// 语义澄清（JJC-20261112-01 S1-a）：protocol=tcp 即「整端口 TCP 透传」
+		// （L4 全端口字节流转发，无 SNI 分流）；SNI 级透传是 protocol=passthrough
+		// 的专属语义，两者不混用。
 		return fmt.Errorf("端口 %d 为 HTTP/HTTPS 保留端口", port)
 	}
 	return nil
@@ -738,6 +741,82 @@ func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extr
 		return false, err
 	}
 	return false, nil
+}
+
+// passthroughSNIConflict 同端口同 SNI 冲突检查（含通配重叠歧义）。仅统计启用中
+// 的透传规则与候选域名做 sniDomainsOverlap 判定（保守多级覆盖——*.a.com 与
+// b.a.com 精确规则重叠即拒绝）。返回冲突规则「名（caddy_id）」与命中的 SNI。
+func passthroughSNIConflict(domain string, listenPort int, excludeCaddyID string) (string, string, error) {
+	candidates := normalizedPassthroughSNIDomains(domain)
+	if len(candidates) == 0 {
+		return "", "", nil
+	}
+	rows, err := db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules
+		WHERE protocol='passthrough' AND enabled=1 AND listen_port = ? AND caddy_id != ?`, listenPort, excludeCaddyID)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var otherID, otherName, otherDomain string
+		if err := rows.Scan(&otherID, &otherName, &otherDomain); err != nil {
+			return "", "", err
+		}
+		for _, existing := range normalizedPassthroughSNIDomains(otherDomain) {
+			for _, candidate := range candidates {
+				if sniDomainsOverlap(candidate, existing) {
+					return otherName + "（" + otherID + "）", existing, nil
+				}
+			}
+		}
+	}
+	return "", "", rows.Err()
+}
+
+// passthroughTerminateConflict 「同一域名既透传又本地终结」跨协议冲突检查
+// （方案 §四 校验规则 2，最危险配置歧义）。otherProtocol 指定对侧协议：
+//   - "http"：保存透传规则时检查其 SNI 是否命中任一启用 HTTP 规则的域名
+//     （HTTP 规则在该域名本地终结 TLS/ACME，透传会导致证书与流量归属歧义）；
+//   - "passthrough"：保存 HTTP 规则时检查其域名是否命中任一启用透传规则的 SNI
+//     （与保存门/前端行内红框同口径，双向闭合同一歧义）。
+//
+// 端口不限定（透传恒在 HTTPS 默认口，但 HTTP 规则可在任意口终结该域名）。
+func passthroughTerminateConflict(domain, otherProtocol, excludeCaddyID string) (string, string, error) {
+	candidates := normalizedPassthroughSNIDomains(domain)
+	if len(candidates) == 0 {
+		return "", "", nil
+	}
+	rows, err := db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules
+		WHERE protocol = ? AND enabled=1 AND caddy_id != ?`, otherProtocol, excludeCaddyID)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var otherID, otherName, otherDomain string
+		if err := rows.Scan(&otherID, &otherName, &otherDomain); err != nil {
+			return "", "", err
+		}
+		for _, existing := range normalizedRuleDomains(otherDomain) {
+			for _, candidate := range candidates {
+				if sniDomainsOverlap(candidate, existing) {
+					return otherName + "（" + otherID + "）", existing, nil
+				}
+			}
+		}
+	}
+	return "", "", rows.Err()
+}
+
+// normalizedPassthroughSNIDomains 透传 SNI 域名归一（单域名，小写 TrimSpace）。
+// 与 validateSNIDomain 同形状约定；非法/空值返回空集（形状校验由保存门承担，
+// 此处只做比较归一）。
+func normalizedPassthroughSNIDomains(value string) []string {
+	domain := strings.ToLower(strings.TrimSpace(value))
+	if domain == "" {
+		return nil
+	}
+	return []string{domain}
 }
 
 // pinLastGoodAfterCompensation 把 LKG 钉回「已提交库视图」（零 /load）。
@@ -1254,6 +1333,10 @@ func duplicateRulePayloadRequest(rule models.LbRule) models.CreateRuleRequest {
 		TCPProxyProtocol:              rule.TCPProxyProtocol,
 		TCPTryDuration:                rule.TCPTryDuration,
 		TCPTryInterval:                rule.TCPTryInterval,
+		// TLS 透传上游（JJC-20261112-01 S1-a）：透传源行原样复制（副本同样
+		// 禁用态落库）；非透传源行的存量/带外脏值自愈清空（与 UpdateRule 自愈
+		// 同格——脏值不得让复制恒 400 死端）。
+		PassthroughUpstream: rule.PassthroughUpstream,
 		RequestBodyMaxSizeMB:          rule.RequestBodyMaxSizeMB,
 		UpstreamKeepaliveTimeout:      rule.UpstreamKeepaliveTimeout,
 		ServerTokensHidden:            rule.ServerTokensHidden,
@@ -1297,7 +1380,15 @@ func duplicateRulePayloadRequest(rule models.LbRule) models.CreateRuleRequest {
 			break
 		}
 	}
-	if !hasEnabled {
+	// 非透传源行携带存量/带外 passthrough_upstream 脏值时自愈清空（防脏门
+	// 单源 validateRuleFeatures），透传源行原样保留（校验由复制路径
+	// validateRuleFeatures 输入承担）。
+	if req.Protocol != "passthrough" {
+		req.PassthroughUpstream = ""
+	}
+	// 透传规则上游存 passthrough_upstream 单值列、upstreams 表零行——不插
+	// 探针上游（探针只服务于「至少一个上游」表单门，透传无此门）。
+	if !hasEnabled && rule.Protocol != "passthrough" {
 		req.Upstreams = append(req.Upstreams, models.Upstream{
 			Host: "duplicate-probe.invalid", Port: 1, Weight: 1, Enabled: true, Protocol: rule.Protocol,
 		})
@@ -1393,13 +1484,25 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			req.ListenPort = services.DefaultHTTPPort()
 		}
 	}
+	// 透传规则端口兜底：默认 HTTPS 默认口（第一期透传仅在此口做 SNI 分流）。
+	if req.Protocol == "passthrough" && req.ListenPort == 0 {
+		req.ListenPort = services.DefaultHTTPSPort()
+	}
 
 	if req.ListenPort <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "监听端口必须大于 0"})
 		return
 	}
 
-	if len(req.Upstreams) == 0 {
+	// 透传规则上游契约：上游存 passthrough_upstream 单值列（上游自带反代与
+	// 证书，Layer4 字节流转发），upstreams 表零行——显式携带即 400（防脏数据
+	// 随导出/快照放大）。非透传协议显式携带 passthrough_upstream 由
+	// validateRuleFeatures 防脏门拒绝。
+	if req.Protocol == "passthrough" && len(req.Upstreams) > 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传规则的上游由 passthrough_upstream 字段配置，不支持 upstreams 上游列表"})
+		return
+	}
+	if req.Protocol != "passthrough" && len(req.Upstreams) == 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "至少需要一个上游服务器"})
 		return
 	}
@@ -1426,6 +1529,26 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// HTTP 渲染不消费 TCP-only 字段，创建时显式弃置。
 		req.TCPProxyProtocol = false
 		req.TCPHealthCheckPort = 0
+	} else if req.Protocol == "passthrough" {
+		// TLS 透传（JJC-20261112-01 S1-a）创建归一与保存门。
+		// 域名/上游先归一（小写/TrimSpace）——校验与落库看到同一终值。
+		req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
+		req.PassthroughUpstream = strings.TrimSpace(req.PassthroughUpstream)
+		// S1-a 门：渲染链未接线（caddy.go 全量渲染协议白名单仍只放行 http/tcp
+		// ——启用中的透传行会让配置生成整体失败、拖垮全部规则），本阶段透传
+		// 规则必须以禁用态创建；S1-b 交付 Layer4 渲染后解除。
+		if req.Enabled == nil || *req.Enabled {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传规则暂不支持启用（Layer4 渲染链路由 S1-b 交付），请以禁用状态创建（enabled=false）"})
+			return
+		}
+		// TLS/证书字段携带即拒（方案 §四 校验规则 3）：透传域名证书由上游管理。
+		if req.EnableTLS || req.TLSHTTPRedirect || (req.TLSSource != "" && req.TLSSource != "manual") ||
+			strings.TrimSpace(req.TLSCert) != "" || strings.TrimSpace(req.TLSKey) != "" ||
+			strings.TrimSpace(req.TLSCertPath) != "" || strings.TrimSpace(req.TLSKeyPath) != "" ||
+			req.ACMEConfigID != 0 || req.CAProviderID != 0 {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传域名证书由上游管理：passthrough 规则不支持 TLS/证书字段（enable_tls/tls_source/tls_cert/tls_key/tls_cert_path/tls_key_path/acme_config_id/ca_provider_id），本系统不申请、不续期、不监控透传域名证书"})
+			return
+		}
 	}
 
 	if req.Protocol == "http" && strings.TrimSpace(req.Domain) == "" {
@@ -1491,6 +1614,42 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			} else {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			}
+			return
+		}
+		// HTTP 方向反门（JJC-20261112-01 S1-a）：新建/启用 HTTP 规则的域名命中
+		// 任一启用透传规则的 SNI → 拒绝——「同一域名既透传又本地终结」歧义的
+		// 反向路径（正向由下方透传冲突门承担），双向闭合。
+		if conflictRule, hitDomain, err := passthroughTerminateConflict(req.Domain, "passthrough", ""); err != nil {
+			services.Logf("error", "CreateRule passthrough terminate conflict query failed for domain=%s: %v", req.Domain, err)
+			recordRuleWriteFailure(c, "创建", "检查透传域名冲突失败", err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查域名冲突失败"})
+			return
+		} else if conflictRule != "" {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被透传规则 %s 占用（同一域名既透传又本地终结会造成证书与流量归属歧义，请拆分域名或调整其一）", hitDomain, conflictRule)})
+			return
+		}
+	}
+	// 透传冲突门（JJC-20261112-01 S1-a）：禁用态创建同样执行——透传规则的唯一
+	// 语义就是进入 Layer4 SNI 分流集合（渲染按规则存在性收口），同 SNI/同域
+	// 歧义在保存期显性拒绝（不适用「禁用不占用」豁免；启用方向 S1-b 渲染接线
+	// 后由 EnableRule 二次把关）。
+	if req.Protocol == "passthrough" {
+		if conflictRule, hitDomain, err := passthroughSNIConflict(req.Domain, req.ListenPort, ""); err != nil {
+			services.Logf("error", "CreateRule passthrough SNI conflict query failed for domain=%s port=%d: %v", req.Domain, req.ListenPort, err)
+			recordRuleWriteFailure(c, "创建", "检查 SNI 冲突失败", err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查 SNI 冲突失败"})
+			return
+		} else if conflictRule != "" {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("SNI %s 已被透传规则 %s 占用（端口 %d 同 SNI/通配重叠会产生路由归属歧义，请调整域名）", hitDomain, conflictRule, req.ListenPort)})
+			return
+		}
+		if conflictRule, hitDomain, err := passthroughTerminateConflict(req.Domain, "http", ""); err != nil {
+			services.Logf("error", "CreateRule passthrough terminate conflict query failed for domain=%s: %v", req.Domain, err)
+			recordRuleWriteFailure(c, "创建", "检查透传域名冲突失败", err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查域名冲突失败"})
+			return
+		} else if conflictRule != "" {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被 HTTP 规则 %s 本地终结（同一域名既透传又本地终结会造成证书与流量归属歧义，请拆分域名或调整其一）", hitDomain, conflictRule)})
 			return
 		}
 	}
@@ -1667,6 +1826,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		HealthCheckUnhealthyThreshold: req.HealthCheckUnhealthyThreshold, HealthCheckHealthyThreshold: req.HealthCheckHealthyThreshold,
 		EnableActiveHealthCheck: req.EnableActiveHealthCheck, TCPHealthCheckPort: req.TCPHealthCheckPort,
 		TCPProxyProtocol: req.TCPProxyProtocol, TCPTryDuration: req.TCPTryDuration, TCPTryInterval: req.TCPTryInterval,
+		PassthroughUpstream: req.PassthroughUpstream,
 		RequestBodyMaxSizeMB: req.RequestBodyMaxSizeMB, UpstreamKeepaliveTimeout: req.UpstreamKeepaliveTimeout,
 		ServerTokensHidden: req.ServerTokensHidden, NTLMCompatible: req.NTLMCompatible, UpstreamForceHTTP1: req.UpstreamForceHTTP1,
 		ChainRaceIntervalMS: req.ChainRaceIntervalMS, ChainRequestTimeoutMS: req.ChainRequestTimeoutMS,
@@ -2032,6 +2192,7 @@ var updateRuleBaselineSelectColumns = []updateRuleSelectColumn{
 	{"log_enabled", "COALESCE(log_enabled,0)"},
 	{"name", "name"},
 	{"description", "COALESCE(description,'')"},
+	{"passthrough_upstream", "COALESCE(passthrough_upstream,'')"},
 }
 
 // updateRuleBaselineSelectColumnsSnapshot 是上表的 init 冻结快照（防御性拷贝，
@@ -2090,6 +2251,11 @@ var updateRuleSetColumns = []updateRuleSetColumn{
 	// 显式 0=落库 0，渲染侧按 chain 策略兜底）。
 	{"chain_race_interval_ms", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ChainRaceIntervalMS }},
 	{"chain_request_timeout_ms", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ChainRequestTimeoutMS }},
+	// TLS 透传上游（JJC-20261112-01 S1-a）：合并区已保证指针非 nil——nil=沿用
+	// 存量；非透传协议未提交时自愈清空，显式非空由防脏门 400。值取合并终值。
+	{"passthrough_upstream", nil, func(_ *models.UpdateRuleRequest, features ruleFeatureInput) any {
+		return features.PassthroughUpstream
+	}},
 	// 认证网关四件套：合并区已保证指针非 nil（显式空串=清空，enabled=1 时
 	// 由保存门拒绝清空 upstream；uri/copy_headers 清空随写侧默认回填归一）。
 	{"forward_auth_enabled", nil, func(req *models.UpdateRuleRequest, _ ruleFeatureInput) any { return *req.ForwardAuthEnabled }},
@@ -2327,7 +2493,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.CustomRoutesEnabled,
 		&existingRule.ProxyDialTimeout, &existingRule.ProxyResponseHeaderTimeout, &existingRule.ProxyReadTimeout, &existingRule.ProxyWriteTimeout, &existingRule.ProxyStreamTimeout, &existingRule.ProxyFlushInterval, &existingRule.ProxyStreamCloseDelay,
 		&existingRule.HostHeader, &existingRule.HealthCheckHost, &existingRule.EnableCompress, &existingRule.CompressTypes,
-		&existingRule.Enabled, &existingRule.LogEnabled, &existingRule.Name, &existingRule.Description)
+		&existingRule.Enabled, &existingRule.LogEnabled, &existingRule.Name, &existingRule.Description,
+		&existingRule.PassthroughUpstream)
 	if err != nil {
 		// 分判 ErrNoRows 与真实 DB 故障(同 EnableRule 口径)——
 		// 此前任意 DB 错误误报 404「规则不存在」误导排障。
@@ -2395,6 +2562,17 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	if req.ListenPort == 0 {
 		req.ListenPort = existingRule.ListenPort
+	}
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough_upstream 指针三态合并——
+	// nil=沿用存量；非透传终态未提交时自愈清空（存量/带外脏值不得让无关编辑
+	// 命中防脏门 400 死端，与 TCP 死字段自愈同格）；透传终态沿用存量后由
+	// validatePassthroughRule 必填门兜底。
+	if req.PassthroughUpstream == nil {
+		mergedUpstream := ""
+		if req.Protocol == "passthrough" {
+			mergedUpstream = existingRule.PassthroughUpstream
+		}
+		req.PassthroughUpstream = &mergedUpstream
 	}
 	// F10：删除「合并后仍为 0 再填 443」的兜底——existingRule.listen_port 为
 	// NOT NULL，合并后为 0 不可达（死代码）；合并后仍为 0 走下方
@@ -2684,6 +2862,60 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			if req.DnsFamily == "" {
 				req.DnsFamily = "ipv4"
 			}
+		case "passthrough":
+			// TLS 透传（JJC-20261112-01 S1-a）：切到透传时未提交/存量的
+			// HTTP-only 开关族自愈清零（与 tcp case 同口径——协议切换不是用户
+			// 对这些字段的显式输入）；显式提交的值原样留给 validatePassthroughRule
+			// 400 点名。TLS/证书族不自愈：透传证书由上游管理，携带即显性拒绝
+			// （方案 §四 校验规则 3）。passthrough_upstream 由合并区指针合并承担
+			// （nil 沿用存量 → 必填门兜底）。
+			if !strategySubmitted && (req.Strategy == "cookie" || req.Strategy == "chain_fallback") {
+				req.Strategy = "weighted_round_robin"
+			}
+			if !customRoutesEnabledSubmitted {
+				req.CustomRoutesEnabled = &disabled
+			}
+			emptyPathRules := []models.PathRule{}
+			req.PathRules = &emptyPathRules
+			if !proxyDialTimeoutSubmitted {
+				req.ProxyDialTimeout = &zero
+			}
+			if !proxyResponseHeaderTimeoutSubmitted {
+				req.ProxyResponseHeaderTimeout = &zero
+			}
+			if !proxyReadTimeoutSubmitted {
+				req.ProxyReadTimeout = &zero
+			}
+			if !proxyWriteTimeoutSubmitted {
+				req.ProxyWriteTimeout = &zero
+			}
+			if !proxyStreamTimeoutSubmitted {
+				req.ProxyStreamTimeout = &zero
+			}
+			if !proxyFlushIntervalSubmitted {
+				req.ProxyFlushInterval = &zero
+			}
+			if !proxyStreamCloseDelaySubmitted {
+				req.ProxyStreamCloseDelay = &zero
+			}
+			// 动态上游/DNS 服务发现是 HTTP 语义；未提交/存量值切换即清零，
+			// 显式提交则交 validatePassthroughRule 拒绝。
+			if !dynamicDNSSubmitted {
+				req.DynamicDNS = &disabled
+			}
+			req.EnableDnsServer = &disabled
+			req.DnsServer = &empty
+			// NTLM/认证网关（仅 HTTP 语义）：未提交的存量死值自愈归零，
+			// 显式携带由保存门 400 点名（与最终协议 tcp 块同格）。
+			if !ntlmCompatibleProvided {
+				req.NTLMCompatible = &zero
+			}
+			if !forwardAuthEnabledSubmitted {
+				req.ForwardAuthEnabled = &zero
+				req.ForwardAuthUpstream = &empty
+				req.ForwardAuthURI = &empty
+				req.ForwardAuthCopyHeaders = &empty
+			}
 		}
 	}
 	// 最终协议为 tcp 时一律归一 TLS 字段（与上方切换到 TCP 的分支同
@@ -2815,6 +3047,47 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
+	// TLS 透传（JJC-20261112-01 S1-a）最终协议门（合并后生效值）：TLS/证书
+	// 字段携带即拒（透传域名证书由上游管理）、恒禁用态保存门（S1-a 渲染未接线，
+	// 同 CreateRule）、SNI 冲突双门。证书材料的 DB 残留由 updateRuleSetColumns
+	// 的 protocolChanged 恒写语义清空（req 空值=清空），此处只拦显式携带。
+	if req.Protocol == "passthrough" {
+		req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
+		*req.PassthroughUpstream = strings.TrimSpace(*req.PassthroughUpstream)
+		if *req.EnableTLS || *req.TLSHTTPRedirect || (req.TLSSource != "" && req.TLSSource != "manual") ||
+			strings.TrimSpace(req.TLSCert) != "" || strings.TrimSpace(req.TLSKey) != "" ||
+			strings.TrimSpace(req.TLSCertPath) != "" || strings.TrimSpace(req.TLSKeyPath) != "" || req.ACMEConfigID != 0 {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传域名证书由上游管理：passthrough 规则不支持 TLS/证书字段（enable_tls/tls_source/tls_cert/tls_key/tls_cert_path/tls_key_path/acme_config_id），本系统不申请、不续期、不监控透传域名证书"})
+			return
+		}
+		if *req.Enabled {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传规则暂不支持启用（Layer4 渲染链路由 S1-b 交付），请保持禁用状态保存（enabled=false）"})
+			return
+		}
+		// 冲突门：域名/端口相对存量变化时执行（与 HTTP 域名冲突门同格）——
+		// 禁用态更新同样执行（同 CreateRule 口径：SNI 歧义保存期显性拒绝）。
+		if req.Domain != existingRule.Domain || req.ListenPort != existingRule.ListenPort {
+			if conflictRule, hitDomain, err := passthroughSNIConflict(req.Domain, req.ListenPort, caddyID); err != nil {
+				services.Logf("error", "UpdateRule passthrough SNI conflict query failed for caddy_id=%s domain=%s: %v", caddyID, req.Domain, err)
+				recordRuleWriteFailure(c, "更新", "检查 SNI 冲突失败", err)
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查 SNI 冲突失败"})
+				return
+			} else if conflictRule != "" {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("SNI %s 已被透传规则 %s 占用（端口 %d 同 SNI/通配重叠会产生路由归属歧义，请调整域名）", hitDomain, conflictRule, req.ListenPort)})
+				return
+			}
+			if conflictRule, hitDomain, err := passthroughTerminateConflict(req.Domain, "http", caddyID); err != nil {
+				services.Logf("error", "UpdateRule passthrough terminate conflict query failed for caddy_id=%s domain=%s: %v", caddyID, req.Domain, err)
+				recordRuleWriteFailure(c, "更新", "检查透传域名冲突失败", err)
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查域名冲突失败"})
+				return
+			} else if conflictRule != "" {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被 HTTP 规则 %s 本地终结（同一域名既透传又本地终结会造成证书与流量归属歧义，请拆分域名或调整其一）", hitDomain, conflictRule)})
+				return
+			}
+		}
+	}
+
 	if req.Protocol == "http" && strings.TrimSpace(req.Domain) == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "HTTP/HTTPS 规则的域名不能为空"})
 		return
@@ -2851,6 +3124,17 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 			if existing {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "域名已被其他 HTTP/HTTPS 规则使用"})
+				return
+			}
+			// 透传反门（JJC-20261112-01 S1-a）：HTTP 规则域名命中任一启用透传
+			// 规则的 SNI → 拒绝（同一域名既透传又本地终结歧义的反向路径）。
+			if conflictRule, hitDomain, err := passthroughTerminateConflict(req.Domain, "passthrough", caddyID); err != nil {
+				services.Logf("error", "UpdateRule passthrough terminate conflict query failed for caddy_id=%s domain=%s: %v", caddyID, req.Domain, err)
+				recordRuleWriteFailure(c, "更新", "检查透传域名冲突失败", err)
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查域名冲突失败"})
+				return
+			} else if conflictRule != "" {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被透传规则 %s 占用（同一域名既透传又本地终结会造成证书与流量归属歧义，请拆分域名或调整其一）", hitDomain, conflictRule)})
 				return
 			}
 		}
@@ -4247,6 +4531,12 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	if rule.TLSSource != "acme_dns" {
 		rule.ACMEConfigID = 0
 	}
+	// TLS 透传（JJC-20261112-01 S1-a）：非透传源行的存量/带外 passthrough_upstream
+	// 脏值自愈清空（与 duplicateRulePayloadRequest 同格）；透传源行原样复制
+	// （副本恒禁用态落库，复制链不重复冲突门——启用方向由 EnableRule 把关）。
+	if rule.Protocol != "passthrough" {
+		rule.PassthroughUpstream = ""
+	}
 	// 副本同样按生效来源清理跨模式残留——
 	// 非 manual 不复制证书材料；非 acme_dns 不复制 CA 提供商引用。
 	if rule.TLSSource != "manual" {
@@ -4321,6 +4611,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	if err := validateRuleFeatures(ruleFeatureInput{
 		Protocol: rule.Protocol, Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS,
 		EnableDnsServer: rule.EnableDnsServer, DnsServer: rule.DnsServer,
+		Domain: rule.Domain,
 		EnabledUpstreamCount: enabledUpstreamCount,
 		// 补 5 字段——80 自环门与地址族门在复制
 		// 路径此前因零值恒不触发(注释自述「与 CreateRule 一致」未兑现)。
@@ -4354,6 +4645,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		// 复制即命中 400 死端且用户无自救路径，与 TCP 三字段同格。
 		ChainRaceIntervalMS:   rule.ChainRaceIntervalMS,
 		ChainRequestTimeoutMS: rule.ChainRequestTimeoutMS,
+		// TLS 透传上游随保存门接入（透传源行复制校验 / 非透传脏值已自愈清空）。
+		PassthroughUpstream: rule.PassthroughUpstream,
 	}); err != nil {
 		fail(http.StatusBadRequest, "源规则配置不合法："+err.Error())
 		return

@@ -42,6 +42,7 @@ func testLbRuleFullyPopulated(t *testing.T) models.LbRule {
 		UpdatedAt:         models.JSONNullTime{NullTime: mustParseTime(t, "2026-03-05 06:07:08")},
 		BlockPageStage1ID: 61, BlockPageStage1Status: 403,
 		BlockPageStage3ID: 63, BlockPageStage3Status: 503,
+		PassthroughUpstream: "up.internal:10443",
 	}
 }
 
@@ -177,6 +178,8 @@ func testLbRuleExpectedColumnValue(rule *models.LbRule, column string) any {
 		return rule.BlockPageStage3ID
 	case "block_page_stage3_status":
 		return rule.BlockPageStage3Status
+	case "passthrough_upstream":
+		return rule.PassthroughUpstream
 	}
 	panic("未覆盖列: " + column)
 }
@@ -368,6 +371,7 @@ func assertLbRuleScalarFieldsEqual(t *testing.T, want, got *models.LbRule) {
 	check("BlockPageStage1Status", want.BlockPageStage1Status, got.BlockPageStage1Status)
 	check("BlockPageStage3ID", want.BlockPageStage3ID, got.BlockPageStage3ID)
 	check("BlockPageStage3Status", want.BlockPageStage3Status, got.BlockPageStage3Status)
+	check("PassthroughUpstream", want.PassthroughUpstream, got.PassthroughUpstream)
 	if len(mismatches) > 0 {
 		t.Fatalf("快照往返字段不一致:\n%s", strings.Join(mismatches, "\n"))
 	}

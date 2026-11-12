@@ -560,15 +560,18 @@ func createTables() error {
 		-- 阶段拦截页四列——此前仅靠 newColumns 启动补列，
 		-- fresh DDL 滞后于存量库 ALTER 通道。
 		block_page_stage1_id INTEGER NOT NULL DEFAULT 0,
-		block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
-		block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
-		block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
-		created_by INTEGER,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		updated_at DATETIME,
-		updated_by INTEGER,
-		caddy_id VARCHAR(20) PRIMARY KEY
-	);
+			block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
+			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
+			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
+			-- TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游
+			-- host:port（仅 passthrough 协议消费；非透传行恒 ''，写侧拒绝携带）。
+			passthrough_upstream TEXT NOT NULL DEFAULT '',
+			created_by INTEGER,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME,
+			updated_by INTEGER,
+			caddy_id VARCHAR(20) PRIMARY KEY
+		);
 
 	-- CA Providers table for ACME certificate issuance
 	CREATE TABLE IF NOT EXISTS ca_providers (
@@ -1189,6 +1192,10 @@ var newColumnsRegistry = map[string]string{
 	"lb_rules.block_page_stage1_status":  "INTEGER NOT NULL DEFAULT 0",
 	"lb_rules.block_page_stage3_id":      "INTEGER NOT NULL DEFAULT 0",
 	"lb_rules.block_page_stage3_status":  "INTEGER NOT NULL DEFAULT 0",
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
+	// 重建 DDL 与读路径（lbRuleColumns/快照 SELECT）依赖其存在；新列绝不进
+	// deadColumnDrops/legacy*DeadColumns 死列清单。
+	"lb_rules.passthrough_upstream": "TEXT NOT NULL DEFAULT ''",
 	"auto_backups.app_version":           "TEXT NOT NULL DEFAULT ''",
 	// 统一任务引擎：手动触发操作者归因列——runNow/Trigger 落
 	// 操作者，auto/startup/legacy 落空串。存量库幂等补列（ensureNewColumns）。
@@ -5109,6 +5116,9 @@ func migrateLbRulesPrimaryKey() error {
 			block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
+			-- 与 fresh CREATE 同步携带 TLS 透传上游列——ensureNewColumns 在本
+			-- 重建之前已加列，陈旧 DDL 会把列连同值一并丢弃（同上先例）。
+			passthrough_upstream TEXT NOT NULL DEFAULT '',
 			created_by INTEGER,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME,
@@ -5139,7 +5149,8 @@ func migrateLbRulesPrimaryKey() error {
 			tls_key, tls_cert_path, tls_key_path, tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, enabled, log_enabled,
 			created_by, created_at, updated_at, updated_by, caddy_id,
-			block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status
+			block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status,
+			passthrough_upstream
 		)
 		SELECT
 			id, name, description, protocol, domain, listen_port,
@@ -5161,7 +5172,8 @@ func migrateLbRulesPrimaryKey() error {
 			tls_key, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''), tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, COALESCE(enabled,0), COALESCE(log_enabled,0),
 			created_by, created_at, updated_at, updated_by, caddy_id,
-			COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)
+			COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0),
+			COALESCE(passthrough_upstream,'')
 		FROM lb_rules
 	`)
 		if err != nil {
