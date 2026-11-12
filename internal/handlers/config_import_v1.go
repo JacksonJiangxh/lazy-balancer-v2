@@ -443,6 +443,15 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
+		// 协议白名单与保存侧同口径（JJC-20261112-01 S1-b：passthrough 已接线
+		// Layer4 SNI 分流渲染）。v1（nginx）源无 SNI 透传语义——转换器恒不
+		// 产出 passthrough，且 v1 结构无 passthrough_upstream 字段；若手造
+		// 转换物携带该协议，因渲染必需的上游地址必缺，显式点名跳过（而不是
+		// 落库成无法渲染的死行）。
+		if rule.Protocol == "passthrough" {
+			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：v1 导出格式不支持 TLS 透传（passthrough）规则，已跳过导入", index+1, rule.Name))
+			continue
+		}
 		if rule.Protocol != "http" && rule.Protocol != "tcp" {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：协议无效", index+1, rule.Name))
 			continue

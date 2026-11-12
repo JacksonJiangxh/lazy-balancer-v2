@@ -280,11 +280,40 @@ func TestPassthroughCreateRule_disabled_save_passes(t *testing.T) {
 	}
 }
 
-func TestPassthroughCreateRule_enabled_rejected_in_s1a(t *testing.T) {
+// S1-b（JJC-20261112-01）：渲染已接线，S1-a 的「恒禁用态」保护门解除——
+// 透传规则可以启用态创建，落库 enabled=1。
+func TestPassthroughCreateRule_enabled_allowed_after_s1b(t *testing.T) {
 	_, _, create := newPassthroughRouter(t)
 	response := create(passthroughCreateBody("passthrough-enabled", "app.example.com", true))
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "暂不支持启用") {
-		t.Fatalf("status=%d body=%s, want 400 暂不支持启用", response.Code, response.Body.String())
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201（S1-b 已放行启用态创建）", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			CaddyID string `json:"caddy_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload.Data.CaddyID == "" {
+		t.Fatalf("parse create response %q: %v", response.Body.String(), err)
+	}
+	var storedEnabled int
+	if err := db.DB.QueryRow(`SELECT enabled FROM lb_rules WHERE caddy_id = ?`, payload.Data.CaddyID).Scan(&storedEnabled); err != nil {
+		t.Fatalf("read stored rule: %v", err)
+	}
+	if storedEnabled != 1 {
+		t.Fatalf("stored enabled=%d, want 1", storedEnabled)
+	}
+}
+
+// 渲染所需数据完整性门仍在：缺 passthrough_upstream 的启用态创建必须 400
+// （这正是 S1-b 取代「恒禁用态」后保留的那道门）。
+func TestPassthroughCreateRule_missingUpstreamStillRejected(t *testing.T) {
+	_, _, create := newPassthroughRouter(t)
+	body := fmt.Sprintf(`{"name":"passthrough-noup","protocol":"passthrough","domain":"app.example.com","listen_port":%d,"enabled":true}`,
+		services.DefaultHTTPSPort())
+	response := create(body)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "透传上游地址必填") {
+		t.Fatalf("status=%d body=%s, want 400 透传上游地址必填", response.Code, response.Body.String())
 	}
 }
 
@@ -416,13 +445,28 @@ func TestPassthroughUpdateRule_keep_disabled_and_edit_upstream(t *testing.T) {
 		t.Fatalf("updated passthrough_upstream=%q, want 10.0.0.6:20443", storedUpstream)
 	}
 
-	// 启用尝试 → 400（S1-a 禁用态门）。
+	// 启用 → 200 且落库 enabled=1（S1-b 已放行；S1-a 的禁用态门已解除）。
 	enableRequest := httptest.NewRequest(http.MethodPut, "/rules/"+caddyID, strings.NewReader(`{"enabled":true}`))
 	enableRequest.Header.Set("Content-Type", "application/json")
 	enableRecorder := httptest.NewRecorder()
 	router.ServeHTTP(enableRecorder, enableRequest)
-	if enableRecorder.Code != http.StatusBadRequest || !strings.Contains(enableRecorder.Body.String(), "暂不支持启用") {
-		t.Fatalf("enable status=%d body=%s, want 400 暂不支持启用", enableRecorder.Code, enableRecorder.Body.String())
+	if enableRecorder.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s, want 200（S1-b 放行启用）", enableRecorder.Code, enableRecorder.Body.String())
+	}
+	var storedEnabled int
+	if err := db.DB.QueryRow(`SELECT enabled FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&storedEnabled); err != nil {
+		t.Fatalf("read enabled: %v", err)
+	}
+	if storedEnabled != 1 {
+		t.Fatalf("stored enabled=%d, want 1", storedEnabled)
+	}
+	// 启用后再禁用回来：后续断言（非透传协议防脏门）与启用态无关，保持库干净。
+	disableRequest := httptest.NewRequest(http.MethodPut, "/rules/"+caddyID, strings.NewReader(`{"enabled":false}`))
+	disableRequest.Header.Set("Content-Type", "application/json")
+	disableRecorder := httptest.NewRecorder()
+	router.ServeHTTP(disableRecorder, disableRequest)
+	if disableRecorder.Code != http.StatusOK {
+		t.Fatalf("disable status=%d body=%s, want 200", disableRecorder.Code, disableRecorder.Body.String())
 	}
 
 	// 非透传协议显式携带 passthrough_upstream → 400（防脏门）。
@@ -458,5 +502,56 @@ func TestPassthrough_legacy_zero_impact(t *testing.T) {
 	tcpBody := `{"name":"legacy-tcp","protocol":"tcp","listen_port":19000,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":19001,"enabled":true}]}`
 	if response := create(tcpBody); response.Code != http.StatusCreated {
 		t.Fatalf("tcp create status=%d body=%s, want 201", response.Code, response.Body.String())
+	}
+}
+
+// ── S1-b：v2 备份导入链放行 ────────────────────────────────────────────────
+
+// Given: v2 备份含一条**启用态**透传规则（passthrough_upstream 完整）
+// When: validateV2BackupRules
+// Then: 通过（S1-a 时该行因恒禁用态口径/缺输入被拒；S1-b 渲染已接线，
+// 启用态行必须能随备份往返）。
+func TestValidateV2BackupRules_passthroughEnabledRowAccepted(t *testing.T) {
+	tables := ruleTablesShared()
+	tables["lb_rules"][0]["protocol"] = "passthrough"
+	tables["lb_rules"][0]["domain"] = "import-pt.example.test"
+	tables["lb_rules"][0]["listen_port"] = services.DefaultHTTPSPort()
+	tables["lb_rules"][0]["enabled"] = 1
+	tables["lb_rules"][0]["passthrough_upstream"] = "10.0.0.5:10443"
+	tables["lb_rules"][0]["strategy"] = "weighted_round_robin"
+	// 透传上游不进 upstreams 表（单值列契约）。
+	tables["upstreams"] = []map[string]any{}
+	if err := validateV2BackupRules(tables); err != nil {
+		t.Fatalf("启用态透传行应通过 v2 导入校验: %v", err)
+	}
+}
+
+// 渲染数据完整性门在导入链同样生效：缺 passthrough_upstream 的透传行拒绝。
+func TestValidateV2BackupRules_passthroughMissingUpstreamRejected(t *testing.T) {
+	tables := ruleTablesShared()
+	tables["lb_rules"][0]["protocol"] = "passthrough"
+	tables["lb_rules"][0]["domain"] = "import-pt2.example.test"
+	tables["lb_rules"][0]["listen_port"] = services.DefaultHTTPSPort()
+	tables["lb_rules"][0]["enabled"] = 1
+	tables["lb_rules"][0]["passthrough_upstream"] = ""
+	tables["upstreams"] = []map[string]any{}
+	err := validateV2BackupRules(tables)
+	if err == nil || !strings.Contains(err.Error(), "透传上游地址必填") {
+		t.Fatalf("缺 passthrough_upstream 应被拒（渲染数据完整性门），got %v", err)
+	}
+}
+
+// v1（nginx）导出无透传语义：手造 passthrough 行显性点名跳过，不落库成死行。
+func TestValidateConvertedV1Rules_passthroughSkipped(t *testing.T) {
+	rules := []convertedRule{{
+		Name: "v1-pt", Protocol: "passthrough", Domain: "v1.example.test",
+		ListenPort: services.DefaultHTTPSPort(), Enabled: true,
+	}}
+	valid, skips, _ := validateConvertedV1Rules(rules)
+	if len(valid) != 0 {
+		t.Fatalf("v1 passthrough 行不得进入 valid 集合")
+	}
+	if len(skips) != 1 || !strings.Contains(skips[0], "v1 导出格式不支持 TLS 透传") {
+		t.Fatalf("skips=%v, want 点名 v1 不支持透传", skips)
 	}
 }

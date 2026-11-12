@@ -484,8 +484,10 @@ func sniDomainsOverlap(a, b string) bool {
 // TLS/证书字段互斥（透传域名证书由上游管理）与 HTTP-only 死字段显性拒绝。
 // 挂在 validateRuleFeatures 协议白名单之后，Create/Update/复制全链路复用
 // （与 NTLM/认证网关门同族的组织方式）。
-// TODO(S1-b)：渲染链（caddy.go Layer4 分流）交付后解除「恒禁用态」限制
-// （见 rules.go 保存入口的 S1-a 门）。
+// 启用态已放行（JJC-20261112-01 S1-b：caddy.go 已交付 Layer4 SNI 分流渲染，
+// S1-a 的「恒禁用态」保护门已移除）；本函数保留为「渲染所需数据完整性」的
+// 唯一把守点——passthrough_upstream 必填且为合法 host:port，SNI 形状合法，
+// 端口等于 DefaultHTTPSPort（第一期）。
 func validatePassthroughRule(input ruleFeatureInput) error {
 	domain := strings.ToLower(strings.TrimSpace(input.Domain))
 	if domain == "" {
@@ -602,9 +604,9 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	// （caddy.go:1276）——域名匹配静默丢失、TLS 字段被忽略。统一在特性校验入口
 	// 拒绝未知协议，Create/Update/复制/导入全链路复用；保存校验 validateRuleConfigGeneration
 	// 亦仅放行 http/tcp，存量 https 行由 db 迁移归一为 http+TLS。
-	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 成为合法第三值（保存链）；
-	// TODO(S1-b)：caddy.go 渲染侧协议白名单仍只放行 http/tcp——渲染接线与
-	// Layer4 分流由 S1-b 承担，本阶段透传规则恒禁用态保存（见 validatePassthroughRule）。
+	// TLS 透传（JJC-20261112-01）：passthrough 为合法第三值（保存链）；
+	// S1-b 已接线 caddy.go 的 Layer4 SNI 分流渲染（协议白名单放行
+	// http/tcp/passthrough），透传规则可启用。
 	if input.Protocol != "http" && input.Protocol != "tcp" && input.Protocol != "passthrough" {
 		return fmt.Errorf("协议仅支持 http、tcp 或 passthrough")
 	}

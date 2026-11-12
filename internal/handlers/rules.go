@@ -1534,13 +1534,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// 域名/上游先归一（小写/TrimSpace）——校验与落库看到同一终值。
 		req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
 		req.PassthroughUpstream = strings.TrimSpace(req.PassthroughUpstream)
-		// S1-a 门：渲染链未接线（caddy.go 全量渲染协议白名单仍只放行 http/tcp
-		// ——启用中的透传行会让配置生成整体失败、拖垮全部规则），本阶段透传
-		// 规则必须以禁用态创建；S1-b 交付 Layer4 渲染后解除。
-		if req.Enabled == nil || *req.Enabled {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传规则暂不支持启用（Layer4 渲染链路由 S1-b 交付），请以禁用状态创建（enabled=false）"})
-			return
-		}
+		// 启用态已放行（JJC-20261112-01 S1-b：caddy.go 已接线 Layer4 SNI 分流
+		// 渲染，S1-a 的「恒禁用态」保护门解除）。渲染所需数据完整性
+		// （passthrough_upstream 非空 host:port）由 validatePassthroughRule
+		// 单源把守，此处不再提前拒绝。
 		// TLS/证书字段携带即拒（方案 §四 校验规则 3）：透传域名证书由上游管理。
 		if req.EnableTLS || req.TLSHTTPRedirect || (req.TLSSource != "" && req.TLSSource != "manual") ||
 			strings.TrimSpace(req.TLSCert) != "" || strings.TrimSpace(req.TLSKey) != "" ||
@@ -3060,10 +3057,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传域名证书由上游管理：passthrough 规则不支持 TLS/证书字段（enable_tls/tls_source/tls_cert/tls_key/tls_cert_path/tls_key_path/acme_config_id），本系统不申请、不续期、不监控透传域名证书"})
 			return
 		}
-		if *req.Enabled {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "透传规则暂不支持启用（Layer4 渲染链路由 S1-b 交付），请保持禁用状态保存（enabled=false）"})
-			return
-		}
+		// 启用态已放行（JJC-20261112-01 S1-b，同 CreateRule）。
 		// 冲突门：域名/端口相对存量变化时执行（与 HTTP 域名冲突门同格）——
 		// 禁用态更新同样执行（同 CreateRule 口径：SNI 歧义保存期显性拒绝）。
 		if req.Domain != existingRule.Domain || req.ListenPort != existingRule.ListenPort {

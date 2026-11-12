@@ -2643,8 +2643,14 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		// 已拒、协议切换零值化、存量迁移已清空）。HTTP 规则合法 dns 字段
 		// 不受影响（该门仅 TCP 分支消费）。
 		input := ruleFeatureInput{
-			Protocol:                   protocol,
-			Strategy:                   backupString(rule["strategy"]),
+			Protocol: protocol,
+			Strategy: backupString(rule["strategy"]),
+			// TLS 透传（JJC-20261112-01 S1-b）：passthrough 行必须带 SNI 域名与
+			// 上游 host:port，否则落库后无法渲染。输入与保存侧同源口径——
+			// EnabledUpstreamCount 对透传恒 0（upstreams 表零行），完整性由
+			// validatePassthroughRule 的 PassthroughUpstream 门承担。
+			Domain:                     backupString(rule["domain"]),
+			PassthroughUpstream:        backupString(rule["passthrough_upstream"]),
 			NTLMCompatible:             backupInt(rule["ntlm_compatible"]),
 			DynamicDNS:                 backupBooleanEnabled(rule["dynamic_dns"]),
 			EnableDnsServer:            backupBooleanEnabled(rule["enable_dns_server"]),
