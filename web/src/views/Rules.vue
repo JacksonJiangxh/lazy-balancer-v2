@@ -165,8 +165,8 @@
         </el-table-column>
         <el-table-column label="协议" width="80">
           <template #default="{ row }">
-            <el-tag :type="row.protocol === 'tcp' ? 'warning' : (row.enable_tls ? 'success' : 'primary')" size="small" effect="plain">
-              {{ row.protocol === 'tcp' ? 'TCP' : (row.enable_tls ? 'HTTPS' : 'HTTP') }}
+            <el-tag :type="row.protocol === 'tcp' ? 'warning' : (row.protocol === 'passthrough' ? 'danger' : (row.enable_tls ? 'success' : 'primary'))" size="small" effect="plain">
+              {{ row.protocol === 'tcp' ? 'TCP' : (row.protocol === 'passthrough' ? 'TLS 透传' : (row.enable_tls ? 'HTTPS' : 'HTTP')) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -182,7 +182,12 @@
         </el-table-column>
         <el-table-column label="上游" width="64" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.dynamic_dns ? 'primary' : 'success'" size="small" effect="plain">
+            <!-- 透传规则上游是 passthrough_upstream 单值列（upstreams 表零行）——
+                 悬停展示上游地址，静态/动态徽标不适用 -->
+            <el-tooltip v-if="row.protocol === 'passthrough'" :content="row.passthrough_upstream || '未配置透传上游'" placement="top">
+              <el-tag size="small" effect="plain">透传</el-tag>
+            </el-tooltip>
+            <el-tag v-else :type="row.dynamic_dns ? 'primary' : 'success'" size="small" effect="plain">
               {{ row.dynamic_dns ? '动态' : '静态' }}
             </el-tag>
           </template>
@@ -441,7 +446,15 @@
               <el-radio-group v-model="wizardForm.protocol" aria-label="协议">
                 <el-radio value="http">HTTP</el-radio>
                 <el-radio value="tcp">TCP</el-radio>
+                <el-radio value="passthrough">TLS 透传</el-radio>
               </el-radio-group>
+            </el-form-item>
+
+            <el-form-item label="SNI 域名" required v-if="wizardForm.protocol === 'passthrough'" class="domain-item">
+              <el-input v-model="wizardForm.domain" placeholder="例如：app.example.com 或 *.example.com" :class="{ 'is-error': !!passthroughSniFieldError }" @blur="passthroughSniTouched = true" />
+              <div v-if="passthroughSniTouched && passthroughSniFieldError" class="form-tip-line port-warning">{{ passthroughSniFieldError }}</div>
+              <div v-if="passthroughConflictWarning" class="form-tip-line port-warning">{{ passthroughConflictWarning }}</div>
+              <div class="form-tip-line">单个域名，支持 *.example.com 通配（* 只能占最左标签）；Layer4 按 ClientHello 的 SNI 分流，不支持 IP 字面量</div>
             </el-form-item>
 
             <el-form-item label="域名" required v-if="wizardForm.protocol === 'http'" class="domain-item">
@@ -450,9 +463,12 @@
             </el-form-item>
 
             <el-form-item label="监听端口" required>
-              <el-input-number v-model="wizardForm.listen_port" :min="1" :max="65535" controls-position="right" @change="userExplicitPort = true" />
+              <!-- 透传（JJC-20261112-01）：第一期监听端口必须等于部署侧 HTTPS 默认口
+                   （443/TCP 由 Layer4 统一接管），字段只读防改——后端保存门同口径 400 -->
+              <el-input-number v-model="wizardForm.listen_port" :min="1" :max="65535" controls-position="right" :disabled="wizardForm.protocol === 'passthrough'" @change="userExplicitPort = true" />
               <span class="form-tip-inline">
                 <span v-if="portWarning" class="port-warning">{{ portWarning }}</span>
+                <span v-else-if="wizardForm.protocol === 'passthrough'">跟随部署 HTTPS_PORT（{{ proxyPorts.https_port }}），只读</span>
                 <span v-else-if="wizardForm.protocol === 'http'">建议使用 {{ proxyPorts.http_port }} 或其他非保留端口</span>
                 <span v-else>建议使用 10000-60000 范围内的端口</span>
               </span>
@@ -461,6 +477,17 @@
               <div v-if="stalePortHint" class="form-tip-line">{{ stalePortHint }}</div>
               <div class="form-tip-line">服务端还会按当前部署校验实际管理端口（面板监听端口与 Caddy admin 端口），自定义端口以保存结果为准</div>
             </el-form-item>
+
+            <!-- 透传证书归属提示（方案 §四 校验规则 3）：证书字段整组不渲染，
+                 归属关系必须在此明示，避免用户寻找证书入口 -->
+            <template v-if="wizardForm.protocol === 'passthrough'">
+              <div class="info-note-bar">
+                <span class="info-note-desc">本域名的证书由上游服务器管理，本系统不申请、不续期、不监控有效期</span>
+              </div>
+              <div class="info-note-bar">
+                <span class="info-note-desc">透传域名不支持 HTTP/3（QUIC），自动降级 HTTP/2/1.1</span>
+              </div>
+            </template>
 
             <el-form-item label="启用 HTTPS" v-if="wizardForm.protocol === 'http'">
               <el-switch v-model="wizardForm.enable_tls" :disabled="isCurrentRuleLocked" />
@@ -583,6 +610,24 @@
         <!-- Step 2: 上游服务器 -->
         <div v-show="currentStep === WIZARD_STEP.UPSTREAMS" class="step-content">
           <el-form :model="wizardForm" label-width="100px" :disabled="saving">
+            <!-- 透传（JJC-20261112-01）：上游存 passthrough_upstream 单值列，
+                 upstreams 上游列表显式携带即后端 400——表格整组不渲染 -->
+            <template v-if="wizardForm.protocol === 'passthrough'">
+              <el-form-item label="上游地址" required>
+                <el-input
+                  v-model="wizardForm.passthrough_upstream"
+                  placeholder="host:port，例如 10.0.0.5:10443 或 [2001:db8::1]:10443"
+                  clearable
+                  style="max-width: 480px;"
+                  :class="{ 'is-error': !!passthroughUpstreamFieldError }"
+                  :aria-label="`透传上游地址`"
+                  @blur="passthroughUpstreamTouched = true"
+                />
+                <div v-if="passthroughUpstreamTouched && passthroughUpstreamFieldError" class="form-tip-line port-warning">{{ passthroughUpstreamFieldError }}</div>
+                <div class="form-tip-line">上游自带反向代理与证书（TLS 在上游终结），本系统只做字节流转发；支持 IPv6 字面量 [::1]:10443 形态</div>
+              </el-form-item>
+            </template>
+            <template v-else>
             <div class="upstream-header">
               <span class="section-title">上游服务器列表</span>
               <el-button size="small" type="primary" @click="addUpstream" :disabled="wizardForm.upstreams.length >= MAX_UPSTREAM_ROWS || (wizardForm.dynamic_dns && wizardForm.upstreams.length >= 1)">
@@ -679,6 +724,7 @@
             <div v-if="upstreamFieldWarning" class="form-tip-line">
               <span class="port-warning">{{ upstreamFieldWarning }}</span>
             </div>
+            </template>
 
             <template v-if="wizardForm.protocol === 'http'">
               <el-divider content-position="left" class="compact-divider">路由与后端兼容</el-divider>
@@ -857,7 +903,9 @@
               </template>
             </template>
 
-            <template v-if="wizardForm.protocol === 'tcp'">
+            <!-- 透传与健康检查族语义同 TCP（后端 buildPassthroughProxyHandler
+                 复用 healthCheckCore 同一单源）：主动探测=TCP 连接探测 -->
+            <template v-if="wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough'">
               <el-form-item label="主动检查">
                 <div class="active-check-control">
                   <el-switch v-model="wizardForm.enable_active_health_check" />
@@ -958,7 +1006,8 @@
               </el-form-item>
             </template>
 
-            <template v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
+            <!-- 连接重试对透传可见（后端复用 tcp_try_* 语义，渲染同 buildTCPProxyHandler 口径） -->
+            <template v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough'">
               <el-divider content-position="left" class="compact-divider">连接重试</el-divider>
 
               <el-form-item>
@@ -967,9 +1016,9 @@
                 <el-input-number v-model="wizardForm.tcp_try_duration" :min="ntlmOn ? -1 : 0" :max="60000" controls-position="right" style="width: 120px;" :disabled="ntlmOn" />
                 <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn
                   ? '禁用重试（NTLM 模式锁定）'
-                  : (wizardForm.protocol === 'tcp'
-                      ? '毫秒，0 表示不重试；连接失败后在窗口期内尝试其他上游'
-                      : '毫秒，0 = 默认 5 秒窗口；失败后在窗口期内尝试其他上游') }}</span>
+                  : (wizardForm.protocol === 'http'
+                      ? '毫秒，0 = 默认 5 秒窗口；失败后在窗口期内尝试其他上游'
+                      : '毫秒，0 表示不重试；连接失败后在窗口期内尝试其他上游') }}</span>
               </el-form-item>
 
               <el-form-item label="重试间隔">
@@ -977,7 +1026,7 @@
                 <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn ? '重试已禁用，间隔不生效' : ((wizardForm.tcp_try_duration || 0) <= 0 ? '窗口未启用时间隔不生效' : '毫秒，每次重试间隔；窗口启用时必须 ≥1') }}</span>
               </el-form-item>
 
-              <el-form-item v-if="wizardForm.protocol === 'tcp'" label="PROXY V2">
+              <el-form-item v-if="wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough'" label="PROXY V2">
                 <el-switch v-model="wizardForm.tcp_proxy_protocol" />
                 <span class="form-tip-inline">开启后向上游发送 PROXY v2 协议头传递真实客户端 IP，需后端支持；入站 PROXY 头仅在绑定了安全策略的 TCP 规则上解析，且仅来自系统设置受信代理网段内的来源时采信（用于事件归因与发往上游的源地址），其余来源按直连地址处理（直连客户端无需发送 PROXY 头）；未绑定安全策略的 TCP 规则不解析 PROXY 头，伪造头原样透传上游</span>
               </el-form-item>
@@ -1004,10 +1053,12 @@
           <el-descriptions title="配置预览" :column="1" border>
             <el-descriptions-item label="规则名称">{{ wizardForm.name }}</el-descriptions-item>
             <el-descriptions-item label="协议">
-              <el-tag :type="wizardForm.protocol === 'tcp' ? 'warning' : (wizardForm.enable_tls ? 'success' : 'primary')">
-                {{ wizardForm.protocol === 'tcp' ? 'TCP' : (wizardForm.enable_tls ? 'HTTPS' : 'HTTP') }}
+              <el-tag :type="wizardForm.protocol === 'tcp' ? 'warning' : (wizardForm.protocol === 'passthrough' ? 'danger' : (wizardForm.enable_tls ? 'success' : 'primary'))">
+                {{ wizardForm.protocol === 'tcp' ? 'TCP' : (wizardForm.protocol === 'passthrough' ? 'TLS 透传' : (wizardForm.enable_tls ? 'HTTPS' : 'HTTP')) }}
               </el-tag>
             </el-descriptions-item>
+            <el-descriptions-item label="SNI 域名" v-if="wizardForm.protocol === 'passthrough'">{{ wizardForm.domain || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="透传上游" v-if="wizardForm.protocol === 'passthrough'">{{ wizardForm.passthrough_upstream || '-' }}</el-descriptions-item>
             <el-descriptions-item label="域名" v-if="wizardForm.protocol === 'http'">{{ wizardForm.domain || '-' }}</el-descriptions-item>
             <el-descriptions-item label="监听端口">{{ wizardForm.listen_port }}</el-descriptions-item>
             <el-descriptions-item label="负载策略">{{ getStrategyLabel(wizardForm.strategy) }}</el-descriptions-item>
@@ -1017,15 +1068,15 @@
             <!-- 健康检查行取自 utils/healthCheckSummary 单源：主动分支曾只打印
                  path/interval/timeout（HTTP）或探测端口（TCP），失败/恢复阈值只在
                  被动分支出现——预览自称配置核对面，改过的阈值必须同处可见。 -->
-            <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
+            <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough'">
               {{ healthCheckSummary(wizardForm) }}
             </el-descriptions-item>
-            <el-descriptions-item label="连接重试" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
+            <el-descriptions-item label="连接重试" v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough'">
               <template v-if="(wizardForm.tcp_try_duration || 0) > 0">
                 窗口 {{ wizardForm.tcp_try_duration || 0 }}ms / 间隔 {{ wizardForm.tcp_try_interval || 0 }}ms
               </template>
               <template v-else-if="(wizardForm.tcp_try_duration || 0) < 0">禁用重试（NTLM 模式）</template>
-              <template v-else>{{ wizardForm.protocol === 'tcp' ? '禁用' : '默认 5s 窗口' }}</template>
+              <template v-else>{{ wizardForm.protocol === 'http' ? '默认 5s 窗口' : '禁用' }}</template>
             </el-descriptions-item>
             <!-- 访问日志与连接重试都是高级步可编辑项：预览自称配置核对面，
                  漏项会让误配置只能保存后从单规则配置查看器发现 -->
@@ -1047,7 +1098,7 @@
             <el-descriptions-item label="强制 HTTP/1.1" v-if="wizardForm.protocol === 'http'">
               {{ wizardForm.upstream_force_http1 ? '开启' : '关闭' }}
             </el-descriptions-item>
-            <el-descriptions-item label="PROXY 协议 v2" v-if="wizardForm.protocol === 'tcp'">
+            <el-descriptions-item label="PROXY 协议 v2" v-if="wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough'">
               {{ wizardForm.tcp_proxy_protocol ? '启用' : '禁用' }}
             </el-descriptions-item>
             <el-descriptions-item label="DNS 服务器" v-if="wizardForm.protocol === 'http'">
@@ -1089,7 +1140,7 @@
             <el-descriptions-item label="状态">
               <el-tag :type="wizardForm.enabled ? 'success' : 'info'">{{ wizardForm.enabled ? '启用' : '禁用' }}</el-tag>
             </el-descriptions-item>
-            <el-descriptions-item label="上游服务器" :span="1">
+            <el-descriptions-item label="上游服务器" :span="1" v-if="wizardForm.protocol !== 'passthrough'">
               <el-table :data="wizardForm.upstreams" size="small" border>
                 <el-table-column prop="host" label="主机" />
                 <el-table-column prop="port" label="端口" width="80" />
@@ -1150,9 +1201,13 @@
           <el-descriptions-item label="域名">{{ ruleConfig.domain || '-' }}</el-descriptions-item>
           <el-descriptions-item label="端口">{{ ruleConfig.listen_port }}</el-descriptions-item>
           <el-descriptions-item label="协议">
-            <el-tag :type="ruleConfig.protocol === 'tcp' ? 'warning' : (ruleConfig.enable_tls ? 'success' : 'primary')" size="small">
-              {{ ruleConfig.protocol === 'tcp' ? 'TCP' : (ruleConfig.enable_tls ? 'HTTPS' : 'HTTP') }}
+            <el-tag :type="ruleConfig.protocol === 'tcp' ? 'warning' : (ruleConfig.protocol === 'passthrough' ? 'danger' : (ruleConfig.enable_tls ? 'success' : 'primary'))" size="small">
+              {{ ruleConfig.protocol === 'tcp' ? 'TCP' : (ruleConfig.protocol === 'passthrough' ? 'TLS 透传' : (ruleConfig.enable_tls ? 'HTTPS' : 'HTTP')) }}
             </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="透传上游" v-if="ruleConfig.protocol === 'passthrough'">
+            {{ ruleConfig.passthrough_upstream || '-' }}
+            <span class="tls-source-tag">（证书由上游管理）</span>
           </el-descriptions-item>
           <el-descriptions-item label="负载策略">{{ getStrategyLabel(ruleConfig.strategy) }}</el-descriptions-item>
           <el-descriptions-item label="动态上游">{{ ruleConfig.dynamic_dns ? '启用' : '禁用' }}</el-descriptions-item>
@@ -1179,12 +1234,12 @@
           <el-descriptions-item label="被动健康检查" v-if="!ruleConfig.enable_active_health_check">
             {{ passiveHealthCheckSummary(ruleConfig) }}
           </el-descriptions-item>
-          <el-descriptions-item label="连接重试" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
+          <el-descriptions-item label="连接重试" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp' || ruleConfig.protocol === 'passthrough'">
             <template v-if="ruleConfig.tcp_try_duration > 0">
               窗口 {{ ruleConfig.tcp_try_duration }}ms / 间隔 {{ ruleConfig.tcp_try_interval }}ms
             </template>
             <template v-else-if="ruleConfig.tcp_try_duration === -1">禁用重试（NTLM 模式）</template>
-            <template v-else>{{ ruleConfig.protocol === 'tcp' ? '禁用' : '默认 5s 窗口' }}</template>
+            <template v-else>{{ ruleConfig.protocol === 'http' ? '默认 5s 窗口' : '禁用' }}</template>
           </el-descriptions-item>
           <el-descriptions-item label="请求体大小">{{ (ruleConfig.request_body_max_size_mb || 0) > 0 ? ruleConfig.request_body_max_size_mb + 'MB' : '全局默认' }}</el-descriptions-item>
             <el-descriptions-item label="Keepalive 超时">{{ (ruleConfig.upstream_keepalive_timeout || 0) > 0 ? ruleConfig.upstream_keepalive_timeout + 's' : '全局默认' }}</el-descriptions-item>
@@ -1448,7 +1503,7 @@ import { proxyTimeoutSummary } from '@/utils/proxyTimeouts'
 import { activeHealthCheckSummary, healthCheckSummary, passiveHealthCheckSummary } from '@/utils/healthCheckSummary'
 import { activateOnce } from '@/utils/keyboardActivate'
 import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
-import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS } from '@/utils/ruleValidation'
+import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import { popperViewportSafe } from '@/utils/popper'
@@ -1463,7 +1518,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 
-interface RuleForm extends Omit<CreateRuleRequest, 'dns_family' | 'upstreams' | 'acme_config_id' | 'ca_provider_id' | 'compress_types' | 'host_header'> {
+interface RuleForm extends Omit<CreateRuleRequest, 'dns_family' | 'upstreams' | 'acme_config_id' | 'ca_provider_id' | 'compress_types' | 'host_header' | 'passthrough_upstream'> {
   dns_family: string[]
   upstreams: UpstreamInput[]
   acme_config_id?: number
@@ -1472,6 +1527,8 @@ interface RuleForm extends Omit<CreateRuleRequest, 'dns_family' | 'upstreams' | 
   enabled: boolean
   // 编辑手动证书规则时 GetRule 回传的「私钥已隐藏」标记
   tlsKeySet: boolean
+  // TLS 透传（JJC-20261112-01 S3）：SNI 上游 host:port（仅 passthrough 协议消费）
+  passthrough_upstream: string
 }
 
 interface CertificateConfig {
@@ -1534,6 +1591,8 @@ interface RuleConfigView {
   domain: string
   listen_port: number
   protocol: RuleProtocol
+  // TLS 透传上游 host:port（仅 passthrough 协议消费；非透传恒空串）
+  passthrough_upstream: string
   strategy: string
   dynamic_dns: boolean
   enable_dns_server: boolean
@@ -2362,6 +2421,8 @@ const wizardForm = reactive<RuleForm>({
   description: '',
   protocol: 'http',
   domain: '',
+  // TLS 透传（JJC-20261112-01 S3）：SNI 上游 host:port
+  passthrough_upstream: '',
   // 初值随部署 HTTP 默认口（/system/ports 异步返回后由 resetWizard/新建流程再赋值；
   // 此初值仅为挂载前的占位，出厂 80）
   listen_port: proxyPorts.value.http_port,
@@ -2476,10 +2537,32 @@ watch(() => wizardForm.enable_tls, (newVal, oldVal) => {
   }
 }, { flush: 'sync' })
 
+// 离开透传的恢复（http/tcp 共用）：透传入口曾强制改端口/清空上游列表，
+// 回转时按快照还原端口，并补回默认上游行（http/tcp 保存门要求 ≥1 启用上游）。
+const restoreAfterPassthrough = (target: 'http' | 'tcp'): void => {
+  if (wizardForm.upstreams.length === 0) {
+    const upstream = defaultUpstream(target)
+    wizardForm.upstreams.push(upstream)
+    redistributeWeight(wizardForm.upstreams, 0)
+  }
+  const defHttps = proxyPorts.value.https_port
+  if (preTcpSnapshot && wizardForm.listen_port === defHttps && preTcpSnapshot.listenPort !== defHttps) {
+    wizardForm.listen_port = preTcpSnapshot.listenPort
+    showTlsHint(`已切换为 ${target === 'tcp' ? 'TCP' : 'HTTP'}，监听端口已还原为 ${preTcpSnapshot.listenPort}`)
+  } else {
+    showTlsHint(`已切换为 ${target === 'tcp' ? 'TCP' : 'HTTP'}`)
+  }
+  if (preTcpSnapshot?.enableTls === true && target === 'http') {
+    showTlsHint('TLS 已在透传模式下关闭，如需 HTTPS 请重新开启')
+  }
+}
+
 // Watch for protocol changes to adjust defaults for TCP rules
 watch(() => wizardForm.protocol, (newVal, oldVal) => {
   if (hydratingWizard) return
-  if (newVal !== 'tcp') wizardForm.tcp_proxy_protocol = false
+  // PROXY V2 消费面：TCP 与透传（后端 buildPassthroughProxyHandler 同发射
+  // proxy_protocol v2）——其余协议开关复位
+  if (newVal !== 'tcp' && newVal !== 'passthrough') wizardForm.tcp_proxy_protocol = false
   if (newVal === 'tcp') {
     // 快照进入 TCP 前的 HTTP 态（须先于下方端口/ enable_tls 变更），供回转提示判断
     preTcpSnapshot = { listenPort: wizardForm.listen_port, enableTls: wizardForm.enable_tls }
@@ -2521,6 +2604,58 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
       if (u.protocol === 'http') u.protocol = 'tcp'
       if (u.protocol === 'https') u.protocol = 'tls'
     })
+    // 自透传回转：透传上游列表曾清空，补回默认 TCP 上游行
+    if (oldVal === 'passthrough') restoreAfterPassthrough('tcp')
+  } else if (newVal === 'passthrough') {
+    // 进入 TLS 透传（JJC-20261112-01 S3）：与后端 validatePassthroughRule 的
+    // 「携带即 400」字段清单同族清理——HTTP-only 语义字段、TLS/证书族、
+    // 代理超时七列（透传为纯字节流转发）全部弃置；上游列表清空（后端
+    // upstreams 显式携带即 400，上游走 passthrough_upstream 单值）。
+    preTcpSnapshot = { listenPort: wizardForm.listen_port, enableTls: wizardForm.enable_tls }
+    const defHttps = proxyPorts.value.https_port
+    // 第一期限制（方案决策 #9）：监听端口必须等于部署侧 HTTPS 默认口（表单只读）
+    if (wizardForm.listen_port !== defHttps) {
+      wizardForm.listen_port = defHttps
+      ElMessage.info(`已切换为 TLS 透传，监听端口跟随部署 HTTPS 默认口 ${defHttps}`)
+    }
+    wizardForm.enable_tls = false
+    // TLS/证书字段族携带即拒（Create/Update 双门同文案）：来源/材料/引用一律复位
+    wizardForm.tls_source = 'manual'
+    wizardForm.acme_config_id = 0
+    wizardForm.ca_provider_id = 0
+    wizardForm.tls_cert = ''
+    wizardForm.tls_key = ''
+    wizardForm.tls_cert_path = ''
+    wizardForm.tls_key_path = ''
+    wizardForm.tls_http_redirect = false
+    // HTTP 专属策略（cookie/chain_fallback）回落默认（与切 TCP 同格）
+    if (wizardForm.strategy === 'cookie' || wizardForm.strategy === 'chain_fallback') wizardForm.strategy = 'weighted_round_robin'
+    if (wizardForm.ntlm_compatible === 1) {
+      wizardForm.ntlm_compatible = 0
+      restoreNtlmDefaults()
+    }
+    if (wizardForm.forward_auth_enabled === 1) {
+      wizardForm.forward_auth_enabled = 0
+      wizardForm.forward_auth_upstream = ''
+    }
+    wizardForm.upstream_force_http1 = 0
+    wizardForm.custom_routes_enabled = false
+    wizardForm.path_rules = []
+    wizardForm.health_check_host = ''
+    wizardForm.dynamic_dns = false
+    wizardForm.enable_dns_server = false
+    wizardForm.dns_server = ''
+    wizardForm.enable_compress = false
+    // 代理超时七列：透传无 HTTP 响应语义，非 0 即被后端恒拒（无可见控件可关）
+    wizardForm.proxy_dial_timeout = 0
+    wizardForm.proxy_response_header_timeout = 0
+    wizardForm.proxy_read_timeout = 0
+    wizardForm.proxy_write_timeout = 0
+    wizardForm.proxy_stream_timeout = 0
+    wizardForm.proxy_flush_interval = 0
+    wizardForm.proxy_stream_close_delay = 0
+    // 上游列表清空：透传上游存 passthrough_upstream 单值列（表单字段见上游步）
+    wizardForm.upstreams = []
   } else if (newVal === 'http' && oldVal === 'tcp') {
     // 回转判断基于快照而非 userExplicitPort：编辑态（userExplicitPort=true）进 TCP 同样被
     // 无条件迁移 80/443→8080，回转不还原会保存即静默改写 DB 端口
@@ -2538,6 +2673,8 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     if (portChanged && preTcpSnapshot) notes.push(`监听端口已调整为 ${preTcpSnapshot.listenPort}`)
     if (tlsWasOn) notes.push('TLS 已在 TCP 模式下关闭，如需 HTTPS 请重新开启')
     if (notes.length > 0) showTlsHint(`已切换为 HTTP，${notes.join('；')}`)
+  } else if (newVal === 'http' && oldVal === 'passthrough') {
+    restoreAfterPassthrough('http')
   }
 }, { flush: 'sync' })
 
@@ -2629,6 +2766,13 @@ const portWarning = computed(() => {
     if (httpPorts.includes(wizardForm.listen_port) || tcpPorts.includes(wizardForm.listen_port)) {
       return `端口已被其他规则占用`
     }
+  } else if (wizardForm.protocol === 'passthrough') {
+    // 第一期限制（方案决策 #9）：透传仅 HTTPS 默认口做 SNI 分流——后端
+    // validatePassthroughRule 同判据；表单字段已只读，此门兜编辑态存量行
+    // 部署默认口变更后的错位（编辑打开即 userExplicitPort，不自动迁移）。
+    if (wizardForm.listen_port !== proxyPorts.value.https_port) {
+      return `透传规则监听端口必须为部署侧 HTTPS 默认口 ${proxyPorts.value.https_port}（当前 ${wizardForm.listen_port}）`
+    }
   }
   return ''
 })
@@ -2640,6 +2784,61 @@ const stalePortHint = computed(() => {
   const stored = wizardForm.listen_port
   if (stored === proxyPorts.value.http_port || stored === proxyPorts.value.https_port) return ''
   return `本条规则当前监听 ${stored}，与部署默认口（HTTP ${proxyPorts.value.http_port} / HTTPS ${proxyPorts.value.https_port}）不同；端口不会自动迁移，改好后点保存即按当前值生效`
+})
+
+// ── 透传行内校验（JJC-20261112-01 S3）：判据/顺序与后端 validatePassthroughRule
+// 同源（utils/ruleValidation 单源），避免「前端放行、保存 400 不允许」——
+// 后端文案原样透传，字段级错误驱动红框与提示行。 ──
+const passthroughSniTouched = ref(false)
+const passthroughUpstreamTouched = ref(false)
+
+const passthroughSniFieldError = computed(() => {
+  if (wizardForm.protocol !== 'passthrough') return ''
+  return passthroughSniError(wizardForm.domain)
+})
+
+const passthroughUpstreamFieldError = computed(() => {
+  if (wizardForm.protocol !== 'passthrough') return ''
+  return passthroughUpstreamError(wizardForm.passthrough_upstream)
+})
+
+// 保存门前三段（SNI → 上游 → 端口跟随），步进/提交门共用
+const passthroughGateError = computed(() => {
+  if (wizardForm.protocol !== 'passthrough') return ''
+  return passthroughSaveGateError({
+    domain: wizardForm.domain,
+    upstream: wizardForm.passthrough_upstream,
+    listenPort: wizardForm.listen_port,
+    httpsPort: proxyPorts.value.https_port,
+  })
+})
+
+// 冲突双门行内提示（若面板数据可得）：与后端 passthroughSNIConflict /
+// passthroughTerminateConflict 同口径——只统计启用中规则、sniDomainsOverlap
+// 保守多级覆盖、编辑态排除自身 caddy_id。面板数据不可得（列表加载失败）
+// 时静默跳过，后端保存门兜底。端口不限定与后端一致（透传恒 HTTPS 默认口）。
+const passthroughConflictWarning = computed(() => {
+  if (wizardForm.protocol !== 'passthrough') return ''
+  const sni = normalizeSNIDomain(wizardForm.domain)
+  if (sni === '' || sniDomainError(sni)) return ''
+  const excludeId = editingRule.value?.caddy_id ?? ''
+  for (const rule of rules.value) {
+    if (rule.caddy_id === excludeId || !rule.enabled) continue
+    for (const raw of (rule.domain || '').split(',')) {
+      const other = normalizeSNIDomain(raw)
+      if (other === '' || !sniDomainsOverlap(sni, other)) continue
+      if (rule.protocol === 'passthrough') {
+        if (rule.listen_port === wizardForm.listen_port) {
+          return `SNI ${other} 已被透传规则「${rule.name}」（${rule.caddy_id}）占用（同端口同 SNI/通配重叠会产生路由归属歧义，后端将拒绝保存）`
+        }
+        continue
+      }
+      if (rule.protocol === 'http') {
+        return `域名 ${other} 已由 HTTP 规则「${rule.name}」（${rule.caddy_id}）本地终结 TLS：同一域名既透传又本地终结会造成证书与流量归属歧义，后端将拒绝保存`
+      }
+    }
+  }
+  return ''
 })
 
 // 策略文案映射提取至 utils/strategyLabels（Dashboard 共用，
@@ -2778,6 +2977,7 @@ const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
   description: fullRule.description || '',
   protocol: fullRule.protocol,
   domain: fullRule.domain || '',
+  passthrough_upstream: fullRule.passthrough_upstream || '',
   listen_port: fullRule.listen_port,
   strategy: fullRule.strategy || 'weighted_round_robin',
   // 链式回退竞速参数回填（0=后端兜底默认，UI 显示默认值）
@@ -2864,6 +3064,7 @@ const buildRuleConfigView = (
   domain: rule.domain || '',
   listen_port: rule.listen_port || 0,
   protocol: rule.protocol || 'http',
+  passthrough_upstream: rule.passthrough_upstream || '',
   strategy: rule.strategy || 'weighted_round_robin',
   dynamic_dns: rule.dynamic_dns || false,
   enable_dns_server: rule.enable_dns_server || false,
@@ -2964,6 +3165,8 @@ const openWizard = async (rule?: Rule) => {
   hydratingWizard = true
   preTcpSnapshot = null
   userExplicitPort.value = false
+  passthroughSniTouched.value = false
+  passthroughUpstreamTouched.value = false
   certValidationSessionSeq++
   certValidationSeq++
   resetCertInfo()
@@ -3015,6 +3218,7 @@ const openWizard = async (rule?: Rule) => {
       description: '',
       protocol: 'http',
       domain: '',
+      passthrough_upstream: '',
       listen_port: proxyPorts.value.http_port,
       strategy: 'weighted_round_robin',
       chain_race_interval_ms: 3000,
@@ -3077,6 +3281,8 @@ const openWizard = async (rule?: Rule) => {
 const resetWizard = () => {
   preTcpSnapshot = null
   userExplicitPort.value = false
+  passthroughSniTouched.value = false
+  passthroughUpstreamTouched.value = false
   certValidationSessionSeq++
   certValidationSeq++
   resetCertInfo()
@@ -3321,6 +3527,20 @@ const nextStep = (): void => {
       ElMessage.warning('HTTP 协议必须填写域名')
       return
     }
+    // 透传保存门前置（与后端 validatePassthroughRule 同序同口径，步进即拦）
+    if (wizardForm.protocol === 'passthrough') {
+      passthroughSniTouched.value = true
+      const gate = passthroughGateError.value
+      if (gate) {
+        ElMessage.warning(gate)
+        return
+      }
+      const conflict = passthroughConflictWarning.value
+      if (conflict) {
+        ElMessage.warning(conflict)
+        return
+      }
+    }
     if (!wizardForm.listen_port) {
       ElMessage.warning('请输入监听端口')
       return
@@ -3357,6 +3577,22 @@ const nextStep = (): void => {
     return
   }
   if (currentStep.value === WIZARD_STEP.UPSTREAMS) {
+    // 透传：上游表格整组不渲染（upstreams 显式携带即后端 400），本步只拦
+    // passthrough_upstream 形状与冲突双门——上游表格族门全部跳过。
+    if (wizardForm.protocol === 'passthrough') {
+      passthroughUpstreamTouched.value = true
+      if (passthroughUpstreamFieldError.value) {
+        ElMessage.warning(passthroughUpstreamFieldError.value)
+        return
+      }
+      const conflict = passthroughConflictWarning.value
+      if (conflict) {
+        ElMessage.warning(conflict)
+        return
+      }
+      moveToAdjacentWizardStep(1)
+      return
+    }
     upstreamTouched.value = wizardForm.upstreams.map(() => true)
     // 完整性门与提交口径对齐（只检查启用行；此处 touched 已全置 true，
     // 故与红框/警告共用同一谓词）：host 与 port 缺一不放过——提交侧按
@@ -3436,6 +3672,24 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // 透传保存门前置镜像（跳步绕过 nextStep 时兜底；与后端 validatePassthroughRule
+  // 同序同口径——SNI → 上游 → 端口跟随 → 冲突双门）
+  if (wizardForm.protocol === 'passthrough') {
+    passthroughSniTouched.value = true
+    passthroughUpstreamTouched.value = true
+    const gate = passthroughGateError.value
+    if (gate) {
+      ElMessage.warning(gate)
+      saving.value = false
+      return
+    }
+    const conflict = passthroughConflictWarning.value
+    if (conflict) {
+      ElMessage.warning(conflict)
+      saving.value = false
+      return
+    }
+  }
   // TLS 步校验镜像（跳步绕过 nextStep 时提交前兜底）
   if (wizardForm.enable_tls && wizardForm.protocol === 'http') {
     // ACME 引用门同镜像——后端 validateRuleACMEReferences 在
@@ -3462,7 +3716,8 @@ const submitWizard = async () => {
       return
     }
   }
-  if (wizardForm.upstreams.length === 0) {
+  // 上游列表族门仅非透传协议（透传 upstreams 恒空——后端显式携带即 400）
+  if (wizardForm.protocol !== 'passthrough' && wizardForm.upstreams.length === 0) {
     ElMessage.warning('请至少添加一个上游服务器')
     saving.value = false
     return
@@ -3477,7 +3732,7 @@ const submitWizard = async () => {
   // 剔除，保存「成功」但规则少了上游）。touched 全置与步进门口径对齐，
   // 同时让红框标出待补行。
   upstreamTouched.value = wizardForm.upstreams.map(() => true)
-  if (wizardForm.upstreams.some((u, i) => upstreamRowInvalid(u, i))) {
+  if (wizardForm.protocol !== 'passthrough' && wizardForm.upstreams.some((u, i) => upstreamRowInvalid(u, i))) {
     ElMessage.warning(upstreamFieldWarning.value || '请填写所有已启用上游服务器的主机地址与端口')
     saving.value = false
     return
@@ -3499,7 +3754,7 @@ const submitWizard = async () => {
     }
   }
 
-  const upstreamError = validateEnabledUpstreams()
+  const upstreamError = wizardForm.protocol === 'passthrough' ? '' : validateEnabledUpstreams()
   if (upstreamError) {
     ElMessage.warning(upstreamError)
     saving.value = false
@@ -3688,6 +3943,9 @@ const submitWizard = async () => {
       protocol: wizardForm.protocol,
       domain: wizardForm.domain,
       listen_port: wizardForm.listen_port,
+      // TLS 透传（JJC-20261112-01 S3）：SNI 上游 host:port——非透传协议收敛为
+      // 空串（后端防脏门：非透传携带非空值 400），透传回传 trim 后值
+      passthrough_upstream: wizardForm.protocol === 'passthrough' ? wizardForm.passthrough_upstream.trim() : '',
       strategy: wizardForm.strategy,
       // 链式回退竞速参数（非 chain 策略时后端忽略；0 值后端兜底默认）
       chain_race_interval_ms: wizardForm.chain_race_interval_ms,
@@ -3703,20 +3961,23 @@ const submitWizard = async () => {
       health_check_unhealthy_threshold: wizardForm.health_check_unhealthy_threshold,
       enable_active_health_check: wizardForm.enable_active_health_check,
       tcp_health_check_port: wizardForm.tcp_health_check_port || 0,
-      tcp_proxy_protocol: wizardForm.protocol === 'tcp' && wizardForm.tcp_proxy_protocol,
+      tcp_proxy_protocol: (wizardForm.protocol === 'tcp' || wizardForm.protocol === 'passthrough') && wizardForm.tcp_proxy_protocol,
       tcp_try_duration: wizardForm.tcp_try_duration || 0,
       tcp_try_interval: wizardForm.tcp_try_interval ?? 250,
       health_check_host: wizardForm.health_check_host || '',
-      upstreams: validUpstreams,
-      enable_tls: wizardForm.enable_tls,
-      tls_source: wizardForm.tls_source,
-      acme_config_id: wizardForm.acme_config_id || 0,
-      ca_provider_id: Number(wizardForm.ca_provider_id || 0),
-      tls_cert: wizardForm.tls_source === 'manual' ? wizardForm.tls_cert : '',
-      tls_key: wizardForm.tls_source === 'manual' ? wizardForm.tls_key : '',
+      // 透传上游存 passthrough_upstream 单值列：upstreams 显式携带即后端 400
+      upstreams: wizardForm.protocol === 'passthrough' ? [] : validUpstreams,
+      // 透传：TLS/证书字段族携带即后端 400（Create/Update 双门）——载荷按协议
+      // 收敛为空值/0/manual，防协议切换或表单残留的 stale 值外泄
+      enable_tls: wizardForm.protocol === 'passthrough' ? false : wizardForm.enable_tls,
+      tls_source: wizardForm.protocol === 'passthrough' ? 'manual' : wizardForm.tls_source,
+      acme_config_id: wizardForm.protocol === 'passthrough' ? 0 : (wizardForm.acme_config_id || 0),
+      ca_provider_id: wizardForm.protocol === 'passthrough' ? 0 : Number(wizardForm.ca_provider_id || 0),
+      tls_cert: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'manual' ? wizardForm.tls_cert : '',
+      tls_key: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'manual' ? wizardForm.tls_key : '',
       // 引用文件模式：提交两个路径；其余来源清空（后端亦按形态互为清空）
-      tls_cert_path: wizardForm.tls_source === 'file' ? wizardForm.tls_cert_path.trim() : '',
-      tls_key_path: wizardForm.tls_source === 'file' ? wizardForm.tls_key_path.trim() : '',
+      tls_cert_path: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'file' ? wizardForm.tls_cert_path.trim() : '',
+      tls_key_path: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'file' ? wizardForm.tls_key_path.trim() : '',
       tls_http_redirect: wizardForm.tls_http_redirect,
       enable_compress: wizardForm.enable_compress,
       compress_types: wizardForm.compress_types.join(',') || 'gzip',
@@ -3831,6 +4092,11 @@ const flowDialogModel = ref<RuleStageModel | null>(null)
 
 
 const upstreamSummaryForRule = (rule: Rule): string => {
+  // 透传规则上游是 passthrough_upstream 单值列（upstreams 表零行）——
+  // 「N 个上游」计数口径不适用
+  if (rule.protocol === 'passthrough') {
+    return rule.passthrough_upstream ? `透传上游 ${rule.passthrough_upstream}` : '透传上游未配置'
+  }
   const count = getEnabledUpstreams(rule).length
   const health = healthStatus.value[rule.caddy_id]
   if (health && health.total > 0) return `${count} 个上游 · 健康 ${health.healthy}/${health.total}`
@@ -3988,6 +4254,8 @@ const openCopyWizard = async (rule: Rule) => {
   hydratingWizard = true
   preTcpSnapshot = null
   userExplicitPort.value = false
+  passthroughSniTouched.value = false
+  passthroughUpstreamTouched.value = false
   certValidationSessionSeq++
   certValidationSeq++
   resetCertInfo()

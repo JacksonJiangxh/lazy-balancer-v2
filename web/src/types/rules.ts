@@ -1,4 +1,6 @@
-export type RuleProtocol = 'http' | 'tcp'
+// passthrough（TLS 透传，JJC-20261112-01）：第三规则类型——Layer4 按 ClientHello
+// 的 SNI 分流，透传域名转发 passthrough_upstream（上游自带证书终结 TLS）。
+export type RuleProtocol = 'http' | 'tcp' | 'passthrough'
 export type UpstreamProtocol = 'http' | 'https' | 'tcp' | 'tls'
 
 export interface Upstream {
@@ -111,6 +113,9 @@ export interface Rule extends ProxyTimeoutConfig {
   host_header: string
   // 健康检查域名：主动健康检查 probe 的 Host 头；空=跟随 host_header
   health_check_host?: string
+  // TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
+  // 仅 passthrough 协议消费；非透传行恒空串（后端写侧拒绝携带）。
+  passthrough_upstream: string
   upstreams: Upstream[] | null
   enable_tls: boolean
   tls_source: string
@@ -181,6 +186,10 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   path_rules: PathRule[]
   host_header: string
   health_check_host?: string
+  // TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
+  // 非 passthrough 协议显式携带非空值由保存门 400（防脏数据）；透传规则
+  // upstreams 上游列表显式携带即 400（上游存本单值列）。
+  passthrough_upstream: string
   upstreams: UpstreamInput[]
   enable_tls: boolean
   tls_source: string
@@ -215,7 +224,8 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   | keyof ProxyTimeoutConfig
   | 'path_rules'
   | 'ca_provider_id'
-  | 'host_header'> {
+  | 'host_header'
+  | 'passthrough_upstream'> {
   // host_header 可选（2026-10-10 向导退役后端域名配置项）：省略=保留原值（后端 *string 合并语义）
   host_header?: string
   request_body_max_size_mb?: number
@@ -242,6 +252,10 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   proxy_stream_close_delay?: number
   path_rules?: PathRule[]
   ca_provider_id?: number
+  // TLS 透传上游指针三态（与后端 *string 合并语义同构）：省略=保留存量；
+  // 显式空串=清空（透传规则清空会因必填门 400）；非透传协议显式携带非空值
+  // 由保存门 400。前端透传表单恒显式回传 trim 后值。
+  passthrough_upstream?: string
   enabled: boolean
   // 乐观并发前置条件：编辑向导回传打开时的 updated_at；省略=不校验。
   expected_updated_at?: string
