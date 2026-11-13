@@ -59,3 +59,18 @@
 ## 体系切换说明（2026-11-12）
 - 台账目录由 `.npc-teams/tasks/` 切换为 `.agent_team/`（当前 agent 架构约定：项目根 `.agent_team/`，不预建、需要留痕才建）。
 - 历史档案不迁移：`.npc-teams/tasks/` 四份已交付档案 + casebook 原样保留，作为体系演进记录。
+
+## JJC-20261112-001 · S4-b 施工记录（2026-11-13，兵部）
+- 分支 `feat/JJC-20261112-01-tls-passthrough`，基线 S4-a f5f9777e；落地 `caddygeoip/caddy_passthrough_decode_test.go`（三测试：layer4RoutesDecode / httpListenerWrappersDecode / fixtureProvenance）。
+- **两棒接力说明**：第一棒写测试 24.3KB 时被切断（文件已完整落盘、未提交）；第二棒接手做判别力自证 + 全回归 + 台账收口 + 提交，未改测试语义。
+- **解码降级决策（一句）**：tls listener wrapper 真实解码（caddyhttp 包 init 注册，LoadModuleByID 与 caddy load 同一条模块表查找路）；proxy_protocol wrapper 与 layer4.matchers.tls / layer4.handlers.proxy 系因注册包（caddyhttp/proxyprotocol、mholt/caddy-l4）在本模块依赖树未被 import（引入会增 go.mod/go.sum 条目，不在白名单）降级为结构断言，断言键即真实解码的分派键（"wrapper"/"handler"/matcher 短名），改名即红。
+- **判别力自证**：备份后变异 `"handler": "proxy"`→`"proxyx"`（1 处）→ `TestCaddyPassthroughDecodeChain_layer4RoutesDecode` 红（`route[0] handler="proxyx", want proxy`）；还原 diff 逐字一致（RESTORED_IDENTICAL）→ `-count=1` 重跑全绿。
+- **全回归矩阵**：
+  - `go build ./... && go vet ./...` → BUILD_VET_OK；
+  - `scripts/gate.sh` → GATE: PASS；
+  - `npx vue-tsc --noEmit` → EXIT=0（无输出）；`npm test` → 1622/1622 全绿；
+  - `go test ./internal/...` FAIL 集合 = 基线 4 项逐条一致（TestCaddyProcessControlAllowedOutsideImportWindow / TestGetClusterWafFiles_409DuringImportWindow / TestApplySnapshot_ruleLogCleanupFailureDoesNotFailSync / TestTaskLogsHousekeeping_countsMetadataFailures）；
+  - 四项自研钉测 `ChainFallback|UpstreamHost|ReferencedCert|DefaultPort|StaticResponse`：internal/services 侧全 PASS（caddychain 系独立 go.mod 模块，主模块引用报 setup failed 属模块边界非回归；其测试命名不同，模块内全量 `go test ./...` ok）；
+  - `git diff main..HEAD --stat -- Dockerfile scripts/` 空输出 → DOCKERFILE_SCRIPTS_CLEAN。
+- **S0→S4 全阶段小结一行链**：S0 spike 五项 CONFIRMED → S1-a 51b44388 → S1-b f27e5579 → S3 5df4685f → S4-a f5f9777e → S4-b 本提交。遗留：真实公网 ACME 待部署实测（低风险）。
+- 遗留（follow-up）：`internal/services/zz_tmp_pt_fixture_gen_test.go`（fixture 生成临时文件，untracked，env 未设时 skip）仍留在工作区未删——删除需授权，待裁定；`.agent_team/spike/` 入库与否沿用 S4-a 待裁定项。
