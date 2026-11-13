@@ -2142,7 +2142,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	       COALESCE(host_header,''), COALESCE(health_check_host,''),
 	       COALESCE(forward_auth_enabled,0), COALESCE(forward_auth_upstream,''), COALESCE(forward_auth_uri,''), COALESCE(forward_auth_copy_headers,''),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
-		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0)
+		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
+		       COALESCE(passthrough_upstream,'')
 		FROM lb_rules WHERE enabled = 1
 		ORDER BY rowid
 	`)
@@ -2163,7 +2164,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS, &r.HostHeader, &r.HealthCheckHost,
 			&r.ForwardAuthEnabled, &r.ForwardAuthUpstream, &r.ForwardAuthURI, &r.ForwardAuthCopyHeaders, &r.LogEnabled,
 			&r.CustomRoutesEnabled, &r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout,
-			&r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay)
+			&r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
+			&r.PassthroughUpstream)
 
 		if err != nil {
 			closeErr := rows.Close()
@@ -2481,6 +2483,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 
 	httpServersByPort := make(map[int][]ruleWithUpstreams)
 	tcpServersByPort := make(map[int][]ruleWithUpstreams)
+	// 透传规则按监听口分组（JJC-20261112-01 S1-b）：仅用于「该端口是否需要
+	// Layer4 前置 + HTTP server 监听迁移」的端口级判定与 SNI 集合聚合。
+	// 空 map = 全库无透传规则 = 渲染产物与改造前逐字节一致（R5）。
+	// 详见 docs/fork-notes/render-chain.md §29
+	passthroughRulesByPort := make(map[int][]ruleWithUpstreams)
 	// 发布集与按端口分组在同一遍历内收集（allRules/rowid 序）——此前在
 	// logger_names 构建处再由 httpServersByPort（map 遍历）重建：多一次全量
 	// 拷贝，且顺序来源依赖 map。消费面（按端口分组 + map 键）当前不依赖
@@ -2491,10 +2498,28 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		r := ru.rule
 		ups := ru.upstreams
 
-		// 同族收敛：全量路径与单规则路径共用 http/tcp 白名单，
+		// 同族收敛：全量路径与单规则路径共用 http/tcp/passthrough 白名单，
 		// 带外 https/udp 等脏值不得被静默暴露成原始 TCP 代理。
-		if r.Protocol != "http" && r.Protocol != "tcp" {
+		// passthrough（JJC-20261112-01 S1-b）：Layer4 SNI 分流规则，独立分组
+		// （不并入 tcpServersByPort——后者语义是整端口字节流转发，且带「同端口
+		// 多规则即全部跳过」的互斥约束）。
+		if r.Protocol != "http" && r.Protocol != "tcp" && r.Protocol != "passthrough" {
 			return generationFailure("rule %s: unsupported protocol: %s", r.CaddyID, r.Protocol)
+		}
+
+		// 透传规则的上游是 passthrough_upstream 单值列（upstreams 表零行）——
+		// 「零启用上游即跳过」的发布谓词不适用，改由本族判空（渲染所需数据
+		// 完整性最后一道门；保存门已 400，带外脏行在此 fail-closed 跳过而非
+		// 拖垮整份配置）。
+		if r.Protocol == "passthrough" {
+			if strings.TrimSpace(r.PassthroughUpstream) == "" {
+				Logf("warn", "透传规则 %s 缺少 passthrough_upstream（上游 host:port），已跳过该规则（不影响同端口其他规则）", r.CaddyID)
+				continue
+			}
+			httpServersByPort[r.ListenPort] = append(httpServersByPort[r.ListenPort], ru)
+			// 透传规则不产生 HTTP 路由与 logger：不进 publishedHTTPRules。
+			passthroughRulesByPort[r.ListenPort] = append(passthroughRulesByPort[r.ListenPort], ru)
+			continue
 		}
 
 		// dial 值零消费(仅判空)——改计数器,免每启用
@@ -2539,6 +2564,16 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		server := map[string]interface{}{
 			"listen": []string{fmt.Sprintf(":%d", port)},
 		}
+		// 该端口存在透传规则 → Layer4 前置接管公网 TCP 口，本 HTTP server
+		// 退到内部回环口（PROXY v2 由 Layer4 兜底注入、wrapper 在此剥除还原），
+		// UDP 仍留公网口（HTTP/3 不经 Layer4）。无透传规则的端口走上方原形态，
+		// 逐字节不变（R5）；listener_wrappers 的 servers 挂载键必须与实际
+		// listen 地址逐字一致（spike T-5 实证：否则 wrapper 静默不生效）。
+		// 详见 docs/fork-notes/render-chain.md §29
+		portHasPassthrough := len(passthroughRulesByPort[port]) > 0
+		if portHasPassthrough {
+			server["listen"] = []string{internalTerminateListenAddr(), fmt.Sprintf("udp/:%d", port)}
+		}
 		if err := applyTimeouts(server); err != nil {
 			return generationFailure("%v", err)
 		}
@@ -2548,6 +2583,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		for _, ru := range rules {
 			r := ru.rule
 			ups := ru.upstreams
+
+			// 透传规则本端口只贡献 Layer4 前置与监听迁移，不产 HTTP 路由
+			// （其流量按 SNI 在上游终结，永不进本 server）。
+			if r.Protocol == "passthrough" {
+				continue
+			}
 
 			ruleConfig := SingleRuleConfig{
 				CaddyID:                        r.CaddyID,
@@ -2641,6 +2682,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		emittedSynthetic := make(map[string]struct{})
 		for _, ru := range rules {
 			r := ru.rule
+			// 透传规则无 HTTP 语义（拦截页/限流归因路由都挂在 HTTP server 的
+			// errors 段，透传流量永不进本 server）——不发射归因路由。
+			if r.Protocol == "passthrough" {
+				continue
+			}
 			// nil 上下文门必须在两个拦截页构建器之前——二者内部直接
 			// 解引用 securityCtx.blockPageByID（policiesForRule 虽支持 nil，但
 			// 页面查找不支持）。当前生产路径 loadSecurityPolicyContext 失败即
@@ -2681,6 +2727,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		var tlsPolicies []interface{}
 		for _, ru := range rules {
 			r := ru.rule
+			// 透传域名证书由上游管理（本系统不申请/不续期/不监控）：本 server
+			// 不为透传规则建立 TLS 连接策略——其 SNI 在 Layer4 已被分走。
+			if r.Protocol == "passthrough" {
+				continue
+			}
 			if _, hasCert := availableCerts[r.CaddyID]; hasCert {
 				domainHosts := splitAndTrim(r.Domain)
 				tlsPolicies = append(tlsPolicies, map[string]interface{}{
@@ -2706,6 +2757,24 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		// HTTP→HTTPS 跳转完全由项目自有 redirectRoutes 管理(TLSHTTPRedirect,
 		// 覆盖任意端口,含证书就绪复核与遮蔽检查),引擎侧整体关闭。
 		server["automatic_https"] = map[string]interface{}{"disable": true}
+
+		// 入站 PROXY 头还原（JJC-20261112-01 S1-b）：本端口已由 Layer4 前置
+		// 接管，兜底 route 注入 PROXY v2 携带真实源 IP；此处由原生
+		// caddy.listeners.proxy_protocol 在 **TLS 握手之前** 剥除并改写对端
+		// （顺序不可颠倒——tls 之后 wrapper 拿到的已是加密流）。
+		// allow 只信 127.0.0.1/32：7443 仅绑回环，唯一合法来源是 Layer4 出站，
+		// 外部伪造头在解析阶段即被 fallback_policy reject 关闭（spike T-5 断言 B/D）。
+		// 详见 docs/fork-notes/render-chain.md §29
+		if portHasPassthrough {
+			server["listener_wrappers"] = []interface{}{
+				map[string]interface{}{
+					"wrapper": "proxy_protocol",
+					"allow":   []string{"127.0.0.1/32"},
+					"fallback_policy": "reject",
+				},
+				map[string]interface{}{"wrapper": "tls"},
+			}
+		}
 
 		servers[fmt.Sprintf("http_%d", port)] = server
 	}
@@ -2922,6 +2991,33 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			return generationFailure("build TCP server for rule %s: %v", ruleConfig.CaddyID, tcpErr)
 		}
 		layer4Servers[fmt.Sprintf("tcp_%d", port)] = tcpServer
+	}
+
+	// Layer4 SNI 分流（JJC-20261112-01 S1-b）：按端口插入透传前置。
+	// 端口集合来自 passthroughRulesByPort——空集合即整个循环零迭代，
+	// servers/apps layer4 段与改造前逐字节一致（R5 红线）。
+	// 详见 docs/fork-notes/render-chain.md §29
+	//
+	// 与 TCP 分支的关键差异：透传**允许多规则同端口**（每条规则一个 SNI 或
+	// 通配 SNI，聚合进同一 matchers 集合），这正是 SNI 分流的语义；TCP 的
+	// 「同端口唯一规则」互斥约束不适用。
+	passthroughPorts := make([]int, 0, len(passthroughRulesByPort))
+	for port := range passthroughRulesByPort {
+		passthroughPorts = append(passthroughPorts, port)
+	}
+	sort.Ints(passthroughPorts)
+	for _, port := range passthroughPorts {
+		// 与同端口 TCP 规则的端口归属冲突在保存/启用门已拦（协议互斥）；
+		// 带外脏数据两族同时存在时 Layer4 server 名不同但 listen 同口，Caddy
+		// 会整份拒绝——显性报错而非静默取一。
+		if _, clash := layer4Servers[fmt.Sprintf("tcp_%d", port)]; clash {
+			return generationFailure("端口 %d 同时存在 tcp 与 passthrough 规则——Layer4 端口归属互斥，请调整其一", port)
+		}
+		server, err := buildPassthroughLayer4Server(port, passthroughRulesByPort[port])
+		if err != nil {
+			return generationFailure("%v", err)
+		}
+		layer4Servers[fmt.Sprintf("tls_%d", port)] = server
 	}
 
 	// httpDefaultPort/httpDefaultServer 是兜底站与 HTTP→HTTPS 跳转的落点（随 HTTP_PORT 变）。
@@ -4302,6 +4398,10 @@ type lbRule struct {
 	HostHeader                 string
 	HealthCheckHost            string
 	LogEnabled                 bool
+	// TLS 透传上游（JJC-20261112-01 S1-b）：passthrough_upstream 单值列
+	// （host:port 原样字符串，仅在 protocol=passthrough 时被 Layer4 渲染消费）。
+	// 详见 docs/fork-notes/render-chain.md §29
+	PassthroughUpstream string
 }
 
 // upstream 启用上游行（upstreams 表视图）；OriginDomain 为三级回退第一档。
@@ -5804,4 +5904,171 @@ func buildTCPServer(rule SingleRuleConfig, securityCtxs ...*tcpSecurityRenderInp
 		"listen": []string{fmt.Sprintf(":%d", rule.ListenPort)},
 		"routes": routes,
 	}, nil
+}
+
+// internalTerminatePort 是 Layer4 前置之后的本地终结口（第一期固定 7443，
+// 仅绑 127.0.0.1，不随 HTTP_PORT/HTTPS_PORT env 变）。方案决策 #9：
+// 固定值让「外部直连内网终结口」的绕过面恒为回环一处（spike T-5 断言 C/D
+// 实证：绑 :7443 存在绕过面，绑 127.0.0.1:7443 即收口）。
+// 详见 docs/fork-notes/render-chain.md §29
+const internalTerminatePort = 7443
+
+// internalTerminateAddr 是内部终结口的 host:port 形态（servers 挂载键、
+// Layer4 兜底 dial、HTTP listen 三处必须逐字一致——spike T-5 实证的三元要点）。
+func internalTerminateAddr() string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(internalTerminatePort))
+}
+
+// internalTerminateListenAddr 是 HTTP server 的 tcp/ 前缀监听地址形态
+// （Caddy listen 用 `tcp/host:port` 区分网络；UDP 同口另列保留给 HTTP/3）。
+func internalTerminateListenAddr() string {
+	return "tcp/" + internalTerminateAddr()
+}
+
+// buildPassthroughLayer4Server 渲染单个透传端口的 Layer4 server（tls_<port>）。
+//
+// 形态（与 spike T-1/T-5 实测通过的 Caddyfile 同构）：
+//
+//	listen :<port>
+//	route[0]  match {tls:{sni:[聚合 SNI 集合]}} → proxy <上游 dial>[ + proxy_protocol v2 + health_checks]
+//	route[1]  （无 match 兜底）→ proxy 127.0.0.1:7443 { proxy_protocol v2 }
+//
+// 路由顺序是语义的一部分：SNI 命中先匹配，其余（含 ACME TLS-ALPN-01 挑战、
+// 本地终结域名）落兜底经 PROXY v2 进 7443 的 Caddy TLS 栈——证书/ACME 链路
+// 因此零改动（spike T-1 真实签发验证）。
+//
+// 聚合口径：多条规则 → 多个 route（每条一个 matcher 集合 + 自己的上游与
+// 健康检查参数）。不合并成单 route 多 matcher，因为上游 dial 与
+// proxy_protocol/健康检查都是规则级参数，合并会丢失映射关系。
+func buildPassthroughLayer4Server(port int, rules []ruleWithUpstreams) (map[string]interface{}, error) {
+	routes := make([]interface{}, 0, len(rules)+1)
+	for _, ru := range rules {
+		r := ru.rule
+		// 保存门已保证单域名且形状合法（validateSNIDomain）；此处按 SNI
+		// 匹配口径归一（小写，去首尾空白），与 HTTP 侧 matcher 同源。
+		sni := normalizeHostForMatcher(r.Domain)
+		if sni == "" {
+			return nil, fmt.Errorf("规则 %s：透传 SNI 域名为空，无法渲染 Layer4 matcher", r.CaddyID)
+		}
+		upstreamAddr, err := passthroughDialAddress(r.PassthroughUpstream)
+		if err != nil {
+			return nil, fmt.Errorf("规则 %s：%v", r.CaddyID, err)
+		}
+		proxyHandler, err := buildPassthroughProxyHandler(r, upstreamAddr)
+		if err != nil {
+			return nil, err
+		}
+		routes = append(routes, map[string]interface{}{
+			"@id": r.CaddyID,
+			"match": []interface{}{
+				map[string]interface{}{
+					"tls": map[string]interface{}{
+						"sni": []string{sni},
+					},
+				},
+			},
+			"handle": []interface{}{proxyHandler},
+		})
+	}
+	// 兜底：本地终结（+ ACME 挑战）全部经 7443，注入 PROXY v2 承载真实源 IP。
+	// 无 match 键 = 恒匹配，必须排在全部 SNI 路由之后。
+	fallbackProxy := map[string]interface{}{
+		"handler": "proxy",
+		"upstreams": []interface{}{
+			map[string]interface{}{"dial": []string{internalTerminateAddr()}},
+		},
+		"proxy_protocol": "v2",
+	}
+	routes = append(routes, map[string]interface{}{
+		"handle": []interface{}{fallbackProxy},
+	})
+	return map[string]interface{}{
+		"listen": []string{fmt.Sprintf(":%d", port)},
+		"routes": routes,
+	}, nil
+}
+
+// passthroughDialAddress 把 passthrough_upstream（host:port 原样字符串）
+// 归一为 dial 形态。用 net.SplitHostPort/net.JoinHostPort 往返而不是字符串
+// 直通：IPv6 字面量在库里可能存为 `::1:10443`（无方括号）或 `[::1]:10443`，
+// 统一产出 bracket 形态（`[::1]:10443`）——与 joinUpstreamAddress 同口径，
+// 避免 Caddy 端 dial 解析歧义。
+func passthroughDialAddress(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("透传上游地址为空（passthrough_upstream）")
+	}
+	host, portText, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("透传上游地址 %q 无效：须为 host:port 形态（%v）", trimmed, err)
+	}
+	port, convErr := strconv.Atoi(portText)
+	if convErr != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("透传上游地址 %q 的端口无效（须为 1-65535 的整数）", trimmed)
+	}
+	if strings.TrimSpace(host) == "" {
+		return "", fmt.Errorf("透传上游地址 %q 的主机部分为空", trimmed)
+	}
+	return net.JoinHostPort(strings.TrimSpace(host), strconv.Itoa(port)), nil
+}
+
+// buildPassthroughProxyHandler 渲染单条透传规则的 layer4 proxy handler。
+//
+// 与 buildTCPProxyHandler 的差异（有意不共用）：透传上游是单值（无权重/无
+// 多上游选择），故不发射 load_balancing；但复用其「TCP 透传字段语义」：
+// tcp_proxy_protocol → proxy_protocol: v2（上游侧 PROXY 头）、
+// 健康检查族 → health_checks（active 为 TCP 连接探测，方案决策 #6）。
+func buildPassthroughProxyHandler(r lbRule, upstreamAddr string) (map[string]interface{}, error) {
+	handler := map[string]interface{}{
+		"handler": "proxy",
+		"upstreams": []interface{}{
+			map[string]interface{}{"dial": []string{upstreamAddr}},
+		},
+	}
+	if r.TCPProxyProtocol {
+		handler["proxy_protocol"] = "v2"
+	}
+	// 重试窗口（复用 tcp_try_* 语义，与 buildTCPProxyHandler 同口径）：
+	// 0 = 不重试（不发射）；>0 时 tcp_try_interval 为类型①值型列直读。
+	if r.TCPTryDuration > 0 {
+		if r.TCPTryInterval <= 0 {
+			return nil, fmt.Errorf("规则 %s 重试间隔无效（tcp_try_interval=%d <=0，重试窗口 >0 时为必填值）", r.CaddyID, r.TCPTryInterval)
+		}
+		// 单上游无「换一台重试」语义，try_duration 对 layer4 proxy 仍是
+		// 连接级重试窗口——与 TCP 路径同参数，保持运维口径一致。
+		handler["load_balancing"] = map[string]interface{}{
+			"try_duration": fmt.Sprintf("%dms", r.TCPTryDuration),
+			"try_interval": fmt.Sprintf("%dms", r.TCPTryInterval),
+		}
+	}
+	// 健康检查族：与 TCP 路径同一单源 healthCheckCore（边界/文案同源）。
+	hc, err := healthCheckCore(SingleRuleConfig{
+		CaddyID:                       r.CaddyID,
+		HealthCheckInterval:           r.HealthCheckInterval,
+		HealthCheckTimeout:            r.HealthCheckTimeout,
+		HealthCheckUnhealthyThreshold: r.HealthCheckUnhealthyThreshold,
+		HealthCheckHealthyThreshold:   r.HealthCheckHealthyThreshold,
+		EnableActiveHealthCheck:       r.EnableActiveHealthCheck,
+		TCPHealthCheckPort:            r.TCPHealthCheckPort,
+	})
+	if err != nil {
+		return nil, err
+	}
+	healthChecks := map[string]interface{}{
+		"passive": passiveHealthCheck(hc.interval, hc.failing),
+	}
+	if r.EnableActiveHealthCheck {
+		active := map[string]interface{}{
+			"interval": fmt.Sprintf("%ds", hc.interval),
+			"timeout":  fmt.Sprintf("%ds", hc.timeout),
+			"rise":     hc.passes,
+			"fall":     hc.failing,
+		}
+		if r.TCPHealthCheckPort > 0 {
+			active["port"] = r.TCPHealthCheckPort
+		}
+		healthChecks["active"] = active
+	}
+	handler["health_checks"] = healthChecks
+	return handler, nil
 }

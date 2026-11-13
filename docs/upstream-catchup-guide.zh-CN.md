@@ -301,6 +301,21 @@ git show <新tag>:Dockerfile | grep -nE '^COPY (web/dist|dist|build)/'
 修复：恢复阶段 + 恢复 `.dockerignore` 放行（一条 revert 可回）。
 **教训**：`gate.sh` 的 7 模块 build 只覆盖 Go，**不覆盖镜像构建链**——所以 A 组验收全绿也拦不住它。
 
+### B.7 TLS 透传追平注意事项（`protocol='passthrough'` · Layer4 SNI 分流）★ 2026-11-13 新增
+
+**编译产物要素（渲染依赖，追平新上游时核对仍在）**：① `Dockerfile` 的
+`--with github.com/mholt/caddy-l4@<ver>` 行（Layer4 + `matchers.tls.sni`）；
+② Caddy 原生 `modules/caddyhttp/proxyprotocol`（listener wrapper 还原 PROXY v2 源 IP）。
+
+**语法语义变动即重验**：上游 Caddy 升级若改动 `layer4` 全局选项块语法或
+`matchers.tls.sni` 字段语义 → 重验 spike（`.agent_team/spike/` 五项可复用）。
+
+**机械判据**（防复发约束全文见自研登记第 5 项）：
+```bash
+grep -c 'caddy-l4' Dockerfile                                # ≥ 1
+grep -rn 'func validatePassthroughRule' internal/handlers/   # 命中 rule_features.go
+```
+
 ## 十一、验证门命令清单（附录 C）
 
 ### C.1 机械门

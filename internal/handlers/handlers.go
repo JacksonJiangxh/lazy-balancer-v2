@@ -986,8 +986,11 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		data.CompressTypes = "gzip"
 	}
 
-	if data.Protocol != "http" && data.Protocol != "tcp" {
-		return fmt.Errorf("无效的协议：仅支持 http 或 tcp")
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 成为合法第三值（保存链）。
+	// TODO(S1-b)：caddy.go 渲染侧同类白名单仍只放行 http/tcp，渲染接线由 S1-b
+	// 承担；本阶段透传规则恒禁用态保存（rules.go 保存入口门）。
+	if data.Protocol != "http" && data.Protocol != "tcp" && data.Protocol != "passthrough" {
+		return fmt.Errorf("无效的协议：仅支持 http、tcp 或 passthrough")
 	}
 
 	// host_header 直写 reverse_proxy 头部——CRLF/控制字符可注入额外
@@ -1027,13 +1030,22 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		}
 	}
 
-	enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true)
-	if err != nil {
-		return err
-	}
+	// TLS 透传（S1-a）：透传上游由 passthrough_upstream 单值配置（Layer4 字节流
+	// 转发，S1-b 渲染消费）——upstreams 表零行，显式携带即 400（防脏数据随
+	// 导出/快照放大）；上游形状校验由 validatePassthroughRule 单源承担。
+	if data.Protocol == "passthrough" {
+		if len(data.Upstreams) > 0 {
+			return fmt.Errorf("透传规则的上游由 passthrough_upstream 字段配置，不支持 upstreams 上游列表")
+		}
+	} else {
+		enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true)
+		if err != nil {
+			return err
+		}
 
-	if data.DynamicDNS && enabledUpstreamCount > 1 {
-		return fmt.Errorf("动态 DNS 模式仅支持一个启用的上游（DNS 会解析出多个 IP）")
+		if data.DynamicDNS && enabledUpstreamCount > 1 {
+			return fmt.Errorf("动态 DNS 模式仅支持一个启用的上游（DNS 会解析出多个 IP）")
+		}
 	}
 	// dns_family 是「开关 + 值」的一体配置面：值域门不随 dynamic_dns 关闭而
 	// 失效——关闭态落库的非法枚举渲染零消费，却会随导出/备份/集群快照放大，

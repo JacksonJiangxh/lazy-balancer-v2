@@ -96,6 +96,8 @@ var lbRuleColumnSpecs = []lbRuleColumnSpec{
 	{"block_page_stage1_status", "COALESCE(block_page_stage1_status,0)"},
 	{"block_page_stage3_id", "COALESCE(block_page_stage3_id,0)"},
 	{"block_page_stage3_status", "COALESCE(block_page_stage3_status,0)"},
+	// TLS 透传（JJC-20261112-01 S1-a）：Create/Duplicate/镜像/快照四路同源。
+	{"passthrough_upstream", "COALESCE(passthrough_upstream,'')"},
 }
 
 // lbRuleWriteColumns 返回规则写侧全量列清单（规范序，含 id 与审计四列）。
@@ -280,6 +282,8 @@ func lbRuleWriteValue(rule *models.LbRule, column string) any {
 		return rule.BlockPageStage3ID
 	case "block_page_stage3_status":
 		return rule.BlockPageStage3Status
+	case "passthrough_upstream":
+		return rule.PassthroughUpstream
 	}
 	panic("lbRuleWriteValue: 未知列 " + column)
 }

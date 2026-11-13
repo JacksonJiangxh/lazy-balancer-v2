@@ -59,6 +59,12 @@ type ruleFeatureInput struct {
 	// 链式回退竞速参数（strategy=chain_fallback 时参与范围校验）。
 	ChainRaceIntervalMS   int
 	ChainRequestTimeoutMS int
+	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port，
+	// 由 validatePassthroughRule 消费（非 passthrough 协议非空即 400）。
+	PassthroughUpstream string
+	// Domain 随透传门接入（SNI 域名形状校验）——HTTP/TCP 分支零消费，
+	// 既有构造点不传即零值，行为不变。
+	Domain string
 }
 
 func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
@@ -77,6 +83,7 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 	return ruleFeatureInput{
 		Protocol:                     req.Protocol,
 		Strategy:                     req.Strategy,
+		Domain:                       req.Domain,
 		NTLMCompatible:               req.NTLMCompatible,
 		UpstreamForceHTTP1:           req.UpstreamForceHTTP1,
 		UpstreamKeepaliveTimeout:     req.UpstreamKeepaliveTimeout,
@@ -86,6 +93,7 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 		ForwardAuthCopyHeaders:       req.ForwardAuthCopyHeaders,
 		ChainRaceIntervalMS:          req.ChainRaceIntervalMS,
 		ChainRequestTimeoutMS:        req.ChainRequestTimeoutMS,
+		PassthroughUpstream:          req.PassthroughUpstream,
 		ListenPort:                   req.ListenPort,
 		EnableTLS:                    req.EnableTLS,
 		TLSHTTPRedirect:              req.TLSHTTPRedirect,
@@ -139,6 +147,7 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	input := ruleFeatureInput{
 		Protocol:                     existing.Protocol,
 		Strategy:                     req.Strategy,
+		Domain:                       req.Domain,
 		NTLMCompatible:               existing.NTLMCompatible,
 		UpstreamForceHTTP1:           existing.UpstreamForceHTTP1,
 		UpstreamKeepaliveTimeout:     existing.UpstreamKeepaliveTimeout,
@@ -248,6 +257,12 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	}
 	if req.ChainRequestTimeoutMS != nil {
 		input.ChainRequestTimeoutMS = *req.ChainRequestTimeoutMS
+	}
+	// TLS 透传上游：指针三态（nil=沿用存量；显式空串=清空）——清空对透传规则
+	// 会因必填门 400，对非透传协议是防脏清空路径。
+	input.PassthroughUpstream = existing.PassthroughUpstream
+	if req.PassthroughUpstream != nil {
+		input.PassthroughUpstream = *req.PassthroughUpstream
 	}
 	// NTLM 兼容开关：nil=沿用存量（handler 已预合并），显式 0/1 落库。
 	if req.NTLMCompatible != nil {
@@ -365,6 +380,179 @@ func validateStrategyForProtocol(protocol, strategy string) error {
 		if !tcpStrategies[strategy] {
 			return fmt.Errorf("无效的负载策略：TCP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first")
 		}
+	case "passthrough":
+		// 透传上游负载均衡在 Layer4 收口（S1-b 渲染），语义与 TCP 同构：
+		// cookie/chain_fallback 是 HTTP 响应语义，透传无 HTTP 层可消费。
+		if !tcpStrategies[strategy] {
+			return fmt.Errorf("无效的负载策略：透传（passthrough）规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first")
+		}
+	}
+	return nil
+}
+
+// validateSNIDomain 校验透传规则的 SNI 域名形状：字母数字点连字符，支持
+// `*.example.com` 通配（* 必须独占最左标签，且剩余部分为合法多级域名），
+// 禁空格/控制字符/端口尾缀/尾缀点。与 isValidDomain（HTTP 域名）分立：
+// SNI 恒单域名（无逗号列表）、显式通配语义、拒绝 IP 字面量（Layer4 按
+// ClientHello SNI 匹配，无 IP 语义）。输入须已 TrimSpace 并小写化（由
+// validatePassthroughRule 统一归一后调用）。
+func validateSNIDomain(domain string) error {
+	if domain == "" {
+		return fmt.Errorf("SNI 域名不能为空")
+	}
+	if strings.ContainsAny(domain, " \t\r\n") {
+		return fmt.Errorf("SNI 域名 %q 不能包含空白字符", domain)
+	}
+	for _, r := range domain {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("SNI 域名 %q 含非法控制字符", domain)
+		}
+	}
+	if strings.Contains(domain, ":") {
+		return fmt.Errorf("SNI 域名 %q 不能包含端口尾缀（SNI 匹配按域名进行，不带端口）", domain)
+	}
+	if strings.HasSuffix(domain, ".") {
+		return fmt.Errorf("SNI 域名 %q 不能以点结尾", domain)
+	}
+	if net.ParseIP(domain) != nil {
+		return fmt.Errorf("SNI 域名 %q 是 IP 字面量——Layer4 按 ClientHello 的 SNI（域名）分流，IP 直连不携带 SNI，请改用域名", domain)
+	}
+	if len(domain) > 253 {
+		return fmt.Errorf("SNI 域名长度不能超过 253 字符（当前 %d）", len(domain))
+	}
+	labels := strings.Split(domain, ".")
+	rest := labels
+	if labels[0] == "*" {
+		if len(labels) < 3 {
+			return fmt.Errorf("通配 SNI 域名 %q 无效（* 后至少须保留两级域名，如 *.example.com）", domain)
+		}
+		rest = labels[1:]
+	} else if strings.Contains(domain, "*") {
+		return fmt.Errorf("SNI 域名 %q 的 * 只能作为最左标签整体出现（如 *.example.com）", domain)
+	}
+	for _, label := range rest {
+		if label == "" {
+			return fmt.Errorf("SNI 域名 %q 含空标签", domain)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("SNI 域名 %q 的标签超长（每段 ≤63 字符）", domain)
+		}
+		isAlphaNumeric := func(c byte) bool {
+			return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		}
+		if !isAlphaNumeric(label[0]) || !isAlphaNumeric(label[len(label)-1]) {
+			return fmt.Errorf("SNI 域名 %q 的标签只能以字母或数字开头/结尾", domain)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return fmt.Errorf("SNI 域名 %q 含非法字符（仅支持字母/数字/连字符）", domain)
+			}
+		}
+	}
+	return nil
+}
+
+// sniDomainsOverlap 判定两个规范化（小写、TrimSpace 后）SNI 域名是否可能命中
+// 同一 ClientHello：精确相等，或一方为通配且另一方落在其覆盖域内。覆盖判定
+// 保守取多级（*.a.com 同时视为覆盖 b.a.com 与 c.b.a.com）——保存门从严把
+// 歧义组合显性拒绝，宁可误拦不可漏放（Layer4 同 SNI 双规则的路由归属性歧义
+// 在运行期不可观测）。
+func sniDomainsOverlap(a, b string) bool {
+	if a == b {
+		return true
+	}
+	aWildcard := strings.HasPrefix(a, "*.")
+	bWildcard := strings.HasPrefix(b, "*.")
+	switch {
+	case aWildcard && bWildcard:
+		// 双通配：后缀互为祖先域即重叠（*.a.com 与 *.b.a.com）。
+		return strings.HasSuffix(strings.TrimPrefix(b, "*."), "."+strings.TrimPrefix(a, "*.")) ||
+			strings.HasSuffix(strings.TrimPrefix(a, "*."), "."+strings.TrimPrefix(b, "*."))
+	case aWildcard:
+		base := strings.TrimPrefix(a, "*.")
+		return b == base || strings.HasSuffix(b, "."+base)
+	case bWildcard:
+		base := strings.TrimPrefix(b, "*.")
+		return a == base || strings.HasSuffix(a, "."+base)
+	}
+	return false
+}
+
+// validatePassthroughRule 是 protocol=passthrough 的域内保存门
+// （JJC-20261112-01 S1-a）：SNI 域名形状、上游 host:port、监听端口第一期限制、
+// TLS/证书字段互斥（透传域名证书由上游管理）与 HTTP-only 死字段显性拒绝。
+// 挂在 validateRuleFeatures 协议白名单之后，Create/Update/复制全链路复用
+// （与 NTLM/认证网关门同族的组织方式）。
+// 启用态已放行（JJC-20261112-01 S1-b：caddy.go 已交付 Layer4 SNI 分流渲染，
+// S1-a 的「恒禁用态」保护门已移除）；本函数保留为「渲染所需数据完整性」的
+// 唯一把守点——passthrough_upstream 必填且为合法 host:port，SNI 形状合法，
+// 端口等于 DefaultHTTPSPort（第一期）。
+func validatePassthroughRule(input ruleFeatureInput) error {
+	domain := strings.ToLower(strings.TrimSpace(input.Domain))
+	if domain == "" {
+		return fmt.Errorf("透传规则的 SNI 域名必填（Layer4 按 ClientHello 的 SNI 分流）")
+	}
+	if strings.Contains(domain, ",") {
+		return fmt.Errorf("透传规则的 SNI 域名只支持单个域名（当前 %q）——多条 SNI 请拆分为多条透传规则", domain)
+	}
+	if err := validateSNIDomain(domain); err != nil {
+		return err
+	}
+	upstream := strings.TrimSpace(input.PassthroughUpstream)
+	if upstream == "" {
+		return fmt.Errorf("透传上游地址必填（host:port 形态，passthrough_upstream）——上游自带反代与证书，本系统只做字节流转发")
+	}
+	host, portText, splitErr := net.SplitHostPort(upstream)
+	if splitErr != nil {
+		return fmt.Errorf("透传上游地址 %q 无效：须为 host:port 形态（passthrough_upstream）", upstream)
+	}
+	port, atoiErr := strconv.Atoi(portText)
+	if atoiErr != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("透传上游地址 %q 的端口无效（须为 1-65535 的整数）", upstream)
+	}
+	if strings.TrimSpace(host) == "" || !isValidHost(strings.TrimSpace(host)) {
+		return fmt.Errorf("透传上游地址 %q 的主机无效", upstream)
+	}
+	// 第一期限制（方案决策 #9）：透传规则监听端口必须等于部署侧 HTTPS 默认口
+	// ——443/TCP 由 Layer4 统一接管，其他端口的 SNI 分流留待二期。
+	if input.ListenPort != services.DefaultHTTPSPort() {
+		return fmt.Errorf("透传规则监听端口必须为部署侧 HTTPS 默认口 %d（当前 %d；第一期透传仅在 HTTPS 默认口做 SNI 分流）",
+			services.DefaultHTTPSPort(), input.ListenPort)
+	}
+	// TLS/证书字段互斥：透传域名证书由上游服务器管理，本系统不终结、不申请、
+	// 不监控有效期——携带即误配，显性拒绝（enable_tls/跳转在本门；tls_source/
+	// 证书材料四列由 rules.go 保存入口按请求字段点名，ruleFeatureInput 不承载）。
+	if input.EnableTLS || input.TLSHTTPRedirect {
+		return fmt.Errorf("透传域名证书由上游管理：passthrough 规则不支持 enable_tls/tls_http_redirect（本系统不申请、不续期、不监控透传域名证书）")
+	}
+	// HTTP-only 语义字段（与 TCP 分支同格的显性拒绝）：透传为纯字节流转发，
+	// 无 HTTP 层可消费这些配置。
+	if input.CustomRoutesEnabled || len(input.PathRules) > 0 {
+		return fmt.Errorf("透传规则不支持自定义路径规则（无 HTTP 语义层）")
+	}
+	if input.ForwardAuthEnabled != 0 {
+		return fmt.Errorf("透传规则不支持认证网关（无 HTTP 语义层）")
+	}
+	if input.NTLMCompatible != 0 {
+		return fmt.Errorf("透传规则不支持 NTLM 兼容模式（无 HTTP 语义层）")
+	}
+	if input.DynamicDNS {
+		return fmt.Errorf("透传规则不支持动态上游（上游由 passthrough_upstream 单值配置）")
+	}
+	if input.EnableDnsServer || strings.TrimSpace(input.DnsServer) != "" {
+		return fmt.Errorf("透传规则不支持 DNS 服务发现配置（enable_dns_server/dns_server）")
+	}
+	if input.EnableCompress {
+		return fmt.Errorf("透传规则不支持响应压缩（无 HTTP 响应可压缩）")
+	}
+	if input.ProxyDialTimeout != 0 || input.ProxyResponseHeaderTimeout != 0 || input.ProxyReadTimeout != 0 ||
+		input.ProxyWriteTimeout != 0 || input.ProxyStreamTimeout != 0 || input.ProxyFlushInterval != 0 ||
+		input.ProxyStreamCloseDelay != 0 {
+		return fmt.Errorf("透传规则不支持 HTTP 代理超时配置（七列为 HTTP 响应语义）")
+	}
+	if input.TCPHealthCheckPort < 0 {
+		return fmt.Errorf("透传健康检查端口不能为负数")
 	}
 	return nil
 }
@@ -416,8 +604,23 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	// （caddy.go:1276）——域名匹配静默丢失、TLS 字段被忽略。统一在特性校验入口
 	// 拒绝未知协议，Create/Update/复制/导入全链路复用；保存校验 validateRuleConfigGeneration
 	// 亦仅放行 http/tcp，存量 https 行由 db 迁移归一为 http+TLS。
-	if input.Protocol != "http" && input.Protocol != "tcp" {
-		return fmt.Errorf("协议仅支持 http 或 tcp")
+	// TLS 透传（JJC-20261112-01）：passthrough 为合法第三值（保存链）；
+	// S1-b 已接线 caddy.go 的 Layer4 SNI 分流渲染（协议白名单放行
+	// http/tcp/passthrough），透传规则可启用。
+	if input.Protocol != "http" && input.Protocol != "tcp" && input.Protocol != "passthrough" {
+		return fmt.Errorf("协议仅支持 http、tcp 或 passthrough")
+	}
+	// passthrough 域内校验单源：SNI 形状/上游/端口/TLS 字段互斥/HTTP-only
+	// 死字段——Create/Update/复制全链路复用（与 NTLM 门同族的组织方式）。
+	if input.Protocol == "passthrough" {
+		if err := validatePassthroughRule(input); err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(input.PassthroughUpstream) != "" {
+		// 防脏数据（双向）：passthrough_upstream 仅透传协议消费——非透传协议
+		// 显式携带即 400；存量/带外脏值由保存入口自愈清空（UpdateRule 合并区/
+		// duplicateRulePayloadRequest）后才会抵达本门。
+		return fmt.Errorf("passthrough_upstream 仅透传（passthrough）规则支持，%s 规则不得携带", input.Protocol)
 	}
 	// strategy 白名单校验，非法值不再透传到 Caddy。
 	if err := validateStrategyForProtocol(input.Protocol, input.Strategy); err != nil {
@@ -1249,7 +1452,8 @@ var lbRuleColumns = fmt.Sprintf(`COALESCE(id,0), COALESCE(caddy_id,''), name, CO
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
 	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
-	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`,
+	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0),
+	COALESCE(passthrough_upstream,'')`,
 	db.DefaultHealthCheckInterval, db.DefaultHealthCheckTimeout,
 	db.DefaultHealthCheckUnhealthyThreshold, db.DefaultHealthCheckHealthyThreshold,
 	db.DefaultTCPTryInterval)
@@ -1275,7 +1479,8 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 			&enableTLS, &tlsSource, &acmeConfigID, &caProviderID, &tlsCert, &tlsKey, &tlsCertPath, &tlsKeyPath, &tlsHTTPRedirect,
 			&enableCompress, &compressTypes, &r.Enabled, &r.LogEnabled,
 			&createdBy, &createdAt, &updatedAt, &updatedBy, &hostHeader, &healthCheckHost,
-			&r.BlockPageStage1ID, &r.BlockPageStage1Status, &r.BlockPageStage3ID, &r.BlockPageStage3Status); err != nil {
+			&r.BlockPageStage1ID, &r.BlockPageStage1Status, &r.BlockPageStage3ID, &r.BlockPageStage3Status,
+			&r.PassthroughUpstream); err != nil {
 			return nil, err
 		}
 		r.Description = description

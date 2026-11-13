@@ -196,6 +196,10 @@ var (
 	}
 	lbRuleTCPColumns = []string{
 		"tcp_health_check_port", "tcp_proxy_protocol", "tcp_try_duration", "tcp_try_interval",
+		// TLS 透传上游列（JJC-20261112-01 S1-a）：与 tcp_* 同为透传/TCP 族
+		// 复用列——漏列则主端写 passthrough_upstream 不 bump 版本，从节点经
+		// 304 门永久滞留旧值。
+		"passthrough_upstream",
 	}
 	lbRuleRequestAndUpstreamColumns = []string{
 		"request_body_max_size_mb", "upstream_keepalive_timeout", "server_tokens_hidden",

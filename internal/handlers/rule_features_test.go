@@ -949,6 +949,7 @@ func simulateLegacyNullableLbRules(t *testing.T, database *sql.DB) {
 		block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
 		block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
 		block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
+		passthrough_upstream TEXT NOT NULL DEFAULT '',
 		created_by INTEGER,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME,

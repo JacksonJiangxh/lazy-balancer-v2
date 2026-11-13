@@ -219,7 +219,9 @@ export interface RuleFlowUpstream {
 export interface RuleFlowTarget {
   caddyId?: string
   name: string
-  protocol: 'http' | 'tcp'
+  // passthrough（TLS 透传，JJC-20261112-01 S3）：流程弹框按 === 'tcp' 分流，
+  // 透传落入非 TCP 分支（无 TLS 终结面，enableTls 恒 false）
+  protocol: 'http' | 'tcp' | 'passthrough'
   listenPort: number
   enableTls: boolean
   // 接入卡富化：规则全部域名（chips 展示，逗号分隔解析由调用方完成）

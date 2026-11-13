@@ -43,8 +43,8 @@ test('B 提交路径镜像步进完整性门（跳步保存不得静默剔除空
   )
   assert.match(
     body,
-    /if \(wizardForm\.upstreams\.some\(\(u, i\) => upstreamRowInvalid\(u, i\)\)\) \{\s*ElMessage\.warning\(upstreamFieldWarning\.value \|\| '请填写所有已启用上游服务器的主机地址与端口'\)/,
-    '缺 host/port 门时空行会被载荷过滤静默剔除，保存「成功」但规则少了上游',
+    /if \(wizardForm\.protocol !== 'passthrough' && wizardForm\.upstreams\.some\(\(u, i\) => upstreamRowInvalid\(u, i\)\)\) \{\s*ElMessage\.warning\(upstreamFieldWarning\.value \|\| '请填写所有已启用上游服务器的主机地址与端口'\)/,
+    '缺 host/port 门时空行会被载荷过滤静默剔除，保存「成功」但规则少了上游（透传 upstreams 恒空，门按协议豁免）',
   )
   // 谓词两腿：host 与 port 缺一即无效（端口清空曾不报错也不进载荷）
   const predicates = section(page, 'const upstreamRowMissingHost', 'const upstreamFieldWarning')

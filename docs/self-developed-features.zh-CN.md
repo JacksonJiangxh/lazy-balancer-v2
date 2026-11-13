@@ -8,7 +8,7 @@
 > 登记原则：**一能力一条**，写清「能力名 / 代码位置 / 设计裁定出处 / 防复发约束 /
 > 机械可核符号」。符号必须能 grep 到，供后续派活直接引用。
 >
-> 最近更新：2026-11-11 · TASK-2026-1111-03（注释外置，长解释迁到 `docs/fork-notes/`）
+> 最近更新：2026-11-13 · JJC-20261112-001 S4-a（新增第 5 项 TLS 透传 SNI 分流）
 >
 > **注释外置后的查找方式**：代码里我方补丁处只留「一句话结论 + `详见 docs/fork-notes/xxx.md §N`」，
 > 长解释（设计理由、反例、取舍）**逐字**保存在 `docs/fork-notes/`（索引见其 `README.md`）。
@@ -44,6 +44,7 @@
 | 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
 | 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` | — |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
+| 5 | **TLS 透传 SNI 分流**（`protocol='passthrough'`） | `validatePassthroughRule` · `buildPassthroughLayer4Server` · `passthrough_upstream` · `internalTerminatePort` · `passthroughRulesByPort` | 2026-11-12 |
 
 > **本表的第二用途（2026-11-11 TASK-2026-1111-03 增补）**：`scripts/fork-diff.sh`
 > 把上文「关键符号」列与下文每项「代码位置」条目**机械解析**成归属判据，用来给
@@ -179,6 +180,59 @@
   静态映射永不命中；渲染守卫 + 校验侧 400 双保险）；主动健康检查 probe 的 Host
   只由 `health_check_host` / `host_header` 决定，**不**读逐上游值（probe 为 handler
   级，无法逐上游）。
+
+## 第 5 项 · TLS 透传 SNI 分流（`protocol='passthrough'`）
+
+- **能力名**：TLS 透传 SNI 分流——443 统一入口 · Layer4 混合透传/终结（同一监听端口，
+  部分域名按 SNI 字节流转发给上游、其余域名仍走本系统 Caddy TLS 终结）。
+- **代码位置**：
+  - 协议白名单：`internal/handlers/rule_features.go` → `validateRuleFeatures`
+    （`http/tcp/passthrough` 三值放行，`protocol='passthrough'`）
+  - 保存门：`internal/handlers/rule_features.go` → `validatePassthroughRule` /
+    `validateSNIDomain`；`internal/handlers/rules.go` → `passthroughSNIConflict` /
+    `passthroughTerminateConflict`（同端口 SNI 重叠 / 透传↔本地终结 冲突双门）
+  - 数据：`internal/db/db.go` → `passthrough_upstream` 列（fresh DDL /
+    newColumnsRegistry / PK 重建 DDL 三处登记）
+  - 渲染：`internal/services/caddy.go` → `buildPassthroughLayer4Server` /
+    `buildPassthroughProxyHandler` / `passthroughDialAddress` /
+    `passthroughRulesByPort`（与 http/tcp 并列的第三族按端口分组）；
+    内部终结口 7443 常量 `internalTerminatePort` + `internalTerminateAddr`（仅绑 127.0.0.1）
+  - 前端：`web/src/views/Rules.vue`（SNI 字段/单值上游/协议分支隔离）、
+    `web/src/utils/ruleValidation.ts`（与后端逐条同口径的校验单源）
+  - 钉测：`internal/services/caddy_passthrough_render_test.go`（R5 零回归 sha256 钉测族）、
+    `internal/handlers/rule_features_passthrough_test.go`、
+    `internal/db/db_passthrough_column_test.go`、`web/tests/rulePassthrough.spec.ts`
+  - 渲染链注释：`docs/fork-notes/render-chain.md` §29
+- **设计裁定出处**：董事长 2026-11-12（需求 + 8 项决策点，计划档案
+  `.agent_team/JJC-20261112-001-tls-passthrough-plan.md` §一）；S0 spike 五项验证全
+  CONFIRMED（T-1/T-2/T-4/T-5 真实进程实跑报告 `.agent_team/spike/evidence/`；
+  T-3 为 caddy-l4 源码走读 + 编译产物注册表断言，方法见计划档案 §三）。
+- **关键设计点（也是相对上游的不可替代性）**：
+  1. 443/TCP 由 Caddy Layer4（caddy-l4）接管，按 ClientHello 的 SNI 域名分流；
+     多条透传规则聚合进同一 `matchers.tls.sni` 集合，同端口可共存。
+  2. 透传域名做**字节流转发**：证书由上游自带并终结，本系统不申请、不续期、不监控。
+  3. 无 SNI 命中的兜底路由注入 PROXY v2 转发到 `127.0.0.1:7443`（Caddy TLS 终结）——
+     本地终结域名的证书/ACME/WAF 链路**零迁移**。
+  4. 全库无启用透传规则时渲染产物与改造前**逐字节一致**（R5 sha256 钉测）。
+- **防复发约束（下次追上游必须逐条核对）**：
+  > ① **上游无同需求实现**——追平时不得以「上游有 TLS 转发能力」为由切换：
+  > 本功能是**按 SNI 域名级分流 + 混合终结**（同端口透传/终结并存），上游
+  > `reverse_proxy` 无法表达该语义。
+  > ② `layer4` 是 Caddyfile **全局选项块** `{ layer4 { :443 {...} } }`，**不可顶层直写**。
+  > ③ `servers <addr>` 的 addr 必须与站点 `bind` 监听地址**逐字一致**，否则
+  > listener wrapper 静默失效（spike T-5 实证）。
+  > ④ 7443 必须仅绑 `127.0.0.1`——全绑存在外部直连绕过面（spike T-5 C 断言实测）。
+  > ⑤ 追平新上游时核对 `Dockerfile` 的 `--with caddy-l4` 行与 Caddy
+  > `modules/caddyhttp/proxyprotocol` 注册仍在（详见追平手册 §十 B.7）。
+  >
+  > 机械判据（可直接照抄执行，任一为红即视为回归；grep 通配按本文件维护规则 5 加引号）：
+  > - `grep -rn 'func validatePassthroughRule' internal/handlers/` → 命中 `rule_features.go`
+  > - `grep -c 'caddy-l4' Dockerfile` ≥ 1
+  > - `grep -c 'passthrough_upstream' internal/db/db.go` ≥ 3（fresh DDL / 注册表 / 重建 DDL）
+  > - `go test -run 'TestPassthroughRender_' ./internal/services/` → PASS（R5 零回归钉测族）
+  > - `go test -run 'TestPassthrough' ./internal/handlers/ ./internal/db/` → PASS
+- **不适用面**：HTTP/3（QUIC）——透传域名自动降级 HTTP/2/1.1；透传规则的证书/ACME/
+  WAF 面板能力全部不适用（证书归上游管理）。
 
 ---
 

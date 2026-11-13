@@ -244,3 +244,156 @@ export const RULE_NUMERIC_LIMITS = {
   tcpTryIntervalMax: 60000,
   maxConnectionsMin: 0,
 } as const
+
+// ── TLS 透传（JJC-20261112-01 S3 前端接入）──
+// 以下三个判定与后端 internal/handlers/rule_features.go 的 validateSNIDomain /
+// validatePassthroughRule 上游门 / sniDomainsOverlap 逐条同口径同顺序
+// （本仓 docs/fork-notes/ 未设本节台账，后端源码即对表单源；行内注释逐条
+// 标注对应 Go 行为，防两端口径漂移——纪律：前端放行、保存 400 不允许）。
+
+/** SNI 域名归一：TrimSpace + 小写（与 validatePassthroughRule 入口归一同形）。 */
+export const normalizeSNIDomain = (raw: string): string => raw.trim().toLowerCase()
+
+// 输入须已经 normalizeSNIDomain 归一（与后端约定一致：调用方统一归一后传入）。
+// 字节长度口径：Go len() 是字节数，非 ASCII 由标签字母表门拒绝，此处仍按
+// 字节计（TextEncoder）保持逐条同形。
+export const sniDomainError = (domain: string): string | null => {
+  if (domain === '') return 'SNI 域名不能为空'
+  // 后端 ContainsAny(domain, " \t\r\n")
+  if (/[ \t\r\n]/.test(domain)) return `SNI 域名 ${JSON.stringify(domain)} 不能包含空白字符`
+  // 后端逐 rune 拒 <0x20 或 0x7f
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(domain)) return `SNI 域名 ${JSON.stringify(domain)} 含非法控制字符`
+  if (domain.includes(':')) return `SNI 域名 ${JSON.stringify(domain)} 不能包含端口尾缀（SNI 匹配按域名进行，不带端口）`
+  if (domain.endsWith('.')) return `SNI 域名 ${JSON.stringify(domain)} 不能以点结尾`
+  // IP 字面量拒绝（Layer4 按 ClientHello SNI 匹配，IP 直连不携带 SNI）。
+  // import 单源 utils/ipAddress（写侧严格口径），与 net.ParseIP 同收:
+  // 前导零/zone 后缀该口径均拒——从严方向与后端一致。
+  if (isValidV4(domain) || isValidV6(domain)) {
+    return `SNI 域名 ${JSON.stringify(domain)} 是 IP 字面量——Layer4 按 ClientHello 的 SNI（域名）分流，IP 直连不携带 SNI，请改用域名`
+  }
+  if (domain.length > 253) return `SNI 域名长度不能超过 253 字符（当前 ${domain.length}）`
+  const labels = domain.split('.')
+  let rest = labels
+  if (labels[0] === '*') {
+    // * 独占最左标签后至少保留两级域名（*.example.com）
+    if (labels.length < 3) return `通配 SNI 域名 ${JSON.stringify(domain)} 无效（* 后至少须保留两级域名，如 *.example.com）`
+    rest = labels.slice(1)
+  } else if (domain.includes('*')) {
+    return `SNI 域名 ${JSON.stringify(domain)} 的 * 只能作为最左标签整体出现（如 *.example.com）`
+  }
+  for (const label of rest) {
+    if (label === '') return `SNI 域名 ${JSON.stringify(domain)} 含空标签`
+    if (label.length > 63) return `SNI 域名 ${JSON.stringify(domain)} 的标签超长（每段 ≤63 字符）`
+    // 后端字节 alphabet：小写字母/数字开头结尾，主体仅字母/数字/连字符
+    //（输入已小写化，大写字母在后端同样非法——归一在前端调用点完成）。
+    if (!/^[a-z0-9]$/.test(label[0]) || !/^[a-z0-9]$/.test(label[label.length - 1])) {
+      return `SNI 域名 ${JSON.stringify(domain)} 的标签只能以字母或数字开头/结尾`
+    }
+    if (!/^[a-z0-9-]+$/.test(label)) {
+      return `SNI 域名 ${JSON.stringify(domain)} 含非法字符（仅支持字母/数字/连字符）`
+    }
+  }
+  return null
+}
+
+/**
+ * 透传保存门第①段（必填/单值/形状，与 validatePassthroughRule 开头同序）：
+ * 空值与逗号列表在形状校验之前拦截（后端同序）。
+ */
+export const passthroughSniError = (rawDomain: string): string | null => {
+  const domain = normalizeSNIDomain(rawDomain)
+  if (domain === '') return '透传规则的 SNI 域名必填（Layer4 按 ClientHello 的 SNI 分流）'
+  if (domain.includes(',')) {
+    return `透传规则的 SNI 域名只支持单个域名（当前 ${JSON.stringify(domain)}）——多条 SNI 请拆分为多条透传规则`
+  }
+  return sniDomainError(domain)
+}
+
+/**
+ * 透传上游 host:port 校验（与 validatePassthroughRule 上游门逐条同口径）：
+ * SplitHostPort 形态（host:port / [v6]:port；不带方括号的多冒号串与后端
+ * 同样拒绝）、端口 1-65535、主机为 IP 字面量或主机名（isValidHost 同形，
+ * 消费 utils/ipAddress 与 isValidHostName 单源）。
+ */
+export const passthroughUpstreamError = (rawUpstream: string): string | null => {
+  const upstream = rawUpstream.trim()
+  if (upstream === '') {
+    return '透传上游地址必填（host:port 形态，passthrough_upstream）——上游自带反代与证书，本系统只做字节流转发'
+  }
+  const lastColon = upstream.lastIndexOf(':')
+  if (lastColon < 0) {
+    return `透传上游地址 ${JSON.stringify(upstream)} 无效：须为 host:port 形态（passthrough_upstream）`
+  }
+  let host = upstream.slice(0, lastColon)
+  const portText = upstream.slice(lastColon + 1)
+  if (host.startsWith('[')) {
+    // [v6]:port —— 剥方括号后按 IP 字面量校验
+    if (!host.endsWith(']')) {
+      return `透传上游地址 ${JSON.stringify(upstream)} 无效：须为 host:port 形态（passthrough_upstream）`
+    }
+    host = host.slice(1, -1)
+  } else if (host.includes(':')) {
+    // 与 Go net.SplitHostPort 同拒：不带方括号的多冒号串（::1:10443）
+    return `透传上游地址 ${JSON.stringify(upstream)} 无效：须为 host:port 形态（passthrough_upstream）`
+  }
+  const port = Number(portText)
+  if (!/^\d+$/.test(portText) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return `透传上游地址 ${JSON.stringify(upstream)} 的端口无效（须为 1-65535 的整数）`
+  }
+  const trimmedHost = host.trim()
+  if (trimmedHost === '' || !(isValidV4(trimmedHost) || isValidV6(trimmedHost) || isValidHostName(trimmedHost))) {
+    return `透传上游地址 ${JSON.stringify(upstream)} 的主机无效`
+  }
+  return null
+}
+
+/**
+ * 两个规范化（小写、TrimSpace 后）SNI 域名是否可能命中同一 ClientHello——
+ * 与后端 sniDomainsOverlap 逐条同口径：精确相等，或一方为通配且另一方落在
+ * 其覆盖域内（保守多级覆盖：*.a.com 同时视为覆盖 b.a.com 与 c.b.a.com）。
+ */
+export const sniDomainsOverlap = (a: string, b: string): boolean => {
+  if (a === b) return true
+  const aWildcard = a.startsWith('*.')
+  const bWildcard = b.startsWith('*.')
+  if (aWildcard && bWildcard) {
+    const aBase = a.slice(2)
+    const bBase = b.slice(2)
+    return bBase.endsWith(`.${aBase}`) || aBase.endsWith(`.${bBase}`)
+  }
+  if (aWildcard) {
+    const base = a.slice(2)
+    return b === base || b.endsWith(`.${base}`)
+  }
+  if (bWildcard) {
+    const base = b.slice(2)
+    return a === base || a.endsWith(`.${base}`)
+  }
+  return false
+}
+
+/** passthroughSaveGateError 输入（existingRules 供行内冲突提示，可省略）。 */
+interface PassthroughGateInput {
+  readonly domain: string
+  readonly upstream: string
+  readonly listenPort: number
+  readonly httpsPort: number
+}
+
+/**
+ * 透传保存门前三段组合（与 validatePassthroughRule 同序）：SNI 必填/单值/形状
+ * → 上游 host:port → 监听端口跟随部署 HTTPS 默认口。返回 '' 表示通过；
+ * 冲突双门（同端口同 SNI / 与本地终结域名冲突）依赖规则面板数据，由
+ * Rules.vue 的 passthroughConflictWarning 单独承担。
+ */
+export const passthroughSaveGateError = (input: PassthroughGateInput): string => {
+  const sniError = passthroughSniError(input.domain)
+  if (sniError) return sniError
+  const upstreamError = passthroughUpstreamError(input.upstream)
+  if (upstreamError) return upstreamError
+  if (input.listenPort !== input.httpsPort) {
+    return `透传规则监听端口必须为部署侧 HTTPS 默认口 ${input.httpsPort}（当前 ${input.listenPort}；第一期透传仅在 HTTPS 默认口做 SNI 分流）`
+  }
+  return ''
+}

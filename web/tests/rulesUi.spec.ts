@@ -31,7 +31,7 @@ test('健康检查超时只属于主动探测（HTTP/TCP 均隐藏在被动模�
   assert.ok(healthEnd > healthStart, 'missing custom routes step marker')
   const healthBlock = page.slice(healthStart, healthEnd)
   const activeMarker = '<template v-if="wizardForm.enable_active_health_check">'
-  const tcpRel = markerIndex(healthBlock, /<template\s+v-if="wizardForm\.protocol === 'tcp'">/, 'TCP 健康检查段')
+  const tcpRel = markerIndex(healthBlock, /<template\s+v-if="wizardForm\.protocol === 'tcp' \|\| wizardForm\.protocol === 'passthrough'">/, 'TCP 健康检查段')
   assert.ok(tcpRel > 0, 'TCP 健康检查段必须在健康检查分隔符之后')
 
   const httpHealth = healthBlock.slice(0, tcpRel)

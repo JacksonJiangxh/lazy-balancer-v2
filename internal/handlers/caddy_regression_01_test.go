@@ -31,7 +31,7 @@ func TestCreateRule_rejects_unknown_protocol(t *testing.T) {
 
 	router.ServeHTTP(response, request)
 
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "协议仅支持 http 或 tcp") {
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "协议仅支持 http、tcp 或 passthrough") {
 		t.Fatalf("create https protocol status=%d body=%s, want 400 协议白名单", response.Code, response.Body.String())
 	}
 	// 拒绝必须零落库：坏协议行一旦进库会被渲染为 TCP（域名匹配静默丢失）。
@@ -61,7 +61,7 @@ func TestUpdateRule_rejects_unknown_protocol(t *testing.T) {
 
 	router.ServeHTTP(response, request)
 
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "协议仅支持 http 或 tcp") {
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "协议仅支持 http、tcp 或 passthrough") {
 		t.Fatalf("update to https protocol status=%d body=%s, want 400 协议白名单", response.Code, response.Body.String())
 	}
 	// 拒绝必须保留原值：协议/域名/端口不得被部分写入。

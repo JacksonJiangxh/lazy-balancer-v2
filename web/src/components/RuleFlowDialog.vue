@@ -11,8 +11,9 @@
     <template #header>
       <div class="flow-header">
         <DialogHeader :icon="Connection" title="处理流程" :subtitle="target?.name" />
-        <!-- 协议徽标：HTTP 蓝 / TCP 青（全局 proto-tcp-tag 单源） -->
+        <!-- 协议徽标：HTTP 蓝 / TCP 青（全局 proto-tcp-tag 单源）/ 透传红（对齐 Rules.vue 列表） -->
         <el-tag v-if="isTcp" size="small" effect="plain" class="proto-tcp-tag flow-proto-badge">TCP</el-tag>
+        <el-tag v-else-if="isPassthrough" size="small" effect="plain" type="danger" class="flow-proto-badge">{{ protocolLabel }}</el-tag>
         <el-tag v-else size="small" effect="plain" type="primary" class="flow-proto-badge">{{ protocolLabel }}</el-tag>
       </div>
     </template>
@@ -422,12 +423,15 @@ const props = defineProps<{
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
 const isTcp = computed(() => props.target?.protocol === 'tcp')
+// 透传（JJC-20261112-01 S4）：第三协议值 → 「TLS 透传」，徽标色跟随 Rules.vue 列表（danger 红）
+const isPassthrough = computed(() => props.target?.protocol === 'passthrough')
 // 海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
 // 读 ref 自动解包并注册响应依赖）。
 const countryZh = useCountryNamesCn()
 const protocolLabel = computed(() => {
   if (!props.target) return '-'
   if (props.target.protocol === 'tcp') return 'TCP'
+  if (props.target.protocol === 'passthrough') return 'TLS 透传'
   return props.target.enableTls ? 'HTTPS' : 'HTTP'
 })
 

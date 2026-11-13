@@ -49,10 +49,14 @@ export const STRATEGY_CARD_OPTIONS: readonly StrategyCardOption[] = [
   { value: 'chain_fallback', title: '链式回退', desc: '按上游权重降序组成回退链，等待竞速间隔无有效响应即并行发出下一路，先回者胜', httpOnly: true },
 ]
 
-/** 该协议可选的策略卡片（TCP 剔除 cookie）。 */
-export const strategyCardsForProtocol = (protocol: 'http' | 'tcp'): readonly StrategyCardOption[] =>
-  STRATEGY_CARD_OPTIONS.filter((card) => !(card.httpOnly && protocol === 'tcp'))
+/** 该协议可选的策略卡片（cookie/chain_fallback 为 HTTP-only：TCP 与透传剔除，
+ *  与后端 validateStrategyForProtocol 的 tcpStrategies 白名单同口径——透传
+ *  （passthrough）上游负载均衡在 Layer4 收口，语义与 TCP 同构）。 */
+type RuleProtocolFilter = 'http' | 'tcp' | 'passthrough'
+
+export const strategyCardsForProtocol = (protocol: RuleProtocolFilter): readonly StrategyCardOption[] =>
+  STRATEGY_CARD_OPTIONS.filter((card) => !(card.httpOnly && protocol !== 'http'))
 
 /** 该协议的合法策略值集——提交白名单与卡片集同源派生。 */
-export const strategyValuesForProtocol = (protocol: 'http' | 'tcp'): readonly string[] =>
+export const strategyValuesForProtocol = (protocol: RuleProtocolFilter): readonly string[] =>
   strategyCardsForProtocol(protocol).map((card) => card.value)

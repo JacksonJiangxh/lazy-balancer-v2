@@ -127,7 +127,7 @@ test('配置预览补齐「访问日志」与 HTTP 连接重试', () => {
   const rules = code('src/views/Rules.vue')
   assert.match(rules, /<el-descriptions title="配置预览"/)
   const body = section(rules, '<el-descriptions title="配置预览"', '<el-descriptions-item label="上游服务器"')
-  assert.match(body, /<el-descriptions-item label="连接重试" v-if="wizardForm\.protocol === 'http' \|\| wizardForm\.protocol === 'tcp'">/, 'HTTP 也必须展示重试窗口')
+  assert.match(body, /<el-descriptions-item label="连接重试" v-if="wizardForm\.protocol === 'http' \|\| wizardForm\.protocol === 'tcp' \|\| wizardForm\.protocol === 'passthrough'">/, 'HTTP/透传也必须展示重试窗口')
   assert.match(body, /默认 5s 窗口/, 'HTTP 未设置时必须点明默认窗口口径')
   assert.match(body, /禁用重试（NTLM 模式）/)
   assert.match(body, /<el-descriptions-item label="访问日志" v-if="wizardForm\.protocol === 'http'">/, '访问日志是高级步可编辑项，预览必须覆盖')

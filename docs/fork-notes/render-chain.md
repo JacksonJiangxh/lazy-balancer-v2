@@ -366,3 +366,64 @@ Location，静态短路不创建资源，建议改用 200），**提醒而非拦
 （含裸 IPv6 字面量）原样返回。回源 Host 计划（静态态 TLS `server_name`）与
 自研求值路径共用；与自研版 `stripPortForSNI` 语义等价（本任务吸收上游已修
 的「SNI 静态路径剥端口」能力，见 TASK-2026-1111-02 §3.1）。
+
+## §29 TLS 透传 Layer4 SNI 分流渲染（JJC-20261112-01 S1-b）
+
+`protocol=passthrough` 规则的渲染接线。S1-a 只交付数据面（`passthrough_upstream`
+列 + 保存门 + 恒禁用态落库），本节交付渲染面并解除恒禁用态门。
+
+**按端口启用（R5 红线）**：透传规则按 `listen_port` 分组进
+`passthroughRulesByPort`（与 `httpServersByPort`/`tcpServersByPort` 并列的第三
+族）。端口集合为空（全库无启用透传规则）时，所有新代码路径零迭代，渲染产物与
+改造前（main@c45efb06）**逐字节一致**——由
+`TestPassthroughRender_noPassthroughRulesByteIdenticalToBaseline` 钉住（基线
+sha256 内嵌常量，fixture 证书固定 PEM + certDir 归一化，见该测试注释）。
+
+**存在透传规则的端口 P**，四处改动：
+
+1. Layer4 app 新增 server `tls_<P>`（`buildPassthroughLayer4Server`）：listen
+   `:P`；每条启用透传规则一条 SNI 路由（`@id`=caddy_id，match
+   `tls.sni=[归一 SNI]` → `buildPassthroughProxyHandler`），之后恒一条兜底
+   路由（无 match）→ `proxy 127.0.0.1:7443 { proxy_protocol: v2 }`。**路由
+   顺序是语义**：SNI 未命中的流量（含 ACME TLS-ALPN-01 挑战与本地终结域名）
+   全部落兜底进 7443 的 Caddy TLS 栈——证书/ACME 链路因此零改动（spike T-1
+   真实签发实证）。多条规则**不合并**成单 route：上游 dial /
+   proxy_protocol / 健康检查都是规则级参数。
+2. HTTP app 该端口 server：listen 从 `[":P"]` 迁移为
+   `["tcp/127.0.0.1:7443", "udp/:P"]`（TCP 退内部回环口，UDP 留公网给
+   HTTP/3——Layer4 不碰 UDP）。
+3. 该 server 挂 `listener_wrappers: [proxy_protocol{allow:[127.0.0.1/32],
+   fallback_policy: reject}, tls]`——顺序不可颠倒（wrapper 必须在 TLS 握手前
+   剥头）；allow 只信回环（7443 仅绑 127.0.0.1，唯一合法来源是 Layer4 出站，
+   外部伪造头被 fallback_policy reject 在解析阶段关闭，spike T-5 断言 B/D）。
+4. 证书/ACME 零改动：TLS 连接策略、certmagic、load_files 全部照旧。
+
+**三元一致要点（spike T-5 踩坑实证）**：Caddy 的 `servers` 挂载键必须与
+server.Listen 逐字一致，否则 listener wrapper **静默不生效**。渲染侧的对应
+约束：`internalTerminateAddr()`（127.0.0.1:7443）同时是 HTTP listen 的 tcp/
+前缀地址、Layer4 兜底 dial、未来 servers 块挂载键的唯一定义点（常量
+`internalTerminatePort`）。
+
+**与 TCP 分支的关键差异**：透传**允许多规则同端口**（SNI 分流天然语义，每条
+规则一个 route），TCP 的「同端口唯一规则」互斥约束不适用；透传上游存
+`passthrough_upstream` 单值列（upstreams 表零行），故不过「零启用上游即跳过」
+的发布谓词，改由「passthrough_upstream 非空」判空（带外脏行 fail-closed 跳过，
+不拖垮整份配置）。`tcp_proxy_protocol`→上游侧 PROXY v2、`tcp_try_*`→重试
+窗口、健康检查族→`health_checks.active` TCP 探测——复用 TCP 字段语义
+（`healthCheckCore` 单源）。dial 归一走 `passthroughDialAddress`
+（SplitHostPort/JoinHostPort 往返，IPv6 bracket 形态，与 `joinUpstreamAddress`
+同口径——裸 IPv6 末段 `::1:10443` 歧义形态显性报错）。
+
+**透传规则不进 HTTP 语义面**：同端口共存时（HTTP 规则 + 透传规则都在
+`httpServersByPort[P]`），透传规则跳过 HTTP 路由生成、错误归因路由与 TLS
+连接策略三处循环（各自显式 `protocol == "passthrough" → continue` 门）——其
+流量在 Layer4 按 SNI 分走，永不进本 server。透传也不进 `publishedHTTPRules`
+（logger_names/logs 零发射）。同端口 tcp_*/tls_* Layer4 server 归属冲突
+（带外脏数据）显性 generationFailure。
+
+**解除恒禁用态门**：CreateRule/UpdateRule 的 S1-a 400（「暂不支持启用」）
+移除；渲染数据完整性由 `validatePassthroughRule`（passthrough_upstream 必填
+host:port）单源把守，导入链（v2 备份 `validateRuleFeatures` 输入补
+Domain/PassthroughUpstream）走同一门。v1（nginx）源无透传语义，转换器恒不
+产出 passthrough，手造携带按「v1 导出格式不支持 TLS 透传」显性跳过。
+
