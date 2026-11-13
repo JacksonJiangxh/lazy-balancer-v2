@@ -4,6 +4,8 @@
 
 基于 **Caddy v2.11** 的可视化负载均衡管理平台，内置 WAF 安全防护，单容器交付。
 
+> 本仓库为上游 fork：五项核心自研能力与上游追平体系见 [自研登记](docs/self-developed-features.zh-CN.md) · [追平手册](docs/upstream-catchup-guide.zh-CN.md) · [差异清单](docs/fork-diff/latest.md)（`scripts/fork-diff.sh` 可复现重生）。
+
 ## 功能一览
 
 | 功能 | 说明 |
@@ -66,17 +68,13 @@ docker run -d --name lazy-balancer \
 <summary>Docker Compose / 构建源码</summary>
 
 ```bash
-# 1) 前端产物（镜像构建的必选前置：Dockerfile 只 COPY 预构建的 web/dist；
-#    仅运行官方镜像可跳过本步）。需要 Node.js ≥ 22.18：`npm test` 用
-#    node --test 直跑 .ts，依赖该版本起的默认 type stripping；见
-#    web/package.json 的 engines 字段
-#    用 `npm ci`（而不是 `npm install`）：前者严格按 package-lock.json 装，
-#    不会就地改写锁文件导致依赖解析漂移。
-cd web && npm ci && npm run build && cd ..
-
-#    产出自证：dist 是预构建产物，陈旧 dist 会被盲目 COPY 进镜像（界面版本号
-#    来自后端，看不出来）。构建完比对戳与当前提交，不一致说明产物过期：
-git rev-parse HEAD && cat web/dist/build-info.json
+# 1) 从源码构建无需手工前端步骤——Dockerfile 自带 web-builder 阶段
+#    （node:22 → npm ci → typecheck+vite build），一条 `docker build` 即出镜像
+#    （见 docs/upstream-catchup-guide.zh-CN.md §十一 C.5）；仅当你要在本地
+#    预览面板时才需要手工构建前端：`cd web && npm ci && npm run build`
+#    （用 `npm ci` 而不是 `npm install`：前者严格按 package-lock.json 装，
+#    不会就地改写锁文件导致依赖解析漂移；需要 Node.js ≥ 22.18，见
+#    web/package.json 的 engines 字段）
 
 # 2) Docker Compose（Linux；主节点为 host 网络）
 #    注意通道：仓库里的 docker-compose.yml 钉的是当前开发线的测试通道 tag
@@ -97,6 +95,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 | 文档 | 内容 |
 |---|---|
+| [快速开始](docs/getting-started.zh-CN.md) | 从零到跑起来的一站式教程（含 TLS 透传示例） |
 | [部署指南](docs/deployment.zh-CN.md) | 挂载目录、环境变量、端口、生产参数 |
 | [安全配置](docs/security.zh-CN.md) | WAF 策略、IP 控制、事件采集、规则更新 |
 | [集群管理](docs/cluster.zh-CN.md) | 主从架构、MFA、安全模型、升级须知 |
@@ -104,6 +103,8 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 | [生产调优](docs/production-tuning.zh-CN.md) | 内核/容器/LB/WAF/HTTP3 五层调优 |
 | [API 文档](docs/api.zh-CN.md) | REST 端点概览、认证、错误码 |
 | [MCP 文档](docs/mcp.zh-CN.md) | AI 代理接入、工具权限、工作流示例 |
+| [核心自研登记](docs/self-developed-features.zh-CN.md) | 五项自研能力、代码位置、防复发约束 |
+| [上游追平手册](docs/upstream-catchup-guide.zh-CN.md) | 上游发版后按标准流程快速追平 |
 
 ## 交流群
 

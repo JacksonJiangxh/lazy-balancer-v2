@@ -5,6 +5,13 @@
 | 任务编号 | slug | 判级 | 状态 | 承接 | 驳回 | 自愈 | 档案 |
 |---|---|---|---|---|---|---|---|
 | JJC-20261112-001 | tls-passthrough-plan | XL | S4 完成（S0 五项 spike + S1-a/S1-b/S3/S4-a/S4-b 全绿）已合并 main 并推送（9bf61980） | 兵部（spike + S1-a/S1-b/S3/S4-a 施工） | 0/3 | 0/3 | `JJC-20261112-001-tls-passthrough-plan.md` |
+| JJC-20261113-01 | docs-readme-getting-started | S | 完成（README 构建段修正 + fork 锚点/索引 + 快速开始教程；gate PASS，main 直接单提交推送） | 兵部 | 0/0 | 0/0 | — |
+
+## JJC-20261113-01 · 施工记录（2026-11-13，兵部）
+- 落地（白名单内三文件）：`README.md`（①68-79 行过时段修正：删「手工 npm build 必选前置」，改「Dockerfile 自带 web-builder 阶段一条 docker build 出镜像」，npm ci 说明移入本地预览语境；②简介段末尾加 fork 身份锚点行；③文档索引表补快速开始/核心自研登记/上游追平手册三行）；`docs/getting-started.zh-CN.md`（新建小白化一站式教程：前置要求→启动→初始化→建规则→TLS 透传→验证→FAQ→延伸阅读）；`.agent_team/ledger.md`（本行）。
+- 事实核对：docker run 示例逐字取 README；向导字段名与顺序取 `web/src/views/Rules.vue`（基本配置/TLS/上游/预览保存、SNI 通配、透传端口只读、证书归属与 HTTP/3 降级提示条）；HTTP_PORT/HTTPS_PORT 语义取 `docs/fork-notes/ports-and-config.md` §1/§2；「443 由 Layer4 接管、透传/终结共存」取 `docs/fork-notes/render-chain.md` §29 + 自研登记第 5 项 + spike T-4；「保存即时生效/400 不落库」取 production-tuning 与 rules.go 保存链注释。
+- 自裁 1 项：任务令原文「前提：该端口已存在普通 HTTPS 规则」与代码事实不符（`validatePassthroughRule` 无此前置；透传规则自身即令该端口 HTTP server 建立并经兜底路由保本地终结）——教程按事实表述为「443 由 Layer4 接管，现有普通 HTTPS 规则经兜底路由继续工作、无需改动（spike T-4 实证）」，未照抄前置句。
+- 验证：`/bin/bash scripts/gate.sh` PASS（五项全过，README 版本锚点 8 处未破坏）；README 新增链接目标 8 个全部存在；`git diff --stat` 仅 README.md + 新文档。
 
 ## JJC-20261112-001 · S4-a 施工记录（2026-11-13，兵部）
 - 分支 `feat/JJC-20261112-01-tls-passthrough`，基线 S3 5df4685f；vue-tsc --noEmit EXIT=0、`npm test` 全绿、go build OK、gate.sh PASS（后端零改动佐证）。
