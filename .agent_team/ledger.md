@@ -4,7 +4,21 @@
 
 | 任务编号 | slug | 判级 | 状态 | 承接 | 驳回 | 自愈 | 档案 |
 |---|---|---|---|---|---|---|---|
-| JJC-20261112-001 | tls-passthrough-plan | XL | S3 前端施工完成（待刑部评审）· S1-b 完成（f27e5579）· S1-a 完成（51b44388）· S0 spike 五项全 CONFIRMED | 兵部（spike + S1-a/S1-b/S3 施工） | 0/3 | 0/3 | `JJC-20261112-001-tls-passthrough-plan.md` |
+| JJC-20261112-001 | tls-passthrough-plan | XL | S4-a 文案+文档登记完成 · S3 前端施工完成（待刑部评审）· S1-b 完成（f27e5579）· S1-a 完成（51b44388）· S0 spike 五项全 CONFIRMED | 兵部（spike + S1-a/S1-b/S3/S4-a 施工） | 0/3 | 0/3 | `JJC-20261112-001-tls-passthrough-plan.md` |
+
+## JJC-20261112-001 · S4-a 施工记录（2026-11-13，兵部）
+- 分支 `feat/JJC-20261112-01-tls-passthrough`，基线 S3 5df4685f；vue-tsc --noEmit EXIT=0、`npm test` 全绿、go build OK、gate.sh PASS（后端零改动佐证）。
+- 落地：
+  - `web/src/views/Dashboard.vue`：`getRuleProtocolLabel`/`getRuleProtocolTagType` 补 passthrough 第三值（「TLS 透传」+ danger 红，参照 Rules.vue 列表写法）——S3 遗留自裁 #2 收口；规则表协议列与历史统计弹框副标题两处使用点同源覆盖。
+  - `web/src/components/RuleFlowDialog.vue`：`protocolLabel` 补透传分支（原落入非 TCP 分支显示「HTTP」），头部徽标 danger 对齐 Rules.vue；isPassthrough computed 单源。
+  - `docs/self-developed-features.zh-CN.md`：登记第 5 项「TLS 透传 SNI 分流」（一览表行 + 分项详述：能力名/代码位置/裁定出处/关键设计点/防复发约束 5 条/机械判据/不适用面）；最近更新行同步。
+  - `docs/upstream-catchup-guide.zh-CN.md`：§十新增 B.7「TLS 透传追平注意事项」（编译产物要素 caddy-l4 + proxyprotocol / layer4 语法语义变动即重验 spike / 机械判据两条）。
+- **自裁决策（2 项）**：
+  1. **接手前次中断现场**：开工时工作区已有 Dashboard/RuleFlowDialog 未提交改动（注释标 S4，与任务令逐条一致）——逐行核对（单源函数覆盖全部使用点、`RuleFlowTarget.protocol` 三值类型已由 S3 扩展、web/tests 无旧文案钉点）后采纳，未重写。
+  2. **spike 证据引用照实改写**：任务令要求写「`spike/evidence/T1-T5.md`」，实际 evidence 目录仅 T1/T2/T4/T5 四份真实进程报告（T-3 系源码走读+编译产物注册表断言类验证，无独立报告，方法见计划档案 §三）——登记文档照实写「T-1/T-2/T-4/T-5 实跑报告 + T-3 走读断言」，不写不存在的文件名。另：`.agent_team/spike/` 目前 untracked 未入库，是否入库待太子裁定（follow-up）。
+  3. **钉测契约冲突走 v-else-if 三分支**：采纳现场改动后 `npm test` 红 1 项——`panelUiWiring.spec.ts:657` 钉死 `<el-tag v-else[^>]*type="primary"` 字面量（HTTP 徽标契约），而该测试文件不在白名单禁改。改法：RuleFlowDialog 徽标拆三分支（`v-if isTcp` / `v-else-if isPassthrough` type=danger / `v-else` type=primary 字面量保留）——透传红 + 标签「TLS 透传」照落，钉测契约与 HTTP/HTTPS 徽标零变化，重跑 1622/1622 全绿。
+- fork-diff 归属核对：按登记文件维护规则以 `--out-dir /tmp/...` 跑（产物目录不在白名单，不落 docs/fork-diff/）。
+- 遗留：S4-b 解码链测试与全回归（另做）。
 
 ## JJC-20261112-001 · S3 前端施工记录（2026-11-13，兵部）
 - 分支 `feat/JJC-20261112-01-tls-passthrough`，基线 S1-b f27e5579；vue-tsc --noEmit EXIT=0、typecheck:test EXIT=0、`npm test` 1622/1622 全绿（基线 1601 + 新增 21）、go build OK、gate.sh PASS（后端零改动）。

@@ -827,13 +827,17 @@ const ipList = computed(() => {
 
 // 策略文案映射提取至 utils/strategyLabels（死键 round_robin 已删）。
 
-const getRuleProtocolLabel = (rule: Rule): 'HTTP' | 'HTTPS' | 'TCP' => {
+// 透传（JJC-20261112-01 S4）：第三协议值 passthrough → 「TLS 透传」，
+// tag 色跟随 Rules.vue 列表（danger 红，与 TCP warning / HTTPS success 区分）。
+const getRuleProtocolLabel = (rule: Rule): 'HTTP' | 'HTTPS' | 'TCP' | 'TLS 透传' => {
   if (rule.protocol === 'tcp') return 'TCP'
+  if (rule.protocol === 'passthrough') return 'TLS 透传'
   return rule.enable_tls ? 'HTTPS' : 'HTTP'
 }
 
-const getRuleProtocolTagType = (rule: Rule): 'primary' | 'success' | 'warning' => {
+const getRuleProtocolTagType = (rule: Rule): 'primary' | 'success' | 'warning' | 'danger' => {
   if (rule.protocol === 'tcp') return 'warning'
+  if (rule.protocol === 'passthrough') return 'danger'
   return rule.enable_tls ? 'success' : 'primary'
 }
 
