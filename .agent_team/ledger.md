@@ -4,7 +4,7 @@
 
 | 任务编号 | slug | 判级 | 状态 | 承接 | 驳回 | 自愈 | 档案 |
 |---|---|---|---|---|---|---|---|
-| JJC-20261112-001 | tls-passthrough-plan | XL | S4-a 文案+文档登记完成 · S3 前端施工完成（待刑部评审）· S1-b 完成（f27e5579）· S1-a 完成（51b44388）· S0 spike 五项全 CONFIRMED | 兵部（spike + S1-a/S1-b/S3/S4-a 施工） | 0/3 | 0/3 | `JJC-20261112-001-tls-passthrough-plan.md` |
+| JJC-20261112-001 | tls-passthrough-plan | XL | S4 完成（S0 五项 spike + S1-a/S1-b/S3/S4-a/S4-b 全绿）已合并 main 并推送（9bf61980） | 兵部（spike + S1-a/S1-b/S3/S4-a 施工） | 0/3 | 0/3 | `JJC-20261112-001-tls-passthrough-plan.md` |
 
 ## JJC-20261112-001 · S4-a 施工记录（2026-11-13，兵部）
 - 分支 `feat/JJC-20261112-01-tls-passthrough`，基线 S3 5df4685f；vue-tsc --noEmit EXIT=0、`npm test` 全绿、go build OK、gate.sh PASS（后端零改动佐证）。
@@ -74,3 +74,12 @@
   - `git diff main..HEAD --stat -- Dockerfile scripts/` 空输出 → DOCKERFILE_SCRIPTS_CLEAN。
 - **S0→S4 全阶段小结一行链**：S0 spike 五项 CONFIRMED → S1-a 51b44388 → S1-b f27e5579 → S3 5df4685f → S4-a f5f9777e → S4-b 本提交。遗留：真实公网 ACME 待部署实测（低风险）。
 - 遗留（follow-up）：`internal/services/zz_tmp_pt_fixture_gen_test.go`（fixture 生成临时文件，untracked，env 未设时 skip）仍留在工作区未删——删除需授权，待裁定；`.agent_team/spike/` 入库与否沿用 S4-a 待裁定项。
+
+## JJC-20261112-001 · 交付归档（2026-11-13，兵部最终收口）
+- **合并提交号**：`9bf61980`（完整 `9bf619808c2a719af96951ed3a728fa7cf816938`）——`git merge --no-ff feat/JJC-20261112-01-tls-passthrough` 生成，特性分支已 `git branch -d` 删除。
+- **推送后远程 main 指针**：`9bf619808c2a719af96951ed3a728fa7cf816938`（`git push origin main` → `c45efb06..9bf61980  main -> main`；`git ls-remote origin main` 复核一致）。
+- **收口动作**：S1-b 遗留的 fixture 临时生成器 `internal/services/zz_tmp_pt_fixture_gen_test.go` 本次先核实性质（文件头「临时文件（S4-b 施工过程产物）…生成后立即删除，不入提交」+ `CADDY_PT_DECODE_FIXTURE_OUT` / `os.WriteFile`）后删除；删后 `git status --short` 仅剩 `.agent_team/spike/` 与 `.codebuddy/` 两类 untracked。
+- **最终回归矩阵（合并后全绿）**：`MERGE_BUILD_VET_OK`；`scripts/gate.sh` → `GATE: PASS`（EXIT=0）；`caddygeoip` 解码链 3 项 `--- PASS`（独立 go.mod 模块内跑，EXIT=0；根目录 `./caddygeoip/` 写法报 setup failed 属模块边界非回归）；`web npm test` → tests 1622 / pass 1622 / fail 0；`internal/handlers` + `internal/services` Passthrough 双 `ok`。
+- **遗留（2 条）**：
+  1. 真实公网 ACME 待部署实测（低风险）：本地全绿为渲染产物与解码链级验证，公网证书签发与 443 握手需在部署环境实测。
+  2. `.agent_team/spike/`（太子裁定不入库）与 `.codebuddy/`（团队运行时）保持 untracked 为工作档案，本次未 add、不随交付入库。
