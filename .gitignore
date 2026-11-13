@@ -111,3 +111,12 @@ docs/audit/
 
 # 本地开发容器覆盖层（开发线 beta 通道，不入库）
 docker-compose.override.yml
+
+# S0 spike 验证链（.agent_team/spike/）：文档与源码入库，二进制不入库。
+# 2026-11-13 董事长裁定：验证链随项目走（供审计/合规/新人参考）；但 7 个 ELF
+# 可执行（2×80M caddy + 5×7~9M Go 测试二进制，合计约 200M）体积不可接受，
+# 且可由入库的 cmd/ 源码 + go.mod 重建，故排除。spike/bin/ 已被上方全局
+# 「bin/」规则覆盖，此处显式重申以防全局规则变动；caddybin/caddy 为新增排除点
+# （caddybin/main.go 是 caddy 定制构建入口源码，保留入库）。
+.agent_team/spike/bin/
+.agent_team/spike/caddybin/caddy
