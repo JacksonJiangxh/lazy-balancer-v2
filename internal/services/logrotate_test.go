@@ -645,6 +645,13 @@ func TestTaskLogsHousekeeping_countsMetadataFailures(t *testing.T) {
 		return nil, errors.New("injected task stat failure")
 	}
 	t.Cleanup(func() { taskLogEntryInfo = oldInfo })
+	// 清理面含 CertJobLogDir()：LogDir 未注入时回退宿主 /app/logs，宿主在该
+	// 目录的任何文件都会命中注入失败并把 InfoFailed 炸到 N+1（root 环境曾
+	// 实测 104=1+103）。注入隔离目录，清理面与宿主状态彻底解耦（与
+	// certjoblog_test.go 的 LogDir 注入同款）。
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(filepath.Join(dir, "taskengine-logs"))
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 
 	res := taskLogsHousekeepingWithRetention(logFile, 3, nil)
 	if res.InfoFailed != 1 {

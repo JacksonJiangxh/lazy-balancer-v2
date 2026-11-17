@@ -25,7 +25,7 @@ import (
 func setupSecurityEventsSpoolTest(t *testing.T) string {
 	t.Helper()
 	setupIsolatedDB(t)
-	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+	if err := initMetricsDBForTest(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
 	}
 	spoolDir := filepath.Join(t.TempDir(), "security-events-spool")
@@ -510,7 +510,7 @@ func TestDrainSecurityEventsSpool_recoversAfterBackoff(t *testing.T) {
 // （上一个已 Close），保留同包其余夹具的 teardown 语义。
 func setupSecurityEventsSpoolRecoveredDB(t *testing.T) {
 	t.Helper()
-	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+	if err := initMetricsDBForTest(t, t.TempDir()); err != nil {
 		t.Fatalf("reinitialize metrics database: %v", err)
 	}
 }

@@ -95,7 +95,7 @@ func TestSecurityEventsIngestion_commitFailureReleasesLeakedTransaction(t *testi
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	originalMetrics := db.MetricsDB

@@ -41,7 +41,7 @@ func stallFixtureBytes(doc2, doc3 string) []byte {
 func stallSetup(t *testing.T) (logPath, offsetPath string) {
 	t.Helper()
 	setupIsolatedDB(t)
-	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+	if err := initMetricsDBForTest(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()

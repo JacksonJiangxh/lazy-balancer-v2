@@ -54,7 +54,7 @@ func seedSecurityEventsDedupeDB(t *testing.T) (logPath, offsetPath string) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','test rule','http','go029.com',443,1)`); err != nil {
@@ -547,7 +547,7 @@ func TestUpgradeDedupedEvent_preservesAttributionWhenNewAttributionEmpty(t *test
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events

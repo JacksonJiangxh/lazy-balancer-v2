@@ -244,7 +244,7 @@ func TestTaskLogf_LogCleanupDisabledWhenRuntimeLogFileMissing(t *testing.T) {
 func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
 	newTaskLogDir(t)
 	te := newWireTestEngine(t)
-	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+	if err := initMetricsDBForTest(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
 	}
 	// 指标库表不可用 → 清理在就绪判据处返回 err（真实失败面）。security_events
@@ -270,7 +270,7 @@ func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
 func TestTaskLogf_MetricsOrphanCleanupFailureSaysFailed(t *testing.T) {
 	newTaskLogDir(t)
 	te := newWireTestEngine(t)
-	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+	if err := initMetricsDBForTest(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
 	}
 	// 主库存活规则清单不可读 → PurgeOrphanMetricsHistory 返回 err

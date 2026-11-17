@@ -1692,6 +1692,104 @@ func TestJSONStringEscapedLen_matchesEncodingJSON(t *testing.T) {
 	}
 }
 
+// 探针钉测——表校准与替换长度校准同一探针体系的自证（go1.26 编码后端把
+// 非法 UTF-8 替换符 U+FFFD 编为 6 字节 \ufffd 转义，v1 是 3 字节裸 UTF-8；
+// 本机 go1.26.1 校准值 6，硬编码任一值都在工具链切换时分叉）。
+//
+//	A. 断言 A（双非法字节）："\x80\xff" 估算 = 2×jsonInvalidUTF8EscapeLen =
+//	   json.Marshal 实测——校准常量与估算器口径同源自洽；
+//	B. 13 项探针集逐项等值 json.Marshal（复用 init 同一实现、缝换桩）；
+//	C. 校准防御回退：探针 err/短字面量回退 v1 值 3 并经 jsonTableCalibLogf
+//	   留痕（纯防御分支，正常工具链不可达）。
+func TestJSONInvalidUTF8EscapeLen_probeCalibrated(t *testing.T) {
+	// 断言 A：双非法字节 = 2×校准值 = 真实编码。
+	quoted, err := json.Marshal("\x80\xff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := jsonStringEscapedLen("\x80\xff"), len(quoted)-2; got != want {
+		t.Fatalf("jsonStringEscapedLen(\"\\x80\\xff\")=%d, want %d（2 非法字节，与 json.Marshal 等值）", got, want)
+	}
+	if got := 2 * jsonInvalidUTF8EscapeLen; got != len(quoted)-2 {
+		t.Fatalf("2×jsonInvalidUTF8EscapeLen=%d, want %d（校准常量与真实编码同源自洽）", got, len(quoted)-2)
+	}
+	// 校准源自证：单非法字节常量 = init 探针对 "\x80" 的实测（工具链自适应，
+	// 本机 go1.26.1 = 6）。
+	single, err := json.Marshal("\x80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jsonInvalidUTF8EscapeLen != len(single)-2 {
+		t.Fatalf("jsonInvalidUTF8EscapeLen=%d, want %d（init 探针实测）", jsonInvalidUTF8EscapeLen, len(single)-2)
+	}
+	t.Logf("invalid-utf8 校准值=%d（本机工具链）", jsonInvalidUTF8EscapeLen)
+}
+
+func TestJSONTableProbeSet_matchesEncodingJSON(t *testing.T) {
+	if len(jsonTableProbeSet) != 13 {
+		t.Fatalf("探针集=%d 项, want 13（逐形态覆盖契约）", len(jsonTableProbeSet))
+	}
+	// 缝换桩：init 校准若失准必须留痕——钉测零留痕即表边界/慢路径/校准常量
+	// 与 encoding/json 全形态一致。
+	var mu sync.Mutex
+	var logs []string
+	oldLog := jsonTableCalibLogf
+	jsonTableCalibLogf = func(format string, args ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+	t.Cleanup(func() { jsonTableCalibLogf = oldLog })
+	jsonProbeVerifyTable()
+	if len(logs) != 0 {
+		t.Fatalf("13 项探针集必须全绿，失准留痕: %v", logs)
+	}
+	// 独立逐项复检（不依赖 jsonProbeVerifyTable 自身的遍历正确性）。
+	for _, p := range jsonTableProbeSet {
+		quoted, err := json.Marshal(p.src)
+		if err != nil {
+			t.Fatalf("探针 %s: json.Marshal(%q): %v", p.name, p.src, err)
+		}
+		if got, want := jsonStringEscapedLen(p.src), len(quoted)-2; got != want {
+			t.Fatalf("探针 %s: jsonStringEscapedLen(%q)=%d, want %d（与 json.Marshal 等值）", p.name, p.src, got, want)
+		}
+	}
+}
+
+func TestJSONInvalidUTF8EscapeLenFromProbe_defensiveFallback(t *testing.T) {
+	var mu sync.Mutex
+	var logs []string
+	oldLog := jsonTableCalibLogf
+	jsonTableCalibLogf = func(format string, args ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+	t.Cleanup(func() { jsonTableCalibLogf = oldLog })
+
+	// 纯防御分支：探针 err / 字面量缺引号 → 回退 v1 值 3 并留痕。
+	if got := jsonInvalidUTF8EscapeLenFromProbe(nil, fmt.Errorf("probe failure")); got != 3 {
+		t.Fatalf("探针 err 回退=%d, want 3（v1 值）", got)
+	}
+	if got := jsonInvalidUTF8EscapeLenFromProbe([]byte("\""), nil); got != 3 {
+		t.Fatalf("字面量缺引号回退=%d, want 3（v1 值）", got)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("两个回退分支必须各留痕一条, got %d: %v", len(logs), logs)
+	}
+	// 正常分支：实测字面量 → len(literal)-2（本机 go1.26.1 = 6，\ufffd 转义）。
+	quoted, err := json.Marshal("\x80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := jsonInvalidUTF8EscapeLenFromProbe(quoted, nil), len(quoted)-2; got != want {
+		t.Fatalf("探针实测=%d, want %d（len(literal)-2）", got, want)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("正常分支不得留痕, got %d: %v", len(logs), logs)
+	}
+}
+
 // 快照 headers 有界口径（与 part C/E 同 64KiB 上限）：伪造的客户端丢弃计数
 // 键在首个受信触点剥离；超限按序列化体积降序丢条目并以合成键记数。返回的
 // 精确字节数必须与实际序列化体积一致（差 ≤1 字节的上界），入队预算据此执法。

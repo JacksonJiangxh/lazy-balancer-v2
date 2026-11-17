@@ -14,6 +14,9 @@ import (
 func TestReportSecurityLibraryVersions_partialScanYieldsNoBogusVersion(t *testing.T) {
 	// Given：威胁库结果集首行可扫、次行不可扫
 	fake := sql.OpenDB(&fakeIterErrConnector{partialScanNeedle: "FROM security_threat_sources"})
+	// fake 句柄必须显式收尾：sql.OpenDB 即刻驻留 opener 协程，不 Close 就是
+	// suite 终态守卫下的永久泄漏（JJC-20261116-001-B7）。
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	threat, crawler := reportSecurityLibraryVersions(context.Background(), fake)
@@ -30,6 +33,7 @@ func TestReportSecurityLibraryVersions_partialScanYieldsNoBogusVersion(t *testin
 func TestLatestSourceVersion_scanFailureIsReported(t *testing.T) {
 	// Given：结果集首行不可 Scan（驱动级异常形态，两列对一列目标）
 	fake := sql.OpenDB(&fakeIterErrConnector{scanFailNeedle: "FROM security_threat_sources"})
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	version, err := latestSourceVersion(context.Background(), fake, "security_threat_sources")
@@ -46,6 +50,7 @@ func TestLatestSourceVersion_scanFailureIsReported(t *testing.T) {
 func TestLatestSourceVersion_rowsIterationFailureIsReported(t *testing.T) {
 	// Given：遍历中途驱动失败（Next 后在 rows.Err 暴露）
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM security_crawler_sources"})
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	version, err := latestSourceVersion(context.Background(), fake, "security_crawler_sources")
@@ -62,6 +67,7 @@ func TestLatestSourceVersion_rowsIterationFailureIsReported(t *testing.T) {
 func TestReportSecurityLibraryVersions_scanFailureYieldsNoVersion(t *testing.T) {
 	// Given：威胁库首行即不可扫
 	fake := sql.OpenDB(&fakeIterErrConnector{scanFailNeedle: "FROM security_threat_sources"})
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	threat, crawler := reportSecurityLibraryVersions(context.Background(), fake)

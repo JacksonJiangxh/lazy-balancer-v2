@@ -387,6 +387,9 @@ func TestDumpTableAsJSON_propagatesRowsIterationError(t *testing.T) {
 	// Given：security_policies 迭代中途驱动失败
 	service, _ := newClusterTestService(t)
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM security_policies"})
+	// fake 句柄必须显式收尾：sql.OpenDB 即刻驻留 opener 协程，不 Close 就是
+	// suite 终态守卫下的永久泄漏（JJC-20261116-001-B7）。
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	_, err := service.dumpTableAsJSON(context.Background(), fake, "security_policies", "id", "id")
@@ -403,6 +406,7 @@ func TestSnapshotACME_propagatesCAProviderRowsIterationError(t *testing.T) {
 	// 只检查了 Close 错误）
 	service, _ := newClusterTestService(t)
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM ca_providers"})
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	_, err := service.snapshotACME(context.Background(), fake)
@@ -417,6 +421,7 @@ func TestSnapshotCertificates_propagatesManualCertRowsIterationError(t *testing.
 	// Given：手工证书（tls_source='manual'）迭代中途驱动失败
 	service, _ := newClusterTestService(t)
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "tls_source='manual'"})
+	t.Cleanup(func() { _ = fake.Close() })
 
 	// When
 	_, err := service.snapshotCertificates(context.Background(), fake)

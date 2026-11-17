@@ -380,7 +380,7 @@ func TestRotateAuditLog_continuousWritesStillTruncate(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -506,7 +506,7 @@ func TestRotateAuditLog_truncateDeferredReturnsSentinel(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -720,7 +720,7 @@ func TestRotateAuditLog_gateIngestAdvancesRotatedIngestStart(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()

@@ -50,7 +50,10 @@ func setupIsolatedDBWithMetrics(t *testing.T) *sql.DB {
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatalf("initialize test database: %v", err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	// InitializeMetricsDB 成功路径直接覆盖包级 MetricsDB 且不关旧值：Initialize
+	// 刚建好的指标池被覆盖后指针不可达，必须覆盖后立即 Close（否则每个调用点
+	// 恒定泄漏 opener/cleaner 协程，suite 终态守卫按泄漏计）。
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatalf("initialize test metrics database: %v", err)
 	}
 	database := db.DB
@@ -59,6 +62,24 @@ func setupIsolatedDBWithMetrics(t *testing.T) *sql.DB {
 		restoreGlobalDBHandles(oldDB, oldMetricsDB, oldAuditDB, oldCurrent)
 	})
 	return database
+}
+
+// initMetricsDBForTest 是测试内第二次初始化指标库的单源入口。InitializeMetricsDB
+// 的成功路径直接覆盖包级 MetricsDB 且不关旧值（生产进程只调用一次无碍），测试
+// 反复调用会把被覆盖句柄的 opener/cleaner 协程永久留在进程里——句柄指针不可达，
+// 此后再也 Close 不到（JJC-20261116-001-B7 收口）。与 handlers.initAuditDBForTest、
+// middleware 的 closeSupersededTestHandles 同型语义：覆盖前留存旧值，覆盖成功
+// 后立即 Close（旧值自被覆盖那一刻起已无任何引用方）。
+func initMetricsDBForTest(t testing.TB, dataDir string) error {
+	t.Helper()
+	superseded := db.MetricsDB
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		return err
+	}
+	if superseded != nil && superseded != db.MetricsDB {
+		_ = superseded.Close()
+	}
+	return nil
 }
 
 // restoreGlobalDBHandles 恢复三个全局句柄并同步 db.GetDB() 的原子句柄：

@@ -88,10 +88,20 @@ func TestApplySnapshot_ruleLogCleanupFailureDoesNotFailSync(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(logDir, "lb_gone2.log"), []byte("line\n"), 0o644); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
-	if err := os.Chmod(logDir, 0o500); err != nil {
-		t.Fatalf("chmod log dir: %v", err)
+	// 清理失败注入：把日志本体占位为非空目录——os.Remove 对非空目录返回
+	// ENOTEMPTY，删除面（removeRuleLogRotationsInEntries 的 os.Remove）不得
+	// 吞掉该错误。不依赖目录权限位：chmod 0500 对 root 无效（CAP_DAC_OVERRIDE
+	// 直接无视读位，曾实测 root 下删除成功），非空目录的 ENOTEMPTY 与运行
+	// 用户无关，断言稳定；且最终断言（日志残留）经 stat 仍成立。
+	if err := os.Remove(filepath.Join(logDir, "lb_gone2.log")); err != nil {
+		t.Fatalf("remove log file: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(logDir, 0o755) })
+	if err := os.Mkdir(filepath.Join(logDir, "lb_gone2.log"), 0o755); err != nil {
+		t.Fatalf("occupy log path with dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(logDir, "lb_gone2.log", "inner"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("make occupied dir non-empty: %v", err)
+	}
 
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 8})
 	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)

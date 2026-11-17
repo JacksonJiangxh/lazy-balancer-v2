@@ -1254,16 +1254,49 @@ func snapshotAuditHeaders(hs map[string][]string) (map[string][]string, int64) {
 	return out, total + int64(len(`"_lb_dropped_headers":[""]`)+len(marker)+1)
 }
 
-// jsonStringLengthPreservingByte 标记「JSON 转义后仍输出原字节、长度计 1」的
-// 字节：可打印 ASCII（0x20-0x7e）与 DEL(0x7f) 中不含 " \ < > & 的部分。
-// 其余字节（控制字符、六个转义字符、全部非 ASCII 字节）都要走慢路径，
-// 非 ASCII 一并保守拦下——U+2028/U+2029 计 6 字节、非法 UTF-8 替换为
-// U+FFFD（3 字节），只有解码 rune 才能判定。
+// —— json 转义形态单源区 ——
+//
+// 快/慢边界表（jsonStringLengthPreservingByte）、慢路径 ASCII 分支与探针
+// 体系共用同一份形态语义源：字节按「转义后形态」唯一分类（原样计 1 / 短
+// 转义计 2 / \u00XX 计 6 / 多字节 rune 按字节 / 非法 UTF-8 按
+// jsonInvalidUTF8EscapeLen 探针校准），表与慢路径任何一处改动都必经 13 项
+// 探针钉测与随机对拍钉测对 json.Marshal 验证，杜绝两份并行硬编码漂移。
+
+// jsonShortEscapedBytes 短转义字节集（转义后 2 字节）单源定义：表摘除步
+// 与慢路径 switch（见 jsonStringEscapedLenSlow）同语义——改动必须两处同
+// 步，漂移由探针钉测显红。
+var jsonShortEscapedBytes = []byte{'"', '\\', '\b', '\f', '\n', '\r', '\t'}
+
+// jsonHTMLSafeBytes \u00XX 形态字节集（转义后 6 字节）单源定义：表摘除步
+// 与慢路径 switch 同语义。控制字符（<0x20）同为 6 字节形态但无需入集——
+// 表基准步已保守置非原样，慢路径 c<0x20 分支覆盖。
+var jsonHTMLSafeBytes = []byte{'<', '>', '&'}
+
+// jsonStringLengthPreservingByte 标记「JSON 转义后仍输出原字节、长度计 1」
+// 的字节：可打印 ASCII（0x20-0x7e，含 DEL）中不含短转义与 < > & 的部分。
+// 其余字节（控制字符、短转义、全部非 ASCII 字节）都要走慢路径，非 ASCII
+// 一并保守拦下——U+2028/U+2029 计 6 字节、非法 UTF-8 替换长度是工具链相关
+// 的转义形态（go1.26 编码后端把替换符 U+FFFD 编为 6 字节 \ufffd 转义，v1
+// 是 3 字节裸 UTF-8），只有解码 rune 才能判定。表只控快/慢边界
+// （true ⟺ 该字节转义后原样输出且计 1），语义钉在探针集与对拍钉测上。
+//
+// 初始化器四步单源：每一步都从同一份形态语义源（上方两组单源字节集 + 探
+// 针集钉住的形态事实）取数，不与慢路径另行并行硬编码。
 var jsonStringLengthPreservingByte = func() (t [256]bool) {
+	// 步骤 1｜基准保守：256 项全非原样——任何未被探针证实「转义后原样」
+	// 的字节一律交慢路径裁决（慢路径是完备编码器，只多算不错算）。
+	// 步骤 2｜原样白名单：0x20-0x7e（含 DEL(0x7f)，探针证实原样计 1）；
+	// ≥0x80 永不原样（须解码 rune 判定形态）。
 	for c := 0x20; c < 0x80; c++ {
 		t[c] = true
 	}
-	for _, c := range []byte{'"', '\\', '<', '>', '&'} {
+	// 步骤 3｜短转义摘除：单源短转义集逐字节摘除（转义后 2 字节形态）。
+	for _, c := range jsonShortEscapedBytes {
+		t[c] = false
+	}
+	// 步骤 4｜\u00XX 形态摘除：单源 HTML 安全集逐字节摘除（转义后 6 字节
+	// 形态）；控制字符本就停在步骤 1 的基准零，无需显式摘除。
+	for _, c := range jsonHTMLSafeBytes {
 		t[c] = false
 	}
 	return t
@@ -1285,8 +1318,10 @@ func jsonStringEscapeFreePrefixLen(s string) int {
 // jsonStringEscapedLen 返回 s 经 encoding/json 字符串编码后的精确字节数
 // （不含两侧引号），与 json.Marshal 的转义规则逐一对齐：引号/反斜杠与
 // \b\f\n\r\t 双字节短转义，其余控制字符与 HTML 安全字符 <>& 按 \u00XX
-// 六字节，U+2028/U+2029 按 \u202X 六字节，非法 UTF-8 字节替换为
-// U+FFFD（3 字节）。等值性由随机串对拍测试钉住；纯字节扫描零分配。
+// 六字节，U+2028/U+2029 按 \u202X 六字节，非法 UTF-8 字节替换为 U+FFFD
+// （转义形态长度由 jsonInvalidUTF8EscapeLen init 探针校准——go1.26 编码
+// 后端为 6 字节 \ufffd 转义，v1 为 3 字节裸 UTF-8）。等值性由随机串对拍
+// 测试与 13 项探针钉测钉住；纯字节扫描零分配。
 // 无转义触发字节的前缀（绝大多数请求取值）走
 // jsonStringEscapeFreePrefixLen 快路径，只有触发字节之后才逐字节解码。
 func jsonStringEscapedLen(s string) int {
@@ -1319,7 +1354,7 @@ func jsonStringEscapedLenSlow(s string) int {
 		i += size
 		switch {
 		case r == utf8.RuneError && size == 1:
-			n += 3 // 非法 UTF-8 字节 → 替换为 U+FFFD
+			n += jsonInvalidUTF8EscapeLen // 非法 UTF-8 字节 → 替换为 U+FFFD（转义长度 init 探针校准，勿硬编码）
 		case r == '\u2028' || r == '\u2029':
 			n += 6
 		default:
@@ -1327,6 +1362,83 @@ func jsonStringEscapedLenSlow(s string) int {
 		}
 	}
 	return n
+}
+
+// —— 单源区续：探针体系 ——
+
+// jsonInvalidUTF8EscapeLen 非法 UTF-8 字节的替换转义长度（探针自校准）：
+// init 期对 "\x80" 实测一次 json.Marshal 的字面长度（len(literal)-2）。
+// go1.26 起的编码后端把替换符 U+FFFD 编为 6 字节转义形态 \ufffd（v1 是
+// 3 字节裸 UTF-8）——硬编码任一值都会在工具链切换时让估算器与真实编码
+// 分叉（本机 go1.26.1 实测 6；存量红 TestJSONStringEscapedLen 根因即
+// 此），故与表校准同一探针体系，工具链自适应。
+var jsonInvalidUTF8EscapeLen = jsonCalibrateInvalidUTF8EscapeLen()
+
+// jsonTableCalibLogf json 表/探针校准留痕缝（测试注入；缺省 caddy.Log）：
+// 探针失准/防御回退必须留痕，否则表现为预算口径静默漂移。
+var jsonTableCalibLogf = func(format string, args ...any) {
+	caddy.Log().Named("auditwriter").Sugar().Warnf(format, args...)
+}
+
+// jsonCalibrateInvalidUTF8EscapeLen 校准非法 UTF-8 替换长度。
+func jsonCalibrateInvalidUTF8EscapeLen() int {
+	quoted, err := json.Marshal("\x80")
+	return jsonInvalidUTF8EscapeLenFromProbe(quoted, err)
+}
+
+// jsonInvalidUTF8EscapeLenFromProbe 从探针字面量取替换长度：err 或字面量
+// 缺引号时回退 v1 值 3 并留痕。纯防御——string 探针 marshal 失败理论不可
+// 达；真发生时口径回落旧工具链假设，由探针钉测/对拍钉测显红，绝不带病
+// 静默漂移。
+func jsonInvalidUTF8EscapeLenFromProbe(quoted []byte, err error) int {
+	const v1Fallback = 3 // v1 工具链的裸 UTF-8 形态值。
+	if err != nil || len(quoted) < 2 {
+		jsonTableCalibLogf("auditwriter: json invalid-utf8 probe failed (err=%v), falling back to v1 escaped len %d", err, v1Fallback)
+		return v1Fallback
+	}
+	return len(quoted) - 2
+}
+
+// jsonTableProbeSet 13 项探针集：表边界/慢路径/校准常量与真实编码的逐形态
+// 对拍源，每项钉一种转义形态——
+//
+//  1. 空串（快路径全串基线）；2. 纯可打印（快路径整串）；3. DEL 原样计 1；
+//     4-6. 引号/反斜杠/\n 短转义；7. \b\f\r\t 余四个短转义；8. <>& \u00XX；
+//  9. 控制字符 \u00XX；10. U+2028/U+2029 六字节；11. 合法多字节裸 UTF-8；
+//  12. 非法 UTF-8 单字节（校准源）；13. 非法 UTF-8 双字节（2×校准值）。
+//
+// init 期逐项对拍 json.Marshal 实测长度；失准经 jsonTableCalibLogf 留痕而
+// 不 panic——审计路径不得因口径分叉中断，显红由探针钉测/对拍钉测承担。
+var jsonTableProbeSet = [...]struct{ name, src string }{
+	{"empty", ""},
+	{"printable-fastpath", "abc XYZ09"},
+	{"del-passes-through", "\x7f"},
+	{"quote-short-escape", "\""},
+	{"backslash-short-escape", "\\"},
+	{"newline-short-escape", "\n"},
+	{"other-short-escapes", "\b\f\r\t"},
+	{"html-safe-u00xx", "<>&"},
+	{"control-u00xx", "\x00\x1f"},
+	{"line-sep-u202x", "\u2028\u2029"},
+	{"multibyte-raw-utf8", "中文é"},
+	{"invalid-utf8-single", "\x80"},
+	{"invalid-utf8-double", "\x80\xff"},
+}
+
+func init() { jsonProbeVerifyTable() }
+
+// jsonProbeVerifyTable 13 项探针逐项对拍（init 期与钉测共用同一实现）。
+func jsonProbeVerifyTable() {
+	for _, p := range jsonTableProbeSet {
+		quoted, err := json.Marshal(p.src)
+		if err != nil {
+			jsonTableCalibLogf("auditwriter: json table probe %s marshal failed: %v", p.name, err)
+			continue
+		}
+		if got, want := jsonStringEscapedLen(p.src), len(quoted)-2; got != want {
+			jsonTableCalibLogf("auditwriter: json table probe %s diverged from encoding/json: got=%d want=%d src=%q（工具链编码形态漂移，探针钉测将显红）", p.name, got, want, p.src)
+		}
+	}
 }
 
 // snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil

@@ -266,7 +266,7 @@ func TestSecurityEventsMapHost_MatchesCanonicalAndReportsUnknown(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','test rule','http','go029.com',443,1)`); err != nil {
@@ -311,7 +311,7 @@ func TestSecurityEventsMigration_NameColumnsExistWithDefaults(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	// When: inspecting the security_events snapshot columns
@@ -364,7 +364,7 @@ func TestSecurityEventsTickStoresResolvedNames(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_named1','命名规则','http','go029.com',443,1)`); err != nil {
@@ -519,7 +519,7 @@ func TestSecurityEventsTickIngestsFixtureLog(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','test rule','http','go029.com',443,1)`); err != nil {
@@ -641,7 +641,7 @@ func TestSecurityEventsTick_idleTickSkipsMappingLoad(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	oldDB := db.DB
@@ -711,7 +711,7 @@ func TestSecurityEventsIngestRotatedDelta_recoversRotationWindowEvents(t *testin
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','test rule','http','go029.com',443,1)`); err != nil {
@@ -795,7 +795,7 @@ func TestSecurityEventsTickDedupesDuplicateTransactionID(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','test rule','http','go029.com',443,1)`); err != nil {
@@ -841,7 +841,7 @@ func TestSecurityEventsTickSkipsMalformedAndContinues(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -904,7 +904,7 @@ func TestSecurityEventsTickSkipsTransactionWithoutIDAndContinues(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -953,7 +953,7 @@ func TestRotateAuditLog_ingestsLiveTailWrittenBetweenCopyAndTruncate(t *testing.
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1018,7 +1018,7 @@ func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1075,7 +1075,7 @@ func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 	}
 
 	// When：指标库恢复后再次轮转 → shift 前先重试补采成功、标记清除、B 入库
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	rotateAuditLogIfNeeded(context.Background())
@@ -1104,7 +1104,7 @@ func TestSecurityEventsPollOnce_reportsPersistentFailureAndRecovery(t *testing.T
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	metricsDB := db.MetricsDB
@@ -1154,7 +1154,7 @@ func TestSecurityEventsPollOnce_returnsCountWithoutWritingTaskLog(t *testing.T) 
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1190,7 +1190,7 @@ func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1264,7 +1264,7 @@ func TestSecurityEventsTick_reportsErrorBeyondScanWindow(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1323,7 +1323,7 @@ func TestRotateAuditLog_recoversCrossBoundaryTransaction(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1514,7 +1514,7 @@ func TestSecurityEventsTick_warnRateLimitedPerOffset(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1553,7 +1553,7 @@ func TestRotateAuditLog_skipsMalformedRegionInArchive(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1618,7 +1618,7 @@ func TestRotateAuditLog_endsPassWhenArchiveGarbageUnrecoverable(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1678,7 +1678,7 @@ func TestRotateAuditLog_backscanFindsStraddleDocStartBeyond8MB(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1782,7 +1782,7 @@ func TestRotateAuditLog_abortsRotationWhenMarkerWriteFails(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1845,7 +1845,7 @@ func TestRotateAuditLog_liveTailGarbageDoesNotBlockRotation(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -1975,7 +1975,7 @@ func securityEventsSeedAttrPolicy(t *testing.T, ruleTriggered string, policies [
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','r','http','go029.com',443,1)`); err != nil {
@@ -2177,7 +2177,7 @@ func TestSecurityEventsAttribution_UnboundReturnsZeroValue(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','r','http','go029.com',443,1)`); err != nil {
@@ -2214,7 +2214,7 @@ func TestSecurityEventsAttribution_LegacyBlacklistDenyPicksOwnerPolicy(t *testin
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,custom_rules,crs_rule_groups) VALUES (1,'policy-A',1,'[]','[]')`); err != nil {
@@ -2246,7 +2246,7 @@ func TestSecurityEventsAttribution_IPACLDenyPicksOwnerPolicy(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,custom_rules,crs_rule_groups) VALUES (1,'policy-A',1,'[]','[]')`); err != nil {
@@ -2276,7 +2276,7 @@ func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwn
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,custom_rules,crs_rule_groups) VALUES (1,'policy-A',1,'[]','[]'),(3,'policy-B',1,'[]','[]')`); err != nil {
@@ -2302,7 +2302,7 @@ func TestSecurityEventsAttribution_IPACLAllowModeDoesNotOwnDenyEvent(t *testing.
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,custom_rules,crs_rule_groups) VALUES (1,'policy-A',1,'[]','[]')`); err != nil {
@@ -2630,7 +2630,7 @@ func TestSecurityEventsAttribution_GeoIPOwnerPicksGeoIPCarryingPolicy(t *testing
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rule1','r','http','go029.com',443,1)`); err != nil {
@@ -3020,7 +3020,7 @@ func TestSecurityEventsAttribution_FallbackModeFeasibilityGate(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	// Given:四模式策略——custom_only/blocking(组 94 排空 contains)/detection(组 94)/off
@@ -3097,7 +3097,7 @@ func TestSecurityEventsAttribution_geoipPrecheckExactSegment(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	// Given：p1/p2 各带 geoip（deny 模式），p3 blocking 无 geoip，p5 off 无 geoip
@@ -3153,7 +3153,7 @@ func TestSecurityEventsAttribution_IPFamilyFallbackPrefersIPCapablePolicy(t *tes
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,mode,custom_rules,crs_rule_groups,ip_whitelist_enabled,ip_whitelist) VALUES
@@ -3183,7 +3183,7 @@ func TestSecurityEventsAttribution_IPACLMemberOwnerWinsOverNonMemberDeny(t *test
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,mode,custom_rules,crs_rule_groups,ip_acl_enabled,ip_acl_mode,ip_acl_list,ip_blacklist) VALUES
@@ -3234,7 +3234,7 @@ func TestSecurityEventsAttribution_Stage1DenyOwnerBeatsIncapablePolicies(t *test
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,mode,policy_type,custom_rules,crs_rule_groups,ip_acl_enabled,ip_acl_mode,ip_acl_list) VALUES
@@ -3265,7 +3265,7 @@ func TestSecurityEventsAttribution_IncapableOnlyStillAttributed(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,mode,custom_rules,crs_rule_groups) VALUES
@@ -3297,7 +3297,7 @@ func TestSecurityEventsAttribution_IPFamilyCapabilityTruthTable(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,mode,custom_rules,crs_rule_groups,ip_acl_enabled,ip_acl_mode,ip_acl_list,ip_acl_list_refs,ip_whitelist_enabled,ip_whitelist) VALUES
@@ -3377,7 +3377,7 @@ func TestSecurityEventsAttribution_CustomFamilyCapabilityPreference(t *testing.T
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id, name, description, conditions, action, score, enabled) VALUES
@@ -3463,7 +3463,7 @@ func TestSecurityEventsFallbackGate_CustomFamilyTruthTable(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id, name, description, conditions, action, score, enabled) VALUES
@@ -3611,7 +3611,7 @@ func TestSecurityEventsAttribution_Stage0ZeroEmissionSurfaceLock(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id, name, description, conditions, action, score, enabled) VALUES
@@ -3675,7 +3675,7 @@ func TestSecurityEventsAttribution_Stage0PassthroughTrustDoesNotOwnLoggedIPEvent
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	// 1=stage0 直通信任（更小 policy_id，候选序在前）；2=deny ACL 属主（名单被事后
@@ -3951,7 +3951,7 @@ func installSecurityEventsAutobanFixture(t *testing.T) {
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	setAutobanConfigRaw(t, true, 5, 60, "1h", "all", false)
@@ -4356,7 +4356,7 @@ func BenchmarkSecurityEventsLoadMappingsReferencedThreatList(b *testing.B) {
 			if err := initSecurityEventsTestDB(b, dataDir); err != nil {
 				b.Fatal(err)
 			}
-			if err := db.InitializeMetricsDB(dataDir); err != nil {
+			if err := initMetricsDBForTest(b, dataDir); err != nil {
 				b.Fatal(err)
 			}
 			restoreWaf := OverrideThreatWafDirForTest(b.TempDir())
@@ -4545,7 +4545,7 @@ func TestSecurityEventsAttribution_trustRefsWithEmptyListDoesNotOwnEvent(t *test
 	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
+	if err := initMetricsDBForTest(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	// 策略 1：无 IP 能力的 detection；策略 2：信任名单仅引用一个不存在的名单

@@ -19,6 +19,7 @@ import (
 // IP 名单的策略渲染都会经 writeIPListFile 落盘（fail-closed：写失败=渲染
 // 报错）；默认 /app/waf/ip-lists 在开发机不可写，统一改指临时目录并把
 // 算子白名单前缀对齐（算子构建期会真实读文件）。
+// + DB 句柄守卫（见函数尾）。
 func TestMain(m *testing.M) {
 	// 环境护栏：TMPDIR 被沙箱回收时 t.TempDir() 会级联假红（同
 	// internal/handlers 的 suite 守卫，见 testsupport.EnsureUsableTempDir）。
@@ -61,7 +62,7 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	_ = os.RemoveAll(dir)
-	os.Exit(code)
+	os.Exit(testsupport.CheckDBHandleGoroutines(code))
 }
 
 // readRenderedIPList 从渲染产物中抽取含 scopeMarker 的 @ipListFast 文件名

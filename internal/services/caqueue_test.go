@@ -2066,6 +2066,14 @@ func TestCAQueue_tick_appliesProviderConfigUpdateWhileQueued(t *testing.T) {
 		t.Cleanup(func() {
 			close(release)
 			queue.cancel()
+			// 必须在 cancel 之后等在执行体退出：cleanup 链 LIFO，本闭包先于
+			// setupIsolatedDB 的全局句柄还原执行；若在飞协程仍活着，它会读已还原
+			// （nil）的 db.DB 而 panic。executions 是队列自带的完成信号——
+			// prepareExecutionLocked 里 Add、execute 退出时 Done，Wait 返回即证明
+			// 执行体已走完（含 jobExists/requeueCanceledJob 等读库路径）。
+			// close(release) 已解除唯一阻塞点，Wait 不会死锁。
+			// JJC-20261117-001
+			queue.executions.Wait()
 		})
 		return seed{queue: queue, jobID: int(jobID), providerID: int(providerID)}
 	}

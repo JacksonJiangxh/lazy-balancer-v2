@@ -13,7 +13,7 @@ import (
 func setupSecurityEventsRetentionTestDB(t *testing.T) {
 	t.Helper()
 	setupIsolatedDB(t)
-	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+	if err := initMetricsDBForTest(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
 	}
 }
