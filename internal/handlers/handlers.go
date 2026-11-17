@@ -711,9 +711,9 @@ func reloadDetailFor(f txApplyFinish) string {
 func (h *Handlers) applyCaddyConfigE() error {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	err := h.caddyService.GenerateAndApplyConfigForceInLock() // 已持 caddyOpMu（=CaddyOpLock）——重入取锁死锁
-	h.recordCaddyApplyResult(err)
-	return err
+	// 渲染 + 记账单源在 applyCaddyConfigInLock（branding 锁内入口复用同一份，
+	// 避免两份「渲染 + 记账」实现漂移）；本函数只负责取锁。
+	return h.applyCaddyConfigInLock()
 }
 
 // rulePayloadInput 是规则保存字段层校验的归一视图：Create 取原值，Update

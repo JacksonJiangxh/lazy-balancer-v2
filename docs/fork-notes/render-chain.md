@@ -391,18 +391,75 @@ sha256 内嵌常量，fixture 证书固定 PEM + certDir 归一化，见该测�
    proxy_protocol / 健康检查都是规则级参数。
 2. HTTP app 该端口 server：listen 从 `[":P"]` 迁移为
    `["tcp/127.0.0.1:7443", "udp/:P"]`（TCP 退内部回环口，UDP 留公网给
-   HTTP/3——Layer4 不碰 UDP）。
-3. 该 server 挂 `listener_wrappers: [proxy_protocol{allow:[127.0.0.1/32],
+   HTTP/3——Layer4 不碰 UDP；此为默认收口形态，`PASSTHROUGH_INTERNAL_BIND`
+   对外时 tcp/ 侧主机部分由 `internalTerminateListenHost()` 派生，见下方语义表）。
+3. 该 server 挂 `listener_wrappers: [proxy_protocol{allow:[<派生 allow>],
    fallback_policy: reject}, tls]`——顺序不可颠倒（wrapper 必须在 TLS 握手前
-   剥头）；allow 只信回环（7443 仅绑 127.0.0.1，唯一合法来源是 Layer4 出站，
-   外部伪造头被 fallback_policy reject 在解析阶段关闭，spike T-5 断言 B/D）。
+   剥头）；allow 由 `internalTerminateProxyAllow()` 按绑定形态派生（**默认形态**
+   即 `127.0.0.1/32`：内部口仅绑回环、唯一合法来源是 Layer4 出站，外部伪造头被
+   fallback_policy reject 在解析阶段关闭，spike T-5 断言 B/D；bind 可配后的
+   派生规则见本节下方语义表）。
 4. 证书/ACME 零改动：TLS 连接策略、certmagic、load_files 全部照旧。
 
-**三元一致要点（spike T-5 踩坑实证）**：Caddy 的 `servers` 挂载键必须与
-server.Listen 逐字一致，否则 listener wrapper **静默不生效**。渲染侧的对应
-约束：`internalTerminateAddr()`（127.0.0.1:7443）同时是 HTTP listen 的 tcp/
-前缀地址、Layer4 兜底 dial、未来 servers 块挂载键的唯一定义点（常量
-`internalTerminatePort`）。
+**四元一致要点（spike T-5 踩坑实证，2026-11-15 由三元升为四元）**：Caddy 的
+`servers` 挂载键必须与 server.Listen 逐字一致，否则 listener wrapper
+**静默不生效**。需要同源的取值共**四处**：**listen 地址 / Layer4 兜底 dial
+地址 / `proxy_protocol` wrapper 的 allow 集合 / `servers` 挂载键**。渲染侧的
+唯一定义点：`internalTerminateListenHost()`（listen 主机部分）、
+`internalTerminateDialHost()`（dial 主机部分）、`internalTerminateProxyAllow()`
+（allow 集合）、`internalTerminateAddr()`（servers 挂载键与同类 `host:port`
+形态），端口由 `internalTerminatePort()`（默认 7443）单源提供。任一处内联拼
+地址即视为回归。
+
+**内部口端口与绑定地址均可配（2026-11-15 追加裁定，两则）**：
+
+1. `PASSTHROUGH_INTERNAL_PORT` 换内部终结口——host 网络下 7443 与宿主其他
+   回环监听冲突的逃生门（面板口/代理口同款故障路径）。
+2. `PASSTHROUGH_INTERNAL_BIND` 换绑定地址——家庭网络 / ISP 封禁入站 443 时
+   **放弃 Layer4 SNI 分流**，把终结口绑到对外地址由外部直连入站；默认值
+   不变（收口回环），对外是显式选择。
+
+绑定地址语义表（`internalTerminateBind()` 求值；`internalTerminateExposed()`
+判是否对外，对外时 `warnInternalTerminateExposed()` 告警，每进程一次）：
+
+| 取值 | listen | Layer4 兜底 dial | wrapper allow | 对外 |
+|---|---|---|---|---|
+| 未设 / `localhost` / `127.0.0.1` / `::1` | 该回环 | 同址 | 同族回环 `/32` 或 `/128` | 否 |
+| `0.0.0.0` | `0.0.0.0:<port>` | `127.0.0.1:<port>` | `127.0.0.1/32` | 是 |
+| `::` | `[::]:<port>` | `[::1]:<port>` | `::1/128` | 是 |
+| 其他 IP | 该 IP | 该 IP | 回环 + 该 IP `/32` | 是 |
+| 非法 | 回落 `127.0.0.1` + 告警 | 同左 | 同左 | 否 |
+
+语义边界：
+
+- 端口未设/非法（非数字/0/负/>65535）→ 告警回落默认 7443（与 `envPort`
+  同口径）；绑定地址非法 → 告警回落 `127.0.0.1`（不静默生效）；
+- **listen 与 dial 必须分离**：`0.0.0.0` / `::` 只进 listen（对外收流），兜底
+  dial 恒为同族回环——合并成单一地址就会去拨 `0.0.0.0` 这类不可连接的语义
+  地址，本地终结链路全断；两处取值分别由 `internalTerminateListenHost()` /
+  `internalTerminateDialHost()` 单源提供；
+- **指定 IP 绑定时 allow 必须含该 IP**：dial 目标即该 IP，出站源不保证是回环，
+  allow 若只有 `127.0.0.1/32` 会把 PROXY 头当 TLS 数据（握手 EOF），兜底链路坏；
+- 换口三处同步（HTTP listen 迁移地址 / Layer4 兜底 dial / 挂载键），由
+  `internalTerminateAddr()` 单源保证；钉测
+  `TestInternalTerminatePort_followsEnv` 断言整链跟随；
+- 规则监听口与内部口同口 → 渲染显性 generationFailure（指向换口手段），
+  由 `TestInternalTerminatePort_conflictsWithRulePort` 钉住；
+- 绑定四态由 `TestInternalTerminateBind_` 四条钉住：`_defaultsLoopback`（默认
+  收口回环）/ `_wildcardExposed`（listen 通配 + dial 回环 + allow 不变）/
+  `_specificIPAddsAllow`（指定 IP 且 allow 追加该 IP）/ `_invalidFallsBack`
+  （非法回落）。
+
+**直连入站形态成立（spike T-5 断言 B/C 实证）**：绑全网卡后，外部源**不带**
+PROXY 头直连 `<对外地址>:<内部口>` 可正常完成 TLS 握手（断言 C）——即「放弃
+SNI 分流、外部直连终结口入站」在协议层成立；而非 allow 源**伪造** PROXY 头
+→ 握手 EOF（断言 B），说明 wrapper 的 allow 是唯一入站信任边界，伪造头打不开
+通路；仅绑回环时外部连接被 refused（断言 D）。三者共同结论：**对外能力只依赖
+`PASSTHROUGH_INTERNAL_BIND` 显式开启，安全边界由派生 allow 承担，不靠「是否
+对外」这一隐式前提**——故 ④ 类约束从「恒绑回环」改述为「默认必须收口回环 +
+暴露须显式且告警」。代价（入站无 SNI 分流、无 L4 层 IP/GeoIP 拦截、无 HTTP/3、
+外部 ACME TLS-ALPN-01 不可达、须防火墙限源）见
+`docs/deployment.zh-CN.md`「家庭网络 / 上游封 443（直连终结口入站）」。
 
 **与 TCP 分支的关键差异**：透传**允许多规则同端口**（SNI 分流天然语义，每条
 规则一个 route），TCP 的「同端口唯一规则」互斥约束不适用；透传上游存

@@ -442,6 +442,11 @@ func brandingSyncMarkFailed() {
 // 应用成功后清位；从节点不在本地应用，同样清位（不记待办、不反复重试）。
 var brandingApplyPending atomic.Bool
 
+// brandingApplyPreApplyHook 是测试专用接缝（生产恒 nil）：brandingApplyAfterSync
+// 已通过角色门、即将取 caddyOpMu 渲染前触发——确定性构造「夹具收尾 db.Close()
+// 与异步应用并发」的竞态窗口。生产不调用（先例：retryCertJobPreEnqueueHook）。
+var brandingApplyPreApplyHook func()
+
 // brandingApplyAfterSync 在幂等同步/播种/镜像已完成且有渲染输入变化时，主节点
 // 限定地重应用 Caddy 配置（异步，与 SeedDefaultBlockPage 同模式）。应用侧失败
 // 必须清指纹并记待办（见 brandingSyncMarkFailed）：本轮放行时指纹已记为
@@ -454,21 +459,85 @@ func (h *Handlers) brandingApplyAfterSync() {
 		// 角色读失败不得按主节点继续写
 		// ——公开 GET 触发的异步重应用在从节点上会造成本地 /load 漂移。
 		services.Logf("warn", "branding：读取节点角色失败，跳过本地 Caddy 重应用: %v", roleErr)
-		brandingApplyPending.Store(true)
+		// 先清指纹再记待办：观测方看到待办置位时，重试前置条件（指纹已清）
+		// 必须已就位——否则下一轮同步门会因指纹仍相等被拒，待办永远轮不到重试。
 		brandingSyncMarkFailed()
+		brandingApplyPending.Store(true)
 		return
 	}
 	if !isMaster {
 		brandingApplyPending.Store(false)
 		return
 	}
-	if err := h.applyCaddyConfigE(); err != nil {
-		services.Logf("error", "branding 触发的 Caddy 配置应用失败: %v", err)
-		brandingApplyPending.Store(true)
+	// brandingApplyPreApplyHook 是测试专用接缝（生产恒 nil）：角色门已过、
+	// 渲染尚未开始时触发，用于确定性构造「DB 收尾与异步应用并发」的竞态窗口
+	// （先例：certjobs.go retryCertJobPreEnqueueHook）。
+	if brandingApplyPreApplyHook != nil {
+		brandingApplyPreApplyHook()
+	}
+	// 入口 nil 复核（JJC-20261115-001 D1）：角色门通过后到渲染前重读 db.DB
+	// 之间存在窗口（含 caddyOpMu 排队）——测试夹具收尾 db.Close()（SetDB(nil)
+	// 先于 DB=nil）落进窗口会在 services 渲染链 store.Query 上 panic。防御仅限
+	// 此入口：caddyOpMu 临界区内复核 nil（与渲染链读取同一变量，SeedDefault-
+	// BlockPage 同款先判先例），命中按 roleErr 同款语义收尾——Logf warn →
+	// 清指纹 → 记待办 → return。硬边界：services 渲染链不得加 nil 容错（nil
+	// 是异常态，吞掉会把生产缺陷静默化为「跳过应用」）。
+	// 不直调 applyCaddyConfigE：它自取 caddyOpMu 不可重入，锁内复核必须走
+	// 不取锁的内层实现（applyCaddyConfigInLock，渲染 + recordCaddyApplyResult
+	// 与 applyCaddyConfigE 逐句等价）。
+	applied, err := h.applyCaddyConfigUnderBrandingGate()
+	if !applied {
+		services.Logf("warn", "branding：数据库句柄已收尾，跳过本地 Caddy 重应用（下轮窗口重试）")
+		// 先清指纹再记待办：与上方 roleErr 分支同一顺序语义。
 		brandingSyncMarkFailed()
+		brandingApplyPending.Store(true)
+		return
+	}
+	if err != nil {
+		services.Logf("error", "branding 触发的 Caddy 配置应用失败: %v", err)
+		brandingSyncMarkFailed()
+		brandingApplyPending.Store(true)
 		return
 	}
 	brandingApplyPending.Store(false)
+}
+
+// applyCaddyConfigInLock 是 caddyOpMu 临界区内的「渲染 + 结果记账」内层实现，
+// **自身不取锁**（调用方必须已持 caddyOpMu）：branding 入口需在锁内先复核
+// db.DB，故不能直调自取锁的 applyCaddyConfigE（不可重入），只能复用内层。
+//
+// 与 handlers.go 的 applyCaddyConfigE 同源：applyCaddyConfigE 取锁后也只调本
+// 函数——即配置应用**入口**单源（外部入口 applyCaddyConfigE、品牌入口
+// applyCaddyConfigUnderBrandingGate 都汇到本函数；JJC-20261115-003-B2 已收口，
+// 此前的「单源登记为 follow-up」作废）。新增配置写入口只需复用一个：外部入口
+// 取锁后调本函数，品牌入口走 applyCaddyConfigUnderBrandingGate（锁内先复核
+// db.DB）。
+//
+// 入口层 + 已持锁内联层均已单源（语义单源，非形态单源）——本函数是已持锁
+// 内联层的唯一实现体；另有 4 处『渲染+记账』两行内联点
+// （rules.go:4033/:4110/:5496、config_backup.go:6966）与本函数语义同构，
+// 不得在其中任一处单独增删记账步骤（增删只允许落在本函数）；内联点如需
+// 行为级收口，改调本函数即可。JJC-20261115-003 残留⑥以此口径结项。
+func (h *Handlers) applyCaddyConfigInLock() error {
+	err := h.caddyService.GenerateAndApplyConfigForceInLock() // 已持 caddyOpMu（=CaddyOpLock）——重入取锁死锁
+	h.recordCaddyApplyResult(err)
+	return err
+}
+
+// applyCaddyConfigUnderBrandingGate 取 caddyOpMu，在锁内复核 db.DB 后渲染，
+// 返回 applied=false 表示句柄已收尾、本轮未渲染（调用方按 roleErr 同款语义
+// 收尾：清指纹 + 记待办）。
+//
+// 锁纪律：defer 放锁，**临界区内 panic 不得泄漏全局写锁**——caddyOpMu 委托
+// services.CaddyOpLock（跨层唯一 Caddy 写互斥），泄漏后规则保存/证书部署/
+// 重载/导入等全部配置写窗口永久阻塞；与 services.withCaddyOpLock 同一纪律。
+func (h *Handlers) applyCaddyConfigUnderBrandingGate() (applied bool, err error) {
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
+	if db.DB == nil {
+		return false, nil
+	}
+	return true, h.applyCaddyConfigInLock()
 }
 
 func (h *Handlers) GetBranding(c *gin.Context) {

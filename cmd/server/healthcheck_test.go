@@ -3,16 +3,106 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 )
 
+// withPANEL_PORT 设临时 PANEL_PORT 环境变量（测试结束还原）。
+func withPANEL_PORT(t *testing.T, value string) {
+	t.Helper()
+	old, had := os.LookupEnv("PANEL_PORT")
+	if value == "" {
+		_ = os.Unsetenv("PANEL_PORT")
+	} else {
+		_ = os.Setenv("PANEL_PORT", value)
+	}
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("PANEL_PORT", old)
+		} else {
+			_ = os.Unsetenv("PANEL_PORT")
+		}
+	})
+}
+
+// PANEL_PORT 换口后探针必须跟随：这是本能力的存在意义——host 模式下 8000
+// 被占用时用户换口，探针打旧口会让容器长期误显 unhealthy（面板功能正常）。
+func TestHealthcheckPanelPort_followsPANEL_PORT(t *testing.T) {
+	withPANEL_PORT(t, "9000")
+	urls := healthcheckURLs()
+	wantHTTPS := "https://127.0.0.1:9000/health"
+	wantHTTP := "http://127.0.0.1:9000/health"
+	if urls[0] != wantHTTPS || urls[1] != wantHTTP {
+		t.Fatalf("urls=%v, want [%q %q]", urls, wantHTTPS, wantHTTP)
+	}
+}
+
+// 未设 PANEL_PORT → 出厂默认 8000（与 internal/config 的面板默认端口同口径）。
+func TestHealthcheckPanelPort_defaultsWhenUnset(t *testing.T) {
+	withPANEL_PORT(t, "")
+	urls := healthcheckURLs()
+	if urls[0] != "https://127.0.0.1:8000/health" || urls[1] != "http://127.0.0.1:8000/health" {
+		t.Fatalf("urls=%v, want default :8000 both schemes", urls)
+	}
+}
+
+// 非法值（非数字/越界）必须回落默认而非静默探错端口——与 envPort 同口径。
+func TestHealthcheckPanelPort_invalidFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"not-a-number", "abc"},
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"above-range", "65536"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withPANEL_PORT(t, tc.value)
+			port := healthcheckPanelPort()
+			if port != defaultHealthcheckPort {
+				t.Fatalf("port=%d, want default %d", port, defaultHealthcheckPort)
+			}
+			urls := healthcheckURLs()
+			wantHTTPS := "https://127.0.0.1:" + strconv.Itoa(defaultHealthcheckPort) + "/health"
+			wantHTTP := "http://127.0.0.1:" + strconv.Itoa(defaultHealthcheckPort) + "/health"
+			if urls[0] != wantHTTPS || urls[1] != wantHTTP {
+				t.Fatalf("urls=%v, want [%q %q]", urls, wantHTTPS, wantHTTP)
+			}
+		})
+	}
+}
+
+// 端到端：面板真听在 PANEL_PORT 指定的口上，探针一次打对（HTTPS 先行命中）。
+func TestRunHealthcheck_probesPANEL_PORTPort(t *testing.T) {
+	withPANEL_PORT(t, "9000")
+	// 还原 healthcheckURLs 让它按 env 求值（withHealthcheckURLs 的替身不放行）。
+	oldURLs := healthcheckURLs
+	healthcheckURLs = oldURLs
+	t.Cleanup(func() { healthcheckURLs = oldURLs })
+
+	// httptest 监听随机口，无法钉 9000；改为注入「求值结果」层——真实链路
+	// （env → 端口 → URL）已由上面三个单测覆盖，本测只证明 runHealthcheck
+	// 消费 healthcheckURLs() 的返回值。
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	withHealthcheckURLs(t, srv.URL, "http://127.0.0.1:1")
+	if code := runHealthcheck(); code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+}
+
 func withHealthcheckURLs(t *testing.T, httpsURL, httpURL string) {
 	t.Helper()
-	oldHTTPS, oldHTTP, oldTimeout := healthcheckHTTPSURL, healthcheckHTTPURL, healthcheckTimeout
-	healthcheckHTTPSURL, healthcheckHTTPURL = httpsURL, httpURL
+	oldURLs, oldTimeout := healthcheckURLs, healthcheckTimeout
+	urls := []string{httpsURL, httpURL}
+	healthcheckURLs = func() []string { return urls }
 	t.Cleanup(func() {
-		healthcheckHTTPSURL, healthcheckHTTPURL, healthcheckTimeout = oldHTTPS, oldHTTP, oldTimeout
+		healthcheckURLs, healthcheckTimeout = oldURLs, oldTimeout
 	})
 }
 

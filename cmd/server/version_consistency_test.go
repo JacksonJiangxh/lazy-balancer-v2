@@ -40,10 +40,14 @@ type versionAnchor struct {
 	note string
 }
 
+// 镜像 tag 类锚点只钉 repo 名 + 版本号，**不钉 registry 前缀**：fork 的发布
+// 地址可迁移（上游 Docker Hub → 镜像站/私有 registry），本测试要守的是「各发布面
+// 版本口径一致」，registry 归属换了不该让版本对账失效（0 命中静默通过或误红都算
+// 把测试意图带偏）。build-arg 锚点仍保持「拒 -beta 后缀」的严格口径。
 var versionAnchors = []versionAnchor{
 	{
 		file:        "docker-compose.yml",
-		pattern:     regexp.MustCompile(`image:\s*v55448330/lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
+		pattern:     regexp.MustCompile(`(?m)^\s*image:\s*\S*lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
 		minimumHits: 2,
 		note:        "compose 两处 image tag（主/从节点）",
 		group:       groupStable,
@@ -64,7 +68,7 @@ var versionAnchors = []versionAnchor{
 	},
 	{
 		file:        "README.md",
-		pattern:     regexp.MustCompile(`-t v55448330/lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
+		pattern:     regexp.MustCompile(`-t \S*lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
 		minimumHits: 1,
 		note:        "README.md 构建示例镜像 tag",
 		group:       groupBeta,
@@ -78,7 +82,7 @@ var versionAnchors = []versionAnchor{
 	},
 	{
 		file:        "README.en.md",
-		pattern:     regexp.MustCompile(`-t v55448330/lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
+		pattern:     regexp.MustCompile(`-t \S*lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
 		minimumHits: 1,
 		note:        "README.en.md 构建示例镜像 tag",
 		group:       groupBeta,

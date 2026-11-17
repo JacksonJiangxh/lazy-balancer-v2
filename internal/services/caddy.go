@@ -2762,18 +2762,23 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		// 接管，兜底 route 注入 PROXY v2 携带真实源 IP；此处由原生
 		// caddy.listeners.proxy_protocol 在 **TLS 握手之前** 剥除并改写对端
 		// （顺序不可颠倒——tls 之后 wrapper 拿到的已是加密流）。
-		// allow 只信 127.0.0.1/32：7443 仅绑回环，唯一合法来源是 Layer4 出站，
-		// 外部伪造头在解析阶段即被 fallback_policy reject 关闭（spike T-5 断言 B/D）。
+		// allow 由 internalTerminateProxyAllow() 单源给出：默认形态仍只信
+		// 127.0.0.1/32（内部口仅绑回环，唯一合法来源是 Layer4 出站）；显式
+		// 绑到非回环地址时（PASSTHROUGH_INTERNAL_BIND，JJC-20261115-002）额外
+		// 放行该地址族自身的直连来源。外部伪造头在解析阶段即被
+		// fallback_policy reject 关闭（spike T-5 断言 B/D）。
 		// 详见 docs/fork-notes/render-chain.md §29
 		if portHasPassthrough {
 			server["listener_wrappers"] = []interface{}{
 				map[string]interface{}{
-					"wrapper": "proxy_protocol",
-					"allow":   []string{"127.0.0.1/32"},
+					"wrapper":         "proxy_protocol",
+					"allow":           internalTerminateProxyAllow(),
 					"fallback_policy": "reject",
 				},
 				map[string]interface{}{"wrapper": "tls"},
 			}
+			// 绑定被显式放开到非回环地址时落一次代价提示（默认形态零日志）。
+			warnInternalTerminateExposed()
 		}
 
 		servers[fmt.Sprintf("http_%d", port)] = server
@@ -3006,6 +3011,29 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		passthroughPorts = append(passthroughPorts, port)
 	}
 	sort.Ints(passthroughPorts)
+	// 内部终结口与代理默认监听口冲突（仅透传存在时判断）：内部口一旦等于
+	// HTTP_PORT/HTTPS_PORT，迁到内部口的 listen 会与默认 server 自身的 listen
+	// 抢绑（Caddy 整份拒绝）——显性报错并指向 PASSTHROUGH_INTERNAL_PORT 换口。
+	// 无透传规则时不进入该分支（R5 零回归：默认形态不新增判断路径）。
+	if len(passthroughPorts) > 0 {
+		terminatePort := internalTerminatePort()
+		if terminatePort == DefaultHTTPPort() || terminatePort == DefaultHTTPSPort() {
+			return generationFailure(
+				"透传内部终结口 %d 与代理默认监听口冲突（HTTP_PORT=%d HTTPS_PORT=%d）；请设 PASSTHROUGH_INTERNAL_PORT 换口",
+				terminatePort, DefaultHTTPPort(), DefaultHTTPSPort())
+		}
+	}
+	// 内部终结口与规则监听口冲突：同口会让 Layer4 listen 与 HTTP 迁移 listen
+	// 互相抢绑（本族 listen 迁到内部口后，其他端口规则若正好监听该口，Caddy
+	// 整份拒绝）——显性报错并指向 PASSTHROUGH_INTERNAL_PORT 换口，而非静默
+	// 生成绑不上的配置。
+	for _, port := range passthroughPorts {
+		if port == internalTerminatePort() {
+			return generationFailure(
+				"规则监听端口 %d 与透传内部终结口冲突（PASSTHROUGH_INTERNAL_PORT=%d）；请改规则端口或设 PASSTHROUGH_INTERNAL_PORT 换口",
+				port, internalTerminateDefaultPort)
+		}
+	}
 	for _, port := range passthroughPorts {
 		// 与同端口 TCP 规则的端口归属冲突在保存/启用门已拦（协议互斥）；
 		// 带外脏数据两族同时存在时 Layer4 server 名不同但 listen 同口，Caddy
@@ -5906,23 +5934,130 @@ func buildTCPServer(rule SingleRuleConfig, securityCtxs ...*tcpSecurityRenderInp
 	}, nil
 }
 
-// internalTerminatePort 是 Layer4 前置之后的本地终结口（第一期固定 7443，
-// 仅绑 127.0.0.1，不随 HTTP_PORT/HTTPS_PORT env 变）。方案决策 #9：
-// 固定值让「外部直连内网终结口」的绕过面恒为回环一处（spike T-5 断言 C/D
-// 实证：绑 :7443 存在绕过面，绑 127.0.0.1:7443 即收口）。
+// internalTerminateDefaultPort 是 Layer4 前置之后的本地终结口默认值（7443，
+// 仅绑 127.0.0.1）。原始设计（方案决策 #9）为固定值：让「外部直连内网终结口」
+// 的绕过面恒为回环一处（spike T-5 断言 C/D 实证：绑 :7443 存在绕过面，绑
+// 127.0.0.1:7443 即收口）。host 网络下 7443 虽仅绑回环、不对外，但仍会与宿主
+// 其他进程的回环监听冲突（面板口同款故障路径）——故改为 PASSTHROUGH_INTERNAL_PORT
+// env 可配（非法/越界告警回落默认），仅绑 127.0.0.1 的安全边界不随 env 变。
 // 详见 docs/fork-notes/render-chain.md §29
-const internalTerminatePort = 7443
+const internalTerminateDefaultPort = 7443
 
-// internalTerminateAddr 是内部终结口的 host:port 形态（servers 挂载键、
-// Layer4 兜底 dial、HTTP listen 三处必须逐字一致——spike T-5 实证的三元要点）。
+// internalTerminatePort 返回当前生效的内部终结口：PASSTHROUGH_INTERNAL_PORT
+// env 未设/非法（非数字/0/负/>65535）时告警回落默认。与 config.envPort 同口径
+// （非法值不静默生效——探错口/绑错口都是误报源，必须留痕）；不 import
+// internal/config（services 是其下游包，反向依赖成环）。
+func internalTerminatePort() int {
+	value := os.Getenv("PASSTHROUGH_INTERNAL_PORT")
+	if value == "" {
+		return internalTerminateDefaultPort
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || port < 1 || port > 65535 {
+		Logf("warn", "config: invalid PASSTHROUGH_INTERNAL_PORT=%q; falling back to %d", value, internalTerminateDefaultPort)
+		return internalTerminateDefaultPort
+	}
+	return port
+}
+
+// internalTerminateDefaultBind 是内部终结口的默认绑定地址（仅回环）。
+// 历史设计把「外部直连内部终结口」的绕过面恒定为回环一处（spike T-5 断言
+// C/D：绑 :7443 存在绕过面，绑 127.0.0.1:7443 即收口）；JJC-20261115-002
+// 起该边界可经 PASSTHROUGH_INTERNAL_BIND 显式放开（家庭网络/严格 NAT 下
+// ISP 封禁入站 443 时的逃生通道：放弃 Layer4 SNI 分流、直连终结口入站），
+// 默认值不变。
+const internalTerminateDefaultBind = "127.0.0.1"
+
+// internalTerminateAddr 是内部终结口的 host:port **dial** 形态（Layer4 兜底
+// 路由的 upstream dial）。与 internalTerminateListenAddr 的分工：绑定地址
+// 通配（0.0.0.0 / ::）时不可作为 dial 目标，故退避到同族回环；默认形态下
+// 两者逐字相同（`127.0.0.1:<port>`），保持 R5 口径。
 func internalTerminateAddr() string {
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(internalTerminatePort))
+	return net.JoinHostPort(internalTerminateDialHost(), strconv.Itoa(internalTerminatePort()))
+}
+
+// internalTerminateListenHost 返回内部终结口的绑定 host 形态（= bind.String()）。
+func internalTerminateListenHost() string {
+	return internalTerminateBind().String()
+}
+
+// internalTerminateDialHost 返回内部终结口的连接目标 host：通配地址
+// （0.0.0.0 / ::）不能作为 dial 目标，退避到同族回环；其余原样返回。
+func internalTerminateDialHost() string {
+	bind := internalTerminateBind()
+	if bind.IsUnspecified() {
+		if bind.To4() != nil {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	return bind.String()
 }
 
 // internalTerminateListenAddr 是 HTTP server 的 tcp/ 前缀监听地址形态
 // （Caddy listen 用 `tcp/host:port` 区分网络；UDP 同口另列保留给 HTTP/3）。
 func internalTerminateListenAddr() string {
-	return "tcp/" + internalTerminateAddr()
+	return "tcp/" + net.JoinHostPort(internalTerminateListenHost(), strconv.Itoa(internalTerminatePort()))
+}
+
+// internalTerminateBind 返回内部终结口的绑定地址：PASSTHROUGH_INTERNAL_BIND
+// env 未设/`localhost` 时为回环；无法 net.ParseIP 的值（主机名、带端口写法、
+// 乱填）告警回落 127.0.0.1——非法值不静默生效（绑错口是排障黑洞）。与
+// internalTerminatePort 同族：同在 services 内解析、不 import internal/config
+// （services 是其下游包，反向依赖成环）。
+func internalTerminateBind() net.IP {
+	value := strings.TrimSpace(os.Getenv("PASSTHROUGH_INTERNAL_BIND"))
+	if value == "" || strings.EqualFold(value, "localhost") {
+		return net.ParseIP(internalTerminateDefaultBind)
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		Logf("warn", "config: invalid PASSTHROUGH_INTERNAL_BIND=%q; falling back to %s", value, internalTerminateDefaultBind)
+		return net.ParseIP(internalTerminateDefaultBind)
+	}
+	return ip
+}
+
+// internalTerminateExposed 报告内部终结口是否绑在非回环地址（即对外可达）。
+func internalTerminateExposed() bool {
+	return !internalTerminateBind().IsLoopback()
+}
+
+// internalTerminateProxyAllow 返回 listener_wrappers.proxy_protocol.allow 的
+// 来源 CIDR 集合（单源）：
+//   - 回环/通配绑定：只信同族回环（默认形态 → ["127.0.0.1/32"]，逐字节不变）；
+//   - 指定 v4 IP：回环 + 该 IP /32（该口被外部直连时有合法来源）；
+//   - 指定 v6 IP：回环 + 该 IP /128。
+//
+// 通配绑定不加通配 CIDR：0.0.0.0/0 等于放行任意来源伪造 PROXY 头。
+func internalTerminateProxyAllow() []string {
+	bind := internalTerminateBind()
+	loopback, suffix := "127.0.0.1/32", "/32"
+	if bind.To4() == nil {
+		loopback, suffix = "::1/128", "/128"
+	}
+	if bind.IsLoopback() || bind.IsUnspecified() {
+		return []string{loopback}
+	}
+	return []string{loopback, bind.String() + suffix}
+}
+
+// internalTerminateExposeWarnOnce 保证「内部终结口已对外」的代价提示每次
+// 进程生命周期只落一条——渲染是热路径（每次规则变更重渲染），逐次告警会
+// 把日志刷成噪声。
+var internalTerminateExposeWarnOnce sync.Once
+
+// warnInternalTerminateExposed 在内部终结口绑到非回环地址时落一次 warn，
+// 列明放开该边界的四项代价；默认形态（仅回环）零日志。
+func warnInternalTerminateExposed() {
+	if !internalTerminateExposed() {
+		return
+	}
+	internalTerminateExposeWarnOnce.Do(func() {
+		Logf("warn",
+			"config: PASSTHROUGH_INTERNAL_BIND=%s 使透传内部终结口 %s 对外可达——代价：① 外部直连不经 Layer4，L4 层 IP/GeoIP 拦截不生效（HTTP 层 WAF 仍生效）；② 该口不提供 HTTP/3；③ 外部 ACME 须用 DNS-01；④ 须在防火墙上限制来源地址",
+			internalTerminateListenHost(), internalTerminateListenAddr())
+	})
 }
 
 // buildPassthroughLayer4Server 渲染单个透传端口的 Layer4 server（tls_<port>）。

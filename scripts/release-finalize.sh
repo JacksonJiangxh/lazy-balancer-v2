@@ -19,6 +19,10 @@
 # 每步产出机器可判定输出；任一步失败立即退出非零（set -e + 显式检查）。
 set -euo pipefail
 
+# 镜像仓库前缀集中一处定义（默认 CNB 镜像站，与 docker-compose.yml 的 image 同源）。
+# 换 registry 只需覆盖环境变量 IMAGE_REPO，勿在脚本内各处硬编码仓库地址。
+IMAGE_REPO="${IMAGE_REPO:-docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2}"
+
 TAG="" CHANNEL="" SKIP_CLOUD=0 DRY_RUN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -97,16 +101,16 @@ else
   step "⑤ buildx 双架构推送"
   PROXY_ARGS=""
   [[ -n "${HTTP_PROXY:-}" ]] && PROXY_ARGS="HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY"
-  ( eval "$PROXY_ARGS docker buildx build --builder lazy-builder --platform linux/amd64,linux/arm64 --provenance=false --sbom=false --build-arg VERSION=\"${TAG%%-*}\" -t \"v55448330/lazy-balancer-v2:$TAG\" -t \"v55448330/lazy-balancer-v2:latest\" --push . > /tmp/finalize-push.log 2>&1" ) \
+  ( eval "$PROXY_ARGS docker buildx build --builder lazy-builder --platform linux/amd64,linux/arm64 --provenance=false --sbom=false --build-arg VERSION=\"${TAG%%-*}\" -t \"${IMAGE_REPO}:$TAG\" -t \"${IMAGE_REPO}:latest\" --push . > /tmp/finalize-push.log 2>&1" ) \
     && pass "buildx 推送成功（$TAG + latest）" || fail "buildx 推送失败（见 /tmp/finalize-push.log）"
   # 推送后强拉对账（daemon 缓存可能 stale）；拉取失败不终止——⑥ 一次性容器
   # 终验才是权威判据（无代理环境 pull 走直连可能失败）。
-  ( $PROXY_ARGS docker pull -q "v55448330/lazy-balancer-v2:$TAG" > /dev/null 2>&1 ) || fail "强拉对账失败（不影响已推送镜像；⑥ 终验以本地 tag 为准）"
+  ( $PROXY_ARGS docker pull -q "${IMAGE_REPO}:$TAG" > /dev/null 2>&1 ) || fail "强拉对账失败（不影响已推送镜像；⑥ 终验以本地 tag 为准）"
 fi
 
 # ── ⑥ 一次性容器终验（env/构建戳/健康）──
 step "⑥ 一次性容器终验"
-( docker rm -f lb-finalize > /dev/null 2>&1; docker run -d --rm --name lb-finalize -p 18092:8000 "v55448330/lazy-balancer-v2:$TAG" > /dev/null ) \
+( docker rm -f lb-finalize > /dev/null 2>&1; docker run -d --rm --name lb-finalize -p 18092:8000 "${IMAGE_REPO}:$TAG" > /dev/null ) \
   && pass "lb-finalize 启动" || fail "lb-finalize 启动失败"
 sleep 40
 V_HEALTH="$(docker inspect lb-finalize --format '{{.State.Health.Status}}' 2>/dev/null || echo down)"

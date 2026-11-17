@@ -1,5 +1,76 @@
 # 部署指南
 
+## 镜像与上游 compose 改造（先读这节）
+
+本仓库是上游 [lazy-balancer](https://github.com/v55448330/lazy-balancer)（Lazy Balancer V2）的 fork——**追平上游 + 叠加自研能力**（端口换位、TLS 透传 SNI 分流、链式回退等，登记见 `docs/self-developed-features.zh-CN.md`）。由此有一个关键结论：
+
+> **上游官方仓库的 docker-compose.yml 不能直接用来部署本版本**——上游 compose 的 `image:` 指向官方镜像，拉起来跑的是上游程序，不含本 fork 的任何自研能力（端口换位 env、`PANEL_PORT` 探针跟随、透传内口可配等全部不生效）。
+
+本 fork 的镜像发布地址：
+
+```text
+docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
+```
+
+部署本版本只有两条路，**共同点是镜像必须用上面这个地址**：
+
+1. **用本仓库自带的 `docker-compose.yml`**（已指向本 fork 镜像 + 已内置全部自研参数的注释行，改一行注释即生效）——见下文「完整 compose（本 fork 版）」；
+2. **改造上游官方 compose**：把两处 `image:` 换成本 fork 镜像地址，再按需取消自研参数注释——逐项对照见下表。
+
+### 上游 compose → 本 fork 版逐项对照
+
+| 改动点 | 上游官方 compose | 本 fork 版 | 不改的后果 |
+|---|---|---|---|
+| **镜像（两处）** | `v55448330/lazy-balancer-v2:<tag>` | `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest` | **跑的是上游程序，自研能力全部不存在** |
+| build 段 | `build: context: . + args` | 上游形态照抄会拿上游源码构建 | 本地构建出上游版本 |
+| 自研端口参数 | environment 仅 `NODE_NAME`/`LOG_FILE` | 预置 `HTTP_PORT`/`HTTPS_PORT`/`PANEL_PORT`/`PASSTHROUGH_INTERNAL_PORT` 注释行，取消注释即生效 | 80/443/8000/7443 被占用时没有换口手段 |
+
+### 完整 compose（本 fork 版，可直接复制）
+
+以下即本仓库 `docker-compose.yml` 的当前形态（主节点），镜像与参数已就位，注释行按需取消：
+
+```yaml
+services:
+  lazy-balancer:
+    image: docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
+    container_name: lazy-balancer
+    network_mode: host          # Linux 专用；macOS/Windows 见 README「Docker Desktop」
+    restart: unless-stopped
+    stop_grace_period: 30s      # 优雅关停链最长 25s，默认 10s 会被 SIGKILL
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }   # 每连接一个 fd，默认 1024 必炸
+      nproc:  { soft: 4096, hard: 4096 }
+    pids_limit: 4096
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lazy-balancer", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s          # 冷启动含 CRS 种子/证书物化，30s 必误报
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+    volumes:
+      - lb-data:/app/data        # named volume：SQLite WAL 不经宿主共享层
+      - ./logs:/app/logs
+      - ./certs:/app/certs
+      - ./waf:/app/waf
+      - ./backup:/app/backup
+    environment:
+      - NODE_NAME=master
+      - LOG_FILE=/app/logs/lazy-balancer.log
+      # ↓↓ 本 fork 自研参数（上游无），按需取消注释：
+      # - HTTP_PORT=8080                  # 代理默认口（默认语义，存量规则不迁移）
+      # - HTTPS_PORT=8443
+      # - PANEL_PORT=9000                 # 面板口换口（默认 8000），健康探针自动跟随
+      # - PASSTHROUGH_INTERNAL_PORT=17443 # 透传内部终结口（默认 7443，仅绑 127.0.0.1）
+
+volumes:
+  lb-data:
+```
+
+主从部署、`build` 段与版本号锚点说明见本仓库 `docker-compose.yml` 全文；从节点（bridge 网络）形态与注册说明同文件「lazy-balancer-slave」段。
+
 ## 挂载目录
 
 | 容器路径 | 内容 | 必需 |
@@ -38,6 +109,112 @@
 > Linux 推荐 `--network host`。macOS/Windows 用 `-p 8000:8000 -p 80:80 -p 443:443 -p 443:443/udp`（UDP 为 HTTP/3 必需）。
 >
 > **容器配置用环境变量**（上表）。`docker run <镜像> -config <路径>` 之类的显式参数会被入口脚本透传给面板进程（早期镜像会静默丢弃参数），但容器内侧面板端口固定 8000——用 `-config` 改 `port` 会让内置健康检查打错端口，容器形态请勿改面板端口。
+
+## 修改默认端口（含 compose 具体改法）
+
+80/443 被宿主其他服务占用时的换口方式。**先分清两个端口**：
+
+| 端口 | 能否改 | 方式 |
+|---|---|---|
+| 代理默认口 80/443 | **可改** | 环境变量 `HTTP_PORT` / `HTTPS_PORT` |
+| 面板口 8000 | **容器形态不可改** | 内置健康检查恒打 8000，改了必被判 unhealthy；`PANEL_PORT` 仅裸机自定义启动可用 |
+
+### docker run
+
+```bash
+docker run -d --name lazy-balancer --network host \
+  -e HTTP_PORT=8080 -e HTTPS_PORT=8443 \
+  <其余参数同 README 快速开始> \
+  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
+```
+
+### docker-compose.yml
+
+host 网络下这两个值就是 Caddy 在宿主实际绑定的端口。仓库自带的 `docker-compose.yml` 主节点 environment 段已预置注释行，取消注释即可：
+
+```yaml
+  lazy-balancer:
+    # ...
+    environment:
+      - NODE_NAME=master
+      - LOG_FILE=/app/logs/lazy-balancer.log
+      - HTTP_PORT=8080      # 取消注释并改成目标端口
+      - HTTPS_PORT=8443
+```
+
+Docker Desktop（bridge 网络）场景换口的是 `-p` 映射侧（如 `-p 8080:80`），`HTTP_PORT`/`HTTPS_PORT` 一般保持默认——它决定的是 Caddy 在容器内绑定的端口，与映射无关。
+
+### 语义边界（重要）
+
+`HTTP_PORT`/`HTTPS_PORT` 是本 fork 自研能力（上游无），只决定**默认语义**：
+
+- 新建规则向导的默认端口、空域名兜底站监听口、HTTP→HTTPS 跳转 Location 的自引用判定、80/443 保留端口判定；
+- **已保存规则的监听端口是持久化数据，不会自动迁移**——全项目换口需在面板逐条修改规则后保存。
+
+非法值（0/负数/>65535）启动时回退出厂默认 80/443 并写运行日志告警；`HTTP_PORT`/`HTTPS_PORT` 与面板口同值时同样告警（面板抢占后 Caddy 无法绑定）。实现见 `internal/config/config.go` 与 `internal/services/default_ports.go`，语义说明见 `docs/fork-notes/ports-and-config.md`。
+
+### 面板口 8000 被占用（host 模式专属问题）
+
+host 网络下面板直接绑定宿主 8000——若被宿主其他服务占用，面板启动即绑定失败、容器退出并随 `unless-stopped` 进入重启循环（`docker logs` 可见 bind error）。
+
+处理方式按优先级：
+
+1. **首选**：停掉或迁移占用 8000 的宿主服务（`ss -ltnp | grep :8000` 定位）；
+2. **换口**：设 `PANEL_PORT` 环境变量（如 compose 里 `- PANEL_PORT=9000`），面板真实监听新口，**内置健康探针自动跟随该口**（探针按 `PANEL_PORT` 求值，非法值告警回落 8000）——无需覆盖 healthcheck。本 fork 自研能力（上游探针硬编码端口），实现见 `cmd/server/healthcheck.go` 的 `healthcheckPanelPort` / `healthcheckURLs`；
+3. **禁止**：`PANEL_PORT` 与代理口（`HTTP_PORT`/`HTTPS_PORT`）或 80/443 同值——面板抢占后 Caddy 无法绑定，启动日志有互斥告警。
+
+> 探针跟随只认 `PANEL_PORT` env。用 `docker run <镜像> -config` 经配置文件换面板口的部署不受支持（见「端口」一节注），探针也不会跟随。
+
+### 透传内部终结口 7443 被占用
+
+启用 TLS 透传规则后，系统会在 `127.0.0.1:7443`（仅回环）挂内部 TLS 终结口。它不对外，但 host 网络下仍可能与宿主其他进程的**回环监听**冲突——冲突时 Caddy 绑定失败、配置应用报错。
+
+换口：设 `PASSTHROUGH_INTERNAL_PORT` 环境变量（如 compose 里 `- PASSTHROUGH_INTERNAL_PORT=17443`）。语义边界：
+
+- **默认**绑 `127.0.0.1`（绑定地址另可配，见下节）；换口不改变绑定地址，
+  `proxy_protocol` 的 allow 由绑定形态派生，默认仍只信回环来源；
+- 换口后 Layer4 兜底路由、HTTP 监听迁移地址三处自动同步，无需其他配置；
+- 与规则的监听端口同值时配置生成显性报错（不会静默生成绑不上的配置）；
+- 非法值（非数字/0/负/>65535）告警回落 7443。
+
+实现见 `internal/services/caddy.go` 的 `internalTerminatePort`，自研登记第 5 项。
+
+### 家庭网络 / 上游封 443（直连终结口入站）
+
+家宽或 ISP 封禁入站 443 时，TLS 透传的 Layer4 SNI 分流本身收不到流量（443 上
+没有连接可分流）。逃生形态：把内部终结口绑到对外地址，让外部**直接连终结口
+入站**——代价是这一入口上放弃 SNI 分流（透传域名不可用），本地终结域名照常。
+compose 两行：
+
+```yaml
+environment:
+  - PASSTHROUGH_INTERNAL_PORT=17443
+  - PASSTHROUGH_INTERNAL_BIND=0.0.0.0
+```
+
+`PASSTHROUGH_INTERNAL_BIND` 取值：未设 / `127.0.0.1` / `localhost` / `::1` = 收口
+回环（默认，不对外）；`0.0.0.0` = 全部 IPv4 网卡（dial 仍走 `127.0.0.1`）；`::` =
+全部 IPv6 网卡（`[::]:<port>`，dial 走 `[::1]`）；其他 IP = 只绑该 IP（allow 自动
+追加该 IP）。非法值告警回落 `127.0.0.1`（不静默生效）。
+
+**五条代价，逐条确认再上**：
+
+1. **入站放弃 SNI 分流**：所有域名（含透传域名）都进同一终结口，透传域名在该
+   入口**不可用**（其证书在上游，本系统不持有、不终结）。
+2. **L4 层 IP/GeoIP 拦截不生效**：直连终结口的连接不经 Layer4 的 IP/GeoIP 门
+   （HTTP 层 WAF、规则级 IP 黑名单仍生效）；需要按来源封禁时，前移到防火墙或
+   路由器。
+3. **该口无 HTTP/3**：QUIC（UDP）仍留在原 HTTPS 端口，443 被封后 HTTP/3 不可达，
+   客户端降级 HTTP/2 / HTTP/1.1。
+4. **外部 ACME TLS-ALPN-01 不可达**：该挑战走 443 入站，封 443 即失败；证书须用
+   **DNS-01** 签发（本系统支持）。
+5. **必须用防火墙/路由器限制来源**：该口一旦对公网开放，`proxy_protocol` 的
+   allow 只挡伪造头，不能替代来源控制。
+
+其余边界：`PASSTHROUGH_INTERNAL_PORT` 须与规则监听端口不同（同值渲染显性报错）；
+listen / dial / allow / servers 挂载键四元同源，换绑定无需其他配置。实现见
+`internal/services/caddy.go` 的 `internalTerminateBind` / `internalTerminateExposed` /
+`internalTerminateProxyAllow`，自研登记第 5 项。
 
 ## 生产参数
 

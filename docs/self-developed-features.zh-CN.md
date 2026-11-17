@@ -8,7 +8,7 @@
 > 登记原则：**一能力一条**，写清「能力名 / 代码位置 / 设计裁定出处 / 防复发约束 /
 > 机械可核符号」。符号必须能 grep 到，供后续派活直接引用。
 >
-> 最近更新：2026-11-13 · JJC-20261112-001 S4-a（新增第 5 项 TLS 透传 SNI 分流）
+> 最近更新：2026-11-15 · JJC-20261115-002（第 5 项补「内部终结口绑定地址可配」`PASSTHROUGH_INTERNAL_BIND`）
 >
 > **注释外置后的查找方式**：代码里我方补丁处只留「一句话结论 + `详见 docs/fork-notes/xxx.md §N`」，
 > 长解释（设计理由、反例、取舍）**逐字**保存在 `docs/fork-notes/`（索引见其 `README.md`）。
@@ -42,9 +42,9 @@
 |---|---|---|---|
 | 1 | **链式回退**（`chain_fallback`） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `caddychain/` | 2026-10-09 |
 | 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
-| 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` | — |
+| 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` · `healthcheckPanelPort` | — / 2026-11-15 |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
-| 5 | **TLS 透传 SNI 分流**（`protocol='passthrough'`） | `validatePassthroughRule` · `buildPassthroughLayer4Server` · `passthrough_upstream` · `internalTerminatePort` · `passthroughRulesByPort` | 2026-11-12 |
+| 5 | **TLS 透传 SNI 分流**（`protocol='passthrough'`） | `validatePassthroughRule` · `buildPassthroughLayer4Server` · `passthrough_upstream` · `internalTerminatePort` · `internalTerminateDefaultPort` · `internalTerminateBind` · `internalTerminateProxyAllow` · `passthroughRulesByPort` | 2026-11-12 / 2026-11-15 |
 
 > **本表的第二用途（2026-11-11 TASK-2026-1111-03 增补）**：`scripts/fork-diff.sh`
 > 把上文「关键符号」列与下文每项「代码位置」条目**机械解析**成归属判据，用来给
@@ -100,16 +100,40 @@
 ## 第 3 项 · 默认端口换位
 
 - **能力名**：面板与 Caddy 的默认监听端口可整体换位/自定义，不写死 80/443。
+  **面板口同样可换**：`PANEL_PORT` env 改面板监听口（默认 8000），容器内置健康
+  探针跟随该口探测（2026-11-15 起；此前探针硬编码 8000，`PANEL_PORT` 换口部署
+  会长期误显 unhealthy，需在 compose 覆盖 healthcheck 才能恢复判定）。
 - **代码位置**：
   - `internal/services/default_ports.go` → `DefaultHTTPPort` / `DefaultHTTPSPort`
   - 消费点：渲染层监听端口、面板自访问地址、前端默认值
-- **设计裁定出处**：自研扩展（上游硬编码 80/443）。
+  - 面板口与健康探针：`internal/config/config.go` → `envPort("PANEL_PORT", ...)`；
+    `cmd/server/healthcheck.go` → `healthcheckPanelPort` / `healthcheckURLs`
+    （探针每轮按 `PANEL_PORT` 求值，非法值告警回落 8000，与 `envPort` 同口径）
+  - 钉测：`cmd/server/healthcheck_test.go`（`TestHealthcheckPanelPort_*` 三条：
+    换口跟随 / 未设默认 / 非法回落）
+- **设计裁定出处**：自研扩展（上游硬编码 80/443）；面板口探针联动为
+  2026-11-15 追加裁定（host 模式下 8000 被占用是真实故障路径，换口 + 探针
+  跟随才构成完整能力）。
 - **关键设计点**：端口常量单源，渲染层与前端同源消费；不允许各处再写字面量。
+  探针端口不 import `internal/config`（main 包引入会拖入 DB 装配依赖，探针
+  路径已钉测「不触碰启动依赖」），以常量 `defaultHealthcheckPort` + 注释对齐
+  替代单源——两处默认值改动须同步（钉测断言 8000 会拦住漂移）。
 - **防复发约束**：
   > 追上游时**不得**把渲染层/前端里出现的 `DefaultHTTPPort` / `DefaultHTTPSPort`
   > 引用替换回上游的 `80` / `443` 字面量。上游没有「端口换位」概念，机械取上游会
   > 把换位能力打回硬编码（存量换位部署的规则监听端口全错）。
+  > 同理**不得**把 `healthcheckURLs` 改回硬编码 `:8000`（机械取上游形态会重新
+  > 引入「PANEL_PORT 换口 → 容器误显 unhealthy」缺陷）。
+  >
+  > 机械判据：
+  > - `grep -n 'healthcheckPanelPort' cmd/server/healthcheck.go` → 命中
+  > - `grep -cn '127\.0\.0\.1:8000' cmd/server/healthcheck.go` → **0 命中**
+  >   （探测地址由 `healthcheckURLs` 动态拼出，文件内不得出现硬编码回环 URL）
+  > - `go test -run 'TestHealthcheckPanelPort_' ./cmd/server/` → PASS
 - **不适用面**：ACME HTTP-01 challenge 的端口由 ACME 协议规定，不参与换位。
+  `docker run -config` 通道改 `port`（配置文件键）不影响探针——探针只认
+  `PANEL_PORT` env，容器形态经配置文件换面板口的部署仍需覆盖 healthcheck
+  （该形态本就不受支持，见部署文档「容器配置用环境变量」）。
 
 ## 第 4 项 · 回源 Host 逐上游自定义
 
@@ -185,6 +209,14 @@
 
 - **能力名**：TLS 透传 SNI 分流——443 统一入口 · Layer4 混合透传/终结（同一监听端口，
   部分域名按 SNI 字节流转发给上游、其余域名仍走本系统 Caddy TLS 终结）。
+  **内部终结口的端口与绑定地址均可配，默认收口回环**：host 网络下 7443 虽仅绑
+  回环仍可能与宿主其他进程的回环监听冲突（面板口同款故障路径），
+  `PASSTHROUGH_INTERNAL_PORT` env 可换口（默认 7443，非法值告警回落）；
+  `PASSTHROUGH_INTERNAL_BIND` env 可改绑定地址（**默认 `127.0.0.1` 收口回环**；
+  `0.0.0.0` / `::` / 指定 IP 均为**显式选择对外**）。
+  2026-11-15 两则追加裁定：① 端口可配（host 模式回环端口占用是真实故障路径）；
+  ② 绑定地址可配——家庭网络 / ISP 封禁入站 443 时，可**放弃 Layer4 SNI 分流**，
+  把内部终结口绑到对外地址由外部直连入站；**默认值不变**，收口形态零变化。
 - **代码位置**：
   - 协议白名单：`internal/handlers/rule_features.go` → `validateRuleFeatures`
     （`http/tcp/passthrough` 三值放行，`protocol='passthrough'`）
@@ -196,10 +228,22 @@
   - 渲染：`internal/services/caddy.go` → `buildPassthroughLayer4Server` /
     `buildPassthroughProxyHandler` / `passthroughDialAddress` /
     `passthroughRulesByPort`（与 http/tcp 并列的第三族按端口分组）；
-    内部终结口 7443 常量 `internalTerminatePort` + `internalTerminateAddr`（仅绑 127.0.0.1）
+    内部终结口**端口**：`internalTerminatePort()` / `internalTerminateDefaultPort`
+    （`PASSTHROUGH_INTERNAL_PORT` env 单源，非法值告警回落 7443）；
+    **绑定地址**：`internalTerminateBind()` / `internalTerminateExposed()` /
+    `internalTerminateListenHost()` / `internalTerminateDialHost()` /
+    `internalTerminateProxyAllow()`（`PASSTHROUGH_INTERNAL_BIND` env 单源，listen /
+    dial / allow 三处全部由上述符号派生，**禁止各自读 env**）；
+    暴露告警 `warnInternalTerminateExposed()`（每进程一次）；
+    整链地址 `internalTerminateAddr` / `internalTerminateListenAddr`；
+    规则监听口与内部口同口时渲染显性 generationFailure
   - 前端：`web/src/views/Rules.vue`（SNI 字段/单值上游/协议分支隔离）、
     `web/src/utils/ruleValidation.ts`（与后端逐条同口径的校验单源）
-  - 钉测：`internal/services/caddy_passthrough_render_test.go`（R5 零回归 sha256 钉测族）、
+  - 钉测：`internal/services/caddy_passthrough_render_test.go`（R5 零回归 sha256 钉测族 +
+    `TestInternalTerminatePort_` 四条：默认/换口整链跟随/非法回落/监听口冲突显性报错）、
+    `TestInternalTerminateBind_` 四条：`_defaultsLoopback`（默认收口回环）/
+    `_wildcardExposed`（通配 listen + 回环 dial + allow 不变）/
+    `_specificIPAddsAllow`（指定 IP 且 allow 追加该 IP）/`_invalidFallsBack`（非法回落）；
     `internal/handlers/rule_features_passthrough_test.go`、
     `internal/db/db_passthrough_column_test.go`、`web/tests/rulePassthrough.spec.ts`
   - 渲染链注释：`docs/fork-notes/render-chain.md` §29
@@ -207,13 +251,34 @@
   `.agent_team/JJC-20261112-001-tls-passthrough-plan.md` §一）；S0 spike 五项验证全
   CONFIRMED（T-1/T-2/T-4/T-5 真实进程实跑报告 `.agent_team/spike/evidence/`；
   T-3 为 caddy-l4 源码走读 + 编译产物注册表断言，方法见计划档案 §三）。
+  内部口端口可配为 2026-11-15 追加裁定（host 模式回环端口占用是真实故障路径；
+  原始「固定 7443」的安全目标——绕过面收口在回环一处——由「默认绑 127.0.0.1」
+  承担，不依赖端口值本身）。同批第二则裁定为**绑定地址可配**（家庭网络 / 上游
+  封 443 时放弃 SNI 分流、外部直连终结口入站的逃生形态）：默认收口形态不变，
+  因绑定可对外，该安全目标改由 `internalTerminateProxyAllow()` 派生的 allow 集合
+  承担（spike T-5 断言 B：非 allow 源伪造 PROXY 头 → 握手 EOF），暴露必须显式
+  选择并留告警。
 - **关键设计点（也是相对上游的不可替代性）**：
   1. 443/TCP 由 Caddy Layer4（caddy-l4）接管，按 ClientHello 的 SNI 域名分流；
      多条透传规则聚合进同一 `matchers.tls.sni` 集合，同端口可共存。
   2. 透传域名做**字节流转发**：证书由上游自带并终结，本系统不申请、不续期、不监控。
-  3. 无 SNI 命中的兜底路由注入 PROXY v2 转发到 `127.0.0.1:7443`（Caddy TLS 终结）——
-     本地终结域名的证书/ACME/WAF 链路**零迁移**。
+  3. 无 SNI 命中的兜底路由注入 PROXY v2 转发到内部终结口（默认
+     `127.0.0.1:<内部口>`，Caddy TLS 终结；指定 IP 绑定时拨号目标随之改为该 IP，
+     见第 6/7 点）——本地终结域名的证书/ACME/WAF 链路**零迁移**。
   4. 全库无启用透传规则时渲染产物与改造前**逐字节一致**（R5 sha256 钉测）。
+  5. 内部口换口整链一致：`internalTerminateAddr()` 是 HTTP listen 迁移地址、
+     Layer4 兜底 dial、servers 挂载键的同源形态（**四元一致要点**：listen 地址 /
+     dial 地址 / wrapper allow / servers 挂载键，详见 `docs/fork-notes/render-chain.md` §29），
+     env 换口三处同步；**默认收口形态**下 `proxy_protocol` allow 只信 `127.0.0.1/32`。
+  6. **listen / dial 分离**：绑定地址可配后，监听地址（`internalTerminateListenHost()`）
+     与 Layer4 兜底拨号地址（`internalTerminateDialHost()`）是**两个独立取值**——
+     `0.0.0.0` 只进 listen（对外收流），dial 恒 `127.0.0.1:<port>`；`::` 同理
+     （`[::]:<port>` 监听 / `[::1]:<port>` 拨号）。合并成单一地址就会去拨
+     `0.0.0.0` 这类不可连接的语义地址，本地终结链路整条断掉。
+  7. **指定 IP 绑定时 allow 必须含该 IP**：dial 目标即该 IP，出站源不保证是回环；
+     allow 若只有 `127.0.0.1/32`，Layer4 出站的 PROXY 头会被终结栈当 TLS 数据
+     （握手 EOF，与 spike T-5 断言 B 同型），兜底链路坏。allow 由
+     `internalTerminateProxyAllow()` 按形态派生：同族回环 + （指定 IP 时追加该 IP `/32`）。
 - **防复发约束（下次追上游必须逐条核对）**：
   > ① **上游无同需求实现**——追平时不得以「上游有 TLS 转发能力」为由切换：
   > 本功能是**按 SNI 域名级分流 + 混合终结**（同端口透传/终结并存），上游
@@ -221,18 +286,37 @@
   > ② `layer4` 是 Caddyfile **全局选项块** `{ layer4 { :443 {...} } }`，**不可顶层直写**。
   > ③ `servers <addr>` 的 addr 必须与站点 `bind` 监听地址**逐字一致**，否则
   > listener wrapper 静默失效（spike T-5 实证）。
-  > ④ 7443 必须仅绑 `127.0.0.1`——全绑存在外部直连绕过面（spike T-5 C 断言实测）。
+  > ④ 内部终结口**默认必须收口 `127.0.0.1`**——全绑存在外部直连绕过面（spike T-5 C
+  > 断言实测）；默认值不得改，对外只能经 `PASSTHROUGH_INTERNAL_BIND` **显式选择**
+  > （家庭网络封 443 的取舍形态），且暴露必须留告警
+  > （`warnInternalTerminateExposed()`）；该边界不随 `PASSTHROUGH_INTERNAL_PORT`
+  > 换口变化。
+  > 同理**不得**把 `internalTerminatePort()` 改回硬编码常量（机械取上游/旧形态
+  > 会重新引入「host 模式回环 7443 被占用 → Caddy 绑不上整份拒绝」故障）。
   > ⑤ 追平新上游时核对 `Dockerfile` 的 `--with caddy-l4` 行与 Caddy
   > `modules/caddyhttp/proxyprotocol` 注册仍在（详见追平手册 §十 B.7）。
+  > ⑥ **不得把 listen 与 dial 合并回单一地址**：`0.0.0.0` / `::` 只能出现在
+  > listen，兜底 dial 恒为同族回环（合并即「拨 0.0.0.0」不可连接，本地终结
+  > 链路全断）。两处取值分别由 `internalTerminateListenHost()` /
+  > `internalTerminateDialHost()` 单源提供，不得在渲染处内联拼地址。
+  > ⑦ **不得把 `proxy_protocol` 的 allow 写死 `127.0.0.1/32`**：指定 IP 绑定时
+  > 出站源可能非回环，allow 缺该 IP 会把 PROXY 头当 TLS 数据（握手 EOF）；
+  > allow 必须由 `internalTerminateProxyAllow()` 按绑定形态派生。
   >
   > 机械判据（可直接照抄执行，任一为红即视为回归；grep 通配按本文件维护规则 5 加引号）：
   > - `grep -rn 'func validatePassthroughRule' internal/handlers/` → 命中 `rule_features.go`
   > - `grep -c 'caddy-l4' Dockerfile` ≥ 1
   > - `grep -c 'passthrough_upstream' internal/db/db.go` ≥ 3（fresh DDL / 注册表 / 重建 DDL）
-  > - `go test -run 'TestPassthroughRender_' ./internal/services/` → PASS（R5 零回归钉测族）
+  > - `grep -n 'PASSTHROUGH_INTERNAL_PORT' internal/services/caddy.go` → 命中
+  > - `grep -n 'PASSTHROUGH_INTERNAL_BIND' internal/services/caddy.go` → 命中
+  > - `go test -run 'TestPassthroughRender_|TestInternalTerminatePort_' ./internal/services/` → PASS（R5 零回归钉测族 + 内部口端口钉测）
+  > - `go test -run 'TestInternalTerminateBind_' ./internal/services/` → PASS（绑定地址四态）
   > - `go test -run 'TestPassthrough' ./internal/handlers/ ./internal/db/` → PASS
 - **不适用面**：HTTP/3（QUIC）——透传域名自动降级 HTTP/2/1.1；透传规则的证书/ACME/
-  WAF 面板能力全部不适用（证书归上游管理）。
+  WAF 面板能力全部不适用（证书归上游管理）。直连入站形态（`PASSTHROUGH_INTERNAL_BIND`
+  选对外地址）下**SNI 分流本身不参与**——该入口是纯终结口，透传域名在此不可用，
+  且缺少 Layer4 层 IP/GeoIP 拦截（代价清单见 `docs/deployment.zh-CN.md`
+  「家庭网络 / 上游封 443（直连终结口入站）」）。
 
 ---
 

@@ -4,7 +4,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -361,11 +363,7 @@ func TestLoadBrandingConfig_nullFieldTreatedAsEmpty(t *testing.T) {
 // 启动品牌载入日志(2026-09-11 裁定):boot 后操作日志记录「载入/品牌配置」,
 // detail 标注各字段自定义/默认;系统日志同步 info。主从同路径。
 func TestStartupBrandingLog_recordsAuditWithFieldStatus(t *testing.T) {
-	oldAudit := db.AuditDB
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("init audit: %v", err)
-	}
-	t.Cleanup(func() { db.AuditDB = oldAudit })
+	initAuditDBForTest(t, t.TempDir())
 
 	dataDir := t.TempDir()
 	os.WriteFile(filepath.Join(dataDir, "branding.json"), []byte(`{"app_name":"我的网关","landing_text":"欢迎"}`), 0644)
@@ -406,11 +404,7 @@ func resetBrandingStore() {
 // 内容未变(touch)不记;半截写保旧值不记为重载。
 func TestBrandingHotReload_loggingAndKeepLastGood(t *testing.T) {
 	resetBrandingStore()
-	oldAudit := db.AuditDB
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("init audit: %v", err)
-	}
-	t.Cleanup(func() { db.AuditDB = oldAudit })
+	initAuditDBForTest(t, t.TempDir())
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "branding.json")
@@ -473,11 +467,7 @@ func TestBrandingHotReload_loggingAndKeepLastGood(t *testing.T) {
 // touch(内容不变 mtime 变):不产生重载审计(无实际变更)。
 func TestBrandingHotReload_touchNoChurn(t *testing.T) {
 	resetBrandingStore()
-	oldAudit := db.AuditDB
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.AuditDB = oldAudit })
+	initAuditDBForTest(t, t.TempDir())
 	dir := t.TempDir()
 	path := filepath.Join(dir, "branding.json")
 	content := `{"app_name":"稳"}`
@@ -559,6 +549,143 @@ func TestLoadBrandingConfig_failureProbeThrottledAndRecovers(t *testing.T) {
 	if cfg := loadBrandingConfig(dir); cfg.AppName != "丁" {
 		t.Fatalf("重建文件后必须立即读到新值, got %q", cfg.AppName)
 	}
+}
+
+// TestBrandingApplyAfterSync_survivesDBTearDownRace 复现 JJC-20261115-001 D1
+// 缺陷：handlers 全量 5 轮中 2 轮在 ~90s 处 panic，栈为 GetBranding →
+// go h.brandingApplyAfterSync() → GenerateAndApplyConfigForceInLock →
+// generateCaddyConfigFromStore → store.Query on nil DB（services/caddy.go 渲染
+// 链直读包级 db.DB）。夹具收尾 db.Close()（SetDB(nil) 先于 DB=nil，db.go）
+// 与该协程生命周期无同步——协程通过角色门后、渲染前重读句柄时读到 nil。
+//
+// 确定性构造：接缝让协程在「角色门已过、渲染未开始」处等待，主测试线程在
+// 该窗口内 db.Close() 后放行。修复前在 services 渲染链 panic（nil DB 上的
+// store.Query）；修复后在 branding.go 入口复核 nil 句柄并按 roleErr 同款
+// 语义收尾（Logf warn → 清指纹 → 记待办 → return）。
+//
+// 硬边界（JJC-20261115-002-S1）：本缺陷的防御只允许落在
+// brandingApplyAfterSync 入口——services 渲染链（generateCaddyConfigFromStore
+// / applyConfigLockedOpt 等）不得加 nil 容错：nil 是异常态，吞掉会把生产
+// 缺陷静默化为「跳过应用」（Caddy 挂旧配置继续跑）。
+func TestBrandingApplyAfterSync_survivesDBTearDownRace(t *testing.T) {
+	withIsolatedGlobal(t)
+	initBrandingTestDB(t)
+	handler := newBackupTestHandlers(t)
+	dir := t.TempDir()
+	handler.cfg.DataDir = dir
+	if err := os.WriteFile(filepath.Join(dir, "branding.json"), []byte(`{"app_name":"竞态夹具"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resetBrandingStore()
+	resetBrandingSyncGateForTest()
+	t.Cleanup(func() {
+		resetBrandingStore()
+		resetBrandingSyncGateForTest()
+	})
+
+	// db.Close() 幂等（nil 判定），但 initBrandingTestDB/newBackupTestHandlers
+	// 的收尾会拿旧句柄做恢复——备份一份供收尾恢复，主线程触发 Close。
+	raceClosed := db.DB
+	teardownStarted := make(chan struct{})
+	releaseApply := make(chan struct{})
+	brandingApplyPreApplyHook = func() {
+		close(teardownStarted)
+		<-releaseApply
+	}
+	t.Cleanup(func() { brandingApplyPreApplyHook = nil })
+
+	done := make(chan struct{})
+	var panicked atomic.Bool
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked.Store(true)
+				// 连栈一起留痕：只打 panic 值无法证明「panic 点是 services 渲染链
+				// 的 store.Query on nil DB」——D7 勘误要求真实 panic 栈可核。
+				t.Errorf("brandingApplyAfterSync panic：%v\n%s", r, debug.Stack())
+			}
+			close(done)
+		}()
+		handler.brandingApplyAfterSync()
+	}()
+
+	// 确定性时序：协程已过角色门（接缝已触发）→ 主线程 Close（SetDB(nil)）
+	// → 放行协程进入渲染。
+	<-teardownStarted
+	_ = db.Close()
+	close(releaseApply)
+	<-done
+
+	// 收尾恢复（Close 已把 DB/currentDB 置 nil，测试库已物理关闭）。
+	db.DB, db.MetricsDB, db.AuditDB = raceClosed, nil, nil
+	db.SetDB(raceClosed)
+
+	if panicked.Load() {
+		t.Fatal("修复后不得 panic：入口应复核 nil 句柄并按 roleErr 同款语义收尾")
+	}
+	if !brandingApplyPending.Load() {
+		t.Fatal("nil 句柄路径必须记待办（roleErr 同款语义），否则下轮 60s 窗口不重试")
+	}
+	// roleErr 同款语义的最后一环：清指纹（窗过后下一轮放行）。
+	expireBrandingSyncWindow()
+	if !brandingSyncGateAllow(dir) {
+		t.Fatal("nil 句柄路径必须清指纹（roleErr 同款语义）")
+	}
+}
+
+// TestBrandingApplyUnderGate_releasesCaddyOpLockOnRenderPanic 钉死锁释放在
+// **异常路径**也成立：caddyOpMu 委托 services.CaddyOpLock（跨层唯一 Caddy 写
+// 互斥），临界区内 panic 若逃出（被 gin.Recovery 兜住）而锁未释放，后续全部
+// 配置写窗口（规则保存/证书部署/重载/导入）永久阻塞。
+//
+// 判别力来源：把「渲染」换成 nil 服务的 nil 指针解引用，panic 点确定落在
+// 临界区内、取锁之后；断言 services.CaddyOpLock.TryLock() 能立即拿到锁
+// （defer 未生效时会失败）。锁在本用例内释放，不向 suite 残留。
+func TestBrandingApplyUnderGate_releasesCaddyOpLockOnRenderPanic(t *testing.T) {
+	withIsolatedGlobal(t)
+	initBrandingTestDB(t)
+	handler := newBackupTestHandlers(t)
+	originalService := handler.caddyService
+	// nil 接收者 + s.mu.Lock() = 临界区内的确定性 panic（真实渲染链的 panic
+	// 只能在 DB 收尾窗口里偶发，不可用作判据）。
+	handler.caddyService = nil
+	t.Cleanup(func() { handler.caddyService = originalService })
+
+	panicked := func() (recovered any) {
+		defer func() { recovered = recover() }()
+		_, _ = handler.applyCaddyConfigUnderBrandingGate()
+		return nil
+	}()
+	if panicked == nil {
+		t.Fatal("夹具必须触发临界区内 panic（否则本用例未检验 defer 放锁）")
+	}
+	if !services.CaddyOpLock.TryLock() {
+		t.Fatal("渲染 panic 后 caddyOpMu 仍被持有：全局 Caddy 写锁泄漏，后续所有配置写窗口永久阻塞")
+	}
+	services.CaddyOpLock.Unlock()
+
+	// 常规路径（不 panic）同样走 defer 放锁：句柄为 nil 时是「跳过渲染」分支，
+	// 用它验证非异常路径也没留下持锁——不需要真实渲染（成功/失败路径的锁语义
+	// 同一 defer，真实渲染由 branding_apply_retry_test 覆盖）。
+	handler.caddyService = originalService
+	// db.DB 只置 nil 一个窗口，立刻还回：置 nil 期间句柄仅由局部变量持有，
+	// 若留在 nil 上，夹具收尾的 db.Close() 就找不到它（未关闭句柄 = 守卫
+	// 记到的 opener+cleaner 泄漏）。
+	savedDB := db.DB
+	db.DB = nil
+	// 兜底：中间若 Fatal/panic 提前返回，db.DB 会停在 nil——夹具收尾的 db.Close()
+	// 找不到原句柄（未关闭句柄 = 守卫记到的 opener+cleaner 泄漏）。正常路径下面
+	// 已立即还原，本 Cleanup 只是幂等重复赋值，不改断言强度。
+	t.Cleanup(func() { db.DB = savedDB })
+	applied, _ := handler.applyCaddyConfigUnderBrandingGate()
+	db.DB = savedDB
+	if applied {
+		t.Fatal("句柄为 nil 时应返回 applied=false（跳过渲染）")
+	}
+	if !services.CaddyOpLock.TryLock() {
+		t.Fatal("跳过渲染分支结束后 caddyOpMu 仍被持有")
+	}
+	services.CaddyOpLock.Unlock()
 }
 
 // 内置页 id 被自定义页占用时，播种 UPDATE 不得改写该行

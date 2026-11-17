@@ -50,9 +50,16 @@ func resetConnectionStatsCacheForTest(t *testing.T) {
 	})
 }
 
+// resetCPUSampleStateForTest 测试缝：用例内清空 CPU 采样基线（模拟「尚无基线」
+// 形态），cleanup 还原到**调用时快照**而非零值。还原目标必须是调用时快照：
+// init()/primeSystemSamplers 在测试进程入口写入真实基线（hasValue=true+真实
+// 时间戳），TestMain 的 suite 级泄漏守卫以此为快照——若 cleanup 复位为零值，
+// 凡用本 helper 的用例结束终态必≠入口快照，守卫结构性误报（任何单个用例下
+// 100% 复现）。
 func resetCPUSampleStateForTest(t *testing.T) {
 	t.Helper()
 	lastCPUStats.mu.Lock()
+	baseline := captureCPUSampleStateLocked()
 	lastCPUStats.snapshot = cpuSnapshot{}
 	lastCPUStats.percent = 0
 	lastCPUStats.sampledAt = time.Time{}
@@ -60,12 +67,34 @@ func resetCPUSampleStateForTest(t *testing.T) {
 	lastCPUStats.mu.Unlock()
 	t.Cleanup(func() {
 		lastCPUStats.mu.Lock()
-		lastCPUStats.snapshot = cpuSnapshot{}
-		lastCPUStats.percent = 0
-		lastCPUStats.sampledAt = time.Time{}
-		lastCPUStats.hasValue = false
+		restoreCPUSampleStateLocked(baseline)
 		lastCPUStats.mu.Unlock()
 	})
+}
+
+// cpuSampleStateSnapshotLocked / restoreCPUSampleStateLocked 是 lastCPUStats
+// 的快照/还原原语，调用方必须已持有 lastCPUStats.mu。
+type cpuSampleStateBaseline struct {
+	snapshot  cpuSnapshot
+	percent   float64
+	sampledAt time.Time
+	hasValue  bool
+}
+
+func captureCPUSampleStateLocked() cpuSampleStateBaseline {
+	return cpuSampleStateBaseline{
+		snapshot:  lastCPUStats.snapshot,
+		percent:   lastCPUStats.percent,
+		sampledAt: lastCPUStats.sampledAt,
+		hasValue:  lastCPUStats.hasValue,
+	}
+}
+
+func restoreCPUSampleStateLocked(baseline cpuSampleStateBaseline) {
+	lastCPUStats.snapshot = baseline.snapshot
+	lastCPUStats.percent = baseline.percent
+	lastCPUStats.sampledAt = baseline.sampledAt
+	lastCPUStats.hasValue = baseline.hasValue
 }
 
 func disableCPUSampleWindowForTest(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -257,7 +258,7 @@ func TestPassthroughRender_layer4SNISplitAndInternalPortMigration(t *testing.T) 
 	httpServers := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["http"], "http")["servers"], "servers")
 	httpServer := mustMap(t, httpServers[fmt.Sprintf("http_%d", port)], "http server")
 	httpListen, _ := httpServer["listen"].([]string)
-	wantListen := []string{"tcp/127.0.0.1:" + strconv.Itoa(internalTerminatePort), fmt.Sprintf("udp/:%d", port)}
+	wantListen := []string{"tcp/127.0.0.1:" + strconv.Itoa(internalTerminatePort()), fmt.Sprintf("udp/:%d", port)}
 	if !reflect.DeepEqual(httpListen, wantListen) {
 		t.Fatalf("http_%d listen=%v, want %v（TCP 退内部回环、UDP 留公网给 HTTP/3）", port, httpListen, wantListen)
 	}
@@ -279,6 +280,279 @@ func TestPassthroughRender_layer4SNISplitAndInternalPortMigration(t *testing.T) 
 	}
 	if tlsWrapper := mustMap(t, wrappers[1], "listener_wrappers[1]"); tlsWrapper["wrapper"] != "tls" {
 		t.Fatalf("listener_wrappers[1]=%v, want tls", tlsWrapper)
+	}
+}
+
+// withPassthroughInternalPort 设临时 PASSTHROUGH_INTERNAL_PORT（测试结束还原）。
+func withPassthroughInternalPort(t *testing.T, value string) {
+	t.Helper()
+	old, had := os.LookupEnv("PASSTHROUGH_INTERNAL_PORT")
+	if value == "" {
+		_ = os.Unsetenv("PASSTHROUGH_INTERNAL_PORT")
+	} else {
+		_ = os.Setenv("PASSTHROUGH_INTERNAL_PORT", value)
+	}
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("PASSTHROUGH_INTERNAL_PORT", old)
+		} else {
+			_ = os.Unsetenv("PASSTHROUGH_INTERNAL_PORT")
+		}
+	})
+}
+
+// withPassthroughInternalBind 设临时 PASSTHROUGH_INTERNAL_BIND（测试结束还原）。
+func withPassthroughInternalBind(t *testing.T, value string) {
+	t.Helper()
+	old, had := os.LookupEnv("PASSTHROUGH_INTERNAL_BIND")
+	if value == "" {
+		_ = os.Unsetenv("PASSTHROUGH_INTERNAL_BIND")
+	} else {
+		_ = os.Setenv("PASSTHROUGH_INTERNAL_BIND", value)
+	}
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("PASSTHROUGH_INTERNAL_BIND", old)
+		} else {
+			_ = os.Unsetenv("PASSTHROUGH_INTERNAL_BIND")
+		}
+	})
+}
+
+// 内部终结口默认 7443（方案决策 #9 原始值）——未设 env 时渲染产物必须与
+// 历史形态逐字一致（本文件上方 R5 族与默认端口渲染已覆盖，此处直接钉地址）。
+func TestInternalTerminatePort_defaultsWhenUnset(t *testing.T) {
+	withPassthroughInternalPort(t, "")
+	if got := internalTerminatePort(); got != 7443 {
+		t.Fatalf("port=%d, want default 7443", got)
+	}
+	if got := internalTerminateAddr(); got != "127.0.0.1:7443" {
+		t.Fatalf("addr=%q, want 127.0.0.1:7443", got)
+	}
+}
+
+// host 网络下 7443 与宿主其他回环监听冲突时（面板口同款故障路径），
+// PASSTHROUGH_INTERNAL_PORT 换口必须整链跟随：Layer4 兜底 dial、HTTP listen
+// 迁移地址同源变化。安全边界不随 env 变：仍仅绑 127.0.0.1、proxy_protocol
+// allow 仍只信回环（self-developed-features 第 5 项防复发约束 ④）。
+func TestInternalTerminatePort_followsEnv(t *testing.T) {
+	withPassthroughInternalPort(t, "17443")
+	if got := internalTerminatePort(); got != 17443 {
+		t.Fatalf("port=%d, want 17443", got)
+	}
+	if got := internalTerminateAddr(); got != "127.0.0.1:17443" {
+		t.Fatalf("addr=%q, want 127.0.0.1:17443", got)
+	}
+	if got := internalTerminateListenAddr(); got != "tcp/127.0.0.1:17443" {
+		t.Fatalf("listen=%q, want tcp/127.0.0.1:17443", got)
+	}
+
+	// 端到端：换口后渲染产物三处地址同步（兜底 dial / HTTP listen / wrapper 键）。
+	_, database := newClusterTestService(t)
+	seedPassthroughRuleForRender(t, database, "lb_pt_port", "pass.example.test", "10.0.0.9:10443", DefaultHTTPSPort(), true)
+	cfg := mustRenderOK(t, database)
+	port := DefaultHTTPSPort()
+	httpServers := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["http"], "http")["servers"], "servers")
+	httpServer := mustMap(t, httpServers[fmt.Sprintf("http_%d", port)], "http server")
+	httpListen, _ := httpServer["listen"].([]string)
+	wantListen := []string{"tcp/127.0.0.1:17443", fmt.Sprintf("udp/:%d", port)}
+	if !reflect.DeepEqual(httpListen, wantListen) {
+		t.Fatalf("http_%d listen=%v, want %v（换口后三处地址必须同步）", port, httpListen, wantListen)
+	}
+	layer4 := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["layer4"], "layer4")["servers"], "layer4 servers")
+	l4Server := mustMap(t, layer4[fmt.Sprintf("tls_%d", port)], "layer4 server")
+	fallbackHandler := mustMap(t, mustSlice(t, mustMap(t, mustSlice(t, l4Server["routes"], "routes")[1], "routes[1]")["handle"], "handle")[0], "handle[0]")
+	if got := mustDial(t, fallbackHandler); got != "127.0.0.1:17443" {
+		t.Fatalf("兜底 dial=%q, want 127.0.0.1:17443", got)
+	}
+}
+
+// 非法值（非数字/0/负/>65535）必须回落默认而非静默绑错口——与 envPort 同口径。
+func TestInternalTerminatePort_invalidFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"not-a-number", "abc"},
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"above-range", "65536"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withPassthroughInternalPort(t, tc.value)
+			if got := internalTerminatePort(); got != internalTerminateDefaultPort {
+				t.Fatalf("port=%d, want default %d", got, internalTerminateDefaultPort)
+			}
+			if got := internalTerminateAddr(); got != "127.0.0.1:7443" {
+				t.Fatalf("addr=%q, want 127.0.0.1:7443", got)
+			}
+		})
+	}
+}
+
+// 规则监听口撞上内部终结口：同口会让 Layer4 listen 与 HTTP 迁移 listen 互相
+// 抢绑（Caddy 整份拒绝）——必须显性 generationFailure 并指向换口手段，而非
+// 静默生成绑不上的配置。
+func TestInternalTerminatePort_conflictsWithRulePort(t *testing.T) {
+	withPassthroughInternalPort(t, "17443")
+	_, database := newClusterTestService(t)
+	// 规则监听 17443 = 内部终结口；同库另一条正常透传规则保证 passthrough 族存在。
+	seedPassthroughRuleForRender(t, database, "lb_pt_ok", "pass.example.test", "10.0.0.9:10443", DefaultHTTPSPort(), true)
+	seedPassthroughRuleForRender(t, database, "lb_pt_clash", "clash.example.test", "10.0.0.10:11443", 17443, true)
+
+	cfg := generateCaddyConfigFromStore(database)
+	message, failed := cfg[caddyConfigGenerationErrorKey].(string)
+	if !failed {
+		t.Fatalf("渲染应失败（监听口与内部终结口同口），得到成功配置 keys=%v", mapKeys(cfg))
+	}
+	if !strings.Contains(message, "17443") || !strings.Contains(message, "PASSTHROUGH_INTERNAL_PORT") {
+		t.Fatalf("错误信息未指向冲突端口与换口手段: %s", message)
+	}
+}
+
+// 内部终结口撞上代理默认监听口（HTTP_PORT/HTTPS_PORT）：迁到内部口的 listen
+// 与默认 server 自身 listen 抢绑，必须显性报错并指向换口手段（仅透传存在时判定，
+// 无透传规则不新增判断路径——R5 红线）。
+func TestInternalTerminatePort_conflictsWithDefaultPorts(t *testing.T) {
+	conflictPort := DefaultHTTPSPort()
+	withPassthroughInternalPort(t, strconv.Itoa(conflictPort))
+	_, database := newClusterTestService(t)
+	seedPassthroughRuleForRender(t, database, "lb_pt_defclash", "pass.example.test", "10.0.0.9:10443", conflictPort, true)
+
+	cfg := generateCaddyConfigFromStore(database)
+	message, failed := cfg[caddyConfigGenerationErrorKey].(string)
+	if !failed {
+		t.Fatalf("渲染应失败（内部终结口=%d 撞默认监听口），得到成功配置 keys=%v", conflictPort, mapKeys(cfg))
+	}
+	for _, want := range []string{"透传内部终结口", "HTTP_PORT=", "HTTPS_PORT=", "PASSTHROUGH_INTERNAL_PORT"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("错误信息缺 %q（应同时指出默认口与换口手段）: %s", want, message)
+		}
+	}
+
+	// 无透传规则时不做该判定（默认形态零新增分支）：同一 env 下正常渲染。
+	_, cleanDB := newClusterTestService(t)
+	seedHTTPRuleForGeneration(t, cleanDB, "lb_def_port_ok", "ok.example.test", 8080)
+	mustRenderOK(t, cleanDB)
+}
+
+// ── 绑定地址可配（JJC-20261115-002）：listen / dial / allow 四元同源 ─────────
+
+// 默认形态：未设 PASSTHROUGH_INTERNAL_BIND 时只绑回环、dial 同址、allow 仅
+// 回环 /32，且不判对外（不落代价告警）——R5 口径的地址维度。
+func TestInternalTerminateBind_defaultsLoopback(t *testing.T) {
+	withPassthroughInternalPort(t, "")
+	withPassthroughInternalBind(t, "")
+	if got := internalTerminateListenAddr(); got != "tcp/127.0.0.1:7443" {
+		t.Fatalf("listen=%q, want tcp/127.0.0.1:7443", got)
+	}
+	if got := internalTerminateAddr(); got != "127.0.0.1:7443" {
+		t.Fatalf("dial addr=%q, want 127.0.0.1:7443", got)
+	}
+	if got, want := internalTerminateProxyAllow(), []string{"127.0.0.1/32"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("allow=%v, want %v", got, want)
+	}
+	if internalTerminateExposed() {
+		t.Fatalf("默认绑定（127.0.0.1）不得判为对外")
+	}
+}
+
+// 0.0.0.0 通配：listen 用通配、dial 退避同族回环（通配不可作 dial 目标）、
+// allow 仍只信回环——对外只由绑定显式开启，不等于放行任意 PROXY 头来源。
+func TestInternalTerminateBind_wildcardExposed(t *testing.T) {
+	withPassthroughInternalPort(t, "")
+	withPassthroughInternalBind(t, "0.0.0.0")
+	if got := internalTerminateListenAddr(); got != "tcp/0.0.0.0:7443" {
+		t.Fatalf("listen=%q, want tcp/0.0.0.0:7443", got)
+	}
+	if got := internalTerminateAddr(); got != "127.0.0.1:7443" {
+		t.Fatalf("dial addr=%q, want 127.0.0.1:7443（通配只进 listen）", got)
+	}
+	if got, want := internalTerminateProxyAllow(), []string{"127.0.0.1/32"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("allow=%v, want %v（通配绑定不得派生出 0.0.0.0/0）", got, want)
+	}
+	if !internalTerminateExposed() {
+		t.Fatalf("0.0.0.0 绑定必须判为对外")
+	}
+
+	// 端到端：HTTP listen 首元素为通配监听地址；Layer4 兜底 route 仍 dial 回环。
+	_, database := newClusterTestService(t)
+	port := DefaultHTTPSPort()
+	seedPassthroughRuleForRender(t, database, "lb_pt_bind_wild", "pass.example.test", "10.0.0.9:10443", port, true)
+	cfg := mustRenderOK(t, database)
+	httpServers := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["http"], "http")["servers"], "servers")
+	httpServer := mustMap(t, httpServers[fmt.Sprintf("http_%d", port)], "http server")
+	httpListen, _ := httpServer["listen"].([]string)
+	if len(httpListen) == 0 || httpListen[0] != "tcp/0.0.0.0:7443" {
+		t.Fatalf("http listen=%v, want 首元素 tcp/0.0.0.0:7443", httpListen)
+	}
+	l4Servers := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["layer4"], "layer4")["servers"], "servers")
+	serverName := fmt.Sprintf("tls_%d", port)
+	l4Server := mustMap(t, l4Servers[serverName], serverName)
+	fallbackHandler := mustMap(t, mustSlice(t, mustMap(t, mustSlice(t, l4Server["routes"], "routes")[1], "routes[1]")["handle"], "handle")[0], "handle[0]")
+	if got := mustDial(t, fallbackHandler); got != "127.0.0.1:7443" {
+		t.Fatalf("兜底 dial=%q, want 127.0.0.1:7443", got)
+	}
+}
+
+// 指定 IP：listen/dial 同用该 IP（可作 dial 目标），allow 追加该 IP /32——
+// 外部直连该口时来源地址才是合法 PROXY 头来源（spike T-5 断言 B）。
+func TestInternalTerminateBind_specificIPAddsAllow(t *testing.T) {
+	withPassthroughInternalPort(t, "")
+	withPassthroughInternalBind(t, "192.168.1.10")
+	if got := internalTerminateListenAddr(); got != "tcp/192.168.1.10:7443" {
+		t.Fatalf("listen=%q, want tcp/192.168.1.10:7443", got)
+	}
+	if got := internalTerminateAddr(); got != "192.168.1.10:7443" {
+		t.Fatalf("dial addr=%q, want 192.168.1.10:7443", got)
+	}
+	if got, want := internalTerminateProxyAllow(), []string{"127.0.0.1/32", "192.168.1.10/32"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("allow=%v, want %v", got, want)
+	}
+	if !internalTerminateExposed() {
+		t.Fatalf("指定非回环 IP 必须判为对外")
+	}
+}
+
+// 指定 v6 IP：allow 追加 /128 后缀（原实现按 v4 后缀切片会越界 panic）。
+func TestInternalTerminateBind_specificIPv6AddsAllow(t *testing.T) {
+	withPassthroughInternalPort(t, "")
+	withPassthroughInternalBind(t, "2001:db8::10")
+	if got := internalTerminateListenAddr(); got != "tcp/[2001:db8::10]:7443" {
+		t.Fatalf("listen=%q, want tcp/[2001:db8::10]:7443", got)
+	}
+	if got := internalTerminateAddr(); got != "[2001:db8::10]:7443" {
+		t.Fatalf("dial addr=%q, want [2001:db8::10]:7443", got)
+	}
+	if got, want := internalTerminateProxyAllow(), []string{"::1/128", "2001:db8::10/128"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("allow=%v, want %v", got, want)
+	}
+}
+
+// 非法值（乱填/带端口/主机名）必须回落 127.0.0.1 且留 warn——绑错地址是
+// 排障黑洞，不能静默生效（与 PASSTHROUGH_INTERNAL_PORT 同口径）。
+func TestInternalTerminateBind_invalidFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"not-an-ip", "abc"},
+		{"ip-with-port", "0.0.0.0:7443"},
+		{"hostname", "example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withPassthroughInternalPort(t, "")
+			withPassthroughInternalBind(t, tc.value)
+			if got := internalTerminateListenAddr(); got != "tcp/127.0.0.1:7443" {
+				t.Fatalf("listen=%q, want 回落 tcp/127.0.0.1:7443", got)
+			}
+			if got := internalTerminateAddr(); got != "127.0.0.1:7443" {
+				t.Fatalf("dial addr=%q, want 回落 127.0.0.1:7443", got)
+			}
+			if internalTerminateExposed() {
+				t.Fatalf("非法值回落回环后不得判为对外")
+			}
+		})
 	}
 }
 

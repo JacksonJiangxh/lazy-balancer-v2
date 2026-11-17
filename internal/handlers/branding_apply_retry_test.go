@@ -175,6 +175,31 @@ func waitBrandingApply(t *testing.T, loads *atomic.Int32, want int32, wantPendin
 	t.Fatalf("异步应用未收尾：调用=%d（want≥%d）待办=%v（want %v）", loads.Load(), want, brandingApplyPending.Load(), wantPending)
 }
 
+// waitBrandingSyncFingerprintCleared 等首轮失败路径真正收尾：指纹已被
+// brandingSyncMarkFailed 清空。
+//
+// 必要性：待办标记是 GetBranding 在**启动异步应用 goroutine 之前**置位的
+// （见 branding.go 中 needApply 分支），因此「loads 达标 + 待办置位」不代表
+// 失败路径已收尾——/load 失败后还要过 recordCaddyApplyResult（写库）才轮到
+// 清指纹。此时若直接切换采样窗打第二轮，指纹门仍视该文件为「本轮已处理」而
+// 拒绝放行，测到的就不是「窗后重试」而是「首轮还没收尾」，-race 下写库变慢
+// 窗口更宽，必然误判（HEAD 基线同样复现，属存量测试缺陷而非产品缺陷）。
+// 等指纹清空既消除该窗口，也把「失败必须清指纹」这一产品语义纳入断言。
+func waitBrandingSyncFingerprintCleared(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		brandingSyncMu.Lock()
+		cleared := brandingSyncFingerprint == ""
+		brandingSyncMu.Unlock()
+		if cleared {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("首轮应用失败后品牌指纹未被清空：窗后重试的前置条件不成立")
+}
+
 // 端到端收敛：首轮 /load 失败后，同步已落库（重试轮 needApply=false），必须靠
 // 待办标记在下一个 60s 窗口再次重应用——只清指纹不够，运行配置会一直停在旧
 // 文案/旧拦截页，自动同步承诺仍然失效。
@@ -221,6 +246,9 @@ func TestGetBranding_retriesApplyOnNextWindowWhenFirstLoadFails(t *testing.T) {
 	// 首轮：同步成功、/load 失败。
 	getBranding()
 	waitBrandingApply(t, &loads, 1, true)
+	// 失败路径收尾（指纹已清）后再切窗：待办标记先于异步应用置位，不等这一步
+	// 第二轮会被指纹门拒绝（详见 waitBrandingSyncFingerprintCleared 注释）。
+	waitBrandingSyncFingerprintCleared(t)
 
 	// 采样窗过期后的下一轮匿名读：同步已是 no-op，仍必须重应用。
 	expireBrandingSyncWindow()
