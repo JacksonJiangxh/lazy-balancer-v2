@@ -105,8 +105,19 @@ grep '⚠ 是' docs/fork-diff/latest.md                              # 只看会
 
 ```bash
 (cd <模块> && go build ./...)   # 该模块能编译
-bash scripts/gate.sh            # 机械门（构建×7 / vet / 冲突标记 / 上游路径存在性 / 版本锚点）
+bash scripts/gate.sh            # 机械门（构建×7 / vet / 冲突标记 / 上游路径存在性 / 版本锚点 / handlers 单测）
 ```
+
+> **机械门第 6 项耗时提示**：`internal/handlers` 全量单测裸跑实测 578–622s（约 10 分钟），
+> 是机械门里最重的一项（其余五项合计通常在数分钟内）。`-timeout 15m` 是**超时上限**
+> 而非目标值——该包实测贴近 go test 默认 600s 水位，不显式抬高上限会被默认超时误杀；
+> 实际耗时超 10m 时门禁输出 WARN（不判失败，超上限才失败），提示关注回归变慢。
+>
+> **本地验证入口（本仓无 Makefile）**：pre-commit 与本地门禁脚本为
+> `scripts/gate.sh`（六项机械判定，pre-commit 自动调用，也可手工整跑）与
+> `scripts/test-all.sh`（`--fast` / `--fast-deep` / 默认全量三档，各档位耗时口径见该
+> 脚本头注释）。gate.sh 第 6 项即 handlers 单包全量——test-all.sh 默认全量档
+> （`go test ./... -p 4`）已覆盖该包，此处是把它钉进提交前的机械门。
 
 **失败处置**：`go vet` 报 `undefined: xxx` = **补丁没挂回去**（不是语法问题），按符号名查 §十 B；
 `gofmt` 报括号失衡 = 机械并集了，回滚该文件重做；冲突标记残留用 `git grep -nE '^(<<<<<<<|=======$|>>>>>>>)'` 清掉。
@@ -319,7 +330,12 @@ grep -rn 'func validatePassthroughRule' internal/handlers/   # 命中 rule_featu
 ## 十一、验证门命令清单（附录 C）
 
 ### C.1 机械门
-`bash scripts/gate.sh` → 末行 `GATE: PASS`。含 build×7 模块 / vet / 冲突标记 / 上游 2095 路径存在性 / 版本口径九处。
+`bash scripts/gate.sh` → 末行 `GATE: PASS`。含 build×7 模块 / vet / 冲突标记 / 上游 2095 路径存在性 / 版本口径 9 类锚点·10 处命中点·6 个文件 / `internal/handlers` 全量单测（六项）。**版本口径计数定义**：锚点 = 一次 `check_anchor` 调用（一个文件 + 一条期望模式），命中点 = 该模式应命中的行数，文件 = 命中点的去重文件数（compose 的 args 与双 image tag 同属 `docker-compose.yml`，故 9 类锚点落在 6 个文件上）；compose 的 image tag 是 1 类锚点对应 2 处命中，故锚点数与命中点数须并列引用（9/10），单说其一即漂移。handlers 单包全量实测约 10 分钟（578–622s），是门禁的主要增量耗时；`-timeout 15m` 为超时上限口径，实际耗时超 10m 仅告警不判败（详见 §五「机械门第 6 项耗时提示」）。
+
+**两条固化规则（2026-11-15 新增，与 `scripts/gate.sh` 第 5 项注释同源）**：
+
+1. **镜像锚点只认 repo 名 + tag 字面 latest，registry 前缀可迁**：`check_anchor` 的 compose image 模式形如 `^[[:space:]]*image: \S*lazy-balancer-v2:latest$`（`\S*` 吞掉任意 registry 前缀），compose 两处已切 `:latest`（最近一次稳定版）不再随发版递增，版本防线由其余八锚点承担，命中数要求不放宽（compose 仍须恰好 2 处）。fork 发布地址迁到自建镜像站（现为 `docker.cnb.cool/xzydm/mirrors/`）不应把版本口径判红；但 README 中英两版的 registry+repo 段必须逐字一致，不得并存第二种写法。
+2. **现行口径一律现场跑 gate 第 5 项取得**：9 类锚点 / 10 处命中 / 6 个文件，以实跑输出为准（`bash scripts/gate.sh 2>&1 | sed -n '/5\/6/,/6\/6/p'`）。历史文档里的数字是**当时记录，禁止复算**：`docs/upstream-merge.zh-CN.md:562`「八处」、`:645` 与 `:727`「九处」、`docs/fork-diff/drill-log.md:130`「9 处」均为历史章原文，不回改、不参与现行计数。`docs/fork-diff/latest.md` 是差分表的零版本字面（由 `scripts/fork-diff.sh` 自动生成，只钉 commit `0cd475ed` 与 `HEAD`，含 0 处版本号），不计入锚点/命中。
 
 ### C.2 四项核心自研钉测（逐项）
 ```bash

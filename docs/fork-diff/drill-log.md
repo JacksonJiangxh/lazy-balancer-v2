@@ -127,7 +127,7 @@ $ grep -n 'func UpstreamV250CertDirAudit\|func ResolveReferencedCertPath' intern
 
 | # | 项 | 命令 | 结果 | 判定 |
 |---|---|---|---|---|
-| ① | 机械门 | `bash scripts/gate.sh` | `modules build OK=7/7` / `vet OK` / `conflict markers: 0` / `upstream paths total=2095 missing=0` / 版本锚点 9 处 ok / **`GATE: PASS`** | ✅ |
+| ① | 机械门 | `bash scripts/gate.sh` | `modules build OK=7/7` / `vet OK` / `conflict markers: 0` / `upstream paths total=2095 missing=0` / 版本锚点 9 处 ok / **`GATE: PASS`**（该行为当时记录，不参与现行计数、不复算；现行口径见 `docs/upstream-catchup-guide.zh-CN.md` §十一 C.1） | ✅ |
 | ② | 冲突标记 | 含在 gate 第 3 项 | `conflict markers: 0` | ✅ |
 | ③ | 上游文件一个不丢 | gate 第 4 项 | `2095 missing=0` | ✅ |
 | ④ | 四项自研钉测 | 见下 | 全 `ok` | ✅ |
