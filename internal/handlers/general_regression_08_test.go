@@ -24,9 +24,10 @@ func backupTLSRuleShared(tlsSource any) map[string]any {
 }
 
 // v2 备份校验必须对 enabled+http+enable_tls 行的 tls_source 做白名单
-// （manual/acme_dns）——空串/垃圾值（如 'https'）此前两个分支都不命中、整包放行，
-// 导入后渲染侧 availableCerts 仅认 manual/acme_dns，该规则无证书 → TLS 端口明文服务。
-// 保存侧（rules.go）与启用侧（rule_features.go:697-699）均 400 此形态，导入不得更宽。
+// （manual/acme_dns/file）——空串/垃圾值（如 'https'）此前两个分支都不命中、整包放行，
+// 导入后渲染侧 availableCerts 仅认 manual/file/acme_dns，该规则无证书 → TLS 端口明文服务。
+// 保存侧（handlers.go 共享保存门）与启用侧（rule_features.go）均 400 此形态，导入不得更宽。
+// 启用 file 行按「内容或摄取源路径」校验（validateV2BackupTLSShapeSoft 的 file 分支）。
 // TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 	tests := []struct {
@@ -35,12 +36,13 @@ func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 		injectKey   bool
 		wantErrText string
 	}{
-		{name: "空串 tls_source 被拒绝", tlsSource: "", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "垃圾值 https 被拒绝", tlsSource: "https", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "任意未知值被拒绝", tlsSource: "auto", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "非字符串值（数字）被拒绝", tlsSource: 1, injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "缺失 tls_source 键被拒绝", tlsSource: nil, injectKey: false, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
+		{name: "空串 tls_source 被拒绝", tlsSource: "", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "垃圾值 https 被拒绝", tlsSource: "https", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "任意未知值被拒绝", tlsSource: "auto", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "非字符串值（数字）被拒绝", tlsSource: 1, injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "缺失 tls_source 键被拒绝", tlsSource: nil, injectKey: false, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
 		{name: "manual 携带证书材料放行", tlsSource: "manual", injectKey: true},
+		{name: "file 携带证书材料放行", tlsSource: "file", injectKey: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

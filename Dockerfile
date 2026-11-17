@@ -285,7 +285,8 @@ COPY geoipnames/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.j
 
 # 版本号硬编码点：本文件 ARG VERSION、docker-compose.yml 两处 image tag 与
 # build.args.VERSION、README 两版 docker build 示例（--build-arg VERSION 与
-# 镜像 tag）、web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
+# 镜像 tag）、.cnb/web_trigger.yml 构建按钮默认值（注释补记，锚点口径未变）、
+# web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
 # buildx --build-arg 显式传参。以上各处须同步递增（config.go 的 APP_VERSION
 # 未注入时显示 unknown，不参与硬编码）。
 #

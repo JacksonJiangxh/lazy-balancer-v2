@@ -33,7 +33,7 @@ docker run -d --name lazy-balancer --network host \
   -v $(pwd)/data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
   -v $(pwd)/backup:/app/backup \
-  v55448330/lazy-balancer-v2:latest
+  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
 ```
 
 **Docker Desktop（macOS/Windows，bridge 网络 + 端口映射）**：
@@ -49,10 +49,12 @@ docker run -d --name lazy-balancer \
   -v lb-data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
   -v $(pwd)/backup:/app/backup \
-  v55448330/lazy-balancer-v2:latest
+  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
 ```
 
 > 镜像标签:`latest` 指向最近一次**稳定版**(无通道后缀);测试版标签带 `-beta` 后缀(形如 `:v2.4.2-beta`),需要尝鲜或复现问题时请显式指定该标签。
+>
+> **本 fork 镜像**（`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest`）：本版本是上游 fork + 自研增强（端口换位、TLS 透传 SNI 分流等）。**上游官方仓库的 compose/run 示例里的镜像跑的是上游程序**，不含自研能力——部署本版本请统一改用本 fork 镜像地址；用上游官方 compose 部署的逐项改造对照见[部署指南](docs/deployment.zh-CN.md)「镜像与上游 compose 改造」。
 >
 > **容器初始化**：新镜像已内置 init 进程（回收健康检查等被遗弃的子进程），并改用二进制自带健康检查，无需再加 `--init`。若固定使用更早的镜像，请务必追加 `--init`。启动示例已默认 `--pids-limit=4096`（cgroup PID 配额，按线程计数）并同时设置 `--ulimit nproc=4096:4096`（容器内 `RLIMIT_NPROC`）；两者只作用于容器，宿主系统 ulimit 无需修改，实际可创建任务数取较低者。可按部署规模调整。
 
@@ -77,17 +79,21 @@ docker run -d --name lazy-balancer \
 #    web/package.json 的 engines 字段）
 
 # 2) Docker Compose（Linux；主节点为 host 网络）
-#    注意通道：仓库里的 docker-compose.yml 钉的是当前开发线的测试通道 tag
-#    （形如 vX.Y.Z-beta，与 Dockerfile 的 VERSION 同步校验）。要稳定版请改用
-#    上面示例里的 `:latest` 标签，或把两处 image 改成对应的稳定版 tag。
+#    注意通道：仓库里的 docker-compose.yml 钉的是 `:latest` 标签（最近一次
+#    稳定版）。要测试通道请把两处 image 显式改成 vX.Y.Z-beta（形如
+#    `:v2.4.2-beta`）。
+#    80/443 被占用要换默认口：取消 compose 主节点 environment 里
+#    HTTP_PORT/HTTPS_PORT 注释行即可，具体见 docs/deployment.zh-CN.md
+#    「修改默认端口」。
 docker compose up -d
 
 # 3) 或直接构建并推送镜像：VERSION=正式版本号（面板展示口径）；镜像 tag 可带
 #    -beta 通道后缀——两者刻意不同，判定口径「tag 去掉通道后缀 == APP_VERSION」
+#    （发布地址按实际 registry 替换；当前发布到 docker.cnb.cool）
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.4.2 \
   --provenance=false --sbom=false \
-  -t v55448330/lazy-balancer-v2:v2.4.2-beta --push .   # 测试通道；稳定版当前为 v2.4.2
+  -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:v2.4.2-beta --push .   # 测试通道；稳定版当前为 v2.4.2
 ```
 </details>
 

@@ -23,8 +23,10 @@ docker run -d --name lazy-balancer --network host \
   -v $(pwd)/data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
   -v $(pwd)/backup:/app/backup \
-  v55448330/lazy-balancer-v2:latest
+  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
 ```
+
+> **镜像必须是本 fork 的**：本版本 = 上游追平 + 自研增强，上游官方仓库 compose/示例里的镜像跑的是上游程序（自研能力不存在）。想用官方 compose 改造部署，逐项对照见[部署指南](deployment.zh-CN.md)「镜像与上游 compose 改造」一节。
 
 > `--stop-timeout 30` 是停止宽限期：面板的优雅关停链最多花 25 秒（在途请求排水、Caddy 排水、日志刷盘等），而 Docker 默认只给 10 秒就强杀，所以示例带这个参数；自建 systemd/k8s 编排时也请保证停止宽限 ≥25 秒。
 
@@ -83,7 +85,7 @@ TLS 透传 = 把某个域名的 HTTPS 流量**原样字节转发**给上游服�
 
 **80/443 端口被占用了怎么办？**
 
-启动容器时加环境变量换代理默认口：`-e HTTP_PORT=8080 -e HTTPS_PORT=8443`（host 网络下这就是 Caddy 实际绑定的端口）。注意这两个值只决定「默认语义」（新建规则的默认端口、兜底站、跳转判定），**已保存规则的端口不会自动迁移**，需要在面板逐条修改后保存。管理面板口 8000 在容器形态固定不可改（改了会让内置健康检查打错端口）。详见[部署指南](deployment.zh-CN.md)。
+启动容器时加环境变量换代理默认口：`-e HTTP_PORT=8080 -e HTTPS_PORT=8443`（host 网络下这就是 Caddy 实际绑定的端口）。注意这两个值只决定「默认语义」（新建规则的默认端口、兜底站、跳转判定），**已保存规则的端口不会自动迁移**，需要在面板逐条修改后保存。管理面板口默认 8000，host 模式下被宿主服务占用时可用 `PANEL_PORT` 换口，内置健康探针自动跟随（详见[部署指南](deployment.zh-CN.md)「修改默认端口」与「面板口 8000 被占用」两节）。
 
 **我用的是 Docker Desktop（macOS/Windows），有什么要注意的？**
 

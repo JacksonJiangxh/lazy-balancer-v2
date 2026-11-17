@@ -1296,6 +1296,9 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 	// 跨模式残留归一——非 manual 源不保留证书材料
 	// （私钥正文随导出/备份/快照放大）；非 acme_dns 源不保留 CA 提供商引用
 	// （ResolveCAProviderID 对非 0 不校验存在性，残留死引用签发期才暴露）。
+	// 引用型证书（file）行清空后由导入链提交后按本机源文件回填
+	// （referencedCertImportNote / IngestMissingReferencedCerts）——清空只为阻断
+	// 私钥随备份扩散，不影响还原可用性。
 	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET tls_cert='', tls_key=''
 		WHERE COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>'')`); err != nil {
 		return 0, fmt.Errorf("规则跨模式证书材料归一失败: %w", err)
@@ -2766,13 +2769,17 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 // 将被冲突自动置禁用的规则不投入运行，不参与运行态形态校验（此前垃圾
 // tls_source 的冲突行会把可自愈备份整包 400，与 cert_jobs 豁免哲学不一致）。
 // 导入/预览双路径同序调用（ImportConfigBackup / ValidateConfigImport）。
-// 启用 TLS 的行先做 tls_source 白名单——保存侧（rules.go）
-// 与启用侧（rule_features.go validateStoredRuleConfig）均对非 manual/acme_dns
-// 400，导入此前是唯一能放行该形态的门：”/垃圾值行两个分支都不命中、整包
-// 放行，渲染侧 availableCerts 仅认 manual/acme_dns → 无证书、无
-// tls_connection_policies → TLS 端口明文服务（与启用的 acme_dns 行同类缺口）。
+// 启用 TLS 的行先做 tls_source 白名单——保存侧（handlers.go 共享保存门）
+// 与启用侧（rule_features.go validateStoredRuleConfig）均对非
+// manual/acme_dns/file 400，导入此前是唯一能放行该形态的门：”/垃圾值行两个
+// 分支都不命中、整包放行，渲染侧 availableCerts 仅认 manual/file/acme_dns →
+// 无证书、无 tls_connection_policies → TLS 端口明文服务（与启用的 acme_dns 行
+// 同类缺口）。
 // 启用的手动 TLS 规则必须携带证书与私钥（镜像保存/启用侧
 // rule_features.go validateStoredRuleConfig 口径），拒绝时点名规则。
+// 启用的引用型证书（file）规则按「内容已入库，或携带摄取源路径供还原后回填」
+// 校验——保存侧写入时读取内容入库、启用门要求内容非空，导入两者皆无的启用行
+// 同理会在渲染期无 TLS policy 且无法回填（整包 400）。
 // 导入此前是唯一能绕过该校验的门：无证书规则不在 availableCerts 内 → 无
 // TLS policy → TLS 端口明文服务，且 autohttps.disable_certificates 阻止
 // Caddy 自动签发自愈。
@@ -2804,12 +2811,19 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 			continue
 		}
 		tlsSource := backupString(rule["tls_source"])
-		if tlsSource != "manual" && tlsSource != "acme_dns" {
-			return 0, fmt.Errorf("规则 #%d（%s）：启用 TLS 时必须选择证书来源（manual 或 acme_dns）", index+1, backupString(rule["name"]))
+		if tlsSource != "manual" && tlsSource != "acme_dns" && tlsSource != "file" {
+			return 0, fmt.Errorf("规则 #%d（%s）：启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）", index+1, backupString(rule["name"]))
 		}
 		if tlsSource == "manual" &&
 			(strings.TrimSpace(backupString(rule["tls_cert"])) == "" || strings.TrimSpace(backupString(rule["tls_key"])) == "") {
 			return 0, fmt.Errorf("规则 #%d（%s）：手动证书模式下必须提供 TLS 证书和私钥", index+1, backupString(rule["name"]))
+		}
+		// 引用型证书：内容已入库，或携带摄取源路径供还原后回填；两者皆无整包 400
+		// ——否则启用行渲染无 TLS policy（TLS 端口明文服务）且无从回填。
+		if tlsSource == "file" &&
+			(strings.TrimSpace(backupString(rule["tls_cert"])) == "" || strings.TrimSpace(backupString(rule["tls_key"])) == "") &&
+			(strings.TrimSpace(backupString(rule["tls_cert_path"])) == "" || strings.TrimSpace(backupString(rule["tls_key_path"])) == "") {
+			return 0, fmt.Errorf("规则 #%d（%s）：引用证书文件模式下必须提供 TLS 证书和私钥内容，或提供证书与私钥文件路径（还原后按路径回填）", index+1, backupString(rule["name"]))
 		}
 		// 启用的 acme_dns 行按 validateRuleACMEReferences 同口径校验——
 		// acme_config_id=0/悬挂/已禁用与 ca_provider_id 悬挂/已禁用均整包 400。
@@ -2837,6 +2851,37 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 		}
 	}
 	return acmeDangling, nil
+}
+
+// referencedCertImportNote 备份携带启用引用证书（file）规则时的用户可见说明
+// （预览与导入同文案）：normalizeRuleRowsForTransport 在导入事务内清空这些行的
+// tls_cert/tls_key（防私钥随备份扩散，裁定维持现状），证书内容改由本机源文件
+// 回填——源文件不可用的规则需修复后重新保存规则。
+func referencedCertImportNote(rows []map[string]any) string {
+	count := 0
+	for _, rule := range rows {
+		protocol, _ := rule["protocol"].(string)
+		if protocol == "tcp" {
+			continue
+		}
+		if !backupRuleEnabled(rule) || !backupBooleanEnabled(rule["enable_tls"]) {
+			continue
+		}
+		if backupString(rule["tls_source"]) == "file" {
+			count++
+		}
+	}
+	if count == 0 {
+		return ""
+	}
+	return fmt.Sprintf("备份中 %d 条启用规则的引用证书（tls_source=file）内容不随备份还原（防私钥随备份扩散），导入后按本机源文件回填；源文件不可用的规则需修复后重新保存规则", count)
+}
+
+// v1CertOriginNote v1（nginx 版）备份导入的证书来源口径说明（预览与导入
+// 同文案单源）：v1 备份只携带内联 PEM（ssl_cert/ssl_key），转换后一律按
+// manual 形态落库（tlsSource() 恒 manual），不携带文件路径语义。
+func v1CertOriginNote() string {
+	return "v1 备份的证书与私钥为备份内联内容，导入后一律按手动（manual）形态落库，不携带文件路径语义"
 }
 
 // certJobShape 是启用 ACME 规则不变量判定所需的证书任务行形状。
@@ -6900,15 +6945,45 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, filename,
 		recordAudit(c, action, "配置备份", services.FormatAuditDetail(auditParts...))
 	}
 	recordAudit(c, "重载", "Caddy服务", action+"配置后自动重载")
-	// 2026-09-07：导入成功后清除陈旧 caddy_apply_error
-	// ——但 reseed 失败时不清（reseed 的 caddyApplyNoteLocked 可能刚写入
-	// 失败标记，无条件清除会把真实失败横幅抹掉）。
-	// 未走 reseed 路径时 reseedApplyFailed 恒 false（只在上方 reseed 块内置位），
-	// 故双重否定守卫等价于 !reseedApplyFailed。
+	// 2026-09-07：导入成功后清除陈旧 caddy_apply_error，守卫 !reseedApplyFailed
+	// 的语义留痕（四点）：
+	// ① caddy_apply_error 是单槽全局态：recordCaddyApplyResult 新结果覆写旧值
+	// （nil 清空、非 nil 落失败），清除不吞失败——本处清的是上一次遗留的陈旧
+	// 横幅，而非本次导入结果；
+	// ② 与审计是两条独立通道：reseed 失败审计走 :6850 的 recordAudit（落审计
+	// 日志），横幅走 reseed 块内 caddyApplyNoteLocked 的失败记账（落单槽），
+	// 互不撤消——清横幅不撤审计、记审计不清横幅；
+	// ③ 清除依据是会话内全量重渲染成功收敛：note=="" 才走到这里（note 非空
+	// 即 reseedApplyFailed，不清）；未走 reseed 路径时 reseedApplyFailed 恒
+	// false（只在上方 reseed 块内置位），双重否定守卫等价于 !reseedApplyFailed；
+	// ④ 下方引用证书重放段失败经 recordCaddyApplyResult(reapplyErr) 重新落回
+	// 单槽——此处清过的横幅被真实失败覆写，无「先清后败」的丢失面。
 	if !reseedApplyFailed {
 		h.recordCaddyApplyResult(nil)
 	}
 	responseWarnings := skipWarnings
+	// 引用证书（file）行：传输归一在事务内清空了随备份携带的证书内容（防私钥
+	// 随备份扩散），而导入/还原链不经过启动回填（IngestMissingReferencedCerts
+	// 只在 MaterializeAllCertsFromDB 启动路径执行）也没有重启提示——不回填则
+	// 启用行在运行配置里无 TLS policy（TLS 端口明文服务到下次重启）。提交后
+	// 从本机源文件幂等回填，并强制重渲染让回填内容立即生效；失败只留痕、
+	// 不否决已提交导入。重渲染失败经 recordCaddyApplyResult(reapplyErr) 把失败
+	// 横幅重新落回单槽（回指上方清除段：此处清过的横幅被真实失败覆写）；成功
+	// 则不重复记账。
+	if referencedNote := referencedCertImportNote(backup.Tables["lb_rules"]); referencedNote != "" {
+		responseWarnings = append(append([]string{}, responseWarnings...), referencedNote)
+		if recovered := services.IngestMissingReferencedCerts(); recovered > 0 {
+			if reapplyErr := h.caddyService.GenerateAndApplyConfigForceInLock(); reapplyErr != nil {
+				h.recordCaddyApplyResult(reapplyErr)
+				warning := fmt.Sprintf("引用证书内容已从源文件回填 %d 条规则，但重载 Caddy 配置失败（重启或重新保存规则后生效）：%v", recovered, reapplyErr)
+				recordAudit(c, action+"警告", "配置备份", warning)
+				responseWarnings = append(append([]string{}, responseWarnings...), warning)
+			} else {
+				recordAudit(c, action, "配置备份", fmt.Sprintf("引用证书内容已按本机源文件回填 %d 条规则并重载（备份不携带引用证书内容）", recovered))
+				responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("引用证书内容已按本机源文件回填 %d 条规则并重载", recovered))
+			}
+		}
+	}
 	if warning := backupProductVersionWarning(backup.Meta, h.cfg.Version); warning != "" {
 		responseWarnings = append(append([]string{}, responseWarnings...), warning)
 	}

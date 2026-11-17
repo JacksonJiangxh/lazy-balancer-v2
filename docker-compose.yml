@@ -33,7 +33,7 @@ x-common-healthcheck: &common-healthcheck
   start_period: 90s
 
 services:
-  # 主从两个容器共用同一镜像（image 标签与 Docker Hub 推送的一致）。
+  # 主从两个容器共用同一镜像（image 标签与 docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2 推送的一致）。
   # 本地开发迭代时执行：docker compose build lazy-balancer && docker compose up -d
   #
   # 平台口径：主节点固定 network_mode: host，仅适用于 Linux 宿主。
@@ -41,16 +41,17 @@ services:
   # README「快速开始」的 Docker Desktop 命令（bridge + -p 8000/80/443/443-udp
   # + named volume）启动，而非直接 docker compose up。
   lazy-balancer:
-    image: v55448330/lazy-balancer-v2:v2.4.2
+    image: docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
     logging: *common-logging
     build:
       context: .
       args:
         # 版本号硬编码点之一（本行即 compose build.args.VERSION）。全仓其余
-        # 位置=Dockerfile ARG VERSION、本文件两处 image tag、README 两版
-        # docker build 示例（--build-arg VERSION 与镜像 tag）、
-        # web/src/utils/branding.ts 的 appVersion 回退值；发布时另需 buildx
-        # --build-arg 显式传参。以上各处须同步递增。
+        # 位置=Dockerfile ARG VERSION、README 两版 docker build 示例（--build-arg
+        # VERSION 与镜像 tag）、.cnb/web_trigger.yml 构建按钮默认值（注释补记，
+        # 锚点口径未变）、web/src/utils/branding.ts 的 appVersion 回退值；发布时
+        # 另需 buildx --build-arg 显式传参。以上各处须同步递增。本文件两处
+        # image tag 已切 :latest（最近一次稳定版）不再承载版本号，测试通道须显式改 vX.Y.Z-beta。
         # VERSION=正式版本号（v2.4.2，镜像内 APP_VERSION 同口径）；beta 通道见 v2.4.2-beta
         # 测试通道在 image tag 上加 -beta 后缀。
         VERSION: v2.4.2
@@ -67,6 +68,24 @@ services:
     environment:
       - NODE_NAME=master
       - LOG_FILE=/app/logs/lazy-balancer.log
+      # 自研「默认端口换位」（上游无此能力，自研登记第 3 项）：80/443 被占用时
+      # 取消注释换代理默认口。host 网络下这就是 Caddy 实际绑定的端口；仅决定
+      # 「默认语义」（新建规则默认端口、空域名兜底站、HTTP→HTTPS 跳转判定），
+      # 已保存规则的 listen_port 是持久化数据不会自动迁移，需在面板逐条改后保存。
+      # 面板口默认 8000；host 模式下 8000 被宿主服务占用时可用 PANEL_PORT 换口，
+      # 内置健康探针自动跟随该口（无需覆盖 healthcheck）。PANEL_PORT 禁与
+      # HTTP_PORT/HTTPS_PORT 同值（面板抢占后 Caddy 无法绑定）。
+      # 详见 docs/deployment.zh-CN.md「修改默认端口（compose 示例）」。
+      # - HTTP_PORT=8080
+      # - HTTPS_PORT=8443
+      # - PANEL_PORT=9000
+      # 透传内部终结口（仅绑 127.0.0.1，默认 7443）：与宿主回环监听冲突时换口；
+      # 安全边界（仅回环 + proxy_protocol 只信 127.0.0.1/32）不随换口变化。
+      # - PASSTHROUGH_INTERNAL_PORT=17443
+      # 仅「家庭网络/上游封 443」场景取消下面一行：终结口绑对外地址，外部直连该口
+      # 入站（放弃 Layer4 SNI 分流，透传域名在该入口不可用）——五条代价必读：
+      # docs/deployment.zh-CN.md「家庭网络 / 上游封 443（直连终结口入站）」。
+      # - PASSTHROUGH_INTERNAL_BIND=0.0.0.0
     restart: unless-stopped
     # 面板进程退出前 POST Caddy admin /stop 排水在途连接，
     # grace period 覆盖 HTTP ≤10s Shutdown + Caddy 排水窗口。
@@ -83,7 +102,7 @@ services:
   # Desktop 的默认注入。Docker < 20.10 不认 host-gateway 时，改填宿主 LAN 地址，
   # 例如 http://192.168.1.10:8000（host 网络下主节点直接监听宿主端口）。
   lazy-balancer-slave:
-    image: v55448330/lazy-balancer-v2:v2.4.2
+    image: docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
     logging: *common-logging
     container_name: lazy-balancer-slave
     # 宿主网关别名：bridge 网络内解析 host.docker.internal 到宿主，Linux 宿主
@@ -103,6 +122,8 @@ services:
     environment:
       - NODE_NAME=slave-test
       - LOG_FILE=/app/logs/lazy-balancer.log
+      # 从节点测试实例走 bridge + 端口映射，代理默认口换位时通常不需要动这里
+      # （换的是 Caddy 在容器内绑定的默认语义端口，与 -p 映射无关）。
     ulimits: *common-ulimits
     pids_limit: 4096
     restart: unless-stopped

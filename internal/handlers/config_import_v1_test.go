@@ -766,3 +766,74 @@ func TestImportV1ConfigSurvivesRequestCancellationAfterSessionStarts(t *testing.
 		t.Fatalf("status=%d body=%s, want import to finish on session context", response.Code, response.Body.String())
 	}
 }
+
+// Given 一条启用 TLS 的 v1 SSL 规则（备份携带内联证书）。
+// Then 预览与导入的 warnings 均可见证书来源口径说明——v1 备份证书一律按
+// manual 形态落库，不携带文件路径语义（文案单源 v1CertOriginNote）。
+func TestImportV1Warnings_includeCertOriginNote(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	// 导入路径对启用 TLS 的规则做真 PEM 校验，fixture 用测试自签证书对
+	// （certPairWithLifetime，与 cert_handlers_regression_05_test 同款）。
+	certPEM, keyPEM := certPairWithLifetime(t, 24*time.Hour)
+	backup := fmt.Sprintf(`{"proxy_config":{"config":[{"pk":1,"fields":{"proxy_name":"tls-rule","protocol":true,"listen":8443,"server_name":"tls.example.test","ssl":true,"ssl_cert":%s,"ssl_key":%s,"status":true,"upstream_list":[1]}}]},"upstream_config":{"config":[{"pk":1,"fields":{"status":true,"address":"127.0.0.1","port":9000,"weight":100}}]}}`,
+		mustJSONString(t, certPEM), mustJSONString(t, keyPEM))
+	envelope := func(t *testing.T, body []byte) importValidateResponse {
+		t.Helper()
+		var parsed struct {
+			Data importValidateResponse `json:"data"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("decode response: %v body=%s", err, body)
+		}
+		return parsed.Data
+	}
+	assertCertOriginNote := func(t *testing.T, warnings []string) {
+		t.Helper()
+		for _, warning := range warnings {
+			if warning == v1CertOriginNote() {
+				return
+			}
+		}
+		t.Fatalf("warnings missing cert origin note %q: %v", v1CertOriginNote(), warnings)
+	}
+
+	// 预览：口径说明可见
+	router := gin.New()
+	router.POST("/config/validate", h.ValidateConfigImport)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/config/validate", strings.NewReader(backup))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	preview := envelope(t, response.Body.Bytes())
+	if !preview.Valid {
+		t.Fatalf("preview invalid: %s", response.Body.String())
+	}
+	assertCertOriginNote(t, preview.Warnings)
+
+	// 导入：口径说明可见
+	importRouter := gin.New()
+	importRouter.POST("/config/import/v1", h.ImportV1Config)
+	importResponse := httptest.NewRecorder()
+	importRequest := httptest.NewRequest(http.MethodPost, "/config/import/v1", strings.NewReader(backup))
+	importRequest.Header.Set("Content-Type", "application/json")
+	importRouter.ServeHTTP(importResponse, importRequest)
+	if importResponse.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", importResponse.Code, importResponse.Body.String())
+	}
+	assertCertOriginNote(t, envelope(t, importResponse.Body.Bytes()).Warnings)
+}
+
+// mustJSONString 把字符串编码为合法 JSON 字符串字面量（含引号），
+// 供手工拼接的备份 JSON 使用。
+func mustJSONString(t *testing.T, value string) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json string: %v", err)
+	}
+	return string(encoded)
+}

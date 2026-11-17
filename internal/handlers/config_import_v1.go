@@ -795,6 +795,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		warnings := []string{
 			"仅导入负载规则（用户、全局配置不导入；旧规则的证书任务、证书材料与日志将随规则替换一并清理）",
 			"v1 不支持 ACME，HTTPS 规则的证书与私钥将以手动方式随规则导入",
+			v1CertOriginNote(), // 证书来源口径说明（单源见 config_backup.go，与 :537 注释同口径）
 			"nginx 特有配置（custom_config、日志路径等）已忽略",
 		}
 		warnings = append(warnings, allWarnings...)
@@ -860,6 +861,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	allWarnings = append(allWarnings, conversionWarnings...)
 	allWarnings = append(allWarnings, validationSkips...)
 	allWarnings = append(allWarnings, normalizations...)
+	allWarnings = append(allWarnings, v1CertOriginNote()) // 证书来源口径说明（单源见 config_backup.go）
 	if len(validRules) == 0 {
 		failImportValidation(c, "导入", "备份中没有可导入的有效规则")
 		return

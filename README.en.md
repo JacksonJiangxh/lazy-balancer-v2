@@ -1,3 +1,5 @@
+> **⚠️ The prose in this English README may lag behind the Chinese version. Image addresses and build examples are kept in sync with [README.md](README.md) (Chinese), which remains the maintained documentation.**
+
 # Lazy Balancer V2
 
 English | [简体中文](README.md)
@@ -31,7 +33,7 @@ docker run -d --name lazy-balancer --network host \
   -v $(pwd)/data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
   -v $(pwd)/backup:/app/backup \
-  v55448330/lazy-balancer-v2:latest
+  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
 ```
 
 **Docker Desktop (macOS/Windows, bridge network with port mapping)**:
@@ -47,10 +49,12 @@ docker run -d --name lazy-balancer \
   -v lb-data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
   -v $(pwd)/backup:/app/backup \
-  v55448330/lazy-balancer-v2:latest
+  docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
 ```
 
 > Image tags: `latest` points at the most recent **stable** release (no channel suffix); pre-release tags carry a `-beta` suffix (e.g. `:v2.4.2-beta`). Pin that exact tag when you need a pre-release or a reproducible install.
+>
+> **This fork's image** (`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest`): this release is the upstream fork plus self-developed enhancements (port swapping, TLS passthrough with SNI routing, chained fallback). **The upstream compose/run examples run the upstream program**, without those enhancements — deploy this fork with the fork image address shown here. Item-by-item migration of an upstream compose deployment is described in the [deployment guide](docs/deployment.zh-CN.md) section 「镜像与上游 compose 改造」 (Chinese).
 >
 > **Container init**: current images ship an init process (reaps abandoned health-check children) and use the binary's built-in health check, so `--init` is no longer needed. If you pin an older image, add `--init`. The examples default to `--pids-limit=4096` (PID cgroup, threads included) and also set `--ulimit nproc=4096:4096` (container `RLIMIT_NPROC`). Both apply only inside the container; the host ulimit needs no change, and the effective task cap is the lower of the two. Tune them to your deployment size.
 
@@ -81,11 +85,10 @@ cd web && npm ci && npm run build && cd ..
 git rev-parse HEAD && cat web/dist/build-info.json
 
 # 2) Docker Compose (Linux; the primary node uses host networking)
-#    Mind the channel: the checked-in docker-compose.yml pins the current
-#    development line's beta tag (e.g. vX.Y.Z-beta, kept in sync with the
-#    Dockerfile VERSION by a gate). For a stable release use the `:latest`
-#    tag from the example above, or change both image tags to the matching
-#    stable tag.
+#    Mind the channel: the checked-in docker-compose.yml pins `:latest`,
+#    which points at the most recent stable release. To run the beta
+#    channel, change both image tags explicitly to vX.Y.Z-beta (e.g.
+#    `:v2.4.2-beta`).
 docker compose up -d
 
 # 3) Or build and push the image directly: VERSION is the formal version (what
@@ -94,7 +97,7 @@ docker compose up -d
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.4.2 \
   --provenance=false --sbom=false \
-  -t v55448330/lazy-balancer-v2:v2.4.2-beta --push .   # beta channel; stable is now v2.4.2
+  -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:v2.4.2-beta --push .   # beta channel; stable is now v2.4.2
 ```
 </details>
 
