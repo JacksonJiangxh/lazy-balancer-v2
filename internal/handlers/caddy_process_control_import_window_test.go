@@ -21,14 +21,21 @@ import (
 	"lazy-balancer-v2/internal/config"
 )
 
-// newProcessControlTestHandlers 装配启停端点所需的测试缝：命令恒失败（证明
-// 请求确实走到了命令执行），pause 文件与监督器标记指向临时目录。
+// newProcessControlTestHandlers 装配启停端点所需的测试缝：admin 恒可达 +
+// 命令恒失败（证明请求确实走到了命令执行），pause 文件与监督器标记指向
+// 临时目录。admin 可达性必须注入桩而非依赖宿主 2019 端口——stopCaddy 按
+// 事实分类，「admin 不可达且无 caddy 进程」会被判定为已停止直接成功，
+// 桩命令不执行（宿主 2019 空闲时曾实测 stop 返回 200 而非 500）。
 func newProcessControlTestHandlers(t *testing.T) (*Handlers, *int32, *int32) {
 	t.Helper()
 	var runs, stops int32
 	origRun, origStop := caddyRunCommand, caddyStopCommand
 	origPause, origPid, origWait := caddyPauseFile, caddySupervisorPidFile, caddySupervisorWaitTimeout
 	tempDir := t.TempDir()
+	fakeAdmin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(fakeAdmin.Close)
 	caddyRunCommand = func() *exec.Cmd {
 		atomic.AddInt32(&runs, 1)
 		return exec.Command("sh", "-c", "exit 7")
@@ -45,7 +52,7 @@ func newProcessControlTestHandlers(t *testing.T) (*Handlers, *int32, *int32) {
 		caddyPauseFile, caddySupervisorPidFile = origPause, origPid
 		caddySupervisorWaitTimeout = origWait
 	})
-	return &Handlers{cfg: &config.Config{CaddyAdminURL: "http://127.0.0.1:2019"}}, &runs, &stops
+	return &Handlers{cfg: &config.Config{CaddyAdminURL: fakeAdmin.URL}}, &runs, &stops
 }
 
 func TestCaddyProcessControlRejectsDuringImportWindow(t *testing.T) {

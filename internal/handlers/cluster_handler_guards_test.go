@@ -3,12 +3,14 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 装配缺失必须 fail-closed 503（与 Pull/ForgetPins/mode/sync 同族），
@@ -66,6 +68,11 @@ func TestGetClusterWafFiles_409DuringImportWindow(t *testing.T) {
 	if _, err := db.DB.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
+	// 无数据断言（404）必须以空夹具构造，不得依赖宿主 /app/waf 是否在场——
+	// 宿主装了 CRS/IP2Region 时引用非 nil，端点回 200（曾实测）。测试缝会
+	// 同步失效引用/响应缓存，跨宿主形态稳定。
+	restoreWafPaths := services.OverrideWafLivePathsForTest(t.TempDir(), filepath.Join(t.TempDir(), "ip2region.xdb"))
+	defer restoreWafPaths()
 
 	busyRecorder := httptest.NewRecorder()
 	// 窗口状态是包级全局：模拟开启必须由 t.Cleanup 收尾（helper 内注册），

@@ -219,6 +219,7 @@ func TestPathRuleRoute_staticChainCountsMetrics(t *testing.T) {
 		}
 	}
 }
+
 // ── 2026-11-11 TASK-2026-1111-01：3xx/204 渲染强健度钉测（S1/S7/S8）──
 //
 // 改造前上游实现恒写 Content-Type + body，不看状态码：选 3xx 不发 Location

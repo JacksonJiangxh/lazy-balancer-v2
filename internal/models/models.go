@@ -161,10 +161,10 @@ type LbRule struct {
 	// 仅 passthrough 协议消费（Layer4 字节流转发，上游自带证书终结）；非透传
 	// 行恒 ''（写侧拒绝携带）。与 tcp_health_check_port/tcp_proxy_protocol/
 	// tcp_try_* 同为透传/TCP 族复用列，渲染接线由 S1-b（caddy.go）承担。
-	PassthroughUpstream           string `json:"passthrough_upstream"`
-	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
-	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
-	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	PassthroughUpstream      string `json:"passthrough_upstream"`
+	RequestBodyMaxSizeMB     int    `json:"request_body_max_size_mb"`
+	UpstreamKeepaliveTimeout int    `json:"upstream_keepalive_timeout"`
+	ServerTokensHidden       int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
 	// NTLM 兼容开关（2026-10-12）：1=按 NTLM 兼容形态渲染（保存门强制
 	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
 	NTLMCompatible     int `json:"ntlm_compatible"`
@@ -542,12 +542,12 @@ type CreateRuleRequest struct {
 	TCPTryInterval                int    `json:"tcp_try_interval"`
 	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
 	// 仅 passthrough 协议消费；非透传协议显式携带非空值由保存门 400（防脏数据）。
-	PassthroughUpstream           string `json:"passthrough_upstream"`
-	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
-	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
-	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
-	NTLMCompatible                int    `json:"ntlm_compatible"`      // 0=off, 1=NTLM 兼容形态（要求 strategy=cookie）
-	UpstreamForceHTTP1            int    `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
+	PassthroughUpstream      string `json:"passthrough_upstream"`
+	RequestBodyMaxSizeMB     int    `json:"request_body_max_size_mb"`
+	UpstreamKeepaliveTimeout int    `json:"upstream_keepalive_timeout"`
+	ServerTokensHidden       int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	NTLMCompatible           int    `json:"ntlm_compatible"`      // 0=off, 1=NTLM 兼容形态（要求 strategy=cookie）
+	UpstreamForceHTTP1       int    `json:"upstream_force_http1"` // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）
 	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
 	// 竞速间隔 / 单请求兜底截断（毫秒）；0=写侧/渲染侧按策略兜底 3000/30000。
 	ChainRaceIntervalMS   int `json:"chain_race_interval_ms"`
@@ -569,17 +569,17 @@ type CreateRuleRequest struct {
 	PathRules                  []PathRule `json:"path_rules"`
 	HostHeader                 string     `json:"host_header"`
 	// 健康检查域名：空=跟随 HostHeader（省略与空串同义，创建语义）。
-	HealthCheckHost string     `json:"health_check_host"`
+	HealthCheckHost string `json:"health_check_host"`
 	// Upstreams 不再 binding:"required"（JJC-20261112-01 S1-a）：透传规则
 	// upstreams 表零行（上游存 passthrough_upstream 单值列）；「至少一个上游」
 	// 由保存门按协议感知校验（CreateRule/validateRuleUpstreams）。
-	Upstreams       []Upstream `json:"upstreams"`
-	EnableTLS       bool       `json:"enable_tls"`
-	TLSSource       string     `json:"tls_source"`
-	ACMEConfigID    int        `json:"acme_config_id"`
-	CAProviderID    int        `json:"ca_provider_id"`
-	TLSCert         string     `json:"tls_cert"`
-	TLSKey          string     `json:"tls_key"`
+	Upstreams    []Upstream `json:"upstreams"`
+	EnableTLS    bool       `json:"enable_tls"`
+	TLSSource    string     `json:"tls_source"`
+	ACMEConfigID int        `json:"acme_config_id"`
+	CAProviderID int        `json:"ca_provider_id"`
+	TLSCert      string     `json:"tls_cert"`
+	TLSKey       string     `json:"tls_key"`
 	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
 	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
 	TLSCertPath     string `json:"tls_cert_path"`
@@ -643,17 +643,17 @@ type UpdateRuleRequest struct {
 	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 250
 	//（毫秒，单位与渲染输出 "250ms" 一致；DDL 与回填同取
 	// db.DefaultTCPTryInterval），tcp_health_check_port 0=跟随上游端口。
-	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
-	TCPProxyProtocol         *bool `json:"tcp_proxy_protocol"`
-	TCPTryDuration           *int `json:"tcp_try_duration"`
-	TCPTryInterval           *int `json:"tcp_try_interval"`
+	TCPHealthCheckPort *int  `json:"tcp_health_check_port"`
+	TCPProxyProtocol   *bool `json:"tcp_proxy_protocol"`
+	TCPTryDuration     *int  `json:"tcp_try_duration"`
+	TCPTryInterval     *int  `json:"tcp_try_interval"`
 	// TLS 透传（JJC-20261112-01 S1-a）：passthrough 规则的 SNI 上游 host:port。
 	// 指针化三态：省略（nil）=保留存量；显式空串=清空（非透传协议防脏数据；
 	// 透传协议清空会因必填门 400）；非透传协议显式携带非空值由保存门 400。
 	PassthroughUpstream      *string `json:"passthrough_upstream"`
-	RequestBodyMaxSizeMB     *int  `json:"request_body_max_size_mb"`
-	UpstreamKeepaliveTimeout *int  `json:"upstream_keepalive_timeout"`
-	ServerTokensHidden       *int  `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	RequestBodyMaxSizeMB     *int    `json:"request_body_max_size_mb"`
+	UpstreamKeepaliveTimeout *int    `json:"upstream_keepalive_timeout"`
+	ServerTokensHidden       *int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
 	// NTLM 兼容开关：指针化——省略（nil）=保留原值，显式 0=关闭。
 	NTLMCompatible     *int `json:"ntlm_compatible"`
 	UpstreamForceHTTP1 *int `json:"upstream_force_http1"`

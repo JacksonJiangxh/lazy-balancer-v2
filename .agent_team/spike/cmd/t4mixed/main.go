@@ -156,10 +156,10 @@ func main() {
 	ok := totalOK == connsPerSide*2 && totalFail == 0
 	emit(map[string]any{"step": "T4_mixed_concurrency", "ok": ok,
 		"concurrency": map[string]any{"passthrough": connsPerSide, "local": connsPerSide, "total": connsPerSide * 2},
-		"success":      map[string]any{"passthrough": passOK.Load(), "local": localOK.Load(), "total": totalOK},
-		"failure":      map[string]any{"passthrough": passFail.Load(), "local": localFail.Load(), "total": totalFail},
-		"elapsed_ms":   elapsed.Milliseconds(),
-		"results":      results})
+		"success":     map[string]any{"passthrough": passOK.Load(), "local": localOK.Load(), "total": totalOK},
+		"failure":     map[string]any{"passthrough": passFail.Load(), "local": localFail.Load(), "total": totalFail},
+		"elapsed_ms":  elapsed.Milliseconds(),
+		"results":     results})
 	logf("并发数=%d（透传%d+终结%d） 成功=%d 失败=%d 耗时=%s → %v",
 		connsPerSide*2, connsPerSide, connsPerSide, totalOK, totalFail, elapsed, ok)
 

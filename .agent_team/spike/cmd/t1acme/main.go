@@ -8,9 +8,10 @@
 //	                                                                  [Caddy http app：TLS 终结 + certmagic]
 //
 // 三条断言：
-//   A. 经 Layer4 兜底，acme-tls/1 握手返回带 acmeIdentifier 扩展的挑战证书；
-//   B. pebble 的 VA 真实校验通过 → 证书落盘（端到端签发）；
-//   C. 签发证书可用于 7443 业务握手（挑战路径与业务路径共用同一 TLS 栈）。
+//
+//	A. 经 Layer4 兜底，acme-tls/1 握手返回带 acmeIdentifier 扩展的挑战证书；
+//	B. pebble 的 VA 真实校验通过 → 证书落盘（端到端签发）；
+//	C. 签发证书可用于 7443 业务握手（挑战路径与业务路径共用同一 TLS 栈）。
 package main
 
 import (
@@ -30,14 +31,14 @@ import (
 )
 
 const (
-	portL4        = 443  // Layer4 前置（生产真实端口）
-	portLocal     = 7443 // 本地终结（计划固定值）
-	portACMECA    = 14000
-	portACMEMgmt  = 15000
-	portMockDNS   = 8053
-	portUpstream  = 10443
-	localDomain   = "local.spike.test"
-	passDomain    = "pass.spike.test"
+	portL4       = 443  // Layer4 前置（生产真实端口）
+	portLocal    = 7443 // 本地终结（计划固定值）
+	portACMECA   = 14000
+	portACMEMgmt = 15000
+	portMockDNS  = 8053
+	portUpstream = 10443
+	localDomain  = "local.spike.test"
+	passDomain   = "pass.spike.test"
 )
 
 // 1.3.6.1.5.5.7.1.31 (id-pe-acmeIdentifier)
@@ -65,15 +66,15 @@ func main() {
 	pebbleRoot := filepath.Join(pebbleDir, "test/certs/pebble.minica.pem")
 	pebbleCfg := filepath.Join(base, "pebble-config.json")
 	writeJSON(pebbleCfg, map[string]any{"pebble": map[string]any{
-		"listenAddress":                   fmt.Sprintf("127.0.0.1:%d", portACMECA),
-		"managementListenAddress":         fmt.Sprintf("127.0.0.1:%d", portACMEMgmt),
-		"certificate":                     filepath.Join(pebbleDir, "test/certs/localhost/cert.pem"),
-		"privateKey":                      filepath.Join(pebbleDir, "test/certs/localhost/key.pem"),
-		"httpPort":                        5002,
-		"tlsPort":                         portL4,
-		"externalAccountBindingRequired":  false,
-		"retryAfter":                      map[string]int{"authz": 1, "order": 1},
-		"certificateValidityPeriod":       86400,
+		"listenAddress":                  fmt.Sprintf("127.0.0.1:%d", portACMECA),
+		"managementListenAddress":        fmt.Sprintf("127.0.0.1:%d", portACMEMgmt),
+		"certificate":                    filepath.Join(pebbleDir, "test/certs/localhost/cert.pem"),
+		"privateKey":                     filepath.Join(pebbleDir, "test/certs/localhost/key.pem"),
+		"httpPort":                       5002,
+		"tlsPort":                        portL4,
+		"externalAccountBindingRequired": false,
+		"retryAfter":                     map[string]int{"authz": 1, "order": 1},
+		"certificateValidityPeriod":      86400,
 	}})
 	pebbleBin := filepath.Join(base, "pebble")
 	buildModuleCmd(pebbleBin, "github.com/letsencrypt/pebble/v2@v2.5.0", "./cmd/pebble")

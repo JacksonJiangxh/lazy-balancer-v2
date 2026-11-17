@@ -12,18 +12,18 @@ import (
 
 // Observation 是一次 TLS 握手的可核验观测值。
 type Observation struct {
-	Addr              string   `json:"addr"`
-	SNISent           string   `json:"sni_sent"`
-	SNIServerName     string   `json:"sni_server_name"` // 服务端视角（由响应回填）
-	ALPNSent          []string `json:"alpn_sent"`
-	ALPNNegotiated    string   `json:"alpn_negotiated"`
-	TLSVersion        string   `json:"tls_version"`
-	CipherSuite       string   `json:"cipher_suite"`
-	LeafSubject       string   `json:"leaf_subject"`
-	LeafIssuer        string   `json:"leaf_issuer"`
-	LeafDNSNames      []string `json:"leaf_dns_names"`
-	Body              string   `json:"body,omitempty"`
-	Error             string   `json:"error,omitempty"`
+	Addr           string   `json:"addr"`
+	SNISent        string   `json:"sni_sent"`
+	SNIServerName  string   `json:"sni_server_name"` // 服务端视角（由响应回填）
+	ALPNSent       []string `json:"alpn_sent"`
+	ALPNNegotiated string   `json:"alpn_negotiated"`
+	TLSVersion     string   `json:"tls_version"`
+	CipherSuite    string   `json:"cipher_suite"`
+	LeafSubject    string   `json:"leaf_subject"`
+	LeafIssuer     string   `json:"leaf_issuer"`
+	LeafDNSNames   []string `json:"leaf_dns_names"`
+	Body           string   `json:"body,omitempty"`
+	Error          string   `json:"error,omitempty"`
 }
 
 func versionName(v uint16) string {

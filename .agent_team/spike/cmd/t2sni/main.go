@@ -8,8 +8,9 @@
 //	                                 └─ 其余 → proxy 127.0.0.1:7443（PROXY v2，本地终结）
 //
 // 断言：
-//   A. 直连 10443（baseline）与经 L4 :443 同 SNI 握手，TLS 版本 / ALPN / 服务端所见 SNI 三项一致；
-//   B. 经 L4 后 upstream JSONL 记录的 remote/sni/alpn 与客户端视角吻合。
+//
+//	A. 直连 10443（baseline）与经 L4 :443 同 SNI 握手，TLS 版本 / ALPN / 服务端所见 SNI 三项一致；
+//	B. 经 L4 后 upstream JSONL 记录的 remote/sni/alpn 与客户端视角吻合。
 package main
 
 import (

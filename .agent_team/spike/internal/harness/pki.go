@@ -17,11 +17,11 @@ import (
 
 // PKI 持有生成的证书路径。
 type PKI struct {
-	Dir      string
-	CACert   string
-	CAKey    string
-	CAPool   *x509.CertPool
-	Leaves   map[string]LeafPair
+	Dir    string
+	CACert string
+	CAKey  string
+	CAPool *x509.CertPool
+	Leaves map[string]LeafPair
 }
 
 // LeafPair 是叶证书与私钥的 PEM 路径。

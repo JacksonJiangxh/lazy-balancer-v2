@@ -1196,7 +1196,7 @@ var newColumnsRegistry = map[string]string{
 	// 重建 DDL 与读路径（lbRuleColumns/快照 SELECT）依赖其存在；新列绝不进
 	// deadColumnDrops/legacy*DeadColumns 死列清单。
 	"lb_rules.passthrough_upstream": "TEXT NOT NULL DEFAULT ''",
-	"auto_backups.app_version":           "TEXT NOT NULL DEFAULT ''",
+	"auto_backups.app_version":      "TEXT NOT NULL DEFAULT ''",
 	// 统一任务引擎：手动触发操作者归因列——runNow/Trigger 落
 	// 操作者，auto/startup/legacy 落空串。存量库幂等补列（ensureNewColumns）。
 	"task_runs.operator":                    "TEXT NOT NULL DEFAULT ''",

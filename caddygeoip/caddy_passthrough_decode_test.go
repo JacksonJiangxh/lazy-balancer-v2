@@ -424,9 +424,9 @@ func TestCaddyPassthroughDecodeChain_layer4RoutesDecode(t *testing.T) {
 	// 注册面结论（降级原因标注——任务令要求如实记录，不臆造）。
 	if len(unknownByID) > 0 {
 		t.Logf("layer4 模块注册面：已加载=%v；未注册（降级结构断言）=%v", loadedByID, unknownByID)
-		t.Logf("降级原因：layer4.* 模块来自 mholt/caddy-l4，本模块（caddygeoip）依赖树无该模块"+
-			"（生产镜像经 xcaddy --with github.com/mholt/caddy-l4@v0.1.2 编入，见 Dockerfile；"+
-			"spike/caddybin 的 blank-import 属 spike 独立 go.mod，测试进程不继承）——"+
+		t.Logf("降级原因：layer4.* 模块来自 mholt/caddy-l4，本模块（caddygeoip）依赖树无该模块" +
+			"（生产镜像经 xcaddy --with github.com/mholt/caddy-l4@v0.1.2 编入，见 Dockerfile；" +
+			"spike/caddybin 的 blank-import 属 spike 独立 go.mod，测试进程不继承）——" +
 			"分派键/结构断言照常生效，真实解码待 caddy-l4 入依赖树后自动升级")
 	} else {
 		t.Logf("layer4 模块全部真实加载：%v", loadedByID)
@@ -541,9 +541,9 @@ func TestCaddyPassthroughDecodeChain_httpListenerWrappersDecode(t *testing.T) {
 	// 注册面结论（降级原因标注——任务令要求如实记录，不臆造）。
 	if len(unknownByID) > 0 {
 		t.Logf("listener wrapper 注册面：已加载=%v；未注册（降级结构断言）=%v", loadedByID, unknownByID)
-		t.Logf("降级原因：caddy.listeners.proxy_protocol 的注册包 caddyhttp/proxyprotocol 在本模块"+
-			"依赖树未被 import——import 它会把 pires/go-proxyproto 牵进构建（go.mod/go.sum 增条目，"+
-			"不在本任务白名单）；生产镜像用的是同一份 caddy v2.11.9 内建实现（无外部插件），"+
+		t.Logf("降级原因：caddy.listeners.proxy_protocol 的注册包 caddyhttp/proxyprotocol 在本模块" +
+			"依赖树未被 import——import 它会把 pires/go-proxyproto 牵进构建（go.mod/go.sum 增条目，" +
+			"不在本任务白名单）；生产镜像用的是同一份 caddy v2.11.9 内建实现（无外部插件），" +
 			"依赖树引入该包后本测试自动恢复真实解码")
 	} else {
 		t.Logf("listener wrapper 全部真实加载：%v", loadedByID)
