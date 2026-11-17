@@ -63,9 +63,7 @@ func TestImportConfigBackup_normalizesInvalidBlockPageContentType(t *testing.T) 
 
 func TestUpdateSecurityPolicy_auditDeltaCoversTypeAndTrustDetection(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	router := newSecurityRouter(t)
 	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, policy_type, trust_detection, ip_whitelist_enabled, ip_whitelist, geoip_mode)
 		VALUES ('类型信任策略', 'off', 1, 'stage0', 1, 1, '["::1"]', 'off')`)

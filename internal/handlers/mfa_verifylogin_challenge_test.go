@@ -215,11 +215,7 @@ func TestMFAVerifyLogin_dbFailureReturns500Not401(t *testing.T) {
 // 并留下服务故障审计，客户端可重试。
 func TestMFAVerifyLogin_consumeDBFailureReturns500AndKeepsChallenge(t *testing.T) {
 	seedMFAChallengeLoginFixture(t, "consume-db-err", 0)
-	oldAudit := db.AuditDB
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.AuditDB = oldAudit })
+	initAuditDBForTest(t, t.TempDir())
 	if _, err := db.DB.Exec(`ALTER TABLE mfa_challenges RENAME COLUMN consumed TO consumed_unreadable`); err != nil {
 		t.Fatalf("break consume update: %v", err)
 	}

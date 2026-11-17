@@ -15,9 +15,7 @@ import (
 
 func TestUpdateSecurityPolicy_auditRecordsOnlyChangedFields(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	router := newSecurityRouter(t)
 
 	// Given：一条存量 stage2 策略（rps=100/burst=50/enabled/block_page_id=0；
@@ -84,9 +82,7 @@ func TestUpdateSecurityPolicy_auditRecordsOnlyChangedFields(t *testing.T) {
 // 审计详情以名称呈现（缺失 ID 回落 #id，空数组=（空），拦截页 0=（无））。
 func TestUpdateSecurityPolicy_auditResolvesRefNames(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	router := newSecurityRouter(t)
 
 	// Given：名单两条、自定义规则一条、stage1 策略（refs=[7]、custom=[16]、page=0）

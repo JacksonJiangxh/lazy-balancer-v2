@@ -19,11 +19,7 @@ import (
 func TestLoadBrandingConfig_reloadAuditRunsOutsideStoreLock(t *testing.T) {
 	resetBrandingStore()
 	t.Cleanup(resetBrandingStore)
-	oldAudit := db.AuditDB
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("init audit db: %v", err)
-	}
-	t.Cleanup(func() { db.AuditDB = oldAudit })
+	initAuditDBForTest(t, t.TempDir())
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "branding.json")

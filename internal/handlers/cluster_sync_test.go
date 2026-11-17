@@ -266,9 +266,13 @@ func TestGetClusterSnapshot_auditNodeNameReadsServiceHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	serviceDB := db.DB
+	// 首轮 Initialize 的 metrics/audit 句柄将被下一轮覆盖；主库句柄 serviceDB
+	// 由收尾保留（服务句柄语义），另两句柄必须显式关闭防泄漏。
+	supersededMetrics, supersededAudit := db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	closeSupersededTestDBHandles(nil, supersededMetrics, supersededAudit)
 	t.Cleanup(func() {
 		_ = db.Close()
 		_ = serviceDB.Close()

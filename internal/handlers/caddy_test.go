@@ -829,9 +829,7 @@ func TestPreviewConfigUpdate_matchesSaveSideValidation(t *testing.T) {
 // caddy_apply_error 横幅（重启后真实失败仍可见）。
 func TestUpdateConfig_rollbackFailurePersistsApplyBanner(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/config/":

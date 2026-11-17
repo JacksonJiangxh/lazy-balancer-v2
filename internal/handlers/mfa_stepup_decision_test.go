@@ -228,9 +228,7 @@ func TestDecideMFAStepUp_distinguishesReadFailures(t *testing.T) {
 // 本地 MFA step-up（守卫 fail-open 落穿时也不会被 428）。
 func TestCreateAPIKey_oidcSessionSkipsLocalStepUp(t *testing.T) {
 	newBackupTestHandlers(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("initialize audit db: %v", err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled,auth_provider)
 		VALUES (1,'oidc-operator','x','admin',1,1,'oidc')`); err != nil {
 		t.Fatal(err)

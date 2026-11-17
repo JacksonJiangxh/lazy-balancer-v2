@@ -21,11 +21,7 @@ func setupLoginAuditDB(t *testing.T) {
 	if _, err := db.DB.Exec(`CREATE TABLE IF NOT EXISTS global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER); INSERT OR REPLACE INTO global_config (id, mfa_lockout_enabled) VALUES (1, 1)`); err != nil {
 		t.Fatalf("seed global config: %v", err)
 	}
-	oldAudit := db.AuditDB
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("init audit db: %v", err)
-	}
-	t.Cleanup(func() { db.AuditDB = oldAudit })
+	initAuditDBForTest(t, t.TempDir())
 }
 
 // 登录成功审计详情含完整用户标识「用户 N（username）」,非裸数字 ID(2026-09-11 裁定)。

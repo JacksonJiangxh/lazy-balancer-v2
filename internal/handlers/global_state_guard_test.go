@@ -50,6 +50,11 @@ func TestMain(m *testing.M) {
 		}
 	}
 
+	// DB 句柄守卫：suite 终态的连接池后台协程固定上限断言（JJC-20261115-002-S2）。
+	// 实现单源在 internal/testsupport（JJC-20261115-003-B3）——本包只调用，
+	// 计数口径/结算等待/上限断言不再各包复制一份。
+	code = testsupport.CheckDBHandleGoroutines(code)
+
 	os.Exit(code)
 }
 
@@ -170,6 +175,10 @@ func captureHandlerGlobalSeams() map[string]any {
 		"configBackupExportAfterDBSnapshot": handlerGlobalPointer(configBackupExportAfterDBSnapshot),
 		"maxLbbakTotalBytes":                maxLbbakTotalBytes,
 		"newLbbakWafFileSnapshotDir":        handlerGlobalPointer(newLbbakWafFileSnapshotDir),
+		// branding 异步重应用的前置接缝（JJC-20261115-002 D4）：漏复位会让后续
+		// 用例的品牌同步在「角色门已过、渲染未开始」处阻塞在自己用例的闭包里
+		// ——表现为无关用例超时/挂死，泄漏点极难定位，故与既有 seam 同口径登记。
+		"brandingApplyPreApplyHook": handlerGlobalPointer(brandingApplyPreApplyHook),
 		// 大屏流量缓存的 TTL 旋钮：漏复位后后续用例按 50ms 过期跑（缓存命中
 		// 断言随机失效），失败用例看起来与被测逻辑无关。
 		"threatTrafficCacheTTL": threatTrafficCacheTTL,
@@ -279,6 +288,15 @@ func TestGlobalStateGuard_detectsImportSeamLeaks(t *testing.T) {
 		old := newLbbakWafFileSnapshotDir
 		t.Cleanup(func() { newLbbakWafFileSnapshotDir = old })
 		assertHandlerGlobalStateLeak(t, "newLbbakWafFileSnapshotDir", func() { newLbbakWafFileSnapshotDir = nil })
+	})
+	// 登记即可见性自证（JJC-20261115-002 D4）：只把 seam 加进快照而快照比较
+	// 漏登记/键名漂移时，守卫对该 seam 完全失明。本子测试断言「赋值→被点名」。
+	t.Run("brandingApplyPreApplyHook", func(t *testing.T) {
+		old := brandingApplyPreApplyHook
+		t.Cleanup(func() { brandingApplyPreApplyHook = old })
+		assertHandlerGlobalStateLeak(t, "brandingApplyPreApplyHook", func() {
+			brandingApplyPreApplyHook = func() {}
+		})
 	})
 }
 

@@ -517,9 +517,7 @@ func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
 // detail 不得落完整密钥。
 func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
 	setupAPIKeyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("initialize audit db: %v", err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -558,9 +556,7 @@ func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
 // 此前只有「密钥 id name」，禁用与放宽权限在审计中不可回溯。
 func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
 	setupAPIKeyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("initialize audit db: %v", err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/v1/users/me/api-keys/10",
@@ -754,9 +750,7 @@ func TestUpdateAPIKeyStatus_snapshotAndUpdateShareTransaction(t *testing.T) {
 // 且不消费 ctx，已取消的请求仍会完整生效（200 + 落库 + 审计留痕）。
 func TestUpdateAPIKeyStatus_cancelledContextAborts(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("initialize audit db: %v", err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	gin.SetMode(gin.TestMode)
 	requestCtx, cancel := context.WithCancel(context.Background())
 	cancel()

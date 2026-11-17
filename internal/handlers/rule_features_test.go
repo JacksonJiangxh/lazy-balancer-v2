@@ -789,9 +789,13 @@ func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 	}
 
 	// When 再次初始化触发迁移（UPDATE upstreams SET enabled=0 WHERE enabled IS NULL）
+	// 二次 Initialize 直接覆盖包级三句柄且不关旧值（生产单次调用无碍），
+	// 必须显式关闭上一轮句柄，否则 opener/cleaner 协程永久泄漏。
+	supersededDB, supersededMetrics, supersededAudit := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(dir); err != nil {
 		t.Fatalf("second initialize (migration): %v", err)
 	}
+	closeSupersededTestDBHandles(supersededDB, supersededMetrics, supersededAudit)
 
 	// Then NULL 行消失，原 NULL 行走 0，正常行保持 1
 	var nullCount, enabledSum int
@@ -830,9 +834,12 @@ func TestMigration_lbRulesEnabledNullNormalizedToDisabled(t *testing.T) {
 	}
 
 	// When 再次初始化触发迁移（UPDATE lb_rules SET enabled=0 WHERE enabled IS NULL）
+	// 二次 Initialize 的旧句柄必须显式关闭（覆盖式换句柄不关旧值）。
+	supersededDB, supersededMetrics, supersededAudit := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(dir); err != nil {
 		t.Fatalf("second initialize (migration): %v", err)
 	}
+	closeSupersededTestDBHandles(supersededDB, supersededMetrics, supersededAudit)
 
 	// Then NULL 行消失，原 NULL 行走 0，正常行保持 1
 	var nullCount, enabledSum int

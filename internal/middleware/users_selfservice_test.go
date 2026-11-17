@@ -160,10 +160,15 @@ func TestDatabaseHandleParityAfterFixtureRestore(t *testing.T) {
 	if previous == nil {
 		t.Fatal("Initialize 后原子句柄不应为 nil")
 	}
+	// 二次 Initialize 直接覆盖包级三句柄且不关旧值：首轮 MetricsDB/AuditDB
+	// 被覆盖后不可达、永不 Close（opener/cleaner 协程常驻），必须在覆盖前留存
+	// 并显式关闭。主库句柄 previous 属「服务句柄」语义，由本用例复位后收尾 Close。
+	supersededMetrics, supersededAudit := db.MetricsDB, db.AuditDB
 	// 夹具语境：进入用例前已有库，用例再 Initialize 换库
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("re-initialize database: %v", err)
 	}
+	closeSupersededTestHandles(supersededMetrics, supersededAudit)
 	_ = db.Close()
 	if got := db.GetDB(); got != nil {
 		t.Fatal("Close 后原子句柄应为 nil（夹具必须显式回填）")
@@ -171,6 +176,18 @@ func TestDatabaseHandleParityAfterFixtureRestore(t *testing.T) {
 	restoreTestDBHandles(previous, oldMetricsDB, oldAuditDB)
 	if got := db.GetDB(); got != db.DB || got != previous {
 		t.Fatal("复位后 db.GetDB() 必须与被还原的包级句柄同源")
+	}
+}
+
+// closeSupersededTestHandles 关闭被新一轮 Initialize 覆盖掉的包级句柄。
+// 与 handlers 包同名 helper 同型语义；该 helper 是测试文件内的私有函数，跨包
+// 不可见，故本包就地实现（单用例二次 Initialize 的三个消费点：MetricsDB、
+// AuditDB 由本函数关闭，主库句柄由调用方按夹具语境保留/复位）。
+func closeSupersededTestHandles(handles ...*sql.DB) {
+	for _, handle := range handles {
+		if handle != nil {
+			_ = handle.Close()
+		}
 	}
 }
 

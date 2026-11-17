@@ -86,8 +86,14 @@ func countingDB(t *testing.T, filename string, swap func(counting *sql.DB)) *sql
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
+	// Initialize 已按同目录打开 metrics 库；二次初始化覆盖 MetricsDB 且不关
+	// 旧值，显式关闭被覆盖句柄（守卫见 db_handle_guard_test.go）。
+	supersededMetrics := db.MetricsDB
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
+	}
+	if supersededMetrics != nil {
+		_ = supersededMetrics.Close()
 	}
 	recorder := &sqlQueryRecorder{}
 	swap(sql.OpenDB(queryCountingConnector{

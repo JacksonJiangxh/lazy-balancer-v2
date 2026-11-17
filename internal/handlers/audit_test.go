@@ -18,9 +18,8 @@ func TestRecordAudit_prefersContextAuditIP(t *testing.T) {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	// db.Initialize 已按同目录装配 audit 库；再调 InitializeAuditDB 会覆盖
+	// 包级 AuditDB 且不关旧值（生产单次调用无碍，测试即泄漏句柄），故不重复。
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB

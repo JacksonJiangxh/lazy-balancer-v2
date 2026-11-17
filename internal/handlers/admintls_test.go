@@ -662,9 +662,7 @@ func TestGetAdminTLS_corruptStoredCertIsVisible(t *testing.T) {
 // 「更新失败/基础设置」词条（同 UpdateConfig 失败留痕口径）。
 func TestUpdateAdminTLS_failuresAreAudited(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatalf("initialize audit db: %v", err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	handler := newAdminTLSHandlers(t)
 	send := func(payload string) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()

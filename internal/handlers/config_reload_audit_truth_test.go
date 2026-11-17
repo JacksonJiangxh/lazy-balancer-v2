@@ -19,9 +19,7 @@ import (
 
 func TestUpdateConfig_skipsReloadAuditWhenRenderUnchanged(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	var lastBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -83,9 +81,7 @@ func TestUpdateConfig_skipsReloadAuditWhenRenderUnchanged(t *testing.T) {
 // 重载」审计不得落笔（ApplyConfigReporting.loaded=false）。
 func TestPutCaddyConfig_skipsReloadAuditWhenByteIdentical(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	var lastBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

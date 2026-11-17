@@ -23,8 +23,16 @@ func setupSecurityPolicyTestDB(t *testing.T) {
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
+	// Initialize 已按同一 dataDir 打开过 metrics 库；此处再初始化会直接覆盖
+	// 包级 MetricsDB 句柄且不关旧值（生产单次调用无碍，测试反复调用即泄漏）。
+	// 显式关闭被覆盖的句柄，保持「一轮初始化一套句柄」的配对（守护见
+	// db_handle_guard_test.go）。
+	supersededMetrics := db.MetricsDB
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
+	}
+	if supersededMetrics != nil {
+		_ = supersededMetrics.Close()
 	}
 	t.Cleanup(func() {
 		_ = db.Close()

@@ -192,8 +192,14 @@ func TestGetLogStats_securityEventsRow_reportsSpoolCache(t *testing.T) {
 	oldWafLog := wafAuditLogFile
 	wafAuditLogFile = filepath.Join(dataDir, "logs", "waf-audit", "audit.log")
 	t.Cleanup(func() { wafAuditLogFile = oldWafLog })
+	// fixture 的 Initialize 已装配 metrics 库；此处置换句柄必须关闭被覆盖的
+	// 旧句柄（覆盖式换句柄不关旧值，生产单次调用无碍、测试即泄漏）。
+	supersededMetrics := db.MetricsDB
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
 		t.Fatalf("initialize metrics database: %v", err)
+	}
+	if supersededMetrics != nil {
+		_ = supersededMetrics.Close()
 	}
 	t.Cleanup(func() {
 		if db.MetricsDB != nil {

@@ -20,9 +20,7 @@ import (
 
 func TestUpdateSecurityPolicy_reinferredPolicyTypeAudited(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
-	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initAuditDBForTest(t, t.TempDir())
 	router := newSecurityRouter(t)
 	// Given：存量 mixed 策略但内容仅剩阶段 1 特征（ACL）——部分更新会触发重推断
 	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, policy_type, ip_acl_enabled, ip_acl_mode, ip_acl_list)

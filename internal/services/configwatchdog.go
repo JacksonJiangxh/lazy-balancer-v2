@@ -82,6 +82,11 @@ func ResetReferencedCertWatch() {
 	referencedCertWatchReady = false
 }
 
+// referencedCertIngestBeforeWriteForTest 是「本轮扫描→回写」窗口的测试缝
+// （生产恒 nil）：乐观锁三形态（路径被并发改写 / tls_source 切走 / 行删除）
+// 只能在该窗口内制造并发变更，用于钉住 0 行命中必须跳过。
+var referencedCertIngestBeforeWriteForTest func(caddyID string)
+
 // checkReferencedCertFiles 逐条比对证书源文件指纹，变化即摄取回写并强制重载（首扫仅建基线）。
 // 详见 docs/fork-notes/watchdog-and-server.md §2
 func checkReferencedCertFiles() {
@@ -134,6 +139,11 @@ func checkReferencedCertFiles() {
 
 	// 逐条摄取：文件缺失（digest missing:）或配对无效（外部工具更新到一半）时
 	// 跳过该规则并留痕，DB 保留上次有效内容；有效内容回写 tls_cert/tls_key。
+	// 锁序（certstore.go:201 同一钉死单向序）：先 certWriteMu.RLock，再
+	// per-rule 文件锁，单向不逆。RLock 持有窗口内只做文件读取与校验，SQLite
+	// 写一律在释放全部文件锁之后（锁外）执行——否则与「导入事务持库写锁等
+	// RestoreCertFiles 写锁」（config_import_coordinator.go:670）构成
+	// 「看门狗持 RLock 等库 ∥ 导入事务持库等写锁」组合等待死锁。
 	ingested := 0
 	for _, id := range changed {
 		if strings.HasPrefix(current[id], "missing:") {
@@ -141,13 +151,50 @@ func checkReferencedCertFiles() {
 			continue
 		}
 		p := paths[id]
+		// 文件读取与配对校验整体置于 RLock+per-rule 锁内：certWriteMu 写锁
+		// （RestoreCertFiles 导入回退）与同规则并发写/删（writeCertFiles/
+		// RemoveCertFiles 的 tmp→rename）不得与本校验交错读到撕裂内容。
+		// 仅 per-rule 锁不够：写锁方不取 per-rule 锁，无法与回滚互斥。
+		certWriteMu.RLock()
+		ruleLock := lockCertRuleFile(id)
+		ruleLock.Lock()
 		referenced, loadErr := LoadReferencedCertificate(p[0], p[1])
+		ruleLock.Unlock()
+		certWriteMu.RUnlock()
 		if loadErr != nil {
 			Logf("warn", "引用证书看门狗: 规则 %s 源文件校验失败，跳过摄取（数据库保留上次有效证书）: %v", id, loadErr)
 			continue
 		}
-		if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id=?`, referenced.CertPEM, referenced.KeyPEM, id); err != nil {
-			Logf("error", "引用证书看门狗: 规则 %s 摄取回写数据库失败: %v", id, err)
+		if hook := referencedCertIngestBeforeWriteForTest; hook != nil {
+			// hook 属测试缝，但契约同生产：其内允许的并发操作含 SQLite 写
+			// （乐观锁三形态用例）——必须在文件锁之外调用，否则测试缝自身
+			// 违反「RLock 窗口内不触碰 DB 写」的钉死锁序。
+			hook(id)
+		}
+		// 乐观条件：扫描时读到的 tls_source/摄取源路径必须仍与回写目标一致。
+		// 否则（路径被并发改写 / tls_source 切走 / 行删除）用旧路径的内容回写
+		// 会把新形态规则配成错证书（或复活已删行），0 行命中即跳过并留痕。
+		// 本 Exec 已在文件锁外（上方 Unlock/RUnlock 后）：单一锁序要求 DB 写
+		// 不发生在文件锁持有窗口内，避免与导入事务（持库写锁等 RestoreCertFiles
+		// 写锁）组合等待死锁；乐观条件仍由 WHERE 谓词保证原子判定。
+		res, execErr := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=?
+			WHERE caddy_id=? AND tls_source='file'
+			AND COALESCE(tls_cert_path,'')=? AND COALESCE(tls_key_path,'')=?`,
+			referenced.CertPEM, referenced.KeyPEM, id, p[0], p[1])
+		if execErr != nil {
+			Logf("error", "引用证书看门狗: 规则 %s 摄取回写数据库失败: %v", id, execErr)
+			continue
+		}
+		affected, affectedErr := res.RowsAffected()
+		if affectedErr != nil {
+			// 命中行数未知：不能宣称摄取成功（审计与重载计数会虚报），按跳过留痕。
+			Logf("warn", "引用证书看门狗: 规则 %s 摄取回写结果未知（RowsAffected 读取失败），跳过: %v", id, affectedErr)
+			TaskLogfWarn("config-watchdog", "cert-file", "引用证书看门狗: 规则 %s 摄取回写结果未知（摄取源可能在扫描后被改写），已跳过", id)
+			continue
+		}
+		if affected == 0 {
+			Logf("warn", "引用证书看门狗: 规则 %s 摄取源在扫描后被改写或已删除（tls_source/tls_cert_path/tls_key_path 不再匹配），跳过回写", id)
+			TaskLogfWarn("config-watchdog", "cert-file", "引用证书看门狗: 规则 %s 摄取源在扫描后被改写或已删除，跳过回写（数据库保留原内容）", id)
 			continue
 		}
 		RecordAuditLog("system", "证书摄取", "负载规则", FormatAuditDetail(AuditRulePart(id), "来源文件外部更新，新证书内容已入库"), "")
@@ -556,13 +603,16 @@ func expectedRenderedRules() (map[string]string, error) {
 			return true
 		}
 		switch r.tlsSource {
-		case "manual":
+		case "manual", "file":
+			// manual 与引用型证书（file）同口径：PEM 内容在保存/摄取时入库，
+			// 渲染侧 availableCerts（caddy.go）同样按「内容入库即就绪」收录。
+			// 此前 file 落 default 返回 false，启用 file 行恒被判「缺失」漂移。
 			return r.tlsCert != "" && r.tlsKey != ""
 		case "acme_dns":
 			_, ok := selectCertificate(acmeCerts[r.caddyID], r.domain, selectionNow)
 			return ok
 		default:
-			// 渲染层 availableCerts 只认 manual/acme_dns；其他形态无证可载，
+			// 渲染层 availableCerts 只认 manual/file/acme_dns；其他形态无证可载，
 			// 同 caddy.go 门一并跳过。
 			return false
 		}
