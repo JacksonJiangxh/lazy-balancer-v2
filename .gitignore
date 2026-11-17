@@ -120,3 +120,6 @@ docker-compose.override.yml
 # （caddybin/main.go 是 caddy 定制构建入口源码，保留入库）。
 .agent_team/spike/bin/
 .agent_team/spike/caddybin/caddy
+
+.agent_team/*
+!.agent_team/spike/
