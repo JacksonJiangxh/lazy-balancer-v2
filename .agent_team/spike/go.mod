@@ -173,4 +173,7 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	howett.net/plist v1.0.1 // indirect
+	lazy-balancer-v2/caddychain v0.0.0
 )
+
+replace lazy-balancer-v2/caddychain => ../../caddychain
