@@ -101,13 +101,11 @@ func writeTunnelRequest(conn net.Conn, r *http.Request, up ChainUpstream) error 
 
 // spliceTunnel 完成 101 切换：回写 101 响应给客户端并双向拼接字节流。
 func (h *ChainProxy) spliceTunnel(w http.ResponseWriter, br *bufio.Reader, upstreamConn net.Conn, resp *http.Response, idx int, up ChainUpstream) error {
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		upstreamConn.Close()
-		chainWriteError(w, http.StatusBadGateway, "chain_proxy: client does not support hijacking")
-		return nil
-	}
-	clientConn, clientRW, err := hj.Hijack()
+	// 经 http.NewResponseController 取连接：真实 Caddy 引擎会把 writer 包装成
+	// *caddyhttp.IdleTimeoutWriter 等**不实现 http.Hijacker** 的类型（v2.11.9
+	// 实测，S4 真进程取证），类型断言必失败；ResponseController 沿 Unwrap()
+	// 链穿透包装层。裸 writer（httptest 单测）下行为等价。
+	clientConn, clientRW, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		upstreamConn.Close()
 		chainWriteError(w, http.StatusBadGateway, "chain_proxy: hijack failed")
