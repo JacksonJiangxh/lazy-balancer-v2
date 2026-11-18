@@ -795,7 +795,7 @@ func upstreamDedupeHost(host string) string {
 // validateRuleUpstreams 校验一组实际上游。requireEnabled 用于 Create/Update
 // 与 v1 的表单语义；v2 备份是存量行还原，保留渲染层支持的零上游/零启用
 // 形态，但所有携带行仍逐项经过完全相同的值域、查重与协议校验。
-func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.Upstream, requireEnabled bool) (int, error) {
+func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.Upstream, requireEnabled bool, strategy string) (int, error) {
 	if requireEnabled && len(upstreams) == 0 {
 		return 0, fmt.Errorf("至少需要一个上游服务器")
 	}
@@ -854,8 +854,12 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 			enabledProtocols[proto] = true
 		}
 	}
-	if protocol == "http" && enabledProtocols["http"] && enabledProtocols["https"] {
-		return 0, fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化静默全灭；如需共存请拆分为两条规则）")
+	// 混布门定向放行（JJC-20261118-002 裁决 2）：混布池 ∧ strategy ∈
+	// {weighted_round_robin, chain_fallback} 才放行落库（渲染期由 chain 模块
+	// 逐上游独立 transport 承载，绝不落 reverse_proxy）；其余策略维持
+	// 「协议须一致」400。空串由谓词入口归一（与渲染 chainProxyModeFor 同口径）。
+	if protocol == "http" && !mixedPoolStrategyAllowed(strategy) && enabledProtocols["http"] && enabledProtocols["https"] {
+		return 0, fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布仅支持 weighted_round_robin / chain_fallback，经逐上游独立回源通道承载；其余策略请统一上游协议或拆分规则）")
 	}
 	if requireEnabled && enabledUpstreamCount == 0 {
 		return 0, fmt.Errorf("至少需要一个启用的上游服务器")
@@ -1038,8 +1042,14 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			return fmt.Errorf("透传规则的上游由 passthrough_upstream 字段配置，不支持 upstreams 上游列表")
 		}
 	} else {
-		enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true)
+		enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true, data.Strategy)
 		if err != nil {
+			return err
+		}
+		// 伴随门（JJC-20261118-002 裁决 2）：混布池 + 主动健康检查 → 400。
+		// chain 模块两模式均无健康检查子系统，放行即「保存放行+运行必坏」
+		// 死配置（health_checks 静默缺席）——响亮拒绝优于静默忽略。
+		if err := mixedPoolHealthCheckError(data.Protocol, data.EnableActiveHealthCheck, data.Upstreams); err != nil {
 			return err
 		}
 

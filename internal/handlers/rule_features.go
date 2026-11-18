@@ -926,8 +926,10 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		// 同口径;JoinHostPort 兼容 IPv6 裸地址形态)——同 host:port 双条目
 		// 权重翻倍,均衡语义静默漂移。
 		pathHostPortSeen := make(map[string]bool)
-		// 同族：路径规则自定义上游池同样拒绝 http/https
-		// 混布——同一 reverse_proxy 池级 TLS 传输下 http 上游静默全灭。
+		// 同族：路径规则自定义上游池同样拒绝 http/https 混布——同一
+		// reverse_proxy 池级 TLS 传输下 http 上游静默全灭。定向放行
+		// （JJC-20261118-002 裁决 2）：混布池经 chain 模块承载，谓词允许的
+		// 策略放行（渲染期整池切 chain，绝不落 reverse_proxy）。
 		pathPoolProtos := make(map[string]bool, 2)
 		for _, upstream := range pathRule.Upstreams {
 			proto := upstream.Protocol
@@ -936,8 +938,8 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 			pathPoolProtos[proto] = true
 		}
-		if pathPoolProtos["http"] && pathPoolProtos["https"] {
-			return fmt.Errorf("第 %d 条路径规则的自定义上游 http/https 混布（同一上游池协议须一致）", index+1)
+		if pathPoolProtos["http"] && pathPoolProtos["https"] && !mixedPoolStrategyAllowed(input.Strategy) {
+			return fmt.Errorf("第 %d 条路径规则的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）", index+1)
 		}
 		for upstreamIndex, upstream := range pathRule.Upstreams {
 			if strings.TrimSpace(upstream.Address) == "" {
@@ -1707,18 +1709,23 @@ func validateRuleACMEReferences(input acmeReferenceInput) error {
 	return nil
 }
 
-// mixedUpstreamPoolError：HTTP 规则启用上游池混布
-// （保存门 handlers.go:615 同款文案/口径）——主池按启用上游统计（IIF 归一，
-// 空协议视同 http），路径池全量统计（PathRuleUpstream 无 enabled 位，与
-// 保存门 rule_features.go 路径池同口径）。启用链（EnableRule 经
-// validateStoredRuleConfig）、启动/UpdateConfig 聚合校验、复制链
-// （DuplicateRule）共用本 helper。
-func mixedUpstreamPoolError(rule models.LbRule) error {
-	if rule.Protocol != "http" {
-		return nil
+// mixedPoolStrategyAllowed 混布池定向放行谓词（JJC-20261118-002 裁决 2 单源）：
+// 仅 weighted_round_robin / chain_fallback 允许混布落库（渲染期由 chain 模块
+// 逐上游独立 transport 承载）；空串入口归一 weighted_round_robin（与渲染
+// chainProxyModeFor 同口径，防「门禁判 false 假警报、渲染判 wrr」分叉）。
+// 前端镜像谓词见 web/src/utils/ruleValidation.ts（禁第二份条件清单）。
+func mixedPoolStrategyAllowed(strategy string) bool {
+	if strategy == "" {
+		strategy = "weighted_round_robin"
 	}
+	return strategy == "weighted_round_robin" || strategy == "chain_fallback"
+}
+
+// enabledUpstreamPoolMixed 启用上游池 http/https 混布判定（主池口径，
+// 空协议归一 http）。
+func enabledUpstreamPoolMixed(upstreams []models.Upstream) bool {
 	protos := map[string]bool{}
-	for _, u := range rule.Upstreams {
+	for _, u := range upstreams {
 		if !u.Enabled {
 			continue
 		}
@@ -1728,8 +1735,57 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 		}
 		protos[proto] = true
 	}
-	if protos["http"] && protos["https"] {
-		return fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化静默全灭；如需共存请拆分为两条规则）")
+	return protos["http"] && protos["https"]
+}
+
+// ruleHasAnyMixedPool 主池或任一路径池混布判定（聚合 warn ② 口径）。
+func ruleHasAnyMixedPool(rule models.LbRule) bool {
+	if enabledUpstreamPoolMixed(rule.Upstreams) {
+		return true
+	}
+	for _, pr := range rule.PathRules {
+		protos := map[string]bool{}
+		for _, u := range pr.Upstreams {
+			proto := u.Protocol
+			if proto == "" {
+				proto = "http"
+			}
+			protos[proto] = true
+		}
+		if protos["http"] && protos["https"] {
+			return true
+		}
+	}
+	return false
+}
+
+// mixedPoolHealthCheckError 伴随门（JJC-20261118-002 裁决 2）：混布池 +
+// enable_active_health_check=1 → 400。chain 模块两模式均无健康检查子系统，
+// 放行即「保存放行+运行必坏」死配置（health_checks 静默缺席，v2.3.4 族教训
+// 的精确复刻）——响亮拒绝优于静默忽略。边界：只拦混布池新增可达的死配置，
+// uniform 池（含 uniform+chain_fallback）的既有静默忽略行为零改动。
+func mixedPoolHealthCheckError(protocol string, healthCheck bool, upstreams []models.Upstream) error {
+	if protocol != "http" || !healthCheck || !enabledUpstreamPoolMixed(upstreams) {
+		return nil
+	}
+	return fmt.Errorf("混布池经 chain 模块承载暂不支持主动健康检查，如需健康检查请统一上游协议（uniform 池走原生 reverse_proxy 全量健康检查）或拆分规则")
+}
+
+// mixedUpstreamPoolError：HTTP 规则启用上游池混布
+// （保存门 handlers.go:615 同款文案/口径）——主池按启用上游统计（IIF 归一，
+// 空协议视同 http），路径池全量统计（PathRuleUpstream 无 enabled 位，与
+// 保存门 rule_features.go 路径池同口径）。启用链（EnableRule 经
+// validateStoredRuleConfig）、启动/UpdateConfig 聚合校验、复制链
+// （DuplicateRule）共用本 helper。定向放行（JJC-20261118-002 裁决 2）：
+// strategy ∈ {weighted_round_robin, chain_fallback}（空串归一）的混布行放行
+// （渲染期 chain 模块承载），其余策略维持 400。
+func mixedUpstreamPoolError(rule models.LbRule) error {
+	if rule.Protocol != "http" {
+		return nil
+	}
+	allowed := mixedPoolStrategyAllowed(rule.Strategy)
+	if !allowed && enabledUpstreamPoolMixed(rule.Upstreams) {
+		return fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布仅支持 weighted_round_robin / chain_fallback，经逐上游独立回源通道承载；其余策略请统一上游协议或拆分规则）")
 	}
 	for _, pr := range rule.PathRules {
 		pathProtos := map[string]bool{}
@@ -1740,8 +1796,8 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 			}
 			pathProtos[proto] = true
 		}
-		if pathProtos["http"] && pathProtos["https"] {
-			return fmt.Errorf("路径规则 %s 的自定义上游 http/https 混布（同一上游池协议须一致）", pr.Path)
+		if pathProtos["http"] && pathProtos["https"] && !allowed {
+			return fmt.Errorf("路径规则 %s 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）", pr.Path)
 		}
 	}
 	return nil
@@ -1808,6 +1864,11 @@ func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool)
 	}
 	if includeMixedPool {
 		if err := mixedUpstreamPoolError(rule); err != nil {
+			return &configValidationError{message: err.Error()}
+		}
+		// 伴随门（JJC-20261118-002 裁决 2）：存量启用门的混布+HC 死配置
+		// 同样响亮拒绝（直改 DB 行启用前拦截，复制链经同 helper 继承）。
+		if err := mixedPoolHealthCheckError(rule.Protocol, rule.EnableActiveHealthCheck, rule.Upstreams); err != nil {
 			return &configValidationError{message: err.Error()}
 		}
 	}
@@ -2029,13 +2090,20 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 	}
 	// 存量启用行启用上游池混布点名告警（镜像 portTLSMix 形态，不阻断启动——
 	// 阻断会让节点起不来；新写入方向已被 validateStoredRuleConfig 400 拦截，
-	// 此门兜「直改 DB 或更早版本落库」的存量，提示管理员修正）。
+	// 此门兜「直改 DB 或更早版本落库」的存量）。聚合 warn 三口径
+	// （JJC-20261118-002 裁决 2）：①混布+不允许策略 → 协议承载 warn（渲染
+	// 已兜底切 wrr）；②混布+允许策略+HC 标志 → 点名 HC 在 chain 承载下无效
+	// warn；③其余静默。
 	for _, rule := range rules {
 		if !rule.Enabled || rule.Protocol != "http" {
 			continue
 		}
 		if err := mixedUpstreamPoolError(rule); err != nil {
-			services.Logf("warn", "规则 %s（%s）%s——混布池已进入运行态，http 上游正被池级 TLS 化静默 502，请统一上游协议或拆分规则", rule.Name, rule.CaddyID, err.Error())
+			services.Logf("warn", "规则 %s（%s）%s——渲染已兜底按 chain 模块 wrr 承载，建议改用允许策略（weighted_round_robin / chain_fallback）或统一上游协议/拆分规则", rule.Name, rule.CaddyID, err.Error())
+			continue
+		}
+		if rule.EnableActiveHealthCheck && ruleHasAnyMixedPool(rule) {
+			services.Logf("warn", "规则 %s（%s）主动健康检查标志在混布池 chain 承载下无效（无健康检查子系统），如需健康检查请统一上游协议（uniform 池走原生 reverse_proxy 全量健康检查）或拆分规则", rule.Name, rule.CaddyID)
 		}
 	}
 	return errors.Join(problems...)

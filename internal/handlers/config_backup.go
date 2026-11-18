@@ -1448,10 +1448,12 @@ func validateBackupRuleReferences(tables map[string][]map[string]any) error {
 	// 回源域名与混布全部同门。v2 是存量行还原，仅保留零上游/零启用兼容。
 	ruleProtocols := make(map[string]string, len(ruleRows))
 	ruleDynamicDNS := make(map[string]bool, len(ruleRows))
+	ruleStrategies := make(map[string]string, len(ruleRows))
 	for _, row := range ruleRows {
 		id, _ := row["caddy_id"].(string)
 		ruleProtocols[id], _ = row["protocol"].(string)
 		ruleDynamicDNS[id] = backupBooleanEnabled(row["dynamic_dns"])
+		ruleStrategies[id], _ = row["strategy"].(string)
 		if host := backupString(row["health_check_host"]); host != "" {
 			if ruleProtocols[id] == "tcp" {
 				return fmt.Errorf("备份校验失败：规则 %q 的健康检查域名仅 HTTP 规则支持", id)
@@ -1498,7 +1500,7 @@ func validateBackupRuleReferences(tables map[string][]map[string]any) error {
 		if len(upstreams) == 0 {
 			continue
 		}
-		if _, err := validateRuleUpstreams(ruleProtocols[ruleID], ruleDynamicDNS[ruleID], upstreams, false); err != nil {
+		if _, err := validateRuleUpstreams(ruleProtocols[ruleID], ruleDynamicDNS[ruleID], upstreams, false, ruleStrategies[ruleID]); err != nil {
 			return fmt.Errorf("备份校验失败：规则 %q：%w", ruleID, err)
 		}
 	}

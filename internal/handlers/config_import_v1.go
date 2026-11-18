@@ -506,7 +506,7 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 		for _, upstream := range rule.Upstreams {
 			upstreams = append(upstreams, models.Upstream{Host: upstream.Host, Port: upstream.Port, Weight: upstream.Weight, Enabled: upstream.Enabled, Protocol: upstream.Protocol})
 		}
-		enabledUpstreams, err := validateRuleUpstreams(rule.Protocol, false, upstreams, true)
+		enabledUpstreams, err := validateRuleUpstreams(rule.Protocol, false, upstreams, true, rule.Strategy)
 		if err != nil {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
