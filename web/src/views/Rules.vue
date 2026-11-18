@@ -1503,7 +1503,7 @@ import { proxyTimeoutSummary } from '@/utils/proxyTimeouts'
 import { activeHealthCheckSummary, healthCheckSummary, passiveHealthCheckSummary } from '@/utils/healthCheckSummary'
 import { activateOnce } from '@/utils/keyboardActivate'
 import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
-import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap } from '@/utils/ruleValidation'
+import { isValidHostName, validatePathRules, mixedPoolHealthCheckGateError, mixedPoolStrategyAllowed, MIXED_POOL_ALLOWED_STRATEGY_MESSAGE, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import { popperViewportSafe } from '@/utils/popper'
@@ -3630,7 +3630,7 @@ const nextStep = (): void => {
       ElMessage.warning('请至少添加一条路径规则')
       return
     }
-    const pathRuleError = validatePathRules(wizardForm.path_rules)
+    const pathRuleError = validatePathRules(wizardForm.path_rules, wizardForm.strategy)
     if (pathRuleError) {
       ElMessage.warning(pathRuleError)
       return
@@ -3746,7 +3746,7 @@ const submitWizard = async () => {
       saving.value = false
       return
     }
-    const pathRuleError = validatePathRules(wizardForm.path_rules)
+    const pathRuleError = validatePathRules(wizardForm.path_rules, wizardForm.strategy)
     if (pathRuleError) {
       ElMessage.warning(pathRuleError)
       saving.value = false
@@ -3799,15 +3799,24 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  // 混布门：HTTP 规则启用上游 http/https 混布
-  // 会在 Caddy 池级 TLS 传输下使 http 上游静默全灭——保存前拦截
-  if (wizardForm.protocol === 'http') {
+  // 混布门（JJC-20261118-002 裁决 2）：HTTP 规则启用上游 http/https 混布
+  // 定向放行——谓词允许的策略经 chain 模块逐上游独立回源通道承载（后端
+  // mixedPoolStrategyAllowed 镜像，禁第二份条件清单）；其余策略维持拦截。
+  if (wizardForm.protocol === 'http' && !mixedPoolStrategyAllowed(wizardForm.strategy)) {
     const enabledProtos = new Set(wizardForm.upstreams.filter(u => u.enabled !== false).map(u => u.protocol || 'http'))
     if (enabledProtos.has('http') && enabledProtos.has('https')) {
-      ElMessage.warning('同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化而无法访问；如需共存请拆分为两条规则）')
+      ElMessage.warning(MIXED_POOL_ALLOWED_STRATEGY_MESSAGE)
       saving.value = false
       return
     }
+  }
+  // 伴随门镜像（后端 mixedPoolHealthCheckError 同款文案，400 权威门在后端）：
+  // 混布池 + 主动健康检查 = 死配置（chain 模块无健康检查子系统）。
+  const mixedHcGateError = mixedPoolHealthCheckGateError(wizardForm.protocol, wizardForm.enable_active_health_check, wizardForm.upstreams)
+  if (mixedHcGateError) {
+    ElMessage.warning(mixedHcGateError)
+    saving.value = false
+    return
   }
   // 逐上游回源域名（2026-10-10）：与后端 validateRulePayloadBeforeSave 同口径——
   // 纯主机名不带端口（端口已有独立配置列）、仅 HTTP 静态上游可用
