@@ -128,7 +128,50 @@ export const pathRuleError = (rule: PathRuleInput): string | null => {
   return null
 }
 
-export const validatePathRules = (rules: readonly PathRuleInput[]): string | null => {
+/**
+ * 混布池定向放行谓词（JJC-20261118-002 裁决 2，后端 rule_features.go
+ * mixedPoolStrategyAllowed **镜像单源**）：仅 weighted_round_robin /
+ * chain_fallback 允许混布落库（渲染期 chain 模块逐上游独立回源通道承载）；
+ * 空串入口归一 weighted_round_robin 与后端同口径。禁自造第二份条件清单。
+ */
+export const mixedPoolStrategyAllowed = (strategy: string): boolean => {
+  const normalized = strategy === '' ? 'weighted_round_robin' : strategy
+  return normalized === 'weighted_round_robin' || normalized === 'chain_fallback'
+}
+
+/**
+ * 混布门主池文案——与后端 validateRuleUpstreams / mixedUpstreamPoolError 400
+ * 错误信息**逐字对齐**（太子令：前端门文案与后端逐字对齐或经 API 透传，禁漂移）。
+ */
+export const MIXED_POOL_ALLOWED_STRATEGY_MESSAGE =
+  '同一 HTTP 规则的启用上游协议须一致（http/https 混布仅支持 weighted_round_robin / chain_fallback，经逐上游独立回源通道承载；其余策略请统一上游协议或拆分规则）'
+
+/**
+ * 混布门路径池文案（与后端 mixedUpstreamPoolError 路径池段同款，规则名换
+ * 前端逐条路径的 path 值）。
+ */
+export const mixedPoolPathGateMessage = (path: string): string =>
+  `路径规则 ${path} 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）`
+
+/**
+ * 主动健康检查伴随门镜像（JJC-20261118-002 裁决 2，后端
+ * mixedPoolHealthCheckError 同款文案）：混布池 + enable_active_health_check
+ * → 前端预拦（后端 400 为权威门，此处仅提前反馈免保存往返）。
+ */
+export const mixedPoolHealthCheckGateError = (
+  protocol: string,
+  healthCheck: boolean,
+  upstreams: readonly { protocol?: string; enabled?: boolean }[],
+): string | null => {
+  if (protocol !== 'http' || !healthCheck) return null
+  const protos = new Set(upstreams.filter((upstream) => upstream.enabled !== false).map((upstream) => upstream.protocol || 'http'))
+  if (protos.has('http') && protos.has('https')) {
+    return '混布池经 chain 模块承载暂不支持主动健康检查，如需健康检查请统一上游协议（uniform 池走原生 reverse_proxy 全量健康检查）或拆分规则'
+  }
+  return null
+}
+
+export const validatePathRules = (rules: readonly PathRuleInput[], strategy = ''): string | null => {
   const seen = new Map<string, number>()
   // 同后端：prefix 与 exact 在同一路径上并存时，路由按 SortOrder 首条终结
   // 匹配，靠后的一条必被遮蔽成死规则——保存前整组拒绝（跨类型互查）。
@@ -198,13 +241,13 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     if (rule.upstreams.length === 0) return `第 ${rowNumber} 条路径至少需要一个自定义上游`
 
     // 自定义上游池：与后端 rule_features.go 同口径的三项池级
-    // 校验——http/https 混布（同池 reverse_proxy 池级 TLS 传输下 http 上游静默
-    // 全灭）、主机形态（后端 isValidHost：IP 字面量或主机名）、host:port 去重
-    // （重复条使权重翻倍、均衡语义静默漂移）。此前只校验空/端口/权重，非法行
-    // 行内无错、点保存才被全局 toast 拒绝且不定位到行。
+    // 校验——http/https 混布（定向放行面：混布经 chain 模块逐上游独立回源
+    // 通道承载，谓词允许的策略放行、其余策略拒绝）、主机形态（后端
+    // isValidHost：IP 字面量或主机名）、host:port 去重（重复条使权重翻倍、
+    // 均衡语义静默漂移）。
     const poolProtocols = new Set(rule.upstreams.map((upstream) => (upstream.protocol || 'http')))
-    if (poolProtocols.has('http') && poolProtocols.has('https')) {
-      return `第 ${rowNumber} 条路径的自定义上游 http/https 混布（同一上游池协议须一致）`
+    if (poolProtocols.has('http') && poolProtocols.has('https') && !mixedPoolStrategyAllowed(strategy)) {
+      return mixedPoolPathGateMessage(rule.path)
     }
     const seenHostPorts = new Set<string>()
     for (const upstream of rule.upstreams) {
