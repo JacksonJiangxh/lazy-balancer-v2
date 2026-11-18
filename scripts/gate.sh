@@ -3,6 +3,31 @@
 # 任一失败退出码非 0。pre-commit 调用本脚本；也可手工整跑：
 #   /bin/bash scripts/gate.sh
 #
+# 【staged snapshot 评估（JJC-20261118-001 C 线，2026-11-18 登记）】
+# 议题：pre-commit 是否可改为「仅对 staged snapshot 跑门」（门的判定对象从
+# 工作树收窄到暂存区内容，消除「被测树 ≠ 提交树」缺口）。
+# **结论：可行**。实现要点（零改本脚本）：
+#   1. `TREE=$(git write-tree)` 从暂存区铸树对象（= staged snapshot 的确切
+#      内容；index 含未合并冲突项时失败——正确行为，此时本无从认证）；
+#   2. `COMMIT=$(git commit-tree $TREE -p HEAD -m tmp)` 铸悬空提交，
+#      `git worktree add --detach $SNAP $COMMIT` 物化快照目录——快照即合法
+#      worktree，本脚本第 27 行 rev-parse --show-toplevel、第 3 项 git grep、
+#      第 4 项 cat-file/ls-tree（对象库共享）全部原样可用，本脚本零改动；
+#   3. `(cd $SNAP && /bin/bash /原仓/scripts/gate.sh)`，trap 里
+#      `git worktree remove --force $SNAP` 收尾（gate 失败也必须清理）。
+# 代价（实测取证，2026-11-18 于暂存树物化的 worktree 内整跑六项）：
+#   a. 物化开销秒级（archive/checkout ~3.4k 路径）+ 临时盘一份快照体量；
+#   b. go build/vet/test 缓存按内容键命中、与路径无关，不增编译成本；
+#      第 6 项 -count=1 每轮真跑 handlers 全量（B 线模板库改造后实测约
+#      195s，见台账 JJC-20261118-001）不变；
+#   c. 快照内无 untracked 文件：第 3 项的 untracked 冲突标记扫描自然落空
+#      ——语义收窄即本提案本意（未 add 的文件不在认证范围）；
+#   d. 每次产生一个悬空 commit 对象（gc 可回收）+ worktree 登记瞬时条目；
+#   e. 新增失败形态：write-tree 失败（冲突 index）/worktree 锁竞争——
+#      均应显性拒绝提交（fail-closed），不静默回退工作树口径。
+# 现状：pre-commit 仍按工作树口径调用本脚本；上要点为后续立项的实现蓝图，
+# 落地需另走任务（改 .git/hooks/pre-commit，属门禁令文件）。
+#
 # 判定项（全部机械，无人工直觉参与）：
 #   1) go build ./... × 7 个 Go 模块（根/caddychain/caddygeoip/wafiplist/
 #      caddydeps/caddyl4sec/geoipnames）
