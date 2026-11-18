@@ -127,7 +127,7 @@ func TestBuildChainProxyConfig_paramsAndDialTimeout(t *testing.T) {
 	ups := []UpstreamConfig{
 		{Host: "10.0.0.9", Port: 9409, Weight: 1, Protocol: "https", Enabled: true, OriginDomain: "origin.test"},
 	}
-	cfg := buildChainProxyConfig(rule, ups)
+	cfg := buildChainProxyConfig(rule, ups, chainProxyModeRace)
 	if cfg["race_interval_ms"].(int) != 800 || cfg["request_timeout_ms"].(int) != 3000 {
 		t.Fatalf("竞速参数透传失败: %v/%v", cfg["race_interval_ms"], cfg["request_timeout_ms"])
 	}
@@ -159,7 +159,7 @@ func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 	}
 	rule.HostHeader = ""
 	ups[2].OriginDomain = "  " // 空白视为空
-	cfg := buildChainProxyConfig(rule, ups)
+	cfg := buildChainProxyConfig(rule, ups, chainProxyModeRace)
 	upsOut := cfg["upstreams"].([]interface{})
 	if upsOut[0].(map[string]interface{})["host"] != "upstream-level.test" {
 		t.Fatalf("上游级 origin_domain 应最高优先: %v", upsOut[0])

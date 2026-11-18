@@ -108,22 +108,23 @@ func TestEmitConfigForValidate_emitsMixedOriginConfig(t *testing.T) {
 		t.Fatalf("生成配置含客户端 Host 占位符（H2 禁止）")
 	}
 
-	// 混合态必须在产物里留下 lb_upstream_host 节点，且 hosts 与三级回退一致：
-	// 第一档（C.com/D.com 的 origin_domain）与第二档（规则级 B.com，作用于
-	// / 的 192.168.42.2）同池共存——这正是上游 map 方案表达不了、也是本自研
-	// 能力的价值点。
-	var found []map[string]interface{}
-	collectHandlersOfKind(generated, "lb_upstream_host", &found)
-	if len(found) == 0 {
-		t.Fatalf("生成配置里没有 lb_upstream_host 处理器（混合态必发射）:\n%s", truncateForLog(body))
+	// 混布池承载切换（JJC-20261118-002 裁决 1）：主池 http/https 混布 → 整池
+	// chain_proxy（mode=wrr）承载，逐上游回源 Host 三级回退由 chain entry 的
+	// host 键承载（lb_upstream_host 为 reverse_proxy 专属，混布池不再发射）。
+	// 三档取值断言保留：C.com/D.com 第一档（逐上游 origin_domain）、
+	// 192.168.42.2 第二档（规则级 B.com）。
+	var chainProxies []map[string]interface{}
+	collectHandlersOfKind(generated, "chain_proxy", &chainProxies)
+	if len(chainProxies) == 0 {
+		t.Fatalf("生成配置里没有 chain_proxy 处理器（混布主池必发射）:\n%s", truncateForLog(body))
 	}
 	merged := map[string]string{}
-	for _, node := range found {
-		hosts, ok := node["hosts"].(map[string]string)
-		if !ok {
-			t.Fatalf("lb_upstream_host.hosts type=%T", node["hosts"])
-		}
-		for dial, host := range hosts {
+	for _, node := range chainProxies {
+		ups, _ := node["upstreams"].([]interface{})
+		for _, u := range ups {
+			e, _ := u.(map[string]interface{})
+			dial, _ := e["dial"].(string)
+			host, _ := e["host"].(string)
 			merged[dial] = host
 		}
 	}
@@ -133,11 +134,11 @@ func TestEmitConfigForValidate_emitsMixedOriginConfig(t *testing.T) {
 		"192.168.42.2:40080": "B.com", // 第二档：规则级 host_header
 	} {
 		if got, ok := merged[dial]; !ok || got != want {
-			t.Fatalf("lb_upstream_host.hosts[%s]=%q（存在=%v）; want %q\n全量映射=%v", dial, got, ok, want, merged)
+			t.Fatalf("chain_proxy entry host[%s]=%q（存在=%v）; want %q\n全量映射=%v", dial, got, ok, want, merged)
 		}
 	}
 	if _, leaked := merged["X.com:443"]; leaked {
-		t.Fatalf("表外地址 X.com 不应进映射（orphan 只走规则级，由渲染层静态下发）: %v", merged)
+		t.Fatalf("表外地址 X.com 不应进主池 chain entries（orphan 只走规则级，由渲染层静态下发）: %v", merged)
 	}
 
 	// 对端解码钉子（caddygeoip 包）读取本产物；只有被显式要求时才写文件。

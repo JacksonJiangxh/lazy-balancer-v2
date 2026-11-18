@@ -352,36 +352,57 @@ func TestPathRuleUpstreamHost_mixedPathEmitsOverrideMap(t *testing.T) {
 		t.Fatalf("generation failed: %s", message)
 	}
 	route := renderedRouteByID(t, renderedHTTPRoutesFromGenerated(t, generated), ruleID+"_path_0")
-	host, override := chainHostPlanOf(t, renderedHandleChain(t, route))
-
-	if len(host) != 1 || host[0] != "{lb.upstream_host}" {
-		t.Fatalf("host=%v; want [{lb.upstream_host}]", host)
+	// JJC-20261118-002 裁决 1：渲染触发器=池混布（不分策略）——混布路径池整池
+	// 切 chain 模块承载（mode=wrr，太子裁定 2026-11-18 白名单追加），逐上游
+	// 回源 Host 改由 chain entry 的 host 键承载（三档取值语义断言保留）。
+	chain := renderedHandleChain(t, route)
+	rawChain, err := json.Marshal(chain)
+	if err != nil {
+		t.Fatalf("marshal chain: %v", err)
 	}
-	if override == nil {
-		t.Fatal("混合态必须发射 lb_upstream_host handler")
+	var generic interface{}
+	if err := json.Unmarshal(rawChain, &generic); err != nil {
+		t.Fatalf("unmarshal chain: %v", err)
 	}
-	hostsRaw, ok := override["hosts"]
-	if !ok {
-		t.Fatalf("override hosts missing: %#v", override)
-	}
-	hosts, ok := hostsRaw.(map[string]string)
-	if !ok {
-		// JSON 往返后可能是 map[string]interface{}。
-		generic, genericOK := hostsRaw.(map[string]any)
-		if !genericOK {
-			t.Fatalf("override hosts type=%T", hostsRaw)
+	var proxy map[string]interface{}
+	var walk func(v interface{})
+	walk = func(v interface{}) {
+		switch node := v.(type) {
+		case map[string]interface{}:
+			if node["handler"] == "chain_proxy" {
+				proxy = node
+			}
+			for _, child := range node {
+				walk(child)
+			}
+		case []interface{}:
+			for _, child := range node {
+				walk(child)
+			}
 		}
-		hosts = make(map[string]string, len(generic))
-		for k, v := range generic {
-			text, _ := v.(string)
-			hosts[k] = text
-		}
 	}
-	if hosts["C.com:443"] != "C.com" {
-		t.Fatalf("hosts[C.com:443]=%q; want C.com（第一档）", hosts["C.com:443"])
+	walk(generic)
+	if proxy == nil {
+		t.Fatalf("混布路径池必须整池切 chain 承载:\n%s", rawChain)
 	}
-	if hosts["192.168.42.2:40080"] != "B.com" {
-		t.Fatalf("hosts[192.168.42.2:40080]=%q; want B.com（第二档规则级）", hosts["192.168.42.2:40080"])
+	if proxy["mode"] != "wrr" {
+		t.Fatalf("mode=%v; want wrr（混布+weighted_round_robin）", proxy["mode"])
+	}
+	upsOut, _ := proxy["upstreams"].([]interface{})
+	lanes := map[string]map[string]interface{}{}
+	for _, u := range upsOut {
+		e, _ := u.(map[string]interface{})
+		dial, _ := e["dial"].(string)
+		lanes[dial] = e
+	}
+	if e, ok := lanes["C.com:443"]; !ok || e["host"] != "C.com" {
+		t.Fatalf("chain lanes[C.com:443]=%v; want host=C.com（第一档逐上游 origin_domain）", e)
+	}
+	if e, ok := lanes["192.168.42.2:40080"]; !ok || e["host"] != "B.com" {
+		t.Fatalf("chain lanes[192.168.42.2:40080]=%v; want host=B.com（第二档规则级）", e)
+	}
+	if e, ok := lanes["C.com:443"]; !ok || e["scheme"] != "https" {
+		t.Fatalf("chain lanes[C.com:443]=%v; want scheme=https", e)
 	}
 }
 
