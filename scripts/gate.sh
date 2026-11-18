@@ -45,8 +45,8 @@
 #      image tag 是 1 类锚点、2 处命中），故锚点数与命中点数是两个量，
 #      合计 9 / 10，勿混算、勿只引用单个数字
 #   6) internal/handlers 全量单测（-timeout 15m 是超时上限，非目标值——该包
-#      全量裸跑实测 578-622s，go test 默认 600s 水位会误杀正常轮次；实际耗时
-#      超 10m 仅告警不判败，超上限才失败）
+#      全量裸跑在测试库模板化改造（JJC-20261118-001 B 线）后实测约 195-202s
+#      （改造前历史区间 578-622s）；实际耗时超 10m 仅告警不判败，超上限才失败）
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || {
@@ -155,14 +155,13 @@ check_anchor "branding.ts appVersion 回退值" "web/src/utils/branding.ts" "exp
 check_anchor "web_trigger 构建按钮默认值"    ".cnb/web_trigger.yml"  "default: ${ver}$"                         1
 
 # ---- 6) internal/handlers 全量单测 ----
-# -timeout 15m 是**超时上限**而非目标值：该包全量裸跑实测 578-622s，贴近 go test
-# 默认 600s 水位——不加显式上限时正常轮次会被默认超时误杀。告警阈值 10m（与
-# 默认水位同口径）只提示、不判败：回归变慢要先看见，但失败线仍是 15m 上限。
+# -timeout 15m 是**超时上限**而非目标值：测试库模板化改造（JJC-20261118-001
+# B 线，装配不再每次全量迁移）后该包全量实测约 195-202s——历史区间 578-622s
+# 不再适用，600s 默认水位已无贴近风险，15m 上限与 10m 告警阈值保留作回归
+# 防线（告警线现况不再自然触发，一旦出现即真回归，必须看见）。
 # -count=1 关掉测试结果缓存：本门要的是「这一轮真跑过」的证据，缓存命中会以
 # 十几秒的假通过冒充全量真跑（T1 首试已发生，该轮作废重跑）。代价是此后每次
-# 整跑 gate 都要真跑 handlers 全量约 10 分钟，属期望行为，不是回归变慢。
-# 同理，第 141 行的 10m WARN 此后每轮必现——真跑耗时天然越过告警线，
-# 属预期，勿据此判失败（失败线仍是 15m 超时上限）。
+# 整跑 gate 都要真跑 handlers 全量约 3 分多钟，属期望行为，不是回归变慢。
 step "6/6 go test ./internal/handlers"
 handlers_start=$SECONDS
 if go test ./internal/handlers -count=1 -timeout 15m; then
