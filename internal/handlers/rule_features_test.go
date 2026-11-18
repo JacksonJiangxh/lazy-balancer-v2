@@ -770,6 +770,10 @@ func TestLoadUpstreamsBatch_defaults_NULL_enabled_to_false(t *testing.T) {
 // 不再存在 NULL 行；迁移幂等，重跑无副作用。
 func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 	// Given 模拟迁移前的存量库：先初始化建表，再回退为可空 enabled 并写入 NULL 行
+	// 【豁免登记 JJC-20261118-001 B 线】迁移行为验证类：同目录二次 Initialize
+	// 触发「存量 NULL enabled 上游归一」迁移；先建库再降级 schema 播种存量
+	// 形态——模板拷贝既会覆盖播种形态、也会掩盖「对既有库再初始化跑迁移」
+	// 这一被测路径，故不进模板、继续真实全量 Initialize（两次调用均真实）。
 	dir := t.TempDir()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	t.Cleanup(func() {
@@ -817,6 +821,10 @@ func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 // 与渲染侧 WHERE enabled=1 口径一致），不再存在 NULL 行；迁移幂等，重跑无副作用。
 func TestMigration_lbRulesEnabledNullNormalizedToDisabled(t *testing.T) {
 	// Given 模拟迁移前的存量库：先初始化建表，再回退为可空 enabled 并写入 NULL 行
+	// 【豁免登记 JJC-20261118-001 B 线】迁移行为验证类：同目录二次 Initialize
+	// 触发「存量 NULL enabled 规则归一」迁移；先建库再降级 schema 播种存量
+	// 形态——模板拷贝既会覆盖播种形态、也会掩盖「对既有库再初始化跑迁移」
+	// 这一被测路径，故不进模板、继续真实全量 Initialize（两次调用均真实）。
 	dir := t.TempDir()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	t.Cleanup(func() {
@@ -994,7 +1002,7 @@ func simulateLegacyNullableUpstreams(t *testing.T, database *sql.DB) {
 func initializeRuleFeatureTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize test database: %v", err)
 	}
 	database := db.DB

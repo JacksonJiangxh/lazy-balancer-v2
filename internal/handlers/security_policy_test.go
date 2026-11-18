@@ -20,7 +20,7 @@ func setupSecurityPolicyTestDB(t *testing.T) {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initTestDBFromTemplate(t, dataDir); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	// Initialize 已按同一 dataDir 打开过 metrics 库；此处再初始化会直接覆盖

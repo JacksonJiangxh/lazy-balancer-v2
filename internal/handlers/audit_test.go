@@ -15,7 +15,7 @@ import (
 // 此前 handler 审计路径全部 127.0.0.1。
 func TestRecordAudit_prefersContextAuditIP(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	// db.Initialize 已按同目录装配 audit 库；再调 InitializeAuditDB 会覆盖

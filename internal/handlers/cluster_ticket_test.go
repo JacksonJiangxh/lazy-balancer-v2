@@ -79,7 +79,7 @@ func TestTicketLogin_databaseErrorUsesRetryMessage(t *testing.T) {
 
 func TestRecordTicketLoginFailureAuditsSanitizedReasons(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

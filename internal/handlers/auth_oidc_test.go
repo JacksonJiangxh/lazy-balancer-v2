@@ -214,7 +214,7 @@ func setupOIDCTest(t *testing.T, idp *mockIdP) (*gin.Engine, *Handlers) {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
-	if err := db.Initialize(dir); err != nil {
+	if err := initTestDBFromTemplate(t, dir); err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{JWTSecret: "test-secret", DataDir: dir}
@@ -674,7 +674,7 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 	// 三个全局句柄（同 setupOIDCTest）——否则后续用例踩已关闭的临时库。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
-	if err := db.Initialize(dir); err != nil {
+	if err := initTestDBFromTemplate(t, dir); err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{JWTSecret: "test-secret", DataDir: dir}
@@ -738,7 +738,7 @@ func TestOIDCUser_slave_login_gate_exempt(t *testing.T) {
 	// 完整快照/恢复全局 DB 句柄（同 setupOIDCTest）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
-	if err := db.Initialize(dir); err != nil {
+	if err := initTestDBFromTemplate(t, dir); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

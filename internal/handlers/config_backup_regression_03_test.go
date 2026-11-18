@@ -128,7 +128,7 @@ func TestExportConfigBackup_sectionsTrailingCommaAccepted(t *testing.T) {
 func TestImportBackup_commitFailureCarriesWafApplyWarning(t *testing.T) {
 	// unreachable caddy:commit 内 ApplyConfigFromTxCertAwareForce 必败(整个事务回滚)
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize test database: %v", err)
 	}
 	t.Cleanup(func() {

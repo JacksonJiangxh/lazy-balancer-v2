@@ -461,7 +461,7 @@ func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
 	// db.Initialize 会替换三个全局句柄，恢复必须
 	// 三者齐全——此前漏 MetricsDB，后续用例会踩已关闭的临时指标库。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
 	t.Cleanup(func() {

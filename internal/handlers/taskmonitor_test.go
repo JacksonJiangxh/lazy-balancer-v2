@@ -61,7 +61,7 @@ func initTaskEngineForTest(t *testing.T) {
 	}
 	if db.DB == nil {
 		oldDB, oldM, oldA, oldCurrent := db.DB, db.MetricsDB, db.AuditDB, db.GetDB()
-		if err := db.Initialize(t.TempDir()); err != nil {
+		if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() {

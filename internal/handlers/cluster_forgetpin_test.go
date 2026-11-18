@@ -27,7 +27,7 @@ func TestForgetClusterNodePin_removesTargetPinAndGuards(t *testing.T) {
 	// （cluster_ca_pins/<sha256("host:port")>，与 services 侧 TOFU 钉扎同一命名）
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initTestDBFromTemplate(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

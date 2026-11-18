@@ -21,7 +21,7 @@ import (
 func TestGenerateClusterLoginTicket_nodeNotFoundReturns404(t *testing.T) {
 	// Given:主节点 + OIDC 会话(豁免两道 MFA 门) + 不存在的节点 999
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -58,7 +58,7 @@ func TestGenerateClusterLoginTicket_nodeNotFoundReturns404(t *testing.T) {
 func TestGenerateClusterLoginTicket_tokenPendingReturns409(t *testing.T) {
 	// Given：主节点 + OIDC 会话 + 已批准但令牌为空的节点 8
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -95,7 +95,7 @@ func TestGenerateClusterLoginTicket_tokenPendingReturns409(t *testing.T) {
 func TestGenerateClusterLoginTicket_auditCarriesNodeName(t *testing.T) {
 	// Given:主节点 + OIDC 会话 + 在线已审批节点 7(name=slave-01)
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

@@ -83,7 +83,7 @@ func countingDB(t *testing.T, filename string, swap func(counting *sql.DB)) *sql
 	t.Helper()
 	dataDir := t.TempDir()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initTestDBFromTemplate(t, dataDir); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	// Initialize 已按同目录打开 metrics 库；二次初始化覆盖 MetricsDB 且不关

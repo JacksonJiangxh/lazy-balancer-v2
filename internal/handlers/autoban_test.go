@@ -29,7 +29,7 @@ import (
 func newAutobanTestEnv(t *testing.T) *gin.Engine {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
 	t.Cleanup(func() {

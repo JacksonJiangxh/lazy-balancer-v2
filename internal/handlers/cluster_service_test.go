@@ -26,7 +26,7 @@ import (
 func setupClusterServiceControlDB(t *testing.T) {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

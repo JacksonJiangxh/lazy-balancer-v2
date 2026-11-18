@@ -65,7 +65,7 @@ func TestSetClusterMode_rejectsRegisteringNodeAsItsOwnSlave(t *testing.T) {
 func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	t.Cleanup(func() {
@@ -132,7 +132,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 func TestPromoteClusterNode_reportsUnavailableBeforePromoting(t *testing.T) {
 	// Given:从节点态 + syncService=nil 的 Handlers
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -168,7 +168,7 @@ func TestPromoteClusterNode_reportsUnavailableBeforePromoting(t *testing.T) {
 func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

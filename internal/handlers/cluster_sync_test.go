@@ -36,7 +36,7 @@ func TestAuthenticatedClusterToken_uses_bearer_token(t *testing.T) {
 func TestPullClusterSnapshot_persists_manual_sync_failure(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -72,7 +72,7 @@ func TestPullClusterSnapshot_persists_manual_sync_failure(t *testing.T) {
 func TestGetClusterSnapshot_auditFallsBackToNodeID(t *testing.T) {
 	// Given:主节点 + cluster_node_id 指向不存在的节点 999
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -112,7 +112,7 @@ func TestPullClusterSnapshot_master_rejected_without_sync_error(t *testing.T) {
 	// 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
 	// 且 last_sync_error 保持为空——不得让节点页面显示无自愈路径的假错误。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -167,7 +167,7 @@ func TestAuthenticatedClusterToken_prefers_middleware_context(t *testing.T) {
 func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -262,14 +262,14 @@ func TestPullClusterSnapshot_conflictsWhileImportInProgress(t *testing.T) {
 // 审计到另一库的同 ID 节点名，审计对象被错标。
 func TestGetClusterSnapshot_auditNodeNameReadsServiceHandle(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	serviceDB := db.DB
 	// 首轮 Initialize 的 metrics/audit 句柄将被下一轮覆盖；主库句柄 serviceDB
 	// 由收尾保留（服务句柄语义），另两句柄必须显式关闭防泄漏。
 	supersededMetrics, supersededAudit := db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	closeSupersededTestDBHandles(nil, supersededMetrics, supersededAudit)

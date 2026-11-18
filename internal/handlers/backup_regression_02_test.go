@@ -502,7 +502,7 @@ func a86PinPath(dataDir, hostport string) string {
 func TestTopologyRestoreClearsOnlyDeletedNodePins(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initTestDBFromTemplate(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

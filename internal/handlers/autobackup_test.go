@@ -1213,7 +1213,7 @@ func TestPruneAutoBackups_fileRemovalOutcomes(t *testing.T) {
 	// Given:三个 success 行——同名非空目录(Remove 返回 ENOTEMPTY)/文件缺失/
 	// 正常文件,keep=0 全部进入裁剪
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initTestDBFromTemplate(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
