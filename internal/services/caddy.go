@@ -4869,9 +4869,53 @@ const (
 	chainProxyBodyReplayLimitBytes    = 5 * 1024 * 1024
 )
 
+// chain_proxy 承载模式常量（JJC-20261118-002 裁决 1/P2-7）：mode 推导以包级
+// 常量 + 单源函数实现，禁渲染函数内「零值守卫+字符串字面量赋值」兜底形态
+// （render_anti_fallback_scan_test.go 机械扫描面合规）。
+const (
+	chainProxyModeRace = "race"
+	chainProxyModeWRR  = "wrr"
+)
+
+// chainProxyModeFor mode 单源推导（裁决 1 渲染分派表）：strategy=chain_fallback
+// → race（既有竞速语义零变化）；其余一律 wrr——含空串归一后的
+// weighted_round_robin 与全部不允许策略的存量脏行（渲染触发器=池混布，不分
+// 策略，兜直改 DB/远古落库行，绝不落 reverse_proxy）。
+func chainProxyModeFor(strategy string) string {
+	if strategy == "chain_fallback" {
+		return chainProxyModeRace
+	}
+	return chainProxyModeWRR
+}
+
+// normalizedWRRWeight wrr 模式权重归一（<=0 → 1，与写侧 CreateRule 及排序位
+// 归一同口径）。独立单源函数承载，渲染函数体不新增兜底赋值形态（扫描面合规）。
+func normalizedWRRWeight(w int) int {
+	if w <= 0 {
+		return 1
+	}
+	return w
+}
+
+// httpUpstreamPoolMixed 混布池判定（渲染触发器）：启用上游中 http（含空协议
+// 归一）与 https 并存即整池混布。主池/路径池共用（路径池经同一
+// buildHTTPHandleChain 渲染，天然同口径）。
+func httpUpstreamPoolMixed(enabledUpstreams []UpstreamConfig) bool {
+	hasHTTP, hasHTTPS := false, false
+	for _, u := range enabledUpstreams {
+		switch u.Protocol {
+		case "https":
+			hasHTTPS = true
+		default:
+			hasHTTP = true
+		}
+	}
+	return hasHTTP && hasHTTPS
+}
+
 // buildChainProxyConfig 组装 chain_proxy 处理器配置（权重降序稳定排序 + 三级回退解析）。
 // 详见 docs/fork-notes/render-chain.md §22
-func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamConfig) map[string]interface{} {
+func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamConfig, mode string) map[string]interface{} {
 	sorted := make([]UpstreamConfig, len(enabledUpstreams))
 	copy(sorted, enabledUpstreams)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -4889,6 +4933,10 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 		entry := map[string]interface{}{"dial": joinUpstreamAddress(u.Host, u.Port)}
 		if u.Protocol == "https" {
 			entry["scheme"] = "https"
+		}
+		if mode == chainProxyModeWRR {
+			// wrr 模式消费权重（race 以数组序即权重降序为优先级，不发射）。
+			entry["weight"] = normalizedWRRWeight(u.Weight)
 		}
 		host := strings.TrimSpace(u.OriginDomain)
 		if host == "" {
@@ -4914,6 +4962,9 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 		"request_timeout_ms":      requestTimeoutMS,
 		"body_replay_limit_bytes": chainProxyBodyReplayLimitBytes,
 		"strip_request_headers":   lbInternalControlHeaders,
+	}
+	if mode == chainProxyModeWRR {
+		handler["mode"] = chainProxyModeWRR
 	}
 	timeouts := resolveProxyTimeouts(rule)
 	if timeouts.dial > 0 {
@@ -5297,7 +5348,26 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 链式回退：渲染为自定义 chain_proxy 处理器（竞速 + 兜底截断 + 失败即切）。
 	// 详见 docs/fork-notes/render-chain.md §20
 	if rule.Protocol == "http" && rule.Strategy == "chain_fallback" {
-		chainConfig := buildChainProxyConfig(rule, enabledUpstreams)
+		chainConfig := buildChainProxyConfig(rule, enabledUpstreams, chainProxyModeRace)
+		if effectiveServerTokensHidden {
+			handleChain = append(handleChain, map[string]interface{}{
+				"handler":  "headers",
+				"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
+			})
+		}
+		handleChain = append(handleChain, chainConfig)
+		return handleChain, nil
+	}
+
+	// 混布池承载（JJC-20261118-002 裁决 1）：启用池 http/https 混布即整池切
+	// chain 模块承载——渲染触发器不分策略（兜存量脏行：直改 DB/远古落库的
+	// 「混布+不允许策略」启用行绝不落 reverse_proxy，否则池级 TLS 化使 http
+	// 上游静默 502，正是历史必坏路径）。chain_fallback→race 已由上方分支
+	// 承接（与池形态无关）；其余策略（含空串归一）→ mode=wrr，mode/strategy
+	// 归一以包级常量+单源函数 chainProxyModeFor 实现（扫描面合规）。
+	// server_tokens headers 早退形态镜像 race 分支。
+	if rule.Protocol == "http" && httpUpstreamPoolMixed(enabledUpstreams) {
+		chainConfig := buildChainProxyConfig(rule, enabledUpstreams, chainProxyModeFor(rule.Strategy))
 		if effectiveServerTokensHidden {
 			handleChain = append(handleChain, map[string]interface{}{
 				"handler":  "headers",
