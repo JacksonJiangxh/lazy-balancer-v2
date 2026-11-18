@@ -9,6 +9,11 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+
+	// JJC-20261118-002 S4：导入自研 chain 模块——其 init() 把
+	// http.handlers.chain_proxy 注册进 Caddy 模块表，真实 LoadModule+
+	// Provision 可解码混布池产物（mode=wrr + 逐上游 scheme/host/weight）。
+	"lazy-balancer-v2/caddychain"
 )
 
 // ── 生产就绪硬证据（常驻钉子）：**真实生成产物**能被 Caddy 真实解码链加载 ──────
@@ -50,6 +55,33 @@ const (
 	generationErrorKey = "__lazy_balancer_" + "generation_error"
 )
 
+// checkDecodedChainProxy 断言真实 LoadModule 解码出的 chain_proxy 载荷完整：
+// mode=wrr（混布+wrr 策略）、逐上游 scheme 混布 / host 三级回退 / weight>0
+//（JJC-20261118-002 S4 解码链闭合点）。
+func checkDecodedChainProxy(t *testing.T, proxy *caddychain.ChainProxy) {
+	t.Helper()
+	if proxy.Mode != "wrr" {
+		t.Fatalf("chain_proxy mode=%q, want wrr（混布池 weighted_round_robin 渲染）", proxy.Mode)
+	}
+	if len(proxy.Upstreams) < 2 {
+		t.Fatalf("chain_proxy 上游数=%d, want >=2（混布场景）", len(proxy.Upstreams))
+	}
+	schemes := map[string]bool{}
+	for i, up := range proxy.Upstreams {
+		if up.Dial == "" || up.Host == "" || up.Weight <= 0 {
+			t.Fatalf("chain_proxy 上游[%d] 载荷不完整: %+v", i, up)
+		}
+		scheme := up.Scheme
+		if scheme == "" {
+			scheme = "http" // omitempty 缺省=明文车道（模块内同口径）
+		}
+		schemes[scheme] = true
+	}
+	if !schemes["http"] || !schemes["https"] {
+		t.Fatalf("chain_proxy 逐上游 scheme 混布解码失败: %v", schemes)
+	}
+}
+
 // TestCaddyDecodeChain_generatedConfigLoads 是本任务「生产就绪」的主钉子：
 // 拿**真实生成产物**（若环境无产物则用同形态兜底窗口，见下）走完整解码链，
 // 断言整条 route 链（lb_upstream_host + reverse_proxy + 其它 handler）全部加载成功。
@@ -82,7 +114,7 @@ func TestCaddyDecodeChain_generatedConfigLoads(t *testing.T) {
 	// **必须**在本进程内加载成功——这是本钉子的核心断言，不允许被下面「跳过」
 	// 逻辑稀释。反向约束：跳过清单只能含本模块之外、靠 xcaddy 编进来的 handler，
 	// 一旦新增未知模块名，用例红（防止有人把本模块的名字塞进豁免表）。
-	mustLoad := map[string]bool{"lb_upstream_host": true}
+	mustLoad := map[string]bool{"chain_proxy": true}
 	// 跳过清单（本进程实测未注册的模块，见下 reason）：只允许这两项。它们是
 	// xcaddy 编进正式二进制的模块（`--with`/caddyhttp 内建 handler 注册），纯 Go
 	// 测试进程的依赖树里没有 → `ctx.LoadModule` 报 unknown module。**解码已通过**
@@ -129,9 +161,12 @@ func TestCaddyDecodeChain_generatedConfigLoads(t *testing.T) {
 				}
 				loadedRouteHandlers += len(route.Handlers)
 				for _, handler := range route.Handlers {
-					if override, ok := handler.(*UpstreamHostOverride); ok {
-						for dial, host := range override.Hosts {
-							decodedHosts[dial] = host
+					if proxy, ok := handler.(*caddychain.ChainProxy); ok {
+						checkDecodedChainProxy(t, proxy)
+						// 混布池主池的逐上游回源 Host 由 chain entry 承载
+						//（JJC-20261118-002 裁决 1），真实 Provision 后取值比对。
+						for _, up := range proxy.Upstreams {
+							decodedHosts[up.Dial] = up.Host
 						}
 						overrideCount++
 					}
@@ -159,14 +194,15 @@ func TestCaddyDecodeChain_generatedConfigLoads(t *testing.T) {
 						serverName, i, pos, kind, err, truncate(rawHandler, 600))
 				}
 				if mustLoad[kind] {
-					override, ok := module.(*UpstreamHostOverride)
+					proxy, ok := module.(*caddychain.ChainProxy)
 					if !ok {
-						t.Fatalf("handler %q 加载出 %T，want *UpstreamHostOverride", kind, module)
+						t.Fatalf("handler %q 加载出 %T，want *caddychain.ChainProxy", kind, module)
 					}
-					// 加载后的 Hosts 必须解码正确（映射是 json 对象 → map[string]string）。
-					// 逐条值校验放在下面的汇总断言里（跨 route 合并后比）。
-					for dial, host := range override.Hosts {
-						decodedHosts[dial] = host
+					checkDecodedChainProxy(t, proxy)
+					// 加载后的逐上游 Host 必须解码正确（实测载荷），逐条值校验
+					// 放在下面的汇总断言里（跨 route 合并后比）。
+					for _, up := range proxy.Upstreams {
+						decodedHosts[up.Dial] = up.Host
 					}
 					overrideCount++
 				}
@@ -184,7 +220,7 @@ func TestCaddyDecodeChain_generatedConfigLoads(t *testing.T) {
 		t.Fatalf("生成配置里没有任何 handler（产物异常或取错文件）")
 	}
 	if overrideCount == 0 {
-		t.Fatalf("整份配置没有任何 lb_upstream_host handler（混合态场景必发射），route=%d handler=%d",
+		t.Fatalf("整份配置没有任何成功加载的 chain_proxy handler（混布主池必发射），route=%d handler=%d",
 			routeCount, handlerCount)
 	}
 	if loadedRouteHandlers == 0 && len(provisionSkipped) == 0 {
@@ -265,7 +301,7 @@ func TestCaddyDecodeChain_emittedByProductionGenerator(t *testing.T) {
 	body := loadGeneratedConfig(t)
 	text := string(body)
 	for _, want := range []string{
-		"lb_upstream_host",
+		"chain_proxy",
 		"lb_emit_check_path_0",
 		"lb_emit_check_path_1",
 		"lb_emit_check_path_2",
