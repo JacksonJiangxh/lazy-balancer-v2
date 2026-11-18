@@ -341,6 +341,100 @@ func (h *ChainProxy) serveSingleLane(w http.ResponseWriter, r *http.Request, pre
 	return h.writeUpstreamResponse(w, resp, cancel)
 }
 
+// wrrNext smooth 加权轮询选路器（nginx interleave smooth WRR 同构）：每请求
+// 对全部上游累加有效权重，取当前权重最大者胜出并扣减总权重。确定性序列，
+// 长程分布精确按权重比例。失败切换沿用数组序（生成侧已按权重降序排列）。
+func (h *ChainProxy) wrrNext() int {
+	n := len(h.Upstreams)
+	if h.wrrState == nil {
+		h.wrrState = &wrrCounter{}
+	}
+	st := h.wrrState
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.cw) != n {
+		st.cw = make([]int, n)
+	}
+	total, best := 0, 0
+	for i, up := range h.Upstreams {
+		w := up.Weight
+		if w <= 0 {
+			w = 1
+		}
+		st.cw[i] += w
+		total += w
+		if st.cw[i] > st.cw[best] {
+			best = i
+		}
+	}
+	st.cw[best] -= total
+	return best
+}
+
+// serveWRR mode=wrr 主编排：逐请求按 smooth 加权轮询选主车道；网络错误
+// （建连失败/响应头兜底超时）按权重降序失败即切下一车道（请求体已缓冲≤
+// 重放上限）；响应头已到（任意状态码，含 4xx/5xx——与原生 reverse_proxy
+// 对齐，404 透传）原样透传；车道全灭→502（全部超时→504）。
+func (h *ChainProxy) serveWRR(w http.ResponseWriter, r *http.Request, body []byte) error {
+	n := len(h.Upstreams)
+	start := h.wrrNext()
+	timeouts := 0
+	for k := 0; k < n; k++ {
+		idx := (start + k) % n
+		up := h.Upstreams[idx]
+		laneCtx, cancel := context.WithCancel(r.Context())
+		var bodyReader io.Reader
+		if body != nil {
+			bodyReader = bytes.NewReader(body)
+		}
+		resp, timedOut, err := h.roundTrip(laneCtx, cancel, idx, r, up, bodyReader, int64(len(body)))
+		if err != nil {
+			if timedOut {
+				timeouts++
+			}
+			continue
+		}
+		return h.writeUpstreamResponse(w, resp, cancel)
+	}
+	status := http.StatusBadGateway
+	msg := "chain_proxy: all upstreams failed"
+	if timeouts > 0 && timeouts == n {
+		status = http.StatusGatewayTimeout
+		msg = "chain_proxy: all upstreams timed out"
+	}
+	h.log().Warn("chain_proxy: 全部上游失败（wrr）",
+		zap.Int("lanes", n), zap.Int("timeout_lanes", timeouts), zap.Int("status", status))
+	chainWriteError(w, status, msg)
+	return nil
+}
+
+// serveWRRDirect wrr 直通路径（单上游退化/体重放超限）：不轮询不重放；
+// 与 race 的干净 404 刻意分叉（裁决 3.6）——上游响应含 404 原样透传，
+// 禁复用 serveSingleLane 的干净 404 分支。
+func (h *ChainProxy) serveWRRDirect(w http.ResponseWriter, r *http.Request, prefix []byte, overflow bool) error {
+	var body io.Reader
+	if overflow {
+		body = io.MultiReader(bytes.NewReader(prefix), r.Body)
+	} else if prefix != nil {
+		body = bytes.NewReader(prefix)
+	} else {
+		body = r.Body
+	}
+	laneCtx, cancel := context.WithCancel(r.Context())
+	resp, timedOut, err := h.roundTrip(laneCtx, cancel, 0, r, h.Upstreams[0], body, r.ContentLength)
+	if err != nil {
+		status := http.StatusBadGateway
+		msg := "chain_proxy: upstream failed"
+		if timedOut {
+			status = http.StatusGatewayTimeout
+			msg = "chain_proxy: upstream timed out"
+		}
+		chainWriteError(w, status, msg)
+		return nil
+	}
+	return h.writeUpstreamResponse(w, resp, cancel)
+}
+
 // writeUpstreamResponse 流式写出上游响应（竞速胜者 / 单车道非 404 直通）。
 // done 在流结束后取消车道 context（连接回收）；nil 则跳过。
 func (h *ChainProxy) writeUpstreamResponse(w http.ResponseWriter, resp *http.Response, done context.CancelFunc) error {
