@@ -53,7 +53,7 @@ func TestValidateRuleUpstreams_rejectsNumericLookalikeHost(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			upstreams := []models.Upstream{{Host: c.host, Port: 8080, Weight: 1, Enabled: true}}
-			_, err := validateRuleUpstreams("http", false, upstreams, true)
+			_, err := validateRuleUpstreams("http", false, upstreams, true, "")
 			if c.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "主机") {
 					t.Fatalf("validateRuleUpstreams(%q) error = %v, want 主机无效", c.host, err)
