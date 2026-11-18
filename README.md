@@ -77,6 +77,9 @@ docker run -d --name lazy-balancer \
 #    （用 `npm ci` 而不是 `npm install`：前者严格按 package-lock.json 装，
 #    不会就地改写锁文件导致依赖解析漂移；需要 Node.js ≥ 22.18，见
 #    web/package.json 的 engines 字段）
+#    产物自证：web/dist 是宿主预构建产物、被 Dockerfile 原样 COPY，陈旧前端
+#    会静默入镜像（面板版本号来自后端）。构建后核对构建戳与当前提交：
+#    git rev-parse HEAD && cat web/dist/build-info.json
 
 # 2) Docker Compose（Linux；主节点为 host 网络）
 #    注意通道：仓库里的 docker-compose.yml 钉的是 `:latest` 标签（最近一次

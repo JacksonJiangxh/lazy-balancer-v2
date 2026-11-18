@@ -30,6 +30,26 @@
 - **TLS/明文混布**：同一端口不能同时存在 `enable_tls=1` 与 `enable_tls=0` 的启用 HTTP 规则（监听器形态二选一）
 - **TCP 规则**：独占端口，不能与 HTTP/HTTPS 规则共用端口
 
+#### 上游池 http/https 混布（JJC-20261118-002，2026-11-18）
+
+单条 HTTP 规则的**启用上游池**支持 http/https 混布，但**定向放行**（写侧门禁，
+`mixedPoolStrategyAllowed` 单源谓词，前端镜像同口径）：
+
+| 组合 | 判定 |
+|---|---|
+| 混布池 + `weighted_round_robin` / `chain_fallback` / 空 strategy | **放行**（渲染期整池切 chain 模块 `mode=wrr`/`race` 逐上游独立回源通道承载） |
+| 混布池 + 其余策略（least_conn/ip_hash/cookie/first/random） | **400**（文案点名允许策略） |
+| 混布池 + 主动健康检查 `enable_active_health_check=1` | **400**（chain 无健康检查子系统，放行即「保存放行+运行必坏」死配置——响亮拒绝优于静默忽略） |
+| uniform 池（协议一致）+ 任何策略 | 现状不变（wrr 走原生 reverse_proxy；chain_fallback 维持 chain_proxy race） |
+
+**历史教训钉死**：混布池在 Caddy `reverse_proxy` 下因池级 TLS 传输使 http 上游
+静默 502（v2.11 引擎实测行为，`rule_mixed_protocol_test.go` 文件头注释）——v2.3.4
+前后「保存放行+运行必坏」族教训的精确复刻面。因此渲染触发器=**池混布（不分策略）**：
+直改 DB/远古落库的「混布+不允许策略」启用行渲染兜底整池切 chain 承载，绝不落
+reverse_proxy；存量行聚合校验按三口径 warn（不允许策略 warn / 允许策略+HC 标志
+点名 HC 无效 warn / 其余静默）。模式语义分权与分叉清单见
+`docs/fork-notes/render-chain.md` §22；真进程取证 `.agent_team/spike/evidence/T6.md`。
+
 ```
 HTTP规则A(port=80) + HTTP规则B(port=80) → 允许（同协议）
 HTTP规则(port=80) + TCP规则(port=80) → 冲突（不同协议）

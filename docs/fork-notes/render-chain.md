@@ -277,11 +277,33 @@ Host 占位符全部不发射（竞速即可用性机制；逐上游回源域名
 
 ## §22 `buildChainProxyConfig` 组装口径（权重与三级回退）
 
-`buildChainProxyConfig` 组装 chain_proxy 处理器配置（`strategy=chain_fallback`）。
-上游按权重降序稳定排序（同权重保持列表顺序；`weight<=0`→1，满足「发射权重
-恒 > 0」不变量——chain 配置不发射 `weights` 键，但优先级语义同样依赖正权重）；
+`buildChainProxyConfig` 组装 chain_proxy 处理器配置（`strategy=chain_fallback` 分支 +
+JJC-20261118-002 混布池分支，mode 由 `chainProxyModeFor` 单源推导）。
+上游按权重降序稳定排序（同权重保持列表顺序；`weight<=0`→1 经 `normalizedWRRWeight`
+单源，满足「发射权重恒 > 0」不变量——race 模式不发射 `weights`/`weight` 键
+（优先级=数组序），**wrr 模式发射逐上游 `weight` 键与顶层 `mode:"wrr"`**）；
 逐上游回源域名按「上游 `origin_domain` > 规则级 `host_header` > 空 = 用 dial 地址」
 三级回退解析（与 `reverse_proxy` 侧 map 方案同语义，chain 车道直接下发静态值）。
+
+**mode 分权（2026-11-18 JJC-20261118-002 裁决 1）**：
+- `strategy=chain_fallback` → `race`（竞速回退，现状语义零变化，mode 键缺省）；
+- 混布池（`httpUpstreamPoolMixed`，启用池 http/https 并存）∧ 其余策略 →
+  `mode="wrr"`（确定性平滑加权轮询，nginx interleave smooth WRR 同构，跨请求
+  持久状态）；**渲染触发器不分策略**——混布+不允许策略的存量脏行也整池切 chain
+  承载，绝不落 reverse_proxy（池级 TLS 化会使 http 上游静默 502 的历史必坏路径）；
+- **404 分叉**：race 全挂/单车道直通上游 404 → 干净 404（对象存储防护，不透传
+  后端报文）；wrr（含 `serveWRRDirect` 直通路径）404 **透传**（与原生对齐）——
+  两模式各自钉测，禁互相复用 404 分支；
+- **健康检查分叉**：chain 两模式均不发射 `health_checks`（无健康检查子系统）；
+  混布池+主动健康检查在写侧 400（`mixedPoolHealthCheckError` 伴随门）；uniform
+  池+chain_fallback+HC 标志的既有静默忽略行为保留零改动（已知分叉，另立项）；
+- **HTTP/1.1 恒定**：`caddychain` transport 恒 `ForceAttemptHTTP2=false`——
+  `upstream_force_http1` 在链式/混布车道下无附加效果（语义已满足），不加门；
+- **dns_server 不消费**：chain 模式车道走系统解析器（混布池×DynamicDNS 结构互斥，
+  单上游锁）；文档钉死不静默宣称；
+- **隧道 Hijack 约束**（卡-20261118-02）：升级请求经 `serveTunnel`，取客户端连接
+  必须 `http.NewResponseController(w).Hijack()`——真实引擎 writer 为
+  `*caddyhttp.IdleTimeoutWriter` 包装（不实现 `http.Hijacker`），类型断言必失败。
 
 ---
 

@@ -40,7 +40,7 @@
 
 | # | 能力 | 关键符号（grep 可核） | 裁定出处 |
 |---|---|---|---|
-| 1 | **链式回退**（`chain_fallback`） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `caddychain/` | 2026-10-09 |
+| 1 | **链式回退**（`chain_fallback`） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `chainProxyModeFor` · `caddychain/` | 2026-10-09 / 2026-11-18 |
 | 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
 | 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` · `healthcheckPanelPort` | — / 2026-11-15 |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
@@ -57,24 +57,46 @@
 
 ---
 
-## 第 1 项 · 链式回退（`chain_fallback`）
+## 第 1 项 · 链式回退（`chain_fallback`）+ 混布池 wrr 承载（2026-11-18 扩展）
 
 - **能力名**：链式回退负载策略——上游按权重降序组成回退链，竞速 + 兜底截断 + 失败即切。
+  **2026-11-18 扩展（JJC-20261118-002）**：HTTP 规则启用上游池支持 http/https 混布，
+  混布池由 chain 模块逐上游独立 transport 承载（**绝不落 reverse_proxy**——池级 TLS
+  传输会使 http 上游静默 502）；`mode` 分权：`chain_fallback`→`race`（竞速，现状零变化）、
+  其余策略（含空串归一 `weighted_round_robin`）→`wrr`（**确定性平滑加权轮询**，逐请求
+  精确按权重比例交错选路——与原生 reverse_proxy 随机加权选路长程分布一致、短程形态
+  不同，禁等价宣称）。
 - **代码位置**：
-  - 模块：`caddychain/`（`chain_proxy` handler，独立 Go 模块，经 `xcaddy --with` 编入）
-  - 渲染：`internal/services/caddy.go` → `buildChainProxyConfig`（`strategy=chain_fallback` 分支）
-  - 前端：`web/src/views/Rules.vue`（权重即优先级的提示文案）
+  - 模块：`caddychain/`（`chain_proxy` handler，独立 Go 模块，经 `xcaddy --with` 编入；
+    `Mode` 字段 race/wrr、`serveWRR`/`serveWRRDirect`、`wrrNext` 平滑轮询选路器）
+  - 渲染：`internal/services/caddy.go` → `buildChainProxyConfig`（mode 参数）+
+    `chainProxyModeFor`（mode 单源推导）+ `httpUpstreamPoolMixed`（混布触发器）
+  - 门禁：`internal/handlers/rule_features.go` → `mixedPoolStrategyAllowed`（定向放行
+    谓词单源）+ `mixedPoolHealthCheckError`（混布+主动健康检查=400 伴随门）
+  - 前端：`web/src/views/Rules.vue`（权重即优先级的提示文案；主池门镜像谓词）
 - **设计裁定出处**：2026-10-09（逐上游回源 Host 同批立项；`chain_fallback` 与回源 Host
-  共用「权重降序 + 逐车道 host」的生成侧解析口径）。
+  共用「权重降序 + 逐车道 host」的生成侧解析口径）；2026-11-18（混布池定向放行 +
+  mode 分权，JJC-20261118-002 裁决 1-4，方案 v1.2 门下轮 2 准奏冻结）。
 - **关键设计点**：`reverse_proxy` 专属的负载均衡 / 健康检查 / transport / headers /
   回源 Host 占位符**全部不发射**；逐上游回源 Host 在**生成侧**解析后随车道下发
-  （`entry["host"]`），因此本能力与第 4 项在链式场景下天然同口径。
+  （`entry["host"]`），因此本能力与第 4 项在链式场景下天然同口径。混布池渲染触发器
+  **不分策略**（兜存量脏行：直改 DB 的「混布+不允许策略」启用行也整池切 chain 承载，
+  绝不落 reverse_proxy）。混布池+主动健康检查=写侧 400（chain 无健康检查子系统，
+  「响亮拒绝优于静默忽略」）；wrr 404 透传（与 race「干净 404」刻意分叉）；车道恒
+  HTTP/1.1；`dns_server` 不消费（车道走系统解析器）。真进程验证：`.agent_team/spike/
+  evidence/T6.md`（wrr 分布 2:1:1 精确观测、race 双车道扇出、全灭 502/全超时 504、
+  升级隧道 101）。
 - **防复发约束**：
   > 上游若出现「竞速式回退」类实现（或把 `try_duration`/`try_interval` 的重试语义
   > 包装成等价物），**不得**据此拆除 `caddychain/`。上游的 `reverse_proxy` 重试是
   > 「同一请求在可用池内换上游」，**没有**「按权重排序的确定性回退链 + 竞速扇出 +
   > 兜底截断」语义；两者不等价。参照比对记录：`docs/upstream-merge.zh-CN.md`。
-- **不适用面**：单上游规则、`dynamic_upstreams`（DynamicDNS）规则。
+  > **隧道取连接必须经 `http.NewResponseController(w).Hijack()` 穿透引擎包装层，
+  > 禁直接 `w.(http.Hijacker)` 类型断言**——真实 Caddy 引擎把 writer 包装成
+  > `*caddyhttp.IdleTimeoutWriter` 等**不实现 Hijacker** 的类型（v2.11.9 实测，
+  > 卡-20261118-02），断言失败即隧道 502；httptest 裸 writer 单测测不出该缝隙。
+- **不适用面**：单上游规则、`dynamic_upstreams`（DynamicDNS）规则；混布池规则另见
+  上方 2026-11-18 扩展（单上游 uniform 池维持 reverse_proxy 原生路径零变化）。
 
 ## 第 2 项 · 引用型证书（`tls_source=file`）
 

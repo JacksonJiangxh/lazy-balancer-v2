@@ -242,6 +242,11 @@ test('脚本存在性断言文件禁止裸 source()/repoSource() 回流', () => 
     'templateTypeGate.spec.ts',
     // 注释文案钉：断言 allow 空名单的 fail-closed 说明，剥注释后无法判定。
     'securityStagesModel.spec.ts',
+    // 文案钉：混布门跨栈逐字对齐（JJC-20261118-002）——断言对象是后端 Go
+    // 源文件里**用户可见的 400 错误文案**与前端模板文案（剥注释视图会把
+    // Go 注释剥掉，但这些文案在字符串字面量里，且断言对象是「文案原文一致」
+    // 而非代码符号存在性；该文件同时用 code() 做符号断言，raw 仅限文案钉）。
+    'ruleValidation.spec.ts',
   ])
   // 本文件自身含判据的合成样本字符串（非真实导入），排除自扫描。
   const offenders = specFiles.filter((name) => name !== 'helpersStripComments.spec.ts' && rawImport.test(readSpec(name)) && !allowedRaw.has(name))

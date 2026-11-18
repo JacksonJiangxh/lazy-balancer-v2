@@ -82,7 +82,7 @@ cd web && npm ci && npm run build && cd ..
 #    Artifact self-proof: web/dist is pre-built and copied into the image as-is,
 #    so a stale dist is invisible (the panel version comes from the backend).
 #    After building, compare the stamp with the current commit:
-git rev-parse HEAD && cat web/dist/build-info.json
+#    git rev-parse HEAD && cat web/dist/build-info.json
 
 # 2) Docker Compose (Linux; the primary node uses host networking)
 #    Mind the channel: the checked-in docker-compose.yml pins `:latest`,
