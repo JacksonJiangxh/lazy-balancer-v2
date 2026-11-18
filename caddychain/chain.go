@@ -43,6 +43,9 @@ type ChainUpstream struct {
 	Dial   string `json:"dial,omitempty"`
 	Scheme string `json:"scheme,omitempty"`
 	Host   string `json:"host,omitempty"`
+	// Weight 权重（wrr 模式消费；race 模式忽略——race 以数组序即权重降序
+	// 为优先级）。<=0 按 1 兜底。生成侧与上游同源权重发射。
+	Weight int `json:"weight,omitempty"`
 }
 
 // Default* 与面板写侧默认值同口径（rules.go CreateRule / caddy.go 渲染兜底）。
@@ -59,8 +62,19 @@ const (
 	DefaultBodyReplayLimitBytes = 5 * 1024 * 1024
 )
 
+// mode 合法值。空串与 "race" 均为竞速语义（空串保持 JSON 省略与既有配置
+// 兼容）；"wrr" 为确定性平滑加权轮询（逐请求精确按权重比例交错选路）。
+const (
+	modeRace = "race"
+	modeWRR  = "wrr"
+)
+
 // ChainProxy is the Caddy module. JSON key: "chain_proxy".
 type ChainProxy struct {
+	// Mode 承载模式：""/"race"=竞速回退（现状语义零变化）；"wrr"=smooth
+	// 加权轮询。非法值由 Validate 拒绝。
+	Mode string `json:"mode,omitempty"`
+
 	// Upstreams 按优先级降序排列（生成侧已按权重排序，模块不重复处理）。
 	Upstreams []ChainUpstream `json:"upstreams,omitempty"`
 
@@ -88,6 +102,16 @@ type ChainProxy struct {
 	// CaddyModule 值接收者约定）。惰性初始化，测试可绕过 Provision。
 	tlsCache *tlsTransportCache
 	logger   *zap.Logger
+
+	// wrr 状态（smooth 加权轮询的逐上游当前权重；指针承载避免模块值拷贝
+	// 带锁——与 tlsCache 同模式。惰性初始化）。
+	wrrState *wrrCounter
+}
+
+// wrrCounter wrr 模式跨请求持久的选路状态。
+type wrrCounter struct {
+	mu sync.Mutex
+	cw []int // 当前权重（smooth WRR）
 }
 
 // tlsTransportCache HTTPS 上游回源 Host 与 dial 主机不一致时，按 SNI 缓存
@@ -140,6 +164,9 @@ func (h *ChainProxy) Provision(ctx caddy.Context) error {
 
 // Validate ensures the configuration is usable.
 func (h *ChainProxy) Validate() error {
+	if h.Mode != "" && h.Mode != modeRace && h.Mode != modeWRR {
+		return fmt.Errorf("chain_proxy: mode 仅支持 race/wrr")
+	}
 	if len(h.Upstreams) == 0 {
 		return fmt.Errorf("chain_proxy: 至少需要一个上游")
 	}
@@ -268,7 +295,13 @@ func (h *ChainProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyht
 	if overflow || len(h.Upstreams) == 1 {
 		// 请求体超重放上限（仅车道 0 直通，前缀续流）或链上仅一个上游
 		//（退化直通）。
+		if h.Mode == modeWRR {
+			return h.serveWRRDirect(w, r, body, overflow)
+		}
 		return h.serveSingleLane(w, r, body, overflow)
+	}
+	if h.Mode == modeWRR {
+		return h.serveWRR(w, r, body)
 	}
 	return h.serveRace(w, r, body)
 }
