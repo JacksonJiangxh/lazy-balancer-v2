@@ -39,6 +39,10 @@ func TestMain(m *testing.M) {
 	baseline := captureHandlerGlobalState()
 	code := m.Run()
 
+	// handlers 测试库模板目录清理（JJC-20261118-001 B 线）：模板是进程级
+	// 单例（生命周期超出任何单个用例，t.Cleanup 接不住），suite 收尾移除。
+	cleanupTestDBTemplate()
+
 	if code == 0 {
 		leaks := handlerSuiteGlobalLeaks(baseline)
 		if len(leaks) > 0 {
