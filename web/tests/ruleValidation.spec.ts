@@ -14,10 +14,14 @@ import {
   isRedirectResponseStatus,
   isResponseBodyAllowed,
   isValidRedirectTargetShape,
+  mixedPoolHealthCheckGateError,
+  mixedPoolPathGateMessage,
+  mixedPoolStrategyAllowed,
+  MIXED_POOL_ALLOWED_STRATEGY_MESSAGE,
   upstreamPathRuleError,
   validatePathRules,
 } from '../src/utils/ruleValidation.ts'
-import { repoCode, section } from './_helpers.ts'
+import { repoCode, repoSource, section, source } from './_helpers.ts'
 import { hostPortKey } from '../src/utils/upstreamKeys.ts'
 
 type Upstream = {
@@ -128,12 +132,66 @@ test('上游池：host:port 去重（大小写不敏感、IPv6 方括号键）',
   assert.equal(hostPortKey('api.example.com', 443), 'api.example.com:443')
 })
 
-test('上游池：http/https 混布拒绝（同池 TLS 传输下 http 上游静默全灭）', () => {
+test('上游池：http/https 混布——允许策略放行、其余策略拒绝（JJC-20261118-002 超集）', () => {
+  const mixedUpstreams = [upstream({ protocol: 'http' }), upstream({ protocol: 'https', port: 8081 })]
+  // 允许策略（wrr / chain_fallback / 空串归一）混布放行——渲染期 chain 模块承载
+  for (const strategy of ['weighted_round_robin', 'chain_fallback', '']) {
+    assert.equal(validatePathRules([rule({ upstreams: mixedUpstreams })], strategy), null)
+  }
+  // 其余策略拒绝，文案点名允许策略（与后端 400 对齐）
   assert.match(
-    String(validatePathRules([rule({ upstreams: [upstream({ protocol: 'http' }), upstream({ protocol: 'https', port: 8081 })] })])),
-    /混布/,
+    String(validatePathRules([rule({ upstreams: mixedUpstreams })], 'least_conn')),
+    /混布仅支持 weighted_round_robin \/ chain_fallback/,
   )
-  assert.equal(validatePathRules([rule({ upstreams: [upstream({ protocol: 'https' }), upstream({ protocol: 'https', port: 8081 })] })]), null)
+  assert.match(
+    String(validatePathRules([rule({ upstreams: mixedUpstreams })], 'ip_hash')),
+    /其余策略请统一上游协议或拆分规则/,
+  )
+  // uniform 池任何策略不受混布门影响（现状回归）
+  assert.equal(validatePathRules([rule({ upstreams: [upstream({ protocol: 'https' }), upstream({ protocol: 'https', port: 8081 })] })], 'least_conn'), null)
+})
+
+test('混布门文案跨栈逐字对齐（前端常量=后端 400 错误信息原文）', () => {
+  // 文案断言走 raw 视图（repoSource）——用户可见字符串属例外（见 _helpers.ts）。
+  const goMain = repoSource('internal/handlers/handlers.go')
+  const goFeatures = repoSource('internal/handlers/rule_features.go')
+  const frontendSource = source('src/utils/ruleValidation.ts')
+  // 主池文案逐字出现在后端两处门内（保存门/存量门）
+  assert.ok(goMain.includes(MIXED_POOL_ALLOWED_STRATEGY_MESSAGE), '后端 handlers.go 主池文案必须与前端常量逐字一致')
+  assert.ok(goFeatures.includes(MIXED_POOL_ALLOWED_STRATEGY_MESSAGE), '后端 rule_features.go 主池文案必须与前端常量逐字一致')
+  // 路径池文案逐字对齐：后端为 %s 格式串，前端按 path 填充后逐字等值
+  const backendPathFormat = '路径规则 %s 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）'
+  assert.ok(goFeatures.includes(backendPathFormat), '后端路径池文案格式串必须与前端逐字一致')
+  assert.equal(mixedPoolPathGateMessage('/api/'), backendPathFormat.replace('%s', '/api/'))
+  const hcMessage = mixedPoolHealthCheckGateError('http', true, [
+    { protocol: 'http', enabled: true },
+    { protocol: 'https', enabled: true },
+  ])
+  assert.ok(hcMessage !== null && goFeatures.includes(hcMessage), '后端伴随门文案必须与前端逐字一致')
+  // 前端源码不得再出现旧混布文案（防漂移回旧句）
+  assert.doesNotMatch(frontendSource, /混布时 http 上游会被 TLS 化而无法访问/)
+  assert.doesNotMatch(frontendSource, /同一上游池协议须一致（混布仅支持/)
+})
+
+test('混布池谓词与伴随门镜像与后端同口径（JJC-20261118-002）', () => {
+  // 谓词：允许集 {wrr, chain_fallback, 空串归一}
+  for (const strategy of ['weighted_round_robin', 'chain_fallback', '']) {
+    assert.equal(mixedPoolStrategyAllowed(strategy), true, `strategy=${strategy}`)
+  }
+  for (const strategy of ['least_conn', 'ip_hash', 'cookie', 'first', 'random']) {
+    assert.equal(mixedPoolStrategyAllowed(strategy), false, `strategy=${strategy}`)
+  }
+  // 伴随门镜像：混布+主动健康检查 → 点名文案；uniform+HC / 混布无 HC / TCP 放行
+  const mixed = [
+    { protocol: 'http', enabled: true },
+    { protocol: 'https', enabled: true },
+  ]
+  assert.match(String(mixedPoolHealthCheckGateError('http', true, mixed)), /主动健康检查/)
+  assert.equal(mixedPoolHealthCheckGateError('http', true, [{ protocol: 'http', enabled: true }]), null)
+  assert.equal(mixedPoolHealthCheckGateError('http', false, mixed), null)
+  assert.equal(mixedPoolHealthCheckGateError('tcp', true, mixed), null)
+  // 禁用行不参与混布判定（与后端口径一致）
+  assert.equal(mixedPoolHealthCheckGateError('http', true, [{ protocol: 'http', enabled: true }, { protocol: 'https', enabled: false }]), null)
 })
 
 test('上游空/端口/权重校验不回归', () => {
