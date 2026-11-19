@@ -97,6 +97,10 @@ type ChainProxy struct {
 	// 进程内控制头，与 reverse_proxy 的 headers.request.delete 同源）。
 	StripRequestHeaders []string `json:"strip_request_headers,omitempty"`
 
+	// HealthCheck 主动健康检查配置（nil=不探测=既有行为零变化）。选路联动：
+	// wrr 跳过 unhealthy、race 扇出剔除、隧道同口径、全灭不专判（hcEligible）。
+	HealthCheck *ChainHealthCheck `json:"health_check,omitempty"`
+
 	baseTransport *http.Transport
 	// tlsCache 按 SNI 派生 transport 的缓存（指针承载，避免模块值拷贝带锁——
 	// CaddyModule 值接收者约定）。惰性初始化，测试可绕过 Provision。
@@ -106,6 +110,10 @@ type ChainProxy struct {
 	// wrr 状态（smooth 加权轮询的逐上游当前权重；指针承载避免模块值拷贝
 	// 带锁——与 tlsCache 同模式。惰性初始化）。
 	wrrState *wrrCounter
+
+	// hcState 主动健康检查子系统（指针承载——与 tlsCache/wrrState 同模式）。
+	// Provision 启动 / Cleanup 停止（done 先等探测协程退出再放行）。
+	hcState *healthMonitor
 }
 
 // wrrCounter wrr 模式跨请求持久的选路状态。
@@ -159,6 +167,8 @@ func (h *ChainProxy) Provision(ctx caddy.Context) error {
 	}
 	h.tlsCache = &tlsTransportCache{transports: make(map[string]*http.Transport)}
 	h.logger = ctx.Logger()
+	// HC 子系统挂载（HealthCheck 为 nil 时零操作；初始态全 healthy）。
+	h.startHealthMonitor()
 	return nil
 }
 
@@ -178,12 +188,25 @@ func (h *ChainProxy) Validate() error {
 			return fmt.Errorf("chain_proxy: 上游 %d 的 scheme 仅支持 http/https", i)
 		}
 	}
+	if h.HealthCheck != nil {
+		if h.HealthCheck.IntervalMS < 0 || h.HealthCheck.TimeoutMS < 0 {
+			return fmt.Errorf("chain_proxy: health_check interval_ms/timeout_ms 不可为负")
+		}
+		if h.HealthCheck.HealthyLag < 0 || h.HealthCheck.UnhealthyLag < 0 {
+			return fmt.Errorf("chain_proxy: health_check healthy_lag/unhealthy_lag 不可为负")
+		}
+		if _, _, err := parseExpectStatus(h.HealthCheck.ExpectStatus); err != nil {
+			return fmt.Errorf("chain_proxy: %v", err)
+		}
+	}
 	return nil
 }
 
 // Cleanup closes idle connections held by the transports of the outgoing
 // config（重载窗口内新配置的 handler 持有自己的 transport 实例，互不影响）。
 func (h *ChainProxy) Cleanup() error {
+	// 先等 HC 探测协程退出再关连接（done 先等后放，卡-20261118-01）。
+	h.stopHealthMonitor()
 	if h.baseTransport != nil {
 		h.baseTransport.CloseIdleConnections()
 	}
