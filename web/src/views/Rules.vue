@@ -1503,7 +1503,7 @@ import { proxyTimeoutSummary } from '@/utils/proxyTimeouts'
 import { activeHealthCheckSummary, healthCheckSummary, passiveHealthCheckSummary } from '@/utils/healthCheckSummary'
 import { activateOnce } from '@/utils/keyboardActivate'
 import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
-import { isValidHostName, validatePathRules, mixedPoolHealthCheckGateError, mixedPoolStrategyAllowed, MIXED_POOL_ALLOWED_STRATEGY_MESSAGE, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap } from '@/utils/ruleValidation'
+import { isValidHostName, validatePathRules, mixedPoolStrategyAllowed, MIXED_POOL_ALLOWED_STRATEGY_MESSAGE, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import { popperViewportSafe } from '@/utils/popper'
@@ -3810,14 +3810,8 @@ const submitWizard = async () => {
       return
     }
   }
-  // 伴随门镜像（后端 mixedPoolHealthCheckError 同款文案，400 权威门在后端）：
-  // 混布池 + 主动健康检查 = 死配置（chain 模块无健康检查子系统）。
-  const mixedHcGateError = mixedPoolHealthCheckGateError(wizardForm.protocol, wizardForm.enable_active_health_check, wizardForm.upstreams)
-  if (mixedHcGateError) {
-    ElMessage.warning(mixedHcGateError)
-    saving.value = false
-    return
-  }
+  // 伴随门镜像已随 JJC-20261119-001 裁决 4 移除：chain 模块 HC 子系统落地后
+  // 混布池 + 主动健康检查是活配置（渲染发射 health_check），不再预拦。
   // 逐上游回源域名（2026-10-10）：与后端 validateRulePayloadBeforeSave 同口径——
   // 纯主机名不带端口（端口已有独立配置列）、仅 HTTP 静态上游可用
   // 正则双份收敛为共享 isValidHostName（标签首尾 alnum、63/253 与后端对齐）
