@@ -369,3 +369,124 @@ func TestMixedPoolRender_pathPoolMixed(t *testing.T) {
 		t.Fatalf("路径池 race 不得发射 mode 键: %v", proxy)
 	}
 }
+
+// ===== JJC-20261119-001 S2：health_check 发射钉测（裁决 4）=====
+
+// hcEmissionRule 快捷构造：HC 标志/值域可变、混布双车道上游。
+func hcEmissionRule(t *testing.T, id, strategy string, hcOn bool, interval, timeout, healthy, unhealthy int, path string) SingleRuleConfig {
+	t.Helper()
+	return SingleRuleConfig{
+		CaddyID:                       id,
+		Domain:                        id + ".test",
+		Protocol:                      "http",
+		RequestBodyMaxSizeMB:          128,
+		EnableActiveHealthCheck:       hcOn,
+		HealthCheckPath:               path,
+		HealthCheckInterval:           interval,
+		HealthCheckTimeout:            timeout,
+		HealthCheckUnhealthyThreshold: unhealthy,
+		HealthCheckHealthyThreshold:   healthy,
+		Strategy:                      strategy,
+	}
+}
+
+var hcEmissionUps = []UpstreamConfig{
+	{Host: "10.0.0.1", Port: 8001, Weight: 1, Protocol: "https", Enabled: true},
+	{Host: "10.0.0.2", Port: 8002, Weight: 1, Protocol: "http", Enabled: true},
+}
+
+// TestMixedPoolRender_healthCheckEmission 混布+HC 发射键面（A2）：race/wrr
+// 同发射、值域一致——interval/timeout 秒→毫秒、path 透传、lag 直传；
+// expect_status/body 无规则级字段不发射。
+func TestMixedPoolRender_healthCheckEmission(t *testing.T) {
+	for _, strategy := range []string{"weighted_round_robin", "chain_fallback"} {
+		rule := hcEmissionRule(t, "lb_mp_hc", strategy, true, 10, 2, 2, 3, "/hc")
+		chain := mustRenderChain(t, rule, hcEmissionUps)
+		proxy := findChainProxyHandler(t, chain)
+		if proxy == nil {
+			t.Fatalf("strategy=%s: 混布+HC 未发射 chain_proxy", strategy)
+		}
+		hc, ok := proxy["health_check"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("strategy=%s: chain_proxy 未发射 health_check 键: %v", strategy, proxy)
+		}
+		if hc["interval_ms"].(float64) != 10000 {
+			t.Fatalf("strategy=%s: interval_ms=%v, want 10000（秒→毫秒）", strategy, hc["interval_ms"])
+		}
+		if hc["timeout_ms"].(float64) != 2000 {
+			t.Fatalf("strategy=%s: timeout_ms=%v, want 2000", strategy, hc["timeout_ms"])
+		}
+		if hc["path"] != "/hc" {
+			t.Fatalf("strategy=%s: path=%v, want /hc", strategy, hc["path"])
+		}
+		if hc["healthy_lag"].(float64) != 2 || hc["unhealthy_lag"].(float64) != 3 {
+			t.Fatalf("strategy=%s: lag 阈值发射不一致: %v", strategy, hc)
+		}
+		if _, ok := hc["expect_status"]; ok {
+			t.Fatalf("strategy=%s: expect_status 无规则级字段不得发射: %v", strategy, hc)
+		}
+		if _, ok := hc["body"]; ok {
+			t.Fatalf("strategy=%s: body 无规则级字段不得发射: %v", strategy, hc)
+		}
+	}
+}
+
+// TestMixedPoolRender_healthCheckZeroValuesDirtyRow 存量脏行兜底：HC 标志=1
+// 但 interval/path/阈值全零（直改 DB 形态）——零值不发射、不整规则渲染失败
+// （模块侧按缺省 30s/5s/2,3/"/"兜底，自动获得真探测）。
+func TestMixedPoolRender_healthCheckZeroValuesDirtyRow(t *testing.T) {
+	rule := hcEmissionRule(t, "lb_mp_hc_dirty", "weighted_round_robin", true, 0, 0, 0, 0, "")
+	chain := mustRenderChain(t, rule, hcEmissionUps)
+	proxy := findChainProxyHandler(t, chain)
+	if proxy == nil || proxy["mode"] != "wrr" {
+		t.Fatalf("脏行渲染分派失败: %v", proxy)
+	}
+	if _, ok := proxy["health_check"]; ok {
+		t.Fatalf("零值脏行不得发射空 health_check（模块缺省兜底）: %v", proxy)
+	}
+}
+
+// TestMixedPoolRender_uniformReverseProxyHCUnchanged uniform+wrr+HC=true：
+// reverse_proxy 原生 health_checks 照常发射、chain_proxy 零唤起——uniform
+// 主路径不发射/不触碰（R3 落地，反向钉死）。
+func TestMixedPoolRender_uniformReverseProxyHCUnchanged(t *testing.T) {
+	uniformUps := []UpstreamConfig{
+		{Host: "10.0.0.1", Port: 8001, Weight: 1, Protocol: "http", Enabled: true},
+		{Host: "10.0.0.2", Port: 8002, Weight: 1, Protocol: "http", Enabled: true},
+	}
+	rule := hcEmissionRule(t, "lb_mp_uniform_hc", "weighted_round_robin", true, 10, 2, 2, 3, "/hc")
+	chain := mustRenderChain(t, rule, uniformUps)
+	if proxy := findChainProxyHandler(t, chain); proxy != nil {
+		t.Fatalf("uniform+HC 不得唤起 chain 承载（uniform 路径零改动）: %v", chain)
+	}
+	raw, _ := json.Marshal(chain)
+	if !strings.Contains(string(raw), `"health_checks"`) {
+		t.Fatalf("uniform+HC 原生 health_checks 发射缺失:\n%s", raw)
+	}
+	if strings.Contains(string(raw), `"health_check"`) && !strings.Contains(string(raw), `"health_checks"`) {
+		t.Fatalf("uniform 路径不得发射 chain 侧 health_check 单数键:\n%s", raw)
+	}
+}
+
+// TestMixedPoolRender_uniformChainFallbackHCClosure uniform+chain_fallback+HC
+// （A9 收口）：既有「HC 静默忽略」死配置分叉就此关闭——chain_proxy 发射
+// health_check 真探测。
+func TestMixedPoolRender_uniformChainFallbackHCClosure(t *testing.T) {
+	uniformUps := []UpstreamConfig{
+		{Host: "10.0.0.1", Port: 8001, Weight: 1, Protocol: "http", Enabled: true},
+		{Host: "10.0.0.2", Port: 8002, Weight: 1, Protocol: "http", Enabled: true},
+	}
+	rule := hcEmissionRule(t, "lb_mp_uniform_chain_hc", "chain_fallback", true, 10, 2, 2, 3, "/hc")
+	chain := mustRenderChain(t, rule, uniformUps)
+	proxy := findChainProxyHandler(t, chain)
+	if proxy == nil {
+		t.Fatal("uniform+chain_fallback+HC 未发射 chain_proxy")
+	}
+	hc, ok := proxy["health_check"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("uniform+chain_fallback+HC 未发射 health_check（收口失败）: %v", proxy)
+	}
+	if hc["interval_ms"].(float64) != 10000 || hc["path"] != "/hc" {
+		t.Fatalf("收口发射值域不一致: %v", hc)
+	}
+}

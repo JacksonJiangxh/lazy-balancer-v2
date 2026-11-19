@@ -4966,6 +4966,35 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 	if mode == chainProxyModeWRR {
 		handler["mode"] = chainProxyModeWRR
 	}
+	// 主动健康检查发射（JJC-20261119-001 裁决 4）：EnableActiveHealthCheck 且
+	// 走 chain 分支时发射 health_check 对象——race/wrr 两模式同发射（模块内
+	// 同一 hcState）；uniform 走 reverse_proxy 的路径零改动（原生 HC 组装早退
+	// 于本分支，不在此触碰）。值域映射：interval/timeout 秒→毫秒；path 透传
+	// （空=模块缺省 /）；lag 阈值直传。0/空值不发射（模块侧按缺省 30s/5s/
+	// 2,3/"/"兜底）——存量脏行（直改 DB 的混布+HC 行）由此自动获得真探测，
+	// 不因非法零值整规则渲染失败（与 uniform healthCheckCore 硬报错分叉）。
+	// expect_status/body 无规则级字段，不发射（模块缺省 200-299、不查体）。
+	if rule.EnableActiveHealthCheck {
+		hc := map[string]interface{}{}
+		if rule.HealthCheckInterval > 0 {
+			hc["interval_ms"] = rule.HealthCheckInterval * 1000
+		}
+		if rule.HealthCheckTimeout > 0 {
+			hc["timeout_ms"] = rule.HealthCheckTimeout * 1000
+		}
+		if p := strings.TrimSpace(rule.HealthCheckPath); p != "" {
+			hc["path"] = p
+		}
+		if rule.HealthCheckHealthyThreshold > 0 {
+			hc["healthy_lag"] = rule.HealthCheckHealthyThreshold
+		}
+		if rule.HealthCheckUnhealthyThreshold > 0 {
+			hc["unhealthy_lag"] = rule.HealthCheckUnhealthyThreshold
+		}
+		if len(hc) > 0 {
+			handler["health_check"] = hc
+		}
+	}
 	timeouts := resolveProxyTimeouts(rule)
 	if timeouts.dial > 0 {
 		handler["dial_timeout_ms"] = timeouts.dial * 1000
