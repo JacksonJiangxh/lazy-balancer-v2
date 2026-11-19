@@ -1006,3 +1006,39 @@ func TestTunnel_HTTPSUpstreamWithFallback(t *testing.T) {
 		t.Fatalf("echo = %q", echo[:n])
 	}
 }
+
+// ===== S1 追加：HC 配置面 Validate 钉测（JJC-20261119-001）=====
+
+// TestValidate_HealthCheck HC 配置面校验：expect_status 单值/闭区间/缺省
+// 放行；min>max、非数字等非法形态拒绝；负值 interval/timeout/lag 拒绝。
+func TestValidate_HealthCheck(t *testing.T) {
+	base := []ChainUpstream{{Dial: "127.0.0.1:8000"}}
+	for _, tc := range []struct {
+		name string
+		hc   ChainHealthCheck
+		ok   bool
+	}{
+		{name: "nil", hc: ChainHealthCheck{}, ok: true}, // 缺省 expect_status=200-299
+		{name: "single", hc: ChainHealthCheck{ExpectStatus: "204"}, ok: true},
+		{name: "range", hc: ChainHealthCheck{ExpectStatus: "200-299"}, ok: true},
+		{name: "min>max", hc: ChainHealthCheck{ExpectStatus: "500-400"}, ok: false},
+		{name: "alpha", hc: ChainHealthCheck{ExpectStatus: "2xx"}, ok: false},
+		{name: "open-range", hc: ChainHealthCheck{ExpectStatus: "200-"}, ok: false},
+		{name: "neg-interval", hc: ChainHealthCheck{IntervalMS: -1}, ok: false},
+		{name: "neg-timeout", hc: ChainHealthCheck{TimeoutMS: -1}, ok: false},
+		{name: "neg-lag", hc: ChainHealthCheck{UnhealthyLag: -1}, ok: false},
+	} {
+		h := &ChainProxy{Upstreams: base}
+		if tc.name != "nil" {
+			hc := tc.hc
+			h.HealthCheck = &hc
+		}
+		err := h.Validate()
+		if tc.ok && err != nil {
+			t.Fatalf("case %s: unexpected error %v", tc.name, err)
+		}
+		if !tc.ok && err == nil {
+			t.Fatalf("case %s: must be rejected", tc.name)
+		}
+	}
+}
