@@ -19,34 +19,32 @@ import (
 //   Cleanup 停止、探测 Host-scheme 口径、expect_status 判定与解析、
 //   body 子串、探测慢上游不拖慢并发业务请求。
 
-// hcProbeServer 带探针路径的上游：/hc 按健康开关应答（探针命中计数），
-// 其余路径视为业务请求（业务命中计数）。
+// hcProbeServer 带探针路径的上游：/hc 按 probeRes 逐字应答（探针命中计数；
+// <=0 表示挂起，探测按超时判败），其余路径视为业务请求（业务命中计数）。
 type hcProbeServer struct {
-	ts      *httptest.Server
-	probes  atomic.Int64
-	bizHits atomic.Int64
-	healthy atomic.Bool
-	probeRes atomic.Int64 // /hc 应答状态码（<=0 表示挂起，探测按超时判败）
+	ts       *httptest.Server
+	probes   atomic.Int64
+	bizHits  atomic.Int64
+	probeRes atomic.Int64
 }
 
 func newHCProbeServer(t *testing.T) *hcProbeServer {
 	s := &hcProbeServer{}
-	s.healthy.Store(true)
 	s.probeRes.Store(http.StatusOK)
 	s.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/hc" {
 			s.probes.Add(1)
-			if res := int(s.probeRes.Load()); res <= 0 {
+			res := int(s.probeRes.Load())
+			if res <= 0 {
 				<-r.Context().Done() // 挂起
 				return
 			}
-			if !s.healthy.Load() {
-				w.WriteHeader(http.StatusBadGateway)
+			w.WriteHeader(res)
+			if res == http.StatusOK {
+				fmt.Fprint(w, "hc-ok")
+			} else {
 				fmt.Fprint(w, "down")
-				return
 			}
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "hc-ok")
 			return
 		}
 		s.bizHits.Add(1)
@@ -212,10 +210,10 @@ func TestHC_Recovery_HealthyLag(t *testing.T) {
 }
 
 // TestHC_Scheduler_IntervalCadence 调度间隔：探测按 interval 节奏触发
-//（窗口内命中数落在 interval 推导区间内）。
+// （窗口内命中数落在 interval 推导区间内）。
 func TestHC_Scheduler_IntervalCadence(t *testing.T) {
 	s := newHCProbeServer(t)
-	h := startHC(t, newWRRHandler([]ChainUpstream{newHCUpstream(s, "", 1)}, 50, 9000, 0), hcCfg(50))
+	startHC(t, newWRRHandler([]ChainUpstream{newHCUpstream(s, "", 1)}, 50, 9000, 0), hcCfg(50))
 	time.Sleep(220 * time.Millisecond)
 	n := s.probes.Load()
 	// 220ms / 50ms ≈ 4 轮；调度抖动放宽容差 [2, 7]。
@@ -254,7 +252,7 @@ func TestHC_WRR_SkipsUnhealthy_WeightsPreserve(t *testing.T) {
 }
 
 // TestHC_Race_ExcludesUnhealthy race 扇出剔除：unhealthy 车道不发射
-//（探测性请求为零），健康车道胜出。
+// （探测性请求为零），健康车道胜出。
 func TestHC_Race_ExcludesUnhealthy(t *testing.T) {
 	down := newHCProbeServer(t)
 	up := newHCProbeServer(t)
@@ -516,7 +514,7 @@ func TestHC_BodySubstring(t *testing.T) {
 }
 
 // TestHC_SlowProbe_DoesNotSlowBusiness 探测慢上游不拖慢并发业务请求
-//（探测连接承载缓释判据——方案裁决 1）。
+// （探测连接承载缓释判据——方案裁决 1）。
 func TestHC_SlowProbe_DoesNotSlowBusiness(t *testing.T) {
 	s := newHCProbeServer(t)
 	s.probeRes.Store(0) // /hc 挂起（客户端 150ms 超时判败）
