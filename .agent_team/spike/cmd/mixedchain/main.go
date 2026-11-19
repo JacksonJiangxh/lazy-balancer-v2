@@ -81,8 +81,8 @@ func main() {
 			"dead":    server(portDead, chainProxy("wrr", []lane{{deadAddr, "", "", 1}, {deadAddr, "", "", 1}}, 3000)),
 			"timeout": server(portTimeout, chainProxy("wrr", []lane{{hang1.addr, "", "", 1}, {hang2.addr, "", "", 1}}, 300)),
 			"tunnel":  server(portTunnel, chainProxy("wrr", []lane{{plain2.addr, "", "", 1}}, 3000)),
-		// race 模式隧道（S4-fix 必验：两模式都要真测；死车道→活车道切换）
-		"tunnelrace": server(portTunnelRace, chainProxy("", []lane{{deadAddr, "", "", 1}, {plain2.addr, "", "", 1}}, 3000)),
+			// race 模式隧道（S4-fix 必验：两模式都要真测；死车道→活车道切换）
+			"tunnelrace": server(portTunnelRace, chainProxy("", []lane{{deadAddr, "", "", 1}, {plain2.addr, "", "", 1}}, 3000)),
 		}}},
 	}
 	cfgPath := filepath.Join(base, "caddy.json")
@@ -159,8 +159,144 @@ func main() {
 	}
 	emit(map[string]any{"case": "upgrade-tunnel", "wrr": echoWRR, "race": echoRace})
 
-	emit(map[string]any{"case": "done", "caddy": strings.TrimSpace(string(versionOut)), "ports": []int{portWRR, portRace, portDead, portTimeout, portTunnel, portTunnelRace}})
+	// ---- 7. HC 真进程取证（JJC-20261119-001 S4 / T-7）：可控健康上游翻转 →
+	// wrr 观测摘除 → 恢复回池——全部为真上游命中计数与真探针记录（非断言
+	// 自证）；探针口径（Host=回源 Host 单源 / UA 标识 / TLS 跟车道）一并取证。----
+	hcA := startHCUpstream(true, cert)
+	defer hcA.server.Close()
+	hcB := startHCUpstream(false, cert)
+	defer hcB.server.Close()
+	portHC := freePort()
+	hc := chainProxy("wrr", []lane{{hcA.addr, "https", "hc-origin.spike.test", 1}, {hcB.addr, "", "", 1}}, 3000)
+	hc["health_check"] = map[string]any{
+		"interval_ms": 150, "timeout_ms": 500, "path": "/hc",
+		"unhealthy_lag": 1, "healthy_lag": 1,
+	}
+	cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["hc"] = server(portHC, hc)
+	// HC 配置为运行期注入：重写配置文件并热重载（真进程二阶段启动）。
+	cfgBody2, err := json.MarshalIndent(cfg, "", "  ")
+	must(err)
+	must(os.WriteFile(cfgPath, cfgBody2, 0o600))
+	// 重载方式：重启进程（重载即新实例，与生产重载窗口同语义）。
+	proc.Stop()
+	proc2, err := harness.Start("caddy", caddyBinAbs, []string{"run", "--config", cfgPath}, nil, base)
+	must(err)
+	defer proc2.Stop()
+	must(harness.WaitPort(context.Background(), fmt.Sprintf("127.0.0.1:%d", portHC), 20*time.Second))
+
+	hcClient := &http.Client{Timeout: 5 * time.Second}
+	hcURL := fmt.Sprintf("http://127.0.0.1:%d/", portHC)
+	// 初态基线：全 healthy（初始态裁决）——两车道都接业务流量。
+	time.Sleep(400 * time.Millisecond) // 等 ≥2 轮探针（150ms interval）
+	baseA, baseB := hcA.bizHits.Load(), hcB.bizHits.Load()
+	for i := 0; i < 6; i++ {
+		get(hcClient, hcURL)
+	}
+	midA, midB := hcA.bizHits.Load(), hcB.bizHits.Load()
+	if midA-baseA <= 0 || midB-baseB <= 0 {
+		fatalf("HC 初态基线失败：初值应全 healthy 两车道放行（A %d→%d B %d→%d）", baseA, midA, baseB, midB)
+	}
+	// 探针口径取证（真探针在 /hc 留下的记录）：
+	if hcA.probeHost.Load() != "hc-origin.spike.test" {
+		fatalf("探针 Host=%v, want hc-origin.spike.test（回源 Host 单源）", hcA.probeHost.Load())
+	}
+	if hcA.probeUA.Load() != "chain_proxy-health-check" {
+		fatalf("探针 UA=%v, want chain_proxy-health-check", hcA.probeUA.Load())
+	}
+	if !hcA.probeTLS.Load() {
+		fatalf("探针未走 TLS（https 车道 scheme 口径失败）")
+	}
+	if hcB.probeTLS.Load() {
+		fatalf("明文车道探针不应走 TLS")
+	}
+	// 翻转不健康 → 观测摘除。
+	hcA.healthy.Store(false)
+	time.Sleep(500 * time.Millisecond) // ≥2 轮探针（lag=1 首败即摘）
+	remA, remB := hcA.bizHits.Load(), hcB.bizHits.Load()
+	for i := 0; i < 8; i++ {
+		get(hcClient, hcURL)
+	}
+	afterA, afterB := hcA.bizHits.Load(), hcB.bizHits.Load()
+	if afterA != remA {
+		fatalf("wrr 未观测摘除：摘除后 A 车道业务命中 %d→%d（应冻结）", remA, afterA)
+	}
+	if afterB-remB < 8 {
+		fatalf("wrr 摘除后未全量落健康车道：B %d→%d（want +%d）", remB, afterB, 8)
+	}
+	// 恢复 → 观测回池。
+	hcA.healthy.Store(true)
+	time.Sleep(500 * time.Millisecond)
+	recA, recB := hcA.bizHits.Load(), hcB.bizHits.Load()
+	for i := 0; i < 8; i++ {
+		get(hcClient, hcURL)
+	}
+	endA, endB := hcA.bizHits.Load(), hcB.bizHits.Load()
+	if endA-recA <= 0 {
+		fatalf("恢复未观测回池：A 车道业务命中 %d→%d（应增长）", recA, endA)
+	}
+	if endB-recB <= 0 {
+		fatalf("恢复后 B 车道停服异常: %d→%d", recB, endB)
+	}
+	emit(map[string]any{"case": "health-check-flip",
+		"probe": map[string]any{"host": hcA.probeHost.Load(), "ua": hcA.probeUA.Load(),
+			"tls_lane": hcA.probeTLS.Load(), "plain_lane_tls": hcB.probeTLS.Load(),
+			"path": "/hc", "interval_ms": 150, "unhealthy_lag": 1, "healthy_lag": 1},
+		"baseline_all_healthy": map[string]any{"a": baseA, "b": baseB, "a_delta": midA - baseA, "b_delta": midB - baseB},
+		"removed":              map[string]any{"a_frozen": remA, "b": remB, "a_delta": afterA - remA, "b_delta": afterB - remB},
+		"recovered":            map[string]any{"a": recA, "b": recB, "a_delta": endA - recA, "b_delta": endB - recB}})
+
+	emit(map[string]any{"case": "done", "caddy": strings.TrimSpace(string(versionOut)), "ports": []int{portWRR, portRace, portDead, portTimeout, portTunnel, portTunnelRace, portHC}})
 	logf("全部断言通过")
+}
+
+// hcUpstream 可控健康上游：/hc 探针路径按 healthy 开关应答（探针命中计数 +
+// Host/UA/TLS 记录），其余路径业务应答（业务命中计数）。
+type hcUpstream struct {
+	server    *http.Server
+	addr      string
+	healthy   atomic.Bool
+	probes    atomic.Int64
+	bizHits   atomic.Int64
+	probeHost atomic.Value
+	probeUA   atomic.Value
+	probeTLS  atomic.Bool
+}
+
+func startHCUpstream(secure bool, cert tls.Certificate) *hcUpstream {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	must(err)
+	if secure {
+		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+	}
+	up := &hcUpstream{}
+	up.healthy.Store(true)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hc" {
+			up.probes.Add(1)
+			up.probeHost.Store(r.Host)
+			up.probeUA.Store(r.Header.Get("User-Agent"))
+			up.probeTLS.Store(r.TLS != nil)
+			if !up.healthy.Load() {
+				w.WriteHeader(http.StatusBadGateway)
+				fmt.Fprint(w, "hc-down")
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "hc-ok")
+			return
+		}
+		up.bizHits.Add(1)
+		marker := "PLAIN"
+		if r.TLS != nil {
+			marker = "TLS"
+		}
+		fmt.Fprintf(w, "%s|%s", marker, r.Host)
+	})
+	srv := &http.Server{Handler: handler}
+	go func() { _ = srv.Serve(ln) }()
+	up.server = srv
+	up.addr = ln.Addr().String()
+	return up
 }
 
 type lane struct {
