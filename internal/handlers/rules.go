@@ -4658,12 +4658,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		return
 	}
 
-	// 复制链继承伴随门（JJC-20261118-002 裁决 2）：混布+主动健康检查的死配置
-	// 不得经复制放大（与保存族/存量启用门同款文案）。
-	if err := mixedPoolHealthCheckError(rule.Protocol, rule.EnableActiveHealthCheck, rule.Upstreams); err != nil {
-		fail(http.StatusBadRequest, "源规则配置不合法："+err.Error())
-		return
-	}
+	// 混布+HC 伴随门移除（JJC-20261119-001 裁决 4）：chain 模块 HC 子系统落地
+	// 后混布+HC 是活配置，复制链不再拦截。
 
 	// INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
 	// LbRuleInsertArgs）——复制排除 id（AUTOINCREMENT 分配新主键），审计四列

@@ -1046,12 +1046,8 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		if err != nil {
 			return err
 		}
-		// 伴随门（JJC-20261118-002 裁决 2）：混布池 + 主动健康检查 → 400。
-		// chain 模块两模式均无健康检查子系统，放行即「保存放行+运行必坏」
-		// 死配置（health_checks 静默缺席）——响亮拒绝优于静默忽略。
-		if err := mixedPoolHealthCheckError(data.Protocol, data.EnableActiveHealthCheck, data.Upstreams); err != nil {
-			return err
-		}
+		// 混布+HC 伴随门移除（JJC-20261119-001 裁决 4）：chain 模块 HC 子系统
+		// 落地后混布+HC 是活配置（渲染发射 health_check），保存链不再 400。
 
 		if data.DynamicDNS && enabledUpstreamCount > 1 {
 			return fmt.Errorf("动态 DNS 模式仅支持一个启用的上游（DNS 会解析出多个 IP）")

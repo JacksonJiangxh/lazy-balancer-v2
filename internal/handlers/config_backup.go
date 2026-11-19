@@ -2737,6 +2737,10 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		// 健康检查路径与保存侧同口径：仅在主动健康检查启用时有渲染消费，
 		// 未启用属死字段——存量死组合（enable=0 + path 无前导 /）不得让整包
 		// 导入被无关校验拒绝。不改写备份数据（导入是存量行还原）。
+		// 混布+HC 伴随门撤销（JJC-20261119-001 裁决 4）：v2 经
+		// validateRuleFeatures 过门（双态：启用/禁用行同链），该链上的混布+HC
+		// 400 已随伴随门整体移除——chain 模块 HC 子系统落地后混布+HC 是活配置，
+		// 携带 HC 标志的混布存量行导入放行（渲染发射 health_check 真探测）。
 		if backupBooleanEnabled(rule["enable_active_health_check"]) {
 			if err := validateRuleHealthCheckPath(backupString(rule["health_check_path"])); err != nil {
 				return fmt.Errorf("规则 #%d：%w", index+1, err)

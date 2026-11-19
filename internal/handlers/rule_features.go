@@ -1738,38 +1738,11 @@ func enabledUpstreamPoolMixed(upstreams []models.Upstream) bool {
 	return protos["http"] && protos["https"]
 }
 
-// ruleHasAnyMixedPool 主池或任一路径池混布判定（聚合 warn ② 口径）。
-func ruleHasAnyMixedPool(rule models.LbRule) bool {
-	if enabledUpstreamPoolMixed(rule.Upstreams) {
-		return true
-	}
-	for _, pr := range rule.PathRules {
-		protos := map[string]bool{}
-		for _, u := range pr.Upstreams {
-			proto := u.Protocol
-			if proto == "" {
-				proto = "http"
-			}
-			protos[proto] = true
-		}
-		if protos["http"] && protos["https"] {
-			return true
-		}
-	}
-	return false
-}
-
-// mixedPoolHealthCheckError 伴随门（JJC-20261118-002 裁决 2）：混布池 +
-// enable_active_health_check=1 → 400。chain 模块两模式均无健康检查子系统，
-// 放行即「保存放行+运行必坏」死配置（health_checks 静默缺席，v2.3.4 族教训
-// 的精确复刻）——响亮拒绝优于静默忽略。边界：只拦混布池新增可达的死配置，
-// uniform 池（含 uniform+chain_fallback）的既有静默忽略行为零改动。
-func mixedPoolHealthCheckError(protocol string, healthCheck bool, upstreams []models.Upstream) error {
-	if protocol != "http" || !healthCheck || !enabledUpstreamPoolMixed(upstreams) {
-		return nil
-	}
-	return fmt.Errorf("混布池经 chain 模块承载暂不支持主动健康检查，如需健康检查请统一上游协议（uniform 池走原生 reverse_proxy 全量健康检查）或拆分规则")
-}
+// mixedPoolHealthCheckError 伴随门已于 JJC-20261119-001 裁决 4 整体移除：
+// chain 模块已落地主动健康检查子系统（caddychain/health.go），混布+HC 不再
+// 是死配置（渲染发射 health_check 键，存量脏行自动获得真探测）——伴随门
+// 「响亮拒绝」的立论失效，撤销（uniform+chain_fallback+HC 的既有静默忽略
+// 分叉就此收口为真探测）。
 
 // mixedUpstreamPoolError：HTTP 规则启用上游池混布
 // （保存门 handlers.go:615 同款文案/口径）——主池按启用上游统计（IIF 归一，
@@ -1866,11 +1839,8 @@ func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool)
 		if err := mixedUpstreamPoolError(rule); err != nil {
 			return &configValidationError{message: err.Error()}
 		}
-		// 伴随门（JJC-20261118-002 裁决 2）：存量启用门的混布+HC 死配置
-		// 同样响亮拒绝（直改 DB 行启用前拦截，复制链经同 helper 继承）。
-		if err := mixedPoolHealthCheckError(rule.Protocol, rule.EnableActiveHealthCheck, rule.Upstreams); err != nil {
-			return &configValidationError{message: err.Error()}
-		}
+		// 混布+HC 伴随门移除（JJC-20261119-001 裁决 4）：chain 模块 HC 子系统
+		// 落地后混布+HC 是活配置，存量启用门不再拦截。
 	}
 	return nil
 }
@@ -2090,20 +2060,16 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 	}
 	// 存量启用行启用上游池混布点名告警（镜像 portTLSMix 形态，不阻断启动——
 	// 阻断会让节点起不来；新写入方向已被 validateStoredRuleConfig 400 拦截，
-	// 此门兜「直改 DB 或更早版本落库」的存量）。聚合 warn 三口径
-	// （JJC-20261118-002 裁决 2）：①混布+不允许策略 → 协议承载 warn（渲染
-	// 已兜底切 wrr）；②混布+允许策略+HC 标志 → 点名 HC 在 chain 承载下无效
-	// warn；③其余静默。
+	// 此门兜「直改 DB 或更早版本落库」的存量）。聚合 warn 两口径
+	// （JJC-20261119-001 裁决 4 撤销原口径②）：①混布+不允许策略 → 协议承载
+	// warn（渲染已兜底切 wrr）；②其余静默（混布+允许策略+HC 标志已由 chain
+	// 模块 HC 子系统真承载，不再点名「HC 无效」）。
 	for _, rule := range rules {
 		if !rule.Enabled || rule.Protocol != "http" {
 			continue
 		}
 		if err := mixedUpstreamPoolError(rule); err != nil {
 			services.Logf("warn", "规则 %s（%s）%s——渲染已兜底按 chain 模块 wrr 承载，建议改用允许策略（weighted_round_robin / chain_fallback）或统一上游协议/拆分规则", rule.Name, rule.CaddyID, err.Error())
-			continue
-		}
-		if rule.EnableActiveHealthCheck && ruleHasAnyMixedPool(rule) {
-			services.Logf("warn", "规则 %s（%s）主动健康检查标志在混布池 chain 承载下无效（无健康检查子系统），如需健康检查请统一上游协议（uniform 池走原生 reverse_proxy 全量健康检查）或拆分规则", rule.Name, rule.CaddyID)
 		}
 	}
 	return errors.Join(problems...)
