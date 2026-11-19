@@ -160,10 +160,13 @@ type laneResult struct {
 	timedOut bool
 }
 
-// serveRace 竞速编排主循环（多上游、请求体已物化的路径）。
+// serveRace 竞速编排主循环（多上游、请求体已物化的路径）。hcEligible 在
+// HC 启用时剔除 unhealthy 车道（全灭不专判回退全车道）；未启用 HC 时
+// order 为全序，行为零变化。
 func (h *ChainProxy) serveRace(w http.ResponseWriter, r *http.Request, body []byte) error {
 	ctx := r.Context()
-	n := len(h.Upstreams)
+	order := h.hcEligible()
+	n := len(order)
 	results := make(chan laneResult, n)
 	cancels := make([]context.CancelFunc, n)
 	bodyReader := func() io.Reader {
@@ -173,13 +176,13 @@ func (h *ChainProxy) serveRace(w http.ResponseWriter, r *http.Request, body []by
 		return bytes.NewReader(body)
 	}
 	bodyLen := int64(len(body))
-	launch := func(idx int) {
+	launch := func(pos int) {
 		laneCtx, cancel := context.WithCancel(ctx)
-		cancels[idx] = cancel
-		up := h.Upstreams[idx]
+		cancels[pos] = cancel
+		up := h.Upstreams[order[pos]]
 		go func() {
-			resp, timedOut, err := h.roundTrip(laneCtx, cancel, idx, r, up, bodyReader(), bodyLen)
-			results <- laneResult{idx: idx, resp: resp, err: err, timedOut: timedOut}
+			resp, timedOut, err := h.roundTrip(laneCtx, cancel, pos, r, up, bodyReader(), bodyLen)
+			results <- laneResult{idx: pos, resp: resp, err: err, timedOut: timedOut}
 		}()
 	}
 
@@ -355,17 +358,23 @@ func (h *ChainProxy) wrrNext() int {
 	if len(st.cw) != n {
 		st.cw = make([]int, n)
 	}
-	total, best := 0, 0
-	for i, up := range h.Upstreams {
+	// HC 联动：unhealthy 车道权重视为缺席（全灭不专判时 hcEligible 返回全部）。
+	eligible := h.hcEligible()
+	total, best := 0, -1
+	for _, i := range eligible {
+		up := h.Upstreams[i]
 		w := up.Weight
 		if w <= 0 {
 			w = 1
 		}
 		st.cw[i] += w
 		total += w
-		if st.cw[i] > st.cw[best] {
+		if best == -1 || st.cw[i] > st.cw[best] {
 			best = i
 		}
+	}
+	if best == -1 { // 理论不可达（hcEligible 恒非空），兜底走车道 0
+		best = 0
 	}
 	st.cw[best] -= total
 	return best
@@ -379,8 +388,14 @@ func (h *ChainProxy) serveWRR(w http.ResponseWriter, r *http.Request, body []byt
 	n := len(h.Upstreams)
 	start := h.wrrNext()
 	timeouts := 0
+	attempts := 0
 	for k := 0; k < n; k++ {
 		idx := (start + k) % n
+		// HC 联动：unhealthy 车道跳过（全灭不专判时 hcEligible 全量放行）。
+		if !h.laneEligible(idx) {
+			continue
+		}
+		attempts++
 		up := h.Upstreams[idx]
 		laneCtx, cancel := context.WithCancel(r.Context())
 		var bodyReader io.Reader
@@ -398,7 +413,7 @@ func (h *ChainProxy) serveWRR(w http.ResponseWriter, r *http.Request, body []byt
 	}
 	status := http.StatusBadGateway
 	msg := "chain_proxy: all upstreams failed"
-	if timeouts > 0 && timeouts == n {
+	if timeouts > 0 && timeouts == attempts && attempts > 0 {
 		status = http.StatusGatewayTimeout
 		msg = "chain_proxy: all upstreams timed out"
 	}
