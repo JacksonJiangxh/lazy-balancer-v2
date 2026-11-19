@@ -19,9 +19,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 五态门禁矩阵（JJC-20261118-002 裁决 2，主池）：混布+允许策略=放行 /
+// 五态门禁矩阵（JJC-20261119-001 裁决 4 更新，主池）：混布+允许策略=放行 /
 // 混布+其他策略=400（文案点名允许策略）/ uniform+任何策略=现状 /
-// 混布+主动健康检查=400（伴随门）/ 混布+空 strategy=放行。
+// 混布+主动健康检查=放行（HC 经 chain 模块承载，伴随门已移除）/
+// 混布+空 strategy=放行。
 func TestRulePayload_rejectsMixedHttpHttpsUpstreamPool(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -41,7 +42,7 @@ func TestRulePayload_rejectsMixedHttpHttpsUpstreamPool(t *testing.T) {
 		{"混布+空 strategy 放行", ``, false, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8443,"protocol":"https","enabled":true}]`, http.StatusCreated, ""},
 		{"混布+least_conn 拒绝", `least_conn`, false, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8443,"protocol":"https","enabled":true}]`, http.StatusBadRequest, "weighted_round_robin"},
 		{"混布+ip_hash 拒绝", `ip_hash`, false, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8443,"protocol":"https","enabled":true}]`, http.StatusBadRequest, "chain_fallback"},
-		{"混布+主动健康检查 400（伴随门）", `weighted_round_robin`, true, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8443,"protocol":"https","enabled":true}]`, http.StatusBadRequest, "健康检查"},
+		{"混布+主动健康检查 放行（HC 经 chain 承载，伴随门移除）", `weighted_round_robin`, true, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8443,"protocol":"https","enabled":true}]`, http.StatusCreated, ""},
 		{"uniform+cookie 现状放行", `cookie`, false, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8081,"protocol":"http","enabled":true}]`, http.StatusCreated, ""},
 		{"纯 http 池放行（回归）", `weighted_round_robin`, false, `[{"host":"10.0.0.1","port":8080,"protocol":"http","enabled":true},{"host":"10.0.0.2","port":8081,"protocol":"http","enabled":true}]`, http.StatusCreated, ""},
 		{"纯 https 池放行（回归）", `weighted_round_robin`, false, `[{"host":"10.0.0.1","port":8443,"protocol":"https","enabled":true},{"host":"10.0.0.2","port":8444,"protocol":"https","enabled":true}]`, http.StatusCreated, ""},
@@ -88,6 +89,19 @@ func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	}
 	if err := validateBackupRuleReferences(allow); err != nil {
 		t.Fatalf("混布+允许策略的 v2 备份须放行，got %v", err)
+	}
+
+	// v2 双态 + HC 标志（JJC-20261119-001 裁决 4）：混布+允许策略+HC=1 的存量
+	// 行导入放行（HC 经 chain 承载，伴随门移除后 v2 链不再拒绝）。
+	allowHC := map[string][]map[string]any{
+		"lb_rules": {{"caddy_id": "lb_mixbak_hc", "protocol": "http", "strategy": "weighted_round_robin", "enable_active_health_check": int64(1), "health_check_interval": int64(10), "health_check_timeout": int64(2), "health_check_unhealthy_threshold": int64(3), "health_check_healthy_threshold": int64(2), "health_check_path": "/"}},
+		"upstreams": {
+			{"rule_id": "lb_mixbak_hc", "host": "10.0.0.1", "port": 8080, "weight": 1, "protocol": "http", "enabled": true},
+			{"rule_id": "lb_mixbak_hc", "host": "10.0.0.2", "port": 8443, "weight": 1, "protocol": "https", "enabled": true},
+		},
+	}
+	if err := validateBackupRuleReferences(allowHC); err != nil {
+		t.Fatalf("混布+允许策略+HC 的 v2 备份须放行（伴随门移除），got %v", err)
 	}
 }
 
@@ -264,10 +278,11 @@ func TestDuplicateRule_allowsMixedPoolWithAllowedStrategy(t *testing.T) {
 	}
 }
 
-// 聚合 warn 三口径：①混布+不允许策略 → 协议承载 warn（保留，文案更新）；
-// ②混布+允许策略+HC 标志 → 点名 HC 无效 warn；③混布+允许策略无 HC → 静默。
-func TestValidateEnabledStoredRuleConfigs_warnCaliberThreeWays(t *testing.T) {
-	// 口径③（静默）先行：不得有 warn。
+// 聚合 warn 两口径（JJC-20261119-001 裁决 4，三口径退两口径）：
+// ①混布+不允许策略 → 协议承载 warn（保留）；②其余静默——混布+允许策略
+// 携带 HC 标志不再点名「HC 无效」（chain 模块 HC 子系统已真承载）。
+func TestValidateEnabledStoredRuleConfigs_warnCaliberTwoWays(t *testing.T) {
+	// 口径②（静默，含 HC 标志形态）先行：不得有 warn。
 	newAuditRuleHandlers(t, 0)
 	seedMixedStoredRuleStrategy(t, "lb_mix_silent", true, "weighted_round_robin")
 
@@ -280,29 +295,29 @@ func TestValidateEnabledStoredRuleConfigs_warnCaliberThreeWays(t *testing.T) {
 		t.Fatalf("允许策略混布行不得阻断: %v", err)
 	}
 	if strings.Contains(logs.String(), "lb_mix_silent") {
-		t.Fatalf("口径③：混布+允许策略+无 HC 应静默，got %q", logs.String())
+		t.Fatalf("口径②：混布+允许策略+无 HC 应静默，got %q", logs.String())
 	}
 
-	// 口径②（HC 无效点名）：清日志重新聚合。
-	logs.Reset()
+	// HC 标志形态（原口径②撤销）：携带 HC 的混布+允许策略行同样静默——
+	// HC 在 chain 承载下有效（渲染发射 health_check），「HC 无效」warn 撤销。
 	if _, err := db.DB.Exec(`UPDATE lb_rules SET enable_active_health_check=1, health_check_interval=10, health_check_timeout=2, health_check_unhealthy_threshold=3, health_check_healthy_threshold=2 WHERE caddy_id='lb_mix_silent'`); err != nil {
 		t.Fatalf("enable HC flag: %v", err)
 	}
+	logs.Reset()
 	if err := validateEnabledStoredRuleConfigs(context.Background()); err != nil {
-		t.Fatalf("HC 标志 warn 不阻断: %v", err)
+		t.Fatalf("HC 标志行不得阻断: %v", err)
 	}
-	out := logs.String()
-	if !strings.Contains(out, "lb_mix_silent") || !strings.Contains(out, "健康检查") {
-		t.Fatalf("口径②：应点名 HC 在 chain 承载下无效: %q", out)
+	if strings.Contains(logs.String(), "lb_mix_silent") || strings.Contains(logs.String(), "健康检查") {
+		t.Fatalf("原口径②已撤销：混布+允许策略+HC 标志应静默（chain 承载 HC 有效）, got %q", logs.String())
 	}
 
-	// 口径①（不允许策略协议承载 warn）。
+	// 口径①（不允许策略协议承载 warn，保留）。
 	logs.Reset()
 	seedMixedStoredRuleStrategyPort(t, "lb_mix_cal1", true, "least_conn", 19412)
 	if err := validateEnabledStoredRuleConfigs(context.Background()); err != nil {
 		t.Fatalf("不允许策略混布 warn 不阻断: %v", err)
 	}
-	out = logs.String()
+	out := logs.String()
 	if !strings.Contains(out, "lb_mix_cal1") || !strings.Contains(out, "混布") {
 		t.Fatalf("口径①：应保留协议承载点名 warn: %q", out)
 	}
@@ -337,9 +352,10 @@ func TestRulePayload_NTLMMixedPoolMutuallyExclusive(t *testing.T) {
 	}
 }
 
-// 伴随门存量面：混布+允许策略+HC=1 的存量行经 EnableRule 400（响亮拒绝，
-// 直改 DB 行不得绕过）。uniform 池不受影响（边界回归）。
-func TestEnableRule_rejectsMixedPoolWithHealthCheck(t *testing.T) {
+// 伴随门存量面放行（JJC-20261119-001 裁决 4）：混布+允许策略+HC=1 的存量行
+// 经 EnableRule 放行（HC 经 chain 承载，原 400 伴随门移除）并进入启用态。
+// uniform 池不受影响（边界回归）。
+func TestEnableRule_allowsMixedPoolWithHealthCheck(t *testing.T) {
 	handler, _, _ := newAuditRuleHandlers(t, 0)
 	seedMixedStoredRuleStrategy(t, "lb_mix_hc", false, "weighted_round_robin")
 	if _, err := db.DB.Exec(`UPDATE lb_rules SET enable_active_health_check=1, health_check_interval=10, health_check_timeout=2, health_check_unhealthy_threshold=3, health_check_healthy_threshold=2 WHERE caddy_id='lb_mix_hc'`); err != nil {
@@ -352,7 +368,14 @@ func TestEnableRule_rejectsMixedPoolWithHealthCheck(t *testing.T) {
 
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/rules/lb_mix_hc/enable", nil))
 
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "健康检查") {
-		t.Fatalf("混布+HC 存量启用必须 400 点名健康检查, got %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("混布+HC 存量启用应放行（HC 经 chain 承载）, got %d %s", rec.Code, rec.Body.String())
+	}
+	var enabled bool
+	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_mix_hc'").Scan(&enabled); err != nil {
+		t.Fatalf("read enabled state: %v", err)
+	}
+	if !enabled {
+		t.Fatal("放行规则应进入启用态")
 	}
 }
