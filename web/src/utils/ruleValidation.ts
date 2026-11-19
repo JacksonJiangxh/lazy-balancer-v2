@@ -154,22 +154,11 @@ export const mixedPoolPathGateMessage = (path: string): string =>
   `路径规则 ${path} 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）`
 
 /**
- * 主动健康检查伴随门镜像（JJC-20261118-002 裁决 2，后端
- * mixedPoolHealthCheckError 同款文案）：混布池 + enable_active_health_check
- * → 前端预拦（后端 400 为权威门，此处仅提前反馈免保存往返）。
+ * 主动健康检查伴随门镜像已于 JJC-20261119-001 裁决 4 移除（后端
+ * mixedPoolHealthCheckError 同步整体移除）：chain 模块 HC 子系统落地后
+ * 混布池 + enable_active_health_check 是活配置（渲染发射 health_check），
+ * 前端预拦随之撤销——混布+HC 直接放行交后端保存。
  */
-export const mixedPoolHealthCheckGateError = (
-  protocol: string,
-  healthCheck: boolean,
-  upstreams: readonly { protocol?: string; enabled?: boolean }[],
-): string | null => {
-  if (protocol !== 'http' || !healthCheck) return null
-  const protos = new Set(upstreams.filter((upstream) => upstream.enabled !== false).map((upstream) => upstream.protocol || 'http'))
-  if (protos.has('http') && protos.has('https')) {
-    return '混布池经 chain 模块承载暂不支持主动健康检查，如需健康检查请统一上游协议（uniform 池走原生 reverse_proxy 全量健康检查）或拆分规则'
-  }
-  return null
-}
 
 export const validatePathRules = (rules: readonly PathRuleInput[], strategy = ''): string | null => {
   const seen = new Map<string, number>()
