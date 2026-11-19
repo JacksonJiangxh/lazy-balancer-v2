@@ -294,9 +294,18 @@ JJC-20261118-002 混布池分支，mode 由 `chainProxyModeFor` 单源推导）�
 - **404 分叉**：race 全挂/单车道直通上游 404 → 干净 404（对象存储防护，不透传
   后端报文）；wrr（含 `serveWRRDirect` 直通路径）404 **透传**（与原生对齐）——
   两模式各自钉测，禁互相复用 404 分支；
-- **健康检查分叉**：chain 两模式均不发射 `health_checks`（无健康检查子系统）；
-  混布池+主动健康检查在写侧 400（`mixedPoolHealthCheckError` 伴随门）；uniform
-  池+chain_fallback+HC 标志的既有静默忽略行为保留零改动（已知分叉，另立项）；
+- **健康检查（2026-11-19 JJC-20261119-001 更新）**：chain 模块已落地主动健康检查
+  子系统（`caddychain/health.go` `healthMonitor`）。**发射条件**：`EnableActiveHealthCheck`
+  且走 chain 分支（`buildChainProxyConfig`）时发射 `health_check` 键——race/wrr 同发射
+  （值域一致：interval/timeout 秒→毫秒、path 透传、lag 直传；expect_status/body 无
+  规则级字段不发射）；**0/空值不发射**（存量脏行模块按缺省 30s/5s/2,3/"/" 兜底）；
+  uniform 走 reverse_proxy 的路径零改动（原生 `health_checks` 组装不触碰）。原
+  `mixedPoolHealthCheckError` 伴随门（混布+HC=400）**整体移除**（保存链/存量启用门/
+  复制链/v2 导入链四处调用同步移除；warn 三口径退两口径）；uniform+chain_fallback+HC
+  的既有「静默忽略」死配置分叉就此**收口为真探测**。**初始态**：全 healthy（先放行
+  后探测收敛，重载即新实例不持久化）；**全灭不专判**：全部车道 unhealthy 时真实请求
+  照常放行到全部车道（防探测器误判全站 502），502/504 收尾语义不变；**差异口径**：
+  仅主动探测，被动 5xx 摘除不做（uniform 原生 HC 有被动——差异如实钉死，另立项）。
 - **HTTP/1.1 恒定**：`caddychain` transport 恒 `ForceAttemptHTTP2=false`——
   `upstream_force_http1` 在链式/混布车道下无附加效果（语义已满足），不加门；
 - **dns_server 不消费**：chain 模式车道走系统解析器（混布池×DynamicDNS 结构互斥，

@@ -39,16 +39,19 @@
 |---|---|
 | 混布池 + `weighted_round_robin` / `chain_fallback` / 空 strategy | **放行**（渲染期整池切 chain 模块 `mode=wrr`/`race` 逐上游独立回源通道承载） |
 | 混布池 + 其余策略（least_conn/ip_hash/cookie/first/random） | **400**（文案点名允许策略） |
-| 混布池 + 主动健康检查 `enable_active_health_check=1` | **400**（chain 无健康检查子系统，放行即「保存放行+运行必坏」死配置——响亮拒绝优于静默忽略） |
+| 混布池 + 主动健康检查 `enable_active_health_check=1` | **放行**（2026-11-19 JJC-20261119-001 起经 chain 模块 HC 子系统真承载——渲染发射 `health_check` 键；原 400 伴随门随 HC 落地整体移除；仅主动探测，被动 5xx 摘除另立项） |
 | uniform 池（协议一致）+ 任何策略 | 现状不变（wrr 走原生 reverse_proxy；chain_fallback 维持 chain_proxy race） |
+| uniform 池 + `chain_fallback` + HC 标志 | **放行获真探测**（2026-11-19 收口：原「静默忽略」死配置分叉关闭，chain_proxy 发射 `health_check`） |
 
 **历史教训钉死**：混布池在 Caddy `reverse_proxy` 下因池级 TLS 传输使 http 上游
 静默 502（v2.11 引擎实测行为，`rule_mixed_protocol_test.go` 文件头注释）——v2.3.4
 前后「保存放行+运行必坏」族教训的精确复刻面。因此渲染触发器=**池混布（不分策略）**：
 直改 DB/远古落库的「混布+不允许策略」启用行渲染兜底整池切 chain 承载，绝不落
-reverse_proxy；存量行聚合校验按三口径 warn（不允许策略 warn / 允许策略+HC 标志
-点名 HC 无效 warn / 其余静默）。模式语义分权与分叉清单见
-`docs/fork-notes/render-chain.md` §22；真进程取证 `.agent_team/spike/evidence/T6.md`。
+reverse_proxy；存量行聚合校验按**两口径** warn（JJC-20261119-001 起三口径退两口径：
+不允许策略 warn / 其余静默——混布+HC 已由 chain HC 子系统真承载，原「HC 无效」
+点名口径撤销）。模式语义分权与分叉清单见
+`docs/fork-notes/render-chain.md` §22；真进程取证 `.agent_team/spike/evidence/T6.md`
+（race/wrr 真流量）与 `evidence/T7.md`（HC 翻转→摘除→恢复真观测）。
 
 ```
 HTTP规则A(port=80) + HTTP规则B(port=80) → 允许（同协议）

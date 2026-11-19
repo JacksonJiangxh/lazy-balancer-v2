@@ -14,11 +14,13 @@ import (
 )
 
 // serveTunnel 升级请求（websocket 等）的隧道直通路径：不竞速，按链序建连
-// 并转发握手，101 后双向拼接字节流；dial 失败换下一上游。
+// 并转发握手，101 后双向拼接字节流；dial 失败换下一上游。HC 联动：unhealthy
+// 车道按链序剔除（全灭不专判时 hcEligible 返回全部）。
 func (h *ChainProxy) serveTunnel(w http.ResponseWriter, r *http.Request) error {
 	dialTimeout := time.Duration(h.DialTimeoutMS) * time.Millisecond
 	ctx := r.Context()
-	for idx, up := range h.Upstreams {
+	for _, idx := range h.hcEligible() {
+		up := h.Upstreams[idx]
 		conn, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", up.Dial)
 		if err != nil {
 			h.log().Debug("chain_proxy: 隧道建连失败",

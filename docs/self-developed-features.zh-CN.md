@@ -8,7 +8,7 @@
 > 登记原则：**一能力一条**，写清「能力名 / 代码位置 / 设计裁定出处 / 防复发约束 /
 > 机械可核符号」。符号必须能 grep 到，供后续派活直接引用。
 >
-> 最近更新：2026-11-15 · JJC-20261115-002（第 5 项补「内部终结口绑定地址可配」`PASSTHROUGH_INTERNAL_BIND`）
+> 最近更新：2026-11-19 · JJC-20261119-001（第 1 项扩展「混布池主动健康检查」——HC 子系统/伴随门移除/仅主动探测差异钉死）
 >
 > **注释外置后的查找方式**：代码里我方补丁处只留「一句话结论 + `详见 docs/fork-notes/xxx.md §N`」，
 > 长解释（设计理由、反例、取舍）**逐字**保存在 `docs/fork-notes/`（索引见其 `README.md`）。
@@ -40,7 +40,7 @@
 
 | # | 能力 | 关键符号（grep 可核） | 裁定出处 |
 |---|---|---|---|
-| 1 | **链式回退**（`chain_fallback`） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `chainProxyModeFor` · `caddychain/` | 2026-10-09 / 2026-11-18 |
+| 1 | **链式回退**（`chain_fallback`）+ 混布池 wrr 承载 + 混布池主动健康检查（2026-11-19 扩展） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `chainProxyModeFor` · `caddychain/` · `healthMonitor` · `hcEligible` · `health_check` | 2026-10-09 / 2026-11-18 / 2026-11-19 |
 | 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
 | 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` · `healthcheckPanelPort` | — / 2026-11-15 |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
@@ -57,7 +57,7 @@
 
 ---
 
-## 第 1 项 · 链式回退（`chain_fallback`）+ 混布池 wrr 承载（2026-11-18 扩展）
+## 第 1 项 · 链式回退（`chain_fallback`）+ 混布池 wrr 承载 + 混布池主动健康检查（2026-11-19 扩展）
 
 - **能力名**：链式回退负载策略——上游按权重降序组成回退链，竞速 + 兜底截断 + 失败即切。
   **2026-11-18 扩展（JJC-20261118-002）**：HTTP 规则启用上游池支持 http/https 混布，
@@ -66,26 +66,51 @@
   其余策略（含空串归一 `weighted_round_robin`）→`wrr`（**确定性平滑加权轮询**，逐请求
   精确按权重比例交错选路——与原生 reverse_proxy 随机加权选路长程分布一致、短程形态
   不同，禁等价宣称）。
+  **2026-11-19 扩展（JJC-20261119-001，方案 v1.2 门下轮 2 准奏冻结）**：chain 模块
+  **主动健康检查（HC）子系统**落地（`caddychain/health.go`）——逐车道探测器（GET，
+  复用 `transportFor` 与数据面同池同源）+ 逐车道状态机（初值全 healthy，lag 阈值翻转）
+  + 调度 goroutine；选路联动：wrr 跳过 unhealthy（权重视为缺席，恢复无缝回池）、race
+  扇出剔除、升级隧道同口径、**全灭不专判**（全部不健康时真实请求照常放行，502/504
+  收尾语义不变）；混布+HC 写侧 400 伴随门**整体移除**（原「响亮拒绝」立论失效——
+  chain 已真承载 HC），uniform+chain_fallback+HC 的既有「静默忽略」死配置分叉就此
+  收口为真探测。**差异口径如实钉死：chain HC 仅主动探测，被动 5xx 摘除本期不做
+  （另立项）**——uniform 原生 HC 含被动，此差异为「原生有此概念、chain 本期未做」，
+  非语义分叉。
 - **代码位置**：
   - 模块：`caddychain/`（`chain_proxy` handler，独立 Go 模块，经 `xcaddy --with` 编入；
-    `Mode` 字段 race/wrr、`serveWRR`/`serveWRRDirect`、`wrrNext` 平滑轮询选路器）
-  - 渲染：`internal/services/caddy.go` → `buildChainProxyConfig`（mode 参数）+
-    `chainProxyModeFor`（mode 单源推导）+ `httpUpstreamPoolMixed`（混布触发器）
+    `Mode` 字段 race/wrr、`serveWRR`/`serveWRRDirect`、`wrrNext` 平滑轮询选路器；
+    2026-11-19 扩展：`health.go` 的 `healthMonitor`（调度/探测器/状态机）、
+    `hcEligible`/`laneEligible`（选路联动单源）、`parseExpectStatus`（期望状态单一
+    语法：单值整数或闭区间串 `200-299`，min>max 拒）、`ChainHealthCheck` 配置面
+    （json `health_check`：interval_ms/timeout_ms/expect_status/path/healthy_lag/
+    unhealthy_lag/body，缺省 30s/5s/200-299/`/`/2/3/不查体））
+  - 渲染：`internal/services/caddy.go` → `buildChainProxyConfig`（mode 参数 +
+    **EnableActiveHealthCheck 时发射 `health_check` 键**，race/wrr 同发射，
+    uniform reverse_proxy 路径零触碰）+ `chainProxyModeFor`（mode 单源推导）+
+    `httpUpstreamPoolMixed`（混布触发器）
   - 门禁：`internal/handlers/rule_features.go` → `mixedPoolStrategyAllowed`（定向放行
-    谓词单源）+ `mixedPoolHealthCheckError`（混布+主动健康检查=400 伴随门）
-  - 前端：`web/src/views/Rules.vue`（权重即优先级的提示文案；主池门镜像谓词）
+    谓词单源）；`mixedPoolHealthCheckError` 伴随门已于 2026-11-19 整体移除（保存链/
+    存量启用门/复制链/v2 导入链四处调用同步移除，聚合 warn 三口径退两口径）
+  - 前端：`web/src/views/Rules.vue`（权重即优先级的提示文案；主池门镜像谓词；
+    HC 伴随门镜像已同步移除）
 - **设计裁定出处**：2026-10-09（逐上游回源 Host 同批立项；`chain_fallback` 与回源 Host
   共用「权重降序 + 逐车道 host」的生成侧解析口径）；2026-11-18（混布池定向放行 +
   mode 分权，JJC-20261118-002 裁决 1-4，方案 v1.2 门下轮 2 准奏冻结）。
 - **关键设计点**：`reverse_proxy` 专属的负载均衡 / 健康检查 / transport / headers /
-  回源 Host 占位符**全部不发射**；逐上游回源 Host 在**生成侧**解析后随车道下发
-  （`entry["host"]`），因此本能力与第 4 项在链式场景下天然同口径。混布池渲染触发器
-  **不分策略**（兜存量脏行：直改 DB 的「混布+不允许策略」启用行也整池切 chain 承载，
-  绝不落 reverse_proxy）。混布池+主动健康检查=写侧 400（chain 无健康检查子系统，
-  「响亮拒绝优于静默忽略」）；wrr 404 透传（与 race「干净 404」刻意分叉）；车道恒
-  HTTP/1.1；`dns_server` 不消费（车道走系统解析器）。真进程验证：`.agent_team/spike/
-  evidence/T6.md`（wrr 分布 2:1:1 精确观测、race 双车道扇出、全灭 502/全超时 504、
-  升级隧道 101）。
+  回源 Host 占位符在 uniform 路径之外**全部不发射**（唯一例外：chain 分支的
+  `health_check` 键——HC 标志启用时 chain 模块真承载）；逐上游回源 Host 在**生成侧**
+  解析后随车道下发（`entry["host"]`），因此本能力与第 4 项在链式场景下天然同口径。
+  混布池渲染触发器**不分策略**（兜存量脏行：直改 DB 的「混布+不允许策略」启用行也
+  整池切 chain 承载，绝不落 reverse_proxy）。混布池+主动健康检查=**放行**（2026-11-19
+  起经 `health_check` 键真承载；原写侧 400 伴随门移除；存量脏行零值不发射、模块按
+  缺省 30s/5s/2,3/"/" 兜底自动获得真探测）。**HC 探测口径**：scheme=车道 Scheme
+  （混布核心诉求）、Host=回源 Host 单源（三级回退结果，与数据面严格一致）、UA=
+  `chain_proxy-health-check`、连接复用 `transportFor`（与数据面同池，测真实回源路径）；
+  **仅主动探测，被动 5xx 摘除不做**（与 uniform 原生 HC 的差异，如实登记，另立项）；
+  wrr 404 透传（与 race「干净 404」刻意分叉）；车道恒 HTTP/1.1；`dns_server` 不消费
+  （车道走系统解析器）。真进程验证：`.agent_team/spike/evidence/T6.md`（wrr 分布
+  2:1:1 精确观测、race 双车道扇出、全灭 502/全超时 504、升级隧道 101）+
+  `evidence/T7.md`（HC 翻转→摘除→恢复真观测、探针 Host/UA/TLS 口径、初态全 healthy）。
 - **防复发约束**：
   > 上游若出现「竞速式回退」类实现（或把 `try_duration`/`try_interval` 的重试语义
   > 包装成等价物），**不得**据此拆除 `caddychain/`。上游的 `reverse_proxy` 重试是
@@ -95,8 +120,14 @@
   > 禁直接 `w.(http.Hijacker)` 类型断言**——真实 Caddy 引擎把 writer 包装成
   > `*caddyhttp.IdleTimeoutWriter` 等**不实现 Hijacker** 的类型（v2.11.9 实测，
   > 卡-20261118-02），断言失败即隧道 502；httptest 裸 writer 单测测不出该缝隙。
+  > **HC 探测连接必须复用 `transportFor`（与数据面同池同源）**——独立 transport 可能
+  > 测出不同 SNI/连接形态，违背「测真实回源路径」的目的（JJC-20261119-001 裁决 1，
+  > 门下 P1-2 裁决落地）；HC 状态属 handler 实例非规则，**重载即新实例、不持久化**
+  > （与 tlsCache/wrrState 生命周期同构）；Cleanup 必须**先等探测协程退出再关连接**
+  > （done channel 先等后放，卡-20261118-01 经验）。
 - **不适用面**：单上游规则、`dynamic_upstreams`（DynamicDNS）规则；混布池规则另见
-  上方 2026-11-18 扩展（单上游 uniform 池维持 reverse_proxy 原生路径零变化）。
+  上方 2026-11-18 扩展（单上游 uniform 池维持 reverse_proxy 原生路径零变化）；
+  chain HC **不含被动 5xx 摘除**（与 uniform 原生 HC 的差异，另立项）。
 
 ## 第 2 项 · 引用型证书（`tls_source=file`）
 
