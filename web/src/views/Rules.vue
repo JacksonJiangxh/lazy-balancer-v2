@@ -3184,7 +3184,10 @@ const openWizard = async (rule?: Rule) => {
     // 编辑态一律保留已存端口：DB 中的 listen_port 即用户显式配置，TLS/协议切换不再静默迁移端口
     userExplicitPort.value = true
     let fullRule: Rule = rule
-    if (rule.enable_tls && rule.tls_source === 'manual') {
+    // 按 tls_source 单条件拉全量（manual ∪ file，与 enable_tls 解耦）：
+    // 列表投影有意置空路径列（rule_features.go deriveLbRuleListColumns），
+    // file 源编辑必须经详情投影回显摄取源路径，否则表单路径丢失、被迫重输。
+    if (rule.tls_source === 'manual' || rule.tls_source === 'file') {
       try {
         const resp = await request.get<APIResponse<Rule>>(`/rules/${rule.caddy_id}`)
         // 过期返回直接 return，且不得在此复位 hydratingWizard——复位归属
@@ -3201,7 +3204,9 @@ const openWizard = async (rule?: Rule) => {
       // 过期分支同样不复位 hydratingWizard（归属最新调用的生命周期）。
       if (openSeq !== wizardOpenSeq) return
       console.warn('[openWizard] Failed to fetch cert data for', rule.caddy_id, error)
-      markTlsDetailFailed(rule.caddy_id)
+      // enable_tls 守卫：TLS-off 行 TLS 步不可达，GET 失败禁保存后无自救路径
+      //（重试横幅/按钮在 TLS 步内）——不置 tlsDetailError，由写侧语义兜底。
+      if (rule.enable_tls) markTlsDetailFailed(rule.caddy_id)
     }
     }
     editingRule.value = fullRule
@@ -4277,7 +4282,8 @@ const openCopyWizard = async (rule: Rule) => {
   // 复制走 POST /rules（新建），不存在版本前置条件。
   editingRuleVersion.value = ''
   let fullRule: Rule = rule
-  if (rule.enable_tls && rule.tls_source === 'manual') {
+  // 同 openWizard——file 源编辑也需详情投影回显摄取源路径（列表投影有意置空路径列）。
+  if (rule.tls_source === 'manual' || rule.tls_source === 'file') {
     try {
       const resp = await request.get<APIResponse<Rule>>(`/rules/${rule.caddy_id}`)
       // 同 openWizard——过期返回不复位 hydratingWizard（归属最新调用生命周期）。
@@ -4288,7 +4294,8 @@ const openCopyWizard = async (rule: Rule) => {
       if (openSeq !== wizardOpenSeq) return
       // 不允许静默回退列表快照（证书记载缺失 → 保存会写空证书）
       console.warn('[openCopyWizard] Failed to fetch cert data for', rule.caddy_id, error)
-      markTlsDetailFailed(rule.caddy_id)
+      // enable_tls 守卫：同 openWizard——TLS-off 行不置 tlsDetailError，写侧语义兜底。
+      if (rule.enable_tls) markTlsDetailFailed(rule.caddy_id)
     }
   }
   copySourceHostHeader.value = copyRuleHostHeader(fullRule)
