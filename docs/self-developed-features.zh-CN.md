@@ -8,7 +8,7 @@
 > 登记原则：**一能力一条**，写清「能力名 / 代码位置 / 设计裁定出处 / 防复发约束 /
 > 机械可核符号」。符号必须能 grep 到，供后续派活直接引用。
 >
-> 最近更新：2026-11-19 · JJC-20261119-001（第 1 项扩展「混布池主动健康检查」——HC 子系统/伴随门移除/仅主动探测差异钉死）
+> 最近更新：2026-11-20 · JJC-20261120-002（第 1 项扩展「chain 被动 5xx 摘除」——passiveMonitor 恒启用/eligibleLanes 单源/网络错误不计数有意差异钉死）
 >
 > **注释外置后的查找方式**：代码里我方补丁处只留「一句话结论 + `详见 docs/fork-notes/xxx.md §N`」，
 > 长解释（设计理由、反例、取舍）**逐字**保存在 `docs/fork-notes/`（索引见其 `README.md`）。
@@ -40,7 +40,7 @@
 
 | # | 能力 | 关键符号（grep 可核） | 裁定出处 |
 |---|---|---|---|
-| 1 | **链式回退**（`chain_fallback`）+ 混布池 wrr 承载 + 混布池主动健康检查（2026-11-19 扩展） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `chainProxyModeFor` · `caddychain/` · `healthMonitor` · `hcEligible` · `health_check` | 2026-10-09 / 2026-11-18 / 2026-11-19 |
+| 1 | **链式回退**（`chain_fallback`）+ 混布池 wrr 承载 + 混布池主动健康检查（2026-11-19 扩展）+ 被动 5xx 摘除（2026-11-20 扩展） | `chain_proxy` · `buildChainProxyConfig` · `chain_race_interval_ms` · `ChainRaceIntervalMS` · `chainProxyModeFor` · `caddychain/` · `healthMonitor` · `eligibleLanes` · `health_check` · `passiveMonitor` · `recordPassive` · `passive_health_check` | 2026-10-09 / 2026-11-18 / 2026-11-19 / 2026-11-20 |
 | 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
 | 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` · `healthcheckPanelPort` | — / 2026-11-15 |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
@@ -73,9 +73,18 @@
   扇出剔除、升级隧道同口径、**全灭不专判**（全部不健康时真实请求照常放行，502/504
   收尾语义不变）；混布+HC 写侧 400 伴随门**整体移除**（原「响亮拒绝」立论失效——
   chain 已真承载 HC），uniform+chain_fallback+HC 的既有「静默忽略」死配置分叉就此
-  收口为真探测。**差异口径如实钉死：chain HC 仅主动探测，被动 5xx 摘除本期不做
-  （另立项）**——uniform 原生 HC 含被动，此差异为「原生有此概念、chain 本期未做」，
-  非语义分叉。
+  收口为真探测。
+  **2026-11-20 扩展（JJC-20261120-002，方案 v1.1 门下轮 1 准奏冻结）**：chain 模块
+  **被动 5xx 摘除子系统**落地（`caddychain/passive.go`）——`passiveMonitor` 逐车道
+  5xx 滑动计数（**恒启用、零配置**，对齐 uniform 引擎自带被动 HC；缺省
+  fail_duration=90s=uniform 渲染 interval 缺省 30s×3、max_fails=3、
+  unhealthy_duration=同 fail_duration 回落语义，S0 读码核销
+  `caddy.go:3940-3945/:5469`）；选路单源收敛 `eligibleLanes=HC∩passive`
+  （两套注册表独立、任一判摘即摘、恢复条件各自独立：HC=连续探测成功 lag 次、
+  passive=摘除期满 half-open 试探；全灭不专判延续，502/504 收尾不变）；
+  摘除/恢复各打一行可观测日志。**chain 有意差异（如实钉死）：网络错误不计入
+  被动失败**——uniform 原生计入，但 chain 的 wrr/race「失败即切」已覆盖网络
+  错误，不双罚；另「计数仅覆盖升级响应的状态码面，升级后字节流天然不计数」。
 - **代码位置**：
   - 模块：`caddychain/`（`chain_proxy` handler，独立 Go 模块，经 `xcaddy --with` 编入；
     `Mode` 字段 race/wrr、`serveWRR`/`serveWRRDirect`、`wrrNext` 平滑轮询选路器；
@@ -83,7 +92,9 @@
     `hcEligible`/`laneEligible`（选路联动单源）、`parseExpectStatus`（期望状态单一
     语法：单值整数或闭区间串 `200-299`，min>max 拒）、`ChainHealthCheck` 配置面
     （json `health_check`：interval_ms/timeout_ms/expect_status/path/healthy_lag/
-    unhealthy_lag/body，缺省 30s/5s/200-299/`/`/2/3/不查体））
+    unhealthy_lag/body，缺省 30s/5s/200-299/`/`/2/3/不查体）；
+    2026-11-20 扩展：`passive.go` 的 `passiveMonitor`/`recordPassive`（被动 5xx
+    滑动计数单源，恒启用零配置）、`eligibleLanes`（HC∩passive 选路单源收敛））
   - 渲染：`internal/services/caddy.go` → `buildChainProxyConfig`（mode 参数 +
     **EnableActiveHealthCheck 时发射 `health_check` 键**，race/wrr 同发射，
     uniform reverse_proxy 路径零触碰）+ `chainProxyModeFor`（mode 单源推导）+
@@ -108,9 +119,12 @@
   `chain_proxy-health-check`、连接复用 `transportFor`（与数据面同池，测真实回源路径）；
   **仅主动探测，被动 5xx 摘除不做**（与 uniform 原生 HC 的差异，如实登记，另立项）；
   wrr 404 透传（与 race「干净 404」刻意分叉）；车道恒 HTTP/1.1；`dns_server` 不消费
-  （车道走系统解析器）。真进程验证：`.agent_team/spike/evidence/T6.md`（wrr 分布
-  2:1:1 精确观测、race 双车道扇出、全灭 502/全超时 504、升级隧道 101）+
-  `evidence/T7.md`（HC 翻转→摘除→恢复真观测、探针 Host/UA/TLS 口径、初态全 healthy）。
+  （车道走系统解析器）。**2026-11-20 起被动 5xx 摘除已落地**（见上方扩展段与
+  `passive_health_check` 键面恒发射），原「本期不做」口径核销。真进程验证：
+  `.agent_team/spike/evidence/T6.md`（wrr 分布 2:1:1 精确观测、race 双车道扇出、
+  全灭 502/全超时 504、升级隧道 101）+ `evidence/T7.md`（HC 翻转→摘除→恢复真观测、
+  探针 Host/UA/TLS 口径、初态全 healthy）+ `evidence/T8.md`（被动 5xx 注入→观测
+  摘除→期满恢复真观测、缺省三值实测）。
 - **防复发约束**：
   > 上游若出现「竞速式回退」类实现（或把 `try_duration`/`try_interval` 的重试语义
   > 包装成等价物），**不得**据此拆除 `caddychain/`。上游的 `reverse_proxy` 重试是

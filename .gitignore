@@ -122,3 +122,6 @@ docker-compose.override.yml
 .agent_team/spike/caddybin/caddy
 .agent_team/*
 !.agent_team/spike/
+
+# IDE/agent team runtime
+.codebuddy/

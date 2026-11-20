@@ -245,7 +245,73 @@ func main() {
 		"removed":              map[string]any{"a_frozen": remA, "b": remB, "a_delta": afterA - remA, "b_delta": afterB - remB},
 		"recovered":            map[string]any{"a": recA, "b": recB, "a_delta": endA - recA, "b_delta": endB - recB}})
 
-	emit(map[string]any{"case": "done", "caddy": strings.TrimSpace(string(versionOut)), "ports": []int{portWRR, portRace, portDead, portTimeout, portTunnel, portTunnelRace, portHC}})
+	// ---- 8. 被动 5xx 摘除真进程取证（JJC-20261120-002 S3 / T-8）：真上游注入
+	// 5xx → 观测摘除（该车道命中 delta 冻结）→ 期满（缺省 unhealthy_duration=
+	// fail_duration=90s）恢复真观测——全部为真上游命中计数（非断言自证）。
+	// 缺省值本身即取证对象：90s 窗口内 3 次 5xx 摘除、90s 期满 half-open 试探。----
+	pBad := startCountingUpstream(http.StatusInternalServerError)
+	defer pBad.server.Close()
+	pGood := startCountingUpstream(http.StatusOK)
+	defer pGood.server.Close()
+	portPassive := freePort()
+	pas := chainProxy("wrr", []lane{{pBad.addr, "", "", 1}, {pGood.addr, "", "", 1}}, 3000)
+	pas["passive_health_check"] = map[string]any{} // 键面恒发射（S2 渲染同口径）
+	cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["passive"] = server(portPassive, pas)
+	cfgBody3, err := json.MarshalIndent(cfg, "", "  ")
+	must(err)
+	must(os.WriteFile(cfgPath, cfgBody3, 0o600))
+	proc.Stop()
+	proc3, err := harness.Start("caddy", caddyBinAbs, []string{"run", "--config", cfgPath}, nil, base)
+	must(err)
+	defer proc3.Stop()
+	must(harness.WaitPort(context.Background(), fmt.Sprintf("127.0.0.1:%d", portPassive), 20*time.Second))
+
+	pURL := fmt.Sprintf("http://127.0.0.1:%d/", portPassive)
+	pClient := &http.Client{Timeout: 5 * time.Second}
+	// 达阈摘除：wrr 1:1 交替，bad 车道 3 次 5xx（缺省 max_fails=3）即摘除。
+	// 窗内发 12 次请求：前 ~6 次两车道交替（bad 3 阈满），此后全落 good。
+	deadline8 := time.Now().Add(20 * time.Second)
+	for pBad.hits.Load() < 3 && time.Now().Before(deadline8) {
+		_ = status(pClient, pURL) // 5xx 透传面：状态码只收不验
+	}
+	if pBad.hits.Load() < 3 {
+		fatalf("被动计数未达阈：bad hits=%d（want ≥3）", pBad.hits.Load())
+	}
+	time.Sleep(200 * time.Millisecond) // 摘除态落定
+	ejB, ejG := pBad.hits.Load(), pGood.hits.Load()
+	okCnt := 0
+	for i := 0; i < 8; i++ {
+		if st := status(pClient, pURL); st == http.StatusOK {
+			okCnt++
+		}
+	}
+	if pBad.hits.Load() != ejB {
+		fatalf("摘除后 bad 车道仍接流量：hits %d→%d（应冻结）", ejB, pBad.hits.Load())
+	}
+	if okCnt != 8 {
+		fatalf("摘除后非全 200：ok=%d/8", okCnt)
+	}
+	frozenDelta := pBad.hits.Load() - ejB
+	// 期满恢复（half-open）：缺省 unhealthy_duration=90s，等 92s 后试探——
+	// bad 车道重新接流量（仍 500 透传，真实状态即观测）。
+	time.Sleep(92 * time.Second)
+	recHits := pBad.hits.Load()
+	// wrr 交替：恢复后首个真实请求可能落 good 车道——连发至 bad 命中为止
+	//（每次 bad 命中都会重新计数，未再达 3 次不重摘，窗口 90s 足够）。
+	for i := 0; i < 6 && pBad.hits.Load() <= recHits; i++ {
+		_ = status(pClient, pURL)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if pBad.hits.Load() <= recHits {
+		fatalf("期满未恢复：bad hits %d→%d（half-open 试探应命中 bad 车道）", recHits, pBad.hits.Load())
+	}
+	emit(map[string]any{"case": "passive-5xx",
+		"defaults":        map[string]any{"fail_duration_ms": 90000, "max_fails": 3, "unhealthy_duration_ms": 90000},
+		"ejected":         map[string]any{"bad_hits": ejB, "good_hits": ejG, "frozen_delta": frozenDelta},
+		"ejected_ok_8":    okCnt,
+		"recovered_probe": map[string]any{"bad_before": recHits, "bad_after": pBad.hits.Load()}})
+
+	emit(map[string]any{"case": "done", "caddy": strings.TrimSpace(string(versionOut)), "ports": []int{portWRR, portRace, portDead, portTimeout, portTunnel, portTunnelRace, portHC, portPassive}})
 	logf("全部断言通过")
 }
 
@@ -302,6 +368,20 @@ func startHCUpstream(secure bool, cert tls.Certificate) *hcUpstream {
 type lane struct {
 	dial, scheme, host string
 	weight             int
+}
+
+// startCountingUpstream 恒定状态码应答上游（hits=真命中计数；T-8 被动摘除观测面）。
+func startCountingUpstream(status int) *upstream {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	must(err)
+	hits := &atomic.Int64{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(status)
+	})
+	srv := &http.Server{Handler: handler}
+	go func() { _ = srv.Serve(ln) }()
+	return &upstream{server: srv, addr: ln.Addr().String(), hits: hits}
 }
 
 func server(port int, handler map[string]any) map[string]any {

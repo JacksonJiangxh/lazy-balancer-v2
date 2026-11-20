@@ -14,12 +14,12 @@ import (
 )
 
 // serveTunnel 升级请求（websocket 等）的隧道直通路径：不竞速，按链序建连
-// 并转发握手，101 后双向拼接字节流；dial 失败换下一上游。HC 联动：unhealthy
-// 车道按链序剔除（全灭不专判时 hcEligible 返回全部）。
+// 并转发握手，101 后双向拼接字节流；dial 失败换下一上游。HC/被动联动：判摘
+// 车道按链序剔除（全灭不专判时 eligibleLanes 返回全部）。
 func (h *ChainProxy) serveTunnel(w http.ResponseWriter, r *http.Request) error {
 	dialTimeout := time.Duration(h.DialTimeoutMS) * time.Millisecond
 	ctx := r.Context()
-	for _, idx := range h.hcEligible() {
+	for _, idx := range h.eligibleLanes() {
 		up := h.Upstreams[idx]
 		conn, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, "tcp", up.Dial)
 		if err != nil {
@@ -54,6 +54,9 @@ func (h *ChainProxy) serveTunnel(w http.ResponseWriter, r *http.Request) error {
 			return h.spliceTunnel(w, br, conn, resp, idx, up)
 		}
 		// 非 101：按普通响应透传（握手被上游拒绝等），链终止。
+		// 隧道挂点（JJC-20261120-002）：被动计数仅覆盖升级响应的状态码面；
+		// 101 升级成功后的双向字节流无状态码，天然不计数（见 passive.go 注释）。
+		h.recordPassive(idx, resp.StatusCode)
 		conn.Close()
 		resp.Body.Close()
 		removeHopByHopHeaders(resp.Header)

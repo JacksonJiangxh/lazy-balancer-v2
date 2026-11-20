@@ -247,20 +247,19 @@ func (m *healthMonitor) healthy(idx int) bool {
 	return m.states[idx].healthy
 }
 
-// hcEligible 选路联动单源：返回可参与选路的上游下标序（健康车道）。
-// HC 未启用返回全部；全部不健康同样返回全部（全灭不专判——防探测器误判
-// 时全站 502，真实请求照常放行）。
-func (h *ChainProxy) hcEligible() []int {
+// eligibleLanes 选路联动单源（JJC-20261120-002）：可参与选路的上游下标序
+// = HC∩passive 交集——两套注册表独立，任一判摘即摘（恢复条件各自独立：
+// HC=连续 healthy_lag 次探测成功；passive=摘除期满 half-open 试探）。
+// 交集为空返回全部（全灭不专判——防探测器/计数器误判时全站 502，真实
+// 请求照常放行）；两子系统均未启用时为全序，既有行为零变化。
+func (h *ChainProxy) eligibleLanes() []int {
 	all := make([]int, len(h.Upstreams))
 	for i := range all {
 		all[i] = i
 	}
-	if h.hcState == nil {
-		return all
-	}
 	out := make([]int, 0, len(all))
 	for _, i := range all {
-		if h.hcState.healthy(i) {
+		if h.hcState.healthy(i) && h.passiveHealthy(i) {
 			out = append(out, i)
 		}
 	}
@@ -270,21 +269,15 @@ func (h *ChainProxy) hcEligible() []int {
 	return out
 }
 
-// laneEligible 单车道是否参与本次选路（全灭不专判兜底：全部不健康时恒 true）。
+// laneEligible 单车道是否参与本次选路——eligibleLanes 的单车道投影
+// （全灭不专判时交集为空恒 true），保证两口径永远同源。
 func (h *ChainProxy) laneEligible(idx int) bool {
-	if h.hcState == nil {
-		return true
-	}
-	if h.hcState.healthy(idx) {
-		return true
-	}
-	// 全灭检查：无任何 healthy 车道则放行。
-	for i := range h.Upstreams {
-		if h.hcState.healthy(i) {
-			return false
+	for _, i := range h.eligibleLanes() {
+		if i == idx {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // startHealthMonitor 挂载并启动 HC 子系统（HealthCheck 为 nil 时零操作）。

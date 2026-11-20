@@ -4995,6 +4995,12 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 			handler["health_check"] = hc
 		}
 	}
+	// 被动 5xx 摘除键面（JJC-20261120-002）：chain 分支恒发射 passive_health_check
+	// 空对象——模块侧恒启用零配置（缺省 fail_duration=90s=uniform interval 缺省
+	// 30s×3、max_fails=3、unhealthy_duration=同 fail_duration 回落语义），键面
+	// 显式发射作证据与未来渲染侧传参关断的挂点（规则级开关本期不暴露）；
+	// uniform reverse_proxy 路径零触碰（R5 sha256 硬门）。
+	handler["passive_health_check"] = map[string]interface{}{}
 	timeouts := resolveProxyTimeouts(rule)
 	if timeouts.dial > 0 {
 		handler["dial_timeout_ms"] = timeouts.dial * 1000

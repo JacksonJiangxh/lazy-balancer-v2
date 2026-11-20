@@ -19,6 +19,7 @@ package caddychain
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -32,7 +33,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(ChainProxy{})
+	caddy.RegisterModule(&ChainProxy{})
 }
 
 // ChainUpstream 描述回退链上的一个上游。Dial 为 host:port（host 部分可含
@@ -98,8 +99,14 @@ type ChainProxy struct {
 	StripRequestHeaders []string `json:"strip_request_headers,omitempty"`
 
 	// HealthCheck 主动健康检查配置（nil=不探测=既有行为零变化）。选路联动：
-	// wrr 跳过 unhealthy、race 扇出剔除、隧道同口径、全灭不专判（hcEligible）。
+	// wrr 跳过判摘车道、race 扇出剔除、隧道同口径、全灭不专判（eligibleLanes）。
 	HealthCheck *ChainHealthCheck `json:"health_check,omitempty"`
+
+	// PassiveHealthCheck 被动 5xx 摘除键面（JJC-20261120-002）：模块恒启用
+	// 零配置——渲染侧显式发射空对象钉键面，模块侧全缺省消费（无字段可调，
+	// 缺省值见 passive.go 头注释）；规则级开关本期不暴露（渲染侧传参关断
+	// 预留）。RawMessage 占位防未知键漂移。
+	PassiveHealthCheck json.RawMessage `json:"passive_health_check,omitempty"`
 
 	baseTransport *http.Transport
 	// tlsCache 按 SNI 派生 transport 的缓存（指针承载，避免模块值拷贝带锁——
@@ -114,6 +121,12 @@ type ChainProxy struct {
 	// hcState 主动健康检查子系统（指针承载——与 tlsCache/wrrState 同模式）。
 	// Provision 启动 / Cleanup 停止（done 先等探测协程退出再放行）。
 	hcState *healthMonitor
+
+	// passiveState 被动 5xx 摘除子系统（JJC-20261120-002）：恒启用、零配置
+	//（对齐 uniform 引擎自带被动 HC）；纯请求驱动无后台协程，ServeHTTP 入口
+	// 惰性装配（once 防并发双初始化——测试构造不经 Provision 也可用）。
+	passiveState *passiveMonitor
+	passiveOnce  sync.Once
 }
 
 // wrrCounter wrr 模式跨请求持久的选路状态。
@@ -130,7 +143,9 @@ type tlsTransportCache struct {
 }
 
 // CaddyModule returns the Caddy module information.
-func (ChainProxy) CaddyModule() caddy.ModuleInfo {
+// 指针接收者：ChainProxy 自 JJC-20261120-002 起持有 passiveOnce（sync.Once），
+// 值接收者拷贝锁会被 vet 拒绝。
+func (h *ChainProxy) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.chain_proxy",
 		New: func() caddy.Module { return new(ChainProxy) },
@@ -300,6 +315,8 @@ func (h *ChainProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyht
 		chainWriteError(w, http.StatusBadGateway, "chain_proxy: no upstreams configured")
 		return nil
 	}
+	// 被动 5xx 摘除子系统（恒启用）：惰性装配，先于任何车道分发。
+	h.passiveOnce.Do(func() { h.passiveState = newPassiveMonitor(h) })
 	// X-LB-* 进程内控制头剥离（与 reverse_proxy headers.request.delete 同源；
 	// 先剥后用，防客户端伪造同名头直达后端）。
 	for _, name := range h.StripRequestHeaders {

@@ -180,6 +180,10 @@ func TestMixedPoolRender_mixedWRR(t *testing.T) {
 	if u0["weight"].(float64) != 3 || u1["weight"].(float64) != 1 {
 		t.Fatalf("wrr 权重发射缺失: %v / %v", u0, u1)
 	}
+	// JJC-20261120-002 S2：chain 分支恒发射 passive_health_check 键面（空对象）。
+	if _, ok := proxy["passive_health_check"]; !ok {
+		t.Fatalf("chain_proxy(wrr) 未发射 passive_health_check 键面: %v", proxy)
+	}
 }
 
 // TestMixedPoolRender_mixedChainFallbackRace 混布池 + chain_fallback → race
@@ -308,6 +312,11 @@ func TestMixedPoolRender_uniformKeyFaceDispatch(t *testing.T) {
 	if !foundRP {
 		t.Fatalf("uniform+wrr 未发射 reverse_proxy: %v", chain)
 	}
+	// uniform reverse_proxy 路径不得发射 passive_health_check（R5 反向钉死）。
+	uniformRaw, _ := json.Marshal(chain)
+	if strings.Contains(string(uniformRaw), `"passive_health_check"`) {
+		t.Fatalf("uniform 路径不得发射 passive_health_check（仅 chain 分支）:\n%s", uniformRaw)
+	}
 
 	race := SingleRuleConfig{
 		CaddyID:                       "lb_mp_uniform_race",
@@ -327,6 +336,11 @@ func TestMixedPoolRender_uniformKeyFaceDispatch(t *testing.T) {
 	}
 	if _, ok := proxy["mode"]; ok {
 		t.Fatalf("uniform+chain_fallback race 现状不得发射 mode 键: %v", proxy)
+	}
+	// JJC-20261120-002 S2：chain 分支恒发射 passive_health_check 键面（空对象）；
+	// uniform reverse_proxy 路径零触碰（见上方 wrr 分支的反向钉死）。
+	if _, ok := proxy["passive_health_check"]; !ok {
+		t.Fatalf("chain_proxy(race) 未发射 passive_health_check 键面: %v", proxy)
 	}
 }
 

@@ -421,6 +421,12 @@
         <DialogHeader :icon="Connection" :title="editingRule ? '编辑规则' : (isCopyMode ? '复制规则' : '新建规则')"
           subtitle="配置负载均衡规则的监听、TLS、上游与路由行为" />
       </template>
+      <!-- JJC-20261120-002：TLS 详情失败横幅上提到向导头部（步骤区之上），
+           manual/file 两源同语义——任何步可见可重试，消灭 file 行「无提示的保存死路」 -->
+      <div v-if="tlsDetailBlocked" class="info-note-bar">
+        <span class="info-note-desc">{{ tlsDetailError ? (wizardForm.tls_source === 'file' ? '证书详情加载失败：证书文件路径无法回显，保存前请重新加载。' : '证书详情加载失败：手动 TLS 配置可能不完整，已阻止进入下一步与保存。') : '' }}</span>
+        <el-button size="small" type="primary" plain :loading="tlsDetailLoading" @click="retryTlsDetail">重新加载</el-button>
+      </div>
       <el-steps :active="visualStepIndex" finish-status="success" align-center class="wizard-steps" :class="{ 'is-clickable': stepsClickable }">
         <el-step title="基本配置" :icon="InfoFilled" @click="jumpToStep(WIZARD_STEP.BASIC)" />
         <el-step v-if="showTlsStep" title="TLS 配置" :icon="Lock" @click="jumpToStep(WIZARD_STEP.TLS)" />
@@ -510,10 +516,6 @@
 
         <!-- Step 1: TLS 配置 (仅当启用 HTTPS 时显示) -->
         <div v-show="currentStep === WIZARD_STEP.TLS" class="step-content">
-          <div v-if="tlsDetailError && wizardForm.tls_source === 'manual'" class="info-note-bar">
-            <span class="info-note-desc">证书详情加载失败：手动 TLS 配置可能不完整，已阻止进入下一步与保存。</span>
-            <el-button size="small" type="primary" plain :loading="tlsDetailLoading" @click="retryTlsDetail">重新加载</el-button>
-          </div>
           <el-form :model="wizardForm" label-width="100px" v-if="wizardForm.enable_tls && wizardForm.protocol === 'http'" :disabled="saving">
             <el-form-item label="证书来源" for="radio---1">
               <input type="text" id="radio---1" aria-hidden="true" tabindex="-1" autocomplete="off" style="display:none">
@@ -1175,7 +1177,7 @@
           <el-button v-if="hasNextStep" type="primary" :disabled="saving" @click="nextStep">
             下一步<el-icon><ArrowRight /></el-icon>
           </el-button>
-          <el-button v-if="currentStep === WIZARD_STEP.PREVIEW" type="primary" :loading="saving" :disabled="tlsDetailError && wizardForm.tls_source === 'manual'" :title="tlsDetailError && wizardForm.tls_source === 'manual' ? '证书详情加载失败：请先在 TLS 步骤重新加载' : ''" @click="submitWizard">
+          <el-button v-if="currentStep === WIZARD_STEP.PREVIEW" type="primary" :loading="saving" :disabled="tlsDetailBlocked" :title="tlsDetailBlocked ? '证书详情加载失败：请先在 TLS 步骤重新加载' : ''" @click="submitWizard">
             <span>保存规则</span><el-icon style="margin-left: 6px;"><Check /></el-icon>
           </el-button>
         </div>
@@ -2350,6 +2352,9 @@ let certValidationSessionSeq = 0
 const tlsDetailError = ref(false)
 const tlsDetailLoading = ref(false)
 const tlsDetailRuleId = ref('')
+// JJC-20261120-002：失败阻断态单源化——manual 与 file 两源的证书详情都参与保存，
+// GET 失败时两者同语义（提示可见 + 保存禁用）；acme_dns 不依赖证书正文，不拦。
+const tlsDetailBlocked = computed(() => tlsDetailError.value && ['manual', 'file'].includes(wizardForm.tls_source))
 // 证书详情重试的会话序号：关闭向导/换表单即失效，在途响应不得把旧规则的
 // 证书与私钥写进新表单（与 openWizard 的 wizardOpenSeq 同范式）。
 let tlsDetailSeq = 0
@@ -3204,9 +3209,9 @@ const openWizard = async (rule?: Rule) => {
       // 过期分支同样不复位 hydratingWizard（归属最新调用的生命周期）。
       if (openSeq !== wizardOpenSeq) return
       console.warn('[openWizard] Failed to fetch cert data for', rule.caddy_id, error)
-      // enable_tls 守卫：TLS-off 行 TLS 步不可达，GET 失败禁保存后无自救路径
-      //（重试横幅/按钮在 TLS 步内）——不置 tlsDetailError，由写侧语义兜底。
-      if (rule.enable_tls) markTlsDetailFailed(rule.caddy_id)
+      // JJC-20261120-002：manual/file 两源同语义——GET 失败即置错误态（横幅已
+      // 上提向导头部，任意步可重试，无自救死角）；acme_dns 不依赖证书正文，不置。
+      if (rule.tls_source === 'manual' || rule.tls_source === 'file') markTlsDetailFailed(rule.caddy_id)
     }
     }
     editingRule.value = fullRule
@@ -3558,9 +3563,10 @@ const nextStep = (): void => {
     return
   }
   if (currentStep.value === WIZARD_STEP.TLS) {
-    // 详情失败只影响「手动 TLS」的证书材料：切到 ACME 后证书正文不再参与保存，
-    // 无条件的门会把用户钉死在 TLS 步（横幅文案本身也自述「手动 TLS 配置」）。
-    if (tlsDetailError.value && wizardForm.tls_source === 'manual') {
+    // 详情失败只影响 manual/file 两源（证书正文或路径回显）：JJC-20261120-002
+    // 单源 computed tlsDetailBlocked——切到 ACME 后证书正文不再参与保存，无条件的门
+    // 会把用户钉死在 TLS 步。
+    if (tlsDetailBlocked.value) {
       ElMessage.warning('证书详情加载失败：请先在 TLS 步骤点「重新加载」')
       return
     }
@@ -4294,8 +4300,8 @@ const openCopyWizard = async (rule: Rule) => {
       if (openSeq !== wizardOpenSeq) return
       // 不允许静默回退列表快照（证书记载缺失 → 保存会写空证书）
       console.warn('[openCopyWizard] Failed to fetch cert data for', rule.caddy_id, error)
-      // enable_tls 守卫：同 openWizard——TLS-off 行不置 tlsDetailError，写侧语义兜底。
-      if (rule.enable_tls) markTlsDetailFailed(rule.caddy_id)
+      // JJC-20261120-002：同 openWizard——manual/file 两源同语义，GET 失败即置错误态。
+      if (rule.tls_source === 'manual' || rule.tls_source === 'file') markTlsDetailFailed(rule.caddy_id)
     }
   }
   copySourceHostHeader.value = copyRuleHostHeader(fullRule)
