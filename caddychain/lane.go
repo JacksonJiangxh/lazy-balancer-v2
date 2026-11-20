@@ -149,6 +149,10 @@ func (h *ChainProxy) roundTrip(laneCtx context.Context, laneCancel context.Cance
 	h.log().Debug("chain_proxy: lane 收到响应头",
 		zap.Int("lane", idx), zap.String("upstream", up.Dial),
 		zap.Int("status", resp.StatusCode), zap.Duration("elapsed", elapsed))
+	// 被动 5xx 计数单源挂点（JJC-20261120-002）：数据面所有车道响应出口
+	// （race/wrr/single/wrrDirect）均经本函数；状态码 <500 零开销返回。
+	// 网络错误（err 分支）不计数——「失败即切」已覆盖，不双罚。
+	h.recordPassive(idx, resp.StatusCode)
 	return resp, false, nil
 }
 
@@ -160,12 +164,12 @@ type laneResult struct {
 	timedOut bool
 }
 
-// serveRace 竞速编排主循环（多上游、请求体已物化的路径）。hcEligible 在
-// HC 启用时剔除 unhealthy 车道（全灭不专判回退全车道）；未启用 HC 时
+// serveRace 竞速编排主循环（多上游、请求体已物化的路径）。eligibleLanes
+// 在 HC/被动任一判摘时剔除车道（全灭不专判回退全车道）；均未启用时
 // order 为全序，行为零变化。
 func (h *ChainProxy) serveRace(w http.ResponseWriter, r *http.Request, body []byte) error {
 	ctx := r.Context()
-	order := h.hcEligible()
+	order := h.eligibleLanes()
 	n := len(order)
 	results := make(chan laneResult, n)
 	cancels := make([]context.CancelFunc, n)
@@ -181,7 +185,7 @@ func (h *ChainProxy) serveRace(w http.ResponseWriter, r *http.Request, body []by
 		cancels[pos] = cancel
 		up := h.Upstreams[order[pos]]
 		go func() {
-			resp, timedOut, err := h.roundTrip(laneCtx, cancel, pos, r, up, bodyReader(), bodyLen)
+			resp, timedOut, err := h.roundTrip(laneCtx, cancel, order[pos], r, up, bodyReader(), bodyLen)
 			results <- laneResult{idx: pos, resp: resp, err: err, timedOut: timedOut}
 		}()
 	}
@@ -358,8 +362,8 @@ func (h *ChainProxy) wrrNext() int {
 	if len(st.cw) != n {
 		st.cw = make([]int, n)
 	}
-	// HC 联动：unhealthy 车道权重视为缺席（全灭不专判时 hcEligible 返回全部）。
-	eligible := h.hcEligible()
+	// HC/被动联动：判摘车道权重视为缺席（全灭不专判时 eligibleLanes 返回全部）。
+	eligible := h.eligibleLanes()
 	total, best := 0, -1
 	for _, i := range eligible {
 		up := h.Upstreams[i]
@@ -373,7 +377,7 @@ func (h *ChainProxy) wrrNext() int {
 			best = i
 		}
 	}
-	if best == -1 { // 理论不可达（hcEligible 恒非空），兜底走车道 0
+	if best == -1 { // 理论不可达（eligibleLanes 恒非空），兜底走车道 0
 		best = 0
 	}
 	st.cw[best] -= total
@@ -391,7 +395,7 @@ func (h *ChainProxy) serveWRR(w http.ResponseWriter, r *http.Request, body []byt
 	attempts := 0
 	for k := 0; k < n; k++ {
 		idx := (start + k) % n
-		// HC 联动：unhealthy 车道跳过（全灭不专判时 hcEligible 全量放行）。
+		// HC/被动联动：判摘车道跳过（全灭不专判时 laneEligible 全量放行）。
 		if !h.laneEligible(idx) {
 			continue
 		}
