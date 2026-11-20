@@ -19,6 +19,7 @@ package caddychain
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -100,6 +101,12 @@ type ChainProxy struct {
 	// HealthCheck 主动健康检查配置（nil=不探测=既有行为零变化）。选路联动：
 	// wrr 跳过判摘车道、race 扇出剔除、隧道同口径、全灭不专判（eligibleLanes）。
 	HealthCheck *ChainHealthCheck `json:"health_check,omitempty"`
+
+	// PassiveHealthCheck 被动 5xx 摘除键面（JJC-20261120-002）：模块恒启用
+	// 零配置——渲染侧显式发射空对象钉键面，模块侧全缺省消费（无字段可调，
+	// 缺省值见 passive.go 头注释）；规则级开关本期不暴露（渲染侧传参关断
+	// 预留）。RawMessage 占位防未知键漂移。
+	PassiveHealthCheck json.RawMessage `json:"passive_health_check,omitempty"`
 
 	baseTransport *http.Transport
 	// tlsCache 按 SNI 派生 transport 的缓存（指针承载，避免模块值拷贝带锁——
