@@ -111,16 +111,21 @@ test('规则名入口复用 AccessibleLink（不再手写 <a role=button>）', (
 })
 
 // ── 向导 TLS 门控 / 预览完整性 / 文件读取 ─────────────────────
-test('证书详情失败只拦手动 TLS：改为 ACME 后可进下一步与保存', () => {
+test('证书详情失败拦 manual/file 两源：改 ACME 后可进下一步与保存（JJC-20261120-002 单源化）', () => {
   const rules = code('src/views/Rules.vue')
   const nextTls = section(rules, "if (currentStep.value === WIZARD_STEP.TLS) {", 'if (wizardForm.tls_source === \'acme_dns\' && !wizardForm.acme_config_id) {')
-  assert.match(nextTls, /if \(tlsDetailError\.value && wizardForm\.tls_source === 'manual'\)/, '步进门必须按证书来源收窄')
+  assert.match(nextTls, /if \(tlsDetailBlocked\.value\)/, '步进门须消费单源 computed tlsDetailBlocked（manual ∪ file）')
   assert.match(
     rules,
-    /:disabled="tlsDetailError && wizardForm\.tls_source === 'manual'"/,
-    '保存按钮同样按来源收窄（否则 ACME 路径被钉死）',
+    /:disabled="tlsDetailBlocked"/,
+    '保存按钮同样消费单源 computed（ACME 路径不被钉死）',
   )
-  assert.match(rules, /v-if="tlsDetailError && wizardForm\.tls_source === 'manual'" class="info-note-bar"/, '横幅只作用于手动 TLS')
+  assert.match(rules, /v-if="tlsDetailBlocked"/, '横幅（已上提向导头部）按单源 computed 显隐')
+  assert.match(
+    rules,
+    /const tlsDetailBlocked = computed\(\(\) => tlsDetailError\.value && \['manual', 'file'\]\.includes\(wizardForm\.tls_source\)\)/,
+    '阻断态收窄为 manual ∪ file（ACME 不依赖证书正文，失败不拦）',
+  )
 })
 
 test('配置预览补齐「访问日志」与 HTTP 连接重试', () => {

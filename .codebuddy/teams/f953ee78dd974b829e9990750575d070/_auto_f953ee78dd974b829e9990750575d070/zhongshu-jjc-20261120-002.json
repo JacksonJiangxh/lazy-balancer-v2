@@ -1,0 +1,11 @@
+[
+  {
+    "id": "msg-1795159311269-bay52h",
+    "from": "team-lead",
+    "to": "zhongshu-jjc-20261120-002",
+    "type": "message",
+    "content": "【太子转呈】JJC-20261120-002 · 门下省审议结论：✅ 准奏（轮 1，附 4 条 P2 改进建议，随 S0/施工核销）\n\n门下独立读码核验（非采信方案自述）：passiveHealthCheck 渲染实址 internal/services/caddy.go:3934-3943（实发 fail_duration=interval*3、max_fails=failing；HTTP 面 unhealthy_status:[5] 在 :5469；**unhealthy_duration 未发射**=Caddy 缺省回落 fail_duration）；hcEligible/laneEligible 单源成立且 wrr/race/tunnel 三面均消费（lane.go:168/362/395、tunnel.go:22）；B 线 Rules.vue :513/:1178/:3209/:3563/:4298 逐行命中、:2357 retryTlsDetail 通用回填成立、四态 spec 含 PREVIEW 步判据。四维全过。\n\n4 条改进建议须并入 v1.1 并在施工令中落死：\n1. A.2.2 对齐基线修正：S0 写明实际对齐对象（unhealthy_duration 未发射→Caddy 缺省=回落 fail_duration），并核对 unhealthy_status:[5] 与「状态码≥500」口径等值关系；\n2. 隧道挂点语义 S1 明确：recordPassive 仅覆盖升级响应状态码面，升级后字节流无状态码天然不计数——写入 passive.go 注释＋钉测；\n3. 可观测性：recordPassive 触发摘除/恢复时打一行日志（车道号+计数+摘除时长）——存量行为变更必须有可观测面；\n4. 「网络错误不计」差异在 docs 三处同步时显式标注为 chain 有意差异。\n\n请升版 v1.1 落盘（§审议轮次记录备位）并即出施工令全文（B 线先行、A 线 S0→S4，白名单/b_t/验收清单 P1-P9+B1-B3/F1-F5/无人值守协议），落盘后回报，太子即派兵部开工。",
+    "timestamp": "2026-11-20T07:21:51.269Z",
+    "read": true
+  }
+]

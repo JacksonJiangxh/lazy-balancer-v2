@@ -1,0 +1,41 @@
+{
+  "name": "_auto_f953ee78dd974b829e9990750575d070",
+  "mainConversationId": "f953ee78dd974b829e9990750575d070",
+  "workspacePath": "/workspace/lazy-balancer-v2",
+  "createdAt": "2026-11-20T07:14:43.595Z",
+  "options": {
+    "workspacePath": "/workspace/lazy-balancer-v2",
+    "isAutoTeam": true
+  },
+  "isAutoTeam": true,
+  "members": [
+    {
+      "memberId": "zhongshu-jjc-20261120-002@_auto_f953ee78dd974b829e9990750575d070",
+      "name": "zhongshu-jjc-20261120-002",
+      "role": "两项遗留立项规划",
+      "sessionId": "cccf0b2f5f1b435c95f95f7d671db030",
+      "status": "completed"
+    },
+    {
+      "memberId": "menxia-jjc-20261120-002@_auto_f953ee78dd974b829e9990750575d070",
+      "name": "menxia-jjc-20261120-002",
+      "role": "两项遗留方案审议",
+      "sessionId": "585a58cae8754a9fa362cfccf24fed8a",
+      "status": "completed"
+    },
+    {
+      "memberId": "bingbu-jjc-20261120-002@_auto_f953ee78dd974b829e9990750575d070",
+      "name": "bingbu-jjc-20261120-002",
+      "role": "被动5xx+横幅S1-S4施工",
+      "sessionId": "9f89dad351fd47abb08f99f682515a9d",
+      "status": "running"
+    },
+    {
+      "memberId": "xingbu-jjc-20261120-002@_auto_f953ee78dd974b829e9990750575d070",
+      "name": "xingbu-jjc-20261120-002",
+      "role": "被动5xx+横幅终验",
+      "sessionId": "b2b04eef286f4822b4ec48194518876d",
+      "status": "running"
+    }
+  ]
+}

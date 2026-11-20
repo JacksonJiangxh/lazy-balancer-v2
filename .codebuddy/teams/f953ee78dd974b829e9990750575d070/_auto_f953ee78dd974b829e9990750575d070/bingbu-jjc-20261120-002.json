@@ -1,0 +1,29 @@
+[
+  {
+    "id": "msg-1795168443917-7paa65",
+    "from": "team-lead",
+    "to": "bingbu-jjc-20261120-002",
+    "type": "message",
+    "content": "【太子令】刑部终验驳回 1 项 P0，立即补正：\n\n**缺陷**：`web/tests/feViewsEdgeStates.spec.ts` 的「旧契约对表新契约」改动滞留工作区**未提交**——已提交态实跑该 spec FAIL（旧断言 `tlsDetailError && tls_source==='manual'` 与 `tlsDetailBlocked` 不匹配；刑部 git stash 双态对照实证：stash 后 1 fail、pop 后 1631 全过）。若按现状合并，主分支 spec 红。\n\n**动作**：`git add web/tests/feViewsEdgeStates.spec.ts` → 补提交 `[兵部] test: JJC-20261120-002 旧契约 spec 对表新契约（tlsDetailBlocked 单源，补提交）`（pre-commit 实跑）→ 提交点跑 `cd web && node --test tests/feViewsEdgeStates.spec.ts` 与 `npm test`（应 1631/1631）→ 回报提交哈希＋两跑证据。\n\n另两条 P2（不阻塞，知悉即可）：①刑部实测分支 14 批而非令面 16 批——你回报时确认实际批数与构成（可能含 squash/合并提交，口径如实）；②cmd/server 版本钉测失败系基线既有（`TestVersionHardcodingPointsMatchDockerfileArg`，docker-compose image tag 锚点 0 命中；本分支对该文件 diff=0）——另立 follow-up，不入本任务门。\n\n补提交完成后刑部复跑单 spec 放行，无需重审全量。",
+    "timestamp": "2026-11-20T09:54:03.917Z",
+    "read": true
+  },
+  {
+    "id": "msg-1795169392046-zyqus6",
+    "from": "team-lead",
+    "to": "bingbu-jjc-20261120-002",
+    "type": "message",
+    "content": "【太子探活】P0 补正令已 15 分钟，分支无新提交。请立即回报：①补提交是否已执行（哈希）②若未执行，卡在哪一步。若命令通道卡死，按协议用只读工具确认工作区文件态并如实上报，太子将代行补提交（同前例）。",
+    "timestamp": "2026-11-20T10:09:52.046Z",
+    "read": true
+  },
+  {
+    "id": "msg-1795172969711-i9px7m",
+    "from": "team-lead",
+    "to": "bingbu-jjc-20261120-002",
+    "type": "message",
+    "content": "【太子令·执行】董事长已确认执行序列「补提交 → 单 spec 复跑 → 刑部放行 → 合并」。太子侧审批弹窗未送达（多次超时），现令你立即重试你已备好的那条命令（git add feViewsEdgeStates.spec.ts → commit → node --test 该 spec → npm test）。若仍审批超时：每隔一轮重试一次，不要连发；每次失败在回报里记一次。若本轮成功：回报哈希＋两跑证据，太子即转刑部放行并安排合并。",
+    "timestamp": "2026-11-20T11:09:29.711Z",
+    "read": true
+  }
+]
