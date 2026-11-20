@@ -305,7 +305,19 @@ JJC-20261118-002 混布池分支，mode 由 `chainProxyModeFor` 单源推导）�
   的既有「静默忽略」死配置分叉就此**收口为真探测**。**初始态**：全 healthy（先放行
   后探测收敛，重载即新实例不持久化）；**全灭不专判**：全部车道 unhealthy 时真实请求
   照常放行到全部车道（防探测器误判全站 502），502/504 收尾语义不变；**差异口径**：
-  仅主动探测，被动 5xx 摘除不做（uniform 原生 HC 有被动——差异如实钉死，另立项）。
+  被动 5xx 摘除已于 2026-11-20 落地（见下条），原「仅主动探测」口径核销。
+- **被动 5xx 摘除（2026-11-20 JJC-20261120-002）**：chain 分支恒发射
+  `passive_health_check` 键（**空对象**——模块侧 `passiveMonitor` 恒启用零配置，
+  缺省 fail_duration=90s=uniform 渲染 interval 缺省 30s×3、max_fails=3、
+  unhealthy_duration=同 fail_duration 回落语义，uniform 渲染实值核销于
+  `internal/services/caddy.go:3940-3945/:5469`）。逐车道 5xx 滑动计数单源
+  `recordPassive`（挂点：`roundTrip` 数据面响应出口 + 隧道非 101 状态码面；
+  **仅覆盖升级响应的状态码面，升级后字节流无状态码天然不计数**）；选路单源
+  `eligibleLanes=HC∩passive`（两套注册表独立、任一判摘即摘、恢复条件各自独立
+  ——HC=连续探测成功 lag 次，passive=摘除期满 half-open 试探；全灭不专判延续）。
+  **chain 有意差异：网络错误不计入被动失败**（uniform 原生计入——但 chain 的
+  wrr/race「失败即切」已覆盖网络错误，不双罚，如实在此登记）。真进程取证
+  `.agent_team/spike/evidence/T8.md`。
 - **HTTP/1.1 恒定**：`caddychain` transport 恒 `ForceAttemptHTTP2=false`——
   `upstream_force_http1` 在链式/混布车道下无附加效果（语义已满足），不加门；
 - **dns_server 不消费**：chain 模式车道走系统解析器（混布池×DynamicDNS 结构互斥，
