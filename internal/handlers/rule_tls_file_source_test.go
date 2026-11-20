@@ -154,6 +154,147 @@ func TestCreateRule_referencedCertMismatchedPairRejected(t *testing.T) {
 	}
 }
 
+// newFileSourceUpdateRouter 构造带 PUT /rules/:caddy_id 的测试路由，并把证书目录重定向到临时目录。
+func newFileSourceUpdateRouter(t *testing.T) (*gin.Engine, string) {
+	t.Helper()
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	dir := t.TempDir()
+	restore := services.SetCertDirForTest(dir)
+	t.Cleanup(restore)
+	return router, dir
+}
+
+// putUpdateRulePayload 以 JSON 载荷提交 PUT /rules/:caddy_id。
+func putUpdateRulePayload(t *testing.T, router *gin.Engine, caddyID string, payload map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/rules/"+caddyID, strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+// seedFileSourceRule seed 一条 manual 规则并经 PUT 摄取为 file 源（路径+内容落库），
+// 返回摄取源路径供后续断言比对。
+func seedFileSourceRule(t *testing.T, router *gin.Engine, dir, caddyID, cn string) (string, string) {
+	t.Helper()
+	certPath, keyPath := writeReferencedPair(t, dir, cn)
+	seedAuditRule(t, caddyID, caddyID+"-name", cn, 19450, true, "manual", false)
+	seedAuditUpstream(t, caddyID)
+	rec := putUpdateRulePayload(t, router, caddyID, map[string]any{
+		"enable_tls":    true,
+		"tls_source":    "file",
+		"tls_cert_path": certPath,
+		"tls_key_path":  keyPath,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed file-source rule %s: status=%d body=%s", caddyID, rec.Code, rec.Body.String())
+	}
+	return certPath, keyPath
+}
+
+// queryStoredTLSPaths 读取落库的引用型证书路径列。
+func queryStoredTLSPaths(t *testing.T, caddyID string) (string, string) {
+	t.Helper()
+	var certPath, keyPath string
+	if err := db.DB.QueryRow(`SELECT COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'') FROM lb_rules WHERE caddy_id=?`, caddyID).Scan(&certPath, &keyPath); err != nil {
+		t.Fatalf("read persisted rule %s: %v", caddyID, err)
+	}
+	return certPath, keyPath
+}
+
+// TestUpdateRule_FileSourceEmptyPathRetention V4 三态钉测（JJC-20261120-001 方案 C）：
+// file→file 同模式空路径 PUT 不得清空 DB 路径列（models.go「引用型证书路径列
+// 空串=保留存量路径」契约）。三态：
+// ① enable_tls=true + 空路径 + 文件在 → 200 且路径/内容保持（既有沿用语义正向钉）；
+// ② enable_tls=false + file + 空路径 + 文件在 → 200 且 DB 路径列保留
+//   （修复前红=路径列被无条件写清空）；
+// ③ enable_tls=false + 空路径 + 源文件已删 → 200 且路径保留、无 400
+//   （插入点判别器：合并块若落在摄取分支门之前，沿用填充的路径会把析取支顶开
+//   → 文件校验 400 红；落归一区后门关、跳过校验 → 200 绿）。
+func TestUpdateRule_FileSourceEmptyPathRetention(t *testing.T) {
+	t.Run("case1_tls_on_empty_path_keeps_paths_and_content", func(t *testing.T) {
+		router, dir := newFileSourceUpdateRouter(t)
+		wantCertPath, wantKeyPath := seedFileSourceRule(t, router, dir, "lb_retention_c1", "retention-c1.test")
+		wantCertPEM, err := os.ReadFile(wantCertPath)
+		if err != nil {
+			t.Fatalf("read source cert: %v", err)
+		}
+
+		rec := putUpdateRulePayload(t, router, "lb_retention_c1", map[string]any{
+			"enable_tls":    true,
+			"tls_source":    "file",
+			"tls_cert_path": "",
+			"tls_key_path":  "",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		gotCertPath, gotKeyPath := queryStoredTLSPaths(t, "lb_retention_c1")
+		if gotCertPath != wantCertPath || gotKeyPath != wantKeyPath {
+			t.Fatalf("paths=(%q,%q), want (%q,%q)", gotCertPath, gotKeyPath, wantCertPath, wantKeyPath)
+		}
+		var storedCert, storedKey string
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_retention_c1'`).Scan(&storedCert, &storedKey); err != nil {
+			t.Fatalf("read persisted content: %v", err)
+		}
+		if storedCert != string(wantCertPEM) || storedKey == "" {
+			t.Fatalf("内容应与源文件保持一致, certMatch=%v keyEmpty=%v", storedCert == string(wantCertPEM), storedKey == "")
+		}
+	})
+
+	t.Run("case2_tls_off_empty_path_keeps_paths", func(t *testing.T) {
+		router, dir := newFileSourceUpdateRouter(t)
+		wantCertPath, wantKeyPath := seedFileSourceRule(t, router, dir, "lb_retention_c2", "retention-c2.test")
+
+		rec := putUpdateRulePayload(t, router, "lb_retention_c2", map[string]any{
+			"enable_tls":    false,
+			"tls_source":    "file",
+			"tls_cert_path": "",
+			"tls_key_path":  "",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		gotCertPath, gotKeyPath := queryStoredTLSPaths(t, "lb_retention_c2")
+		if gotCertPath != wantCertPath || gotKeyPath != wantKeyPath {
+			t.Fatalf("关 TLS + 空路径 PUT 后 DB 路径列被清空（应保留存量）: got=(%q,%q), want=(%q,%q)", gotCertPath, gotKeyPath, wantCertPath, wantKeyPath)
+		}
+	})
+
+	t.Run("case3_tls_off_deleted_source_file_no_400", func(t *testing.T) {
+		router, dir := newFileSourceUpdateRouter(t)
+		wantCertPath, wantKeyPath := seedFileSourceRule(t, router, dir, "lb_retention_c3", "retention-c3.test")
+		// 源文件删除：file 源证据消失，关 TLS 保存必须不触发文件校验（无 400）
+		for _, p := range []string{wantCertPath, wantKeyPath} {
+			if err := os.Remove(p); err != nil {
+				t.Fatalf("remove source file: %v", err)
+			}
+		}
+
+		rec := putUpdateRulePayload(t, router, "lb_retention_c3", map[string]any{
+			"enable_tls":    false,
+			"tls_source":    "file",
+			"tls_cert_path": "",
+			"tls_key_path":  "",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update status=%d body=%s, want 200（文件已删时关 TLS 保存不应 400）", rec.Code, rec.Body.String())
+		}
+		gotCertPath, gotKeyPath := queryStoredTLSPaths(t, "lb_retention_c3")
+		if gotCertPath != wantCertPath || gotKeyPath != wantKeyPath {
+			t.Fatalf("文件已删 + 空路径 PUT 后 DB 路径列被清空（应保留存量）: got=(%q,%q), want=(%q,%q)", gotCertPath, gotKeyPath, wantCertPath, wantKeyPath)
+		}
+	})
+}
+
 // Given: 存量规则（manual 来源）与证书目录内一对合法成品证书
 // When: 通过 PUT 切换到 tls_source=file 并提交容器内路径
 // Then: 更新成功且 PEM 内容摄取入库——守卫以 CreateRule 同口径放过 file 来源

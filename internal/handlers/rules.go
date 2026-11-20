@@ -3393,6 +3393,21 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.TLSSource != "file" {
 		req.TLSCertPath, req.TLSKeyPath = "", ""
 	}
+	// file→file 同模式空路径沿用存量（对齐 models.go「引用型证书路径列
+	// 空串=保留存量路径」契约；JJC-20261120-001 方案 C）。enable_tls=false +
+	// 空路径不经上方 :3312 摄取分支门（门被 enable_tls=false 关闭），若无此
+	// 合并，路径列被下方无条件写列清空——看门狗对该行失明、重新启用时
+	// 沿用空路径 400 死锁。已过摄取分支的行（enable_tls=true 或显式路径）
+	// req 路径已非空，TrimSpace 条件天然跳过。禁移至 :3312 门之前：沿用填充
+	// 会把门的析取支顶开，文件已删时关 TLS 保存反增 400 回归。
+	if req.TLSSource == "file" && existingRule.TLSSource == "file" {
+		if strings.TrimSpace(req.TLSCertPath) == "" {
+			req.TLSCertPath = existingRule.TLSCertPath
+		}
+		if strings.TrimSpace(req.TLSKeyPath) == "" {
+			req.TLSKeyPath = existingRule.TLSKeyPath
+		}
+	}
 	// 生效来源非 acme_dns 时 ca_provider_id 归零（与
 	// CreateRule 非 ACME 分支同口径）。此前仅 acme→manual 切换 / tcp 归零，
 	// manual→manual 编辑把存量残留值原样写回；而 ResolveCAProviderID 对非 0
