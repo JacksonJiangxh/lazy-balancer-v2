@@ -184,7 +184,11 @@ if [[ -n "$branch_target_mismatch" ]]; then
   exit 1
 fi
 
-top_go_dirs="$(git ls-files --cached --others --exclude-standard '*.go' | awk -F/ 'NF>1{print $1}' | LC_ALL=C sort -u)"
+# 顶层 Go 目录派生排除 .agent_team：spike 验证链源码按 2026-11-13 董事长裁定
+# 入库（审计/合规参考），但**故意不入镜像**（非交付物，COPY 清单永不含它）——
+# 不排除会让本门禁在含 spike 的任何工作树上恒红（JJC-20261121-001 实测，HEAD
+# 版 Dockerfile 同红），把真漏 COPY 信号淹没。
+top_go_dirs="$(git ls-files --cached --others --exclude-standard '*.go' | awk -F/ 'NF>1{print $1}' | grep -vx '.agent_team' | LC_ALL=C sort -u)"
 missing_dirs=""
 while IFS= read -r dir; do
   [[ -z "$dir" ]] && continue

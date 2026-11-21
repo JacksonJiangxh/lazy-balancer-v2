@@ -60,6 +60,7 @@ docs/
 # 本地工具会话目录（防构建上下文形态变化泄漏本地会话/审计产物进中间层）
 .omp/
 .agent/
+.agent_team/
 .superpowers/
 story.md
 # 本地测试/AI 会话产物（均非 Dockerfile COPY 源）。

@@ -116,11 +116,14 @@ ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
 # 可能得到不同编译器产物，且下载失败与依赖拉取失败的错误形态混淆。工具链不足
 # 时应由构建显性失败，同步 bump 基础镜像。
 ENV GOTOOLCHAIN=local
-# wafiplist/geoipnames 叶模块经根 go.mod replace ./wafiplist ./geoipnames 引用
-# ——go mod download 解析 replace 需要被替换模块的 go.mod/go.sum 在场
-# （geoipnames 零依赖无 go.sum）。
+# wafiplist/geoipnames/caddychain 叶模块经根 go.mod replace 引用（caddychain 自
+# JJC-20261121-001 起被根 require：internal/services 测试跨模块断言 chain_proxy
+# 配置契约）——go mod download 解析 replace 需要被替换模块的 go.mod/go.sum 在场
+# （geoipnames 零依赖无 go.sum；完整目录在下方编译层 COPY，此处仅模块文件，
+# 避免插件源码变更 bust 下载缓存层）。
 COPY wafiplist/go.mod wafiplist/go.sum ./wafiplist/
 COPY geoipnames/go.mod ./geoipnames/
+COPY caddychain/go.mod caddychain/go.sum ./caddychain/
 COPY go.mod go.sum ./
 # 模块缓存挂载（lazy-builder GC 48h）：go.sum 未变时 download 直接命中缓存；
 # 3 次重试兜底镜像源偶发供应与校验不符的瞬态错误（与 xcaddy build 同形态）。
