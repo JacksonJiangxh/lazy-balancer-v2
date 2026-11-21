@@ -113,6 +113,12 @@ var antiFallbackScanTargets = map[string][]string{
 	"certinfo.go": {
 		"formatRuleCertInfo",
 	},
+	// 逐上游健康检查路径（JJC-20261121-001）：渲染入口可达（buildHTTPHandleChain
+	// HC 分歧检测调用），effectiveUpstreamHealthPaths 的规则级回退兜底见
+	// antiFallbackAllowlist 同名条目 Ruling。
+	"upstream_health_probe.go": {
+		"effectiveUpstreamHealthPaths",
+	},
 }
 
 // antiFallbackAllowlist 允许列表：函数名 → 赋值形态 → Ruling。
@@ -255,6 +261,9 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	},
 	"ParseCRSExcludedRules": {
 		`entry.Scope = "all"`: "CRS 排除项 scope 缺省→all：旧格式/缺字段（集群同步、带外改库、降级版本写入）的防御归一到全局限定，属类型②省略型归一而非无效库值兜底——可达性 Ruling 披露",
+	},
+	"effectiveUpstreamHealthPaths": {
+		`fallback = "/"`: "逐上游健康检查路径空=跟随规则级，规则级亦空→渲染 /：类型②省略型（与 buildHTTPHandleChain 的 hcPath 兜底同口径——规则级列 DB DEFAULT ''、写侧允许空，渲染层承担「未配置→/」省略替换）——JJC-20261121-001 Ruling 披露",
 	},
 	// buildCorazaDirectivesWithIndex 的「信任名单 + 绕过」复合条件条目已退役：
 	// 该函数改为用单源布尔 emitTrustControl 开分支（不再以库值复合条件包裹

@@ -1978,7 +1978,7 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 			// 上游传输归一（单一事实源，与主端导出同函数）：落库值与导出
 			// canonical 必须同形，否则 rules 节哈希主从恒不等。
 			normalizeUpstreamForTransport(&upstream, rule.Protocol)
-			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain) VALUES (?,?,?,?,?,?,?,?,?,?)`, upstream.ID, rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight, false /* dynamic_dns 废弃列：落库恒 0 */, upstream.Enabled, upstream.Protocol, upstream.MaxConnections, upstream.OriginDomain); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain,health_check_path) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, upstream.ID, rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight, false /* dynamic_dns 废弃列：落库恒 0 */, upstream.Enabled, upstream.Protocol, upstream.MaxConnections, upstream.OriginDomain, upstream.HealthCheckPath); err != nil {
 				return fmt.Errorf("写入快照上游 %s: %w", rule.CaddyID, err)
 			}
 		}

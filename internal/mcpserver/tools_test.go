@@ -183,7 +183,7 @@ func TestRuleToolSchemasDeclareNestedItemContracts(t *testing.T) {
 			// And：主 upstreams 在 create（回归）与 update（目标）均完整声明。
 			upstreamItems := items(property(root, "upstreams"))
 			require(upstreamItems, "host", "port")
-			for _, field := range []string{"host", "port", "weight", "enabled", "protocol", "max_connections", "origin_domain"} {
+			for _, field := range []string{"host", "port", "weight", "enabled", "protocol", "max_connections", "origin_domain", "health_check_path"} {
 				if _, ok := upstreamItems.Properties[field]; !ok {
 					t.Errorf("upstreams.items lacks property %q", field)
 				}

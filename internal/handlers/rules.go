@@ -1868,9 +1868,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// 非协议族的上游 protocol（如 HTTP 规则携带 tls，此前
 		// 静默当 http 处理，与 TCP 行为不对称）已在 validateRulePayloadBeforeSave
 		// 显式 400 拒绝——此处 INSERT 只写归一后的合法值。
-		_, err = tx.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			caddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：写侧恒 0，渲染只读规则级 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain)
+		_, err = tx.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain, health_check_path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			caddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：写侧恒 0，渲染只读规则级 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain, u.HealthCheckPath)
 		if err != nil {
 			rollbackRuleWriteTx(tx, "CreateRule", caddyID)
 			services.Logf("error", "CreateRule upstream insert error: %v", err)
@@ -2514,7 +2514,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 存量 upstreams.enabled 无 NOT NULL，NULL 行裸 scan 进 bool 会 500；
 	// 启用判定引用 services 单源常量（NULL 视同禁用），回写/回滚保持同一有效状态。
 	var oldUpstreams []models.Upstream
-	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), "+services.UpstreamEnabledSQLValue+", COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams u WHERE rule_id = ?", caddyID)
+	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), "+services.UpstreamEnabledSQLValue+", COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''), COALESCE(health_check_path,'') FROM upstreams u WHERE rule_id = ?", caddyID)
 	if err != nil {
 		services.Logf("error", "UpdateRule failed to read existing upstreams for caddy_id=%s: %v", caddyID, err)
 		recordRuleWriteFailure(c, "更新", "读取现有上游服务器失败", err)
@@ -2523,7 +2523,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	for oldUpstreamRows.Next() {
 		var u models.Upstream
-		if err := oldUpstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
+		if err := oldUpstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain, &u.HealthCheckPath); err != nil {
 			if closeErr := oldUpstreamRows.Close(); closeErr != nil {
 				services.Logf("error", "UpdateRule failed to close existing upstream cursor for caddy_id=%s: %v", caddyID, closeErr)
 			}
@@ -3187,16 +3187,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.Protocol == "tcp" {
 		for index := range req.Upstreams {
 			req.Upstreams[index].OriginDomain = ""
+			req.Upstreams[index].HealthCheckPath = ""
 		}
 	}
 	if protocolChanged {
 		for index := range req.Upstreams {
 			switch req.Protocol {
 			case "tcp":
-				// 回源域名是 HTTP-only 语义——切换即弃置
+				// 回源域名/健康检查路径是 HTTP-only 语义——切换即弃置
 				//（与 host_header/health_check_host 归零同格），否则隐藏残留字段
 				// 被「回源域名仅 HTTP 规则支持」门恒拒，卡死保存。
 				req.Upstreams[index].OriginDomain = ""
+				req.Upstreams[index].HealthCheckPath = ""
 				switch req.Upstreams[index].Protocol {
 				case "", "http":
 					req.Upstreams[index].Protocol = "tcp"
@@ -4499,6 +4501,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		// 导出/备份/集群快照放大。
 		for index := range rule.Upstreams {
 			rule.Upstreams[index].OriginDomain = ""
+			rule.Upstreams[index].HealthCheckPath = ""
 		}
 		// TCP 自愈族：custom_routes_enabled 归零后源行残留 path_rules 不得
 		// 进入保存门（TCP 分支对 len(PathRules)>0 显式 400）或复制到副本——
@@ -4709,7 +4712,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// dynamic_dns 同列同病——legacy NULL 行裸 scan
 	// NULL→bool 报错恒 500，按 0 归一（遗留死列，渲染只读规则级值）。
 	upstreamRows, err := tx.Query(`
-		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), `+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
+		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), `+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''), COALESCE(health_check_path,'')
 		FROM upstreams u WHERE rule_id = ?
 	`, caddyID)
 	if err != nil {
@@ -4718,30 +4721,32 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	}
 	for upstreamRows.Next() {
 		var u struct {
-			Host           string
-			Port           int
-			Weight         int
-			DynamicDNS     bool
-			Enabled        bool
-			Protocol       string
-			MaxConnections int
-			OriginDomain   string
+			Host            string
+			Port            int
+			Weight          int
+			DynamicDNS      bool
+			Enabled         bool
+			Protocol        string
+			MaxConnections  int
+			OriginDomain    string
+			HealthCheckPath string
 		}
-		if err := upstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
+		if err := upstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain, &u.HealthCheckPath); err != nil {
 			upstreamRows.Close()
 			failInternal("扫描上游失败，已回滚", err)
 			return
 		}
 		if rule.Protocol == "tcp" {
 			// 复制上游从库内源行重新读取（并不使用上方内存投影）——
-			// TCP 零消费的回源域名必须在此一并清零，否则副本携带保存门
-			// 硬拒的死配置（与编辑/启用同族）。
+			// TCP 零消费的回源域名/健康检查路径必须在此一并清零，否则副本
+			// 携带保存门硬拒的死配置（与编辑/启用同族）。
 			u.OriginDomain = ""
+			u.HealthCheckPath = ""
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, newCaddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：复制时归 0 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain); err != nil {
+			INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain, health_check_path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, newCaddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：复制时归 0 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain, u.HealthCheckPath); err != nil {
 			upstreamRows.Close()
 			failInternal("复制上游失败，已回滚", err)
 			return
@@ -4815,16 +4820,17 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 // COALESCE/IIF 归一读覆盖的列上为 NULL（legacy 可空 schema 残留）——
 // 契约要求保存后不再存在 NULL 行，此类行即使内容等价也必须原地 UPDATE 归一。
 type storedUpstream struct {
-	id             int
-	host           string
-	port           int
-	weight         int
-	dynamicDNS     bool
-	enabled        bool
-	protocol       string
-	maxConnections int
-	originDomain   string
-	needsNormalize bool
+	id              int
+	host            string
+	port            int
+	weight          int
+	dynamicDNS      bool
+	enabled         bool
+	protocol        string
+	maxConnections  int
+	originDomain    string
+	healthCheckPath string
+	needsNormalize  bool
 }
 
 // replaceUpstreamsTx 以「保留不变行」的方式收敛给定规则的上游集合（历史
@@ -4844,11 +4850,11 @@ type storedUpstream struct {
 // （legacy 可空 schema / 带外写入残留）：判定依据必须覆盖读侧 COALESCE 的
 // **全部**列——漏一列时该行的 NULL 在原样保存后永久保留，导出/集群快照继续
 // 携带 NULL，与 schema 的 NOT NULL DEFAULT ” 终态不一致。
-const storedUpstreamNullColumnsSQL = `(weight IS NULL OR dynamic_dns IS NULL OR enabled IS NULL OR protocol IS NULL OR max_connections IS NULL OR origin_domain IS NULL)`
+const storedUpstreamNullColumnsSQL = `(weight IS NULL OR dynamic_dns IS NULL OR enabled IS NULL OR protocol IS NULL OR max_connections IS NULL OR origin_domain IS NULL OR health_check_path IS NULL)`
 
 func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstreams []models.Upstream) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0),
-		`+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''),
+		`+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''), COALESCE(health_check_path,''),
 		`+storedUpstreamNullColumnsSQL+`
 		FROM upstreams u WHERE rule_id = ? ORDER BY id`, ruleID)
 	if err != nil {
@@ -4857,7 +4863,7 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 	var existing []storedUpstream
 	for rows.Next() {
 		var row storedUpstream
-		if err := rows.Scan(&row.id, &row.host, &row.port, &row.weight, &row.dynamicDNS, &row.enabled, &row.protocol, &row.maxConnections, &row.originDomain, &row.needsNormalize); err != nil {
+		if err := rows.Scan(&row.id, &row.host, &row.port, &row.weight, &row.dynamicDNS, &row.enabled, &row.protocol, &row.maxConnections, &row.originDomain, &row.healthCheckPath, &row.needsNormalize); err != nil {
 			rows.Close()
 			return fmt.Errorf("解析规则 %s 的上游: %w", ruleID, err)
 		}
@@ -4881,6 +4887,7 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 		incoming := storedUpstream{
 			host: u.Host, port: u.Port, weight: u.Weight,
 			enabled: u.Enabled, protocol: u.Protocol, maxConnections: u.MaxConnections, originDomain: u.OriginDomain,
+			healthCheckPath: u.HealthCheckPath,
 		}
 		// ① 显式 id 命中（前端编辑既有行回传真实 id）
 		if index, ok := indexByID[u.ID]; ok && !consumed[index] {
@@ -4915,9 +4922,9 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 		}
 	}
 	for _, insert := range inserts {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ruleID, insert.host, insert.port, insert.weight, insert.dynamicDNS, insert.enabled, insert.protocol, insert.maxConnections, insert.originDomain); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain, health_check_path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ruleID, insert.host, insert.port, insert.weight, insert.dynamicDNS, insert.enabled, insert.protocol, insert.maxConnections, insert.originDomain, insert.healthCheckPath); err != nil {
 			return fmt.Errorf("写入规则 %s 的上游 %s:%d: %w", ruleID, insert.host, insert.port, err)
 		}
 	}
@@ -4936,7 +4943,8 @@ func matchStoredUpstream(existing []storedUpstream, consumed []bool, incoming st
 			continue
 		}
 		if exactContent && (row.needsNormalize || row.weight != incoming.weight || row.dynamicDNS != incoming.dynamicDNS ||
-			row.enabled != incoming.enabled || row.maxConnections != incoming.maxConnections || row.originDomain != incoming.originDomain) {
+			row.enabled != incoming.enabled || row.maxConnections != incoming.maxConnections || row.originDomain != incoming.originDomain ||
+			row.healthCheckPath != incoming.healthCheckPath) {
 			continue
 		}
 		return index
@@ -4949,11 +4957,12 @@ func matchStoredUpstream(existing []storedUpstream, consumed []bool, incoming st
 func updateUpstreamTx(ctx context.Context, tx *sql.Tx, row, incoming storedUpstream) error {
 	if !row.needsNormalize && row.host == incoming.host && row.port == incoming.port && row.protocol == incoming.protocol &&
 		row.weight == incoming.weight && row.dynamicDNS == incoming.dynamicDNS &&
-		row.enabled == incoming.enabled && row.maxConnections == incoming.maxConnections && row.originDomain == incoming.originDomain {
+		row.enabled == incoming.enabled && row.maxConnections == incoming.maxConnections && row.originDomain == incoming.originDomain &&
+		row.healthCheckPath == incoming.healthCheckPath {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE upstreams SET host=?, port=?, weight=?, dynamic_dns=?, enabled=?, protocol=?, max_connections=?, origin_domain=? WHERE id=?`,
-		incoming.host, incoming.port, incoming.weight, incoming.dynamicDNS, incoming.enabled, incoming.protocol, incoming.maxConnections, incoming.originDomain, row.id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE upstreams SET host=?, port=?, weight=?, dynamic_dns=?, enabled=?, protocol=?, max_connections=?, origin_domain=?, health_check_path=? WHERE id=?`,
+		incoming.host, incoming.port, incoming.weight, incoming.dynamicDNS, incoming.enabled, incoming.protocol, incoming.maxConnections, incoming.originDomain, incoming.healthCheckPath, row.id); err != nil {
 		return err
 	}
 	return nil

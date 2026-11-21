@@ -16,6 +16,9 @@ export interface Upstream {
   max_connections: number
   // 逐上游回源域名（2026-10-10）：驱动该上游回源 Host 头与 HTTPS SNI；空=跟随后端域名
   origin_domain?: string
+  // 逐上游健康检查路径（JJC-20261121-001）：主动健康检查探测路径逐上游覆盖；
+  // 空=跟随规则级 health_check_path（默认 /）。仅 HTTP 规则可用。
+  health_check_path?: string
 }
 
 export type UpstreamInput = Omit<Upstream, 'id' | 'rule_id'> & {

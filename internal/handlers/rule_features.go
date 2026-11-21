@@ -1555,7 +1555,7 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 		}
 		// 与渲染侧同口径（services.UpstreamEnabledSQLValue 单源，NULL 视禁用）——
 		// 此前 COALESCE(enabled,1) 将遗留 NULL 行视为启用，UI 显示与生成配置分裂。
-		rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), `+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
+		rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), `+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''), COALESCE(health_check_path,'')
 			FROM upstreams u WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
 		if err != nil {
 			return fmt.Errorf("批量读取上游: %w", err)
@@ -1563,7 +1563,7 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 		defer rows.Close()
 		for rows.Next() {
 			var u models.Upstream
-			if err := rows.Scan(&u.ID, &u.RuleID, &u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
+			if err := rows.Scan(&u.ID, &u.RuleID, &u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain, &u.HealthCheckPath); err != nil {
 				return err
 			}
 			result[u.RuleID] = append(result[u.RuleID], u)
@@ -2127,7 +2127,7 @@ func precheckRuleConfig(rule models.LbRule, globalBody int) services.SingleRuleC
 		upstreams = append(upstreams, services.UpstreamConfig{
 			Host: upstream.Host, Port: upstream.Port, Weight: upstream.Weight,
 			Protocol: upstream.Protocol, Enabled: upstream.Enabled, MaxConnections: upstream.MaxConnections,
-			OriginDomain: upstream.OriginDomain,
+			OriginDomain: upstream.OriginDomain, HealthCheckPath: upstream.HealthCheckPath,
 		})
 	}
 	return services.SingleRuleConfig{

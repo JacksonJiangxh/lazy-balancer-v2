@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"lazy-balancer-v2/caddychain"
 )
 
 // 链式回退（chain_fallback）渲染契约（2026-10-09）：
@@ -166,5 +168,57 @@ func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 	}
 	if _, ok := upsOut[1].(map[string]interface{})["host"]; ok {
 		t.Fatalf("规则级与上游级均空时不发射 host（用 dial 地址兜底）: %v", upsOut[1])
+	}
+}
+
+// 逐上游健康检查 path 键发射/不发射形态（JJC-20261121-001）：
+//   - 上游非空 path：发射，双端 roundtrip 后模块侧 ChainUpstream.HealthCheckPath 命中（跨模块真值断言——
+//     chain 渲染产物是本仓 caddychain 模块的直接配置，json 键面即契约）；
+//   - 上游空 path：不发射键面（与 origin_domain 键面同款——空键零漂移）；
+//   - 空白 path 归一为空：不发射。
+func TestBuildChainProxyConfig_perUpstreamHealthPath(t *testing.T) {
+	rule := SingleRuleConfig{
+		CaddyID:              "lb_chain_hcpath",
+		Protocol:             "http",
+		Strategy:             "chain_fallback",
+		EnableActiveHealthCheck: true,
+		HealthCheckPath:      "/hc-rule",
+	}
+	ups := []UpstreamConfig{
+		{Host: "10.0.1.1", Port: 9601, Weight: 1, Protocol: "http", Enabled: true, HealthCheckPath: "/hc-a"},
+		{Host: "10.0.1.2", Port: 9602, Weight: 1, Protocol: "http", Enabled: true}, // 空：回退规则级，不发射
+		{Host: "10.0.1.3", Port: 9603, Weight: 1, Protocol: "http", Enabled: true, HealthCheckPath: "  "}, // 空白归一不发射
+	}
+	cfg := buildChainProxyConfig(rule, ups, chainProxyModeRace)
+	upsOut := cfg["upstreams"].([]interface{})
+	if len(upsOut) != 3 {
+		t.Fatalf("upstreams=%d, want 3", len(upsOut))
+	}
+	if got := upsOut[0].(map[string]interface{})["path"]; got != "/hc-a" {
+		t.Fatalf("上游 0 应发射 path=/hc-a: %v", upsOut[0])
+	}
+	for i := 1; i <= 2; i++ {
+		if _, ok := upsOut[i].(map[string]interface{})["path"]; ok {
+			t.Fatalf("上游 %d 空路径不得发射 path 键（键面零漂移）: %v", i, upsOut[i])
+		}
+	}
+	// 键面契约断言：发射产物必须能被 caddychain.ChainUpstream 原样反序列化（json 键 = path）。
+	hc, ok := cfg["health_check"].(map[string]interface{})
+	if !ok || hc["path"] != "/hc-rule" {
+		t.Fatalf("规则级 health_check.path 应发射: %v", cfg["health_check"])
+	}
+	raw, err := json.Marshal(upsOut[0])
+	if err != nil {
+		t.Fatalf("marshal upstream entry: %v", err)
+	}
+	var lane caddychain.ChainUpstream
+	if err := json.Unmarshal(raw, &lane); err != nil {
+		t.Fatalf("unmarshal to ChainUpstream: %v", err)
+	}
+	if lane.HealthCheckPath != "/hc-a" {
+		t.Fatalf("roundtrip 后车道 HealthCheckPath=%q, want /hc-a（json 键面 path 契约）", lane.HealthCheckPath)
+	}
+	if lane.Dial != "10.0.1.1:9601" {
+		t.Fatalf("roundtrip 既有键面漂移: dial=%q", lane.Dial)
 	}
 }

@@ -1327,7 +1327,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 }
 
 func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapshotStore) (map[string][]models.Upstream, error) {
-	rows, err := store.QueryContext(ctx, `SELECT u.id, u.rule_id, u.host, u.port, COALESCE(u.weight,1), COALESCE(u.dynamic_dns,0), `+UpstreamEnabledSQLValue+`, COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,''), COALESCE(r.protocol,'') FROM upstreams u LEFT JOIN lb_rules r ON r.caddy_id = u.rule_id ORDER BY u.rule_id, u.id`)
+	rows, err := store.QueryContext(ctx, `SELECT u.id, u.rule_id, u.host, u.port, COALESCE(u.weight,1), COALESCE(u.dynamic_dns,0), `+UpstreamEnabledSQLValue+`, COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,''), COALESCE(u.health_check_path,''), COALESCE(r.protocol,'') FROM upstreams u LEFT JOIN lb_rules r ON r.caddy_id = u.rule_id ORDER BY u.rule_id, u.id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照上游: %w", err)
 	}
@@ -1336,7 +1336,7 @@ func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapsho
 	for rows.Next() {
 		var upstream models.Upstream
 		var ruleProtocol string
-		if err := rows.Scan(&upstream.ID, &upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Weight, &upstream.DynamicDNS, &upstream.Enabled, &upstream.Protocol, &upstream.MaxConnections, &upstream.OriginDomain, &ruleProtocol); err != nil {
+		if err := rows.Scan(&upstream.ID, &upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Weight, &upstream.DynamicDNS, &upstream.Enabled, &upstream.Protocol, &upstream.MaxConnections, &upstream.OriginDomain, &upstream.HealthCheckPath, &ruleProtocol); err != nil {
 			return nil, fmt.Errorf("扫描快照上游: %w", err)
 		}
 		// 上游传输归一（单一事实源）：dynamic_dns 废弃列与写侧恒 0 同口径、

@@ -306,6 +306,13 @@ JJC-20261118-002 混布池分支，mode 由 `chainProxyModeFor` 单源推导）�
   后探测收敛，重载即新实例不持久化）；**全灭不专判**：全部车道 unhealthy 时真实请求
   照常放行到全部车道（防探测器误判全站 502），502/504 收尾语义不变；**差异口径**：
   被动 5xx 摘除已于 2026-11-20 落地（见下条），原「仅主动探测」口径核销。
+  **逐上游探测路径（2026-11-21 JJC-20261121-001）**：chain 车道携带逐上游 HC
+  探测路径——`healthMonitor` 装配 `healthMonitor.paths` 逐车道有效路径
+  （车道 `ChainUpstream.HealthCheckPath`（json 键 `path`）覆盖>规则级
+  `health_check` 键的 `path` 兜底），`probe(idx)` 取 `m.paths[idx]`；路径
+  规格化与规则级同口径（TrimSpace + 缺 `/` 前缀补齐）；渲染侧
+  `buildChainProxyConfig` 逐上游非空发射 `path` 键（空不发射=键面零漂移，
+  与 origin_domain 同款）。uniform 域承载（route D 聚合探针）见 §30。
 - **被动 5xx 摘除（2026-11-20 JJC-20261120-002）**：chain 分支恒发射
   `passive_health_check` 键（**空对象**——模块侧 `passiveMonitor` 恒启用零配置，
   缺省 fail_duration=90s=uniform 渲染 interval 缺省 30s×3、max_fails=3、
@@ -526,4 +533,63 @@ SNI 分流、外部直连终结口入站」在协议层成立；而非 allow 源
 host:port）单源把守，导入链（v2 备份 `validateRuleFeatures` 输入补
 Domain/PassthroughUpstream）走同一门。v1（nginx）源无透传语义，转换器恒不
 产出 passthrough，手造携带按「v1 导出格式不支持 TLS 透传」显性跳过。
+
+---
+
+## §30 uniform 域逐后端健康检查路径承载（JJC-20261121-001，route D 终稿）
+
+逐后端独立健康检查路径（董事长自研第 6 项，2026-11-21；登记见
+docs/self-developed-features.zh-CN.md 第 6 项）。upstreams 表新增
+`health_check_path` 列（循 origin_domain 同款模式：fresh DDL +
+newColumnsRegistry 幂等补列 + 主键重建 DDL 三处同形），空=跟随规则级
+`health_check_path`（渲染默认 `/`）、非空=该后端独立探测路径。
+
+**稳态部分（照写有效）**：无任一后端设独立路径的规则全程走原 HC
+链路，渲染产物与升级前逐字节一致（R5 零漂移）。chain 域（`chain_proxy`）
+为方案 B：车道携带逐上游路径、`healthMonitor` 装配 `healthMonitor.paths`
+逐车道有效路径（车道覆盖>规则级兜底）、`probe(idx)` 取 `m.paths[idx]`——
+见 §22 逐上游探测路径段。TCP/透传规则拒绝非空逐上游路径
+（无路径语义面）；TCP 存量残留启动清零（`TCPRuleUpstreamHealthPathResetSQL`，
+与 origin_domain 备份自毒同族）。
+
+**uniform 域终稿（route D，门下终裁 2026-11-21）**：Caddy 原生
+`health_checks.active.uri` 是 handler 级单值（上游 v2.11.7 upstreams 结构体
+无 HC 字段；`doActiveHealthCheck` 的 `u.Path` 恒取 `HealthChecks.Active.uri`，
+raw 源码逐字核实），逐上游语义在原生 HC 上不可表达——借用官方
+**`health_upstream` 中间服务模式**（`ActiveHealthChecks.Upstream`，v2.11.7
+实证）：**路径分歧规则**（主动 HC 启用 ∧ 启用上游有效路径与规则级基准任一
+不同，`effectiveUpstreamHealthPaths` 三级回退 + `healthProbePathsDiverge`
+判定）的探针改打面板回环聚合端点——
+
+- 发射面（`buildHTTPHandleChain` HC 分歧分支）：`active.uri` =
+  `perUpstreamProbeURI(ruleID)`（`/lb-hc-probe/<ruleID>`）、`active.upstream`
+  = `127.0.0.1:PanelPort()`、`active.headers` 发射 `Host` 与
+  `X-LB-Probe-Target`（均取 `{http.reverse_proxy.active.target_upstream}`
+  占位符——官方在探测路径将其 Set 为逐上游 dial 地址，`doActiveHealthCheck`
+  实证）；`timeout/interval/passes/fails` 与原生单路径形态逐字段同构；
+  HTTPS 上游规则 transport tls 块按官方 `except_ports` 语义豁免面板口
+  （防 `OverrideHealthCheckScheme` 把明文探针强制升 https——`httptransport.go`
+  实证：tls 非空 ∧ 探测端口不在豁免表 → scheme 强制 https）。
+- 面板端（`internal/services/upstream_health_probe.go`）：渲染前
+  `perUpstreamProbeRegistrySnapshot` 快照 + 清空收集器 → 渲染中
+  `registerPerUpstreamProbeRule`/`buildProbeRuleDef` 累积分歧规则登记面 →
+  成功出口 `commitPerUpstreamProbeRegistry` 原子替换 → 失败出口
+  `restorePerUpstreamProbeRegistry` 还原（端点寻址面必须与运行配置强一致）。
+  端点 `HandlePanelProbe`（gin 挂线 `middleware.go` 认证组外，GET/HEAD，
+  自守卫仅回环 403 面）：按规则 ID + `X-LB-Probe-Target` 头定位该上游的
+  有效探测路径，`probeUpstreamHealth` 真实探测（scheme=上游协议；Host=
+  健康检查域名三级回退与原生 probe 同源；TLS skip-verify 与数据面同语义；
+  超时=规则级 `health_check_timeout`、0 兜底 5s、共享 client 30s 上限），
+  回 2xx（健康）/502（失败）；未知/漂移目标 502（失败语义，渲染漂移被
+  下一次成功渲染纠偏）。
+- **状态机归属（⑩⑪ 已定夺）**：探测状态机/摘除恢复/指标全部保留 Caddy
+  原生实现（health_upstream 模式探测结果按各 upstream 记账），面板侧
+  **零状态机、零落库、零渲染期摘除**——方案 C 的「面板探测器+渲染期摘除+
+  apply 重渲染」整线废弃。动态 DNS 池规则不参与分歧承载（官方明文 active
+  HC 不运行于 dynamic upstreams，探测面不存在）。
+
+**边界（稳态）**：uniform 域逐后端探测与 `cmd/server/healthcheck.go` 容器
+探针无关（后者探测面板自身端口，PANEL_PORT 联动，见 ports-and-config
+同族登记）。承载函数实名与 chain 车道字段见登记第 6 项符号清单（已实名
+冻结，逐条可 grep 核验）。
 

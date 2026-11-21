@@ -47,7 +47,7 @@ type versionAnchor struct {
 var versionAnchors = []versionAnchor{
 	{
 		file:        "docker-compose.yml",
-		pattern:     regexp.MustCompile(`(?m)^\s*image:\s*\S*lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+)(?:-beta)?`),
+		pattern:     regexp.MustCompile(`(?m)^\s*image:\s*\S*lazy-balancer-v2:(v[0-9]+\.[0-9]+\.[0-9]+(?:-beta)?|latest)`),
 		minimumHits: 2,
 		note:        "compose 两处 image tag（主/从节点）",
 		group:       groupStable,
@@ -141,6 +141,13 @@ func TestVersionHardcodingPointsMatchDockerfileArg(t *testing.T) {
 						anchor.file, anchor.note, got, version)
 				}
 			case groupStable:
+				if got == "latest" {
+					// 43560be2（JJC-20261117-002 B2）起 fork 镜像发布面走滚动
+					// latest（不逐版本改 compose）：latest 即「跟随最近稳定版」，
+					// 对账时归一为 stableExpected（JJC-20261121-001 存量修复——
+					// 该锚点自镜像切 latest 起对不上语义化版本，恒 0 命中红）。
+					got = stableExpected
+				}
 				stableSeen[got] = true
 			}
 		}

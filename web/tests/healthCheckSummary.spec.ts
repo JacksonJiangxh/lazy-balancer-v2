@@ -52,6 +52,24 @@ test('被动摘要只用失败阈值，恢复窗口是间隔的 3 倍且不宣�
   assert.doesNotMatch(text, /超时|连续 5 次/)
 })
 
+test('逐上游路径分歧摘要点名覆盖数，全同/未携带形态不追加', () => {
+  // 分歧：2/3 后端覆盖（一条跟随规则级）
+  const diverged = activeHealthCheckSummary({
+    ...httpActive,
+    upstream_health_check_paths: ['/hz1', '/healthz', '/hz3'],
+  })
+  assert.ok(diverged.includes('逐上游路径覆盖 2/3 个后端'), diverged)
+  // 全同（全部跟随规则级 /healthz）：不追加覆盖行
+  const same = activeHealthCheckSummary({
+    ...httpActive,
+    upstream_health_check_paths: ['/healthz', '/healthz'],
+  })
+  assert.ok(!same.includes('逐上游路径覆盖'), same)
+  // 旧载荷形态（未携带字段）：不追加
+  const legacy = activeHealthCheckSummary({ ...httpActive })
+  assert.ok(!legacy.includes('逐上游路径覆盖'), legacy)
+})
+
 test('摘要按开关选分支：主动开启不再打印被动行', () => {
   assert.equal(healthCheckSummary(httpActive), activeHealthCheckSummary(httpActive))
   const passive = { ...httpActive, enable_active_health_check: false }

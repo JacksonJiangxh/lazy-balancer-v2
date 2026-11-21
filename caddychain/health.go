@@ -91,7 +91,10 @@ type healthMonitor struct {
 	cfg  *ChainHealthCheck
 	low  int // expect 闭区间下界
 	high int // expect 闭区间上界
-	path string
+	// path 规则级探测路径（兜底源：车道未配置 health_check_path 时消费；
+	// newHealthMonitor 归一含前导 / 补齐）。逐车道覆盖面见 paths。
+	path   string
+	paths  []string // 逐车道有效探测路径（JJC-20261121-001）：车道覆盖>规则级兜底；与 Upstreams 同序同长
 
 	mu     sync.Mutex
 	states []laneHealthState
@@ -127,6 +130,19 @@ func newHealthMonitor(h *ChainProxy) (*healthMonitor, error) {
 	}
 	if !strings.HasPrefix(m.path, "/") {
 		m.path = "/" + m.path
+	}
+	// 逐车道探测路径解析（JJC-20261121-001）：车道 HealthCheckPath 非空优先
+	//（独立归一——前导 / 补齐），空则回退规则级归一结果（m.path）。
+	m.paths = make([]string, len(h.Upstreams))
+	for i, up := range h.Upstreams {
+		p := strings.TrimSpace(up.HealthCheckPath)
+		if p == "" {
+			p = m.path
+		}
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		m.paths[i] = p
 	}
 	if cfg.HealthyLag <= 0 {
 		cfg.HealthyLag = DefaultHCHealthyLag
@@ -177,7 +193,8 @@ func (m *healthMonitor) probeAll() {
 
 // probe 单车道探测：scheme=车道 Scheme（空=http）；Host=回源 Host 单源
 // （上游 host_header > 规则级 > dial 的三级回退结果，与数据面严格一致）；
-// 复用 transportFor（SNI 派生与连接池与数据面同源）。
+// path=逐车道有效探测路径（车道 health_check_path > 规则级 Path 兜底，
+// JJC-20261121-001）；复用 transportFor（SNI 派生与连接池与数据面同源）。
 func (m *healthMonitor) probe(idx int) bool {
 	up := m.h.Upstreams[idx]
 	scheme := up.Scheme
@@ -188,7 +205,7 @@ func (m *healthMonitor) probe(idx int) bool {
 	if host == "" {
 		host = up.Dial
 	}
-	u := &url.URL{Scheme: scheme, Host: up.Dial, Path: m.path}
+	u := &url.URL{Scheme: scheme, Host: up.Dial, Path: m.paths[idx]}
 	timeout := time.Duration(m.cfg.TimeoutMS) * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

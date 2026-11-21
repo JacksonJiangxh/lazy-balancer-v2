@@ -2862,13 +2862,21 @@ func createLegacyLbRulesTables(t *testing.T, database *sql.DB, variant legacyLbR
 		forward_auth_copy_headers TEXT NOT NULL DEFAULT ''`)
 	}
 	schema.WriteString("\n);")
+	// upstreams 侧变体与 lb_rules 侧同约定（上方「真实启动序」注释）：直调
+	// migrateLbRulesPrimaryKey 的用例不经 runMigrations——newColumnsRegistry
+	// 登记列（origin_domain 2026-10-11、health_check_path JJC-20261121-001）
+	// 必须写进夹具 DDL 模拟 ensureNewColumns 补列后形态，否则重建拷贝 SQL
+	// 直报 no such column。legacyUpstreamsLegacy 保持真实最早历史形态
+	// （无任何 newColumns 列），仅供 Initialize 全链测试消费（真实启动序
+	// ensureNewColumns 先补列，重建时形态已收敛）。
 	switch variant.upstreams {
 	case legacyUpstreamsMinimal:
 		schema.WriteString(`
 	CREATE TABLE upstreams (
 		id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
 		weight INTEGER, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, max_connections INTEGER,
-		origin_domain TEXT NOT NULL DEFAULT ''
+		origin_domain TEXT NOT NULL DEFAULT '',
+		health_check_path TEXT NOT NULL DEFAULT ''
 	);`)
 	case legacyUpstreamsLegacy:
 		schema.WriteString(`
@@ -2882,7 +2890,8 @@ func createLegacyLbRulesTables(t *testing.T, database *sql.DB, variant legacyLbR
 	CREATE TABLE upstreams (
 		id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
 		weight INTEGER, domain TEXT, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, host_header TEXT,
-		dns_server TEXT, max_connections INTEGER, proxy_protocol TEXT, origin_domain TEXT NOT NULL DEFAULT ''
+		dns_server TEXT, max_connections INTEGER, proxy_protocol TEXT, origin_domain TEXT NOT NULL DEFAULT '',
+		health_check_path TEXT NOT NULL DEFAULT ''
 	);`)
 	}
 	if _, err := database.Exec(schema.String()); err != nil {

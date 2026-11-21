@@ -688,6 +688,19 @@
                   </el-tooltip>
                 </template>
               </el-table-column>
+              <el-table-column min-width="124" v-if="wizardForm.protocol === 'http' && wizardForm.enable_active_health_check">
+                <template #header>
+                  探测路径<FieldHelpIcon content="该上游独立的主动健康检查路径（/ 开头）。留空=跟随规则级检查路径（默认 /）；填入独立路径后该后端按自己的路径探测。仅当至少一个后端配置独立路径时生效（逐后端探测通道）" />
+                </template>
+                <template #default="{ row }">
+                  <el-input
+                    v-model="row.health_check_path"
+                    :placeholder="`留空=跟随 ${wizardForm.health_check_path || '/'}`"
+                    size="small"
+                    class="upstream-input"
+                  />
+                </template>
+              </el-table-column>
               <el-table-column width="80">
                 <template #header>
                   权重 %<FieldHelpIcon :content="wizardForm.strategy === 'chain_fallback'
@@ -1263,6 +1276,9 @@
           </el-table-column>
           <el-table-column v-if="ruleConfig?.protocol !== 'tcp'" label="回源Host">
             <template #default="{ row }">{{ row.origin_domain || '跟随规则/自身地址' }}</template>
+          </el-table-column>
+          <el-table-column v-if="ruleConfig?.protocol === 'http' && ruleConfig?.enable_active_health_check" label="探测路径">
+            <template #default="{ row }">{{ row.health_check_path || `跟随规则级（${ruleConfig?.health_check_path || '/'}）` }}</template>
           </el-table-column>
           <el-table-column label="权重" align="center">
             <template #default="{ row }">{{ weightPercent(ruleConfig?.upstreams, row) }}%</template>
@@ -2324,6 +2340,7 @@ const defaultUpstream = (protocol: UpstreamProtocol = 'http'): UpstreamInput => 
   protocol,
   max_connections: 0,
   origin_domain: '',
+  health_check_path: '',
 })
 
 const pathRuleUpstreamsToPercent = (upstreams: readonly PathRuleUpstream[] | null | undefined): PathRuleUpstream[] | null => {

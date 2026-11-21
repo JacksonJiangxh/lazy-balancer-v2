@@ -82,6 +82,7 @@ func TestGenerateCaddyConfig_toleratesNullEnabledUpstream(t *testing.T) {
 		protocol VARCHAR(10) DEFAULT 'http',
 		max_connections INTEGER DEFAULT 0,
 		origin_domain TEXT NOT NULL DEFAULT '',
+		health_check_path TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	)`); err != nil {
 		t.Fatalf("recreate legacy upstreams: %v", err)

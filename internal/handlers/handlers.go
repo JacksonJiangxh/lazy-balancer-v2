@@ -775,6 +775,25 @@ func validateRuleHealthCheckPath(path string) error {
 	return nil
 }
 
+// validateUpstreamHealthCheckPath 逐上游健康检查路径值域门（JJC-20261121-001）：
+// 与规则级 validateRuleHealthCheckPath 同口径（/ 开头）+ 长度与字符集收紧
+// （路径面写入 Caddy 探测 URL 与面板聚合端点寻址面，空白/控制字符一律拒绝；
+// 长度对齐规则级列 VARCHAR(255) 的容量语义）。
+func validateUpstreamHealthCheckPath(path string) error {
+	if strings.HasPrefix(path, "/") == false {
+		return fmt.Errorf("健康检查路径必须以 / 开头")
+	}
+	if len(path) > 255 {
+		return fmt.Errorf("健康检查路径长度不能超过 255 字符")
+	}
+	for _, r := range path {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("健康检查路径不能包含空白或控制字符")
+		}
+	}
+	return nil
+}
+
 // upstreamDedupeHost 是「同一后端」判重的单源主机形态。
 //
 // 判重必须按地址语义而不是文本：2001:db8::1 与 2001:0db8:0:0:0:0:0:1 是同一个
@@ -843,6 +862,17 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 			}
 			if !isValidHost(u.OriginDomain) {
 				return 0, fmt.Errorf("上游 #%d：回源域名 %q 无效（仅支持主机名，不带端口）", i+1, u.OriginDomain)
+			}
+		}
+		// 逐上游健康检查路径（JJC-20261121-001）：仅 HTTP 规则（TCP/passthrough
+		// 无路径探测面，保存族拒绝携带——与回源域名门同格）；值域门
+		// validateUpstreamHealthCheckPath（/ 开头、≤255、禁空白与控制字符）。
+		if u.HealthCheckPath != "" {
+			if protocol != "http" {
+				return 0, fmt.Errorf("上游 #%d：健康检查路径仅 HTTP 规则支持", i+1)
+			}
+			if err := validateUpstreamHealthCheckPath(u.HealthCheckPath); err != nil {
+				return 0, fmt.Errorf("上游 #%d：%w", i+1, err)
 			}
 		}
 		if u.Enabled {

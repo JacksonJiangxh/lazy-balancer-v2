@@ -257,7 +257,7 @@ func joinColumnGroups(groups ...[]string) string {
 
 var clusterSyncedTables = []clusterSyncedTable{
 	{name: "lb_rules", snapshotColumns: lbRuleSnapshotColumns},
-	{name: "upstreams", snapshotColumns: "id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain"},
+	{name: "upstreams", snapshotColumns: "id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain,health_check_path"},
 	// path_rules OF 列表与读投影单源（db.PathRuleSelectColumns）同源：
 	// 快照读哪些列，写哪些列就 bump——新增列只改单源两侧同步。
 	{name: "path_rules", snapshotColumns: db.PathRuleSelectColumns("")},

@@ -155,9 +155,11 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 // TCP 规则的上游 origin_domain 同属死值（回源域名仅 HTTP 回源使用，保存族
 // 自引入起即拒绝 TCP 携带）——存储/传输面残留会让主端备份在导入校验被整包
 // 拒绝（备份自毒），且随 rules 节同步到从端；故按 ruleProtocol 一并清零。
+// 逐上游健康检查路径同族（JJC-20261121-001，仅 HTTP 消费），同批归一。
 func normalizeUpstreamForTransport(upstream *models.Upstream, ruleProtocol string) {
 	upstream.DynamicDNS = false
 	if ruleProtocol == "tcp" {
 		upstream.OriginDomain = ""
+		upstream.HealthCheckPath = ""
 	}
 }

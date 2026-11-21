@@ -47,6 +47,12 @@ type ChainUpstream struct {
 	// Weight 权重（wrr 模式消费；race 模式忽略——race 以数组序即权重降序
 	// 为优先级）。<=0 按 1 兜底。生成侧与上游同源权重发射。
 	Weight int `json:"weight,omitempty"`
+	// HealthCheckPath 逐车道主动健康检查探测路径覆盖（JJC-20261121-001）：
+	// 键面 path（与渲染侧 buildChainProxyConfig 逐上游 path 键同源）；空=跟随
+	// 规则级 HealthCheck.Path（规则级亦空时模块缺省 /）；非空=该车道独立探测
+	// 路径（无前导 / 由 HC 子系统归一补齐）。渲染侧仅非空发射（与 origin_domain
+	// 键面同款——空键零漂移）。
+	HealthCheckPath string `json:"path,omitempty"`
 }
 
 // Default* 与面板写侧默认值同口径（rules.go CreateRule / caddy.go 渲染兜底）。

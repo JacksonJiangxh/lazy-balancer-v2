@@ -756,6 +756,14 @@ func (g recordingRouterGroup) DELETE(path string, handlers ...gin.HandlerFunc) {
 	g.record(http.MethodDelete, path)
 }
 
+// ginWrapStdHandler 把标准库 handler 适配为 gin.HandlerFunc（逐上游健康检查
+// 聚合探针端点挂载用；c.Next 不调用——标准库形态无需 gin 链续传）。
+func ginWrapStdHandler(h http.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h(c.Writer, c.Request)
+	}
+}
+
 func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	services.ApplyLogLevel()
 
@@ -822,6 +830,13 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+
+	// 逐上游健康检查聚合探针端点（JJC-20261121-001）：Caddy health_upstream
+	// 模式的探测落点（GET /lb-hc-probe/<ruleID>，X-LB-Probe-Target 定位真实
+	// 上游）。注册在认证组之外（Caddy 探测无面板凭据），自守卫：仅回环来源
+	// 放行（HandlePanelProbe 内 403）、GET/HEAD 限定、路径含 "/" 拒绝。
+	r.GET(services.PanelProbeGinPath, ginWrapStdHandler(services.HandlePanelProbe))
+	r.HEAD(services.PanelProbeGinPath, ginWrapStdHandler(services.HandlePanelProbe))
 
 	// API routes
 	v1 := r.Group("/api/v1")

@@ -220,6 +220,9 @@ func run() error {
 	// 代理默认监听口注入渲染层（兜底站/跳转判定/保留端口判定同源；只影响默认语义）。
 	// 详见 docs/fork-notes/watchdog-and-server.md §4
 	services.SetDefaultProxyPorts(cfg.HTTPPort, cfg.HTTPSPort)
+	// 面板口注入渲染层（JJC-20261121-001）：逐上游健康检查路径分歧形态的
+	// health_upstream 指向面板回环聚合探针端点（127.0.0.1:<面板口>）。
+	services.SetPanelPort(cfg.Port)
 	// 引用型证书外部更新自动摄取：看门狗回写 DB 后复用同一强制重载执行体（必须 force）。
 	// 详见 docs/fork-notes/watchdog-and-server.md §5
 	services.SetReferencedCertReload(caddyReloader)

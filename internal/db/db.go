@@ -600,6 +600,10 @@ func createTables() error {
 		max_connections INTEGER DEFAULT 0,
 		-- 逐上游回源域名（2026-10-10）：驱动该上游回源 Host 头与 HTTPS SNI，空=跟随规则后端域名。
 		origin_domain TEXT NOT NULL DEFAULT '',
+		-- 逐上游健康检查路径（JJC-20261121-001）：主动健康检查探测路径覆盖，
+		-- 空=跟随规则级 health_check_path（渲染默认 /）；非空=该上游独立探测路径。
+		-- 仅 HTTP 规则消费（TCP/passthrough 无路径面，写侧拒绝、残留启动清零）。
+		health_check_path TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	);
 	CREATE INDEX IF NOT EXISTS idx_upstreams_rule_enabled_id ON upstreams(rule_id, enabled, id);
@@ -1196,7 +1200,11 @@ var newColumnsRegistry = map[string]string{
 	// 重建 DDL 与读路径（lbRuleColumns/快照 SELECT）依赖其存在；新列绝不进
 	// deadColumnDrops/legacy*DeadColumns 死列清单。
 	"lb_rules.passthrough_upstream": "TEXT NOT NULL DEFAULT ''",
-	"auto_backups.app_version":      "TEXT NOT NULL DEFAULT ''",
+	// 逐上游健康检查路径（JJC-20261121-001）：active 探测路径逐上游覆盖，
+	// 空=跟随规则级 health_check_path。仅 HTTP 规则消费；TCP 残留由
+	// TCPRuleUpstreamHealthPathResetSQL 与 origin_domain 同批清零（备份自毒同族）。
+	"upstreams.health_check_path": "TEXT NOT NULL DEFAULT ''",
+	"auto_backups.app_version":    "TEXT NOT NULL DEFAULT ''",
 	// 统一任务引擎：手动触发操作者归因列——runNow/Trigger 落
 	// 操作者，auto/startup/legacy 落空串。存量库幂等补列（ensureNewColumns）。
 	"task_runs.operator":                    "TEXT NOT NULL DEFAULT ''",
@@ -5208,6 +5216,7 @@ func migrateLbRulesPrimaryKey() error {
 		protocol VARCHAR(10) DEFAULT 'http',
 	max_connections INTEGER DEFAULT 0,
 origin_domain TEXT NOT NULL DEFAULT '',
+health_check_path TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	)
 `)
@@ -5217,9 +5226,9 @@ origin_domain TEXT NOT NULL DEFAULT '',
 
 		// Copy data from old upstreams table to new (convert rule_id from int to string)
 		_, err = tx.Exec(`
-	INSERT INTO upstreams_new (id, rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
+	INSERT INTO upstreams_new (id, rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain, health_check_path)
 	SELECT u.id, r.caddy_id, u.host, u.port, u.weight, u.dynamic_dns, COALESCE(u.enabled, 0), u.protocol,
-		       COALESCE(u.max_connections, 0), COALESCE(u.origin_domain, '')
+		       COALESCE(u.max_connections, 0), COALESCE(u.origin_domain, ''), COALESCE(u.health_check_path, '')
 		FROM upstreams u
 		JOIN lb_rules r ON u.rule_id = r.id
 	`)
@@ -5746,6 +5755,15 @@ const TCPRulePathRulesResetSQL = `DELETE FROM path_rules WHERE rule_id IN (SELEC
 const TCPRuleUpstreamOriginResetSQL = `UPDATE upstreams SET origin_domain=''
 	WHERE COALESCE(origin_domain,'')<>'' AND rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
 
+// TCPRuleUpstreamHealthPathResetSQL：TCP 规则上游健康检查路径残留清零——
+// health_check_path 仅 HTTP 规则消费（TCP/passthrough 无路径探测面，保存族
+// 拒绝携带），残留行随 rules 节同步到从端并让系统自身导出的备份在导入校验被
+// 整包 400 拒绝（备份自毒，与 TCPRuleUpstreamOriginResetSQL 同族）。启动迁移
+// 与导入归一共用同一字面量单源。passthrough 不清零——透传规则上游存单值列、
+// upstreams 表零行，本谓词天然不命中。
+const TCPRuleUpstreamHealthPathResetSQL = `UPDATE upstreams SET health_check_path=''
+	WHERE COALESCE(health_check_path,'')<>'' AND rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
+
 // tcpDeadFieldsProbeSQL 死值探测（与下方 UPDATE 同谓词 + TCP 孤儿路径规则）：
 // 无命中时零写事务、零版本扰动。谓词必须与 UPDATE WHERE 逐字对齐（改一侧
 // 必改另一侧）。
@@ -5768,7 +5786,7 @@ func migrateTCPRuleDeadFields() error {
 	if stale == 0 {
 		return nil
 	}
-	var affected, removedPathRules, clearedOrigins int64
+	var affected, removedPathRules, clearedOrigins, clearedHCPaths int64
 	if err := withWriteTx("TCP dead-field cleanup", func(tx *sql.Tx) error {
 		res, err := tx.Exec(TCPRuleDeadFieldsResetSQL)
 		if err != nil {
@@ -5800,7 +5818,17 @@ func migrateTCPRuleDeadFields() error {
 		if err != nil {
 			return fmt.Errorf("failed to read cleared TCP upstream origin count: %w", err)
 		}
-		if affected > 0 || removedPathRules > 0 || clearedOrigins > 0 {
+		// TCP 上游健康检查路径残留同批清零（JJC-20261121-001，仅 HTTP 消费，
+		// 与 origin_domain 备份自毒同族）。
+		hcPathRes, err := tx.Exec(TCPRuleUpstreamHealthPathResetSQL)
+		if err != nil {
+			return fmt.Errorf("failed to zero TCP upstream health check path: %w", err)
+		}
+		clearedHCPaths, err = hcPathRes.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to read cleared TCP upstream health check path count: %w", err)
+		}
+		if affected > 0 || removedPathRules > 0 || clearedOrigins > 0 || clearedHCPaths > 0 {
 			// 快照缓存随版本失效；bump 让从端下一轮拉到归一后 canonical，
 			// rules 节哈希两侧收敛（「分区滞后」自愈）。
 			if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
@@ -5811,10 +5839,10 @@ func migrateTCPRuleDeadFields() error {
 	}); err != nil {
 		return err
 	}
-	if affected > 0 || removedPathRules > 0 || clearedOrigins > 0 {
+	if affected > 0 || removedPathRules > 0 || clearedOrigins > 0 || clearedHCPaths > 0 {
 		// 用户规则数据被改写须留痕（与 TCP stale DNS / legacy HTTPS /
 		// 孤儿 upstream 三个姊妹迁移同口径，聚合一行+计数）。
-		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（含路径规则 %d 条、上游回源域名 %d 条；主端库/导出 canonical/从端落库三面同值）", affected, removedPathRules, clearedOrigins)
+		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（含路径规则 %d 条、上游回源域名 %d 条、上游健康检查路径 %d 条；主端库/导出 canonical/从端落库三面同值）", affected, removedPathRules, clearedOrigins, clearedHCPaths)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}

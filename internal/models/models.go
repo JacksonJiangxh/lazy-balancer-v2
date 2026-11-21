@@ -371,6 +371,9 @@ type Upstream struct {
 	// 逐上游回源域名（2026-10-10）：非空时驱动该上游回源 Host 头与 HTTPS SNI
 	// （map 处理器晚绑定查表）；空=跟随规则级 HostHeader/现状默认。
 	OriginDomain string `json:"origin_domain,omitempty"`
+	// 逐上游健康检查路径（JJC-20261121-001）：主动健康检查探测路径逐上游覆盖，
+	// 空=跟随规则级 health_check_path（渲染默认 /）。仅 HTTP 规则消费。
+	HealthCheckPath string `json:"health_check_path,omitempty"`
 }
 
 type PathRuleUpstream struct {

@@ -170,5 +170,17 @@ func TestRuleToolSchemasDocumentWriteSideConstraints(t *testing.T) {
 		if !strings.Contains(originDescription, "dynamic_dns") || !strings.Contains(originDescription, "TCP") {
 			t.Errorf("%s: upstreams[].origin_domain 描述未说明 dynamic_dns/TCP 规则不支持", name)
 		}
+		// 逐上游健康检查路径（JJC-20261121-001）：schema 面披露仅 HTTP、
+		// 留空跟随规则级、分歧形态走聚合探针。
+		hcPath, ok := itemProperties["health_check_path"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: upstreams[].health_check_path 缺失", name)
+		}
+		hcPathDescription, _ := hcPath["description"].(string)
+		for _, required := range []string{"仅 HTTP", "跟随规则级", "聚合探针"} {
+			if !strings.Contains(hcPathDescription, required) {
+				t.Errorf("%s: upstreams[].health_check_path 描述缺少 %q", name, required)
+			}
+		}
 	}
 }

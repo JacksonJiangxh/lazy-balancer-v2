@@ -603,7 +603,7 @@ func TestUpstreamsRebuildSchema_matchesFreshDDL(t *testing.T) {
 	createLegacyLbRulesTables(t, legacyDB, legacyLbRulesSchema{withCaddyID: true, withStagePages: true, withNewHealthCols: true, upstreams: legacyUpstreamsLegacyOrigin})
 	if _, err := legacyDB.Exec(`
 		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id) VALUES (7, 'legacy', 'http', 8080, 'lb_upstreams_parity');
-		INSERT INTO upstreams (id, rule_id, host, port, max_connections, origin_domain) VALUES (9, 7, '127.0.0.1', 8443, 37, 'origin.example');
+		INSERT INTO upstreams (id, rule_id, host, port, max_connections, origin_domain, health_check_path) VALUES (9, 7, '127.0.0.1', 8443, 37, 'origin.example', '/hc-keep');
 	`); err != nil {
 		t.Fatalf("seed legacy schema: %v", err)
 	}
@@ -616,12 +616,15 @@ func TestUpstreamsRebuildSchema_matchesFreshDDL(t *testing.T) {
 	// Then upstreams 重建形状与 fresh 逐列一致，行数据保留
 	assertShapeMatchesFresh(t, "upstreams", freshShape, tablePragmaShape(t, legacyDB, "upstreams"))
 	var maxConnections int
-	var originDomain string
-	if err := legacyDB.QueryRow(`SELECT max_connections, origin_domain FROM upstreams WHERE id=9`).Scan(&maxConnections, &originDomain); err != nil {
+	var originDomain, hcPath string
+	if err := legacyDB.QueryRow(`SELECT max_connections, origin_domain, health_check_path FROM upstreams WHERE id=9`).Scan(&maxConnections, &originDomain, &hcPath); err != nil {
 		t.Fatalf("read rebuilt upstream: %v", err)
 	}
 	if maxConnections != 37 || originDomain != "origin.example" {
 		t.Fatalf("rebuilt upstream=(%d,%q), want (37,origin.example)（用户值必须随重建保留）", maxConnections, originDomain)
+	}
+	if hcPath != "/hc-keep" {
+		t.Fatalf("rebuilt upstream health_check_path=%q, want /hc-keep（逐上游健康检查路径 JJC-20261121-001 用户值必须随重建保留，server_map_lat/lon 先例）", hcPath)
 	}
 }
 

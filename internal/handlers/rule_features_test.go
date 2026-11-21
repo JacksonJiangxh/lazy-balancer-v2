@@ -977,6 +977,9 @@ func simulateLegacyNullableLbRules(t *testing.T, database *sql.DB) {
 
 // simulateLegacyNullableUpstreams 把 upstreams 回退为迁移前的可空 enabled 结构
 // （schema 已 NOT NULL，NULL 仅存在于迁移前存量库），供测试构造遗留 NULL 行。
+// newColumns 登记列（origin_domain/health_check_path）保持 NOT NULL DEFAULT ''
+// ——本夹具模拟的是「迁移前存量库经 ensureNewColumns 补列后」的形态（真实
+// 启动序补列先于一切读写），读侧 COALESCE 投影含全列，缺列即 no such column。
 func simulateLegacyNullableUpstreams(t *testing.T, database *sql.DB) {
 	t.Helper()
 	if _, err := database.Exec(`DROP TABLE upstreams`); err != nil {
@@ -993,6 +996,7 @@ func simulateLegacyNullableUpstreams(t *testing.T, database *sql.DB) {
 		protocol VARCHAR(10) DEFAULT 'http',
 		max_connections INTEGER DEFAULT 0,
 		origin_domain TEXT NOT NULL DEFAULT '',
+		health_check_path TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	)`); err != nil {
 		t.Fatalf("recreate legacy upstreams: %v", err)

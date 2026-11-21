@@ -2115,6 +2115,12 @@ func generateCaddyConfigFromStore(store caddyConfigStore, overrides ...*models.U
 // 导入期 CA 队列已 PauseAndDrain，无并发证书提交，tx 视图即最新真相。
 func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rulesWrittenInTx bool, overrides ...*models.UpdateConfigRequest) map[string]interface{} {
 	var filesSnapshot CertFilesSnapshot
+	// 逐上游健康检查路径分歧规则登记面（JJC-20261121-001）：渲染前快照、
+	// 渲染中经 registerPerUpstreamProbeRule 累积、成功出口原子替换；失败出口
+	// 还原快照（运行配置未变，端点寻址面必须与运行配置一致——渲染中半途
+	// 累积的新登记不得残留）。
+	probeRegistrySnapshot := perUpstreamProbeRegistrySnapshot()
+	resetPerUpstreamProbeCollector()
 	generationFailure := func(format string, args ...any) map[string]interface{} {
 		err := fmt.Errorf(format, args...)
 		Logf("error", "Caddy 配置生成失败；状态：旧配置已保留（启动期则未加载）：%v", err)
@@ -2122,6 +2128,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			err = errors.Join(err, RestoreCertFiles(filesSnapshot))
 			filesSnapshot = nil
 		}
+		restorePerUpstreamProbeRegistry(probeRegistrySnapshot)
 		return map[string]interface{}{caddyConfigGenerationErrorKey: err.Error()}
 	}
 
@@ -2196,7 +2203,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	}
 
 	upstreamRows, err := store.Query(`
-		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), ` + UpstreamEnabledSQLValue + `, COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,'')
+		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), ` + UpstreamEnabledSQLValue + `, COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,''), COALESCE(u.health_check_path,'')
 		FROM upstreams u JOIN lb_rules r ON r.caddy_id = u.rule_id
 		WHERE ` + UpstreamEnabledSQLPredicate + ` AND r.enabled = 1 ORDER BY u.rule_id, u.id
 	`)
@@ -2206,7 +2213,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	for upstreamRows.Next() {
 		var ruleID string
 		var u upstream
-		if err := upstreamRows.Scan(&ruleID, &u.Host, &u.Port, &u.Weight, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
+		if err := upstreamRows.Scan(&ruleID, &u.Host, &u.Port, &u.Weight, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain, &u.HealthCheckPath); err != nil {
 			closeErr := upstreamRows.Close()
 			return generationFailure("scan upstream: %v", errors.Join(err, closeErr))
 		}
@@ -2657,7 +2664,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 					}
 					ruleConfig.Upstreams = append(ruleConfig.Upstreams, UpstreamConfig{
 						Host: u.Host, Port: u.Port, Weight: weight, Protocol: protocol, Enabled: u.Enabled,
-						MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain,
+						MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain, HealthCheckPath: u.HealthCheckPath,
 					})
 				}
 			}
@@ -3249,6 +3256,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	if filesSnapshot != nil {
 		conf[caddyCertFilesSnapshotKey] = filesSnapshot
 	}
+	// 渲染成功出口：本轮累积的分歧规则登记面原子替换注册表（渲染失败出口
+	// 不替换——端点寻址面必须与运行配置一致）。
+	commitPerUpstreamProbeRegistry()
 
 	return conf
 }
@@ -3584,6 +3594,9 @@ type UpstreamConfig struct {
 	// 逐上游回源 Host（三级回退第一档，列名保持 origin_domain 以零迁移；绝不透传客户端 Host）。
 	// 详见 docs/fork-notes/render-chain.md §12
 	OriginDomain string
+	// 逐上游健康检查路径（JJC-20261121-001）：主动健康检查探测路径逐上游覆盖，
+	// 空=跟随规则级 HealthCheckPath（渲染默认 /）。仅 HTTP 规则消费。
+	HealthCheckPath string
 }
 
 // resolveRuleOverrides 规则级覆盖解析（库值唯一真相批 1+2 改造）：
@@ -4435,13 +4448,14 @@ type lbRule struct {
 // upstream 启用上游行（upstreams 表视图）；OriginDomain 为三级回退第一档。
 // 详见 docs/fork-notes/render-chain.md §7
 type upstream struct {
-	Host           string
-	Port           int
-	Weight         int
-	Enabled        bool
-	Protocol       string
-	MaxConnections int
-	OriginDomain   string
+	Host            string
+	Port            int
+	Weight          int
+	Enabled         bool
+	Protocol        string
+	MaxConnections  int
+	OriginDomain    string
+	HealthCheckPath string
 }
 
 // ruleWithUpstreams 生成期规则与其启用上游集合的绑定（包级可见性理由见上）。
@@ -4499,7 +4513,7 @@ func buildPathUpstreamHostResolver(rulesByID map[string]*ruleWithUpstreams) *pat
 			}
 			ups = append(ups, UpstreamConfig{
 				Host: u.Host, Port: u.Port, Weight: u.Weight, Protocol: protocol, Enabled: u.Enabled,
-				MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain,
+				MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain, HealthCheckPath: u.HealthCheckPath,
 			})
 		}
 		for _, u := range entry.upstreams {
@@ -4945,6 +4959,13 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 		if host != "" {
 			entry["host"] = host
 		}
+		// 逐上游健康检查路径（JJC-20261121-001）：chain 域逐车道真承载——
+		// 非空发射 path 键（模块侧车道级覆盖，空回退 health_check.path 规则级
+		// 默认）；空不发射=键面零漂移（与 origin_domain 键面同款），存量规则
+		// 渲染逐字节不变。
+		if p := strings.TrimSpace(u.HealthCheckPath); p != "" {
+			entry["path"] = p
+		}
 		entries = append(entries, entry)
 	}
 	raceIntervalMS := rule.ChainRaceIntervalMS
@@ -5333,6 +5354,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	upstreamList := make([]interface{}, 0, len(enabledUpstreams))
 	upstreamWeights := make([]int, 0, len(enabledUpstreams))
 	hasHTTPSUpstream := false
+	// 逐上游健康检查路径分歧标记（JJC-20261121-001）：函数级作用域——transport
+	// 段（except_ports）与路由出口（聚合探针路由装配）都要消费；非 HTTP 规则
+	// 恒 false（TCP/passthrough 无路径探测面）。
+	probeDivergent := false
 	for _, upstream := range enabledUpstreams {
 		weight := upstream.Weight
 		if weight <= 0 {
@@ -5474,29 +5499,70 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		// L4 无状态码面，故该键只在 HTTP 侧发射。
 		passive["unhealthy_status"] = []int{5}
 		healthChecks := map[string]interface{}{"passive": passive}
+		// 逐上游健康检查路径分歧检测（JJC-20261121-001）：Caddy 单 handler 的
+		// 探测 uri 为 handler 级（healthchecks.go 实证：u.Path 恒取
+		// HealthChecks.Active.uri，无逐上游路径能力），探测 scheme 又会经
+		// OverrideHealthCheckScheme 随 transport TLS 强制升 https。路径分歧形态
+		// 采用官方 health_upstream 中间服务模式：探测打到面板回环聚合探针端点
+		// （/lb-hc-probe/<ruleID>，静态路由按 X-LB-Probe-Target 头定位真实上游，
+		// 面板侧按逐上游有效路径真实探测并回 2xx/5xx）——探测状态机/摘除恢复/
+		// 指标面全部保留 Caddy 原生实现，数据面零改动。HTTPS 上游规则的
+		// transport TLS 加 except_ports=[面板口]（OverrideHealthCheckScheme 实证
+		// 语义：命中豁免口不升 https），探针保持明文打到面板。
+		// probeDivergent 提升到函数级作用域：transport 段（except_ports）与
+		// 聚合探针路由装配（generateHTTPRouteObjects 出口）都要消费。
 		if rule.EnableActiveHealthCheck {
 			// hcPath 空串=「未配置路径」语义（渲染 /），字符串缺省非本批治理范围。
 			hcPath := rule.HealthCheckPath
 			if hcPath == "" {
 				hcPath = "/"
 			}
-			active := map[string]interface{}{
-				"uri":      hcPath,
-				"timeout":  fmt.Sprintf("%ds", hc.timeout),
-				"interval": fmt.Sprintf("%ds", hc.interval),
-				"passes":   hc.passes,
-				"fails":    hc.failing,
+			probePaths := effectiveUpstreamHealthPaths(rule, enabledUpstreams)
+			probeDivergent = healthProbePathsDiverge(hcPath, probePaths)
+			if probeDivergent {
+				registerPerUpstreamProbeRule(buildProbeRuleDef(rule, enabledUpstreams, probePaths, hc))
+				active := map[string]interface{}{
+					// uri 携带规则 ID：同一后端地址被多条分歧规则共享时端点可
+					// 无歧义定位该规则的逐上游路径面（ruleID 为 lb_ 前缀受限字符集，
+					// 路径安全）。timeout/interval/passes/fails 语义与原生单路径
+					// 形态逐字段同构。
+					"uri":      perUpstreamProbeURI(rule.CaddyID),
+					"timeout":  fmt.Sprintf("%ds", hc.timeout),
+					"interval": fmt.Sprintf("%ds", hc.interval),
+					"passes":   hc.passes,
+					"fails":    hc.failing,
+					// health_upstream（v2.11.7 ActiveHealthChecks.Upstream 实证）：
+					// 非空时 probe URL Host 恒取它、探测结果仍按各 upstream 记账
+					// （per-proxy-handler 状态）。headers 值经 replacer 展开，
+					// {http.reverse_proxy.active.target_upstream} 在探测路径被
+					// Set 为逐上游 dial 地址（doActiveHealthCheck 实证）——目标
+					// 定位头与 Host 头同源发射。
+					"upstream": fmt.Sprintf("127.0.0.1:%d", PanelPort()),
+					"headers": map[string]interface{}{
+						"Host":              []string{"{http.reverse_proxy.active.target_upstream}"},
+						"X-LB-Probe-Target": []string{"{http.reverse_proxy.active.target_upstream}"},
+					},
+				}
+				healthChecks["active"] = active
+			} else {
+				active := map[string]interface{}{
+					"uri":      hcPath,
+					"timeout":  fmt.Sprintf("%ds", hc.timeout),
+					"interval": fmt.Sprintf("%ds", hc.interval),
+					"passes":   hc.passes,
+					"fails":    hc.failing,
+				}
+				// 健康检查域名优先于规则级后端域名（probe Host 头特判实证，
+				// healthchecks.go:453-458）；皆空则不输出 headers 键（现状不变）。
+				probeHost := rule.HealthCheckHost
+				if probeHost == "" {
+					probeHost = rule.HostHeader
+				}
+				if probeHost != "" {
+					active["headers"] = map[string]interface{}{"Host": []string{probeHost}}
+				}
+				healthChecks["active"] = active
 			}
-			// 健康检查域名优先于规则级后端域名（probe Host 头特判实证，
-			// healthchecks.go:453-458）；皆空则不输出 headers 键（现状不变）。
-			probeHost := rule.HealthCheckHost
-			if probeHost == "" {
-				probeHost = rule.HostHeader
-			}
-			if probeHost != "" {
-				active["headers"] = map[string]interface{}{"Host": []string{probeHost}}
-			}
-			healthChecks["active"] = active
 		}
 		proxyConfig["health_checks"] = healthChecks
 	}
@@ -5532,10 +5598,18 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			} else if hostPlan.staticHost != "" {
 				serverName = stripOriginPort(hostPlan.staticHost)
 			}
-			transportConfig["tls"] = map[string]interface{}{
+			tlsConfig := map[string]interface{}{
 				"insecure_skip_verify": true,
 				"server_name":          serverName,
 			}
+			// 逐上游健康检查路径分歧形态（JJC-20261121-001）：探针打到面板口
+			// （127.0.0.1:PanelPort），OverrideHealthCheckScheme（httptransport.go
+			// 实证：tls 非空∧探测端口不在 except_ports → scheme 强制 https）会把
+			// 明文探针升 https 致探测全败——按官方 except_ports 语义豁免面板口。
+			if probeDivergent {
+				tlsConfig["except_ports"] = []string{fmt.Sprintf("%d", PanelPort())}
+			}
+			transportConfig["tls"] = tlsConfig
 			if rule.UpstreamForceHTTP1 == 1 && rule.NTLMCompatible != 1 {
 				// 上游强制 HTTP/1.1（通用列，2026-10-12）：Caddy HTTPTransport.Versions
 				// （modules/caddyhttp/reverseproxy/httptransport.go）——限定协议版本集即

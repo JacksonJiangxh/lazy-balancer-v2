@@ -1284,6 +1284,11 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 	if _, err := tx.ExecContext(ctx, db.TCPRuleUpstreamOriginResetSQL); err != nil {
 		return 0, fmt.Errorf("规则 TCP 上游回源域名归一失败: %w", err)
 	}
+	// TCP 上游健康检查路径残留同批归一（JJC-20261121-001，与 origin_domain
+	// 备份自毒同族——校验侧已按归一形态评估，字面量单源=db 包常量）。
+	if _, err := tx.ExecContext(ctx, db.TCPRuleUpstreamHealthPathResetSQL); err != nil {
+		return 0, fmt.Errorf("规则 TCP 上游健康检查路径归一失败: %w", err)
+	}
 	// 非 acme_dns 来源不消费 acme_config_id——导入行清理跨模式死引用
 	// （与 Create/Update/Duplicate 保存链、启动迁移、传输归一同一谓词）。
 	// tls_source 的读取口径全族是 COALESCE(tls_source,'manual')（写侧列清单、
@@ -1482,16 +1487,20 @@ func validateBackupRuleReferences(tables map[string][]map[string]any) error {
 		// TCP 渲染零消费），写侧由 normalizeRuleRowsForTransport 按与启动迁移
 		// 同一常量清零——校验必须先按归一后的形态评估，否则带外残留（直改库/
 		// 旧版本/外来写入）会让实例自己导出的备份在导入阶段整包 400（备份自毒）。
-		// HTTP 规则的回源域名仍交 validateRuleUpstreams 的值域门。
+		// HTTP 规则的回源域名仍交 validateRuleUpstreams 的值域门。逐上游健康
+		// 检查路径同族归一（JJC-20261121-001，仅 HTTP 消费）。
 		originDomain := backupString(row["origin_domain"])
+		hcPath := backupString(row["health_check_path"])
 		if ruleProtocols[ruleID] == "tcp" {
 			originDomain = ""
+			hcPath = ""
 		}
 		upstreamsByRule[ruleID] = append(upstreamsByRule[ruleID], models.Upstream{
 			Host: backupString(row["host"]), Port: backupInt(row["port"]),
 			Weight: backupInt(row["weight"]), DynamicDNS: backupBooleanEnabled(row["dynamic_dns"]),
 			Enabled: backupBooleanEnabled(row["enabled"]), Protocol: backupString(row["protocol"]),
 			MaxConnections: backupInt(row["max_connections"]), OriginDomain: originDomain,
+			HealthCheckPath: hcPath,
 		})
 	}
 	for _, rule := range ruleRows {

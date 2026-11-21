@@ -1183,14 +1183,14 @@ func TestRuleMutationFingerprint_tracksPolicyBindings(t *testing.T) {
 func TestStoredUpstreamNullColumnsFlagsOriginDomainNull(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
 	if _, err := db.DB.Exec(`CREATE TABLE upstream_null_probe (
-		weight INTEGER, dynamic_dns INTEGER, enabled INTEGER, protocol TEXT, max_connections INTEGER, origin_domain TEXT)`); err != nil {
+		weight INTEGER, dynamic_dns INTEGER, enabled INTEGER, protocol TEXT, max_connections INTEGER, origin_domain TEXT, health_check_path TEXT)`); err != nil {
 		t.Fatalf("create probe table: %v", err)
 	}
 	query := `SELECT ` + storedUpstreamNullColumnsSQL + ` FROM upstream_null_probe WHERE rowid = ?`
 	insert := func(originDomain any) int64 {
 		t.Helper()
-		result, err := db.DB.Exec(`INSERT INTO upstream_null_probe (weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
-			VALUES (1, 0, 1, 'http', 0, ?)`, originDomain)
+		result, err := db.DB.Exec(`INSERT INTO upstream_null_probe (weight, dynamic_dns, enabled, protocol, max_connections, origin_domain, health_check_path)
+			VALUES (1, 0, 1, 'http', 0, ?, '')`, originDomain)
 		if err != nil {
 			t.Fatalf("seed probe row: %v", err)
 		}
@@ -1222,5 +1222,14 @@ func TestStoredUpstreamNullColumnsFlagsOriginDomainNull(t *testing.T) {
 	}
 	if got := needsNormalize(nullWeight); got != 1 {
 		t.Fatal("既有列（weight）判据不得回退")
+	}
+	// 新列同族覆盖（JJC-20261121-001）：health_check_path IS NULL 同样判为待归一
+	// ——「判定依据覆盖全部列」的谓词意图逐列验证，防止漏列回归。
+	nullHCPath := insert("")
+	if _, err := db.DB.Exec(`UPDATE upstream_null_probe SET health_check_path = NULL WHERE rowid = ?`, nullHCPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := needsNormalize(nullHCPath); got != 1 {
+		t.Fatal("health_check_path IS NULL 必须判为待归一（新列同族覆盖）")
 	}
 }

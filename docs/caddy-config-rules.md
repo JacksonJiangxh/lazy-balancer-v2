@@ -264,6 +264,27 @@ GeoIP 打标不在主路由的 `handle` 链内。任一绑定策略启用地域�
 }
 ```
 
+#### 逐后端独立探测路径（JJC-20261121-001，2026-11-21）
+
+上游表 `health_check_path` 列为每条启用上游提供独立主动 HC 探测路径：
+**空=跟随规则级 `health_check_path`（渲染默认 `/`）、非空=覆盖该后端**。
+规则级路径保留为默认值，存量规则行为不变；无任一后端设独立路径的规则
+全程走原 HC 链路，渲染零漂移（R5）。承载分双轨（机制细节见
+`docs/fork-notes/render-chain.md` §22/§30）：
+
+| 池形态 | 承载方式 |
+|---|---|
+| chain 域（混布池 / `chain_fallback`） | 车道携带逐上游路径，`healthMonitor` 装配 `healthMonitor.paths` 逐车道有效路径（车道覆盖>规则级兜底）、`probe(idx)` 取 `m.paths[idx]` |
+| uniform 池 + 主动 HC + 任一后端非空路径（路径分歧） | **route D：官方 `health_upstream` 聚合探针模式**（门下终裁 2026-11-21）——探针改打面板回环聚合端点 `127.0.0.1:<面板口>/lb-hc-probe/<ruleID>`（`X-LB-Probe-Target` 头携带逐上游 dial 地址），面板按该上游有效路径真实探测回 2xx/502；**探测状态机/摘除恢复全部保留 Caddy 原生实现，数据面零改动**；HTTPS 上游规则 transport `tls.except_ports` 豁免面板口（机制细节见 `docs/fork-notes/render-chain.md` §30） |
+| uniform 池（全部后端路径为空/全同） | 原生 `health_checks.active` 现状不变（分歧判定 `healthProbePathsDiverge` 全同返回 false，渲染逐字节不变） |
+
+校验口径：逐上游路径非空须 `/` 开头、≤255 字符、拒绝空白/控制字符
+（`validateUpstreamHealthCheckPath` 值域门，规则级 `validateRuleHealthCheckPath`
+同口径收紧）；**TCP/透传规则携带非空逐上游路径拒绝**（健康检查路径仅 HTTP
+规则语义面；TCP 存量残留启动清零，与 origin_domain 备份自毒同族）。
+动态 DNS 池 uniform 规则不参与分歧承载（官方明文 active HC 不运行于
+dynamic upstreams，探测面不存在）。
+
 ### TLS 配置
 - 上游 HTTPS 时自动设置 `insecure_skip_verify: true`
 - DNS 服务器用于动态上游解析
