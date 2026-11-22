@@ -22,8 +22,10 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +50,10 @@ var ErrNoKey = errors.New("caddydbcert: no DEK provider configured")
 // KeyProvider unwraps a wrapped DEK into the raw 32-byte AES-256 key.
 // Implementations must never log or persist the returned bytes.
 type KeyProvider interface {
+	// Ping checks provider availability without needing any wrapped DEK.
+	// Caddy's loader calls it at Provision time; an empty wrapped DEK must
+	// never be used as a probe (KMS rejects it by design).
+	Ping(ctx context.Context) error
 	UnwrapDEK(ctx context.Context, wrappedDEK string) ([]byte, error)
 }
 
@@ -58,11 +64,22 @@ type EnvKeyProvider struct {
 	Env string
 }
 
-func (p EnvKeyProvider) UnwrapDEK(_ context.Context, _ string) ([]byte, error) {
-	name := p.Env
-	if name == "" {
-		name = "LB_CERT_DEK_B64"
+func (p EnvKeyProvider) name() string {
+	if p.Env == "" {
+		return "LB_CERT_DEK_B64"
 	}
+	return p.Env
+}
+
+// Ping implements KeyProvider: env mode is available iff the DEK variable is
+// present and well-formed. The value is never logged.
+func (p EnvKeyProvider) Ping(ctx context.Context) error {
+	_, err := p.UnwrapDEK(ctx, "")
+	return err
+}
+
+func (p EnvKeyProvider) UnwrapDEK(_ context.Context, _ string) ([]byte, error) {
+	name := p.name()
 	raw := os.Getenv(name)
 	if raw == "" {
 		return nil, ErrNoKey
@@ -82,9 +99,75 @@ func (p EnvKeyProvider) UnwrapDEK(_ context.Context, _ string) ([]byte, error) {
 // TLS/mTLS and authorization are configured by the caller's http.Client —
 // this package deliberately does not embed credentials.
 type KMSKeyProvider struct {
-	Endpoint  string
-	Client    *http.Client
-	TokenEnv  string // optional: env var holding a bearer token
+	Endpoint string
+	Client   *http.Client
+	TokenEnv string // optional: env var holding a bearer token
+}
+
+// KMSClientLogger is the optional logging seam used by BuildKMSHTTPClient.
+// The panel injects services.Logf; standalone/test binaries may leave it nil.
+type KMSClientLogger func(level, format string, args ...any)
+
+// BuildKMSHTTPClient constructs the mTLS HTTP client for KMS DEK unwrap from a
+// client certificate/key pair. Both files must be present; on a load error it
+// degrades to ordinary TLS (the KMS endpoint is still HTTPS) rather than
+// silently disabling encryption. No credential bytes live in this package —
+// only file paths cross the config boundary.
+func BuildKMSHTTPClient(certFile, keyFile string, logf KMSClientLogger) *http.Client {
+	base := &http.Client{Timeout: 10 * time.Second}
+	if certFile == "" || keyFile == "" {
+		return base
+	}
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		if logf != nil {
+			logf("error", "KMS mTLS 客户端证书加载失败，退回普通 TLS: %v", err)
+		}
+		return base
+	}
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{pair},
+		}},
+	}
+}
+
+// client returns the configured HTTP client (mTLS when supplied), never a
+// package-global default that would drop client certificates.
+func (p KMSKeyProvider) client() *http.Client {
+	if p.Client != nil {
+		return p.Client
+	}
+	return &http.Client{Timeout: 10 * time.Second}
+}
+
+// Ping implements KeyProvider without an empty wrapped DEK: a GET to the
+// KMS endpoint (optionally /health) must return a non-5xx response. A 5xx or
+// transport error fails Provision visibly — no plaintext fallback.
+func (p KMSKeyProvider) Ping(ctx context.Context) error {
+	if p.Endpoint == "" {
+		return ErrNoKey
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.Endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("caddydbcert: build KMS ping: %w", err)
+	}
+	if p.TokenEnv != "" {
+		if token := os.Getenv(p.TokenEnv); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return fmt.Errorf("caddydbcert: KMS ping: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("caddydbcert: KMS ping returned HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (p KMSKeyProvider) UnwrapDEK(ctx context.Context, wrappedDEK string) ([]byte, error) {
@@ -94,8 +177,11 @@ func (p KMSKeyProvider) UnwrapDEK(ctx context.Context, wrappedDEK string) ([]byt
 	if wrappedDEK == "" {
 		return nil, errors.New("caddydbcert: empty wrapped DEK")
 	}
-	body := `{"wrapped_dek":` + mustJSONString(wrappedDEK) + `}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.Endpoint, strings.NewReader(body))
+	body, err := json.Marshal(kmsUnwrapRequest{WrappedDEK: wrappedDEK})
+	if err != nil {
+		return nil, fmt.Errorf("caddydbcert: encode KMS request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.Endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("caddydbcert: build KMS request: %w", err)
 	}
@@ -105,11 +191,7 @@ func (p KMSKeyProvider) UnwrapDEK(ctx context.Context, wrappedDEK string) ([]byt
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 	}
-	client := p.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
-	resp, err := client.Do(req)
+	resp, err := p.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("caddydbcert: KMS unwrap: %w", err)
 	}
@@ -202,56 +284,30 @@ func Fingerprint(certPEM, keyPEM, domain string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// mustJSONString is a minimal JSON string escaper for the KMS request body.
-// It avoids importing encoding/json into the hot loader path.
-func mustJSONString(s string) string {
-	var b bytes.Buffer
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		default:
-			if r < 0x20 {
-				fmt.Fprintf(&b, `\u%04x`, r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
+// kmsUnwrapRequest / kmsUnwrapResponse are the strict KMS wire contract.
+// encoding/json (not hand-rolled string scanning) is used so that escapes,
+// duplicate keys and trailing garbage follow one well-defined decoder path.
+type kmsUnwrapRequest struct {
+	WrappedDEK string `json:"wrapped_dek"`
 }
 
-// parseDekResponse extracts {"dek":"<base64>"} without pulling in encoding/json.
+type kmsUnwrapResponse struct {
+	DEK string `json:"dek"`
+}
+
+// parseDekResponse strictly decodes {"dek":"<base64>"} and base64-decodes the
+// key. A missing/empty dek field is rejected; the decoded value must be a
+// 32-byte AES-256 key (checked by the caller).
 func parseDekResponse(payload []byte) ([]byte, error) {
-	const key = `"dek"`
-	idx := bytes.Index(payload, []byte(key))
-	if idx < 0 {
+	var resp kmsUnwrapResponse
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if err := dec.Decode(&resp); err != nil {
+		return nil, fmt.Errorf("caddydbcert: decode KMS response: %w", err)
+	}
+	if resp.DEK == "" {
 		return nil, errors.New("caddydbcert: KMS response has no dek field")
 	}
-	rest := bytes.TrimSpace(payload[idx+len(key):])
-	if len(rest) == 0 || rest[0] != ':' {
-		return nil, errors.New("caddydbcert: malformed KMS dek field")
-	}
-	rest = bytes.TrimSpace(rest[1:])
-	if len(rest) == 0 || rest[0] != '"' {
-		return nil, errors.New("caddydbcert: KMS dek is not a string")
-	}
-	rest = rest[1:]
-	end := bytes.IndexByte(rest, '"')
-	if end < 0 {
-		return nil, errors.New("caddydbcert: unterminated KMS dek string")
-	}
-	dek, err := base64.StdEncoding.DecodeString(string(rest[:end]))
+	dek, err := base64.StdEncoding.DecodeString(resp.DEK)
 	if err != nil {
 		return nil, fmt.Errorf("caddydbcert: decode KMS dek: %w", err)
 	}

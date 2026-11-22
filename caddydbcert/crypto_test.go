@@ -3,6 +3,9 @@ package caddydbcert
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -87,5 +90,59 @@ func TestKMSErrorNeverEchoesBody(t *testing.T) {
 	_, err := p.UnwrapDEK(context.Background(), strings.Repeat("x", 16))
 	if err == nil || strings.Contains(err.Error(), "xxx") {
 		t.Fatalf("KMS error leaked or was nil: %v", err)
+	}
+}
+
+// TestKMSPingNeverSendsEmptyWrappedDEK closes P0-2: Provision probes the KMS
+// with Ping (a GET), never UnwrapDEK(""). A KMS that rejects empty wrapped
+// DEKs on POST must still let the loader provision.
+func TestKMSPingNeverSendsEmptyWrappedDEK(t *testing.T) {
+	dek := testDEK(t)
+	encoded := base64.StdEncoding.EncodeToString(dek)
+	var sawGET, sawEmptyWrapped bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			sawGET = true
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			var req kmsUnwrapRequest
+			dec := json.NewDecoder(r.Body)
+			_ = dec.Decode(&req)
+			if req.WrappedDEK == "" {
+				sawEmptyWrapped = true
+			}
+			_, _ = w.Write([]byte(`{"dek":"` + encoded + `"}`))
+		}
+	}))
+	defer srv.Close()
+
+	p := KMSKeyProvider{Endpoint: srv.URL}
+	if err := p.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	if !sawGET {
+		t.Fatal("Ping did not use GET (empty wrapped DEK probe regression)")
+	}
+	got, err := p.UnwrapDEK(context.Background(), "wrapped-1")
+	if err != nil || string(got) != string(dek) {
+		t.Fatalf("UnwrapDEK: got %v, err %v", got, err)
+	}
+	if sawEmptyWrapped {
+		t.Fatal("an empty wrapped DEK was sent to KMS")
+	}
+}
+
+func TestParseDekResponseStrict(t *testing.T) {
+	dek := testDEK(t)
+	encoded := base64.StdEncoding.EncodeToString(dek)
+	good, err := parseDekResponse([]byte(`{"dek":"` + encoded + `"}`))
+	if err != nil || string(good) != string(dek) {
+		t.Fatalf("strict parse failed: %v %v", good, err)
+	}
+	for _, bad := range []string{"", "not json", `{"dek":123}`, `{"key":"` + encoded + `"}`} {
+		if _, err := parseDekResponse([]byte(bad)); err == nil {
+			t.Fatalf("malformed response accepted: %q", bad)
+		}
 	}
 }

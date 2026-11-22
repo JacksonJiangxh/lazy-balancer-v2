@@ -543,6 +543,27 @@ type ClusterCertificate struct {
 	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
+// ClusterVaultCert is one ciphertext certificate row carried over the cluster
+// sync channel under Route A. Only ciphertext columns and wrapped DEK travel;
+// plaintext cert/key are never embedded. The slave imports these rows verbatim
+// into its local cert_secrets table and decrypts with its own DEK/KMS.
+type ClusterVaultCert struct {
+	Domain         string `json:"domain"`
+	RuleID         string `json:"rule_id"`
+	CertCiphertext string `json:"cert_ciphertext"`
+	KeyCiphertext  string `json:"key_ciphertext"`
+	WrappedDEK     string `json:"wrapped_dek,omitempty"`
+	// Fingerprint is SHA256(cert||key||domain), needed by the slave's
+	// LoadSecrets integrity check after local decryption. It travels ONLY over
+	// the authenticated cluster-sync channel (mTLS + token); it is never placed
+	// in an admin/public HTTP response or an audit log (JJC-20261122-003 H6).
+	// It is a one-way digest, not key material.
+	Fingerprint  string `json:"fingerprint"`
+	Tags         string `json:"tags,omitempty"`
+	SinceVersion int64  `json:"since_version,omitempty"`
+	Deleted      bool   `json:"deleted,omitempty"`
+}
+
 type ClusterACMEState struct {
 	CAProviders        []CAProvider        `json:"ca_providers"`
 	CertificateConfigs []CertificateConfig `json:"certificate_configs"`
@@ -550,18 +571,28 @@ type ClusterACMEState struct {
 }
 
 type ClusterSnapshot struct {
-	Version             int                  `json:"version"`
-	SchemaVersion       int                  `json:"schema_version,omitempty"`
-	MinReaderVersion    int                  `json:"min_reader_version,omitempty"`
-	Fingerprint         string               `json:"fingerprint"`
-	Signature           string               `json:"signature,omitempty"`
-	CanonicalPayload    json.RawMessage      `json:"canonical_payload,omitempty"`
-	Rules               []LbRule             `json:"rules"`
-	Users               []ClusterUser        `json:"users"`
-	APIKeys             []ClusterAPIKey      `json:"api_keys"`
-	BasicSettings       ClusterBasicSettings `json:"basic_settings"`
-	CaddyConfig         *string              `json:"caddy_config,omitempty"`
-	Certs               []ClusterCertificate `json:"certs"`
+	Version          int                  `json:"version"`
+	SchemaVersion    int                  `json:"schema_version,omitempty"`
+	MinReaderVersion int                  `json:"min_reader_version,omitempty"`
+	Fingerprint      string               `json:"fingerprint"`
+	Signature        string               `json:"signature,omitempty"`
+	CanonicalPayload json.RawMessage      `json:"canonical_payload,omitempty"`
+	Rules            []LbRule             `json:"rules"`
+	Users            []ClusterUser        `json:"users"`
+	APIKeys          []ClusterAPIKey      `json:"api_keys"`
+	BasicSettings    ClusterBasicSettings `json:"basic_settings"`
+	CaddyConfig      *string              `json:"caddy_config,omitempty"`
+	Certs            []ClusterCertificate `json:"certs"`
+	// VaultCerts (JJC-20261122-003 P0-1) is the ciphertext-only certificate
+	// payload used when Route A (DB certificate loader) is enabled on the whole
+	// cluster. Each row is copied verbatim from the master's cert_secrets table;
+	// no plaintext PEM crosses the wire. Additive + omitempty: when Route A is
+	// off the legacy Certs/ReferencedCerts axes above are used verbatim (JJC-001
+	// zero regression), and old peers ignore this unknown field.
+	VaultCerts []ClusterVaultCert `json:"vault_certs,omitempty"`
+	// CertVersion is the master's monotonic cert_vault watermark carried with
+	// VaultCerts for the dual-watermark state machine (P1-1). 0 = not present.
+	CertVersion         int64                `json:"cert_version,omitempty"`
 	ACME                *ClusterACMEState    `json:"acme,omitempty"`
 	SecurityPolicies    json.RawMessage      `json:"security_policies,omitempty"`
 	SecurityBindings    json.RawMessage      `json:"security_bindings,omitempty"`

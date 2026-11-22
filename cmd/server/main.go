@@ -123,20 +123,28 @@ func run() error {
 	// 证书库（甲路线 JJC-20261122-003）：仅在显式配置 DEK/KMS 时启用。
 	// 迁移是加性回填（不删旧明文列），故 JJC-001 的引用型证书随快照同步
 	// 与面板现有读路径零回归；从节点不读 .crt/.key，配置不内联私钥。
-	if os.Getenv("LB_CERT_DEK_B64") != "" || os.Getenv("LB_CERT_KMS_ENDPOINT") != "" {
+	// P1-4: single enable predicate (DEK value or KMS endpoint); env name is
+	// fixed to LB_CERT_DEK_B64 — no LB_CERT_DEK_ENV indirection that could
+	// silently keep the deployment on plaintext load_files.
+	if services.CertVaultDEKSource() != "" {
+		// P1-3：甲路线启用即以明文私钥进程内存为信任边界，启动即禁 core dump
+		// （PR_SET_DUMPABLE=0）；失败必须拒绝启动，不以可 dumps 的进程服务证书。
+		if err := services.HardenProcessMemoryForCerts(); err != nil {
+			return startupFailed(fmt.Errorf("harden process memory for certs: %w", err))
+		}
 		if err := services.InitCertVault(context.Background()); err != nil {
 			return startupFailed(fmt.Errorf("init certificate vault: %w", err))
 		}
-		keyEnv := os.Getenv("LB_CERT_DEK_ENV")
-		if keyEnv == "" {
-			keyEnv = "LB_CERT_DEK_B64"
-		}
 		services.ConfigureDBCertLoader(
 			filepath.Join(cfg.DataDir, "lazy-balancer.db"),
-			keyEnv,
+			services.DefaultCertDEKEnv,
 			os.Getenv("LB_CERT_KMS_ENDPOINT"),
 			os.Getenv("LB_CERT_KMS_TOKEN_ENV"),
+			os.Getenv("LB_CERT_KMS_CLIENT_CERT"),
+			os.Getenv("LB_CERT_KMS_CLIENT_KEY"),
 		)
+		// P1-1: confirmed successful POST /load advances the applied watermark.
+		services.SetCaddyLoadSuccessHook(func() { services.RecordAppliedWatermark(context.Background()) })
 	}
 	services.ApplyLogLevel()
 	// 配置载入期告警重放：此刻运行日志文件写端与级别门都已装配，误配信号
@@ -284,6 +292,14 @@ func run() error {
 			return startupFailed(fmt.Errorf("load cluster mTLS client certificate: %w", pairErr))
 		}
 		services.SetClusterClientCertificate(&pair)
+	}
+	// 服务端 mTLS（P1-2，缺口 B）：配置 LB_CLUSTER_CLIENT_CA 后，TLS 层校验证书
+	// 到该 CA，且集群机器端点由 clusterClientCertGuard 强制要求验证链；未配置
+	// 时 no-op，浏览器 UI 与既有 token posture 完全不变。凭据只读路径，不入仓。
+	if caFile := os.Getenv("LB_CLUSTER_CLIENT_CA"); caFile != "" {
+		if err := services.ConfigureClusterServerMTLS(caFile); err != nil {
+			return startupFailed(fmt.Errorf("configure cluster server mTLS: %w", err))
+		}
 	}
 	clusterService := services.NewClusterService(db.DB, cfg.DataDir)
 	caProviderService := services.NewCAProviderService(cfg.DataDir)
@@ -512,6 +528,9 @@ func run() error {
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
+		// P1-2：若配置了集群客户端 CA，请求并验证客户端证书（VerifyClientCertIfGiven
+		// 保留浏览器 UI 访问）；机器端点的强制性由 clusterClientCertGuard 承担。
+		services.ApplyClusterServerMTLS(server.TLSConfig)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return startupFailed(fmt.Errorf("HTTPS 监听失败: %w", err))

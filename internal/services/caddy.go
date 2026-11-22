@@ -492,6 +492,12 @@ func (s *CaddyService) applyConfigWithOptions(config map[string]interface{}, opt
 	}
 
 	Logf("info", "Caddy config applied successfully")
+	// P1-1: 仅在「确认 /load 成功」后推进 last_applied_version；同字节短路
+	// 与 4xx/5xx 失败分支均到不了这里。只在实际落 LKG 的非事务 apply 路径
+	// 记账，避免事务内 apply（commit 前）把尚未提交的配置记为已应用。
+	if opts.persistLastGood && caddyLoadSuccessHook != nil {
+		caddyLoadSuccessHook()
+	}
 	// 重载重建 registry：限流 429 计数归零，/metrics 抓取缓存与上游健康聚合
 	// 必须同步失效（否则安全总览/健康面板在 ≤5s 内仍显示重载前集合与累计值）。
 	InvalidateOverviewMetricsCache()
@@ -2374,12 +2380,26 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 
 	availableCerts := make(map[string]CertMaterial)
 	materials := make([]CertMaterial, 0)
+	// Route A（JJC-20261122-003 P0-1）：证书就绪集以加密证书库为唯一真相——
+	// 从节点本地 cert_jobs/lb_rules 不再持有明文 PEM，不能用它们判就绪。
+	// vaultAvailableRuleIDs 只返回有活跃密文行的 rule_id/tag，不读取/返回明文。
+	if dbCertLoaderReady := DBCertLoaderEnabled(); dbCertLoaderReady {
+		for ruleID := range vaultAvailableRuleIDs(certSource) {
+			// 不携带 PEM：甲路线 Caddy 由 lb_db loader 从密文库装载，不在
+			// 渲染期物化文件；materials 保持空，下方 MaterializeCertPairs 不触发。
+			availableCerts[ruleID] = CertMaterial{RuleID: ruleID}
+		}
+	}
 	for _, ru := range allRules {
 		r := ru.rule
 		// 与发布门（下方 isTCP/TLS 策略段）同判据：TCP/layer4 规则不能终止
 		// TLS，写侧/迁移/导入已把 TCP 的 TLS 字段归零；带外保留 enable_tls 的
 		// TCP 行不得在此物化私钥文件（纵深防御，不是功能判据）。
 		if r.Protocol != "http" || !r.EnableTLS {
+			continue
+		}
+		if DBCertLoaderEnabled() {
+			// 就绪集已在上方从证书库构建；本循环不再读明文 cert_pem。
 			continue
 		}
 		// 引用型证书与手动证书同流：PEM 内容已在保存/摄取时入库，运行时唯一信任源
@@ -2398,7 +2418,13 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			}
 		}
 	}
-	if len(materials) > 0 {
+	// Route A（JJC-20261122-003 P0-1）：甲路线启用时不物化任何 .crt/.key 明文
+	// 文件——Caddy 的 lb_db loader 直接读加密证书库并在内存解密。availableCerts
+	// 上方已从加密证书库的就绪集构建（vaultAvailableRuleIDs），仅用于「证书
+	// 就绪才发布 TLS 策略」的门控；tlsCertFiles 在本路径下不再发射（下方 TLS
+	// app 段改用 lb_db）。关闭时原样走 MaterializeCertPairs（JJC-001 零回归，
+	// 含带外删除自愈）。
+	if len(materials) > 0 && !DBCertLoaderEnabled() {
 		filesSnapshot, err = MaterializeCertPairs(materials)
 		if err != nil {
 			return generationFailure("materialize certificate files: %v", err)

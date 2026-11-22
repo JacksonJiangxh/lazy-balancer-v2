@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# 证书私钥内存保护（JJC-20261122-003 P1-3）：禁止 core dump 落盘——甲路线
+# 私钥以明文形式短暂驻留进程内存，core 文件会把它们带出加密边界。ulimit 对
+# 本 shell 及其派生的 Caddy/面板进程生效；失败不阻断启动（容器可能已由运行
+# 时禁 core），但要留下告警供审计。
+if ! ulimit -c 0 2>/dev/null; then
+    echo "WARNING: 无法设置 ulimit -c 0（core dump 未禁用）" >&2
+fi
+
 # Use /app/data as the single persistent data directory.
 export XDG_DATA_HOME=/app/data
 mkdir -p /app/data/caddy

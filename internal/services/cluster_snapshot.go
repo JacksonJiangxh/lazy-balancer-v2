@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/caddydbcert"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 	"lazy-balancer-v2/internal/models"
@@ -947,15 +948,30 @@ func (s *ClusterService) buildSnapshot(ctx context.Context, store snapshotStore)
 	if snapshot.NodeSites, err = s.snapshotNodeSites(ctx, store); err != nil {
 		return models.ClusterSnapshot{}, err
 	}
-	if snapshot.Certs, err = s.snapshotCertificates(ctx, store); err != nil {
-		return models.ClusterSnapshot{}, err
-	}
-	// JJC-20261122-001：引用型证书文件对内容随快照下发。单规则文件对读取失败
-	// 仅跳过该对（fail-open，对齐 ACME 校验的单行损坏语义），不阻断快照——
-	// 快照瘫痪会让全部从节点同步失效，而单文件缺失只影响该规则在从节点的
-	// 渲染（与主节点自身渲染失败同口径）。
-	if snapshot.ReferencedCerts, err = snapshotReferencedCerts(ctx, store); err != nil {
-		return models.ClusterSnapshot{}, err
+	// Route A（JJC-20261122-003 P0-1）：甲路线全群启用时，证书轴改走
+	// cert_secrets 密文列——只下发密文 + wrapped DEK，无任何明文 PEM 过通道。
+	// 关闭时（滚动升级/未配密钥）走下方 JJC-001 逐字保留的明文轴，零回归。
+	// 硬约束①：甲路线默认关闭，仅显式配置 DEK/KMS 才启用；滚动升级期间全群
+	// 仍在明文兼容模式、行为与基线一致，只有全群升级到位且统一配密钥后才
+	// 切甲路线，届时所有节点都认识 vault_certs 密文字段。
+	if DBCertLoaderEnabled() {
+		if snapshot.VaultCerts, snapshot.CertVersion, err = s.snapshotVaultCerts(ctx, store); err != nil {
+			return models.ClusterSnapshot{}, err
+		}
+		// 明文轴清空：禁止明文 PEM 随快照下发（P0-1 硬闸）。
+		snapshot.Certs = nil
+		snapshot.ReferencedCerts = nil
+	} else {
+		if snapshot.Certs, err = s.snapshotCertificates(ctx, store); err != nil {
+			return models.ClusterSnapshot{}, err
+		}
+		// JJC-20261122-001：引用型证书文件对内容随快照下发。单规则文件对读取失败
+		// 仅跳过该对（fail-open，对齐 ACME 校验的单行损坏语义），不阻断快照——
+		// 快照瘫痪会让全部从节点同步失效，而单文件缺失只影响该规则在从节点的
+		// 渲染（与主节点自身渲染失败同口径）。
+		if snapshot.ReferencedCerts, err = snapshotReferencedCerts(ctx, store); err != nil {
+			return models.ClusterSnapshot{}, err
+		}
 	}
 	if snapshot.ACME, err = s.snapshotACME(ctx, store); err != nil {
 		return models.ClusterSnapshot{}, err
@@ -1574,6 +1590,32 @@ func (s *ClusterService) snapshotAPIKeys(ctx context.Context, store snapshotStor
 		keys = append(keys, key)
 	}
 	return keys, rows.Err()
+}
+
+// snapshotVaultCerts exports the master's cert_secrets ciphertext rows
+// verbatim for the Route A snapshot. No decryption is performed and no
+// plaintext PEM is placed in the snapshot. The returned certVersion is the
+// master's monotonic watermark used by the dual-watermark state machine (P1-1).
+func (s *ClusterService) snapshotVaultCerts(ctx context.Context, store snapshotStore) ([]models.ClusterVaultCert, int64, error) {
+	rows, version, err := caddydbcert.ExportVaultRows(ctx, store)
+	if err != nil {
+		return nil, 0, fmt.Errorf("读取证书库密文快照: %w", err)
+	}
+	out := make([]models.ClusterVaultCert, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, models.ClusterVaultCert{
+			Domain:         r.Domain,
+			RuleID:         r.RuleID,
+			CertCiphertext: r.CertCiphertext,
+			KeyCiphertext:  r.KeyCiphertext,
+			WrappedDEK:     r.WrappedDEK,
+			Fingerprint:    r.Fingerprint,
+			Tags:           r.Tags,
+			SinceVersion:   r.SinceVersion,
+			Deleted:        r.Deleted,
+		})
+	}
+	return out, version, nil
 }
 
 func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapshotStore) ([]models.ClusterCertificate, error) {

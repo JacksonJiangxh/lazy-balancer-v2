@@ -96,6 +96,27 @@ volumes:
 | `BACKUP_DIR` | `data_dir` 同级 `backup`（容器 `/app/backup`） | 自动备份落盘目录 |
 | `APP_VERSION` | 构建时注入 | 显示版本号（正式版本号，不含 `-beta` 等通道后缀；镜像 tag 可带后缀，二者刻意不同） |
 | `TZ` | 数据库 `timezone` | 进程时区。数据库已初始化后，容器启动时 entrypoint 会以数据库时区覆盖该变量（`-e TZ=...` 传入不生效）；时区请经面板「基础设置」修改 |
+| `LB_CERT_DEK_B64` | 空 | 证书库（甲路线）DEK 的 base64 值（32 字节 AES-256），**仅开发/CI 用**；生产用 KMS。设置它或 `LB_CERT_KMS_ENDPOINT` 任一即启用甲路线 |
+| `LB_CERT_KMS_ENDPOINT` | 空 | KMS 解封端点（HTTPS）；生产环境启用甲路线的推荐方式 |
+| `LB_CERT_KMS_TOKEN_ENV` | 空 | KMS 请求 Bearer token 所在的**环境变量名**（不是 token 本身） |
+| `LB_CERT_KMS_CLIENT_CERT` / `LB_CERT_KMS_CLIENT_KEY` | 空 | KMS mTLS 客户端证书/私钥路径（只读路径，凭据由部署注入、不入仓） |
+| `LB_CERT_WRAPPED_DEK` | 空 | 启动回填时用于初次封装的 wrapped DEK（env 模式通常留空） |
+| `LB_CLUSTER_CLIENT_CERT` / `LB_CLUSTER_CLIENT_KEY` | 空 | 从节点访问集群同步端点的 mTLS 客户端证书/私钥路径 |
+| `LB_CLUSTER_CLIENT_CA` | 空 | 主节点校验集群客户端证书的 CA bundle 路径；配置后集群机器端点强制 mTLS |
+
+## 证书库单源（甲路线）与滚动升级
+
+甲路线把证书私钥从「面板进程内存 + SQLite 密文列 + Caddy 定制 `CertificateLoader`」直读，配置 JSON 与快照不再出现明文 PEM/`load_files`。启用判据只有一个：`LB_CERT_DEK_B64` 或 `LB_CERT_KMS_ENDPOINT` 任一非空；未配置时行为与基线逐字一致（旧 `load_files` / JJC-001 引用型证书随快照同步零回归）。
+
+**滚动升级论证（必须满足的前提，勿留隐含假设）：**
+
+1. 甲路线**默认关闭**。滚动升级期间全群都不设 DEK/KMS，所有节点处于明文兼容模式，快照继续携带 `Certs`/`ReferencedCerts`、`load_files` 路径照常工作——此阶段行为与基线 ed04bd38 完全相同，新旧版本可任意混跑。
+2. 只有当**全群节点都已升级到本版本**、且统一注入同一份 DEK/KMS 配置后，才允许在全部节点同时开启甲路线。因为密文快照新增了 `vault_certs` 字段：所有节点都必须认识该字段（旧版本节点不认识，会忽略它并退回明文 `Certs`——若此时只有部分节点开了甲路线，未升级节点仍走明文，不属于本方案的安全边界，但也不破坏功能）。
+3. 切换后快照的证书载荷改走 `vault_certs` 密文列（逐字复制主节点密文，从节点用本地 DEK/KMS 独立解密），`Certs`/`ReferencedCerts` 不再下发明文。回滚用 `git revert`，不 amend、不强推。
+
+**内存保护基线（P1-3）：** 私钥明文只在解密瞬间驻留进程内存并即刻 zero（`clearBytes`）。三层防护：entrypoint `ulimit -c 0` 禁 core dump；Go 侧 Linux `PR_SET_DUMPABLE=0` 禁 ptrace/core（启用甲路线时失败即拒绝启动）；**宿主机必须 swapoff 或使用加密 swap**——这是部署方责任，容器内无法强制。不要依赖 mlock：Go 的 GC 与栈复制使逐分配 mlock 不可靠，且默认 `RLIMIT_MEMLOCK` 极小。
+
+**集群 mTLS（P1-2）：** 配置 `LB_CLUSTER_CLIENT_CA` 后，主节点 TLS 层验证客户端证书（`VerifyClientCertIfGiven`，浏览器 UI 不受影响），集群机器端点（`/cluster/sync/*`、`/cluster/registration/confirm`、`/cluster/nodes/report`、`/cluster/register/:id/status`）由 `clusterClientCertGuard` 强制要求验证链。未配置 CA 时 no-op，既有「TLS + 指纹钉扎 + X-Cluster-Token」posture 不变。mTLS 是**叠加**不是替换令牌鉴权。
 
 ## 端口
 

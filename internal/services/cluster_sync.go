@@ -1208,6 +1208,10 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 		return SyncResult{}, err
 	}
 	snapshot = verifiedSnapshot
+	// P1-1: 拉取并验签成功后立即记录 pulled 水位（config=快照版本，
+	// cert=主节点随快照下发的证书水位）。applied 水位只由确认成功的
+	// /load 推进——两者分工，失败重载下轮仍从 pulled 重放。
+	RecordPulledWatermark(ctx, int64(snapshot.Version), snapshot.CertVersion)
 	if s.beforeApplySnapshot != nil {
 		s.beforeApplySnapshot()
 	}

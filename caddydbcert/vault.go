@@ -16,12 +16,12 @@ import (
 // Secret is a decrypted in-memory certificate record. It is never serialized
 // to disk or logs by this package.
 type Secret struct {
-	Domain     string
-	RuleID     string
-	CertPEM    string
-	KeyPEM     string
-	Fingerprint string
-	Tags       []string
+	Domain       string
+	RuleID       string
+	CertPEM      string
+	KeyPEM       string
+	Fingerprint  string
+	Tags         []string
 	SinceVersion int64
 }
 
@@ -91,6 +91,105 @@ func EnsureVaultTables(ctx context.Context, database *sql.DB) error {
 	return nil
 }
 
+// DBReader is the read-only SQL view shared by *sql.DB, *sql.Tx and the
+// cluster snapshot store. Export helpers only need reads.
+type DBReader interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+// DB is the full SQL executor (reader + writer) so import helpers can join the
+// caller's snapshot apply transaction.
+type DB interface {
+	DBReader
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+// VaultRow is one ciphertext-only vault row as carried in the cluster
+// snapshot. It contains no plaintext and can cross the wire safely.
+type VaultRow struct {
+	Domain         string
+	RuleID         string
+	CertCiphertext string
+	KeyCiphertext  string
+	WrappedDEK     string
+	Fingerprint    string
+	Tags           string
+	SinceVersion   int64
+	Deleted        bool
+}
+
+// ExportVaultRows reads every cert_secrets row verbatim (ciphertext columns
+// only) plus the current cert watermark. Used by the master to build the
+// Route A snapshot; never decrypts anything.
+func ExportVaultRows(ctx context.Context, database DBReader) ([]VaultRow, int64, error) {
+	rows, err := database.QueryContext(ctx, `SELECT domain, rule_id, cert_ciphertext, key_ciphertext,
+		wrapped_dek, fingerprint, tags, since_version, deleted FROM cert_secrets
+		ORDER BY domain, rule_id`)
+	if err != nil {
+		return nil, 0, fmt.Errorf("caddydbcert: export vault rows: %w", err)
+	}
+	defer rows.Close()
+	out := make([]VaultRow, 0)
+	for rows.Next() {
+		var r VaultRow
+		var deleted int
+		if err := rows.Scan(&r.Domain, &r.RuleID, &r.CertCiphertext, &r.KeyCiphertext,
+			&r.WrappedDEK, &r.Fingerprint, &r.Tags, &r.SinceVersion, &deleted); err != nil {
+			return nil, 0, fmt.Errorf("caddydbcert: scan vault row: %w", err)
+		}
+		r.Deleted = deleted != 0
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("caddydbcert: iterate vault rows: %w", err)
+	}
+	version, err := CurrentVersionFrom(ctx, database)
+	if err != nil {
+		return nil, 0, err
+	}
+	return out, version, nil
+}
+
+// CurrentVersionFrom reads the cert watermark from any SQL executor (DB or Tx).
+func CurrentVersionFrom(ctx context.Context, database DBReader) (int64, error) {
+	var version int64
+	if err := database.QueryRowContext(ctx, `SELECT version FROM cert_version_seq WHERE id=1`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("caddydbcert: read cert version: %w", err)
+	}
+	return version, nil
+}
+
+// ImportVaultRows upserts ciphertext rows verbatim into cert_secrets. It never
+// decrypts or re-encrypts: the slave keeps the exact ciphertext the master
+// sealed, so no plaintext key material is ever written on the slave. Rows are
+// inserted with since_version=0 so the local trigger assigns the slave's own
+// monotonic version (identical ciphertext produces no update/no version bump).
+func ImportVaultRows(ctx context.Context, database DB, rows []VaultRow) error {
+	for _, r := range rows {
+		del := 0
+		if r.Deleted {
+			del = 1
+		}
+		if _, err := database.ExecContext(ctx, `INSERT INTO cert_secrets
+			(domain, rule_id, cert_ciphertext, key_ciphertext, wrapped_dek, fingerprint, tags, since_version, deleted, updated_at)
+			VALUES (?,?,?,?,?,?,?,0,?,CURRENT_TIMESTAMP)
+			ON CONFLICT(domain, rule_id) DO UPDATE SET
+				cert_ciphertext=excluded.cert_ciphertext,
+				key_ciphertext=excluded.key_ciphertext,
+				wrapped_dek=excluded.wrapped_dek,
+				fingerprint=excluded.fingerprint,
+				tags=excluded.tags,
+				deleted=excluded.deleted,
+				updated_at=CURRENT_TIMESTAMP`,
+			r.Domain, r.RuleID, r.CertCiphertext, r.KeyCiphertext,
+			r.WrappedDEK, r.Fingerprint, r.Tags, del); err != nil {
+			return fmt.Errorf("caddydbcert: import vault row %s/%s: %w", r.Domain, r.RuleID, err)
+		}
+	}
+	return nil
+}
+
 // Upsert encrypts and stores one certificate. The plaintext exists only in
 // the caller's memory and in the wrapped DEK provider's return value.
 func Upsert(ctx context.Context, database *sql.DB, provider KeyProvider, wrappedDEK, domain, ruleID, certPEM, keyPEM string, deleted bool, tags []string) (string, error) {
@@ -117,6 +216,16 @@ func Upsert(ctx context.Context, database *sql.DB, provider KeyProvider, wrapped
 	del := 0
 	if deleted {
 		del = 1
+	}
+	// Idempotency guard: a repeated backfill with unchanged material must not
+	// re-encrypt (random GCM nonce) and bump since_version on every reload.
+	// Skip the write when the stored fingerprint and deleted flag already match.
+	var storedFP string
+	var storedDeleted int
+	if err := database.QueryRowContext(ctx, `SELECT fingerprint, deleted FROM cert_secrets WHERE domain=? AND rule_id=?`, domain, ruleID).Scan(&storedFP, &storedDeleted); err == nil {
+		if storedFP == fp && storedDeleted == del {
+			return fp, nil
+		}
 	}
 	_, err = database.ExecContext(ctx, `INSERT INTO cert_secrets
 		(domain, rule_id, cert_ciphertext, key_ciphertext, wrapped_dek, fingerprint, tags, deleted, updated_at)
@@ -178,6 +287,9 @@ func LoadSecrets(ctx context.Context, database *sql.DB, provider KeyProvider) ([
 			return nil, err
 		}
 		if Fingerprint(string(certPEM), string(keyPEM), domain) != fp {
+			clearBytes(certPEM)
+			clearBytes(keyPEM)
+			clearDEKCache(dekCache)
 			return nil, fmt.Errorf("caddydbcert: fingerprint mismatch for domain %q", domain)
 		}
 		var tagList []string
@@ -211,6 +323,44 @@ func CurrentVersion(ctx context.Context, database *sql.DB) (int64, error) {
 		return 0, fmt.Errorf("caddydbcert: read cert version: %w", err)
 	}
 	return version, nil
+}
+
+// RecordPulled records config_version/cert_version/last_pulled_version after a
+// snapshot has been successfully pulled and verified, WITHOUT touching
+// last_applied_version (which only advances after a confirmed /load). It is a
+// partial upsert: the applied watermark survives a pure pull.
+func RecordPulled(ctx context.Context, database DB, node string, configVersion, certVersion, pulled int64) error {
+	_, err := database.ExecContext(ctx, `INSERT INTO cert_sync_state
+		(node_id, config_version, cert_version, last_pulled_version, last_applied_version, updated_at)
+		VALUES (?,?,?,?,0,CURRENT_TIMESTAMP)
+		ON CONFLICT(node_id) DO UPDATE SET
+			config_version=excluded.config_version,
+			cert_version=excluded.cert_version,
+			last_pulled_version=excluded.last_pulled_version,
+			updated_at=CURRENT_TIMESTAMP`,
+		node, configVersion, certVersion, pulled)
+	if err != nil {
+		return fmt.Errorf("caddydbcert: record pulled watermark: %w", err)
+	}
+	return nil
+}
+
+// RecordApplied advances last_applied_version (and cert_version) only after a
+// confirmed successful POST /load. A failed reload leaves the applied
+// watermark at the previous value so the next round replays.
+func RecordApplied(ctx context.Context, database DB, node string, certVersion, applied int64) error {
+	_, err := database.ExecContext(ctx, `INSERT INTO cert_sync_state
+		(node_id, config_version, cert_version, last_pulled_version, last_applied_version, updated_at)
+		VALUES (?,0,?,0,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(node_id) DO UPDATE SET
+			cert_version=excluded.cert_version,
+			last_applied_version=excluded.last_applied_version,
+			updated_at=CURRENT_TIMESTAMP`,
+		node, certVersion, applied)
+	if err != nil {
+		return fmt.Errorf("caddydbcert: record applied watermark: %w", err)
+	}
+	return nil
 }
 
 // SetWatermark records config/cert/pull/apply watermarks for one node.

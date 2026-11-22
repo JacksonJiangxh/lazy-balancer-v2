@@ -914,11 +914,14 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		// 不受影响），与 oidc 两条公开端点同口径。
 		v1.GET("/branding", clusterRateLimit("branding", 120, "品牌配置查询过于频繁，请稍后再试"), h.GetBranding)
 		v1.POST("/cluster/register", clusterRegisterRateLimit(), h.RegisterClusterNode)
-		v1.GET("/cluster/register/:id/status", clusterMachineRateLimit("registration-status", clusterCredentialFromRegistration), noStoreResponse(), registrationAuth(db.DB), h.GetClusterRegistrationStatus)
-		v1.GET("/cluster/sync/snapshot", clusterMachineRateLimit("sync-snapshot", clusterCredentialFromToken), noStoreResponse(), clusterTokenAuth(db.DB), h.GetClusterSnapshot)
-		v1.GET("/cluster/sync/waf-files", clusterMachineRateLimit("sync-waf-files", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.GetClusterWafFiles)
-		v1.POST("/cluster/registration/confirm", clusterMachineRateLimit("registration-confirm", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.ConfirmClusterRegistration)
-		v1.POST("/cluster/nodes/report", clusterMachineRateLimit("node-report", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.ReportClusterNode)
+		// clusterClientCertGuard（P1-2）：配置客户端 CA 后，集群机器端点要求
+		// TLS 层验证过的客户端证书；未配置 CA 时为 no-op，token 口径不变。
+		// 挂在认证中间件之前——先拒绝无客户端证书者，不浪费令牌校验开销。
+		v1.GET("/cluster/register/:id/status", clusterMachineRateLimit("registration-status", clusterCredentialFromRegistration), noStoreResponse(), clusterClientCertGuard(), registrationAuth(db.DB), h.GetClusterRegistrationStatus)
+		v1.GET("/cluster/sync/snapshot", clusterMachineRateLimit("sync-snapshot", clusterCredentialFromToken), noStoreResponse(), clusterClientCertGuard(), clusterTokenAuth(db.DB), h.GetClusterSnapshot)
+		v1.GET("/cluster/sync/waf-files", clusterMachineRateLimit("sync-waf-files", clusterCredentialFromToken), clusterClientCertGuard(), clusterTokenAuth(db.DB), h.GetClusterWafFiles)
+		v1.POST("/cluster/registration/confirm", clusterMachineRateLimit("registration-confirm", clusterCredentialFromToken), clusterClientCertGuard(), clusterTokenAuth(db.DB), h.ConfirmClusterRegistration)
+		v1.POST("/cluster/nodes/report", clusterMachineRateLimit("node-report", clusterCredentialFromToken), clusterClientCertGuard(), clusterTokenAuth(db.DB), h.ReportClusterNode)
 		// 从节点服务控制：票据即凭证（主节点签发的一次性 HMAC，与登录票据同
 		// 机制），不走 clusterTokenAuth——主节点无法取回令牌明文（仅存哈希）。
 		v1.POST("/cluster/service-control", clusterRateLimit("service-control", 20, "服务控制请求过于频繁，请稍后再试"), h.ClusterServiceControl)

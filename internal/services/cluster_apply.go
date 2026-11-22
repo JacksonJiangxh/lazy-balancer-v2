@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"lazy-balancer-v2/caddydbcert"
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
@@ -274,22 +275,48 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// ——文件内容变化不改变渲染 JSON 字节，必须作为独立强制重载信号。
 	refCertsChanged := false
 	if !skip.disabled["rules"] {
-		certsChanged = snapshotCertsDiffer(previous.Certs, snapshot.Certs)
-		if err := removeMissingSnapshotCerts(previous.Certs, snapshot.Certs); err != nil {
-			return errors.Join(fmt.Errorf("删除本地旧证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
-		}
-		// 有意无条件物化（不按 certsChanged 门控）：这是「证书文件被带外删除/
-		// 权限被改错」的自愈通道；写放大由 writeCertPair 自身承担——内容一致
-		// 且权限正确时零写（只读比对，见 certstore.go）。DNS ownership 同理：
-		// ownership.Replace 对相同字节零写。certsChanged 仍是末段条件重载的
-		// 强制信号（路径确定性 ⇒ 内容变化不改变渲染字节）。
-		if err := materializeSnapshotCerts(snapshot.Certs); err != nil {
-			return errors.Join(fmt.Errorf("写入同步证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
-		}
-		var refCertErr error
-		refCertsChanged, refCertErr = materializeSnapshotReferencedCerts(previous.ReferencedCerts, snapshot.ReferencedCerts)
-		if refCertErr != nil {
-			return errors.Join(fmt.Errorf("写入同步引用证书: %w", refCertErr), s.restoreSnapshotArtifacts(previous, snapshot))
+		if DBCertLoaderEnabled() {
+			// Route A（JJC-20261122-003 P0-1）：证书走 cert_secrets 密文列同步。
+			// 事务内导入主节点密文行（逐字，从端不解密、不落明文 .crt/.key），
+			// Caddy 的 lb_db loader 在 provision 时用本节点 DEK/KMS 独立解密。
+			// 变更信号取「导入前后本地 cert 水位是否推进」——证书内容变化
+			// 不改变渲染 JSON 字节，必须作为强制重载信号（P1-1：以
+			// CurrentCertVersion 为变更检测唯一口径）。
+			beforeVersion, verr := currentCertVersionTx(ctx, tx)
+			if verr != nil {
+				return errors.Join(fmt.Errorf("读取本地证书水位: %w", verr), s.restoreSnapshotArtifacts(previous, snapshot))
+			}
+			if err := importSnapshotVaultCerts(ctx, tx, snapshot.VaultCerts); err != nil {
+				return errors.Join(fmt.Errorf("导入证书库密文: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
+			}
+			afterVersion, verr := currentCertVersionTx(ctx, tx)
+			if verr != nil {
+				return errors.Join(fmt.Errorf("读取导入后证书水位: %w", verr), s.restoreSnapshotArtifacts(previous, snapshot))
+			}
+			// 只比「本地导入前后」水位：主从各自持单调递增序列，直接拿主端
+			// watermark 比从端本地值会造成每轮恒真 → 永久强制重载。密文行有
+			// 实际变化才会推进本地 trigger 水位（相同密文 UPDATE 被 WHEN 守卫挡掉）。
+			// 主端 watermark 仅用于 pulled 记账（cluster_sync.go），不参与变更检测。
+			certsChanged = afterVersion > beforeVersion
+		} else {
+			// 明文兼容路径（JJC-001 逐字保留，滚动升级期全群走此分支）。
+			certsChanged = snapshotCertsDiffer(previous.Certs, snapshot.Certs)
+			if err := removeMissingSnapshotCerts(previous.Certs, snapshot.Certs); err != nil {
+				return errors.Join(fmt.Errorf("删除本地旧证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
+			}
+			// 有意无条件物化（不按 certsChanged 门控）：这是「证书文件被带外删除/
+			// 权限被改错」的自愈通道；写放大由 writeCertPair 自身承担——内容一致
+			// 且权限正确时零写（只读比对，见 certstore.go）。DNS ownership 同理：
+			// ownership.Replace 对相同字节零写。certsChanged 仍是末段条件重载的
+			// 强制信号（路径确定性 ⇒ 内容变化不改变渲染字节）。
+			if err := materializeSnapshotCerts(snapshot.Certs); err != nil {
+				return errors.Join(fmt.Errorf("写入同步证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
+			}
+			var refCertErr error
+			refCertsChanged, refCertErr = materializeSnapshotReferencedCerts(previous.ReferencedCerts, snapshot.ReferencedCerts)
+			if refCertErr != nil {
+				return errors.Join(fmt.Errorf("写入同步引用证书: %w", refCertErr), s.restoreSnapshotArtifacts(previous, snapshot))
+			}
 		}
 	}
 	if !skip.disabled["rules"] {
@@ -604,9 +631,11 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 恒非 nil）且已被节级三态覆盖：全局配置并入 users（系统数据）节，节实际
 	// 应用/跳过面见上列（2026-10-03「汇总行反映节级实际应用面」裁定）。
 	RecordAuditLog("system", "同步", "集群同步", FormatAuditDetail(summaryParts...), "")
-	// 双水位记账（甲路线证书库启用时）：config_version 来自快照，cert_version
-	// 取自本地证书库的单调递增水位；重载失败路径不推进。
-	RecordAppliedWatermark(ctx, int64(snapshot.Version))
+	// 双水位（P1-1）：pulled 在拉取验签成功后由 RecordPulledWatermark 推进；
+	// applied 只在确认成功的 POST /load 后由 caddyLoadSuccessHook 推进。
+	// 此处不再无条件记账——否则重载失败/跳过时 applied 会被错误推进，
+	// 双水位退化为「只落死表」。跳过重载（渲染输入无变化）时，运行配置
+	// 已等于本轮渲染，applied 保持上一轮确认值即可，语义正确。
 	return nil
 }
 
@@ -2333,6 +2362,38 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	// 否则从节点最长 5 分钟仍按旧阈值轮转。幂等且无失败面。
 	InvalidateTaskLogSizeCache()
 	return nil
+}
+
+// currentCertVersionTx reads the local cert watermark inside the snapshot apply
+// transaction. A missing vault schema is treated as version 0 (fresh node).
+func currentCertVersionTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var version int64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM cert_version_seq WHERE id=1`).Scan(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// importSnapshotVaultCerts imports the master's ciphertext rows verbatim into
+// the local vault inside the apply transaction (Route A / P0-1). No plaintext
+// PEM is written; the slave decrypts with its own DEK at loader provision time.
+func importSnapshotVaultCerts(ctx context.Context, tx *sql.Tx, certs []models.ClusterVaultCert) error {
+	rows := make([]caddydbcert.VaultRow, 0, len(certs))
+	for _, c := range certs {
+		rows = append(rows, caddydbcert.VaultRow{
+			Domain:         c.Domain,
+			RuleID:         c.RuleID,
+			CertCiphertext: c.CertCiphertext,
+			KeyCiphertext:  c.KeyCiphertext,
+			WrappedDEK:     c.WrappedDEK,
+			Fingerprint:    c.Fingerprint,
+			Tags:           c.Tags,
+			SinceVersion:   c.SinceVersion,
+			Deleted:        c.Deleted,
+		})
+	}
+	return caddydbcert.ImportVaultRows(ctx, tx, rows)
 }
 
 func materializeSnapshotCerts(certs []models.ClusterCertificate) error {

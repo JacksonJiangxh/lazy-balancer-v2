@@ -30,7 +30,10 @@ func init() {
 //	}}}
 //
 // It replaces "load_files" on the route-A main path: no .crt/.key on any node,
-// no inline private key in the rendered JSON, no plaintext at rest.
+// no inline private key in the rendered JSON, no plaintext at rest. This holds
+// only when Route A is enabled cluster-wide (every node has a DEK/KMS configured
+// and understands vault_certs); during rolling upgrade the whole cluster stays
+// on the legacy load_files path with byte-identical baseline behavior.
 type DBCertificateLoader struct {
 	DBPath string `json:"db_path,omitempty"`
 	KeyEnv string `json:"key_env,omitempty"`
@@ -40,6 +43,12 @@ type DBCertificateLoader struct {
 	// standard TLS (mTLS is configured at deployment via the panel's client).
 	KMSEndpoint string `json:"kms_endpoint,omitempty"`
 	KMSTokenEnv string `json:"kms_token_env,omitempty"`
+	// KMSClientCert/KMSClientKey are file paths to a client certificate pair
+	// for mTLS to the KMS endpoint. Paths (never key bytes) cross the config
+	// boundary; Provision builds an http.Client that presents the pair so the
+	// runtime KMS DEK unwrap is authenticated, not just encrypted.
+	KMSClientCert string `json:"kms_client_cert,omitempty"`
+	KMSClientKey  string `json:"kms_client_key,omitempty"`
 
 	db       *sql.DB
 	provider KeyProvider
@@ -62,15 +71,25 @@ func (l *DBCertificateLoader) Provision(_ caddy.Context) error {
 		return fmt.Errorf("caddydbcert: open vault %q: %w", l.DBPath, err)
 	}
 	if l.KMSEndpoint != "" {
-		l.provider = KMSKeyProvider{Endpoint: l.KMSEndpoint, TokenEnv: l.KMSTokenEnv}
+		// P1-5: the runtime loader must present the same mTLS client as the
+		// panel-side backfill, otherwise KMS deployments that require client
+		// certs fail every DEK unwrap at LoadCertificates time.
+		l.provider = KMSKeyProvider{
+			Endpoint: l.KMSEndpoint,
+			TokenEnv: l.KMSTokenEnv,
+			Client:   BuildKMSHTTPClient(l.KMSClientCert, l.KMSClientKey, nil),
+		}
 	} else {
 		l.provider = EnvKeyProvider{Env: l.KeyEnv}
 	}
+	// P0-2: probe provider availability with Ping, never with an empty wrapped
+	// DEK. KMS providers reject an empty wrapped DEK by design, so the previous
+	// UnwrapDEK(ctx, "") probe made every KMS deployment fail Provision.
 	// Fail visible at config-load time: a loader without a DEK cannot serve
 	// any certificate and must not silently fall back to plaintext files.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := l.provider.UnwrapDEK(ctx, ""); err != nil {
+	if err := l.provider.Ping(ctx); err != nil {
 		return err
 	}
 	database, err := sql.Open("sqlite", l.DBPath)

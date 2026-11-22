@@ -13,6 +13,26 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+// clusterClientCertGuard enforces server-side mTLS on cluster machine routes
+// (JJC-20261122-003 P1-2). When an operator configures a client CA, the TLS
+// layer verifies any presented client cert into VerifiedChains; this guard
+// makes a verified chain mandatory on these endpoints. It is additive to the
+// X-Cluster-Token check (never a replacement) and a no-op when no CA is set.
+func clusterClientCertGuard() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if services.ClusterServerMTLSEnabled() {
+			verified := c.Request.TLS != nil && len(c.Request.TLS.VerifiedChains) > 0
+			if !verified {
+				services.RecordAuditLog("system", "证书拒绝", "集群同步", "缺少或不受信任的客户端证书", "")
+				c.Header("X-LB-Error-Code", "client_cert_required")
+				c.AbortWithStatusJSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "集群端点要求有效的客户端证书"})
+				return
+			}
+		}
+		c.Next()
+	}
+}
+
 func clusterTokenAuth(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := c.GetHeader("X-Cluster-Token")
