@@ -137,6 +137,133 @@ func certFileScanReloadFnGet() func() error {
 	return certFileScanReloadFn
 }
 
+// 主节点 force /load 失败的补偿重试状态（与从端 reload 失败标记/304 补偿链对称）。
+//
+// 退避：base = 默认扫描周期（60s），每次失败 ×2，上限 10min。理由：默认节律下
+// 首次失败下一轮即重试（一次瞬时 5xx 的恢复延迟 ≤60s）；持续失败收敛到最多
+// 每 10min 一次，不会把 60s 扫描周期变成对故障 Caddy 的高频重试炮。新证书入库
+// （round.Upserted>0）不受退避约束，立即重载。
+//
+// 状态仅存内存（不持久化）：进程重启后标记丢失，但启动期 InitCertVault 回填 +
+// 后续 /app/certs 文件变化会自然重新收敛；为「重载待重试」单独加 DB 列/迁移
+// 既扩大 schema 面，又在 Caddy 持续故障时把重试状态本身暴露给同步通道，收益
+// 不抵复杂度。角色翻转（主→从→主）后残留标记在回到主节点的第一轮按退避重试，
+// 重载在锁内现场渲染当前 DB，不会回放陈旧配置。
+var (
+	certFileReloadRetryBase = time.Minute
+	certFileReloadRetryMax  = 10 * time.Minute
+
+	certFileReloadRetryMu sync.Mutex
+	certFileReloadPending *certFileReloadRetryState
+)
+
+type certFileReloadRetryState struct {
+	certVersion int64     // 失败时最新证书水位（诊断/日志用）
+	failedAt    time.Time // 最近一次失败时刻（退避起点）
+	attempts    int       // 连续失败次数（退避阶数）
+}
+
+// certFileReloadRetryDelay 第 attempts 次连续失败后的最小重试间隔。
+func certFileReloadRetryDelay(attempts int) time.Duration {
+	if attempts <= 0 {
+		return certFileReloadRetryBase
+	}
+	delay := certFileReloadRetryBase
+	for i := 1; i < attempts && delay < certFileReloadRetryMax; i++ {
+		delay *= 2
+	}
+	if delay > certFileReloadRetryMax {
+		delay = certFileReloadRetryMax
+	}
+	return delay
+}
+
+// certFileReloadRetryDue 报告补偿重试是否到期（未标记=false）。
+func certFileReloadRetryDue(now time.Time) bool {
+	certFileReloadRetryMu.Lock()
+	defer certFileReloadRetryMu.Unlock()
+	pending := certFileReloadPending
+	if pending == nil {
+		return false
+	}
+	return now.Sub(pending.failedAt) >= certFileReloadRetryDelay(pending.attempts)
+}
+
+// certFileReloadRetrySnapshot 读取待重试状态供日志使用（无标记返回 ok=false）。
+func certFileReloadRetrySnapshot() (certFileReloadRetryState, bool) {
+	certFileReloadRetryMu.Lock()
+	defer certFileReloadRetryMu.Unlock()
+	if certFileReloadPending == nil {
+		return certFileReloadRetryState{}, false
+	}
+	return *certFileReloadPending, true
+}
+
+// markCertFileReloadFailed 记录一次失败并推进退避阶数。
+func markCertFileReloadFailed(version int64, now time.Time) {
+	certFileReloadRetryMu.Lock()
+	defer certFileReloadRetryMu.Unlock()
+	if certFileReloadPending == nil {
+		certFileReloadPending = &certFileReloadRetryState{certVersion: version, failedAt: now, attempts: 1}
+		return
+	}
+	pending := certFileReloadPending
+	pending.certVersion, pending.failedAt = version, now
+	pending.attempts++
+}
+
+// clearCertFileReloadRetry 成功 /load 后清标记（也供角色翻转/测试隔离使用）。
+func clearCertFileReloadRetry() {
+	certFileReloadRetryMu.Lock()
+	defer certFileReloadRetryMu.Unlock()
+	certFileReloadPending = nil
+}
+
+// maybeReloadMasterAfterScan 统一处理「本轮入库触发」与「历史失败补偿」两种重载。
+// 唯一生产调用点是已做甲路线/DEK 门控的 scanCertFilesToVault：甲路线关闭或
+// DEK 缺失时扫描器整轮提前返回，补偿链同样完全 no-op（零回归）。
+// ctx 取消时不下发（引擎换代/停机），且不清标记——换代后新 Run 体仍会补偿。
+func maybeReloadMasterAfterScan(ctx context.Context, round certScanRound) {
+	if ctx.Err() != nil {
+		return
+	}
+	retryPending := certFileReloadRetryDue(time.Now())
+	if round.Upserted == 0 && !retryPending {
+		return // 指纹全同且无待重试：零空重载（不抖动的硬口径）
+	}
+	reload := certFileScanReloadFnGet()
+	if reload == nil {
+		if retryPending {
+			certFileScanWarn("reload-unwired", "证书文件扫描：主节点重载补偿待执行但钩子未接线，保留标记")
+		}
+		return
+	}
+	if retryPending {
+		if state, ok := certFileReloadRetrySnapshot(); ok {
+			Logf("info", "证书文件扫描：重载补偿重试（失败 %d 次，cert_version=%d，上次 %s）", state.attempts, state.certVersion, state.failedAt.Format("15:04:05"))
+		}
+	}
+	err := reload()
+	if err != nil {
+		version, versionErr := CurrentCertVersion(ctx)
+		if versionErr != nil {
+			certFileScanWarn("reload-version", "证书文件扫描：读取证书水位用于失败标记失败，按 0 记录: %v", versionErr)
+			version = 0
+		}
+		markCertFileReloadFailed(version, time.Now())
+		certFileScanWarn("reload-failed", "证书文件扫描：主节点强制重载失败（已标记，后续扫描轮按退避补偿重试）: %v", err)
+		certFileScanErrors.Add(1)
+		return
+	}
+	wasRetry := retryPending
+	clearCertFileReloadRetry()
+	if wasRetry {
+		Logf("info", "证书文件扫描：重载补偿成功，标记已清除")
+	} else {
+		Logf("info", "证书文件扫描：入库后主节点强制重载完成（%d 项证书）", round.Upserted)
+	}
+}
+
 // certScanRound 一轮扫描的可观测结果（测试直接断言；生产按差异落日志）。
 type certScanRound struct {
 	Pairs     int // 通过合法性校验并进入比对/入库的证书对数
@@ -250,23 +377,9 @@ func scanCertFilesToVault(ctx context.Context) certScanRound {
 	}
 	if round.Upserted > 0 {
 		Logf("info", "证书文件扫描：本轮入库 %d 项（跳过未变 %d 项，失败 %d 项）", round.Upserted, round.Unchanged, round.Failed)
-		// 只有真实入库才重载：指纹全同的周期轮不得每 60s 空 reload。
-		// ctx 已取消（引擎换代）时不下发——避免停机期间向 Caddy 写配置。
-		if ctx.Err() != nil {
-			return round
-		}
-		reload := certFileScanReloadFnGet()
-		if reload == nil {
-			certFileScanWarn("reload-unwired", "证书文件扫描：本轮入库 %d 项但主节点重载未接线，跳过（放文件即生效不可用）", round.Upserted)
-			return round
-		}
-		if err := reload(); err != nil {
-			certFileScanWarn("reload-failed", "证书文件扫描：入库后主节点强制重载失败（下一轮证书未变不会重试）: %v", err)
-			certFileScanErrors.Add(1)
-		} else {
-			Logf("info", "证书文件扫描：入库后主节点强制重载完成（%d 项证书）", round.Upserted)
-		}
 	}
+	// 入库触发 + 历史失败补偿统一在此收口：指纹全同且无待重试标记时零重载。
+	maybeReloadMasterAfterScan(ctx, round)
 	return round
 }
 

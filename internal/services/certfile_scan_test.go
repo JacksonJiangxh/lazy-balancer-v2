@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -83,6 +84,17 @@ func scanTestCertPair(t *testing.T, domain string) (certPEM, keyPEM string) {
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
 		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+}
+
+// resetCertFileReloadRetryForTest 隔离全局补偿标记与退避参数（用例间零污染）。
+func resetCertFileReloadRetryForTest(t *testing.T) {
+	t.Helper()
+	clearCertFileReloadRetry()
+	oldBase, oldMax := certFileReloadRetryBase, certFileReloadRetryMax
+	t.Cleanup(func() {
+		clearCertFileReloadRetry()
+		certFileReloadRetryBase, certFileReloadRetryMax = oldBase, oldMax
+	})
 }
 
 func certVaultVersion(t *testing.T, database *sql.DB) int64 {
@@ -511,5 +523,186 @@ func TestCertFileScanReload_serializesWithSlaveApplySnapshot(t *testing.T) {
 	}
 	if overlap.Load() {
 		t.Fatal("两处 reload 临界区发生重叠")
+	}
+}
+
+// 失败 → 标记 → 下一轮无变化仍重试 → 成功清标记 → 再下一轮零调用。
+func TestCertFileReloadRetry_marksRetriesAndClears(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+	resetCertFileReloadRetryForTest(t)
+	certFileReloadRetryBase = 0 // 立即到期，隔离退避等待
+
+	var calls int
+	SetCertFileScanReload(func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("caddy 503 service unavailable")
+		}
+		return nil
+	})
+	defer SetCertFileScanReload(nil)
+
+	certPEM, keyPEM := scanTestCertPair(t, "scan-retry.example.test")
+	if err := WriteCertFiles("lb_scan_retry", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	first := scanCertFilesToVault(context.Background())
+	if first.Upserted != 1 || calls != 1 {
+		t.Fatalf("first round=%+v calls=%d, want upserted=1 calls=1", first, calls)
+	}
+	state, ok := certFileReloadRetrySnapshot()
+	if !ok || state.attempts != 1 || state.certVersion < 1 {
+		t.Fatalf("retry marker=%+v ok=%v, want attempts=1 cert_version>=1", state, ok)
+	}
+
+	second := scanCertFilesToVault(context.Background())
+	if second.Upserted != 0 || second.Unchanged != 1 || calls != 2 {
+		t.Fatalf("second round=%+v calls=%d, want unchanged only + retry (calls=2)", second, calls)
+	}
+	if _, stillPending := certFileReloadRetrySnapshot(); stillPending {
+		t.Fatal("successful retry did not clear marker")
+	}
+
+	scanCertFilesToVault(context.Background())
+	if calls != 2 {
+		t.Fatalf("after clear, third round called hook %d times, want 2（无变化零重载）", calls)
+	}
+}
+
+// 补偿重试必须与原触发路径一样走 CaddyOpLock：applySnapshot 持锁期间不进入。
+func TestCertFileReloadRetry_serializesWithSlaveApplySnapshot(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	enableCertVaultForTest(t, database)
+	resetCertFileReloadRetryForTest(t)
+	certFileReloadRetryBase = 0
+	for _, stmt := range []string{
+		`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_retry_conc','retry conc','http','rc.example.test',80,1)`,
+		`INSERT INTO upstreams (rule_id,host,port,weight,enabled) VALUES ('lb_retry_conc','127.0.0.1',8080,1,1)`,
+		`INSERT INTO users (id,username,password_hash,role,is_enabled,last_login) VALUES (1,'admin','h','admin',1,datetime('now'))`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if _, err := database.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+		t.Fatalf("set master: %v", err)
+	}
+	seedCert, seedKey := scanTestCertPair(t, "rc.example.test")
+	if _, err := caddydbcert.Upsert(ctx, database, certKeyProvider(""), "", "rc.example.test", "lb_retry_conc", seedCert, seedKey, false, []string{"lb_retry_conc"}); err != nil {
+		t.Fatalf("seed vault cert: %v", err)
+	}
+	service := NewClusterService(database, "")
+	snap, _, err := service.Snapshot(ctx, 0, "", "")
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("set slave: %v", err)
+	}
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+
+	// 先制造一次失败，留下待重试标记（直接调 helper，避免额外文件/证书铺垫）。
+	SetCertFileScanReload(func() error { return errors.New("caddy 503") })
+	maybeReloadMasterAfterScan(ctx, certScanRound{Upserted: 1})
+	if _, ok := certFileReloadRetrySnapshot(); !ok {
+		t.Fatal("retry marker not set after failure")
+	}
+
+	var active atomic.Int32
+	var overlap atomic.Bool
+	applyEntered, retryEntered := make(chan struct{}), make(chan struct{})
+	releaseApply, releaseRetry := make(chan struct{}), make(chan struct{})
+	oldHook := syncReloadLockHook
+	syncReloadLockHook = func() {
+		if active.Add(1) != 1 {
+			overlap.Store(true)
+		}
+		close(applyEntered)
+		<-releaseApply
+		active.Add(-1)
+	}
+	defer func() { syncReloadLockHook = oldHook }()
+
+	retryCaddy := NewCaddyService(caddyServer.URL)
+	SetCertFileScanReload(func() error {
+		var reloadErr error
+		WithCaddyOpLock(func() {
+			if active.Add(1) != 1 {
+				overlap.Store(true)
+			}
+			close(retryEntered)
+			<-releaseRetry
+			reloadErr = ReloadFromDB(retryCaddy, database, database)
+			active.Add(-1)
+		})
+		return reloadErr
+	})
+	defer SetCertFileScanReload(nil)
+
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- syncService.applySnapshot(ctx, snap) }()
+	<-applyEntered
+
+	retryDone := make(chan struct{})
+	go func() { maybeReloadMasterAfterScan(ctx, certScanRound{}); close(retryDone) }()
+	select {
+	case <-retryEntered:
+		t.Fatal("补偿重试与从端 applySnapshot reload 重叠（未共用 CaddyOpLock）")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseApply)
+	if err := <-applyDone; err != nil {
+		t.Fatalf("slave applySnapshot: %v", err)
+	}
+	select {
+	case <-retryEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("apply 释放锁后补偿重试未进入")
+	}
+	close(releaseRetry)
+	<-retryDone
+	if overlap.Load() {
+		t.Fatal("两处 reload 临界区发生重叠")
+	}
+	if _, ok := certFileReloadRetrySnapshot(); ok {
+		t.Fatal("successful compensated retry did not clear marker")
+	}
+}
+
+// 连续失败时限流：退避 base=120ms / cap=240ms，500ms 窗口内调用次数远小于轮数。
+func TestCertFileReloadRetry_throttlesConsecutiveFailures(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	resetCertFileReloadRetryForTest(t)
+	certFileReloadRetryBase = 120 * time.Millisecond
+	certFileReloadRetryMax = 240 * time.Millisecond
+
+	var calls int
+	SetCertFileScanReload(func() error { calls++; return errors.New("caddy down") })
+	defer SetCertFileScanReload(nil)
+
+	maybeReloadMasterAfterScan(context.Background(), certScanRound{Upserted: 1}) // 首次失败 → attempts=1
+	rounds := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		maybeReloadMasterAfterScan(context.Background(), certScanRound{}) // 无入库，只有补偿到期才调用
+		rounds++
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rounds < 20 {
+		t.Fatalf("rounds=%d, want >=20（限流窗口未跑够）", rounds)
+	}
+	if calls < 2 || calls > 4 {
+		t.Fatalf("500ms 内重载调用 %d 次（共 %d 轮），want 2..4（退避限流）", calls, rounds)
+	}
+	state, ok := certFileReloadRetrySnapshot()
+	if !ok || state.attempts < 2 {
+		t.Fatalf("retry marker=%+v ok=%v, want attempts>=2（失败持续保留）", state, ok)
 	}
 }
