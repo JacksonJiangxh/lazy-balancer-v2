@@ -513,7 +513,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 				// 按 B 库内容渲染并 /load（写入 A、渲染 B，静默错配）。
 				// certSource 同用 s.db（快照事务已提交，证书候选与渲染同一真相）；
 				// rulesWrittenInTx=true：快照写过 lb_rules，谓词 miss 需 per-rule 补查。
-				reloadErr = s.caddy.ApplyConfigForce(generateCaddyConfigWithCertSource(s.db, s.db, true))
+				reloadErr = ReloadFromDB(s.caddy, s.db, s.db)
 			}
 		})
 	}
@@ -604,6 +604,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 恒非 nil）且已被节级三态覆盖：全局配置并入 users（系统数据）节，节实际
 	// 应用/跳过面见上列（2026-10-03「汇总行反映节级实际应用面」裁定）。
 	RecordAuditLog("system", "同步", "集群同步", FormatAuditDetail(summaryParts...), "")
+	// 双水位记账（甲路线证书库启用时）：config_version 来自快照，cert_version
+	// 取自本地证书库的单调递增水位；重载失败路径不推进。
+	RecordAppliedWatermark(ctx, int64(snapshot.Version))
 	return nil
 }
 

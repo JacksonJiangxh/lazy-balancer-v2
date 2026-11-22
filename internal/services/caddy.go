@@ -137,6 +137,9 @@ type CaddyService struct {
 	// lastGoodPath 非空时，每次成功 /load 后把已应用 JSON 原子落盘到该路径，
 	// 供启动兜底（裁定 2026-09-06 ③）读取回放。
 	lastGoodPath string
+	// authoritativePath 是「已由 DB 权威渲染并成功 /load」配置的落盘副本。
+	// reapply 优先读它，last_good 仅作降级兜底（JJC-20261122-003 D）。
+	authoritativePath string
 	// cliValidate 非空时，写路径在事务内应用前先用 caddy CLI（validate-only：
 	// run(cfg,false) 执行完整 provisionContext(含 coraza 编译)仅跳过 Start、
 	// 不绑端口——比「不 provision」更强,引擎级错误在此被捕获)校验
@@ -287,6 +290,10 @@ func withCaddyOpLock(fn func()) {
 	defer CaddyOpLock.Unlock()
 	fn()
 }
+
+// WithCaddyOpLock is the exported form used by cross-package certificate
+// callbacks (main wires cert-vault changes to ReloadFromDB through it).
+func WithCaddyOpLock(fn func()) { withCaddyOpLock(fn) }
 
 // errSameConfig 渲染产物与运行配置字节一致（Caddy changeConfig 同源短路）。
 // 审计真实性裁定（2026-09-25 用户裁定：审计事件必须真实有效）——同字节时
@@ -561,6 +568,14 @@ func (s *CaddyService) SetLastGoodPath(path string) {
 	s.lastGoodPath = path
 }
 
+// SetAuthoritativePath 启用 DB 权威渲染配置的落盘副本。写入与 LKG 同一时刻
+// （成功 /load 后），两者字节一致；entrypoint reapply 优先权威文件。
+func (s *CaddyService) SetAuthoritativePath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authoritativePath = path
+}
+
 // persistLastGoodIfMissingLocked 只在 LKG 文件缺失时落盘（同字节短路路径专用）：
 // 短路的内容已确认等于运行配置，补写零风险；文件已存在则不动（避免每次短路
 // 都写盘）。stat 的其他错误（权限/父目录缺失）按缺失处理——落盘失败只记日志。
@@ -591,6 +606,22 @@ func (s *CaddyService) persistLastGoodLocked(data []byte) {
 	}
 	if err := syncParentDir(s.lastGoodPath); err != nil {
 		Logf("error", "last-known-good: sync parent dir failed: %v", err)
+	}
+	// 权威副本与 LKG 同字节：只有经 DB 渲染且 /load 成功的配置才会写这里。
+	// 失败仅留痕——LKG 仍是可用兜底，不得因副本 IO 失败影响主应用路径。
+	if s.authoritativePath != "" {
+		authTmp := s.authoritativePath + ".tmp"
+		if err := writeSyncedFile(authTmp, data, 0o600); err != nil {
+			Logf("error", "authoritative config: write temp file failed: %v", err)
+			return
+		}
+		if err := os.Rename(authTmp, s.authoritativePath); err != nil {
+			Logf("error", "authoritative config: rename into place failed: %v", err)
+			return
+		}
+		if err := syncParentDir(s.authoritativePath); err != nil {
+			Logf("error", "authoritative config: sync parent dir failed: %v", err)
+		}
 	}
 }
 
@@ -3187,13 +3218,18 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	}
 
 	// TLS app: load certificates from database (manual + ACME), no Caddy ACME automation.
-	if len(tlsCertFiles) > 0 {
-		tlsApp := map[string]interface{}{
-			"certificates": map[string]interface{}{
-				"load_files": tlsCertFiles,
-			},
+	// Route A（皇上圣裁 JJC-20261122-003）：甲路线启用时改用自定义
+	// tls.certificates.lb_db 直读加密证书库——不发射 load_files 文件列表、
+	// 不内联 PEM，从节点零证书文件；Caddy 自身按 SNI 从 loader 返回的证书集
+	// 选择。未配置 DEK 时保持既有 load_files 路径，升级零回归。
+	if len(tlsCertFiles) > 0 || DBCertLoaderEnabled() {
+		certificates := map[string]interface{}{}
+		if DBCertLoaderEnabled() {
+			certificates["lb_db"] = dbCertLoaderConfig()
+		} else {
+			certificates["load_files"] = tlsCertFiles
 		}
-		apps["tls"] = tlsApp
+		apps["tls"] = map[string]interface{}{"certificates": certificates}
 	}
 
 	// 库值唯一真相（批 1+2）：caddy_log_size_mb 为类型①值型列，<=0 显性报错

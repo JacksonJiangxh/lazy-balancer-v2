@@ -35,7 +35,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -578,15 +577,6 @@ func securityEventsSpoolActivePID(name string) int {
 		return 0
 	}
 	return pid
-}
-
-// securityEventsSpoolProcessAlive 判断 pid 是否仍存在（EPERM=存在但无权限）。
-func securityEventsSpoolProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return true // 未知 pid 按存活处理，不冒进封存
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // sealOrphanedSecurityEventsSpoolFiles 把「写侧进程已不存在且文件静默」

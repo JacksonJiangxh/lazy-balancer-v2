@@ -120,6 +120,24 @@ func run() error {
 			services.Logf("error", "close databases during shutdown: %v", err)
 		}
 	}()
+	// 证书库（甲路线 JJC-20261122-003）：仅在显式配置 DEK/KMS 时启用。
+	// 迁移是加性回填（不删旧明文列），故 JJC-001 的引用型证书随快照同步
+	// 与面板现有读路径零回归；从节点不读 .crt/.key，配置不内联私钥。
+	if os.Getenv("LB_CERT_DEK_B64") != "" || os.Getenv("LB_CERT_KMS_ENDPOINT") != "" {
+		if err := services.InitCertVault(context.Background()); err != nil {
+			return startupFailed(fmt.Errorf("init certificate vault: %w", err))
+		}
+		keyEnv := os.Getenv("LB_CERT_DEK_ENV")
+		if keyEnv == "" {
+			keyEnv = "LB_CERT_DEK_B64"
+		}
+		services.ConfigureDBCertLoader(
+			filepath.Join(cfg.DataDir, "lazy-balancer.db"),
+			keyEnv,
+			os.Getenv("LB_CERT_KMS_ENDPOINT"),
+			os.Getenv("LB_CERT_KMS_TOKEN_ENV"),
+		)
+	}
 	services.ApplyLogLevel()
 	// 配置载入期告警重放：此刻运行日志文件写端与级别门都已装配，误配信号
 	// （未知键/类型错误/弱 JWT 密钥/caddy_admin_url 失联/APP_VERSION 未注入）
@@ -211,6 +229,8 @@ func run() error {
 	// 放行（事务内应用仍门控）。
 	caddyService.EnableCLIValidation()
 	caddyService.SetLastGoodPath(filepath.Join(cfg.DataDir, "last_good_caddy_config.json"))
+	// JJC-20261122-003 D：DB 权威渲染副本，供监督器 reapply 优先回放。
+	caddyService.SetAuthoritativePath(filepath.Join(cfg.DataDir, "caddy-authoritative.json"))
 	// 数据类更新（xdb/CRS/CA 证书文件）后的重载必须强制——配置
 	// JSON 不变时 Caddy 会跳过 provision（errSameConfig 短路），插件内存停留
 	// 旧库而更新流程报成功。三个消费方（IP 库/CRS/CA 队列）全是数据更新入口。
@@ -223,9 +243,18 @@ func run() error {
 	// 面板口注入渲染层（JJC-20261121-001）：逐上游健康检查路径分歧形态的
 	// health_upstream 指向面板回环聚合探针端点（127.0.0.1:<面板口>）。
 	services.SetPanelPort(cfg.Port)
-	// 引用型证书外部更新自动摄取：看门狗回写 DB 后复用同一强制重载执行体（必须 force）。
-	// 详见 docs/fork-notes/watchdog-and-server.md §5
-	services.SetReferencedCertReload(caddyReloader)
+	// 引用型证书外部更新自动摄取：看门狗回写 DB 后走证书专用重载链——
+	// JJC-20261122-003 要求证书变更回调收口到 ReloadFromDB（DB→渲染→校验→
+	// /load→LKG），与配置增量通道分离。InLock 变体不能在此使用：本回调的
+	// 调用方（certissuer 部署链）不持 CaddyOpLock，由本闭包自取。
+	certReloader := func() error {
+		var reloadErr error
+		services.WithCaddyOpLock(func() {
+			reloadErr = services.ReloadFromDB(caddyService, db.DB, db.DB)
+		})
+		return reloadErr
+	}
+	services.SetReferencedCertReload(certReloader)
 	// CA 证书队列走 InLock 变体——部署临界区按全局锁序
 	// CaddyOpLock → DeployLock 先持 CaddyOpLock（与规则补偿恢复链同序，
 	// 消除 AB-BA），重载回调不得再自取锁（重入死锁）。CRS/IP 库/威胁库
@@ -247,6 +276,15 @@ func run() error {
 	lifecycle := newRuntimeLifecycle(syncService, func() lifecycleWorker {
 		return services.NewCertificateService()
 	})
+	// 集群同步 mTLS（JJC-20261122-003 E）：客户端证书由部署注入，仓内不含凭据。
+	// 未配置时保持既有「TLS + 服务端指纹钉扎 + X-Cluster-Token」 posture 不变。
+	if clusterCertFile, clusterKeyFile := os.Getenv("LB_CLUSTER_CLIENT_CERT"), os.Getenv("LB_CLUSTER_CLIENT_KEY"); clusterCertFile != "" && clusterKeyFile != "" {
+		pair, pairErr := tls.LoadX509KeyPair(clusterCertFile, clusterKeyFile)
+		if pairErr != nil {
+			return startupFailed(fmt.Errorf("load cluster mTLS client certificate: %w", pairErr))
+		}
+		services.SetClusterClientCertificate(&pair)
+	}
 	clusterService := services.NewClusterService(db.DB, cfg.DataDir)
 	caProviderService := services.NewCAProviderService(cfg.DataDir)
 

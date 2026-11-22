@@ -112,8 +112,17 @@ func TestSyncService_applySnapshot_renderUsesServiceDBHandle(t *testing.T) {
 	if strings.Contains(text, "ApplyConfigForce(GenerateCaddyConfig())") {
 		t.Fatal("applySnapshot 重载段用包级 db.DB 渲染（多库形态会写入 A 库、渲染 B 库）")
 	}
-	if !strings.Contains(text, "generateCaddyConfigWithCertSource(s.db, s.db, true)") {
-		t.Fatal("applySnapshot 重载段必须用服务句柄渲染：generateCaddyConfigWithCertSource(s.db, s.db, true)")
+	// JJC-20261122-003：重载段收口为 ReloadFromDB 单一入口；服务句柄必须
+	// 作为参数显式传入（不得在 helper 内回落包级 db.DB）。
+	if !strings.Contains(text, "ReloadFromDB(s.caddy, s.db, s.db)") {
+		t.Fatal("applySnapshot 重载段必须用服务句柄渲染：ReloadFromDB(s.caddy, s.db, s.db)")
+	}
+	helper, err := os.ReadFile("certdb.go")
+	if err != nil {
+		t.Fatalf("read certdb.go: %v", err)
+	}
+	if !strings.Contains(string(helper), "generateCaddyConfigWithCertSource(store, certSource, true)") {
+		t.Fatal("ReloadFromDB 必须用入参 store/certSource 渲染，禁止回落包级 db.DB")
 	}
 	if strings.Contains(text, "LoadAdminTLSConfigE()") {
 		t.Fatal("applySnapshot 重启判定必须按服务句柄读 Admin TLS：包级 db.DB 在多库形态会读错库")

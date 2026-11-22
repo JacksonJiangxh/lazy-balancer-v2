@@ -348,10 +348,33 @@ func newClusterDetachTransport(expectedPin string) *http.Transport {
 	})
 }
 
+// clusterClientCert holds an optional client certificate for mutual TLS on
+// the cluster sync channel. Nil keeps the historical TLS+pin+token posture;
+// main wires it from LB_CLUSTER_CLIENT_CERT / LB_CLUSTER_CLIENT_KEY when the
+// deployment provisions mTLS credentials (no credentials live in the repo).
+var clusterClientCert atomic.Value // *tls.Certificate
+
+// SetClusterClientCertificate enables mTLS client authentication for cluster
+// sync. Passing nil disables it again.
+func SetClusterClientCertificate(cert *tls.Certificate) {
+	if cert == nil {
+		clusterClientCert.Store((*tls.Certificate)(nil))
+		return
+	}
+	clusterClientCert.Store(cert)
+}
+
 func newClusterVerifyTransport(verify func(state tls.ConnectionState, address string) error) *http.Transport {
 	tlsConfig := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
+	}
+	// Route A / JJC-20261122-003: mTLS is additive to the existing server
+	// pin check — pinning remains authoritative, the client cert adds proof
+	// of node identity. Order: SetClusterClientCertificate is called once at
+	// startup before any transport is built.
+	if cert, ok := clusterClientCert.Load().(*tls.Certificate); ok && cert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*cert}
 	}
 	transport := &http.Transport{
 		MaxIdleConns:          100,

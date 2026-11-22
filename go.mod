@@ -24,6 +24,7 @@ require (
 	github.com/pquerna/otp v1.5.0
 	golang.org/x/sync v0.24.0
 	lazy-balancer-v2/caddychain v0.0.0-00010101000000-000000000000
+	lazy-balancer-v2/caddydbcert v0.0.0-00010101000000-000000000000
 	lazy-balancer-v2/geoipnames v0.0.0-00010101000000-000000000000
 	lazy-balancer-v2/wafiplist v0.0.0-00010101000000-000000000000
 )
@@ -50,7 +51,7 @@ require (
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic v1.15.2 // indirect
 	github.com/bytedance/sonic/loader v0.5.2 // indirect
-	github.com/caddyserver/caddy/v2 v2.11.6 // indirect
+	github.com/caddyserver/caddy/v2 v2.11.9 // indirect
 	github.com/caddyserver/certmagic v0.25.6 // indirect
 	github.com/caddyserver/zerossl v0.1.6 // indirect
 	github.com/ccoveille/go-safecast/v2 v2.0.1 // indirect
@@ -67,6 +68,7 @@ require (
 	github.com/dgraph-io/ristretto v0.2.0 // indirect
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da // indirect
 	github.com/dunglas/go-urlpattern v1.0.0 // indirect
+	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.15 // indirect
@@ -191,7 +193,7 @@ require (
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.30.0 // indirect
-	golang.org/x/crypto/x509roots/fallback v0.0.0-20260929172509-b39ff6d641ec // indirect
+	golang.org/x/crypto/x509roots/fallback v0.0.0-20261030153154-30a33513ff6d // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
@@ -213,6 +215,8 @@ require (
 )
 
 replace lazy-balancer-v2/caddychain => ./caddychain
+
+replace lazy-balancer-v2/caddydbcert => ./caddydbcert
 
 replace lazy-balancer-v2/wafiplist => ./wafiplist
 

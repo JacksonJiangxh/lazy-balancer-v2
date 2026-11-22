@@ -108,14 +108,31 @@ rm -f "$CADDY_STARTUP_REPLAY_DONE"
 
     # 就绪后的恢复动作(重应用 last-good + 写权威修正 trigger)
     reapply_last_good() {
-      if [ -s /app/data/last_good_caddy_config.json ]; then
-        if wget -q -O /dev/null -T 5 --header="Content-Type: application/json" \
-          --post-file=/app/data/last_good_caddy_config.json \
-          http://localhost:2019/load 2>/dev/null; then
-          sup_log "Re-applied last known good config (last_good 快照)"
-        else
-          sup_log "WARN: last-good config re-apply failed"
+      # JJC-20261122-003 D：权威渲染优先，last_good 降级兜底。
+      # 两个文件均由面板在成功 /load 后写同字节副本；权威文件缺失/回放失败
+      # 才回落 LKG。trigger→watcher 的权威修正链保持不变（见下方注释）。
+      CADDY_AUTHORITATIVE=/app/data/caddy-authoritative.json
+      CADDY_LAST_GOOD=/app/data/last_good_caddy_config.json
+      REAPPLIED=0
+      for CANDIDATE in "$CADDY_AUTHORITATIVE" "$CADDY_LAST_GOOD"; do
+        if [ -s "$CANDIDATE" ]; then
+          if wget -q -O /dev/null -T 5 --header="Content-Type: application/json" \
+            --post-file="$CANDIDATE" \
+            http://localhost:2019/load 2>/dev/null; then
+            if [ "$CANDIDATE" = "$CADDY_AUTHORITATIVE" ]; then
+              sup_log "Re-applied authoritative DB-rendered config"
+            else
+              sup_log "Re-applied last known good config (authoritative unavailable, degraded fallback)"
+            fi
+            REAPPLIED=1
+            break
+          else
+            sup_log "WARN: re-apply failed for $CANDIDATE"
+          fi
         fi
+      done
+      if [ "$REAPPLIED" -eq 0 ]; then
+        sup_log "WARN: no authoritative/last-good config available to re-apply"
       fi
       # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
       # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)。
