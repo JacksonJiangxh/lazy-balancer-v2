@@ -38,6 +38,12 @@ var (
 	ErrLoginTicketUserUnavailable = errors.New("登录票据用户不存在或已禁用")
 )
 
+// loginTicketTTL 登录票据有效期：90s→300s（JJC-20261122-001），与服务控制
+// 票据同口径——主从时钟偏差超 90s 时刚签出的票据恒被判过期（全从节点必现）。
+// TTL 只界定「签发后未消费」窗口，重放由 jti 一次性消费防御；校验侧另有
+// 主从时钟偏移校正（masterAdjustedNow）根治偏差。
+const loginTicketTTL = 300 * time.Second
+
 // clusterTicketVerify 是集群一次性票据的验签结果分类：登录票据
 // 与服务控制票据共用同一 HMAC/base64 实现，调用方只按分类映射各自哨兵
 // （两者错误文案不同，不能合并成同一 error）。
@@ -146,9 +152,9 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 		return models.ClusterLoginTicketResponse{}, err
 	}
 	claims.JTI = jti
-	// 签发侧预留时钟偏移（60s→90s）：从节点按自身时钟校验，两侧偏差超过
-	// 一分钟时票据恒被拒且无重试窗口。校验侧语义不变。
-	claims.ExpiresAt = now.UTC().Add(90 * time.Second).Unix()
+	// 签发侧预留时钟偏移：90s→300s（JJC-20261122-001，与服务控制票据同口径）
+	// ——偏差超 90s 时票据刚签出即被判过期，浏览器跳转链路全体必现失败。
+	claims.ExpiresAt = now.UTC().Add(loginTicketTTL).Unix()
 	ticket, err := signClusterTicket(claims, key)
 	if err != nil {
 		return models.ClusterLoginTicketResponse{}, fmt.Errorf("编码登录票据: %w", err)
@@ -161,10 +167,13 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 // login_locked_until——该列是从节点自身密码登录端点的暴破防护记账
 // 本地写入、不随快照同步），而本路径不含任何口令猜测面：票据由主节点在
 // 完整认证（本地用户强制 MFA 步进验证/OIDC 会话经 IdP 二因子）后签发，
-// 票据本身即主端 MFA 事实；一次性消费（jti 入 used_login_tickets）+90s
+// 票据本身即主端 MFA 事实；一次性消费（jti 入 used_login_tickets）+300s
 // TTL+HMAC 绑定节点，重查本地锁对暴破防护无增量，反而会让主端合法跳转
 // 被从节点残留的本地锁误拦。
 func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string, now time.Time) (models.ClusterLoginTicketClaims, models.User, int64, error) {
+	// JJC-20261122-001：票据以主节点时钟签发，先把本机时刻校正到主节点基准
+	// 再比对（无新鲜偏移测量时零偏移，行为与旧版一致）。
+	now = masterAdjustedNow(now)
 	parts := strings.Split(ticket, ".")
 	if len(parts) != 2 {
 		return models.ClusterLoginTicketClaims{}, models.User{}, 0, ErrInvalidLoginTicket

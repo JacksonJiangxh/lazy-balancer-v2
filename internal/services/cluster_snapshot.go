@@ -49,7 +49,11 @@ type clusterSnapshotCache struct {
 	fingerprint string
 	ownership   [sha256.Size]byte
 	switches    string
-	expiresAt   time.Time
+	// refCertsDigest 引用型证书文件对内容摘要（JJC-20261122-001）：文件内容
+	// 属文件态（外部更新不 bump cluster_version），必须进缓存键才能让指纹随
+	// 文件变化重算、从节点经指纹差异走全量重拉。
+	refCertsDigest string
+	expiresAt      time.Time
 }
 
 var clusterSnapshotCaches sync.Map
@@ -218,6 +222,14 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	if err != nil {
 		return models.ClusterSnapshot{}, nil, "", err
 	}
+	// JJC-20261122-001：引用型证书文件对摘要进缓存键（文件态变更无 DB 版本
+	// 递增，指纹必须随文件内容重算）。摘要失败按无引用文件继续（与空态同
+	// 键），不让单点文件 I/O 故障瘫痪快照服务。
+	refCertsDigest, err := referencedCertsDigest(ctx, tx)
+	if err != nil {
+		Logf("warn", "读取引用型证书文件摘要失败，快照缓存键按空态继续: %v", err)
+		refCertsDigest = ""
+	}
 	now := s.snapshotNow()
 	// 开关读取失败必须报错——空缓存键 + nil 开关会把主节点 sync_users=0
 	// 等关闭保护在该份快照内绕过（从节点 computeSectionSkips 回退全开默认值），
@@ -231,7 +243,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	switchesKey := fmt.Sprintf("%t%t%t", switches.Users, switches.Rules, switches.Security)
 	// 双检：读字段用 mu（构建已在 buildMu 内串行化，此处只防并发读的撕裂）。
 	cache.mu.Lock()
-	hit := cache.initialized && cache.version == version && cache.ownership == ownershipHash && cache.switches == switchesKey && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt))
+	hit := cache.initialized && cache.version == version && cache.ownership == ownershipHash && cache.switches == switchesKey && cache.refCertsDigest == refCertsDigest && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt))
 	cachedSnapshot, cachedCanonical, cachedFingerprint := cache.snapshot, cache.canonical, cache.fingerprint
 	cache.mu.Unlock()
 	if hit {
@@ -266,6 +278,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	cache.fingerprint = fingerprint
 	cache.ownership = ownershipHash
 	cache.switches = switchesKey
+	cache.refCertsDigest = refCertsDigest
 	cache.expiresAt = nearestSnapshotCertificateExpiry(snapshot.Certs, now)
 	cache.mu.Unlock()
 	return snapshot, canonical, fingerprint, nil
@@ -570,6 +583,104 @@ func parseSnapshotExpiry(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法解析证书过期时间 %q", value)
 }
 
+// referencedCertPairKey 引用型证书文件对的去重/比对键（路径对唯一标识）。
+func referencedCertPairKey(pair models.ClusterReferencedCertPair) string {
+	return pair.CertPath + "\x00" + pair.KeyPath
+}
+
+// referencedCertRulePairs 读取引用型证书（tls_source="file"）规则引用的
+// 去重路径对（不读文件内容）。多条规则共享同一对文件时仅产出一条。
+// 排序保证 canonical payload 字节确定（指纹跨构建稳定）。
+func referencedCertRulePairs(ctx context.Context, store snapshotStore) ([][2]string, error) {
+	rows, err := store.QueryContext(ctx, `SELECT DISTINCT COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
+		FROM lb_rules
+		WHERE IIF(COALESCE(enable_tls,0) IN ('1',1),1,0)=1 AND COALESCE(tls_source,'')='file'
+		AND COALESCE(tls_cert_path,'')<>'' AND COALESCE(tls_key_path,'')<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	pairs := make([][2]string, 0, 4)
+	for rows.Next() {
+		var certPath, keyPath string
+		if err := rows.Scan(&certPath, &keyPath); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, [2]string{certPath, keyPath})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i][0] != pairs[j][0] {
+			return pairs[i][0] < pairs[j][0]
+		}
+		return pairs[i][1] < pairs[j][1]
+	})
+	return pairs, nil
+}
+
+// referencedCertsDigest 引用型证书文件对的内容摘要（快照缓存键成分，主节点
+// 侧）：文件缺失/不可读同样纳入摘要（存在性变化也要失效缓存触发指纹重算）。
+// 查询级失败才返回错误（调用方按空态降级）；单文件 I/O 失败进摘要不报错。
+func referencedCertsDigest(ctx context.Context, store snapshotStore) (string, error) {
+	pairs, err := referencedCertRulePairs(ctx, store)
+	if err != nil {
+		return "", err
+	}
+	if len(pairs) == 0 {
+		return "", nil
+	}
+	h := sha256.New()
+	for _, pair := range pairs {
+		h.Write([]byte(pair[0]))
+		h.Write([]byte{0})
+		if data, err := os.ReadFile(pair[0]); err != nil {
+			fmt.Fprintf(h, "cert-err:%v\x00", err)
+		} else {
+			h.Write(data)
+			h.Write([]byte{0})
+		}
+		h.Write([]byte(pair[1]))
+		h.Write([]byte{0})
+		if data, err := os.ReadFile(pair[1]); err != nil {
+			fmt.Fprintf(h, "key-err:%v\x00", err)
+		} else {
+			h.Write(data)
+			h.Write([]byte{0})
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// snapshotReferencedCerts 装载引用型证书文件对内容（含配对校验，与主节点
+// 渲染同口径）。单对失败 warn+跳过（fail-open），不阻断快照构建；排序由
+// referencedCertRulePairs 保证，canonical payload 字节确定。
+func snapshotReferencedCerts(ctx context.Context, store snapshotStore) ([]models.ClusterReferencedCertPair, error) {
+	pairs, err := referencedCertRulePairs(ctx, store)
+	if err != nil {
+		return nil, fmt.Errorf("读取引用型证书规则路径: %w", err)
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	out := make([]models.ClusterReferencedCertPair, 0, len(pairs))
+	for _, pair := range pairs {
+		referenced, err := LoadReferencedCertificate(pair[0], pair[1])
+		if err != nil {
+			Logf("warn", "引用型证书文件对读取失败（证书 %s / 私钥 %s），集群快照跳过该文件对，引用它的规则在从节点渲染将失败: %v", pair[0], pair[1], err)
+			continue
+		}
+		out = append(out, models.ClusterReferencedCertPair{
+			CertPath: referenced.CertPath,
+			KeyPath:  referenced.KeyPath,
+			CertPEM:  referenced.CertPEM,
+			KeyPEM:   referenced.KeyPEM,
+		})
+	}
+	return out, nil
+}
+
 // normalizeSnapshotCaddyNumericSettings 归一快照携带的 Caddy 全局数值设置
 // （request_body_max_size_mb / 三类 HTTP 超时 / caddy_log_size_mb）。
 // 主端装载侧（loadSnapshotGlobalSettings）与从端 apply 侧
@@ -837,6 +948,13 @@ func (s *ClusterService) buildSnapshot(ctx context.Context, store snapshotStore)
 		return models.ClusterSnapshot{}, err
 	}
 	if snapshot.Certs, err = s.snapshotCertificates(ctx, store); err != nil {
+		return models.ClusterSnapshot{}, err
+	}
+	// JJC-20261122-001：引用型证书文件对内容随快照下发。单规则文件对读取失败
+	// 仅跳过该对（fail-open，对齐 ACME 校验的单行损坏语义），不阻断快照——
+	// 快照瘫痪会让全部从节点同步失效，而单文件缺失只影响该规则在从节点的
+	// 渲染（与主节点自身渲染失败同口径）。
+	if snapshot.ReferencedCerts, err = snapshotReferencedCerts(ctx, store); err != nil {
 		return models.ClusterSnapshot{}, err
 	}
 	if snapshot.ACME, err = s.snapshotACME(ctx, store); err != nil {

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -594,7 +595,11 @@ func TestServiceControlTicketFailureReason_mapsSentinels(t *testing.T) {
 		want string
 	}{
 		{"签名错误", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlSignature), "签名错误"},
+		// JJC-20261122-001：过期细因附带偏差诊断；无诊断段（纯哨兵，仅测试
+		// 构造可达）保持原「已过期」文案。
 		{"已过期", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlExpired), "已过期"},
+		{"已过期带偏差诊断", errors.Join(services.ErrInvalidServiceControlTicket,
+			fmt.Errorf("%w（票据到期 1，本机校正后 2，偏差约 1 秒）", services.ErrServiceControlExpired)), "已过期（票据到期 1，本机校正后 2，偏差约 1 秒）"},
 		{"已使用", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlReplay), "已使用"},
 		{"仅通用无效", services.ErrInvalidServiceControlTicket, "无效"},
 	}

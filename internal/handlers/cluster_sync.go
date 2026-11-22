@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -16,6 +17,10 @@ func (h *Handlers) GetClusterSnapshot(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
+	// JJC-20261122-001：响应携带主节点 Unix 秒（200/304 均带），从节点每轮
+	// Pull 测量主从时钟偏移供票据校验对齐签发基准。认证端点 + TOFU 钉扎 TLS
+	// 保护该值；从节点侧另有 ±24h 钳制与 10min 新鲜度约束。
+	c.Header("X-Cluster-Server-Time", strconv.FormatInt(time.Now().Unix(), 10))
 	// 快照生成会内联写 nodes（注册令牌交付清空，见
 	// services/cluster_snapshot.go），与配置导入的 nodes 全量替换同表——
 	// 导入窗口内下发会让令牌交付与导入事务交错（被覆盖或阻塞至 busy_timeout）。

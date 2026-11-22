@@ -439,7 +439,9 @@ func TestMasterServingRound_retriesPendingPinCleanup(t *testing.T) {
 func TestClusterLoginTicket_expired_returnsClaimsForAudit(t *testing.T) {
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	service, ticket := issueClusterLoginTicket(t, now)
-	claims, _, _, err := service.ValidateLoginTicket(context.Background(), ticket, now.Add(91*time.Second))
+	resetMasterClockOffsetForTest(t)
+	// TTL 随 JJC-20261122-001 放宽到 loginTicketTTL（300s），越过新窗口判过期
+	claims, _, _, err := service.ValidateLoginTicket(context.Background(), ticket, now.Add(loginTicketTTL+time.Second))
 	if !errors.Is(err, ErrLoginTicketExpired) {
 		t.Fatalf("expired ticket error=%v", err)
 	}

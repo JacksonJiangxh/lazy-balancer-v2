@@ -594,6 +594,22 @@ type ClusterSnapshot struct {
 	// 从节点按本地 registration_id 取自己的一项应用；加性可选字段，旧从端
 	// 忽略未知字段，旧主端缺省时新从端保持本地现值（先例 LockedUsers）。
 	NodeSites map[int]ClusterNodeSite `json:"node_sites,omitempty"`
+	// ReferencedCerts（JJC-20261122-001）：引用型证书（tls_source="file"）被
+	// 引用的 /app/certs 成品文件对内容。此前快照只带路径不带文件，从节点本地
+	// 无文件 → Caddy /load 失败（配置同步后不生效）且证书信息页「证书不存在」。
+	// 同为加性可选字段（先例：LockedUsers/NodeSites），旧主端缺省 → 从端
+	// no-op；旧从端忽略未知字段，不 bump CurrentSnapshotSchema。
+	ReferencedCerts []ClusterReferencedCertPair `json:"referenced_certs,omitempty"`
+}
+
+// ClusterReferencedCertPair 是一条引用型证书文件对（证书+私钥，路径均为
+// 主节点解析后的 /app/certs 内绝对路径）。多条规则可引用同一对文件，按
+// (cert_path,key_path) 去重。
+type ClusterReferencedCertPair struct {
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path"`
+	CertPEM  string `json:"cert_pem"`
+	KeyPEM   string `json:"key_pem"`
 }
 
 // ClusterNodeSite 是单节点的威胁大屏站点坐标（0,0=未设置）。

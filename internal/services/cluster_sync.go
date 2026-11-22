@@ -1013,6 +1013,14 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 			}
 			return SyncResult{}, newSyncFailure(code, fmt.Errorf("拉取主节点快照: %w", err))
 		}
+		// JJC-20261122-001：每轮成功响应（200/304 均带）测量主从时钟偏移，供
+		// 票据校验对齐主节点签发基准。无校验头（旧主节点）时 Record 内部忽略，
+		// 偏移保持上次测量值（新鲜度超时回退零偏移）。
+		if serverTime := resp.Header.Get("X-Cluster-Server-Time"); serverTime != "" {
+			if serverUnix, perr := strconv.ParseInt(strings.TrimSpace(serverTime), 10, 64); perr == nil {
+				RecordMasterClockOffset(serverUnix, time.Now())
+			}
+		}
 		if resp.StatusCode == http.StatusNotModified && attempt == 0 {
 			// 上一轮应用已提交但 Caddy 重载失败：运行配置与库数据不一致，
 			// 需要全量重拉以补偿重试（不能靠 304 跳过期瞒）。

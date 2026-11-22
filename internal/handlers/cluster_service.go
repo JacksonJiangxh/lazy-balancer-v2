@@ -267,12 +267,34 @@ func serviceControlTicketFailureReason(err error) string {
 	case errors.Is(err, services.ErrServiceControlSignature):
 		return "签名错误"
 	case errors.Is(err, services.ErrServiceControlExpired):
+		// JJC-20261122-001：过期细因携带偏差诊断（票据到期/本机校正后时刻/
+		// 偏差秒数）——全从节点同时「已过期」时该数字直接给出主从时钟偏差
+		// 量级，运维无需另行对表。多行 errors.Join 压成单行（；分隔）；无
+		// 诊断段（旧版本对端）保持原「已过期」文案。
+		if detail := expiredTicketDetail(err); detail != "" {
+			return "已过期（" + detail + "）"
+		}
 		return "已过期"
 	case errors.Is(err, services.ErrServiceControlReplay):
 		return "已使用"
 	default:
 		return "无效"
 	}
+}
+
+// expiredTicketDetail 从过期细分错误里提取附加工夫诊断
+// （「票据到期 X，本机校正后 Y，偏差约 Z 秒」，全角括号剥除）；无附加诊断
+// 时返回空串。
+func expiredTicketDetail(err error) string {
+	detail := err.Error()
+	// errors.Join 的错误串以换行拼接各层文案，逐行找带「（票据到期」的诊断段。
+	for _, line := range strings.Split(detail, "\n") {
+		if idx := strings.Index(line, "（票据到期"); idx >= 0 {
+			// 「（」为 3 字节 UTF-8，跳过开括号再剥尾括号。
+			return strings.TrimSuffix(line[idx+len("（"):], "）")
+		}
+	}
+	return ""
 }
 
 // executeClusterCaddyAction 与本机 /caddy/start|stop|restart handler 同一锁序

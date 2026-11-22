@@ -29,6 +29,61 @@ func SetCertDirForTest(dir string) func() {
 // CertDir 返回引用型证书允许的根目录（tls_source="file" 白名单边界）。
 func CertDir() string { return certDir }
 
+// resolveReferencedCertWritePath 写侧引用型证书路径校验（JJC-20261122-001，
+// 集群同步落盘通道）：文件尚可不存在（从节点首次落盘），故仅做词法边界
+// 校验 + 建父目录 + 父目录链真实路径复核（对齐读侧 ResolveReferencedCertPath
+// 的软链逃逸防护）。返回真实落盘路径。
+func resolveReferencedCertWritePath(rawPath string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" || strings.ContainsRune(trimmed, 0) {
+		return "", fmt.Errorf("证书文件路径非法")
+	}
+	cleaned := filepath.Clean(trimmed)
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("证书文件路径必须是绝对路径")
+	}
+	base := filepath.Clean(certDir)
+	if !pathWithinBase(cleaned, base) {
+		return "", fmt.Errorf("证书文件路径必须位于 %s 目录内", base)
+	}
+	dir := filepath.Dir(cleaned)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("创建证书目录: %w", err)
+	}
+	realBase := base
+	if rb, err := filepath.EvalSymlinks(base); err == nil {
+		realBase = rb
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("解析证书目录失败: %w", err)
+	}
+	// 证书直接位于 certDir 根时 realDir == realBase（合法形态，放行）；
+	// 仅拒绝解析后逃逸出 certDir 的目录链。
+	if realDir != realBase && !pathWithinBase(realDir, realBase) {
+		return "", fmt.Errorf("证书文件目录（解析符号链接后）必须位于 %s 内", certDir)
+	}
+	return filepath.Join(realDir, filepath.Base(cleaned)), nil
+}
+
+// WriteReferencedCertPair 落盘一对引用型证书文件（集群同步通道，从节点侧）。
+// 内容与权限均一致时零写（writeCertPairFiles 既有跳过契约），修复权限/补齐
+// 被外部删除的文件由调用方按快照差异驱动。任意路径对不适用 per-rule 锁，
+// 取 certWriteMu 独占锁（与读侧 RLock 互斥，锁序不嵌套、无 AB-BA）。
+func WriteReferencedCertPair(certPath, keyPath, certPEM, keyPEM string) error {
+	certWriteMu.Lock()
+	defer certWriteMu.Unlock()
+	resolvedCert, err := resolveReferencedCertWritePath(certPath)
+	if err != nil {
+		return fmt.Errorf("证书文件：%w", err)
+	}
+	resolvedKey, err := resolveReferencedCertWritePath(keyPath)
+	if err != nil {
+		return fmt.Errorf("私钥文件：%w", err)
+	}
+	return writeCertPair(resolvedCert, resolvedKey, certPEM, keyPEM)
+}
+
 // ReferencedCertificate 引用型证书（tls_source="file"）的校验结果：
 // 归一后的路径 + 已读取的 PEM 内容（仅供调用方校验与预检，不落库）。
 type ReferencedCertificate struct {

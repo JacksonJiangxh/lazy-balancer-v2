@@ -33,9 +33,11 @@ var (
 	ErrServiceControlReplay        = errors.New("服务控制票据已使用")
 )
 
-// serviceControlTicketTTL 与登录票据同口径：签发侧预留时钟偏移（90s），
-// 从节点按自身时钟校验；一次性消费（jti 记入 used_login_tickets）。
-const serviceControlTicketTTL = 90 * time.Second
+// serviceControlTicketTTL 与登录票据同口径：90s→300s（JJC-20261122-001）——
+// 签发侧 90s 容差在主从时钟偏差超 90s 时票据刚签出即「已过期」（全从节点
+// 同时必现）。TTL 只界定「签发后未消费」窗口，重放由 jti 一次性消费防御；
+// 校验侧另有主从时钟偏移校正（masterAdjustedNow）根治偏差。
+const serviceControlTicketTTL = 300 * time.Second
 
 // IssueServiceControlTicket 主节点侧：为目标从节点签发一次性服务控制票据。
 // HMAC 密钥取 nodes.cluster_token_hash 的原始字节（= sha256(cluster_token)）——
@@ -166,6 +168,9 @@ func (s *ClusterService) ValidateServiceControlTicket(ctx context.Context, ticke
 	if !models.IsValidClusterServiceAction(action) {
 		return ErrInvalidServiceControlTicket
 	}
+	// JJC-20261122-001：票据 ExpiresAt 以主节点时钟签发，先把本机时刻校正到
+	// 主节点基准再比对（无新鲜偏移测量时零偏移，行为与旧版一致）。
+	now = masterAdjustedNow(now)
 	parts := strings.Split(ticket, ".")
 	if len(parts) != 2 {
 		return ErrInvalidServiceControlTicket
@@ -202,7 +207,12 @@ func (s *ClusterService) ValidateServiceControlTicket(ctx context.Context, ticke
 		return ErrInvalidServiceControlTicket
 	}
 	if claims.ExpiresAt <= now.UTC().Unix() {
-		return errors.Join(ErrInvalidServiceControlTicket, ErrServiceControlExpired)
+		// 诊断增强（JJC-20261122-001）：细因携带票据到期/本机校正后时刻与偏差
+		// 秒数——全从节点同时报「已过期」时该数字直接给出主从时钟偏差量级。
+		// errors.Is 经 %w 链对 ErrServiceControlExpired 保持成立。
+		gap := now.UTC().Unix() - claims.ExpiresAt
+		return errors.Join(ErrInvalidServiceControlTicket, fmt.Errorf("%w（票据到期 %d，本机校正后 %d，偏差约 %d 秒）",
+			ErrServiceControlExpired, claims.ExpiresAt, now.UTC().Unix(), gap))
 	}
 	consumed, err := consumeClusterTicketJTI(ctx, tx, claims.JTI, now.UTC(), time.Unix(claims.ExpiresAt, 0).UTC())
 	if err != nil {

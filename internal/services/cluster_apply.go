@@ -269,6 +269,10 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 文件路径确定性意味着内容变化时渲染 JSON 字节不变，不强制则 Caddy 内存
 	// 继续用旧证书。
 	certsChanged := false
+	// refCertsChanged 引用型证书文件对轴（JJC-20261122-001）：快照携带的
+	// /app/certs 成品文件相对上次已应用快照有新增/内容变化。同门于 certsChanged
+	// ——文件内容变化不改变渲染 JSON 字节，必须作为独立强制重载信号。
+	refCertsChanged := false
 	if !skip.disabled["rules"] {
 		certsChanged = snapshotCertsDiffer(previous.Certs, snapshot.Certs)
 		if err := removeMissingSnapshotCerts(previous.Certs, snapshot.Certs); err != nil {
@@ -281,6 +285,11 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		// 强制信号（路径确定性 ⇒ 内容变化不改变渲染字节）。
 		if err := materializeSnapshotCerts(snapshot.Certs); err != nil {
 			return errors.Join(fmt.Errorf("写入同步证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
+		}
+		var refCertErr error
+		refCertsChanged, refCertErr = materializeSnapshotReferencedCerts(previous.ReferencedCerts, snapshot.ReferencedCerts)
+		if refCertErr != nil {
+			return errors.Join(fmt.Errorf("写入同步引用证书: %w", refCertErr), s.restoreSnapshotArtifacts(previous, snapshot))
 		}
 	}
 	if !skip.disabled["rules"] {
@@ -484,7 +493,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// last_good 兼容：渲染未变则既有 last_good 仍是当前运行配置的准确
 	// 快照，无需重写。
 	renderInputsChanged := !(skip.skip("users") && skip.skip("rules") && skip.skip("security"))
-	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || brandingWritten || reloadCompensation || commitUncertainRetry
+	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || refCertsChanged || brandingWritten || reloadCompensation || commitUncertainRetry
 	var reloadErr error
 	if mustReload {
 		// defer 释放：panic（gin.Recovery 恢复）后包级锁不得泄漏——否则后续
@@ -673,7 +682,34 @@ func (s *SyncService) restoreSnapshotArtifacts(previous, current models.ClusterS
 	// previous 是 apply 前的本地快照，不是主端 incoming；失败回滚恢复本地基线。
 	// rules 开关禁用时主端 ownership 从未写入（初始物化已跳过），因此此处仍须
 	// 恢复 previous 本地 ownership，不能与写入侧同门跳过。
-	return errors.Join(restoreSnapshotCerts(previous.Certs, current.Certs), s.materializeSnapshotDNSOwnership(previous.ACME))
+	return errors.Join(
+		restoreSnapshotCerts(previous.Certs, current.Certs),
+		restoreSnapshotReferencedCerts(previous.ReferencedCerts, current.ReferencedCerts),
+		s.materializeSnapshotDNSOwnership(previous.ACME),
+	)
+}
+
+// restoreSnapshotReferencedCerts apply 中断时把引用型证书文件对恢复为上次
+// 已应用内容（JJC-20261122-001，与 restoreSnapshotCerts 同语义：previous 已
+// 读出旧内容，直接重写）。仅处理两快照均含的路径对（内容不同才恢复）——
+// 仅 current 含的对（新增）文件为孤儿不删除（删除任意路径文件风险大于孤儿
+// 收益），仅 previous 含的对本 apply 未触碰、无需恢复。
+func restoreSnapshotReferencedCerts(previous, current []models.ClusterReferencedCertPair) error {
+	currentByKey := make(map[string]models.ClusterReferencedCertPair, len(current))
+	for _, pair := range current {
+		currentByKey[referencedCertPairKey(pair)] = pair
+	}
+	var errs []error
+	for _, pair := range previous {
+		cur, ok := currentByKey[referencedCertPairKey(pair)]
+		if !ok || (cur.CertPEM == pair.CertPEM && cur.KeyPEM == pair.KeyPEM) {
+			continue
+		}
+		if err := WriteReferencedCertPair(pair.CertPath, pair.KeyPath, pair.CertPEM, pair.KeyPEM); err != nil {
+			errs = append(errs, fmt.Errorf("恢复引用证书 %s: %w", pair.CertPath, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *SyncService) materializeSnapshotDNSOwnership(acme *models.ClusterACMEState) error {
@@ -2303,6 +2339,52 @@ func materializeSnapshotCerts(certs []models.ClusterCertificate) error {
 		}
 	}
 	return nil
+}
+
+// materializeSnapshotReferencedCerts 落盘快照携带的引用型证书文件对
+// （JJC-20261122-001）：返回「相对上次已应用快照是否有新增/内容变化」作为
+// 强制重载信号（文件内容变化不改变渲染 JSON 字节）。previous 为本地重建的
+// 已应用快照（从本地磁盘读取），文件被外部删除/改动时 previous 缺对或内容
+// 不同 → 判变化 → 重写修复 + 重载。
+//
+// 边界防护：词法路径越界（不在 certDir 内）的文件对逐条 warn+跳过（fail-open，
+// 与 ACME 校验的单行损坏语义一致），不阻断整包同步；写侧
+// resolveReferencedCertWritePath 的真实路径复核失败属 I/O/逃逸类错误，
+// 与 materializeSnapshotCerts 同口径中断本次 apply（restoreSnapshotArtifacts
+// 补偿回滚）。
+func materializeSnapshotReferencedCerts(previous, current []models.ClusterReferencedCertPair) (bool, error) {
+	if len(current) == 0 {
+		return false, nil
+	}
+	prevContents := make(map[string]models.ClusterReferencedCertPair, len(previous))
+	for _, pair := range previous {
+		prevContents[referencedCertPairKey(pair)] = pair
+	}
+	changed := false
+	for _, pair := range current {
+		// 词法边界预检：越界对不落盘、不参与变化判定（防快照越权写文件）。
+		base := filepath.Clean(CertDir())
+		for _, path := range []string{pair.CertPath, pair.KeyPath} {
+			cleaned := filepath.Clean(strings.TrimSpace(path))
+			if !filepath.IsAbs(cleaned) || !strings.HasPrefix(cleaned, base+string(os.PathSeparator)) {
+				Logf("warn", "快照引用证书路径越界（必须位于 %s 内），跳过该文件对: %s", CertDir(), path)
+				return changed, nil
+			}
+		}
+		key := referencedCertPairKey(pair)
+		prev, ok := prevContents[key]
+		if ok && prev.CertPEM == pair.CertPEM && prev.KeyPEM == pair.KeyPEM {
+			// 与上次已应用快照一致：内容未变。仍走 WriteReferencedCertPair——
+			// 其零写契约（内容+权限一致才跳过）会在文件被外部删除/权限被改时
+			// 修复落盘；此时不额外触发重载（渲染输入未变，重载无意义）。
+		} else {
+			changed = true
+		}
+		if err := WriteReferencedCertPair(pair.CertPath, pair.KeyPath, pair.CertPEM, pair.KeyPEM); err != nil {
+			return changed, fmt.Errorf("写入引用证书 %s: %w", pair.CertPath, err)
+		}
+	}
+	return changed, nil
 }
 
 func nullableString(value string) any {

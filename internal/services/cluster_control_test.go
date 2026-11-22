@@ -55,9 +55,45 @@ func TestServiceControlTicketRoundtrip(t *testing.T) {
 func TestServiceControlTicketRejectsExpired(t *testing.T) {
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
 	service, ticket := issueControlTicket(t, now, models.ClusterServiceActionRestartApp)
-	// 签发 TTL 90s（含时钟偏移容差），越过该窗口必须拒绝
-	if err := service.ValidateServiceControlTicket(context.Background(), ticket, models.ClusterServiceActionRestartApp, now.Add(91*time.Second)); !errors.Is(err, ErrInvalidServiceControlTicket) {
+	resetMasterClockOffsetForTest(t)
+	// 签发 TTL 为 serviceControlTicketTTL（300s，JJC-20261122-001 时钟偏移容差
+	// 放宽），越过该窗口必须拒绝
+	if err := service.ValidateServiceControlTicket(context.Background(), ticket, models.ClusterServiceActionRestartApp, now.Add(serviceControlTicketTTL+time.Second)); !errors.Is(err, ErrInvalidServiceControlTicket) {
 		t.Fatalf("expired error=%v", err)
+	}
+}
+
+// TestServiceControlTicketToleratesMeasuredClockSkew（JJC-20261122-001）：
+// 从节点时钟超前主节点 400s（远超旧 90s 容差）时，未测偏移的旧行为是票据刚
+// 签出即「已过期」（全从节点必现）；同步轮测得偏移后，校验侧对齐主节点签发
+// 基准，票据正常消费。
+func TestServiceControlTicketToleratesMeasuredClockSkew(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	service, ticket := issueControlTicket(t, now, models.ClusterServiceActionStopCaddy)
+	resetMasterClockOffsetForTest(t)
+	localValidationTime := now.Add(400 * time.Second)
+	if err := service.ValidateServiceControlTicket(context.Background(), ticket, models.ClusterServiceActionStopCaddy, localValidationTime); !errors.Is(err, ErrServiceControlExpired) {
+		t.Fatalf("unadjusted skew should reject, error=%v", err)
+	}
+	// 测得偏移：主节点时钟落后本机 400s（offset = master - local = -400s）
+	RecordMasterClockOffset(now.Unix(), localValidationTime)
+	if err := service.ValidateServiceControlTicket(context.Background(), ticket, models.ClusterServiceActionStopCaddy, localValidationTime); err != nil {
+		t.Fatalf("adjusted validation should pass, error=%v", err)
+	}
+}
+
+// TestServiceControlTicketExpiredDetailCarriesSkewDiagnostic：过期细因必须
+// 携带偏差秒数（审计单行展示直接给出主从时钟偏差量级）。
+func TestServiceControlTicketExpiredDetailCarriesSkewDiagnostic(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	service, ticket := issueControlTicket(t, now, models.ClusterServiceActionStartCaddy)
+	resetMasterClockOffsetForTest(t)
+	err := service.ValidateServiceControlTicket(context.Background(), ticket, models.ClusterServiceActionStartCaddy, now.Add(serviceControlTicketTTL+time.Minute))
+	if !errors.Is(err, ErrServiceControlExpired) {
+		t.Fatalf("expired error=%v", err)
+	}
+	if !strings.Contains(err.Error(), "偏差约") {
+		t.Fatalf("expired detail should carry skew seconds, got %q", err.Error())
 	}
 }
 
