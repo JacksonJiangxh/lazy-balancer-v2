@@ -46,6 +46,10 @@ type masterServingWatch struct {
 func masterSyncServingLifecycleRun(rc taskengine.RunContext) error {
 	ctx, cancel := context.WithCancel(rc.Ctx)
 	defer cancel()
+	// 用户最终裁定流程：主节点定期扫描 /app/certs 更新证书到数据库。
+	// 挂在甲路线主分支 Run 体内（仅主节点运行、换代 ctx 取消即退）；甲路线
+	// 关闭/DEK 未配置时 startCertFileScanLoop 内部完全 no-op（零回归）。
+	startCertFileScanLoop(ctx)
 	// 启动可见性：零噪音口径下全绿只在小时级心跳落一条，刚启动/刚切角色
 	// 时日志面板会长时间只有 [start]。这里每次换代只写一次巡检参数，
 	// 不逐轮写（内部周期不属于任务调度节奏）。

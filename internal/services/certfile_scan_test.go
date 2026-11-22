@@ -1,0 +1,349 @@
+package services
+
+// 主节点证书文件扫描器测试（用户最终裁定流程）：
+//   - 新证书入库、cert_version 推进；
+//   - 指纹相同绝不重复 Upsert（cert_version 不抖动 → 从端不会永久重载）；
+//   - 内容变化才推进版本；
+//   - 非法 PEM 跳过、单行失败不中断整批；
+//   - 甲路线关闭 / DEK 未配置时完全 no-op；
+//   - 已有回填行沿用其 domain（不造重复证书行）；
+//   - 扫描周期环境变量解析。
+//
+// 私钥一律 crypto/x509 内存生成，不留测试夹具文件。
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"database/sql"
+	"encoding/base64"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"lazy-balancer-v2/caddydbcert"
+)
+
+// enableCertVaultForTest 在测试库上装 vault schema、注入 env 模式 DEK、开启甲路线。
+// 与 InitCertVault 同一 DEK 来源与 provider 口径，清理时关掉全局开关避免污染后续用例。
+func enableCertVaultForTest(t *testing.T, database *sql.DB) {
+	t.Helper()
+	if err := caddydbcert.EnsureVaultTables(context.Background(), database); err != nil {
+		t.Fatalf("EnsureVaultTables: %v", err)
+	}
+	dek := make([]byte, 32)
+	if _, err := rand.Read(dek); err != nil {
+		t.Fatalf("rand dek: %v", err)
+	}
+	t.Setenv(DefaultCertDEKEnv, base64.StdEncoding.EncodeToString(dek))
+	t.Setenv(kmsEndpointEnv, "")
+	t.Setenv("LB_CERT_WRAPPED_DEK", "")
+	ConfigureDBCertLoader(filepath.Join(t.TempDir(), "vault.db"), DefaultCertDEKEnv, "", "", "", "")
+	t.Cleanup(func() { dbCertLoader.enabled.Store(false) })
+}
+
+// scanTestCertPair 生成自签证书对（无私钥落盘夹具）。SerialNumber 每次不同，
+// 保证「内容变化」用例拿到真正不同的 PEM。
+func scanTestCertPair(t *testing.T, domain string) (certPEM, keyPEM string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+}
+
+func certVaultVersion(t *testing.T, database *sql.DB) int64 {
+	t.Helper()
+	v, err := caddydbcert.CurrentVersion(context.Background(), database)
+	if err != nil {
+		t.Fatalf("read cert version: %v", err)
+	}
+	return v
+}
+
+func TestScanCertFilesToVault_newCertUpserted(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+
+	certPEM, keyPEM := scanTestCertPair(t, "scan-new.example.test")
+	if err := WriteCertFiles("lb_scan_new", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	round := scanCertFilesToVault(context.Background())
+	if round.Pairs != 1 || round.Upserted != 1 || round.Failed != 0 {
+		t.Fatalf("scan round=%+v, want pairs=1 upserted=1 failed=0", round)
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cert_secrets`).Scan(&count); err != nil {
+		t.Fatalf("count vault rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("vault rows=%d, want 1", count)
+	}
+	var domain, cipher, keyCipher string
+	if err := database.QueryRow(`SELECT domain, cert_ciphertext, key_ciphertext FROM cert_secrets`).Scan(&domain, &cipher, &keyCipher); err != nil {
+		t.Fatalf("read vault row: %v", err)
+	}
+	if domain != "scan-new.example.test" {
+		t.Fatalf("vault domain=%q, want SAN 首项 scan-new.example.test", domain)
+	}
+	if strings.Contains(cipher, "BEGIN CERTIFICATE") || strings.Contains(keyCipher, "PRIVATE KEY") {
+		t.Fatal("plaintext PEM leaked into vault columns")
+	}
+	if v := certVaultVersion(t, database); v != 1 {
+		t.Fatalf("cert_version=%d, want 1 after first upsert", v)
+	}
+}
+
+// TestScanCertFilesToVault_identicalFingerprintDoesNotBumpVersion 是本次流程的
+// 关键不变量：每轮重复 Upsert 会让触发器每轮 +1 cert_version，从端 before<after
+// 恒真 → 永久强制重载。指纹一致必须跳过写入。
+func TestScanCertFilesToVault_identicalFingerprintDoesNotBumpVersion(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+
+	certPEM, keyPEM := scanTestCertPair(t, "scan-idempotent.example.test")
+	if err := WriteCertFiles("lb_scan_idem", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	first := scanCertFilesToVault(context.Background())
+	if first.Upserted != 1 {
+		t.Fatalf("first round=%+v, want upserted=1", first)
+	}
+	versionAfterFirst := certVaultVersion(t, database)
+	for i := 0; i < 5; i++ {
+		round := scanCertFilesToVault(context.Background())
+		if round.Upserted != 0 || round.Unchanged != 1 {
+			t.Fatalf("round %d=%+v, want upserted=0 unchanged=1（指纹相同不得重复入库）", i+1, round)
+		}
+		if got := certVaultVersion(t, database); got != versionAfterFirst {
+			t.Fatalf("round %d bumped cert_version %d→%d（从端会永久重载）", i+1, versionAfterFirst, got)
+		}
+	}
+}
+
+func TestScanCertFilesToVault_changedCertAdvancesVersion(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+
+	certPEM, keyPEM := scanTestCertPair(t, "scan-change.example.test")
+	if err := WriteCertFiles("lb_scan_change", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	scanCertFilesToVault(context.Background())
+	before := certVaultVersion(t, database)
+
+	newCert, newKey := scanTestCertPair(t, "scan-change.example.test")
+	if newCert == certPEM {
+		t.Fatal("test cert generator produced identical PEM")
+	}
+	if err := WriteCertFiles("lb_scan_change", newCert, newKey); err != nil {
+		t.Fatalf("WriteCertFiles (changed): %v", err)
+	}
+	round := scanCertFilesToVault(context.Background())
+	if round.Upserted != 1 {
+		t.Fatalf("changed round=%+v, want upserted=1", round)
+	}
+	if after := certVaultVersion(t, database); after <= before {
+		t.Fatalf("cert_version %d→%d did not advance on real content change", before, after)
+	}
+}
+
+func TestScanCertFilesToVault_invalidPEMSkippedWithoutAbortingBatch(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	dir := t.TempDir()
+	restore := SetCertDirForTest(dir)
+	defer restore()
+
+	// 合法对 + 非法对：非法对只记 failed，合法对仍须入库。
+	goodCert, goodKey := scanTestCertPair(t, "scan-good.example.test")
+	if err := WriteCertFiles("lb_scan_good", goodCert, goodKey); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lb_scan_bad.crt"), []byte("not a PEM"), 0644); err != nil {
+		t.Fatalf("write bad crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lb_scan_bad.key"), []byte("not a PEM"), 0600); err != nil {
+		t.Fatalf("write bad key: %v", err)
+	}
+	round := scanCertFilesToVault(context.Background())
+	if round.Pairs != 1 || round.Upserted != 1 || round.Failed != 1 {
+		t.Fatalf("round=%+v, want pairs=1 upserted=1 failed=1", round)
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cert_secrets`).Scan(&count); err != nil {
+		t.Fatalf("count vault rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("vault rows=%d, want 1（非法对不得入库）", count)
+	}
+}
+
+func TestScanCertFilesToVault_routeADisabledIsNoOp(t *testing.T) {
+	database := setupIsolatedDB(t)
+	if err := caddydbcert.EnsureVaultTables(context.Background(), database); err != nil {
+		t.Fatalf("EnsureVaultTables: %v", err)
+	}
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+	certPEM, keyPEM := scanTestCertPair(t, "scan-off.example.test")
+	if err := WriteCertFiles("lb_scan_off", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	// 不调用 ConfigureDBCertLoader：甲路线关闭。
+	round := scanCertFilesToVault(context.Background())
+	if round != (certScanRound{}) {
+		t.Fatalf("route A off round=%+v, want zero", round)
+	}
+	if v := certVaultVersion(t, database); v != 0 {
+		t.Fatalf("route A off bumped cert_version=%d, want 0", v)
+	}
+}
+
+func TestScanCertFilesToVault_dekNotConfiguredIsNoOp(t *testing.T) {
+	database := setupIsolatedDB(t)
+	if err := caddydbcert.EnsureVaultTables(context.Background(), database); err != nil {
+		t.Fatalf("EnsureVaultTables: %v", err)
+	}
+	t.Setenv(DefaultCertDEKEnv, "")
+	t.Setenv(kmsEndpointEnv, "")
+	ConfigureDBCertLoader(filepath.Join(t.TempDir(), "vault.db"), DefaultCertDEKEnv, "", "", "", "")
+	t.Cleanup(func() { dbCertLoader.enabled.Store(false) })
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+	certPEM, keyPEM := scanTestCertPair(t, "scan-nodek.example.test")
+	if err := WriteCertFiles("lb_scan_nodek", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	round := scanCertFilesToVault(context.Background())
+	if round != (certScanRound{}) {
+		t.Fatalf("DEK missing round=%+v, want zero", round)
+	}
+	if v := certVaultVersion(t, database); v != 0 {
+		t.Fatalf("DEK missing bumped cert_version=%d, want 0", v)
+	}
+}
+
+// 已有回填行（domain ≠ SAN）沿用其 domain 计算指纹——内容一致时既不重复
+// 造行，也不推进版本。
+func TestScanCertFilesToVault_reusesBackfilledRowDomain(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+
+	certPEM, keyPEM := scanTestCertPair(t, "scan-san.example.test")
+	if err := WriteCertFiles("lb_scan_domain", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	// 模拟启动回填：domain 取规则域名（与 SAN 不同），rule_id 与文件名一致。
+	if _, err := caddydbcert.Upsert(context.Background(), database, certKeyProvider(""), "",
+		"seed.example.test", "lb_scan_domain", certPEM, keyPEM, false, []string{"lb_scan_domain"}); err != nil {
+		t.Fatalf("seed backfill row: %v", err)
+	}
+	before := certVaultVersion(t, database)
+	round := scanCertFilesToVault(context.Background())
+	if round.Upserted != 0 || round.Unchanged != 1 {
+		t.Fatalf("round=%+v, want upserted=0 unchanged=1（沿用已有 domain 比对）", round)
+	}
+	if got := certVaultVersion(t, database); got != before {
+		t.Fatalf("cert_version %d→%d bumped on unchanged backfilled row", before, got)
+	}
+	var count int
+	var domain string
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cert_secrets WHERE rule_id='lb_scan_domain'`).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if err := database.QueryRow(`SELECT domain FROM cert_secrets WHERE rule_id='lb_scan_domain'`).Scan(&domain); err != nil {
+		t.Fatalf("read domain: %v", err)
+	}
+	if count != 1 || domain != "seed.example.test" {
+		t.Fatalf("rows=%d domain=%q, want 1 / seed.example.test（不得按 SAN 造第二行）", count, domain)
+	}
+}
+
+// 循环接线 + 多轮不抖动：真实 ticker 连跑多轮，cert_version 只能推进一次；
+// ctx 取消后循环退出，不再写库。
+func TestStartCertFileScanLoop_repeatsWithoutChurnAndStopsOnCancel(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+	certPEM, keyPEM := scanTestCertPair(t, "scan-loop.example.test")
+	if err := WriteCertFiles("lb_scan_loop", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	oldInterval := certFileScanInterval
+	certFileScanInterval = 20 * time.Millisecond
+	defer func() { certFileScanInterval = oldInterval }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startCertFileScanLoop(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for certVaultVersion(t, database) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if v := certVaultVersion(t, database); v != 1 {
+		t.Fatalf("loop did not ingest on first round: cert_version=%d, want 1", v)
+	}
+	// 多轮 ticker（≥20ms × 10 轮）后版本不得抖动。
+	time.Sleep(250 * time.Millisecond)
+	if got := certVaultVersion(t, database); got != 1 {
+		t.Fatalf("repeated ticks churned cert_version to %d（从端会永久重载）", got)
+	}
+	cancel()
+	time.Sleep(60 * time.Millisecond)
+	if got := certVaultVersion(t, database); got != 1 {
+		t.Fatalf("scan loop wrote after ctx cancel: cert_version=%d", got)
+	}
+}
+
+func TestCertFileScanInterval_envOverride(t *testing.T) {
+	t.Setenv(CertFileScanIntervalEnv, "15")
+	if got := effectiveCertFileScanInterval(); got != 15*time.Second {
+		t.Fatalf("interval=%v, want 15s", got)
+	}
+	t.Setenv(CertFileScanIntervalEnv, "bogus")
+	if got := effectiveCertFileScanInterval(); got != certFileScanInterval {
+		t.Fatalf("invalid env interval=%v, want default %v", got, certFileScanInterval)
+	}
+	t.Setenv(CertFileScanIntervalEnv, "0")
+	if got := effectiveCertFileScanInterval(); got != certFileScanInterval {
+		t.Fatalf("zero env interval=%v, want default %v", got, certFileScanInterval)
+	}
+}

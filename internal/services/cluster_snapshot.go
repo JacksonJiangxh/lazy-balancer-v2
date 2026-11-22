@@ -54,7 +54,11 @@ type clusterSnapshotCache struct {
 	// 属文件态（外部更新不 bump cluster_version），必须进缓存键才能让指纹随
 	// 文件变化重算、从节点经指纹差异走全量重拉。
 	refCertsDigest string
-	expiresAt      time.Time
+	// certVersion 证书库水位（甲路线）：cert_secrets 变更不 bump cluster_version，
+	// 若不在缓存键内，主节点扫描器入库后快照缓存恒命中 → 从端永远收到 304 →
+	// 新证书无法下发。与 refCertsDigest 同理：文件/密文态变化进键、指纹随重建重算。
+	certVersion int64
+	expiresAt   time.Time
 }
 
 var clusterSnapshotCaches sync.Map
@@ -242,9 +246,19 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 		return models.ClusterSnapshot{}, nil, "", fmt.Errorf("读取同步开关: %w", err)
 	}
 	switchesKey := fmt.Sprintf("%t%t%t", switches.Users, switches.Rules, switches.Security)
+	// 证书库水位进缓存键：主节点扫描器/回填写 cert_secrets 只推进 cert_version，
+	// 不动 cluster_version。甲路线关闭时不查表（无 vault schema 的存量库零回归），
+	// 恒为 0。读取失败按 0 继续——快照可用性优先，下一轮键变化自然重建。
+	var certVersion int64
+	if DBCertLoaderEnabled() {
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM cert_version_seq WHERE id=1`).Scan(&certVersion); err != nil {
+			Logf("warn", "读取证书库水位用于快照缓存键失败，按 0 继续: %v", err)
+			certVersion = 0
+		}
+	}
 	// 双检：读字段用 mu（构建已在 buildMu 内串行化，此处只防并发读的撕裂）。
 	cache.mu.Lock()
-	hit := cache.initialized && cache.version == version && cache.ownership == ownershipHash && cache.switches == switchesKey && cache.refCertsDigest == refCertsDigest && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt))
+	hit := cache.initialized && cache.version == version && cache.ownership == ownershipHash && cache.switches == switchesKey && cache.refCertsDigest == refCertsDigest && cache.certVersion == certVersion && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt))
 	cachedSnapshot, cachedCanonical, cachedFingerprint := cache.snapshot, cache.canonical, cache.fingerprint
 	cache.mu.Unlock()
 	if hit {
@@ -280,6 +294,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	cache.ownership = ownershipHash
 	cache.switches = switchesKey
 	cache.refCertsDigest = refCertsDigest
+	cache.certVersion = certVersion
 	cache.expiresAt = nearestSnapshotCertificateExpiry(snapshot.Certs, now)
 	cache.mu.Unlock()
 	return snapshot, canonical, fingerprint, nil
