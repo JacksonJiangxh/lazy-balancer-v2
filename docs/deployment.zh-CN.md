@@ -123,11 +123,11 @@ volumes:
 
 甲路线启用后证书生命周期按以下流程闭环，**从节点全程不需要重启容器**：
 
-1. **主节点定期扫描文件入库**：主节点的 cluster-sync daemon 在主分支每 `LB_CERT_FILE_SCAN_INTERVAL`（默认 60 秒）扫描一次 `/app/certs`，配对读取 `<规则ID>.crt` / `<规则ID>.key`，用 `tls.X509KeyPair` 校验合法性后计算指纹；只有指纹变化（新证书或内容更新）才以密文 `Upsert` 进 `cert_secrets` 并推进 `cert_version`。指纹一致时**绝不重复写入**——否则触发器每轮 +1，从端会永久强制重载。单个文件损坏只告警跳过，不中断整批。
+1. **主节点定期扫描文件入库**：主节点的 cluster-sync daemon 在主分支每 `LB_CERT_FILE_SCAN_INTERVAL`（默认 60 秒）扫描一次 `/app/certs`，配对读取 `<规则ID>.crt` / `<规则ID>.key`，用 `tls.X509KeyPair` 校验合法性后计算指纹；只有指纹变化（新证书或内容更新）才以密文 `Upsert` 进 `cert_secrets` 并推进 `cert_version`。指纹一致时**绝不重复写入**——否则触发器每轮 +1，从端会永久强制重载。单个文件损坏只告警跳过，不中断整批。本轮只要有任一证书真实入库，主节点**立即自身 force reload 一次**（`CaddyOpLock` 内现场渲染最新 DB → `POST /load` 带 `must-revalidate`），所以主节点也是「放文件即生效」；指纹全同的周期轮零重载。
 2. **密文随快照同步**：快照证书轴走 `vault_certs` 密文列（只下发密文 + wrapped DEK，无明文 PEM）。证书库水位 `cert_version` 已进入快照缓存键：即使 `cluster_version` 没变，证书变化也会让主节点重建快照、从节点收到全量下发而非 304。口径说明：用户已裁定「过通道明文可接受」，但现行实现保留密文轴（更安全），不倒退回明文轴；JJC-001 引用型证书随快照同步的行为在甲路线关闭时逐字保留。
 3. **从节点自动热重载**：从节点导入密文行后比较本地导入前后的 `cert_version`，只要 `before < after` 就走 `ReloadFromDB` → `ApplyConfigForce` 强制 `POST /load`（带 `Cache-Control: must-revalidate`）。证书路径确定性使渲染 JSON 字节在证书变化前后完全相同，强制重载确保 Caddy 的 `lb_db` loader 重新 provision、新证书立即生效；证书未变时不做额外重载。
 
-**运维要点：** 证书由主节点扫描 `/app/certs` 入库，从节点**不依赖**自身 `/app/certs` 落盘（甲路线下 Caddy 从本地密文库解密装载）。甲路线关闭或 DEK 未配置时扫描器完全 no-op，行为与基线一致；DEK 来源见 `LB_CERT_DEK_B64` / `LB_CERT_KMS_ENDPOINT` 说明。
+**运维要点：** 证书由主节点扫描 `/app/certs` 入库，从节点**不依赖**自身 `/app/certs` 落盘（甲路线下 Caddy 从本地密文库解密装载）。主节点扫到变化即自身 force reload，从节点同步后 force reload，**两端都无需重启容器**；两处 reload 共用 `CaddyOpLock` 串行，且都在锁内重新渲染当前 DB，不会互相用陈旧配置覆盖。甲路线关闭或 DEK 未配置时扫描器完全 no-op，行为与基线一致；DEK 来源见 `LB_CERT_DEK_B64` / `LB_CERT_KMS_ENDPOINT` 说明。
 
 ## 端口
 

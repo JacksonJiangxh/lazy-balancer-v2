@@ -111,6 +111,32 @@ func startCertFileScanLoop(ctx context.Context) {
 	}()
 }
 
+// 主节点扫描入库后的强制重载钩子。main 注入的实现 =
+// WithCaddyOpLock{ ReloadFromDB(caddyService, db.DB, db.DB) }：
+//   - 与从端 applySnapshot 共用 CaddyOpLock，两处 reload 全程串行；
+//   - 渲染在锁内现场读 DB（不缓存陈旧快照），不会被滞后的渲染态覆盖；
+//   - ReloadFromDB 走 ApplyConfigForce，证书密文变化不改变渲染 JSON 字节也能
+//     击穿 errSameConfig、真实 POST /load。
+//
+// 未接线时（独立运维/测试形态）只告警，不 panic。
+var (
+	certFileScanReloadMu sync.Mutex
+	certFileScanReloadFn func() error
+)
+
+// SetCertFileScanReload 注入主节点证书文件扫描入库后的强制重载实现。
+func SetCertFileScanReload(fn func() error) {
+	certFileScanReloadMu.Lock()
+	defer certFileScanReloadMu.Unlock()
+	certFileScanReloadFn = fn
+}
+
+func certFileScanReloadFnGet() func() error {
+	certFileScanReloadMu.Lock()
+	defer certFileScanReloadMu.Unlock()
+	return certFileScanReloadFn
+}
+
 // certScanRound 一轮扫描的可观测结果（测试直接断言；生产按差异落日志）。
 type certScanRound struct {
 	Pairs     int // 通过合法性校验并进入比对/入库的证书对数
@@ -224,6 +250,22 @@ func scanCertFilesToVault(ctx context.Context) certScanRound {
 	}
 	if round.Upserted > 0 {
 		Logf("info", "证书文件扫描：本轮入库 %d 项（跳过未变 %d 项，失败 %d 项）", round.Upserted, round.Unchanged, round.Failed)
+		// 只有真实入库才重载：指纹全同的周期轮不得每 60s 空 reload。
+		// ctx 已取消（引擎换代）时不下发——避免停机期间向 Caddy 写配置。
+		if ctx.Err() != nil {
+			return round
+		}
+		reload := certFileScanReloadFnGet()
+		if reload == nil {
+			certFileScanWarn("reload-unwired", "证书文件扫描：本轮入库 %d 项但主节点重载未接线，跳过（放文件即生效不可用）", round.Upserted)
+			return round
+		}
+		if err := reload(); err != nil {
+			certFileScanWarn("reload-failed", "证书文件扫描：入库后主节点强制重载失败（下一轮证书未变不会重试）: %v", err)
+			certFileScanErrors.Add(1)
+		} else {
+			Logf("info", "证书文件扫描：入库后主节点强制重载完成（%d 项证书）", round.Upserted)
+		}
 	}
 	return round
 }

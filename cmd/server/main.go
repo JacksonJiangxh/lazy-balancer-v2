@@ -263,6 +263,11 @@ func run() error {
 		return reloadErr
 	}
 	services.SetReferencedCertReload(certReloader)
+	// 主节点 /app/certs 扫描器入库后的自动热重载（用户裁定「放文件即生效」）：
+	// 复用同一 certReloader —— 同为 WithCaddyOpLock + ReloadFromDB 强制 /load，
+	// 与从端 applySnapshot 的 reload 段共用 CaddyOpLock 并在锁内现场渲染最新 DB。
+	// 仅在扫描到证书真实变化（cert_version 推进）时由扫描器调用一次。
+	services.SetCertFileScanReload(certReloader)
 	// CA 证书队列走 InLock 变体——部署临界区按全局锁序
 	// CaddyOpLock → DeployLock 先持 CaddyOpLock（与规则补偿恢复链同序，
 	// 消除 AB-BA），重载回调不得再自取锁（重入死锁）。CRS/IP 库/威胁库

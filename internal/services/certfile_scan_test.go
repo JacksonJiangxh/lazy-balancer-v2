@@ -7,7 +7,8 @@ package services
 //   - 非法 PEM 跳过、单行失败不中断整批；
 //   - 甲路线关闭 / DEK 未配置时完全 no-op；
 //   - 已有回填行沿用其 domain（不造重复证书行）；
-//   - 扫描周期环境变量解析。
+//   - 扫描周期环境变量解析；
+//   - 主节点入库后 force reload（真 /load）、无变化零 reload、与从端 apply 串行。
 //
 // 私钥一律 crypto/x509 内存生成，不留测试夹具文件。
 
@@ -21,14 +22,20 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"lazy-balancer-v2/caddydbcert"
+	"lazy-balancer-v2/internal/config"
 )
 
 // enableCertVaultForTest 在测试库上装 vault schema、注入 env 模式 DEK、开启甲路线。
@@ -345,5 +352,164 @@ func TestCertFileScanInterval_envOverride(t *testing.T) {
 	t.Setenv(CertFileScanIntervalEnv, "0")
 	if got := effectiveCertFileScanInterval(); got != certFileScanInterval {
 		t.Fatalf("zero env interval=%v, want default %v", got, certFileScanInterval)
+	}
+}
+
+// 主节点「放文件即生效」：入库后只触发一次真实 /load，且强制击穿同配置短路。
+// 注入的钩子与 main.go 的 certReloader 同语义（WithCaddyOpLock + ReloadFromDB）。
+func TestScanCertFilesToVault_masterForceReloadOnChange(t *testing.T) {
+	database := setupIsolatedDB(t)
+	enableCertVaultForTest(t, database)
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+
+	var mu sync.Mutex
+	var bodies [][]byte
+	var forced []bool
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			bodies = append(bodies, body)
+			forced = append(forced, r.Header.Get("Cache-Control") == "must-revalidate")
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	caddyService := NewCaddyService(caddyServer.URL)
+	SetCertFileScanReload(func() error {
+		var reloadErr error
+		WithCaddyOpLock(func() { reloadErr = ReloadFromDB(caddyService, database, database) })
+		return reloadErr
+	})
+	defer SetCertFileScanReload(nil)
+	loadCount := func() (int, []bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(bodies), append([]bool(nil), forced...)
+	}
+
+	certPEM, keyPEM := scanTestCertPair(t, "scan-master-reload.example.test")
+	if err := WriteCertFiles("lb_scan_mreload", certPEM, keyPEM); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+	first := scanCertFilesToVault(context.Background())
+	if first.Upserted != 1 {
+		t.Fatalf("first round=%+v, want upserted=1", first)
+	}
+	if n, flags := loadCount(); n != 1 || !flags[0] {
+		t.Fatalf("/load 次数=%d flags=%v, want 1 次且 must-revalidate", n, flags)
+	}
+
+	// 指纹全同的重复扫描：0 次 reload（不能每 60s 空重载）。
+	second := scanCertFilesToVault(context.Background())
+	if second.Upserted != 0 || second.Unchanged != 1 {
+		t.Fatalf("second round=%+v, want upserted=0 unchanged=1", second)
+	}
+	if n, _ := loadCount(); n != 1 {
+		t.Fatalf("unchanged scan triggered extra /load: count=%d, want 1", n)
+	}
+}
+
+// 扫描 reload 与从端 applySnapshot reload 必须共用 CaddyOpLock：
+// apply 持锁期间扫描 reload 不得进入临界区；释放后串行进入，全程零重叠。
+func TestCertFileScanReload_serializesWithSlaveApplySnapshot(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	enableCertVaultForTest(t, database)
+	for _, stmt := range []string{
+		`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_conc','conc','http','conc.example.test',80,1)`,
+		`INSERT INTO upstreams (rule_id,host,port,weight,enabled) VALUES ('lb_conc','127.0.0.1',8080,1,1)`,
+		`INSERT INTO users (id,username,password_hash,role,is_enabled,last_login) VALUES (1,'admin','h','admin',1,datetime('now'))`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if _, err := database.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+		t.Fatalf("set master: %v", err)
+	}
+	seedCert, seedKey := scanTestCertPair(t, "conc.example.test")
+	if _, err := caddydbcert.Upsert(ctx, database, certKeyProvider(""), "", "conc.example.test", "lb_conc", seedCert, seedKey, false, []string{"lb_conc"}); err != nil {
+		t.Fatalf("seed vault cert: %v", err)
+	}
+	service := NewClusterService(database, "")
+	snap, _, err := service.Snapshot(ctx, 0, "", "")
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("set slave: %v", err)
+	}
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+
+	var active atomic.Int32
+	var overlap atomic.Bool
+	applyEntered, scanEntered := make(chan struct{}), make(chan struct{})
+	releaseApply, releaseScan := make(chan struct{}), make(chan struct{})
+	oldHook := syncReloadLockHook
+	syncReloadLockHook = func() { // applySnapshot 重载临界区入口（已在 CaddyOpLock 内）
+		if active.Add(1) != 1 {
+			overlap.Store(true)
+		}
+		close(applyEntered)
+		<-releaseApply
+		active.Add(-1)
+	}
+	defer func() { syncReloadLockHook = oldHook }()
+
+	scanCaddy := NewCaddyService(caddyServer.URL)
+	SetCertFileScanReload(func() error {
+		var reloadErr error
+		WithCaddyOpLock(func() {
+			if active.Add(1) != 1 {
+				overlap.Store(true)
+			}
+			close(scanEntered)
+			<-releaseScan
+			reloadErr = ReloadFromDB(scanCaddy, database, database)
+			active.Add(-1)
+		})
+		return reloadErr
+	})
+	defer SetCertFileScanReload(nil)
+
+	dirRestore := SetCertDirForTest(t.TempDir())
+	defer dirRestore()
+	newCert, newKey := scanTestCertPair(t, "scan-conc.example.test")
+	if err := WriteCertFiles("lb_scan_conc", newCert, newKey); err != nil {
+		t.Fatalf("WriteCertFiles: %v", err)
+	}
+
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- syncService.applySnapshot(ctx, snap) }()
+	<-applyEntered // 从端已持 CaddyOpLock
+
+	scanDone := make(chan certScanRound, 1)
+	go func() { scanDone <- scanCertFilesToVault(ctx) }()
+	select {
+	case <-scanEntered:
+		t.Fatal("扫描 reload 与从端 applySnapshot reload 重叠（未共用 CaddyOpLock）")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseApply)
+	if err := <-applyDone; err != nil {
+		t.Fatalf("slave applySnapshot: %v", err)
+	}
+	select {
+	case <-scanEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("apply 释放锁后扫描 reload 未进入")
+	}
+	close(releaseScan)
+	round := <-scanDone
+	if round.Upserted != 1 {
+		t.Fatalf("scan round=%+v, want upserted=1", round)
+	}
+	if overlap.Load() {
+		t.Fatal("两处 reload 临界区发生重叠")
 	}
 }
