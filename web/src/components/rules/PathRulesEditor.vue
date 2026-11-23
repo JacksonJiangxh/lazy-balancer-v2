@@ -144,6 +144,7 @@
               <el-select v-model="upstream.protocol" size="small" aria-label="协议">
                 <el-option value="http" label="HTTP" />
                 <el-option value="https" label="HTTPS" />
+                <el-option value="h2c" label="H2C" />
               </el-select>
             </label>
             <label class="upstream-field">

@@ -958,11 +958,15 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		// 同口径;JoinHostPort 兼容 IPv6 裸地址形态)——同 host:port 双条目
 		// 权重翻倍,均衡语义静默漂移。
 		pathHostPortSeen := make(map[string]bool)
-		// 同族：路径规则自定义上游池同样拒绝 http/https 混布——同一
-		// reverse_proxy 池级 TLS 传输下 http 上游静默全灭。定向放行
-		// （JJC-20261118-002 裁决 2）：混布池经 chain 模块承载，谓词允许的
-		// 策略放行（渲染期整池切 chain，绝不落 reverse_proxy）。
-		pathPoolProtos := make(map[string]bool, 2)
+		// 同族：路径规则自定义上游池拒绝协议混布——同一 reverse_proxy 池级
+		// TLS 传输下 http 上游静默全灭。定向放行（JJC-20261118-002 裁决 2）：
+		// 混布池经 chain 模块承载，谓词允许的策略放行（渲染期整池切 chain，
+		// 绝不落 reverse_proxy）。h2c 与 http 同族（明文池，渲染层
+		// reverse_proxy 整池 versions=["1.1","h2c"]，http 上游兼容）——
+		// h2c+http 混布放行；h2c+https 无论如何拒绝（https 混布触发渲染层
+		// httpUpstreamPoolMixed→整池切 chain 模块，chain 的逐上游 transport
+		// 无 h2c 语义——SetUnencryptedHTTP2 缺席，h2c 上游 gRPC 必坏）。
+		pathPoolProtos := make(map[string]bool, 3)
 		for _, upstream := range pathRule.Upstreams {
 			proto := upstream.Protocol
 			if proto == "" {
@@ -970,8 +974,11 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 			pathPoolProtos[proto] = true
 		}
-		if pathPoolProtos["http"] && pathPoolProtos["https"] && !mixedPoolStrategyAllowed(input.Strategy) {
-			return fmt.Errorf("第 %d 条路径规则的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）", index+1)
+		if pathPoolProtos["h2c"] && pathPoolProtos["https"] {
+			return fmt.Errorf("第 %d 条路径规则的自定义上游 h2c 不兼容 https 混布：h2c 依赖池级明文 transport（versions 含 h2c），https 混布会让整池切 chain 模块承载，chain 的逐上游 transport 不含 h2c 语义（gRPC 必坏）；请统一上游协议或拆分规则", index+1)
+		}
+		if (pathPoolProtos["https"] && (pathPoolProtos["http"] || pathPoolProtos["h2c"])) && !mixedPoolStrategyAllowed(input.Strategy) {
+			return fmt.Errorf("第 %d 条路径规则的自定义上游协议混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）", index+1)
 		}
 		for upstreamIndex, upstream := range pathRule.Upstreams {
 			if strings.TrimSpace(upstream.Address) == "" {
@@ -988,8 +995,8 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			if upstream.Weight < 1 {
 				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游权重必须为不小于 1 的整数", index+1, upstreamIndex+1)
 			}
-			if upstream.Protocol != "" && upstream.Protocol != "http" && upstream.Protocol != "https" {
-				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游协议只能是 http 或 https", index+1, upstreamIndex+1)
+			if upstream.Protocol != "" && upstream.Protocol != "http" && upstream.Protocol != "https" && upstream.Protocol != "h2c" {
+				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游协议只能是 http/https/h2c", index+1, upstreamIndex+1)
 			}
 			key := net.JoinHostPort(upstreamDedupeHost(upstream.Address), strconv.Itoa(upstream.Port))
 			if pathHostPortSeen[key] {
@@ -1792,6 +1799,9 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 	if !allowed && enabledUpstreamPoolMixed(rule.Upstreams) {
 		return fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布仅支持 weighted_round_robin / chain_fallback，经逐上游独立回源通道承载；其余策略请统一上游协议或拆分规则）")
 	}
+	if ruleH2CHTTPSUpstreamMixed(rule.Upstreams) {
+		return fmt.Errorf("h2c 不兼容 https 混布：h2c 依赖池级明文 transport（versions 含 h2c），https 混布会让整池切 chain 模块承载，chain 的逐上游 transport 不含 h2c 语义（gRPC 必坏）；请统一上游协议或拆分规则")
+	}
 	for _, pr := range rule.PathRules {
 		pathProtos := map[string]bool{}
 		for _, u := range pr.Upstreams {
@@ -1801,11 +1811,32 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 			}
 			pathProtos[proto] = true
 		}
-		if pathProtos["http"] && pathProtos["https"] && !allowed {
-			return fmt.Errorf("路径规则 %s 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）", pr.Path)
+		if pathProtos["h2c"] && pathProtos["https"] {
+			return fmt.Errorf("路径规则 %s 的自定义上游 h2c 不兼容 https 混布：h2c 依赖池级明文 transport（versions 含 h2c），https 混布会让整池切 chain 模块承载，chain 的逐上游 transport 不含 h2c 语义（gRPC 必坏）；请统一上游协议或拆分规则", pr.Path)
+		}
+		if (pathProtos["https"] && (pathProtos["http"] || pathProtos["h2c"])) && !allowed {
+			return fmt.Errorf("路径规则 %s 的自定义上游协议混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）", pr.Path)
 		}
 	}
 	return nil
+}
+
+// ruleH2CHTTPSUpstreamMixed 主池 h2c+https 混布判定（启用上游口径，空协议
+// 归一 http）——h2c 与 https 并存即拒绝（无论策略）：渲染层 chain 模块的
+// 逐上游 transport 无 h2c 语义，gRPC 必坏（与路径池显式门同口径）。
+func ruleH2CHTTPSUpstreamMixed(upstreams []models.Upstream) bool {
+	protos := map[string]bool{}
+	for _, u := range upstreams {
+		if !u.Enabled {
+			continue
+		}
+		proto := u.Protocol
+		if proto == "" {
+			proto = "http"
+		}
+		protos[proto] = true
+	}
+	return protos["h2c"] && protos["https"]
 }
 
 // validateTCPTryWindowBounds 是重试窗口的单源值域门：保存族

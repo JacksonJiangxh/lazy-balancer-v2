@@ -29,8 +29,8 @@ export type UpstreamInput = Omit<Upstream, 'id' | 'rule_id'> & {
 }
 
 export interface PathRuleUpstream {
-  // 路径级自定义上游仅 http/https（h2c 仅规则级主上游可用）
-  protocol: 'http' | 'https'
+  // 路径级自定义上游白名单 http/https/h2c（h2c+https 混布由保存门拒绝）
+  protocol: 'http' | 'https' | 'h2c'
   address: string
   port: number
   weight: number

@@ -2,7 +2,7 @@ import { upstreamDedupeKey } from './upstreamKeys.ts'
 import { isValidV4, isValidV6 } from './ipAddress.ts'
 
 type PathUpstreamInput = {
-  readonly protocol: 'http' | 'https'
+  readonly protocol: 'http' | 'https' | 'h2c'
   readonly address: string
   readonly port: number
   readonly weight: number
@@ -147,11 +147,19 @@ export const MIXED_POOL_ALLOWED_STRATEGY_MESSAGE =
   '同一 HTTP 规则的启用上游协议须一致（http/https 混布仅支持 weighted_round_robin / chain_fallback，经逐上游独立回源通道承载；其余策略请统一上游协议或拆分规则）'
 
 /**
- * 混布门路径池文案（与后端 mixedUpstreamPoolError 路径池段同款，规则名换
+ * 混布门路径池文案（与后端 validateRuleFeatures 路径池门同款，规则名换
  * 前端逐条路径的 path 值）。
  */
 export const mixedPoolPathGateMessage = (path: string): string =>
-  `路径规则 ${path} 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）`
+  `路径规则 ${path} 的自定义上游协议混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）`
+
+/**
+ * h2c+https 混布显式拒绝文案（与后端保存门/存量门逐字对齐）：h2c 与 https
+ * 并存无论策略拒绝——https 混布触发渲染层整池切 chain 模块，chain 的逐上游
+ * transport 无 h2c 语义（gRPC 必坏）。h2c+http 同族放行。
+ */
+export const H2C_HTTPS_MIXED_GATE_MESSAGE =
+  'h2c 不兼容 https 混布：h2c 依赖池级明文 transport（versions 含 h2c），https 混布会让整池切 chain 模块承载，chain 的逐上游 transport 不含 h2c 语义（gRPC 必坏）；请统一上游协议或拆分规则'
 
 /**
  * 主动健康检查伴随门镜像已于 JJC-20261119-001 裁决 4 移除（后端
@@ -235,7 +243,10 @@ export const validatePathRules = (rules: readonly PathRuleInput[], strategy = ''
     // isValidHost：IP 字面量或主机名）、host:port 去重（重复条使权重翻倍、
     // 均衡语义静默漂移）。
     const poolProtocols = new Set(rule.upstreams.map((upstream) => (upstream.protocol || 'http')))
-    if (poolProtocols.has('http') && poolProtocols.has('https') && !mixedPoolStrategyAllowed(strategy)) {
+    if (poolProtocols.has('h2c') && poolProtocols.has('https')) {
+      return H2C_HTTPS_MIXED_GATE_MESSAGE
+    }
+    if (poolProtocols.has('https') && (poolProtocols.has('http') || poolProtocols.has('h2c')) && !mixedPoolStrategyAllowed(strategy)) {
       return mixedPoolPathGateMessage(rule.path)
     }
     const seenHostPorts = new Set<string>()
@@ -249,10 +260,10 @@ export const validatePathRules = (rules: readonly PathRuleInput[], strategy = ''
       }
       if (upstream.port < 1 || upstream.port > 65535) return `第 ${rowNumber} 条路径的自定义上游端口无效`
       const protocol = (upstream.protocol ?? '') as string
-      // 路径级自定义上游仅 http/https（h2c 仅规则级主上游可用——此处仍拒绝，
-      // 文案不变，与后端路径池门同口径）。
-      if (protocol !== '' && protocol !== 'http' && protocol !== 'https') {
-        return `第 ${rowNumber} 条路径的自定义上游协议只能是 http 或 https`
+      // 路径级自定义上游白名单 http/https/h2c（与后端路径池门同口径，
+      // JJC-20261123-003 后续收口：netbird gRPC 回源需路径上游 h2c）。
+      if (protocol !== '' && protocol !== 'http' && protocol !== 'https' && protocol !== 'h2c') {
+        return `第 ${rowNumber} 条路径的自定义上游协议只能是 http/https/h2c`
       }
       if (upstream.weight < 1) return `第 ${rowNumber} 条路径的自定义上游权重必须大于 0`
       // 与后端 upstreamDedupeHost 同口径：IP 按地址语义归一（IPv6 等价写法
@@ -447,7 +458,7 @@ export const passthroughSaveGateError = (input: PassthroughGateInput): string =>
 
 export const H2C_UPSTREAM_PROTOCOL = 'h2c'
 
-/** HTTP 规则级主上游协议白名单（含 h2c）。路径级自定义上游仍限 http/https。 */
+/** HTTP 规则级主上游协议白名单（含 h2c）。路径级自定义上游同白名单（h2c+https 混布除外）。 */
 export const HTTP_RULE_UPSTREAM_PROTOCOLS: readonly string[] = ['http', 'https', H2C_UPSTREAM_PROTOCOL]
 
 /** 主向导上游协议下拉选项（label/value），协议族白名单的单一展示源。 */

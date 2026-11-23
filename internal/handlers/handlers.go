@@ -902,6 +902,13 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 	if protocol == "http" && !mixedPoolStrategyAllowed(strategy) && enabledProtocols["http"] && enabledProtocols["https"] {
 		return 0, fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布仅支持 weighted_round_robin / chain_fallback，经逐上游独立回源通道承载；其余策略请统一上游协议或拆分规则）")
 	}
+	// h2c+https 混布显式拒绝（与 mixedUpstreamPoolError 主池显式门同口径，
+	// 无论策略）：h2c 依赖池级明文 transport（versions 含 h2c），https 混布会
+	// 触发渲染层 httpUpstreamPoolMixed→整池切 chain 模块，chain 的逐上游
+	// transport 无 h2c 语义（gRPC 必坏）。h2c+http 同族放行。
+	if protocol == "http" && enabledProtocols["h2c"] && enabledProtocols["https"] {
+		return 0, fmt.Errorf("h2c 不兼容 https 混布：h2c 依赖池级明文 transport（versions 含 h2c），https 混布会让整池切 chain 模块承载，chain 的逐上游 transport 不含 h2c 语义（gRPC 必坏）；请统一上游协议或拆分规则")
+	}
 	if requireEnabled && enabledUpstreamCount == 0 {
 		return 0, fmt.Errorf("至少需要一个启用的上游服务器")
 	}

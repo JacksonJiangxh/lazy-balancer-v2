@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -102,6 +103,87 @@ func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	}
 	if err := validateBackupRuleReferences(allowHC); err != nil {
 		t.Fatalf("混布+允许策略+HC 的 v2 备份须放行（伴随门移除），got %v", err)
+	}
+}
+
+// h2c 路径池门（JJC-20261123-003 收口）：路径上游 h2c 放行；h2c+http 同族
+// 放行（明文池，渲染层 versions=["1.1","h2c"] 兼容 http 上游）；h2c+https
+// 无论策略拒绝（https 混布触发渲染层整池切 chain，chain 的逐上游 transport
+// 无 h2c 语义，gRPC 必坏）。
+func TestRulePayload_pathRuleUpstreamH2CGates(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+
+	seq := 0
+	mkBody := func(protocol string, port int, strategy string) string {
+		seq++
+		return `{"name":"h2cpath","protocol":"http","domain":"h2cpath-` + strconv.Itoa(seq) + `.test","listen_port":` + strconv.Itoa(19321+seq*2) + `,"strategy":"` + strategy + `","custom_routes_enabled":true,` +
+			`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
+			`"upstreams":[{"host":"10.0.0.1","port":9000,"weight":1,"enabled":true}],` +
+			`"path_rules":[{"sort_order":0,"match_type":"prefix","path":"/api/","upstreams":[` +
+			`{"address":"10.0.0.1","port":8080,"weight":1,"protocol":"` + protocol + `"},{"address":"10.0.0.2","port":` + strconv.Itoa(port) + `,"weight":1,"protocol":"http"}]}]}`
+	}
+	do := func(body string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+	// 纯 h2c 路径上游放行
+	code, body := do(mkBody("h2c", 8081, "weighted_round_robin"))
+	if code != http.StatusCreated {
+		t.Fatalf("path-rule h2c upstream must 201, got %d %s", code, body)
+	}
+	// h2c+http 同族放行
+	code, body = do(mkBody("h2c", 8081, "least_conn"))
+	if code != http.StatusCreated {
+		t.Fatalf("path-rule h2c+http pool must 201, got %d %s", code, body)
+	}
+	// h2c+https 无论策略拒绝（显式门）
+	for _, strategy := range []string{"weighted_round_robin", "least_conn"} {
+		body2 := strings.Replace(mkBody("h2c", 8081, strategy), `{"address":"10.0.0.2","port":8081,"weight":1,"protocol":"http"}`, `{"address":"10.0.0.2","port":8443,"weight":1,"protocol":"https"}`, 1)
+		code, body := do(body2)
+		if code != http.StatusBadRequest || !strings.Contains(body, "h2c 不兼容 https 混布") {
+			t.Fatalf("path-rule h2c+https pool strategy=%s must 400, got %d %s", strategy, code, body)
+		}
+	}
+}
+
+// h2c 主池门（主池/路径池同口径）：h2c+https 无论策略拒绝；h2c+http 放行。
+func TestRulePayload_mainPoolH2CHttpsGate(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+
+	seqMain := 0
+	mkBody := func(second string, strategy string) string {
+		seqMain++
+		return `{"name":"h2cmain","protocol":"http","domain":"h2cmain-` + strconv.Itoa(seqMain) + `.test","listen_port":` + strconv.Itoa(19340+seqMain) + `,"strategy":"` + strategy + `",` +
+			`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
+			`"upstreams":[{"host":"10.0.0.1","port":8080,"weight":1,"enabled":true,"protocol":"h2c"},` + second + `]}`
+	}
+	httpSecond := `{"host":"10.0.0.2","port":8081,"weight":1,"enabled":true,"protocol":"http"}`
+	httpsSecond := `{"host":"10.0.0.2","port":8443,"weight":1,"enabled":true,"protocol":"https"}`
+	for _, strategy := range []string{"weighted_round_robin", "least_conn"} {
+		req := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(mkBody(httpsSecond, strategy)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "h2c 不兼容 https 混布") {
+			t.Fatalf("main pool h2c+https strategy=%s must 400, got %d %s", strategy, rec.Code, rec.Body.String())
+		}
+	}
+	// h2c+http 放行
+	req := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(mkBody(httpSecond, "weighted_round_robin")))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("main pool h2c+http must 201, got %d %s", rec.Code, rec.Body.String())
 	}
 }
 

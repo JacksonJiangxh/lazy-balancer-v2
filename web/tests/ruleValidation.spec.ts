@@ -9,6 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  H2C_HTTPS_MIXED_GATE_MESSAGE,
   H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE,
   H2C_UPSTREAM_PROTOCOL,
   HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS,
@@ -165,9 +166,12 @@ test('混布门文案跨栈逐字对齐（前端常量=后端 400 错误信息�
   assert.ok(goMain.includes(MIXED_POOL_ALLOWED_STRATEGY_MESSAGE), '后端 handlers.go 主池文案必须与前端常量逐字一致')
   assert.ok(goFeatures.includes(MIXED_POOL_ALLOWED_STRATEGY_MESSAGE), '后端 rule_features.go 主池文案必须与前端常量逐字一致')
   // 路径池文案逐字对齐：后端为 %s 格式串，前端按 path 填充后逐字等值
-  const backendPathFormat = '路径规则 %s 的自定义上游 http/https 混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）'
+  const backendPathFormat = '路径规则 %s 的自定义上游协议混布（混布仅支持 weighted_round_robin / chain_fallback；其余策略请统一上游协议或拆分规则）'
   assert.ok(goFeatures.includes(backendPathFormat), '后端路径池文案格式串必须与前端逐字一致')
   assert.equal(mixedPoolPathGateMessage('/api/'), backendPathFormat.replace('%s', '/api/'))
+  // h2c+https 显式门文案逐字对齐（主池与路径池共用同句）
+  assert.ok(goMain.includes(H2C_HTTPS_MIXED_GATE_MESSAGE), '后端 handlers.go 主池 h2c+https 文案必须与前端常量逐字一致')
+  assert.ok(goFeatures.includes(H2C_HTTPS_MIXED_GATE_MESSAGE), '后端 rule_features.go h2c+https 文案必须与前端常量逐字一致')
   // 伴随门撤销钉（JJC-20261119-001 裁决 4）：后端伴随门文案必须已移除
   //（防回流——若有人把「混布+HC=400」加回任一侧，此钉即红）。
   const staleHcGateMessage = '混布池经 chain 模块承载暂不支持主动健康检查'
@@ -189,10 +193,6 @@ test('混布池谓词与后端同口径（JJC-20261119-001 超集：伴随门镜
   }
   // 伴随门镜像已移除（JJC-20261119-001 裁决 4）：混布+主动健康检查放行——
   // HC 经 chain 模块承载（渲染发射 health_check），前端不再预拦。
-  const mixed = [
-    { protocol: 'http', enabled: true },
-    { protocol: 'https', enabled: true },
-  ]
   // 混布+HC 的判定语义归 mixedPoolStrategyAllowed（允许策略放行即放行，
   // HC 标志不再构成额外拒绝面）；uniform+HC / TCP 本就不经此面。
   assert.equal(mixedPoolStrategyAllowed('weighted_round_robin'), true)
@@ -466,14 +466,34 @@ test('response_mode：forward 是 UI 哨兵（等价空串），未知值显式�
   assert.equal(validatePathRules([unknownMode]), '第 1 条路径：response_mode 无效')
 })
 
-test('路径池上游协议枚举：空串/http/https 之外一律拒绝（h2c 等）', () => {
-  // h2c 仅规则级主上游可用（JJC-20261123-003）：路径级自定义上游池仍限
-  // http/https，文案不变（与后端路径池门同口径）。
+test('路径池上游协议枚举：http/https/h2c 放行、其余拒绝', () => {
+  // 路径级自定义上游白名单含 h2c（netbird gRPC 回源需要路径上游 h2c，
+  // JJC-20261123-003 收口）。
   const h2c = upstream({ protocol: 'h2c' as unknown as 'http' })
-  assert.equal(validatePathRules([rule({ upstreams: [h2c] })]), '第 1 条路径的自定义上游协议只能是 http 或 https')
+  assert.equal(validatePathRules([rule({ upstreams: [h2c] })]), null, '路径上游 h2c 放行')
   assert.equal(validatePathRules([rule({ upstreams: [upstream({ protocol: 'https' })] })]), null)
   const implicit = { ...upstream(), protocol: '' as unknown as 'http' }
   assert.equal(validatePathRules([rule({ upstreams: [implicit] })]), null, '空串=默认 http')
+  // 白名单之外仍拒绝
+  const bogus = upstream({ protocol: 'grpc' as unknown as 'http' })
+  assert.match(String(validatePathRules([rule({ upstreams: [bogus] })])), /协议只能是 http\/https\/h2c/)
+})
+
+test('路径池 h2c 混布语义：h2c+http 放行、h2c+https 无论策略拒绝', () => {
+  const h2cHttp = [upstream({ protocol: 'h2c' as unknown as 'http' }), upstream({ port: 8081 })]
+  // h2c+http 同族（明文池）——任何策略放行
+  for (const strategy of ['weighted_round_robin', 'chain_fallback', '', 'least_conn']) {
+    assert.equal(validatePathRules([rule({ upstreams: h2cHttp })], strategy), null, `h2c+http strategy=${strategy} 放行`)
+  }
+  // h2c+https 无论策略拒绝（显式门）
+  const h2cHttps = [upstream({ protocol: 'h2c' as unknown as 'http' }), upstream({ protocol: 'https', port: 8081 })]
+  for (const strategy of ['weighted_round_robin', 'chain_fallback', '', 'least_conn']) {
+    assert.match(
+      String(validatePathRules([rule({ upstreams: h2cHttps })], strategy)),
+      /h2c 不兼容 https 混布/,
+      `h2c+https strategy=${strategy} 须拒绝`,
+    )
+  }
 })
 
 test('HTTP 规则级主上游协议白名单：http/https/h2c（JJC-20261123-003）', () => {
