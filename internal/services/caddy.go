@@ -5416,6 +5416,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	upstreamList := make([]interface{}, 0, len(enabledUpstreams))
 	upstreamWeights := make([]int, 0, len(enabledUpstreams))
 	hasHTTPSUpstream := false
+	// h2c 强制 transport（缺口②，JJC-20261123-003）：纯 h2c 明文上游（无
+	// https/无超时/无 NTLM）若不置位，needsTransport 判定整块不渲染 transport，
+	// versions 注入成死路径——h2c 上游按默认 HTTP/1.1 明文回源，gRPC 必坏。
+	hasH2CUpstream := false
 	// 逐上游健康检查路径分歧标记（JJC-20261121-001）：函数级作用域——transport
 	// 段（except_ports）与路由出口（聚合探针路由装配）都要消费；非 HTTP 规则
 	// 恒 false（TCP/passthrough 无路径探测面）。
@@ -5459,6 +5463,9 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		}
 		if upstream.Protocol == "https" {
 			hasHTTPSUpstream = true
+		}
+		if upstream.Protocol == "h2c" {
+			hasH2CUpstream = true
 		}
 	}
 
@@ -5639,7 +5646,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	if timeouts.streamCloseDelay > 0 {
 		proxyConfig["stream_close_delay"] = fmt.Sprintf("%ds", timeouts.streamCloseDelay)
 	}
-	needsTransport := hasHTTPSUpstream || rule.EnableDnsServer || effectiveUpstreamKeepaliveTimeout > 0 || timeouts.dial > 0 || timeouts.responseHeader > 0 || timeouts.read > 0 || timeouts.write > 0 || rule.NTLMCompatible == 1
+	// h2c 上游强制渲染 transport 块（缺口②）：否则纯 h2c 明文上游（无 https/
+	// 无超时/无 NTLM/无 DNS 服务发现/无 keepalive）时整块不渲染，下方
+	// versions=["1.1","h2c"] 注入成死路径——h2c 退化为 HTTP/1.1 明文回源。
+	needsTransport := hasHTTPSUpstream || hasH2CUpstream || rule.EnableDnsServer || effectiveUpstreamKeepaliveTimeout > 0 || timeouts.dial > 0 || timeouts.responseHeader > 0 || timeouts.read > 0 || timeouts.write > 0 || rule.NTLMCompatible == 1
 	if needsTransport {
 		// NTLM 兼容（ntlm=1）：transport 换用 caddyserver/ntlm-transport 的
 		// http_ntlm（连接级协商亲和——NTLM/Negotiate 握手的客户端连接钉定
@@ -5672,16 +5682,26 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 				tlsConfig["except_ports"] = []string{fmt.Sprintf("%d", PanelPort())}
 			}
 			transportConfig["tls"] = tlsConfig
-			if rule.UpstreamForceHTTP1 == 1 && rule.NTLMCompatible != 1 {
-				// 上游强制 HTTP/1.1（通用列，2026-10-12）：Caddy HTTPTransport.Versions
-				// （modules/caddyhttp/reverseproxy/httptransport.go）——限定协议版本集即
-				// 禁用 h2（TLS 上游同时从 ALPN 剔除 h2）。语义比 tls.alpn_protocols 准确
-				// （后者只影响 ALPN 握手、不管 h2c 协商）。仅 https 上游输出：
-				// http 明文无 ALPN/协商面（用户裁定）。
-				// http_ntlm transport 不发射 versions——模块 Provision 无条件强制
-				// Versions=["1.1"]（ntlm-transport ntlm.go），显式输出是死配置。
-				transportConfig["versions"] = []string{"1.1"}
-			}
+		if rule.UpstreamForceHTTP1 == 1 && rule.NTLMCompatible != 1 {
+			// 上游强制 HTTP/1.1（通用列，2026-10-12）：Caddy HTTPTransport.Versions
+			// （modules/caddyhttp/reverseproxy/httptransport.go）——限定协议版本集即
+			// 禁用 h2（TLS 上游同时从 ALPN 剔除 h2）。语义比 tls.alpn_protocols 准确
+			// （后者只影响 ALPN 握手、不管 h2c 协商）。仅 https 上游输出：
+			// http 明文无 ALPN/协商面（用户裁定）。
+			// http_ntlm transport 不发射 versions——模块 Provision 无条件强制
+			// Versions=["1.1"]（ntlm-transport ntlm.go），显式输出是死配置。
+			transportConfig["versions"] = []string{"1.1"}
+		}
+		// h2c 上游（缺口②，JJC-20261123-003）：versions=["1.1","h2c"]——Caddy 2.11
+		// HTTPTransport.Versions 合法值 1.1/2/h2c（allowedVersions，httptransport.go），
+		// h2c 使 RoundTrip 对明文连接 SetUnencryptedHTTP2（prior knowledge HTTP/2，
+		// netbird gRPC 回源必需）。dial 保持 host:port 明文形态（joinUpstreamAddress
+		// 无 scheme 语义，严禁 h2c:// 前缀方案）。与 upstream_force_http1 互斥：
+		// force_http1=1 时上方已发射 ["1.1"]，h2c 注入被跳过（保存门虽不拦该组合，
+		// 渲染按 force_http1 优先——用户显式要 HTTP/1.1 的意图优先）。
+		if hasH2CUpstream && rule.UpstreamForceHTTP1 != 1 && rule.NTLMCompatible != 1 {
+			transportConfig["versions"] = []string{"1.1", "h2c"}
+		}
 		}
 		if rule.EnableDnsServer && rule.DnsServer != "" {
 			transportConfig["resolver"] = map[string]interface{}{"addresses": SplitDnsAddresses(rule.DnsServer)}
@@ -6316,9 +6336,31 @@ func warnInternalTerminateExposed() {
 // 聚合口径：多条规则 → 多个 route（每条一个 matcher 集合 + 自己的上游与
 // 健康检查参数）。不合并成单 route 多 matcher，因为上游 dial 与
 // proxy_protocol/健康检查都是规则级参数，合并会丢失映射关系。
+//
+// SNI 路由顺序（缺口①，JJC-20261123-003）：精确 SNI route 恒排在通配 SNI
+// route 之前——保存门已放行「精确基域透传 vs 覆盖它的通配透传」同端口共存
+// （sniCoexistablePair），Layer4 route 顺序成为路由归属语义的一部分：apex
+// 精确名必须先被精确 route 吃掉，其余子域 ClientHello 才落到通配 route
+// （certmagic.MatchWildcard 同时接受精确名与子域——顺序即语义，必须与
+// 渲染无关地确定）。库内（allRules）序仍为同层稳定序。
 func buildPassthroughLayer4Server(port int, rules []ruleWithUpstreams) (map[string]interface{}, error) {
-	routes := make([]interface{}, 0, len(rules)+1)
+	// 精确/通配两段稳定分组（slice.Sort 与 Go 排序皆稳定，分组不搅乱库内序；
+	// 直通组合 SNI 值不含 "*"，精确分组先行即通配垫后）。
+	exactRules := make([]ruleWithUpstreams, 0, len(rules))
+	wildcardRules := make([]ruleWithUpstreams, 0, len(rules))
 	for _, ru := range rules {
+		if strings.Contains(ru.rule.Domain, "*") {
+			wildcardRules = append(wildcardRules, ru)
+		} else {
+			exactRules = append(exactRules, ru)
+		}
+	}
+	ordered := make([]ruleWithUpstreams, 0, len(rules))
+	ordered = append(ordered, exactRules...)
+	ordered = append(ordered, wildcardRules...)
+
+	routes := make([]interface{}, 0, len(ordered)+1)
+	for _, ru := range ordered {
 		r := ru.rule
 		// 保存门已保证单域名且形状合法（validateSNIDomain）；此处按 SNI
 		// 匹配口径归一（小写，去首尾空白），与 HTTP 侧 matcher 同源。

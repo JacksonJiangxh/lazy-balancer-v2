@@ -751,6 +751,7 @@ type rulePayloadInput struct {
 	RequestBodyMaxSizeMB          int
 	UpstreamKeepaliveTimeout      int
 	ServerTokensHidden            int
+	NTLMCompatible                int
 	BlockPageStage1ID             int
 	BlockPageStage1Status         int
 	BlockPageStage3ID             int
@@ -814,7 +815,9 @@ func upstreamDedupeHost(host string) string {
 // validateRuleUpstreams 校验一组实际上游。requireEnabled 用于 Create/Update
 // 与 v1 的表单语义；v2 备份是存量行还原，保留渲染层支持的零上游/零启用
 // 形态，但所有携带行仍逐项经过完全相同的值域、查重与协议校验。
-func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.Upstream, requireEnabled bool, strategy string) (int, error) {
+// ntlmCompatible 为规则级 ntlm_compatible 合并后值（Create 直取 req；
+// Update/存量门取合并终值；备份校验取行值）——h2c 互斥门消费。
+func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.Upstream, requireEnabled bool, strategy string, ntlmCompatible int) (int, error) {
 	if requireEnabled && len(upstreams) == 0 {
 		return 0, fmt.Errorf("至少需要一个上游服务器")
 	}
@@ -835,11 +838,19 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 			return 0, fmt.Errorf("上游 #%d：权重必须为不小于 1 的整数", i+1)
 		}
 		if protocol == "http" {
-			if u.Protocol != "" && u.Protocol != "http" && u.Protocol != "https" {
-				return 0, fmt.Errorf("上游 #%d：协议 '%s' 无效（HTTP 规则仅支持 http/https）", i+1, u.Protocol)
+			if u.Protocol != "" && u.Protocol != "http" && u.Protocol != "https" && u.Protocol != "h2c" {
+				return 0, fmt.Errorf("上游 #%d：协议 '%s' 无效（HTTP 规则仅支持 http/https/h2c）", i+1, u.Protocol)
 			}
 		} else if u.Protocol != "" && u.Protocol != "tcp" && u.Protocol != "tls" {
 			return 0, fmt.Errorf("上游 #%d：协议 '%s' 无效（TCP 规则仅支持 tcp/tls）", i+1, u.Protocol)
+		}
+		// h2c 与 NTLM 兼容互斥（缺口②，显性拒绝不静默忽略）：h2c 是明文
+		// HTTP/2 prior knowledge 回源，ntlm-transport 模块 Provision 无条件
+		// 强制 Versions=["1.1"]——同一 HTTP 规则整池共享一个 transport，h2c
+		// 语义会被吞没（gRPC/HTTP2 上游必坏）。与「NTLM+HTTPS+origin_domain」
+		// 同格的组合互斥，错误文案供前端 ruleValidation.ts 逐字复刻。
+		if protocol == "http" && u.Protocol == "h2c" && u.Enabled && ntlmCompatible == 1 {
+			return 0, fmt.Errorf("h2c 上游不兼容 ntlm（上游 #%d）：NTLM 接管强制 HTTP/1.1 transport，h2c 语义会被静默吞没，请拆分规则或关闭其一", i+1)
 		}
 		if u.MaxConnections < 0 {
 			return 0, fmt.Errorf("上游 #%d：最大连接数不能为负数", i+1)
@@ -935,6 +946,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		data.RequestBodyMaxSizeMB = r.RequestBodyMaxSizeMB
 		data.UpstreamKeepaliveTimeout = r.UpstreamKeepaliveTimeout
 		data.ServerTokensHidden = r.ServerTokensHidden
+		data.NTLMCompatible = r.NTLMCompatible
 		data.BlockPageStage1ID = r.BlockPageStage1ID
 		data.BlockPageStage1Status = r.BlockPageStage1Status
 		data.BlockPageStage3ID = r.BlockPageStage3ID
@@ -984,12 +996,10 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		if r.RequestBodyMaxSizeMB != nil {
 			data.RequestBodyMaxSizeMB = *r.RequestBodyMaxSizeMB
 		}
-		if r.UpstreamKeepaliveTimeout != nil {
-			data.UpstreamKeepaliveTimeout = *r.UpstreamKeepaliveTimeout
-		}
-		if r.ServerTokensHidden != nil {
-			data.ServerTokensHidden = *r.ServerTokensHidden
-		}
+		data.UpstreamKeepaliveTimeout = derefInt(r.UpstreamKeepaliveTimeout)
+		data.ServerTokensHidden = derefInt(r.ServerTokensHidden)
+		// UpdateRule 已在调用本门前完成指针合并（nil=沿用存量），此处读合并终值。
+		data.NTLMCompatible = derefInt(r.NTLMCompatible)
 		if r.BlockPageStage1ID != nil {
 			data.BlockPageStage1ID = *r.BlockPageStage1ID
 		}
@@ -1072,7 +1082,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			return fmt.Errorf("透传规则的上游由 passthrough_upstream 字段配置，不支持 upstreams 上游列表")
 		}
 	} else {
-		enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true, data.Strategy)
+		enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true, data.Strategy, data.NTLMCompatible)
 		if err != nil {
 			return err
 		}

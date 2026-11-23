@@ -42,7 +42,7 @@ func TestValidateRuleUpstreams_rejectsEquivalentIPv6Spellings(t *testing.T) {
 		{Host: "2001:db8::80", Port: 8080, Weight: 1, Enabled: true},
 		{Host: "2001:0db8:0:0:0:0:0:80", Port: 8080, Weight: 1, Enabled: true},
 	}
-	_, err := validateRuleUpstreams("http", false, upstreams, true, "")
+	_, err := validateRuleUpstreams("http", false, upstreams, true, "", 0)
 	if err == nil || !strings.Contains(err.Error(), "重复") {
 		t.Fatalf("等价 IPv6 写法必须判重, err=%v", err)
 	}
@@ -62,7 +62,7 @@ func TestUpstreamDedupeHost_keepsBracketedIPv6ForShapeGate(t *testing.T) {
 		t.Fatalf("isValidHost(%q)=true, want false（写侧必须拒绝方括号形态）", bracketed)
 	}
 	upstreams := []models.Upstream{{Host: bracketed, Port: 8080, Weight: 1, Enabled: true}}
-	_, err := validateRuleUpstreams("http", false, upstreams, true, "")
+	_, err := validateRuleUpstreams("http", false, upstreams, true, "", 0)
 	if err == nil || !strings.Contains(err.Error(), "主机") {
 		t.Fatalf("方括号 IPv6 必须被写侧形状门拒绝, err=%v", err)
 	}
@@ -74,7 +74,7 @@ func TestValidateRuleUpstreams_rejectsIPv4MappedDuplicate(t *testing.T) {
 		{Host: "10.0.0.5", Port: 8080, Weight: 1, Enabled: true},
 		{Host: "::ffff:10.0.0.5", Port: 8080, Weight: 1, Enabled: true},
 	}
-	if _, err := validateRuleUpstreams("http", false, upstreams, true, ""); err == nil || !strings.Contains(err.Error(), "重复") {
+	if _, err := validateRuleUpstreams("http", false, upstreams, true, "", 0); err == nil || !strings.Contains(err.Error(), "重复") {
 		t.Fatalf("IPv4-mapped 等价形态必须判重, err=%v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestValidateRuleUpstreams_keepsDistinctUpstreamsValid(t *testing.T) {
 			for i, host := range tc.hosts {
 				upstreams = append(upstreams, models.Upstream{Host: host, Port: tc.ports[i], Weight: 1, Enabled: true})
 			}
-			_, err := validateRuleUpstreams("http", false, upstreams, true, "")
+			_, err := validateRuleUpstreams("http", false, upstreams, true, "", 0)
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "重复") {
 					t.Fatalf("want 重复错误, got %v", err)

@@ -453,11 +453,36 @@ func validateSNIDomain(domain string) error {
 	return nil
 }
 
+// sniCoexistablePair 共存特例（JJC-20261123-003 缺口①）：一方为精确域名、
+// 另一方为通配、且精确域名恰为该通配的基域（x == strings.TrimPrefix(w, "*.")）。
+// 该组合在运行时无歧义：apex 精确名只会命中透传通配的 layer4 sni matcher
+// （caddytls.MatchServerName → certmagic.MatchWildcard 对 *.base 与 base 同真），
+// 而本地终结的 HTTP host matcher（caddyhttp.MatchHost 逐字匹配）对 apex 恒
+// 精确命中——两者互不抢流（Traefik/Caddy/Nginx 生态标准拓扑：apex 本地终结 +
+// 子域透传）。仅此特例放行；其余重叠组合维持 sniDomainsOverlap 原判
+// （通配 vs 通配嵌套、基域以外的覆盖子域等仍拒绝）。
+func sniCoexistablePair(a, b string) bool {
+	aWildcard := strings.HasPrefix(a, "*.")
+	bWildcard := strings.HasPrefix(b, "*.")
+	// 一方精确、一方通配，且精确方恰为通配基域——精确方与其覆盖通配的
+	// 运行时命中面天然分离，可共存。
+	switch {
+	case aWildcard && !bWildcard:
+		return b == strings.TrimPrefix(a, "*.")
+	case bWildcard && !aWildcard:
+		return a == strings.TrimPrefix(b, "*.")
+	}
+	return false
+}
+
 // sniDomainsOverlap 判定两个规范化（小写、TrimSpace 后）SNI 域名是否可能命中
 // 同一 ClientHello：精确相等，或一方为通配且另一方落在其覆盖域内。覆盖判定
 // 保守取多级（*.a.com 同时视为覆盖 b.a.com 与 c.b.a.com）——保存门从严把
 // 歧义组合显性拒绝，宁可误拦不可漏放（Layer4 同 SNI 双规则的路由归属性歧义
 // 在运行期不可观测）。
+// 例外（缺口①）：精确基域 vs 覆盖它的通配（netbird.cc.cd vs *.netbird.cc.cd）
+// 可共存——透传通配只吃子域 ClientHello，apex 精确名归本地终结的 HTTP 侧
+// （sniCoexistablePair 注释）；相等分支已先行放行精确 vs 精确。
 func sniDomainsOverlap(a, b string) bool {
 	if a == b {
 		return true
@@ -471,9 +496,16 @@ func sniDomainsOverlap(a, b string) bool {
 			strings.HasSuffix(strings.TrimPrefix(a, "*."), "."+strings.TrimPrefix(b, "*."))
 	case aWildcard:
 		base := strings.TrimPrefix(a, "*.")
+		// 共存特例：精确基域 vs 覆盖它的通配不视为重叠（运行时语义可分离）。
+		if sniCoexistablePair(a, b) {
+			return false
+		}
 		return b == base || strings.HasSuffix(b, "."+base)
 	case bWildcard:
 		base := strings.TrimPrefix(b, "*.")
+		if sniCoexistablePair(a, b) {
+			return false
+		}
 		return a == base || strings.HasSuffix(a, "."+base)
 	}
 	return false

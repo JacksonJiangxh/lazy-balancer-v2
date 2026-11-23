@@ -746,6 +746,9 @@ func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extr
 // passthroughSNIConflict 同端口同 SNI 冲突检查（含通配重叠歧义）。仅统计启用中
 // 的透传规则与候选域名做 sniDomainsOverlap 判定（保守多级覆盖——*.a.com 与
 // b.a.com 精确规则重叠即拒绝）。返回冲突规则「名（caddy_id）」与命中的 SNI。
+// 共存特例（缺口①）：精确基域 vs 覆盖它的通配透传放行——Layer4 sni matcher
+// 精确名只会命中透传通配，不会命中本地终结的精确基域 HTTP host matcher
+// （Caddy layer4 tls.sni 精确匹配与通配命中面分离，sniCoexistablePair 注释）。
 func passthroughSNIConflict(domain string, listenPort int, excludeCaddyID string) (string, string, error) {
 	candidates := normalizedPassthroughSNIDomains(domain)
 	if len(candidates) == 0 {
@@ -764,7 +767,7 @@ func passthroughSNIConflict(domain string, listenPort int, excludeCaddyID string
 		}
 		for _, existing := range normalizedPassthroughSNIDomains(otherDomain) {
 			for _, candidate := range candidates {
-				if sniDomainsOverlap(candidate, existing) {
+				if sniDomainsOverlap(candidate, existing) && !sniCoexistablePair(candidate, existing) {
 					return otherName + "（" + otherID + "）", existing, nil
 				}
 			}
@@ -781,6 +784,11 @@ func passthroughSNIConflict(domain string, listenPort int, excludeCaddyID string
 //     （与保存门/前端行内红框同口径，双向闭合同一歧义）。
 //
 // 端口不限定（透传恒在 HTTPS 默认口，但 HTTP 规则可在任意口终结该域名）。
+//
+// 共存特例（缺口①）：候选精确基域 vs 启用透传通配（或反向）放行——运行时
+// ClientHello 命中面无交集：透传通配只吃子域 ClientHello（caddytls
+// MatchServerName 的精确匹配与通配覆盖互不劫持），apex 精确名恒归本地终结
+// 的 HTTP 侧（caddyhttp host matcher 逐字匹配）。依据见 sniCoexistablePair。
 func passthroughTerminateConflict(domain, otherProtocol, excludeCaddyID string) (string, string, error) {
 	candidates := normalizedPassthroughSNIDomains(domain)
 	if len(candidates) == 0 {
@@ -799,7 +807,7 @@ func passthroughTerminateConflict(domain, otherProtocol, excludeCaddyID string) 
 		}
 		for _, existing := range normalizedRuleDomains(otherDomain) {
 			for _, candidate := range candidates {
-				if sniDomainsOverlap(candidate, existing) {
+				if sniDomainsOverlap(candidate, existing) && !sniCoexistablePair(candidate, existing) {
 					return otherName + "（" + otherID + "）", existing, nil
 				}
 			}

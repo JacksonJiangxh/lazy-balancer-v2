@@ -506,7 +506,9 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 		for _, upstream := range rule.Upstreams {
 			upstreams = append(upstreams, models.Upstream{Host: upstream.Host, Port: upstream.Port, Weight: upstream.Weight, Enabled: upstream.Enabled, Protocol: upstream.Protocol})
 		}
-		enabledUpstreams, err := validateRuleUpstreams(rule.Protocol, false, upstreams, true, rule.Strategy)
+		// v1 形状无 ntlm_compatible 字段（NTLM 兼容为 v2 世代特性）——恒 0，
+		// h2c 互斥门自然不触发（v1 转换规则也无法携带 h2c 上游）。
+		enabledUpstreams, err := validateRuleUpstreams(rule.Protocol, false, upstreams, true, rule.Strategy, 0)
 		if err != nil {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
