@@ -249,6 +249,8 @@ export const validatePathRules = (rules: readonly PathRuleInput[], strategy = ''
       }
       if (upstream.port < 1 || upstream.port > 65535) return `第 ${rowNumber} 条路径的自定义上游端口无效`
       const protocol = (upstream.protocol ?? '') as string
+      // 路径级自定义上游仅 http/https（h2c 仅规则级主上游可用——此处仍拒绝，
+      // 文案不变，与后端路径池门同口径）。
       if (protocol !== '' && protocol !== 'http' && protocol !== 'https') {
         return `第 ${rowNumber} 条路径的自定义上游协议只能是 http 或 https`
       }
@@ -384,6 +386,12 @@ export const passthroughUpstreamError = (rawUpstream: string): string | null => 
  * 两个规范化（小写、TrimSpace 后）SNI 域名是否可能命中同一 ClientHello——
  * 与后端 sniDomainsOverlap 逐条同口径：精确相等，或一方为通配且另一方落在
  * 其覆盖域内（保守多级覆盖：*.a.com 同时视为覆盖 b.a.com 与 c.b.a.com）。
+ *
+ * 共存特例（JJC-20261123-003）：一方精确、另一方通配且精确域名恰为其基域
+ * （x === TrimPrefix(w, '*.')，如 netbird.cc.cd vs *.netbird.cc.cd）→ 不重叠——
+ * Caddy layer4 精确 matcher 优先于通配，路由归属无歧义，允许共存。判据与
+ * 后端 sniDomainsOverlap 逐字一致（snidot 判定形态），通配 vs 通配嵌套
+ * （*.b.a.com vs *.a.com）不在特例内，仍按重叠拒绝。
  */
 export const sniDomainsOverlap = (a: string, b: string): boolean => {
   if (a === b) return true
@@ -396,11 +404,13 @@ export const sniDomainsOverlap = (a: string, b: string): boolean => {
   }
   if (aWildcard) {
     const base = a.slice(2)
-    return b === base || b.endsWith(`.${base}`)
+    if (b === base) return false
+    return b.endsWith(`.${base}`)
   }
   if (bWildcard) {
     const base = b.slice(2)
-    return a === base || a.endsWith(`.${base}`)
+    if (a === base) return false
+    return a.endsWith(`.${base}`)
   }
   return false
 }
@@ -428,4 +438,40 @@ export const passthroughSaveGateError = (input: PassthroughGateInput): string =>
     return `透传规则监听端口必须为部署侧 HTTPS 默认口 ${input.httpsPort}（当前 ${input.listenPort}；第一期透传仅在 HTTPS 默认口做 SNI 分流）`
   }
   return ''
+}
+
+// ── HTTP 上游协议族（JJC-20261123-003：新增 h2c 明文 HTTP/2 上游）──
+// 白名单 {http, https, h2c}，与后端上游协议白名单同集（Caddy 2.11
+// HTTPTransport.Versions 合法值 1.1/2/h2c，h2c → versions=["1.1","h2c"]、
+// dial 明文）。单源于此，Rules.vue 提交门与主向导下拉禁自造第二份字面量。
+
+export const H2C_UPSTREAM_PROTOCOL = 'h2c'
+
+/** HTTP 规则级主上游协议白名单（含 h2c）。路径级自定义上游仍限 http/https。 */
+export const HTTP_RULE_UPSTREAM_PROTOCOLS: readonly string[] = ['http', 'https', H2C_UPSTREAM_PROTOCOL]
+
+/** 主向导上游协议下拉选项（label/value），协议族白名单的单一展示源。 */
+export const HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: 'HTTP', value: 'http' },
+  { label: 'HTTPS', value: 'https' },
+  { label: 'H2C', value: H2C_UPSTREAM_PROTOCOL },
+]
+
+/**
+ * h2c 上游与 NTLM 接管互斥文案——h2c dial 明文无 TLS 会话，NTLM 接管链路
+ * 强制 TLS，二者不可同时配置。措辞刻意简短，供后端校验层逐字复刻；
+ * 若后端终版文案不同，以工部推送前对齐结果为准再同步。
+ */
+export const H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE = 'h2c 上游不兼容 ntlm'
+
+/**
+ * h2c 与 NTLM 互斥判定（与后端校验层同口径）：任一启用上游为 h2c 且
+ * ntlm_compatible=1 → true。ntlm_compatible 非 1（含 undefined/0）不触发。
+ */
+export const h2cNtlmMutuallyExclusive = (
+  upstreams: ReadonlyArray<{ readonly protocol: string }>,
+  ntlmCompatible: number | undefined,
+): boolean => {
+  if (ntlmCompatible !== 1) return false
+  return upstreams.some((upstream) => (upstream.protocol || 'http') === H2C_UPSTREAM_PROTOCOL)
 }

@@ -1,6 +1,7 @@
 // 路径规则校验与后端 rule_features.go 同口径验收
 //   自定义上游池：主机形态 / host:port 去重 / http-https 混布
 //   同类型查重按后端键（exact 不剥尾 /），跨类型遮蔽仍归一键
+//   HTTP 主上游协议族白名单（http/https/h2c）与 ntlm 互斥门（JJC-20261123-003）
 //
 // 运行：cd web && npm test
 
@@ -8,6 +9,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE,
+  H2C_UPSTREAM_PROTOCOL,
+  HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS,
+  HTTP_RULE_UPSTREAM_PROTOCOLS,
+  h2cNtlmMutuallyExclusive,
   pathDuplicateKey,
   STATIC_RESPONSE_BODY_MAX_RUNES,
   STATIC_RESPONSE_STATUSES,
@@ -20,7 +26,7 @@ import {
   upstreamPathRuleError,
   validatePathRules,
 } from '../src/utils/ruleValidation.ts'
-import { repoCode, repoSource, section, source } from './_helpers.ts'
+import { code, repoCode, repoSource, section, source } from './_helpers.ts'
 import { hostPortKey } from '../src/utils/upstreamKeys.ts'
 
 type Upstream = {
@@ -460,10 +466,49 @@ test('response_mode：forward 是 UI 哨兵（等价空串），未知值显式�
   assert.equal(validatePathRules([unknownMode]), '第 1 条路径：response_mode 无效')
 })
 
-test('自定义上游协议枚举：空串/http/https 之外一律拒绝（h2c 等）', () => {
+test('路径池上游协议枚举：空串/http/https 之外一律拒绝（h2c 等）', () => {
+  // h2c 仅规则级主上游可用（JJC-20261123-003）：路径级自定义上游池仍限
+  // http/https，文案不变（与后端路径池门同口径）。
   const h2c = upstream({ protocol: 'h2c' as unknown as 'http' })
   assert.equal(validatePathRules([rule({ upstreams: [h2c] })]), '第 1 条路径的自定义上游协议只能是 http 或 https')
   assert.equal(validatePathRules([rule({ upstreams: [upstream({ protocol: 'https' })] })]), null)
   const implicit = { ...upstream(), protocol: '' as unknown as 'http' }
   assert.equal(validatePathRules([rule({ upstreams: [implicit] })]), null, '空串=默认 http')
+})
+
+test('HTTP 规则级主上游协议白名单：http/https/h2c（JJC-20261123-003）', () => {
+  // 白名单与下拉选项同源同集（禁两份字面量漂移）
+  assert.deepEqual(HTTP_RULE_UPSTREAM_PROTOCOLS, ['http', 'https', 'h2c'])
+  assert.deepEqual(
+    HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS.map((opt) => opt.value),
+    HTTP_RULE_UPSTREAM_PROTOCOLS,
+    '下拉选项集必须与白名单同源',
+  )
+  assert.equal(H2C_UPSTREAM_PROTOCOL, 'h2c')
+  // TCP 规则白名单不受影响（tcp/tls 仍排除 http 族）
+  const pageCode = code('src/views/Rules.vue')
+  const submit = section(pageCode, 'const submitWizard = async', 'const data: UpdateRuleRequest')
+  assert.match(submit, /wizardForm\.protocol === 'tcp'\s*\?\s*\['tcp', 'tls'\]\s*:\s*HTTP_RULE_UPSTREAM_PROTOCOLS/, '提交门白名单必须单源自 HTTP_RULE_UPSTREAM_PROTOCOLS')
+  // 主向导下拉经共享常量渲染（禁在模板里写第二份 http/https 字面量）
+  assert.match(pageCode, /el-option v-for="opt in HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS"/)
+})
+
+test('h2c 与 ntlm=1 互斥：判定谓词与文案常量（JJC-20261123-003）', () => {
+  // 谓词：任一启用上游为 h2c 且 ntlm_compatible=1 → true
+  const mixed = [{ protocol: 'http' }, { protocol: 'h2c' }]
+  const uniform = [{ protocol: 'http' }, { protocol: 'https' }]
+  assert.equal(h2cNtlmMutuallyExclusive(mixed, 1), true, 'h2c + ntlm=1 互斥')
+  assert.equal(h2cNtlmMutuallyExclusive(mixed, 0), false, 'ntlm=0 不触发')
+  assert.equal(h2cNtlmMutuallyExclusive(mixed, undefined), false, 'ntlm 未提交不触发')
+  assert.equal(h2cNtlmMutuallyExclusive(uniform, 1), false, '无 h2c 不触发')
+  // 空串协议归一 http（不构成 h2c）
+  assert.equal(h2cNtlmMutuallyExclusive([{ protocol: '' }, { protocol: 'h2c' }], 1), true)
+  assert.equal(h2cNtlmMutuallyExclusive([{ protocol: '' }], 1), false)
+  // 文案常量：简短、可被后端逐字复刻（变更须与后端同步）
+  assert.equal(H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE, 'h2c 上游不兼容 ntlm')
+  // Rules.vue 提交门接线：HTTP 协议 + 谓词命中 → 后端同句文案
+  const pageCode = code('src/views/Rules.vue')
+  const submit = section(pageCode, 'const submitWizard = async', 'const data: UpdateRuleRequest')
+  assert.match(submit, /h2cNtlmMutuallyExclusive\(wizardForm\.upstreams, wizardForm\.ntlm_compatible\)/)
+  assert.match(submit, /ElMessage\.warning\(H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE\)/)
 })

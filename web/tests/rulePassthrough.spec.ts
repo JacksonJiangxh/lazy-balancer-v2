@@ -102,7 +102,7 @@ test('上游拒绝形态：空/无端口/端口越界/多冒号/坏主机（后�
   assert.match(passthroughUpstreamError('app.internal..:8443')!, /主机无效/)
 })
 
-// ── 通配重叠（与后端 sniDomainsOverlap 同口径：保守多级覆盖）──
+// ── 通配重叠（与后端 sniDomainsOverlap 同口径：保守多级覆盖 + apex 共存特例）──
 
 test('sniDomainsOverlap：精确相等 / 通配覆盖单级与多级 / 双通配祖先域', () => {
   assert.equal(sniDomainsOverlap('a.com', 'a.com'), true)
@@ -111,7 +111,23 @@ test('sniDomainsOverlap：精确相等 / 通配覆盖单级与多级 / 双通配
   assert.equal(sniDomainsOverlap('*.b.a.com', '*.a.com'), true)
   assert.equal(sniDomainsOverlap('a.com', 'b.com'), false)
   assert.equal(sniDomainsOverlap('*.a.com', 'b.other.com'), false)
-  assert.equal(sniDomainsOverlap('*.a.com', 'a.com'), true)
+})
+
+test('sniDomainsOverlap 共存特例（JJC-20261123-003）：apex 精确 + 覆盖它的通配不重叠', () => {
+  // 一方精确、另一方通配且精确域名恰为其基域（x === TrimPrefix(w, '*.')）：
+  // Caddy layer4 精确 matcher 优先于通配，路由归属无歧义 → 允许共存。
+  // 典型场景：netbird.cc.cd（HTTP 本地终结）与 *.netbird.cc.cd（TLS 透传）。
+  assert.equal(sniDomainsOverlap('*.a.com', 'a.com'), false, 'apex 恰为通配基域 → 特例放行')
+  assert.equal(sniDomainsOverlap('a.com', '*.a.com'), false, '参数序对调后特例仍放行')
+  assert.equal(sniDomainsOverlap('*.netbird.cc.cd', 'netbird.cc.cd'), false, '真实需求场景')
+  assert.equal(sniDomainsOverlap('netbird.cc.cd', '*.netbird.cc.cd'), false, '真实需求场景（对调）')
+  // 非 apex 子域不享受特例：通配仍覆盖其下任意更深层域名
+  assert.equal(sniDomainsOverlap('*.a.com', 'b.a.com'), true)
+  assert.equal(sniDomainsOverlap('*.a.com', 'a.b.a.com'), true, '非 apex 子域仍重叠')
+  // 通配 vs 通配嵌套不在特例内（特例只限一方精确）
+  assert.equal(sniDomainsOverlap('*.b.a.com', '*.a.com'), true)
+  // 精确相等恒重叠（与特例无关，防回归）
+  assert.equal(sniDomainsOverlap('a.com', 'a.com'), true)
 })
 
 // ── 保存门同序组合（SNI → 上游 → 端口跟随）──

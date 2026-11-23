@@ -1,7 +1,9 @@
 // passthrough（TLS 透传，JJC-20261112-01）：第三规则类型——Layer4 按 ClientHello
 // 的 SNI 分流，透传域名转发 passthrough_upstream（上游自带证书终结 TLS）。
 export type RuleProtocol = 'http' | 'tcp' | 'passthrough'
-export type UpstreamProtocol = 'http' | 'https' | 'tcp' | 'tls'
+// h2c（JJC-20261123-003）：HTTP 上游明文 HTTP/2（Caddy HTTPTransport.Versions
+// 合法值 1.1/2/h2c）；仅 HTTP 规则上游可用，与 ntlm_compatible=1 互斥。
+export type UpstreamProtocol = 'http' | 'https' | 'h2c' | 'tcp' | 'tls'
 
 export interface Upstream {
   id: number
@@ -27,6 +29,7 @@ export type UpstreamInput = Omit<Upstream, 'id' | 'rule_id'> & {
 }
 
 export interface PathRuleUpstream {
+  // 路径级自定义上游仅 http/https（h2c 仅规则级主上游可用）
   protocol: 'http' | 'https'
   address: string
   port: number

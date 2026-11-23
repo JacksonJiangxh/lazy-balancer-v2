@@ -665,8 +665,7 @@
                       <el-option value="tls" label="TLS" />
                     </template>
                     <template v-else>
-                      <el-option value="http" label="HTTP" />
-                      <el-option value="https" label="HTTPS" />
+                      <el-option v-for="opt in HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS" :key="opt.value" :value="opt.value" :label="opt.label" />
                     </template>
                   </el-select>
                 </template>
@@ -1521,7 +1520,7 @@ import { proxyTimeoutSummary } from '@/utils/proxyTimeouts'
 import { activeHealthCheckSummary, healthCheckSummary, passiveHealthCheckSummary } from '@/utils/healthCheckSummary'
 import { activateOnce } from '@/utils/keyboardActivate'
 import { nextRadioValue, rovingTabindex } from '@/utils/rovingRadio'
-import { isValidHostName, validatePathRules, mixedPoolStrategyAllowed, MIXED_POOL_ALLOWED_STRATEGY_MESSAGE, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap } from '@/utils/ruleValidation'
+import { isValidHostName, validatePathRules, mixedPoolStrategyAllowed, MIXED_POOL_ALLOWED_STRATEGY_MESSAGE, RULE_NUMERIC_LIMITS, normalizeSNIDomain, passthroughSaveGateError, passthroughSniError, passthroughUpstreamError, sniDomainError, sniDomainsOverlap, H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE, HTTP_RULE_UPSTREAM_PROTOCOL_OPTIONS, HTTP_RULE_UPSTREAM_PROTOCOLS, h2cNtlmMutuallyExclusive } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import { popperViewportSafe } from '@/utils/popper'
@@ -2837,7 +2836,8 @@ const passthroughGateError = computed(() => {
 
 // 冲突双门行内提示（若面板数据可得）：与后端 passthroughSNIConflict /
 // passthroughTerminateConflict 同口径——只统计启用中规则、sniDomainsOverlap
-// 保守多级覆盖、编辑态排除自身 caddy_id。面板数据不可得（列表加载失败）
+// 同口径判定（JJC-20261123-003 起含共存特例：apex 精确 + 覆盖它的通配可
+// 共存，不告警）、编辑态排除自身 caddy_id。面板数据不可得（列表加载失败）
 // 时静默跳过，后端保存门兜底。端口不限定与后端一致（透传恒 HTTPS 默认口）。
 const passthroughConflictWarning = computed(() => {
   if (wizardForm.protocol !== 'passthrough') return ''
@@ -3821,9 +3821,21 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  const allowedProtocols: readonly UpstreamProtocol[] = wizardForm.protocol === 'tcp' ? ['tcp', 'tls'] : ['http', 'https']
+  // HTTP 上游协议白名单（含 h2c，JJC-20261123-003）：单源
+  // utils/ruleValidation.HTTP_RULE_UPSTREAM_PROTOCOLS，禁自造第二份字面量
+  const allowedProtocols: readonly string[] = wizardForm.protocol === 'tcp'
+    ? ['tcp', 'tls']
+    : HTTP_RULE_UPSTREAM_PROTOCOLS
   if (wizardForm.upstreams.some(u => !allowedProtocols.includes(u.protocol))) {
     ElMessage.warning(`${wizardForm.protocol.toUpperCase()} 规则包含协议族不匹配的上游服务器`)
+    saving.value = false
+    return
+  }
+  // h2c 与 NTLM 互斥（JJC-20261123-003）：判定与文案单源 utils/ruleValidation，
+  // 后端校验层同句拒绝（H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE 供逐字复刻）。
+  if (wizardForm.protocol === 'http'
+      && h2cNtlmMutuallyExclusive(wizardForm.upstreams, wizardForm.ntlm_compatible)) {
+    ElMessage.warning(H2C_NTLM_MUTUALLY_EXCLUSIVE_MESSAGE)
     saving.value = false
     return
   }

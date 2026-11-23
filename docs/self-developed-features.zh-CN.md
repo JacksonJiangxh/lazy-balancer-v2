@@ -8,7 +8,7 @@
 > 登记原则：**一能力一条**，写清「能力名 / 代码位置 / 设计裁定出处 / 防复发约束 /
 > 机械可核符号」。符号必须能 grep 到，供后续派活直接引用。
 >
-> 最近更新：2026-11-21 · JJC-20261121-001（新增第 6 项「逐后端独立健康检查路径」——规则级主动 HC 升级为逐后端覆盖，空=跟随规则级默认，存量行为不变；**双轨终稿：chain 域逐车道真承载 + uniform 域官方 health_upstream 聚合探针模式（route D）**）
+> 最近更新：2026-11-23 · JJC-20261123-003（第 5 项语义放宽两点：①「apex 精确 + 覆盖它的通配」SNI 共存——`sniDomainsOverlap` 特例放行，如 `netbird.cc.cd` HTTP 终结 与 `*.netbird.cc.cd` 透传；②HTTP 上游协议新增 `h2c` 明文 HTTP/2——versions 注入 `["1.1","h2c"]`，dial 明文，h2c 与 ntlm=1 互斥拒绝）
 >
 > **注释外置后的查找方式**：代码里我方补丁处只留「一句话结论 + `详见 docs/fork-notes/xxx.md §N`」，
 > 长解释（设计理由、反例、取舍）**逐字**保存在 `docs/fork-notes/`（索引见其 `README.md`）。
@@ -44,7 +44,7 @@
 | 2 | **引用型证书**（`tls_source=file`） | `ResolveReferencedCertPath` · `IngestMissingReferencedCerts` · `tls_cert_path` · `tls_key_path` | — |
 | 3 | **默认端口换位** | `DefaultHTTPPort` · `DefaultHTTPSPort` · `default_ports.go` · `healthcheckPanelPort` | — / 2026-11-15 |
 | 4 | **回源 Host 逐上游自定义** | `resolveUpstreamHostPlan` · `pathUpstreamHostResolver` · `lb_upstream_host` · `lb.upstream_host` · `lb.upstream_sni` | 2026-10-09 / 2026-10-10 / **2026-11-11** |
-| 5 | **TLS 透传 SNI 分流**（`protocol='passthrough'`） | `validatePassthroughRule` · `buildPassthroughLayer4Server` · `passthrough_upstream` · `internalTerminatePort` · `internalTerminateDefaultPort` · `internalTerminateBind` · `internalTerminateProxyAllow` · `passthroughRulesByPort` | 2026-11-12 / 2026-11-15 |
+| 5 | **TLS 透传 SNI 分流**（`protocol='passthrough'`；2026-11-23 语义放宽：apex 精确 + 覆盖通配共存 / HTTP 上游新增 h2c） | `validatePassthroughRule` · `buildPassthroughLayer4Server` · `passthrough_upstream` · `internalTerminatePort` · `internalTerminateDefaultPort` · `internalTerminateBind` · `internalTerminateProxyAllow` · `passthroughRulesByPort` | 2026-11-12 / 2026-11-15 / **2026-11-23** |
 | 6 | **逐后端独立健康检查路径**（规则级主动 HC 升级为逐后端覆盖，2026-11-21） | `upstreams.health_check_path` · `Upstream.HealthCheckPath` · `UpstreamConfig.HealthCheckPath` · `ChainUpstream.HealthCheckPath` · `health_check_path`（chain 车道键 `path`）· `effectiveUpstreamHealthPaths` · `healthProbePathsDiverge` · `buildProbeRuleDef` · `registerPerUpstreamProbeRule` · `commitPerUpstreamProbeRegistry` · `restorePerUpstreamProbeRegistry` · `perUpstreamProbeURI` · `PanelProbePathPrefix` / `PanelProbeGinPath`（`/lb-hc-probe/:rule_id`）· `HandlePanelProbe` · `probeUpstreamHealth` · `validateUpstreamHealthCheckPath` · `TCPRuleUpstreamHealthPathResetSQL` | 2026-11-21 |
 
 > **本表的第二用途（2026-11-11 TASK-2026-1111-03 增补）**：`scripts/fork-diff.sh`
@@ -347,6 +347,24 @@
      allow 若只有 `127.0.0.1/32`，Layer4 出站的 PROXY 头会被终结栈当 TLS 数据
      （握手 EOF，与 spike T-5 断言 B 同型），兜底链路坏。allow 由
      `internalTerminateProxyAllow()` 按形态派生：同族回环 + （指定 IP 时追加该 IP `/32`）。
+- **语义放宽（2026-11-23 · JJC-20261123-003，两点）**：
+  1. **「apex 精确 + 覆盖它的通配」SNI 共存**：`sniDomainsOverlap` 新增特例——
+     一方精确、另一方通配且精确域名恰为其基域（`x == TrimPrefix(w, "*.")`）→
+     判不重叠，冲突双门（同端口同 SNI / 透传↔本地终结）随之放行。依据：Caddy
+     layer4 精确 matcher 优先于通配 matcher，路由归属无歧义（典型场景：
+     `netbird.cc.cd` HTTP 本地终结 与 `*.netbird.cc.cd` TLS 透传共存于同一 443）。
+     通配 vs 通配嵌套（`*.b.a.com` vs `*.a.com`）不在特例内，仍拒绝。
+     代码位置：`internal/handlers/rule_features.go` → `sniDomainsOverlap`；
+     前端同源副本 `web/src/utils/ruleValidation.ts` → `sniDomainsOverlap`
+     （逐字同判据），Rules.vue 冲突行内提示同口径消费。
+  2. **HTTP 上游协议新增 `h2c`（明文 HTTP/2）**：HTTP 规则级主上游协议白名单
+     由 {http, https} 扩为 {http, https, h2c}——渲染在 `http_transport` 注入
+     `versions: ["1.1", "h2c"]`（Caddy 2.11 `HTTPTransport.Versions` 合法值
+     1.1/2/h2c），dial 明文。`h2c` 与 `ntlm_compatible=1` 互斥：同现时保存
+     校验层显性拒绝（文案「h2c 上游不兼容 ntlm」）。路径级自定义上游池仍限
+     http/https。前端同步：下拉选项 / 提交门白名单 / 互斥门单源于
+     `web/src/utils/ruleValidation.ts`（钉测 `web/tests/ruleValidation.spec.ts`、
+     `web/tests/rulePassthrough.spec.ts`）。
 - **防复发约束（下次追上游必须逐条核对）**：
   > ① **上游无同需求实现**——追平时不得以「上游有 TLS 转发能力」为由切换：
   > 本功能是**按 SNI 域名级分流 + 混合终结**（同端口透传/终结并存），上游
