@@ -1912,6 +1912,19 @@ func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool)
 // 首读与校验读之间的并发删除属冲突（409），不是服务端故障（500）。
 var errStoredRuleMissing = errors.New("规则不存在（可能已被并发删除）")
 
+// validateReferencedCertPathsForEnable 引用型证书启用门（重构 JJC-20261125-001）：
+// 库只存路径、运行时从文件读——路径非空且两文件当前存在、可读、可解析配对才允许
+// 启用/保持启用。文件缺失/损坏时报清晰错误（fail-closed），由保存链重新校验修复。
+func validateReferencedCertPathsForEnable(certPath, keyPath string) error {
+	if strings.TrimSpace(certPath) == "" || strings.TrimSpace(keyPath) == "" {
+		return &configValidationError{message: "引用证书文件模式下证书路径为空，请编辑规则重新指定证书文件路径"}
+	}
+	if _, err := services.LoadReferencedCertificate(certPath, keyPath); err != nil {
+		return &configValidationError{message: "引用证书文件不可用，请确认文件存在且与私钥配对: " + err.Error()}
+	}
+	return nil
+}
+
 func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 	rules, err := loadRulesForConfigValidation(ctx, " WHERE caddy_id = ?", caddyID)
 	if err != nil {
@@ -1947,11 +1960,12 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
 		return &configValidationError{message: "手动证书模式下必须提供 TLS 证书和私钥"}
 	}
-	// 引用型证书：运行时唯一信任源是 DB——启用状态下内容必须已摄取入库
-	// （路径仅作摄取源记录；内容缺失（如旧备份/导入行）先经保存路径摄取）。
-	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" &&
-		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
-		return &configValidationError{message: "引用证书文件模式下证书内容未入库，请重新保存规则以从文件摄取"}
+	// 引用型证书（重构 JJC-20261125-001）：库只存路径、运行时从文件读——
+	// 启用门改为路径非空 + 文件存在且可解析（fail-closed：文件缺失/损坏拒绝启用）。
+	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" {
+		if err := validateReferencedCertPathsForEnable(rule.TLSCertPath, rule.TLSKeyPath); err != nil {
+			return err
+		}
 	}
 	// 策略白名单、NTLM、TCP dynamic_dns、上游池混布
 	// 与启动/UpdateConfig 聚合门共用同一 helper。
@@ -1997,11 +2011,12 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）", rule.Name, rule.CaddyID)})
 			continue
 		}
-		// 引用型证书：运行时唯一信任源是 DB——启用状态下内容缺失的行
-		// （旧备份/导入行未摄取）与 manual 空材料同危害，聚合点名。
-		if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" &&
-			(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
-			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）引用证书文件模式下证书内容未入库，请重新保存规则以从文件摄取", rule.Name, rule.CaddyID)})
+		// 引用型证书（重构 JJC-20261125-001）：路径模式下库不存内容——
+		// 启用行按「路径非空 + 文件存在且可解析」聚合点名。
+		if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" {
+			if err := validateReferencedCertPathsForEnable(rule.TLSCertPath, rule.TLSKeyPath); err != nil {
+				problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）%s", rule.Name, rule.CaddyID, err.Error())})
+			}
 		}
 		// 发现1：启动/UpdateConfig 聚合校验与 EnableRule 同门——ACME 引用
 		// 不可解析（0 值/悬挂/已禁用）的启用规则必须点名，不得静默通过。

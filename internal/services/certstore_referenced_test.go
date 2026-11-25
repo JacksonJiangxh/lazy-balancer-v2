@@ -146,10 +146,11 @@ func TestReferencedCertFileDigest_detectsContentChange(t *testing.T) {
 	}
 }
 
-// Given: 一条 tls_source=file 规则（内容已入库）且源文件被外部更新为新配对
+// Given: 一条 tls_source=file 规则（库中仅路径）且源文件被外部更新为新配对
 // When: checkReferencedCertFiles 逐轮扫描
-// Then: 首扫建基线不摄取；文件变化后读取新内容回写 DB（摄取入库）并强制重载
-// 一次；无变化不再摄取/重载（数据库是运行时唯一信任源，文件只是采集来源）
+// Then: 首扫建基线不重载；文件变化后强制重载一次（重构 JJC-20261125-001：
+// 路径引用架构库不存 PEM，运行时渲染层 load_files 直接读文件，检出变化只
+// 重载不再摄取回写）；无变化不再重载
 func TestCheckReferencedCertFiles_ingestsChangedFiles(t *testing.T) {
 	_, database := newClusterTestService(t)
 	dir := useTemporaryCertDir(t)
@@ -168,17 +169,17 @@ func TestCheckReferencedCertFiles_ingestsChangedFiles(t *testing.T) {
 		ResetReferencedCertWatch()
 	})
 
-	// 首扫：仅建基线，不摄取不重载。
+	// 首扫：仅建基线，不重载。
 	checkReferencedCertFiles()
 	if reloads != 0 {
 		t.Fatalf("首扫不应重载, reloads=%d", reloads)
 	}
-	// 内容未变：仍不摄取/重载。
+	// 内容未变：仍不重载。
 	checkReferencedCertFiles()
 	if reloads != 0 {
 		t.Fatalf("内容未变不应重载, reloads=%d", reloads)
 	}
-	// 外部更新为新配对文件：下一轮检出变化，摄取新内容入库并重载一次。
+	// 外部更新为新配对文件：下一轮检出变化，强制重载一次（不回写 DB）。
 	newCertPEM, newKeyPEM := matchingCertificatePair(t, "updated.example.test")
 	if err := os.WriteFile(certPath, []byte(newCertPEM), 0644); err != nil {
 		t.Fatalf("rewrite cert: %v", err)
@@ -194,10 +195,10 @@ func TestCheckReferencedCertFiles_ingestsChangedFiles(t *testing.T) {
 	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_refcert'`).Scan(&storedCert, &storedKey); err != nil {
 		t.Fatalf("read persisted rule: %v", err)
 	}
-	if storedCert != newCertPEM || storedKey != newKeyPEM {
-		t.Fatal("变化后新内容应已摄取入库（tls_cert/tls_key 与新源文件一致）")
+	if storedCert != "" || storedKey != "" {
+		t.Fatal("路径引用架构下看门狗不得回写 PEM 内容（运行时从文件读取）")
 	}
-	// 无进一步变化：不应重复摄取/重载。
+	// 无进一步变化：不应重复重载。
 	checkReferencedCertFiles()
 	if reloads != 1 {
 		t.Fatalf("无变化不应重复重载, reloads=%d", reloads)
@@ -282,9 +283,10 @@ func TestCheckReferencedCertFiles_invalidPairSkipsIngest(t *testing.T) {
 	}
 }
 
-// Given: tls_source=file 规则且内容已入库
+// Given: tls_source=file 规则且内容已入库（旧版本存量行）
 // When: MaterializeAllCertsFromDB 启动物化
-// Then: 与 manual 同流——物化 /app/certs/{rule}.crt/.key 且内容与 DB 一致
+// Then: 重构（JJC-20261125-001）后 file 行不再物化——渲染层 load_files 直接
+// 引用源路径，物化语义仅保留给 manual
 func TestMaterializeAllCertsFromDB_materializesReferencedRule(t *testing.T) {
 	_, database := newClusterTestService(t)
 	useTemporaryCertDir(t)
@@ -298,16 +300,11 @@ func TestMaterializeAllCertsFromDB_materializesReferencedRule(t *testing.T) {
 	MaterializeAllCertsFromDB()
 
 	certPath, keyPath := CertFilePaths("lb_refmat")
-	certPEM, err := os.ReadFile(certPath)
-	if err != nil {
-		t.Fatalf("read materialized certificate: %v", err)
+	if _, err := os.Stat(certPath); err == nil {
+		t.Fatal("file 行不应被启动物化（路径引用架构：渲染层直接引用源文件）")
 	}
-	keyPEM, err := os.ReadFile(keyPath)
-	if err != nil {
-		t.Fatalf("read materialized private key: %v", err)
-	}
-	if string(certPEM) != wantCert || string(keyPEM) != wantKey {
-		t.Fatal("物化内容应与 DB 入库内容一致（引用型与手动证书同流）")
+	if _, err := os.Stat(keyPath); err == nil {
+		t.Fatal("file 行的私钥不应被启动物化")
 	}
 }
 
@@ -357,25 +354,26 @@ func TestIngestMissingReferencedCerts_backfillsPathOnlyRows(t *testing.T) {
 	}
 }
 
-// Given: tls_source=file 规则内容已入库
+// Given: tls_source=file 规则（库中仅路径，无内联内容）
 // When: GenerateRuleServerContext 构建单规则服务器上下文
-// Then: 与 manual 同口径判有证并引用物化路径（路径列不参与判定）
+// Then: 按路径引用判有证——文件当前可读可解析即产出 tls app，load_files
+// 直接引用库中路径对（路径引用架构，重构 JJC-20261125-001）
 func TestGenerateRuleServerContext_referencedRuleHasCertLikeManual(t *testing.T) {
 	_, database := newClusterTestService(t)
-	useTemporaryCertDir(t)
+	dir := useTemporaryCertDir(t)
 	wantCert, wantKey := matchingCertificatePair(t, "refctx.example.test")
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path, tls_cert, tls_key, enabled)
-		VALUES ('lb_refctx','ref-ctx','http','refctx.example.test',19449,1,'file','/app/certs/refctx.example.test.crt','/app/certs/refctx.example.test.key',?,?,'0')`,
-		wantCert, wantKey); err != nil {
-		t.Fatalf("seed referenced rule: %v", err)
-	}
-	// 物化文件预置（hasCert 判定只看 DB 内容，load_files 引用物化路径）。
-	certPath, keyPath := CertFilePaths("lb_refctx")
+	certPath := filepath.Join(dir, "refctx.example.test.crt")
+	keyPath := filepath.Join(dir, "refctx.example.test.key")
 	if err := os.WriteFile(certPath, []byte(wantCert), 0644); err != nil {
-		t.Fatalf("write materialized cert: %v", err)
+		t.Fatalf("write source cert: %v", err)
 	}
 	if err := os.WriteFile(keyPath, []byte(wantKey), 0600); err != nil {
-		t.Fatalf("write materialized key: %v", err)
+		t.Fatalf("write source key: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path, enabled)
+		VALUES ('lb_refctx','ref-ctx','http','refctx.example.test',19449,1,'file',?,?,'0')`,
+		certPath, keyPath); err != nil {
+		t.Fatalf("seed referenced rule: %v", err)
 	}
 
 	ctx := GenerateRuleServerContext("lb_refctx", 19449, "http", "refctx.example.test")
@@ -385,7 +383,7 @@ func TestGenerateRuleServerContext_referencedRuleHasCertLikeManual(t *testing.T)
 	}
 	tlsApp, ok := apps["tls"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("file 模式内容在库应判有证并产出 tls app，got %v", ctx)
+		t.Fatalf("file 模式路径就绪应判有证并产出 tls app，got %v", ctx)
 	}
 	certs, _ := tlsApp["certificates"].(map[string]interface{})
 	loadFiles, _ := certs["load_files"].([]interface{})
@@ -394,6 +392,6 @@ func TestGenerateRuleServerContext_referencedRuleHasCertLikeManual(t *testing.T)
 	}
 	entry, _ := loadFiles[0].(map[string]interface{})
 	if entry["certificate"] != certPath || entry["key"] != keyPath {
-		t.Fatalf("load_files 应引用物化路径 (%v,%v), want (%s,%s)", entry["certificate"], entry["key"], certPath, keyPath)
+		t.Fatalf("load_files 应引用源文件路径 (%v,%v), want (%s,%s)", entry["certificate"], entry["key"], certPath, keyPath)
 	}
 }

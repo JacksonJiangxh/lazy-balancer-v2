@@ -73,19 +73,11 @@ func writeReferencedPair(t *testing.T, dir, cn string) (string, string) {
 
 // Given: 证书目录内的合法成品证书文件
 // When: 以 tls_source=file 创建规则
-// Then: 创建成功，路径落库为摄取源记录，且 PEM 内容摄取入库（数据库是运行时
-// 唯一信任源——与 manual 同列 tls_cert/tls_key）
-func TestCreateRule_referencedCertFileIngestsContent(t *testing.T) {
+// Then: 创建成功，路径落库；PEM 内容不落库（路径引用架构，重构 JJC-20261125-001：
+// 保存门只校验文件，运行时由渲染层 load_files 引用本地文件）
+func TestCreateRule_referencedCertStoresPathOnly(t *testing.T) {
 	router, dir := newReferencedCertRouter(t)
 	certPath, keyPath := writeReferencedPair(t, dir, "file-src.test")
-	wantCertPEM, err := os.ReadFile(certPath)
-	if err != nil {
-		t.Fatalf("read source cert: %v", err)
-	}
-	wantKeyPEM, err := os.ReadFile(keyPath)
-	if err != nil {
-		t.Fatalf("read source key: %v", err)
-	}
 
 	rec := postReferencedCertRule(t, router, certPath, keyPath)
 	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
@@ -100,9 +92,9 @@ func TestCreateRule_referencedCertFileIngestsContent(t *testing.T) {
 	if storedCertPath != certPath || storedKeyPath != keyPath {
 		t.Fatalf("paths=(%q,%q), want (%q,%q)", storedCertPath, storedKeyPath, certPath, keyPath)
 	}
-	if storedCert != string(wantCertPEM) || storedKey != string(wantKeyPEM) {
-		t.Fatalf("file 模式应摄取 PEM 内容入库（与源文件逐字节一致）, cert match=%v key match=%v",
-			storedCert == string(wantCertPEM), storedKey == string(wantKeyPEM))
+	if storedCert != "" || storedKey != "" {
+		t.Fatalf("file 模式库中不得存 PEM 内容（路径引用架构）, cert=%d bytes key=%d bytes",
+			len(storedCert), len(storedKey))
 	}
 }
 
@@ -220,13 +212,9 @@ func queryStoredTLSPaths(t *testing.T, caddyID string) (string, string) {
 //   （插入点判别器：合并块若落在摄取分支门之前，沿用填充的路径会把析取支顶开
 //   → 文件校验 400 红；落归一区后门关、跳过校验 → 200 绿）。
 func TestUpdateRule_FileSourceEmptyPathRetention(t *testing.T) {
-	t.Run("case1_tls_on_empty_path_keeps_paths_and_content", func(t *testing.T) {
+	t.Run("case1_tls_on_empty_path_keeps_paths_and_no_content", func(t *testing.T) {
 		router, dir := newFileSourceUpdateRouter(t)
 		wantCertPath, wantKeyPath := seedFileSourceRule(t, router, dir, "lb_retention_c1", "retention-c1.test")
-		wantCertPEM, err := os.ReadFile(wantCertPath)
-		if err != nil {
-			t.Fatalf("read source cert: %v", err)
-		}
 
 		rec := putUpdateRulePayload(t, router, "lb_retention_c1", map[string]any{
 			"enable_tls":    true,
@@ -245,8 +233,8 @@ func TestUpdateRule_FileSourceEmptyPathRetention(t *testing.T) {
 		if err := db.DB.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_retention_c1'`).Scan(&storedCert, &storedKey); err != nil {
 			t.Fatalf("read persisted content: %v", err)
 		}
-		if storedCert != string(wantCertPEM) || storedKey == "" {
-			t.Fatalf("内容应与源文件保持一致, certMatch=%v keyEmpty=%v", storedCert == string(wantCertPEM), storedKey == "")
+		if storedCert != "" || storedKey != "" {
+			t.Fatalf("file 模式沿用路径保存不得回填 PEM 内容, cert=%d bytes key=%d bytes", len(storedCert), len(storedKey))
 		}
 	})
 
@@ -297,18 +285,15 @@ func TestUpdateRule_FileSourceEmptyPathRetention(t *testing.T) {
 
 // Given: 存量规则（manual 来源）与证书目录内一对合法成品证书
 // When: 通过 PUT 切换到 tls_source=file 并提交容器内路径
-// Then: 更新成功且 PEM 内容摄取入库——守卫以 CreateRule 同口径放过 file 来源
+// Then: 更新成功、路径落库、库中无 PEM 内容——守卫以 CreateRule 同口径放过 file 来源，
+// 且保存链不再摄取内容（路径引用架构，重构 JJC-20261125-001）
 // （回归：UpdateRule 的来源白名单曾漏列 file，导致前端「引用证书文件」保存恒 400）
-func TestUpdateRule_referencedCertFileIngestsContent(t *testing.T) {
+func TestUpdateRule_referencedCertStoresPathOnly(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	dir := t.TempDir()
 	restore := services.SetCertDirForTest(dir)
 	t.Cleanup(restore)
 	certPath, keyPath := writeReferencedPair(t, dir, "file-update.test")
-	wantCertPEM, err := os.ReadFile(certPath)
-	if err != nil {
-		t.Fatalf("read source cert: %v", err)
-	}
 
 	seedAuditRule(t, "lb_file_update", "file-update", "file-update.test", 19445, true, "manual", false)
 	seedAuditUpstream(t, "lb_file_update")
@@ -333,15 +318,18 @@ func TestUpdateRule_referencedCertFileIngestsContent(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s, want 200 (file 来源不应被来源白名单拒绝)", response.Code, response.Body.String())
 	}
-	var storedSource, storedCert, storedKey string
-	if err := db.DB.QueryRow(`SELECT tls_source, COALESCE(tls_cert,''), COALESCE(tls_key,'')
-		FROM lb_rules WHERE caddy_id='lb_file_update'`).Scan(&storedSource, &storedCert, &storedKey); err != nil {
+	var storedSource, storedCertPath, storedKeyPath, storedCert, storedKey string
+	if err := db.DB.QueryRow(`SELECT tls_source, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''), COALESCE(tls_cert,''), COALESCE(tls_key,'')
+		FROM lb_rules WHERE caddy_id='lb_file_update'`).Scan(&storedSource, &storedCertPath, &storedKeyPath, &storedCert, &storedKey); err != nil {
 		t.Fatalf("read persisted rule: %v", err)
 	}
 	if storedSource != "file" {
 		t.Fatalf("tls_source=%q, want file", storedSource)
 	}
-	if storedCert != string(wantCertPEM) || storedKey == "" {
-		t.Fatalf("file 模式应摄取 PEM 内容入库, certEmpty=%v keyEmpty=%v", storedCert == "", storedKey == "")
+	if storedCertPath != certPath || storedKeyPath != keyPath {
+		t.Fatalf("paths=(%q,%q), want (%q,%q)", storedCertPath, storedKeyPath, certPath, keyPath)
+	}
+	if storedCert != "" || storedKey != "" {
+		t.Fatalf("file 模式保存后库中不得存 PEM 内容, cert=%d bytes key=%d bytes", len(storedCert), len(storedKey))
 	}
 }

@@ -95,17 +95,20 @@ func validateTLSCertificate(certPEM, keyPEM string) error {
 	return err
 }
 
-// validateReferencedCertificateFiles 校验引用型证书路径与配对合法性，返回归一路径、PEM 内容与质量警告。
+// validateReferencedCertificateFiles 校验引用型证书路径与配对合法性，返回归一路径与质量警告。
+// 重构（JJC-20261125-001）：路径模式改为「库只存路径，运行时从文件读」——本函数
+// 仅做校验（存在、可读、可解析、配对匹配、域名覆盖），不再返回 PEM 内容，
+// 调用方不得把证书材料写入库行。
 // 详见 docs/fork-notes/handlers-misc.md §1
-func validateReferencedCertificateFiles(certPath, keyPath, domain string) (certResolved, keyResolved, certPEM, keyPEM string, warnings []string, err error) {
+func validateReferencedCertificateFiles(certPath, keyPath, domain string) (certResolved, keyResolved string, warnings []string, err error) {
 	referenced, loadErr := services.LoadReferencedCertificate(certPath, keyPath)
 	if loadErr != nil {
-		return "", "", "", "", nil, loadErr
+		return "", "", nil, loadErr
 	}
 	if validErr := validateTLSCertificate(referenced.CertPEM, referenced.KeyPEM); validErr != nil {
-		return "", "", "", "", nil, validErr
+		return "", "", nil, validErr
 	}
-	return referenced.CertPath, referenced.KeyPath, referenced.CertPEM, referenced.KeyPEM,
+	return referenced.CertPath, referenced.KeyPath,
 		tlsCertificateWarnings(referenced.CertPEM, referenced.KeyPEM, domain), nil
 }
 

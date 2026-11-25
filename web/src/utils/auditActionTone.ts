@@ -99,6 +99,9 @@ const ACTION_TONE_EXCEPTIONS: Record<string, AuditActionTone> = {
   // 证书摄取：例行自愈成功动作（success）；摄取失败由「失败」关键词派生 danger。
   // 详见 docs/fork-notes/frontend.md §7
   '证书摄取': 'success',
+  // 证书更新（路径引用架构）：看门狗检出源文件外部更新并触发重载，例行自愈
+  // 成功动作（success）；失败由「失败」关键词派生 danger。
+  '证书更新': 'success',
   '启用': 'success',
   '审批': 'success',
   '恢复': 'success',

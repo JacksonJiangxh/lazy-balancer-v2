@@ -2177,8 +2177,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		       IIF(dynamic_dns IN ('1',1),1,0), IIF(enable_dns_server IN ('1',1),1,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
 		       COALESCE(health_check_path,''), health_check_interval,
 		       health_check_timeout, health_check_unhealthy_threshold, health_check_healthy_threshold,
-		       IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''),
-		       IIF(tls_http_redirect IN ('1',1),1,0),
+	       IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''),
+	       COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
+	       IIF(tls_http_redirect IN ('1',1),1,0),
 		       IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), tcp_try_interval,
 	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
@@ -2202,6 +2203,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 			&r.DynamicDNS, &r.EnableDnsServer, &r.DnsServer, &r.DnsFamily, &r.HealthCheckPath, &r.HealthCheckInterval,
 			&r.HealthCheckTimeout, &r.HealthCheckUnhealthyThreshold, &r.HealthCheckHealthyThreshold,
 			&r.EnableTLS, &r.TLSSource, &r.TLSCert, &r.TLSKey,
+			&r.TLSCertPath, &r.TLSKeyPath,
 			&r.TLSHTTPRedirect, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
 			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.NTLMCompatible, &r.UpstreamForceHTTP1,
@@ -2398,13 +2400,27 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		if r.Protocol != "http" || !r.EnableTLS {
 			continue
 		}
+		// 引用型证书（重构 JJC-20261125-001）：file 模式先于 vault 分流——
+		// 就绪与内容只看本地文件（路径存在且可解析配对），不进 availableCerts
+		// 的 PEM 物化路径，也不消费 cert_secrets（vault 服务 manual 模式）。
+		// 渲染期读文件头验证一次；文件缺失/损坏 → fail-closed 不就绪，发布门
+		// 下方拦下。就绪后经下方 tlsCertFiles 循环把路径对列入 load_files。
+		if r.TLSSource == "file" {
+			if r.TLSCertPath != "" && r.TLSKeyPath != "" {
+				if _, err := LoadReferencedCertificate(r.TLSCertPath, r.TLSKeyPath); err == nil {
+					availableCerts[r.CaddyID] = CertMaterial{RuleID: r.CaddyID}
+				} else {
+					Logf("warn", "规则 %s 引用证书文件不可用（%v），暂不发布该规则；文件恢复后自动重载", r.CaddyID, err)
+				}
+			}
+			continue
+		}
 		if DBCertLoaderEnabled() {
 			// 就绪集已在上方从证书库构建；本循环不再读明文 cert_pem。
 			continue
 		}
-		// 引用型证书与手动证书同流：PEM 内容已在保存/摄取时入库，运行时唯一信任源
-		// 是数据库，文件不参与运行配置真相。
-		if (r.TLSSource == "manual" || r.TLSSource == "file") && r.TLSCert != "" && r.TLSKey != "" {
+		// 手动证书：PEM 内容在保存时入库，运行时唯一信任源是数据库。
+		if r.TLSSource == "manual" && r.TLSCert != "" && r.TLSKey != "" {
 			material := CertMaterial{RuleID: r.CaddyID, CertPEM: r.TLSCert, KeyPEM: r.TLSKey}
 			availableCerts[r.CaddyID] = material
 			materials = append(materials, material)
@@ -2611,7 +2627,13 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		// 本规则路由，未匹配请求不会落到后端）。单规则预览路径不受影响。
 		if r.Protocol == "http" && r.EnableTLS {
 			if _, ready := availableCerts[r.CaddyID]; !ready {
-				Logf("warn", "规则 %s 启用 TLS 但证书尚未就绪（tls_source=%s），暂不发布该规则以避免明文降级；证书就绪后自动重载", r.CaddyID, r.TLSSource)
+				// file 模式（重构 JJC-20261125-001）：就绪=文件可读可解析——
+				// 文件缺失/损坏时同样 fail-closed 不发布，文案区分指引。
+				if r.TLSSource == "file" {
+					Logf("warn", "规则 %s 启用 TLS 但引用证书文件不可读或与私钥不配对（tls_source=file，路径 %s / %s），暂不发布该规则以避免明文降级；文件恢复后自动重载", r.CaddyID, r.TLSCertPath, r.TLSKeyPath)
+				} else {
+					Logf("warn", "规则 %s 启用 TLS 但证书尚未就绪（tls_source=%s），暂不发布该规则以避免明文降级；证书就绪后自动重载", r.CaddyID, r.TLSSource)
+				}
 				continue
 			}
 		}
@@ -2973,6 +2995,19 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 		if r.Protocol != "http" || !r.EnableTLS {
 			continue
 		}
+		// 引用型证书（重构 JJC-20261125-001）：file 规则直接把库中路径对列入
+		// load_files——Caddy 运行时自行读文件，渲染层零物化（与甲路线并存：
+		// lb_db 服务 vault 行、load_files 服务 file 行，certificates 两来源可共存）。
+		if r.TLSSource == "file" {
+			if _, ready := availableCerts[r.CaddyID]; ready {
+				tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
+					"certificate": r.TLSCertPath,
+					"key":         r.TLSKeyPath,
+					"tags":        []string{r.CaddyID},
+				})
+			}
+			continue
+		}
 		if _, hasCert := availableCerts[r.CaddyID]; hasCert {
 			certPath, keyPath := CertFilePaths(r.CaddyID)
 			tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
@@ -3244,15 +3279,19 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	}
 
 	// TLS app: load certificates from database (manual + ACME), no Caddy ACME automation.
-	// Route A（皇上圣裁 JJC-20261122-003）：甲路线启用时改用自定义
-	// tls.certificates.lb_db 直读加密证书库——不发射 load_files 文件列表、
-	// 不内联 PEM，从节点零证书文件；Caddy 自身按 SNI 从 loader 返回的证书集
-	// 选择。未配置 DEK 时保持既有 load_files 路径，升级零回归。
+	// Route A（皇上圣裁 JJC-20261122-003）：甲路线启用时用自定义
+	// tls.certificates.lb_db 直读加密证书库——manual/ACME 行不发射物化文件列表、
+	// 不内联 PEM，从节点零证书文件。未配置 DEK 时 manual/ACME 走 load_files 物化
+	// 路径，升级零回归。
+	// 重构（JJC-20261125-001）：file 模式规则恒走 load_files 路径引用（库不存
+	// 内容，Caddy 运行时自行读文件）——lb_db 与 load_files 可并存于同一
+	// certificates 节：lb_db 服务 vault 行，load_files 服务 file 行。
 	if len(tlsCertFiles) > 0 || DBCertLoaderEnabled() {
 		certificates := map[string]interface{}{}
 		if DBCertLoaderEnabled() {
 			certificates["lb_db"] = dbCertLoaderConfig()
-		} else {
+		}
+		if len(tlsCertFiles) > 0 {
 			certificates["load_files"] = tlsCertFiles
 		}
 		apps["tls"] = map[string]interface{}{"certificates": certificates}
@@ -3751,17 +3790,29 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 	}
 	apps := map[string]interface{}{}
 	hasCert := false
+	// file 模式（重构 JJC-20261125-001）路径对：hasCert 为真时 load_files 引用
+	// 库中源路径（零物化）；manual/ACME 仍走物化路径。提升到函数级供下方
+	// apps.tls 段消费。
+	var ruleCertFile, ruleKeyFile string
 	if protocol == "http" {
 		var tlsSource string
 		var certPresent, keyPresent, enableTLS bool
+		var tlsCertPath, tlsKeyPath string
 		// Round 34 F-3: 查询失败必须留痕，对话框不得静默显示"无证书"。
 		// 证书存在性判断：仅需存在与否，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
-		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0), COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'') FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS, &tlsCertPath, &tlsKeyPath); err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
 		} else if enableTLS {
-			// 与全量渲染 availableCerts 同口径：未开 TLS 不加载证书；引用型与 manual 同口径判有证。
+			// 与全量渲染 availableCerts 同口径：未开 TLS 不加载证书；
+			// file 模式（重构 JJC-20261125-001）按路径引用判就绪——文件可读可解析，
+			// 不再要求内联 PEM；manual 判库内材料。
 			// 详见 docs/fork-notes/render-chain.md §19
-			if (tlsSource == "manual" || tlsSource == "file") && certPresent && keyPresent {
+			if tlsSource == "file" && tlsCertPath != "" && tlsKeyPath != "" {
+				if _, err := LoadReferencedCertificate(tlsCertPath, tlsKeyPath); err == nil {
+					hasCert = true
+					ruleCertFile, ruleKeyFile = tlsCertPath, tlsKeyPath
+				}
+			} else if tlsSource == "manual" && certPresent && keyPresent {
 				hasCert = true
 			} else if tlsSource == "acme_dns" {
 				hasCert = isACMECertIssuedFromStore(db.DB, caddyID, domain)
@@ -3772,7 +3823,7 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		policies := []interface{}{}
 		// 与全量渲染 httpServersByPort 同口径：仅 enable_tls=1 且存在启用上游的规则进 TLS 策略。
 		// 详见 docs/fork-notes/render-chain.md §19
-		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
+		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != '', COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
 			FROM lb_rules WHERE `+publishableRulesSQLPredicate+` AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
 			ORDER BY rowid`, listenPort)
 		if err != nil {
@@ -3781,11 +3832,15 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 			for rows.Next() {
 				var ruleID, ruleDomain, tlsSource string
 				var hasInlineCert bool
-				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasInlineCert) != nil {
+				var certPath, keyPath string
+				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasInlineCert, &certPath, &keyPath) != nil {
 					Logf("error", "GenerateRuleServerContext: 扫描端口 %d 规则 TLS 字段失败", listenPort)
 					continue
 				}
-				available := (tlsSource == "manual" || tlsSource == "file") && hasInlineCert || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
+				// file 模式（重构 JJC-20261125-001）按路径引用判就绪；manual 判库内材料。
+				available := tlsSource == "file" && certPath != "" && keyPath != "" && referencedCertPairReadable(certPath, keyPath) ||
+					tlsSource == "manual" && hasInlineCert ||
+					tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain)
 				if !available {
 					continue
 				}
@@ -3816,13 +3871,17 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		apps["layer4"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}
 	}
 	if hasCert {
-		certPath, keyPath := CertFilePaths(caddyID)
+		// file 模式（重构 JJC-20261125-001）：load_files 直接引用库中源路径对
+		//（零物化）；manual/ACME 沿用物化路径。
+		if ruleCertFile == "" {
+			ruleCertFile, ruleKeyFile = CertFilePaths(caddyID)
+		}
 		apps["tls"] = map[string]interface{}{
 			"certificates": map[string]interface{}{
 				"load_files": []interface{}{
 					map[string]interface{}{
-						"certificate": certPath,
-						"key":         keyPath,
+						"certificate": ruleCertFile,
+						"key":         ruleKeyFile,
 						"tags":        []string{caddyID},
 					},
 				},
@@ -4469,6 +4528,10 @@ type lbRule struct {
 	TLSSource                     string
 	TLSCert                       string
 	TLSKey                        string
+	// 引用型证书路径（重构 JJC-20261125-001）：file 模式库只存路径，渲染层
+	// load_files 直接引用（零物化）。
+	TLSCertPath                   string
+	TLSKeyPath                    string
 	TLSHTTPRedirect               bool
 	EnableCompress                bool
 	CompressTypes                 string

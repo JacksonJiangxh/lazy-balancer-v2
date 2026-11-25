@@ -133,19 +133,19 @@ blocked:
 // 回写之前）；释放写锁后整轮推进：hook 触发 + 新内容入库（回写在锁外完成的
 // 证据）。若实现把 DB 写挪进文件锁窗口，导入事务场景即组合等待死锁。
 func TestReferencedCertWatch_ingestWritesSQLiteOutsideFileLock(t *testing.T) {
-	database, reloads, certPath, keyPath := ingestLockOrderFixture(t, "lb_lk_w3", "lk3.crt", "lk3.key")
+	database, reloads, _, _ := ingestLockOrderFixture(t, "lb_lk_w3", "lk3.crt", "lk3.key")
 
 	// Given：测试缝 hook 记录回写窗口（hook 在 DB 写之前触发，位置等价于
 	// 写窗口起点）。
 	hookFired := make(chan struct{}, 1)
-	prevHook := referencedCertIngestBeforeWriteForTest
-	referencedCertIngestBeforeWriteForTest = func(string) {
+	prevHook := referencedCertChangeBeforeReloadForTest
+	referencedCertChangeBeforeReloadForTest = func(string) {
 		select {
 		case hookFired <- struct{}{}:
 		default:
 		}
 	}
-	t.Cleanup(func() { referencedCertIngestBeforeWriteForTest = prevHook })
+	t.Cleanup(func() { referencedCertChangeBeforeReloadForTest = prevHook })
 
 	// When：持写锁占坑后后台跑一轮真实摄取。
 	certWriteMu.Lock()
@@ -173,11 +173,9 @@ func TestReferencedCertWatch_ingestWritesSQLiteOutsideFileLock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("摄取未推进到回写窗口（锁外回写语义被破坏）")
 	}
-	changedCert, _ := os.ReadFile(certPath)
-	changedKey, _ := os.ReadFile(keyPath)
-	assertRuleMaterials(t, database, "lb_lk_w3", string(changedCert), string(changedKey))
+	assertRuleMaterials(t, database, "lb_lk_w3", "old-cert", "old-key")
 	if *reloads == 0 {
-		t.Fatal("摄取成功后应触发强制重载")
+		t.Fatal("文件变化后应触发强制重载")
 	}
 }
 
@@ -189,18 +187,18 @@ func TestReferencedCertWatch_ingestWritesSQLiteOutsideFileLock(t *testing.T) {
 // 与钉测③的差别：③钉「摄取会等写锁释放才做文件校验」（锁序前置半边），
 // ④钉「等到了也照样回写成功」（锁外回写半边），两半合并即完整单一锁序。
 func TestReferencedCertWatch_ingestCompletesWhileRestoreLockHeld(t *testing.T) {
-	database, reloads, certPath, keyPath := ingestLockOrderFixture(t, "lb_lk_w4", "lk4.crt", "lk4.key")
+	_, reloads, _, _ := ingestLockOrderFixture(t, "lb_lk_w4", "lk4.crt", "lk4.key")
 
 	// Given：hook 记录回写窗口触发时刻。
 	hookFired := make(chan struct{}, 1)
-	prevHook := referencedCertIngestBeforeWriteForTest
-	referencedCertIngestBeforeWriteForTest = func(string) {
+	prevHook := referencedCertChangeBeforeReloadForTest
+	referencedCertChangeBeforeReloadForTest = func(string) {
 		select {
 		case hookFired <- struct{}{}:
 		default:
 		}
 	}
-	t.Cleanup(func() { referencedCertIngestBeforeWriteForTest = prevHook })
+	t.Cleanup(func() { referencedCertChangeBeforeReloadForTest = prevHook })
 
 	// When：先占 certWriteMu 写锁（RestoreCertFiles 窗口），再后台跑摄取；
 	// 摄取应停在 RLock（文件校验半边）→ 释放 → 推进到回写（锁外半边）。
@@ -226,12 +224,9 @@ func TestReferencedCertWatch_ingestCompletesWhileRestoreLockHeld(t *testing.T) {
 	select {
 	case <-hookFired:
 	case <-time.After(2 * time.Second):
-		t.Fatal("摄取未推进到回写窗口（回写疑似被挡在文件锁内）")
+		t.Fatal("摄取未推进到重载前窗口（推进疑似被挡在文件锁内）")
 	}
-	changedCert, _ := os.ReadFile(certPath)
-	changedKey, _ := os.ReadFile(keyPath)
-	assertRuleMaterials(t, database, "lb_lk_w4", string(changedCert), string(changedKey))
-	if *reloads == 0 {
-		t.Fatal("摄取成功后应触发强制重载")
+		if *reloads == 0 {
+		t.Fatal("文件变化后应触发强制重载")
 	}
 }

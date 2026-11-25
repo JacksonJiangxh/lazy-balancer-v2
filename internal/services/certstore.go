@@ -179,6 +179,17 @@ func LoadReferencedCertificate(certPath, keyPath string) (ReferencedCertificate,
 	}, nil
 }
 
+// referencedCertPairReadable 渲染期就绪判据（重构 JJC-20261125-001）：引用型
+// 证书两路径非空且当前可读、可解析、配对匹配。不返回内容——Caddy 运行时自行
+// 读文件，渲染层只做一次头验证。
+func referencedCertPairReadable(certPath, keyPath string) bool {
+	if certPath == "" || keyPath == "" {
+		return false
+	}
+	_, err := LoadReferencedCertificate(certPath, keyPath)
+	return err == nil
+}
+
 // ReferencedCertFileDigest 返回引用型证书文件对的内容指纹（供外部更新 → 自动重载的变更检测）。
 // 详见 docs/fork-notes/tls-file-source.md §2
 func ReferencedCertFileDigest(certPath, keyPath string) string {
@@ -729,12 +740,17 @@ func MaterializeAllCertsFromDB() {
 		Logf("error", "certstore: create cert dir failed: %v", err)
 		return
 	}
-	// 引用型证书内容回填先行（升级/还原后「有路径无内容」的行先摄取，再统一物化）。
-	IngestMissingReferencedCerts()
+	// 重构（JJC-20261125-001）：file 模式改为路径引用——库不存内容、渲染层
+	// 运行时直接读文件，启动期不再做「有路径无内容」行的回填摄取（该回填会把
+	// 路径引用架构保存的行重新灌入 PEM）。导入链的显式回填
+	// （IngestMissingReferencedCerts）保留，仅服务旧版本行升级语义。
+	// manual/ACME 物化照旧。
 	manualRecovered := 0
 	acmeRecovered := 0
 
-	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source IN ('manual','file') AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
+	// 重构（JJC-20261125-001）：file 模式行不再物化（渲染层 load_files 直接
+	// 引用源路径，物化路径与源路径语义分叉）——查询收窄到 manual。
+	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source='manual' AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
 	if err != nil {
 		Logf("error", "certstore: query manual certs failed: %v", err)
 		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动/引用证书", AuditResultPart("query_failed")), "")

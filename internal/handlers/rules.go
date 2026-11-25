@@ -1705,16 +1705,17 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			services.Logf("warn", "CreateRule manual TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
 		}
 	}
-	// 引用型证书：文件只是采集来源——校验后把 PEM 内容摄取入库，路径列留作摄取源记录。
-	// 详见 docs/fork-notes/tls-file-source.md §4
+	// 引用型证书：库只存路径，运行时从文件读——校验（存在/可解析/配对/域名
+	// 覆盖）通过后仅落路径列，PEM 内容一律不入库。
+	// 重构 JJC-20261125-001，详见 docs/fork-notes/tls-file-source.md §4
 	if req.EnableTLS && req.TLSSource == "file" {
-		certPath, keyPath, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(req.TLSCertPath, req.TLSKeyPath, req.Domain)
+		certPath, keyPath, warnings, err := validateReferencedCertificateFiles(req.TLSCertPath, req.TLSKeyPath, req.Domain)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "引用证书文件校验失败: " + err.Error()})
 			return
 		}
 		req.TLSCertPath, req.TLSKeyPath = certPath, keyPath
-		req.TLSCert, req.TLSKey = certPEM, keyPEM
+		req.TLSCert, req.TLSKey = "", ""
 		certWarnings = warnings
 		for _, warning := range warnings {
 			services.Logf("warn", "CreateRule referenced TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
@@ -3318,6 +3319,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 
 	// 引用型证书：同模式可沿用存量路径，跨模式必须显式提供（空路径由校验层拒绝）。
+	// 重构（JJC-20261125-001）：只校验并落路径，PEM 内容一律不入库。
 	// 详见 docs/fork-notes/tls-file-source.md §4
 	if (*req.EnableTLS || req.TLSCertPath != "" || req.TLSKeyPath != "") && req.TLSSource == "file" {
 		certPath, keyPath := req.TLSCertPath, req.TLSKeyPath
@@ -3329,13 +3331,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				keyPath = existingRule.TLSKeyPath
 			}
 		}
-		resolvedCert, resolvedKey, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(certPath, keyPath, req.Domain)
+		resolvedCert, resolvedKey, warnings, err := validateReferencedCertificateFiles(certPath, keyPath, req.Domain)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "引用证书文件校验失败: " + err.Error()})
 			return
 		}
 		req.TLSCertPath, req.TLSKeyPath = resolvedCert, resolvedKey
-		req.TLSCert, req.TLSKey = certPEM, keyPEM
+		req.TLSCert, req.TLSKey = "", ""
 		certWarnings = warnings
 		for _, warning := range warnings {
 			services.Logf("warn", "UpdateRule referenced TLS certificate warning for caddy_id=%s (domain %s): %s", caddyID, req.Domain, warning)
@@ -3389,26 +3391,27 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 「队列已摘、行仍非终态」的复活态）。
 	// acme_config_id 的清零在同格合并后的「非 acme_dns」门统一完成（覆盖 manual
 	// 与空来源，见上方合并块），此处不再重复。
-	// 生效证书来源非 manual/file 时不保留任何证书材料——
+	// 生效证书来源非 manual 时不保留任何证书材料——
 	// manual→acme_dns 此前保留 tls_cert/tls_key（渲染按 tls_source 分流零消费，
 	// 但私钥正文长期留在 lb_rules 并随导出/备份/集群快照放大）。与
-	// 「acme→manual 必须重新上传」对称清理。file 源豁免：内容刚经上方校验分支
-	// 摄取入库（文件只是采集来源）。
-	clearingTLSMaterial := req.TLSSource != "manual" && req.TLSSource != "file"
+	// 「acme→manual 必须重新上传」对称清理。file 源同口径：路径模式下库不存
+	// 内容，切走时清空历史摄取残留（重构 JJC-20261125-001 起保存链不再摄取，
+	// 此处仅兜底清理旧版本入库的存量 PEM）。
+	clearingTLSMaterial := req.TLSSource != "manual"
 	if clearingTLSMaterial {
 		req.TLSCert, req.TLSKey = "", ""
 	}
 	// 形态互斥归一（2026-10-09）：非 file 模式清空引用路径列，避免切走后残留
-	// 悬挂路径（file 模式的内联 PEM 摄取入库已在上方校验分支完成）。
+	// 悬挂路径（file 模式的路径校验与落库已在上方校验分支完成）。
 	if req.TLSSource != "file" {
 		req.TLSCertPath, req.TLSKeyPath = "", ""
 	}
 	// file→file 同模式空路径沿用存量（对齐 models.go「引用型证书路径列
 	// 空串=保留存量路径」契约；JJC-20261120-001 方案 C）。enable_tls=false +
-	// 空路径不经上方 :3312 摄取分支门（门被 enable_tls=false 关闭），若无此
+	// 空路径不经上方 file 校验分支门（门被 enable_tls=false 关闭），若无此
 	// 合并，路径列被下方无条件写列清空——看门狗对该行失明、重新启用时
-	// 沿用空路径 400 死锁。已过摄取分支的行（enable_tls=true 或显式路径）
-	// req 路径已非空，TrimSpace 条件天然跳过。禁移至 :3312 门之前：沿用填充
+	// 沿用空路径 400 死锁。已过校验分支的行（enable_tls=true 或显式路径）
+	// req 路径已非空，TrimSpace 条件天然跳过。禁移至 file 校验门之前：沿用填充
 	// 会把门的析取支顶开，文件已删时关 TLS 保存反增 400 回归。
 	if req.TLSSource == "file" && existingRule.TLSSource == "file" {
 		if strings.TrimSpace(req.TLSCertPath) == "" {

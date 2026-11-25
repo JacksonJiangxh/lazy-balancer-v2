@@ -70,7 +70,7 @@ var (
 	referencedCertReloadFn   func() error
 )
 
-// SetReferencedCertReload 注入引用证书摄取入库后的强制重载实现（main: caddyReloader）。
+// SetReferencedCertReload 注入引用证书文件变化后的强制重载实现（main: caddyReloader）。
 func SetReferencedCertReload(fn func() error) { referencedCertReloadFn = fn }
 
 // ResetReferencedCertWatch 清空引用型证书指纹快照——角色切换/测试隔离复用；
@@ -82,12 +82,16 @@ func ResetReferencedCertWatch() {
 	referencedCertWatchReady = false
 }
 
-// referencedCertIngestBeforeWriteForTest 是「本轮扫描→回写」窗口的测试缝
+// referencedCertChangeBeforeReloadForTest 是「本轮扫描→重载」窗口的测试缝
 // （生产恒 nil）：乐观锁三形态（路径被并发改写 / tls_source 切走 / 行删除）
-// 只能在该窗口内制造并发变更，用于钉住 0 行命中必须跳过。
-var referencedCertIngestBeforeWriteForTest func(caddyID string)
+// 只能在该窗口内制造并发变更。路径引用架构（重构 JJC-20261125-001）下看门狗
+// 不再回写数据库，检出变化→校验通过→触发重载；缝内并发变更改变的是「该规则
+// 是否应当重载」的判定（重读行即可正确分流，无需 0 行命中乐观条件）。
+var referencedCertChangeBeforeReloadForTest func(caddyID string)
 
-// checkReferencedCertFiles 逐条比对证书源文件指纹，变化即摄取回写并强制重载（首扫仅建基线）。
+// checkReferencedCertFiles 逐条比对证书源文件指纹，变化即校验并触发重载（首扫仅建基线）。
+// 重构（JJC-20261125-001）：路径引用架构下库不存 PEM，检出变化不需要回写
+// tls_cert/tls_key——渲染层运行时直接读文件，重载即生效。
 // 详见 docs/fork-notes/watchdog-and-server.md §2
 func checkReferencedCertFiles() {
 	if db.DB == nil {
@@ -137,17 +141,16 @@ func checkReferencedCertFiles() {
 	}
 	sort.Strings(changed)
 
-	// 逐条摄取：文件缺失（digest missing:）或配对无效（外部工具更新到一半）时
-	// 跳过该规则并留痕，DB 保留上次有效内容；有效内容回写 tls_cert/tls_key。
-	// 锁序（certstore.go:201 同一钉死单向序）：先 certWriteMu.RLock，再
-	// per-rule 文件锁，单向不逆。RLock 持有窗口内只做文件读取与校验，SQLite
-	// 写一律在释放全部文件锁之后（锁外）执行——否则与「导入事务持库写锁等
-	// RestoreCertFiles 写锁」（config_import_coordinator.go:670）构成
-	// 「看门狗持 RLock 等库 ∥ 导入事务持库等写锁」组合等待死锁。
+	// 逐条检视：文件缺失（digest missing:）或配对无效（外部工具更新到一半）时
+	// 跳过该规则并留痕（fail-closed：渲染层就绪判据会拦下坏文件）。
+	// 重构（JJC-20261125-001）：路径引用架构下库不存 PEM、渲染层运行时直接
+	// 读文件——检出变化只需强制重载让 Caddy 重新 load_files，不再回写
+	// tls_cert/tls_key。锁序（certstore.go:201 同一钉死单向序）：先
+	// certWriteMu.RLock，再 per-rule 文件锁，单向不逆。
 	ingested := 0
 	for _, id := range changed {
 		if strings.HasPrefix(current[id], "missing:") {
-			Logf("warn", "引用证书看门狗: 规则 %s 源文件缺失，跳过摄取（数据库保留上次有效证书）", id)
+			Logf("warn", "引用证书看门狗: 规则 %s 源文件缺失，跳过重载（渲染层按文件不可用 fail-closed）", id)
 			continue
 		}
 		p := paths[id]
@@ -158,63 +161,37 @@ func checkReferencedCertFiles() {
 		certWriteMu.RLock()
 		ruleLock := lockCertRuleFile(id)
 		ruleLock.Lock()
-		referenced, loadErr := LoadReferencedCertificate(p[0], p[1])
+		_, loadErr := LoadReferencedCertificate(p[0], p[1])
 		ruleLock.Unlock()
 		certWriteMu.RUnlock()
 		if loadErr != nil {
-			Logf("warn", "引用证书看门狗: 规则 %s 源文件校验失败，跳过摄取（数据库保留上次有效证书）: %v", id, loadErr)
+			Logf("warn", "引用证书看门狗: 规则 %s 源文件校验失败，跳过重载（渲染层按文件不可用 fail-closed）: %v", id, loadErr)
 			continue
 		}
-		if hook := referencedCertIngestBeforeWriteForTest; hook != nil {
+		if hook := referencedCertChangeBeforeReloadForTest; hook != nil {
 			// hook 属测试缝，但契约同生产：其内允许的并发操作含 SQLite 写
 			// （乐观锁三形态用例）——必须在文件锁之外调用，否则测试缝自身
 			// 违反「RLock 窗口内不触碰 DB 写」的钉死锁序。
 			hook(id)
 		}
-		// 乐观条件：扫描时读到的 tls_source/摄取源路径必须仍与回写目标一致。
-		// 否则（路径被并发改写 / tls_source 切走 / 行删除）用旧路径的内容回写
-		// 会把新形态规则配成错证书（或复活已删行），0 行命中即跳过并留痕。
-		// 本 Exec 已在文件锁外（上方 Unlock/RUnlock 后）：单一锁序要求 DB 写
-		// 不发生在文件锁持有窗口内，避免与导入事务（持库写锁等 RestoreCertFiles
-		// 写锁）组合等待死锁；乐观条件仍由 WHERE 谓词保证原子判定。
-		res, execErr := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=?
-			WHERE caddy_id=? AND tls_source='file'
-			AND COALESCE(tls_cert_path,'')=? AND COALESCE(tls_key_path,'')=?`,
-			referenced.CertPEM, referenced.KeyPEM, id, p[0], p[1])
-		if execErr != nil {
-			Logf("error", "引用证书看门狗: 规则 %s 摄取回写数据库失败: %v", id, execErr)
-			continue
-		}
-		affected, affectedErr := res.RowsAffected()
-		if affectedErr != nil {
-			// 命中行数未知：不能宣称摄取成功（审计与重载计数会虚报），按跳过留痕。
-			Logf("warn", "引用证书看门狗: 规则 %s 摄取回写结果未知（RowsAffected 读取失败），跳过: %v", id, affectedErr)
-			TaskLogfWarn("config-watchdog", "cert-file", "引用证书看门狗: 规则 %s 摄取回写结果未知（摄取源可能在扫描后被改写），已跳过", id)
-			continue
-		}
-		if affected == 0 {
-			Logf("warn", "引用证书看门狗: 规则 %s 摄取源在扫描后被改写或已删除（tls_source/tls_cert_path/tls_key_path 不再匹配），跳过回写", id)
-			TaskLogfWarn("config-watchdog", "cert-file", "引用证书看门狗: 规则 %s 摄取源在扫描后被改写或已删除，跳过回写（数据库保留原内容）", id)
-			continue
-		}
-		RecordAuditLog("system", "证书摄取", "负载规则", FormatAuditDetail(AuditRulePart(id), "来源文件外部更新，新证书内容已入库"), "")
+		RecordAuditLog("system", "证书更新", "负载规则", FormatAuditDetail(AuditRulePart(id), "来源文件外部更新，已触发重载（运行时从文件读取）"), "")
 		ingested++
 	}
 	if ingested == 0 {
-		TaskLogf("config-watchdog", "cert-file", "引用证书源文件变化但全部摄取失败，数据库保留上次有效内容（规则: %s）", strings.Join(changed, "、"))
+		TaskLogf("config-watchdog", "cert-file", "引用证书源文件变化但全部校验失败，未触发重载（规则: %s）", strings.Join(changed, "、"))
 		return
 	}
 	if referencedCertReloadFn == nil {
-		Logf("warn", "引用证书看门狗: 检出证书文件变化并已入库，但重载未接线，跳过（规则: %s）", strings.Join(changed, "、"))
+		Logf("warn", "引用证书看门狗: 检出证书文件变化，但重载未接线，跳过（规则: %s）", strings.Join(changed, "、"))
 		return
 	}
 	if err := referencedCertReloadFn(); err != nil {
-		Logf("error", "引用证书看门狗: 证书摄取入库后重载失败: %v", err)
-		TaskLogf("config-watchdog", "cert-file", "引用证书已摄取入库，自动重载失败：%v", err)
+		Logf("error", "引用证书看门狗: 证书文件变化后重载失败: %v", err)
+		TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，自动重载失败：%v", err)
 		return
 	}
-	Logf("info", "引用证书看门狗: 检出证书文件变化，已摄取入库并重载（规则: %s）", strings.Join(changed, "、"))
-	TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，已摄取入库并重载 %d 条规则", ingested)
+	Logf("info", "引用证书看门狗: 检出证书文件变化，已重载（规则: %s）", strings.Join(changed, "、"))
+	TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，已重载 %d 条规则", ingested)
 }
 
 // CurrentConfigDrift 返回看门狗当前状态（GetCaddyStatus 等展示路径消费）。
@@ -530,7 +507,8 @@ func expectedRenderedRules() (map[string]string, error) {
 	// 发布谓词单源 publishableRulesSQLPredicate（caddy.go）：启用 ∧ 存在启用
 	// 上游——与渲染侧 Go 跳过（hasEnabledUpstream）恒等，禁止另写第三份。
 	rows, err := db.DB.Query(`SELECT caddy_id, name, protocol, COALESCE(dynamic_dns,0), listen_port,
-		IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(domain,'')
+		IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(domain,''),
+		COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
 		FROM lb_rules WHERE ` + publishableRulesSQLPredicate)
 	if err != nil {
 		return nil, err
@@ -547,13 +525,15 @@ func expectedRenderedRules() (map[string]string, error) {
 		tlsCert    string
 		tlsKey     string
 		domain     string
+		certPath   string
+		keyPath    string
 	}
 	var all []ruleRow
 	hasACMEHTTPTLS := false
 	for rows.Next() {
 		var r ruleRow
 		if err := rows.Scan(&r.caddyID, &r.name, &r.protocol, &r.dynamicDNS, &r.listenPort,
-			&r.enableTLS, &r.tlsSource, &r.tlsCert, &r.tlsKey, &r.domain); err != nil {
+			&r.enableTLS, &r.tlsSource, &r.tlsCert, &r.tlsKey, &r.domain, &r.certPath, &r.keyPath); err != nil {
 			return nil, err
 		}
 		if r.protocol == "http" && r.enableTLS == 1 && r.tlsSource == "acme_dns" {
@@ -603,10 +583,13 @@ func expectedRenderedRules() (map[string]string, error) {
 			return true
 		}
 		switch r.tlsSource {
-		case "manual", "file":
-			// manual 与引用型证书（file）同口径：PEM 内容在保存/摄取时入库，
-			// 渲染侧 availableCerts（caddy.go）同样按「内容入库即就绪」收录。
-			// 此前 file 落 default 返回 false，启用 file 行恒被判「缺失」漂移。
+		case "file":
+			// 路径引用架构（重构 JJC-20261125-001）：就绪=路径非空且文件当前
+			// 可读可解析——与渲染层 availableCerts 的 file 分支同判据。
+			return r.certPath != "" && r.keyPath != "" && referencedCertPairReadable(r.certPath, r.keyPath)
+		case "manual":
+			// manual：PEM 内容在保存时入库，渲染侧 availableCerts 同样按
+			// 「内容入库即就绪」收录。
 			return r.tlsCert != "" && r.tlsKey != ""
 		case "acme_dns":
 			_, ok := selectCertificate(acmeCerts[r.caddyID], r.domain, selectionNow)

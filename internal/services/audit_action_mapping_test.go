@@ -358,11 +358,13 @@ func loadFrontendAuditTone(t *testing.T) *frontendAuditTone {
 		t.Fatalf("read %s: %v", frontendAuditToneSource, err)
 	}
 	tone := parseFrontendAuditTone(t, data, frontendAuditToneSource)
-	// 当前单源登记 71 条（新增「证书摄取」：引用型证书看门狗检测外部更新并
+	// 当前单源登记 72 条（新增「证书摄取」：引用型证书看门狗检测外部更新并
 	// 成功入库，success 呈现；新增「导入归一」：备份携带的 waiting_ca 存量在导入
-	// 提交后保窗归一为 failed，与「启动迁移」同族告警性呈现）；
+	// 提交后保窗归一为 failed，与「启动迁移」同族告警性呈现；新增「证书更新」：
+	// 路径引用架构（JJC-20261125-001）看门狗检出源文件外部更新并触发重载，
+	// success 呈现）；
 	// 等值门同时拦截整表漏解析与未经审查的新增/删除。
-	const registeredExceptionCount = 71
+	const registeredExceptionCount = 72
 	if len(tone.exceptions) != registeredExceptionCount {
 		t.Fatalf("%s 解析漂移：例外表解析到 %d 条（登记值 %d）——请同步审查映射并更新解析", frontendAuditToneSource, len(tone.exceptions), registeredExceptionCount)
 	}
