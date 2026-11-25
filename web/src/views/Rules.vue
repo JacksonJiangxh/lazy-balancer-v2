@@ -547,13 +547,13 @@
               </el-form-item>
             </template>
             <template v-else-if="wizardForm.tls_source === 'file'">
-              <el-form-item label="证书文件">
+              <el-form-item label="证书文件" required>
                 <el-input v-model="wizardForm.tls_cert_path" placeholder="如 /app/certs/example.com.crt" />
-                <div class="form-tip-line">引用程序可读写目录内的成品证书文件（需位于 /app/certs 目录内），保存时读取并校验后内容入库；外部更新文件后会自动同步入库并重载</div>
+                <div class="form-tip-line">引用程序可读写目录内的成品证书文件（需位于 /app/certs 目录内），运行时按此路径读取；外部更新文件后自动生效并热重载，无需重新保存</div>
               </el-form-item>
-              <el-form-item label="私钥文件">
+              <el-form-item label="私钥文件" required>
                 <el-input v-model="wizardForm.tls_key_path" placeholder="如 /app/certs/example.com.key" />
-                <div class="form-tip-line">与证书文件配对的私钥文件路径（需位于 /app/certs 目录内），内容随保存入库</div>
+                <div class="form-tip-line">与证书文件配对的私钥文件路径（需位于 /app/certs 目录内），运行时按此路径读取</div>
               </el-form-item>
             </template>
             <template v-else>
@@ -2069,11 +2069,11 @@ const tlsTagLabel = (row: Rule) => {
   }
   if (cert?.status === 'expired') return '已过期'
   if (cert?.status === 'expiring') return `临期 ${cert.days_remaining} 天`
-  if (cert?.status === 'valid') return row.tls_source === 'acme_dns' ? '已签发' : '手动'
+  if (cert?.status === 'valid') return row.tls_source === 'acme_dns' ? '已签发' : row.tls_source === 'file' ? '引用文件' : '手动'
   if (row.tls_source === 'acme_dns') {
     return (jobStatus ? certJobStatusLabel(jobStatus) : '') || '未签发'
   }
-  return '手动'
+  return row.tls_source === 'file' ? '引用文件' : '手动'
 }
 
 const isCurrentRuleLocked = computed(() => {
@@ -3208,7 +3208,8 @@ const openWizard = async (rule?: Rule) => {
     let fullRule: Rule = rule
     // 按 tls_source 单条件拉全量（manual ∪ file，与 enable_tls 解耦）：
     // 列表投影有意置空路径列（rule_features.go deriveLbRuleListColumns），
-    // file 源编辑必须经详情投影回显摄取源路径，否则表单路径丢失、被迫重输。
+    // file 源编辑必须经详情投影回显证书/私钥文件路径（数据库只存路径），否则
+    // 表单路径丢失、被迫重输。
     if (rule.tls_source === 'manual' || rule.tls_source === 'file') {
       try {
         const resp = await request.get<APIResponse<Rule>>(`/rules/${rule.caddy_id}`)
@@ -3596,7 +3597,8 @@ const nextStep = (): void => {
       ElMessage.warning(wizardForm.tls_cert.trim() ? '请上传证书和私钥（或粘贴新私钥以更换）' : '请上传证书和私钥')
       return
     }
-    // 引用文件模式：证书与私钥文件路径均必填（后端另校验位于 /app/certs 内且配对）
+    // 引用文件模式：证书与私钥文件路径均必填（后端另校验位于 /app/certs 内且
+    // 可解析——数据库只存路径，运行时按路径读文件，前端仅做非空门）
     if (wizardForm.tls_source === 'file' && (!wizardForm.tls_cert_path.trim() || !wizardForm.tls_key_path.trim())) {
       ElMessage.warning('请填写证书文件与私钥文件路径')
       return
@@ -3737,7 +3739,8 @@ const submitWizard = async () => {
         return
       }
     }
-    // 引用文件模式镜像：两个路径均必填
+    // 引用文件模式镜像：两个路径均必填（前端仅非空门；存在性/可解析性由
+    // 后端保存门校验——数据库只存路径，运行时按路径读文件）
     if (wizardForm.tls_source === 'file' && (!wizardForm.tls_cert_path?.trim() || !wizardForm.tls_key_path?.trim())) {
       ElMessage.warning('引用证书文件模式须填写证书与私钥文件路径')
       saving.value = false
@@ -4018,7 +4021,7 @@ const submitWizard = async () => {
       ca_provider_id: wizardForm.protocol === 'passthrough' ? 0 : Number(wizardForm.ca_provider_id || 0),
       tls_cert: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'manual' ? wizardForm.tls_cert : '',
       tls_key: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'manual' ? wizardForm.tls_key : '',
-      // 引用文件模式：提交两个路径；其余来源清空（后端亦按形态互为清空）
+      // 引用文件模式：提交两个路径（数据库只存路径，运行时读文件）；其余来源清空（后端亦按形态互为清空）
       tls_cert_path: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'file' ? wizardForm.tls_cert_path.trim() : '',
       tls_key_path: wizardForm.protocol !== 'passthrough' && wizardForm.tls_source === 'file' ? wizardForm.tls_key_path.trim() : '',
       tls_http_redirect: wizardForm.tls_http_redirect,

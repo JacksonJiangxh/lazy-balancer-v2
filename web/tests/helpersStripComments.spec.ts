@@ -247,6 +247,10 @@ test('脚本存在性断言文件禁止裸 source()/repoSource() 回流', () => 
     // Go 注释剥掉，但这些文案在字符串字面量里，且断言对象是「文案原文一致」
     // 而非代码符号存在性；该文件同时用 code() 做符号断言，raw 仅限文案钉）。
     'ruleValidation.spec.ts',
+    // file 模式路径引用语义钉（JJC-20261125-001）：fileFormBlock 切自 Vue 模板
+    //（el-form-item required 与 form-tip-line 文案是模板原文，剥注释视图会破坏
+    // 结构断言）；代码存在性断言（保存门/tlsTagLabel/manual 分支）仍走 code()。
+    'ruleFileSourceCertPath.spec.ts',
   ])
   // 本文件自身含判据的合成样本字符串（非真实导入），排除自扫描。
   const offenders = specFiles.filter((name) => name !== 'helpersStripComments.spec.ts' && rawImport.test(readSpec(name)) && !allowedRaw.has(name))
