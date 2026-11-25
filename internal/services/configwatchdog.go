@@ -61,14 +61,65 @@ func ResetConfigDrift() {
 	ResetReferencedCertWatch()
 }
 
-// 引用型证书外部更新自动摄取：看门狗检出指纹变化 → 校验回写 DB → 强制重载（必须 force）。
-// 详见 docs/fork-notes/watchdog-and-server.md §1
+// 引用型证书外部更新自动生效：看门狗检出指纹变化 → 校验 → 强制重载（必须 force）。
+//
+// 为什么必须 force：路径引用架构（重构 JJC-20261125-001）下库里只存路径，渲染层
+// load_files 直接引用文件——「文件内容变了」在配置 JSON 上是零字节差异（路径不变），
+// 普通 apply 会被 Caddy changeConfig 的同字节短路（errSameConfig，零 provision）
+// 静默吞掉，Caddy 内存里继续用旧证书。让文件变更真正生效的唯一通道是 force 重载
+// （POST /load + Cache-Control: must-revalidate）。
+// 详见 docs/fork-notes/watchdog-and-server.md §1/§6
 var (
-	referencedCertWatchMu    sync.Mutex
+	referencedCertWatchMu sync.Mutex
+	// referencedCertWatchState 已「生效」的指纹基线（key=caddy_id）。只有强制重载
+	// 成功、或重试达上限已告警放弃，才把基线推进到磁盘当前内容——校验失败/重载
+	// 失败时基线原地不动，下一轮因此仍能检出「同一次变化」并重试。基线先行是
+	// 这类看门狗最典型的失效形态：一次瞬时失败会让该次变更永久消失。
 	referencedCertWatchState = map[string]string{}
 	referencedCertWatchReady bool
-	referencedCertReloadFn   func() error
+	// referencedCertRetry 逐规则失败退避账面（key=caddy_id）。
+	referencedCertRetry    = map[string]referencedCertRetryEntry{}
+	referencedCertReloadFn func() error
+	// referencedCertClock 退避时钟的测试缝（生产恒 time.Now）。
+	referencedCertClock = time.Now
 )
+
+// referencedCertRetryEntry 一条规则的失败重试账面。digest 固定「本次待生效的
+// 内容指纹」：文件再次变化即视为新一次变更（新额度），计数从零开始——换了内容
+// 不该继承旧内容的失败额度。
+type referencedCertRetryEntry struct {
+	digest   string
+	failures int
+	nextTry  time.Time
+}
+
+const (
+	// referencedCertRetryLimit 单次文件变更的最大尝试次数（含首轮）：证书更新
+	// 通常是秒级的两文件原子替换，超过 5 次仍失败即非瞬时态（配对写错/权限/
+	// 磁盘满），继续 60s 重试只是刷日志——告警一次并停在旧配置，等文件下次
+	// 变化重新开始。
+	referencedCertRetryLimit = 5
+	// referencedCertRetryBase 退避基数（指数：60s、120s、240s、480s、480s…）。
+	referencedCertRetryBase = 60 * time.Second
+	// referencedCertRetryMax 退避上限：规则数再多也不让「重试预算」滚成小时级
+	// 抖动（外部工具整批替换后仍在写盘时，1h 一条仍能自动收敛）。
+	referencedCertRetryMax = 30 * time.Minute
+)
+
+// referencedCertRetryBackoff 第 failures 次失败后的等待时长（指数退避 + 上限）。
+func referencedCertRetryBackoff(failures int) time.Duration {
+	if failures <= 1 {
+		return referencedCertRetryBase
+	}
+	wait := referencedCertRetryBase
+	for i := 1; i < failures; i++ {
+		wait *= 2
+		if wait >= referencedCertRetryMax {
+			return referencedCertRetryMax
+		}
+	}
+	return wait
+}
 
 // SetReferencedCertReload 注入引用证书文件变化后的强制重载实现（main: caddyReloader）。
 func SetReferencedCertReload(fn func() error) { referencedCertReloadFn = fn }
@@ -80,6 +131,9 @@ func ResetReferencedCertWatch() {
 	defer referencedCertWatchMu.Unlock()
 	referencedCertWatchState = map[string]string{}
 	referencedCertWatchReady = false
+	// 失败退避账面同源清空：新角色/新测试不继承旧节点的失败额度与等待窗口
+	// （否则首轮变化会因陈旧 nextTry 被无谓推迟）。
+	referencedCertRetry = map[string]referencedCertRetryEntry{}
 }
 
 // referencedCertChangeBeforeReloadForTest 是「本轮扫描→重载」窗口的测试缝
@@ -92,7 +146,13 @@ var referencedCertChangeBeforeReloadForTest func(caddyID string)
 // checkReferencedCertFiles 逐条比对证书源文件指纹，变化即校验并触发重载（首扫仅建基线）。
 // 重构（JJC-20261125-001）：路径引用架构下库不存 PEM，检出变化不需要回写
 // tls_cert/tls_key——渲染层运行时直接读文件，重载即生效。
-// 详见 docs/fork-notes/watchdog-and-server.md §2
+//
+// 基线与重试语义（文件变更实时生效的核心，勿改成「扫描即推进基线」）：
+// 基线只在「强制重载成功」或「重试达上限已告警放弃」两个出口推进——中间失败
+// （文件缺失/配对无效/重载失败）基线原地不动，下一轮扫描会重新检出同一变化并按
+// 退避重试；重试预算按规则×变更指纹记账，文件再次变化即清零重开；达上限告警后
+// 推进基线并停手（磁盘停在旧配置，等文件下次变化），不无限刷告警。
+// 详见 docs/fork-notes/watchdog-and-server.md §2/§6
 func checkReferencedCertFiles() {
 	if db.DB == nil {
 		return
@@ -105,8 +165,9 @@ func checkReferencedCertFiles() {
 		return
 	}
 	defer rows.Close()
-	current := make(map[string]string)
+	now := referencedCertClock()
 	paths := make(map[string][2]string)
+	current := make(map[string]string)
 	for rows.Next() {
 		var caddyID, certPath, keyPath string
 		if err := rows.Scan(&caddyID, &certPath, &keyPath); err != nil {
@@ -124,22 +185,46 @@ func checkReferencedCertFiles() {
 	referencedCertWatchMu.Lock()
 	prev := referencedCertWatchState
 	ready := referencedCertWatchReady
+	// 幽灵基线清理：上一轮在册而本轮查询不再返回的规则（行已删除）同步移除，
+	// 防止同 ID 复用或残留字典造成陈旧基线/陈旧重试账面。
+	for id := range prev {
+		if _, listed := current[id]; !listed {
+			delete(referencedCertRetry, id)
+			delete(prev, id)
+		}
+	}
 	var changed []string
+	oldDigest := make(map[string]string)
 	if ready {
 		for id, digest := range current {
 			if old, ok := prev[id]; !ok || old != digest {
 				changed = append(changed, id)
+				oldDigest[id] = old
 			}
 		}
 	}
 	referencedCertWatchState = current
 	referencedCertWatchReady = true
+	// 重试门（与账面同一临界区读写）：处于退避窗口内的规则本轮不重复尝试——
+	// 同一次变更的失败不该变成每 60s 一条刷屏。
+	var retryable []string
+	for _, id := range changed {
+		if entry, ok := referencedCertRetry[id]; ok {
+			// 文件再次变化＝新一次变更：重置失败额度。
+			if entry.digest != current[id] {
+				delete(referencedCertRetry, id)
+			} else if now.Before(entry.nextTry) {
+				continue
+			}
+		}
+		retryable = append(retryable, id)
+	}
 	referencedCertWatchMu.Unlock()
 
-	if !ready || len(changed) == 0 {
+	if !ready || len(retryable) == 0 {
 		return
 	}
-	sort.Strings(changed)
+	sort.Strings(retryable)
 
 	// 逐条检视：文件缺失（digest missing:）或配对无效（外部工具更新到一半）时
 	// 跳过该规则并留痕（fail-closed：渲染层就绪判据会拦下坏文件）。
@@ -147,10 +232,16 @@ func checkReferencedCertFiles() {
 	// 读文件——检出变化只需强制重载让 Caddy 重新 load_files，不再回写
 	// tls_cert/tls_key。锁序（certstore.go:201 同一钉死单向序）：先
 	// certWriteMu.RLock，再 per-rule 文件锁，单向不逆。
-	ingested := 0
-	for _, id := range changed {
+	var ingested []string
+	var failed []string
+	var missingIDs []string
+	for _, id := range retryable {
 		if strings.HasPrefix(current[id], "missing:") {
 			Logf("warn", "引用证书看门狗: 规则 %s 源文件缺失，跳过重载（渲染层按文件不可用 fail-closed）", id)
+			// 文件缺失不计入失败重试账面：渲染层 fail-closed 已让该规则下线，
+			// 告警通道是它，重试刷屏无意义。基线推进到 missing——否则同一
+			// 缺失每轮重告警；文件恢复时 digest 不同，仍会作为新变化正常生效。
+			missingIDs = append(missingIDs, id)
 			continue
 		}
 		p := paths[id]
@@ -165,7 +256,8 @@ func checkReferencedCertFiles() {
 		ruleLock.Unlock()
 		certWriteMu.RUnlock()
 		if loadErr != nil {
-			Logf("warn", "引用证书看门狗: 规则 %s 源文件校验失败，跳过重载（渲染层按文件不可用 fail-closed）: %v", id, loadErr)
+			failed = append(failed, id)
+			Logf("warn", "引用证书看门狗: 规则 %s 源文件校验失败，本轮跳过（渲染层按文件不可用 fail-closed）: %v", id, loadErr)
 			continue
 		}
 		if hook := referencedCertChangeBeforeReloadForTest; hook != nil {
@@ -174,24 +266,87 @@ func checkReferencedCertFiles() {
 			// 违反「RLock 窗口内不触碰 DB 写」的钉死锁序。
 			hook(id)
 		}
+		ingested = append(ingested, id)
 		RecordAuditLog("system", "证书更新", "负载规则", FormatAuditDetail(AuditRulePart(id), "来源文件外部更新，已触发重载（运行时从文件读取）"), "")
-		ingested++
 	}
-	if ingested == 0 {
-		TaskLogf("config-watchdog", "cert-file", "引用证书源文件变化但全部校验失败，未触发重载（规则: %s）", strings.Join(changed, "、"))
+	if len(failed) > 0 {
+		// 校验失败也是一次「尝试」：推进失败账面并按退避推迟下一轮。
+		recordReferencedCertRetry(now, current, oldDigest, failed)
+	}
+	if len(missingIDs) > 0 {
+		referencedCertWatchMu.Lock()
+		for _, id := range missingIDs {
+			referencedCertWatchState[id] = current[id]
+		}
+		referencedCertWatchMu.Unlock()
+	}
+	if len(ingested) == 0 {
+		if len(failed) > 0 {
+			TaskLogf("config-watchdog", "cert-file", "引用证书源文件变化但全部校验失败，未触发重载（规则: %s）", strings.Join(failed, "、"))
+		}
 		return
 	}
 	if referencedCertReloadFn == nil {
-		Logf("warn", "引用证书看门狗: 检出证书文件变化，但重载未接线，跳过（规则: %s）", strings.Join(changed, "、"))
+		Logf("warn", "引用证书看门狗: 检出证书文件变化，但重载未接线，跳过（规则: %s）", strings.Join(ingested, "、"))
 		return
 	}
 	if err := referencedCertReloadFn(); err != nil {
 		Logf("error", "引用证书看门狗: 证书文件变化后重载失败: %v", err)
 		TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，自动重载失败：%v", err)
+		// 重载失败推进失败账面（基线回滚到变化前，下轮按退避重试；达上限告警并放弃）。
+		recordReferencedCertRetry(now, current, oldDigest, ingested)
 		return
 	}
-	Logf("info", "引用证书看门狗: 检出证书文件变化，已重载（规则: %s）", strings.Join(changed, "、"))
-	TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，已重载 %d 条规则", ingested)
+	Logf("info", "引用证书看门狗: 检出证书文件变化，已重载（规则: %s）", strings.Join(ingested, "、"))
+	TaskLogf("config-watchdog", "cert-file", "引用证书源文件已更新，已重载 %d 条规则", len(ingested))
+	// 重载成功：本轮变化就此「已生效」——失败账面清空（基线已在扫描时推进）。
+	referencedCertWatchMu.Lock()
+	for _, id := range ingested {
+		delete(referencedCertRetry, id)
+	}
+	referencedCertWatchMu.Unlock()
+}
+
+// recordReferencedCertRetry 记一轮失败并执行退避/告警/放弃判定（failedIDs 的
+// digest 取自 current——失败后文件再变会以新 digest 重新计数）。
+// 失败数达 referencedCertRetryLimit：告警一次、基线钉在磁盘当前内容并停止重试
+// （fail-safe 保持旧配置），等文件下次变化以新 digest 重新开始；未达限则把基线
+// 回滚到上一轮 digest——下一轮扫描重新检出同一变化并按退避重试（基线若在扫描时
+// 先行推进，一次瞬时失败就会让该次变更永久消失）。
+func recordReferencedCertRetry(now time.Time, current map[string]string, oldDigest map[string]string, failedIDs []string) {
+	var giveUp []string
+	referencedCertWatchMu.Lock()
+	for _, id := range failedIDs {
+		entry := referencedCertRetry[id]
+		if entry.digest != current[id] {
+			// 换了内容：新一次变更，额度清零重开。
+			entry = referencedCertRetryEntry{digest: current[id]}
+		}
+		entry.failures++
+		entry.nextTry = now.Add(referencedCertRetryBackoff(entry.failures))
+		referencedCertRetry[id] = entry
+		if entry.failures >= referencedCertRetryLimit {
+			giveUp = append(giveUp, id)
+		} else {
+			// 未达限：基线回滚到变化前，下一轮重新检出并重试。
+			if old, ok := oldDigest[id]; ok && old != "" {
+				referencedCertWatchState[id] = old
+			} else {
+				delete(referencedCertWatchState, id)
+			}
+		}
+	}
+	for _, id := range giveUp {
+		// 放弃＝基线钉在磁盘当前内容：不再重复检出/告警；文件下次变化时
+		// digest 不同，会作为新变更重新走完整链路。
+		referencedCertWatchState[id] = current[id]
+		delete(referencedCertRetry, id)
+	}
+	referencedCertWatchMu.Unlock()
+	if len(giveUp) > 0 {
+		Logf("error", "引用证书看门狗: 规则 %s 证书文件变更连续 %d 次未能生效，已停止自动重试并保持旧配置；请修复文件后再次更新（或手动重载）", strings.Join(giveUp, "、"), referencedCertRetryLimit)
+		TaskLogf("config-watchdog", "cert-file", "引用证书源文件变更重试 %d 次失败，已放弃本轮变更并保持旧配置（规则: %s）", referencedCertRetryLimit, strings.Join(giveUp, "、"))
+	}
 }
 
 // CurrentConfigDrift 返回看门狗当前状态（GetCaddyStatus 等展示路径消费）。

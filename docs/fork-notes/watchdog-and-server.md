@@ -47,3 +47,26 @@ HTTP→HTTPS 跳转 Location 判定、规则侧保留端口判定同源。只影
 引用型证书（`tls_source="file"`）外部更新自动摄取：看门狗检出 `/app/certs` 内
 源文件变化后读取校验并回写 DB（运行时唯一信任源是数据库），再复用同一强制
 重载执行体（物化路径不变导致渲染 JSON 同字节，必须 force）。
+
+---
+
+## §6 文件变更实时生效：退避重试与放弃告警（路径引用架构，2026-11-25）
+
+路径引用架构（重构 JJC-20261125-001）下库只存路径、渲染层 load_files 直接读
+文件，文件变更在配置 JSON 上是零字节差异——生效的唯一通道是 force 重载
+（`ReloadFromDB` → `ApplyConfigForce`，`POST /load` + `must-revalidate`，
+`cmd/server/main.go` 的 `certReloader` 注入 `SetReferencedCertReload`）。
+`checkReferencedCertFiles` 在该链路上补齐失败韧性（基准线不得先于生效推进）：
+
+- **基线推进出口**：扫描检出的变化只有在「强制重载成功」或「重试达上限放弃」
+  后才推进基线（`referencedCertWatchState`）；校验失败/重载失败时基线回滚到
+  变化前——否则一次瞬时失败会让该次变更永久消失（与 errSameConfig 短路同效
+  的静默失效）。
+- **退避重试**：逐规则失败账面（`referencedCertRetry`，key=caddy_id），指数
+  退避 60s·2ⁿ 封顶 30min；文件再次变化（digest 变）即清零额度重开。
+- **放弃与告警**：连续 5 次失败（`referencedCertRetryLimit`）→ 运行日志
+  error + 任务日志（`config-watchdog`/`cert-file`）告警一次、基线钉住磁盘
+  当前内容、停止重试（fail-safe 保持旧配置）；文件下次变化以新 digest 重新
+  走完整链路。
+- **文件缺失**：不计入失败账面（渲染层 fail-closed 已让规则下线，重试刷屏
+  无意义），基线直接推进到 missing；文件恢复时 digest 不同仍会触发重载。
