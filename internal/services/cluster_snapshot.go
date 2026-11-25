@@ -669,9 +669,29 @@ func referencedCertsDigest(ctx context.Context, store snapshotStore) (string, er
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// snapshotReferencedCerts 装载引用型证书文件对内容（含配对校验，与主节点
+// SnapshotReferencedCertsPathOnlyModeEnv 渐进期 feature flag（JJC-20261125-001）：
+// 主端快照是否停传引用型证书内容（PEM），只传路径。默认关闭=现行为（快照带
+// 路径+内容，存量从节点可从快照物化本地文件）；主从均升级新版后运维显式置
+// 1/true/on，快照零明文（只传路径），从端必须纯靠本地 /app/certs 文件工作。
+// 与既有 env 配置先例（CertFileScanIntervalEnv 等）同构：主从各自进程独立
+// 读取——主端控制快照形态，从端控制 apply 回退行为。
+const SnapshotReferencedCertsPathOnlyModeEnv = "LB_CLUSTER_REFERENCED_CERTS_SNAPSHOT_PATH_ONLY"
+
+// snapshotReferencedCertsPathOnlyMode 读取渐进期开关（默认关闭=携带内容）。
+func snapshotReferencedCertsPathOnlyMode() bool {
+	v := strings.TrimSpace(os.Getenv(SnapshotReferencedCertsPathOnlyModeEnv))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+}
+
+// snapshotReferencedCerts 装载引用型证书文件对（含配对校验，与主节点
 // 渲染同口径）。单对失败 warn+跳过（fail-open），不阻断快照构建；排序由
 // referencedCertRulePairs 保证，canonical payload 字节确定。
+//
+// 渐进式路径同步（JJC-20261125-001）：路径字段恒携带；内容字段按
+// SnapshotReferencedCertsPathOnlyModeEnv 门控——关闭（默认，渐进期）时同时
+// 携带路径+内容（存量从节点无本地文件也能物化）；开启后零明文，从端纯靠
+// 本地文件渲染。内容模式下读取失败跳过该对；纯路径模式下主端不读文件
+// （本地文件缺失由从端渲染侧报错，与主节点自身渲染失败同口径）。
 func snapshotReferencedCerts(ctx context.Context, store snapshotStore) ([]models.ClusterReferencedCertPair, error) {
 	pairs, err := referencedCertRulePairs(ctx, store)
 	if err != nil {
@@ -680,19 +700,27 @@ func snapshotReferencedCerts(ctx context.Context, store snapshotStore) ([]models
 	if len(pairs) == 0 {
 		return nil, nil
 	}
+	withContent := !snapshotReferencedCertsPathOnlyMode()
 	out := make([]models.ClusterReferencedCertPair, 0, len(pairs))
 	for _, pair := range pairs {
+		entry := models.ClusterReferencedCertPair{
+			CertPath: pair[0],
+			KeyPath:  pair[1],
+		}
+		if !withContent {
+			out = append(out, entry)
+			continue
+		}
 		referenced, err := LoadReferencedCertificate(pair[0], pair[1])
 		if err != nil {
 			Logf("warn", "引用型证书文件对读取失败（证书 %s / 私钥 %s），集群快照跳过该文件对，引用它的规则在从节点渲染将失败: %v", pair[0], pair[1], err)
 			continue
 		}
-		out = append(out, models.ClusterReferencedCertPair{
-			CertPath: referenced.CertPath,
-			KeyPath:  referenced.KeyPath,
-			CertPEM:  referenced.CertPEM,
-			KeyPEM:   referenced.KeyPEM,
-		})
+		entry.CertPath = referenced.CertPath
+		entry.KeyPath = referenced.KeyPath
+		entry.CertPEM = referenced.CertPEM
+		entry.KeyPEM = referenced.KeyPEM
+		out = append(out, entry)
 	}
 	return out, nil
 }

@@ -737,6 +737,11 @@ func restoreSnapshotReferencedCerts(previous, current []models.ClusterReferenced
 		if !ok || (cur.CertPEM == pair.CertPEM && cur.KeyPEM == pair.KeyPEM) {
 			continue
 		}
+		// 纯路径快照（JJC-20261125-001）：previous 无 PEM 时无可恢复内容，
+		// 落盘空文件会清掉本地现用证书，跳过（本地文件即基线）。
+		if pair.CertPEM == "" && pair.KeyPEM == "" {
+			continue
+		}
 		if err := WriteReferencedCertPair(pair.CertPath, pair.KeyPath, pair.CertPEM, pair.KeyPEM); err != nil {
 			errs = append(errs, fmt.Errorf("恢复引用证书 %s: %w", pair.CertPath, err))
 		}
@@ -2406,10 +2411,15 @@ func materializeSnapshotCerts(certs []models.ClusterCertificate) error {
 }
 
 // materializeSnapshotReferencedCerts 落盘快照携带的引用型证书文件对
-// （JJC-20261122-001）：返回「相对上次已应用快照是否有新增/内容变化」作为
-// 强制重载信号（文件内容变化不改变渲染 JSON 字节）。previous 为本地重建的
-// 已应用快照（从本地磁盘读取），文件被外部删除/改动时 previous 缺对或内容
-// 不同 → 判变化 → 重写修复 + 重载。
+// （JJC-20261122-001；JJC-20261125-001 渐进式路径同步增强）：返回「相对上次
+// 已应用快照是否有新增/内容变化」作为强制重载信号（文件内容变化不改变渲染
+// JSON 字节）。previous 为本地重建的已应用快照（从本地磁盘读取），文件被外部
+// 删除/改动时 previous 缺对或内容不同 → 判变化 → 重写修复 + 重载。
+//
+// 本地文件优先（渐进期）：feature flag 开启后主端快照零明文（只传路径），
+// 从端本地 /app/certs 文件已存在且可解析配对 → 直接采用本地文件（不落盘）；
+// 本地文件缺失/不可解析 → 回退快照内容落盘（旧主端内容快照兼容，服务不中断）；
+// 快照亦无内容可回退 → warn 跳过，不写坏本地路径。
 //
 // 边界防护：词法路径越界（不在 certDir 内）的文件对逐条 warn+跳过（fail-open，
 // 与 ACME 校验的单行损坏语义一致），不阻断整包同步；写侧
@@ -2424,6 +2434,8 @@ func materializeSnapshotReferencedCerts(previous, current []models.ClusterRefere
 	for _, pair := range previous {
 		prevContents[referencedCertPairKey(pair)] = pair
 	}
+	// 停传内容模式（flag 开启）：主端快照零明文时从端先尝试本地文件。
+	pathOnlyMode := snapshotReferencedCertsPathOnlyMode()
 	changed := false
 	for _, pair := range current {
 		// 词法边界预检：越界对不落盘、不参与变化判定（防快照越权写文件）。
@@ -2434,6 +2446,19 @@ func materializeSnapshotReferencedCerts(previous, current []models.ClusterRefere
 				Logf("warn", "快照引用证书路径越界（必须位于 %s 内），跳过该文件对: %s", CertDir(), path)
 				return changed, nil
 			}
+		}
+		// 主端停传内容（纯路径快照对无 PEM）且从端本地文件已就绪 → 直接采用本地
+		// 文件，不落盘、不触发重载（渲染读本地文件，输入未变）。本地文件经
+		// LoadReferencedCertificate 全量校验（存在+常规文件+配对合法），任一
+		// 不满足即回退快照内容（兼容既有物化路径，升级瞬间服务不中断）；快照
+		// 亦无内容可回退时 warn 跳过，不落盘空文件（渲染失败由从端渲染侧告警，
+		// 运维补齐主节点文件后下轮快照自然收敛）。
+		if pathOnlyMode && pair.CertPEM == "" && pair.KeyPEM == "" {
+			if _, err := LoadReferencedCertificate(pair.CertPath, pair.KeyPath); err == nil {
+				continue
+			}
+			Logf("warn", "引用型证书 %s 本地文件缺失或不可解析且快照无内容可回退，跳过落盘，请尽快在主节点补齐 /app/certs 文件", pair.CertPath)
+			continue
 		}
 		key := referencedCertPairKey(pair)
 		prev, ok := prevContents[key]

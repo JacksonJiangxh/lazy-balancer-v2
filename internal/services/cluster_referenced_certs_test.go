@@ -4,8 +4,10 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,5 +205,131 @@ func TestCachedSnapshot_fingerprintTracksReferencedCertFileChanges(t *testing.T)
 	}
 	if fingerprint2 != fingerprint3 {
 		t.Fatalf("fingerprint should be stable across cache hits")
+	}
+}
+
+// TestSnapshotReferencedCerts_pathOnlyMode_zeroPlaintext 回归用例 a（JJC-20261125-001）：
+// 主端 feature flag 开启后快照只传路径、零明文——序列化 JSON 断言无 PEM 字段。
+func TestSnapshotReferencedCerts_pathOnlyMode_zeroPlaintext(t *testing.T) {
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+	t.Setenv(SnapshotReferencedCertsPathOnlyModeEnv, "1")
+	_, database := newClusterTestService(t)
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(24*time.Hour), "ref.example.com")
+	certPath, keyPath := seedReferencedCertRule(t, certPEM, keyPEM)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source,tls_cert_path,tls_key_path)
+		VALUES ('lb_pathonly','ref','http','ref.example.com',443,1,1,'file',?,?)`, certPath, keyPath); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+
+	pairs, err := snapshotReferencedCerts(context.Background(), database)
+	if err != nil {
+		t.Fatalf("snapshot referenced certs: %v", err)
+	}
+	if len(pairs) != 1 {
+		t.Fatalf("pairs=%d, want 1", len(pairs))
+	}
+	if pairs[0].CertPath != certPath || pairs[0].KeyPath != keyPath {
+		t.Fatalf("paths mismatch: %s/%s", pairs[0].CertPath, pairs[0].KeyPath)
+	}
+	if pairs[0].CertPEM != "" || pairs[0].KeyPEM != "" {
+		t.Fatalf("path-only mode must not carry content, got %q/%q", pairs[0].CertPEM, pairs[0].KeyPEM)
+	}
+
+	payload, err := json.Marshal(pairs)
+	if err != nil {
+		t.Fatalf("marshal pairs: %v", err)
+	}
+	body := string(payload)
+	for _, needle := range []string{"BEGIN CERTIFICATE", "BEGIN PRIVATE KEY"} {
+		if strings.Contains(body, needle) {
+			t.Fatalf("path-only snapshot payload must contain no plaintext PEM (%q found): %s", needle, body)
+		}
+	}
+	// 字段键存在但值为空串（模型字段无 omitempty）：无任何明文内容随快照下发。
+	var round []models.ClusterReferencedCertPair
+	if err := json.Unmarshal(payload, &round); err != nil {
+		t.Fatalf("unmarshal pairs: %v", err)
+	}
+	if len(round) != 1 || round[0].CertPEM != "" || round[0].KeyPEM != "" {
+		t.Fatalf("path-only mode must carry empty content, got %+v", round)
+	}
+}
+
+// TestMaterializeSnapshotReferencedCerts_localFirstAndContentFallback 回归用例 b
+// （JJC-20261125-001）：渐进期从端行为。
+//  1) flag 关（默认，渐进期）+ 从端本地文件缺失 + 快照携带内容 → 内容落盘
+//     生效，渲染仍有证书（存量从节点服务不中断）；
+//  2) flag 开（主从均新版）+ 本地文件就绪 + 纯路径快照 → 直接采用本地文件，
+//     零落盘、零明文；
+//  3) flag 开 + 本地缺失 + 仍携带内容的旧主端快照（滚动升级混跑）→ 回退内容落盘；
+//  4) flag 开 + 本地缺失 + 纯路径快照 → 无内容可回退，不写坏本地路径、不中断。
+func TestMaterializeSnapshotReferencedCerts_localFirstAndContentFallback(t *testing.T) {
+	restore := SetCertDirForTest(t.TempDir())
+	defer restore()
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(24*time.Hour), "ref.example.com")
+	certPath := filepath.Join(CertDir(), "site.crt")
+	keyPath := filepath.Join(CertDir(), "site.key")
+	withContent := models.ClusterReferencedCertPair{CertPath: certPath, KeyPath: keyPath, CertPEM: certPEM, KeyPEM: keyPEM}
+	pathOnly := models.ClusterReferencedCertPair{CertPath: certPath, KeyPath: keyPath}
+
+	// 场景 1：flag 关（默认）+ 本地文件缺失 → 快照内容落盘，服务不中断。
+	if err := os.MkdirAll(CertDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := materializeSnapshotReferencedCerts(nil, []models.ClusterReferencedCertPair{withContent})
+	if err != nil || !changed {
+		t.Fatalf("default mode should materialize snapshot content when local file missing, changed=%v err=%v", changed, err)
+	}
+	data, err := os.ReadFile(certPath)
+	if err != nil || string(data) != certPEM {
+		t.Fatalf("fallback snapshot content should be written to disk (rendering must have cert)")
+	}
+	if info, err := os.Stat(keyPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("key file perm=%v err=%v", info, err)
+	}
+
+	// 场景 2：flag 开 + 本地文件就绪 + 纯路径快照 → 直接采用本地，不落盘。
+	t.Setenv(SnapshotReferencedCertsPathOnlyModeEnv, "1")
+	changed, err = materializeSnapshotReferencedCerts(nil, []models.ClusterReferencedCertPair{pathOnly})
+	if err != nil || changed {
+		t.Fatalf("local-ready pair should be adopted silently, changed=%v err=%v", changed, err)
+	}
+	data, err = os.ReadFile(certPath)
+	if err != nil || string(data) != certPEM {
+		t.Fatalf("local file must be left untouched: err=%v", err)
+	}
+
+	// 场景 3：flag 开 + 本地缺失 + 旧主端内容快照（滚动升级混跑）→ 回退内容落盘。
+	if err := os.Remove(certPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = materializeSnapshotReferencedCerts(nil, []models.ClusterReferencedCertPair{withContent})
+	if err != nil || !changed {
+		t.Fatalf("missing local file should fall back to snapshot content, changed=%v err=%v", changed, err)
+	}
+	data, err = os.ReadFile(certPath)
+	if err != nil || string(data) != certPEM {
+		t.Fatalf("fallback snapshot content should be written to disk")
+	}
+
+	// 场景 4：flag 开 + 本地缺失 + 纯路径快照 → 无内容可回退：不落盘、不中断。
+	if err := os.Remove(certPath); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = materializeSnapshotReferencedCerts(nil, []models.ClusterReferencedCertPair{pathOnly})
+	if err != nil {
+		t.Fatalf("path-only snapshot without local file must not fail apply: %v", err)
+	}
+	if changed {
+		t.Fatalf("path-only snapshot without local file must not signal reload")
+	}
+	if _, err := os.Stat(certPath); !os.IsNotExist(err) {
+		t.Fatalf("empty-content pair must not materialize an empty file")
 	}
 }
