@@ -2210,8 +2210,22 @@ func runMigrations() error {
 	if err := migrateTCPRuleDeadFields(); err != nil {
 		return err
 	}
+	// file 模式证书行启动迁移（JJC-20261125-001 子任务 6）：路径回填校验 +
+	// 可回滚明文清空（DEK 未配置时备份到 migration_tls_file_backup 后清空）
+	// + 甲路线互斥（DEK 已配置整体跳过清空，仅记 file 行清单供渲染侧过滤）。
+	// 必须先于 migrateRuleTLSModeResidue：后者复位「file 模式启用行」以外
+	// 的跨模式残留，本迁移独立承担 file 形态（下方谓词已排除 file 行）。
+	// 失败仅告警不阻断启动（内部已兜底）。
+	if err := migrateTlsFilePlaintextClear(); err != nil {
+		// 自愈不阻断：校验/备份/清空任一失败都只留痕继续启动
+		// （明文保留=保守终态，下次启动重跑）。
+		log.Printf("WARN: file 模式证书行启动迁移失败（明文保留，下次启动重跑）: %v", err)
+	}
 	// HTTP 规则跨模式 TLS 残留（升级前遗留行；与保存族/导入/传输归一同一
 	// 不变量，bump cluster_version 触发从端下轮收敛）。
+	// file 模式启用行由 migrateTlsFilePlaintextClear 独占接管（路径校验+
+	// 可回滚清空+甲路线互斥），本迁移的证书材料复位谓词已排除该形态，
+	// 不得在此重复清空（明文保留交由其校验，路径列不得被此处清零）。
 	if err := migrateRuleTLSModeResidue(); err != nil {
 		return err
 	}
@@ -5854,7 +5868,13 @@ func migrateTCPRuleDeadFields() error {
 // Duplicate）及导入后置归一逐字对齐。
 const (
 	// 三条「跨模式 TLS 残留」谓词：探测与三条复位语句由它们拼出（单一出处）。
-	ruleTLSResidueCertPredicate       = `protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>'')`
+	//
+	// 证书材料谓词排除 file 模式启用行（enable_tls=1 AND tls_source='file'）：
+	// 该形态由 migrateTlsFilePlaintextClear 独占接管（路径校验 + 可回滚清空 +
+	// 甲路线互斥）。此处若一并清空会绕过其校验与备份（明文与路径被无备份抹掉）。
+	ruleTLSResidueCertPredicate       = `protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'manual'
+		AND NOT (COALESCE(enable_tls,0)=1 AND COALESCE(tls_source,'manual')='file')
+		AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>'')`
 	ruleTLSResidueCAProviderPredicate = `protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(ca_provider_id,0)<>0`
 	ruleTLSResidueACMEConfigPredicate = `protocol<>'tcp' AND COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(acme_config_id,0)<>0`
 )
