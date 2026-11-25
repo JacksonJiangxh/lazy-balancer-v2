@@ -2386,7 +2386,20 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	// 从节点本地 cert_jobs/lb_rules 不再持有明文 PEM，不能用它们判就绪。
 	// vaultAvailableRuleIDs 只返回有活跃密文行的 rule_id/tag，不读取/返回明文。
 	if dbCertLoaderReady := DBCertLoaderEnabled(); dbCertLoaderReady {
+		// file 模式排除（吏部迁移 5433c1d2 接线，JJC-20261125-001）：file 行
+		// 走路径引用（下方 file 分支 load_files），即使 cert_secrets 存有历史
+		// 密文行也不得从 vault 装载——否则 lb_db 与 load_files 双加载器同时
+		// 服务同一规则，SNI 选择歧义。按渲染循环已有的 rule 数据判源。
+		fileSourceRules := make(map[string]bool)
+		for i := range allRules {
+			if allRules[i].rule.TLSSource == "file" {
+				fileSourceRules[allRules[i].rule.CaddyID] = true
+			}
+		}
 		for ruleID := range vaultAvailableRuleIDs(certSource) {
+			if fileSourceRules[ruleID] {
+				continue
+			}
 			// 不携带 PEM：甲路线 Caddy 由 lb_db loader 从密文库装载，不在
 			// 渲染期物化文件；materials 保持空，下方 MaterializeCertPairs 不触发。
 			availableCerts[ruleID] = CertMaterial{RuleID: ruleID}

@@ -1,9 +1,12 @@
 package services
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"lazy-balancer-v2/caddydbcert"
 )
 
 // TestRender_fileRuleLoadFilesFromPaths 主路径：file 规则库中仅路径，渲染出
@@ -151,5 +154,70 @@ func TestRender_fileRuleBypassesVaultWhenDEKEnabled(t *testing.T) {
 	servers := httpApp["servers"].(map[string]interface{})
 	if _, ok := servers["http_9445"]; !ok {
 		t.Fatalf("DEK 开启时 file 规则未被发布（不应被 vault 就绪集拦截）")
+	}
+}
+
+// TestRender_fileRuleExcludedFromVaultEvenIfSecretExists 双加载器排除（吏部迁移
+// 5433c1d2 接线）：甲路线下 cert_secrets 若存有 file 规则的密文行（历史回填残留
+// 或从节点同步），该 rule_id 仍必须从 vault 就绪集排除——file 行只走 load_files，
+// 不得同时被 lb_db 装载（SNI 选择歧义）。
+func TestRender_fileRuleExcludedFromVaultEvenIfSecretExists(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dir := useTemporaryCertDir(t)
+	ConfigureDBCertLoader(filepath.Join(t.TempDir(), "vault.db"), DefaultCertDEKEnv, "", "", "", "")
+	t.Cleanup(func() { dbCertLoader.enabled.Store(false) })
+	if err := caddydbcert.EnsureVaultTables(context.Background(), database); err != nil {
+		t.Fatalf("ensure vault tables: %v", err)
+	}
+
+	// Given：cert_secrets 存在 file 规则的活跃密文行（rule_id 与 tags 均指向它）。
+	// 表结构需全部 NOT NULL 列（vaultAvailableRuleIDs 只查 rule_id/tags/deleted）。
+	if _, err := database.Exec(`INSERT INTO cert_secrets (domain, rule_id, cert_ciphertext, key_ciphertext, wrapped_dek, fingerprint, tags, since_version, deleted)
+		VALUES ('file-dup.example.test', 'lb_file_dup', 'cipher-c', 'cipher-k', '', 'fp-test', 'lb_file_dup', 0, 0)`); err != nil {
+		t.Fatalf("seed cert_secrets: %v", err)
+	}
+	certPEM, keyPEM := matchingCertificatePair(t, "file-dup.example.test")
+	certPath := filepath.Join(dir, "file-dup.example.test.crt")
+	keyPath := filepath.Join(dir, "file-dup.example.test.key")
+	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyPEM), 0600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,strategy,enabled,enable_tls,tls_source,tls_cert_path,tls_key_path)
+		VALUES ('lb_file_dup','file-dup','file-dup.example.test','http',9446,'weighted_round_robin',1,1,'file',?,?)`, certPath, keyPath); err != nil {
+		t.Fatalf("seed file rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES ('lb_file_dup','127.0.0.1',9000,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	// When
+	cfg := generateCaddyConfigFromStore(database)
+	if message, failed := cfg[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generate config: %s", message)
+	}
+	apps := cfg["apps"].(map[string]interface{})
+	tlsApp, ok := apps["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("apps.tls 缺失")
+	}
+	certs := tlsApp["certificates"].(map[string]interface{})
+	loadFiles := loadFilesAsMaps(certs["load_files"])
+	found := false
+	for _, raw := range loadFiles {
+		tags := stringSlice(raw["tags"])
+		if len(tags) == 1 && tags[0] == "lb_file_dup" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("cert_secrets 有密文行时 file 规则仍应走 load_files: %#v", loadFiles)
+	}
+	httpApp := apps["http"].(map[string]interface{})
+	servers := httpApp["servers"].(map[string]interface{})
+	if _, ok := servers["http_9446"]; !ok {
+		t.Fatalf("cert_secrets 有密文行时 file 规则仍应按本地文件就绪并发布")
 	}
 }
