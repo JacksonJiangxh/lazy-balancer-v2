@@ -424,6 +424,9 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       COALESCE(threat_traffic_sample_n,?) as threat_traffic_sample_n,
 	       COALESCE(security_events_retention_days,?) as security_events_retention_days,
 	       COALESCE(security_events_row_cap,?) as security_events_row_cap,
+	       COALESCE(metrics_history_retention_days,?) as metrics_history_retention_days,
+	       COALESCE(lb_l4_conn_retention_days,?) as lb_l4_conn_retention_days,
+	       COALESCE(metrics_max_bytes,?) as metrics_max_bytes,
 	       COALESCE(is_master,1) as is_master, COALESCE(master_url, '') as master_url, sync_interval,
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
@@ -438,6 +441,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		db.DefaultAuditRetentionMonths, db.DefaultJWTExpireMinutes, db.DefaultTimezone,
 		db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN,
 		db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap,
+		db.DefaultMetricsHistoryRetentionDays, db.DefaultL4ConnRetentionDays, db.DefaultMetricsMaxBytes,
 	).Scan(
 		&cfg.ID, &cfg.CaddyConfig,
 		&cfg.ACMEEmail, &cfg.CertExpiryDays, &cfg.CertRenewalDays, &cfg.CertRenewalAttempts, &cfg.DefaultCAProviderID,
@@ -449,6 +453,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		&cfg.TrustedProxyEnabled, &cfg.TrustedProxyRanges, &cfg.TrustedProxyRangeRefs, &cfg.TrustedProxyHeaders, &cfg.TrustedProxyStrict,
 		&cfg.ServerMapLat, &cfg.ServerMapLon, &cfg.ThreatScreenMode, &cfg.ThreatTrafficSampleN,
 		&cfg.SecurityEventsRetentionDays, &cfg.SecurityEventsRowCap,
+		&cfg.MetricsHistoryRetentionDays, &cfg.L4ConnRetentionDays, &cfg.MetricsMaxBytes,
 		&cfg.IsMaster, &cfg.MasterURL, &cfg.SyncInterval, &cfg.LastSync, &cfg.UpdatedAt)
 
 	if err != nil {
@@ -685,6 +690,18 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	}
 	if req.SecurityEventsRowCap != nil && (*req.SecurityEventsRowCap < 1 || *req.SecurityEventsRowCap > db.MaxSecurityEventsRowCap) {
 		return fmt.Errorf("安全事件行数上限必须在 1 到 %d 之间", db.MaxSecurityEventsRowCap)
+	}
+	// 指标历史保留三列（JJC-20261126-001）：保留天数 0=禁用清理（合法值），
+	// 上限 3650 与安全事件同界；metrics_max_bytes 0=禁用硬上限，上限 1TB。
+	if req.MetricsHistoryRetentionDays != nil && (*req.MetricsHistoryRetentionDays < 0 || *req.MetricsHistoryRetentionDays > db.MaxSecurityEventsRetentionDays) {
+		return fmt.Errorf("指标历史保留天数必须在 0 到 %d 之间（0=禁用清理）", db.MaxSecurityEventsRetentionDays)
+	}
+	if req.L4ConnRetentionDays != nil && (*req.L4ConnRetentionDays < 0 || *req.L4ConnRetentionDays > db.MaxSecurityEventsRetentionDays) {
+		return fmt.Errorf("L4 连接历史保留天数必须在 0 到 %d 之间（0=禁用清理）", db.MaxSecurityEventsRetentionDays)
+	}
+	const maxMetricsMaxBytes = 1099511627776 // 1TB
+	if req.MetricsMaxBytes != nil && (*req.MetricsMaxBytes < 0 || *req.MetricsMaxBytes > maxMetricsMaxBytes) {
+		return fmt.Errorf("指标库体积上限必须在 0 到 %d 字节之间（0=禁用硬上限）", maxMetricsMaxBytes)
 	}
 	if req.Timezone != nil {
 		// 空串必须显式拒绝（time.LoadLocation("") 是合法特殊值=UTC）：否则
@@ -987,6 +1004,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 				threat_traffic_sample_n = COALESCE(?, threat_traffic_sample_n),
 				security_events_retention_days = COALESCE(?, security_events_retention_days),
 				security_events_row_cap = COALESCE(?, security_events_row_cap),
+				metrics_history_retention_days = COALESCE(?, metrics_history_retention_days),
+				lb_l4_conn_retention_days = COALESCE(?, lb_l4_conn_retention_days),
+				metrics_max_bytes = COALESCE(?, metrics_max_bytes),
 				updated_at = datetime('now')
 			WHERE id = 1
 		`, req.ACMEEmail, req.ACMEEmail, req.CertExpiryDays, req.CertRenewalDays, req.CertRenewalAttempts, req.DefaultCAProviderID, req.DefaultCAProviderID, req.LogLevel,
@@ -995,7 +1015,8 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		req.UpstreamKeepaliveTimeout, req.ProxyDialTimeout, req.ProxyResponseHeaderTimeout, req.ProxyReadTimeout, req.ProxyWriteTimeout, req.ProxyStreamTimeout, req.ProxyFlushInterval, req.ProxyStreamCloseDelay,
 		req.ServerTokensHidden, req.TaskLogSizeMB, req.AuditLogSizeMB, req.RuntimeLogSizeMB, req.AccessLogJSON, req.AccessLogFormat, req.AccessLogFormat, req.AuditRetentionMonths, req.JWTExpireMinutes, req.Timezone, req.GitHubProxyURL, req.GitHubToken, req.GitHubToken, req.MFAWriteGuard, req.MFALockoutEnabled,
 		req.TrustedProxyEnabled, req.TrustedProxyRanges, req.TrustedProxyRangeRefs, req.TrustedProxyHeaders, req.TrustedProxyStrict,
-		req.ServerMapLat, req.ServerMapLon, req.ThreatScreenMode, req.ThreatTrafficSampleN, req.SecurityEventsRetentionDays, req.SecurityEventsRowCap)
+		req.ServerMapLat, req.ServerMapLon, req.ThreatScreenMode, req.ThreatTrafficSampleN, req.SecurityEventsRetentionDays, req.SecurityEventsRowCap,
+		req.MetricsHistoryRetentionDays, req.L4ConnRetentionDays, req.MetricsMaxBytes)
 	if err != nil {
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("配置写入数据库失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置写入数据库失败"})

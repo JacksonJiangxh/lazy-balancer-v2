@@ -57,6 +57,10 @@ type configSnapshot struct {
 	ThreatTrafficSampleN        int
 	SecurityEventsRetentionDays int
 	SecurityEventsRowCap        int
+	// 指标历史保留三列（JJC-20261126-001）：预览变更清单与字段级审计。
+	MetricsHistoryRetentionDays int
+	L4ConnRetentionDays         int
+	MetricsMaxBytes             int
 }
 
 type configChangePlan struct {
@@ -116,10 +120,12 @@ func loadConfigSnapshot(ctx context.Context) (configSnapshot, error) {
 		COALESCE(mfa_write_guard,0),
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
-		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?)
+		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?),
+		COALESCE(metrics_history_retention_days,?), COALESCE(lb_l4_conn_retention_days,?), COALESCE(metrics_max_bytes,?)
 		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultLogLevel, db.DefaultTimezone, db.DefaultCaddyLogLevel,
 		db.DefaultTaskLogSizeMB, db.DefaultAuditLogSizeMB, db.DefaultRuntimeLogSizeMB, db.DefaultAuditRetentionMonths, db.DefaultJWTExpireMinutes, db.DefaultGitHubProxyURL,
-		db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
+		db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap,
+		db.DefaultMetricsHistoryRetentionDays, db.DefaultL4ConnRetentionDays, db.DefaultMetricsMaxBytes).Scan(
 		&old.ACMEEmail,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,
@@ -134,7 +140,8 @@ func loadConfigSnapshot(ctx context.Context) (configSnapshot, error) {
 		&old.GitHubToken,
 		&old.MFAWriteGuard, &old.MFALockoutEnabled,
 		&old.TrustedProxyEnabled, &old.TrustedProxyRanges, &old.TrustedProxyRangeRefs, &old.TrustedProxyHeaders, &old.TrustedProxyStrict,
-		&old.ServerMapLat, &old.ServerMapLon, &old.ThreatScreenMode, &old.ThreatTrafficSampleN, &old.SecurityEventsRetentionDays, &old.SecurityEventsRowCap)
+		&old.ServerMapLat, &old.ServerMapLon, &old.ThreatScreenMode, &old.ThreatTrafficSampleN, &old.SecurityEventsRetentionDays, &old.SecurityEventsRowCap,
+		&old.MetricsHistoryRetentionDays, &old.L4ConnRetentionDays, &old.MetricsMaxBytes)
 	return old, err
 }
 
@@ -193,6 +200,9 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 	add("threat_traffic_sample_n", "大屏流量采样", req.ThreatTrafficSampleN != nil && *req.ThreatTrafficSampleN != old.ThreatTrafficSampleN)
 	add("security_events_retention_days", "安全事件保留天数", req.SecurityEventsRetentionDays != nil && *req.SecurityEventsRetentionDays != old.SecurityEventsRetentionDays)
 	add("security_events_row_cap", "安全事件行数上限", req.SecurityEventsRowCap != nil && *req.SecurityEventsRowCap != old.SecurityEventsRowCap)
+	add("metrics_history_retention_days", "指标历史保留天数", req.MetricsHistoryRetentionDays != nil && *req.MetricsHistoryRetentionDays != old.MetricsHistoryRetentionDays)
+	add("lb_l4_conn_retention_days", "L4连接历史保留天数", req.L4ConnRetentionDays != nil && *req.L4ConnRetentionDays != old.L4ConnRetentionDays)
+	add("metrics_max_bytes", "指标库体积上限", req.MetricsMaxBytes != nil && *req.MetricsMaxBytes != old.MetricsMaxBytes)
 	add("jwt_expire_minutes", "登录过期时间", req.JWTExpireMinutes != nil && *req.JWTExpireMinutes != old.JWTExpireMinutes)
 	add("mfa_write_guard", "MFA 写操作验证", req.MFAWriteGuard != nil && *req.MFAWriteGuard != old.MFAWriteGuard)
 	add("mfa_lockout_enabled", "登录失败锁定", req.MFALockoutEnabled != nil && *req.MFALockoutEnabled != old.MFALockoutEnabled)

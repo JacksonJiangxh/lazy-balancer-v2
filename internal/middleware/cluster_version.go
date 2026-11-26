@@ -167,6 +167,10 @@ var globalConfigSyncedColumns = []string{
 	// 大屏视觉模式同组：从节点写入口被只读门拒绝，配置只能由主节点经快照
 	// 下发——漏列时主端改它不 bump 版本，从端经 304 门永久滞留旧视觉。
 	"threat_screen_mode",
+	// 指标历史保留三列（JJC-20261126-001）：与安全事件保留同族随快照同步
+	// 并物化到从端（models.ClusterBasicSettings / services/cluster_apply.go）。
+	// 补列：仅写这三列的端点此前不 bump 版本，从端经 304 门永久滞留旧保留期。
+	"metrics_history_retention_days", "lb_l4_conn_retention_days", "metrics_max_bytes",
 }
 
 // clusterSyncedTable 集群快照同步表与其触发列清单（触发器安装与「列清单↔

@@ -74,6 +74,12 @@ var ConfigFieldSections = map[string]string{
 	"security_events_retention_days": "基础设置",
 	"security_events_row_cap":        "基础设置",
 	"threat_traffic_sample_n":        "基础设置",
+
+	// 指标历史保留三列（JJC-20261126-001）：字段级审计归因（双向比对钉测
+	// handlers/config_field_sections_test.go 会自动覆盖 planConfigChanges 新增项）。
+	"metrics_history_retention_days": "基础设置",
+	"lb_l4_conn_retention_days":      "基础设置",
+	"metrics_max_bytes":              "基础设置",
 }
 
 func GetConfigSection(field string) string {

@@ -335,6 +335,12 @@ type GlobalConfig struct {
 	// 属 legacy 形态，由启动迁移一次性归一。渲染/查询直读库值。
 	SecurityEventsRetentionDays int `json:"security_events_retention_days"`
 	SecurityEventsRowCap        int `json:"security_events_row_cap"`
+	// 指标历史保留三列（JJC-20261126-001）：保留天数 0=读取侧禁用清理语义；
+	// metrics_max_bytes 0=禁用库体积硬上限裁剪。与已退役死列
+	// metrics_retention_days 无关（列名刻意区分）。
+	MetricsHistoryRetentionDays int `json:"metrics_history_retention_days"`
+	L4ConnRetentionDays         int `json:"lb_l4_conn_retention_days"`
+	MetricsMaxBytes             int `json:"metrics_max_bytes"`
 	// v2.1.8 MFA 全局开关（响应面）
 	MFAWriteGuard     bool `json:"mfa_write_guard"`
 	MFALockoutEnabled bool `json:"mfa_lockout_enabled"`
@@ -762,6 +768,11 @@ type UpdateConfigRequest struct {
 	// 1-1 亿（0=自动的旧语义已废除，0/NULL 仅作 legacy 库值由启动迁移归一）。
 	SecurityEventsRetentionDays *int `json:"security_events_retention_days"`
 	SecurityEventsRowCap        *int `json:"security_events_row_cap"`
+	// 指标历史保留三列（JJC-20261126-001）：nil=保持现值；保留天数 0=禁用
+	// 清理（读取侧语义）、metrics_max_bytes 0=禁用硬上限裁剪。
+	MetricsHistoryRetentionDays *int `json:"metrics_history_retention_days"`
+	L4ConnRetentionDays         *int `json:"lb_l4_conn_retention_days"`
+	MetricsMaxBytes             *int `json:"metrics_max_bytes"`
 	// v2.1.8 MFA 全局开关（基础设置卡片，决策6）：默认均关。
 	MFAWriteGuard     *bool `json:"mfa_write_guard"`
 	MFALockoutEnabled *bool `json:"mfa_lockout_enabled"`

@@ -40,7 +40,13 @@ var (
 // glebarez 仅识别 _pragma/_txlock/_time_format 三类 DSN 参数；_pragma 会在
 // 每条新建连接上执行（applyQueryParams），正适合 busy_timeout 这类连接级参数。
 // journal_mode 是文件级（一次设置持久生效），放这里仅为幂等兜底。
-const sqliteWALDSNParams = "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)"
+// wal_autocheckpoint(400) 三库有意全库生效（JJC-20261126-001）：metrics 库
+// 每分钟写入且从未执行 wal_checkpoint，27G WAL 的根因即 autocheckpoint 被长
+// 事务/读游标打断后永久失效；400 页（约 1.6MB@4KB）把 WAL 上限钉在受控水位。
+// 主库/audit 同参数幂等无害——autocheckpoint 本就是 SQLite 默认行为（1000 页）
+// 的温和收紧。护栏：internal/handlers/testdb_template_test.go 的
+// testMainDBDSNParams 必须与本常量逐字镜像。
+const sqliteWALDSNParams = "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(400)"
 
 // sqlitePoolConfig 连接池三参数显式命名组——池尺寸差异常驻（metrics
 // MaxIdle==MaxOpen 防 last-close checkpoint 风暴，见 openAndPingMetricsDB），
@@ -120,6 +126,15 @@ const (
 	// 读侧绑定参数/导入归一全部引用，db_truth_defaults_test 双向钉死。
 	DefaultSecurityEventsRetentionDays = 90
 	DefaultSecurityEventsRowCap        = 1000000
+	// 指标历史保留与库体积硬上限三列治理默认（JJC-20261126-001）：
+	// metrics_history_retention_days / lb_l4_conn_retention_days 默认 7 天
+	// 引用 services.go:866 注释的既有用户裁定（指标历史固定 7 天，仅可配化
+	// 不改语义）；metrics_max_bytes 0=禁用硬上限裁剪。与 2026-10-26 已退役
+	// 的历史死列 metrics_retention_days 无关（该列由 db.go:1508 附近的主动
+	// DROP 迁移删除，四处反向钉测看守，本三列不得复用其名）。
+	DefaultMetricsHistoryRetentionDays = 7
+	DefaultL4ConnRetentionDays         = 7
+	DefaultMetricsMaxBytes             = 0
 	// 保留边界的上限同样单源：写侧校验（caddy.go）、导入钳制
 	// （config_backup.go）、从端 apply 归一（cluster_apply.go）与 MCP schema
 	// 四处引用，调整边界只改这里。
@@ -1366,6 +1381,12 @@ var newColumnsRegistry = map[string]string{
 	// 不再用 0 隐式映射服务层写死默认值。默认值单源=Default* 常量。
 	"global_config.security_events_retention_days":     fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRetentionDays),
 	"global_config.security_events_row_cap":            fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRowCap),
+	// 指标历史保留两列与库体积硬上限（JJC-20261126-001）：默认 7/7/0=禁用。
+	// 与已退役死列 metrics_retention_days 无关（该列由启动 DROP 迁移删除并有
+	// 反向钉测看守——本三列命名刻意区分，不复用历史名）。
+	"global_config.metrics_history_retention_days": fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultMetricsHistoryRetentionDays),
+	"global_config.lb_l4_conn_retention_days":      fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultL4ConnRetentionDays),
+	"global_config.metrics_max_bytes":              fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultMetricsMaxBytes),
 	"global_config.security_events_retention_migrated": "INTEGER NOT NULL DEFAULT 0",
 	// CA 提供商播种一次性 marker。此前「表空即
 	// 播种」每次启动评估——导入/集群快照把 ca_providers 清空后重启会复活
@@ -1760,6 +1781,12 @@ func runMigrations() error {
 		// 或旧版本写入的超大值在下次启动归默认，避免保留窗口长期超出治理范围。
 		updateWhere("global_config", fmt.Sprintf("security_events_retention_days=%d", DefaultSecurityEventsRetentionDays), fmt.Sprintf("security_events_retention_days IS NULL OR security_events_retention_days>%d", MaxSecurityEventsRetentionDays)),
 		updateWhere("global_config", fmt.Sprintf("security_events_row_cap=%d", DefaultSecurityEventsRowCap), fmt.Sprintf("security_events_row_cap IS NULL OR security_events_row_cap>%d", MaxSecurityEventsRowCap)),
+		// 指标保留三列（JJC-20261126-001）：NULL/负值收敛默认（7/7/0=禁用）。
+		// 0 是 metrics_max_bytes 的合法「禁用」值不回填；<0 视为脏数据归 0。
+		// 保留天数 0 是否合法由读取侧裁定（0=禁用跳过清理），此处只修 NULL/负值。
+		updateWhere("global_config", fmt.Sprintf("metrics_history_retention_days=%d", DefaultMetricsHistoryRetentionDays), "metrics_history_retention_days IS NULL OR metrics_history_retention_days<0"),
+		updateWhere("global_config", fmt.Sprintf("lb_l4_conn_retention_days=%d", DefaultL4ConnRetentionDays), "lb_l4_conn_retention_days IS NULL OR lb_l4_conn_retention_days<0"),
+		updateWhere("global_config", fmt.Sprintf("metrics_max_bytes=%d", DefaultMetricsMaxBytes), "metrics_max_bytes IS NULL OR metrics_max_bytes<0"),
 	}
 	for _, entry := range defaultUpdates {
 		// 先只读探测再写：收敛库上这批回填全部零命中，探测门让二次启动

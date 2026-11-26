@@ -114,6 +114,12 @@ func TestRunMigrationsColumnDefaults_MatchGovernedConstants(t *testing.T) {
 	}{
 		{"security_events_retention_days", fmt.Sprint(DefaultSecurityEventsRetentionDays), 1},
 		{"security_events_row_cap", fmt.Sprint(DefaultSecurityEventsRowCap), 1},
+		// 指标历史保留三列（JJC-20261126-001）：fresh DDL DEFAULT 与治理常量
+		// 同源钉死；metrics_max_bytes 0=禁用硬上限。与已退役死列
+		// metrics_retention_days 无关（反向钉测另行看守其不存在）。
+		{"metrics_history_retention_days", fmt.Sprint(DefaultMetricsHistoryRetentionDays), 1},
+		{"lb_l4_conn_retention_days", fmt.Sprint(DefaultL4ConnRetentionDays), 1},
+		{"metrics_max_bytes", fmt.Sprint(DefaultMetricsMaxBytes), 1},
 		{"threat_traffic_sample_n", fmt.Sprint(DefaultThreatTrafficSampleN), 1},
 		{"threat_screen_mode", "'" + DefaultThreatScreenMode + "'", 1},
 		// 威胁/爬虫任务级排程（newColumns 补列）：DDL DEFAULT 与 services 兜底同源。
