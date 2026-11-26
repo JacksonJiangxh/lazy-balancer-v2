@@ -440,7 +440,7 @@ func TestEnforceSizeLimit_trimsOldestToWatermark(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	if _, err := MetricsDB.Exec(`INSERT INTO metrics_daily_agg (local_date) VALUES (date('now'))`); err != nil {
+	if _, err := MetricsDB.Exec(`INSERT INTO metrics_daily_agg (rule_id, local_date, requests_delta) VALUES ('lb_seed', date('now'), 0)`); err != nil {
 		t.Fatalf("seed daily agg: %v", err)
 	}
 	// 把上限压到「2000 行大约 1.6MB 实际库」不可靠——直接用极小上限触发裁剪，
