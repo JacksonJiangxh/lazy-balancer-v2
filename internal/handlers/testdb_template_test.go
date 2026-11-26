@@ -65,7 +65,7 @@ const (
 	// 生产口径由 applySQLiteRuntimePragmas 验证；②本 helper 每次直开后
 	// 专用连接回读三参数（journal_mode/busy_timeout/synchronous），任一
 	// 不符立即报错。
-	testMainDBDSNParams = "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)"
+	testMainDBDSNParams = "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(400)"
 )
 
 // testDBTemplate 进程级单例：模板目录 + 结构指纹。只缓存成功建立；
