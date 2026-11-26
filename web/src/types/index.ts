@@ -385,6 +385,10 @@ export interface GlobalConfigData {
   trusted_proxy_range_refs: string
   trusted_proxy_headers: string
   trusted_proxy_strict: boolean
+  // metrics 治理：保留天数 0=禁用 TTL；硬上限 0=禁用
+  metrics_history_retention_days: number
+  lb_l4_conn_retention_days: number
+  metrics_max_bytes: number
   acme_email: string
   cert_expiry_days: number
   cert_renewal_days: number

@@ -42,6 +42,18 @@
             <span class="form-tip-inline">行数上限</span>
             <div class="form-tip-line">安全事件日志每日清理：超出保留天数或行数上限时按最旧优先删除（行数上限在两次清理之间可能短暂超出）。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
+          <el-form-item label="metrics 保留">
+            <el-input-number v-model="settings.metrics_history_retention_days" :disabled="formFrozen" :min="0" :max="3650" controls-position="right" style="width: 120px;" />
+            <span class="form-tip-inline">天</span>
+            <el-input-number v-model="settings.lb_l4_conn_retention_days" :disabled="formFrozen" :min="0" :max="3650" controls-position="right" style="width: 120px; margin-left: 10px;" />
+            <span class="form-tip-inline">天（L4 连接）</span>
+            <div class="form-tip-line">metrics 历史与 L4 连接历史的保留天数，默认 7 天；0=禁用按时间清理。修改后下一清理周期生效（每日清理一次）。</div>
+          </el-form-item>
+          <el-form-item label="metrics 库上限">
+            <el-input-number v-model="metricsMaxBytes" :disabled="formFrozen" :min="0" :max="107374182400" :step="107374182" controls-position="right" style="width: 170px;" />
+            <span class="form-tip-inline">字节</span>
+            <div class="form-tip-line">metrics 库体积硬上限（字节），默认 0=禁用；超过上限按最老批次裁剪至 90% 水位并触发止损告警，与保留天数相互独立。</div>
+          </el-form-item>
           <el-form-item label="登录过期">
             <el-input-number v-model="settings.jwt_expire_minutes" :disabled="formFrozen" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">分钟，登录令牌有效期</span>
@@ -1365,6 +1377,9 @@ interface BasicSettingsConfig {
   threat_screen_mode?: string
   security_events_retention_days?: number
   security_events_row_cap?: number
+  metrics_history_retention_days?: number
+  lb_l4_conn_retention_days?: number
+  metrics_max_bytes?: number
   threat_traffic_sample_n?: number
   server_map_lon?: number
   jwt_expire_minutes: number
@@ -1572,6 +1587,13 @@ const seRowCap = computed<number>({
   set: (value) => {
     settings.value.security_events_row_cap = value
     securityEventsRowCapDirty.value = true
+  },
+})
+// metrics 库上限：0=禁用为合法库值，直接读写不做展示归一
+const metricsMaxBytes = computed<number>({
+  get: () => settings.value.metrics_max_bytes ?? 0,
+  set: (value) => {
+    settings.value.metrics_max_bytes = value
   },
 })
 const trafficSampleN = computed<number>({
@@ -1852,6 +1874,10 @@ const handleSave = async () => {
       audit_log_size_mb: settings.value.audit_log_size_mb,
       runtime_log_size_mb: settings.value.runtime_log_size_mb,
       audit_retention_months: settings.value.audit_retention_months,
+      // metrics 治理三键：0 为合法值（禁用），无条件提交原值
+      metrics_history_retention_days: settings.value.metrics_history_retention_days ?? 7,
+      lb_l4_conn_retention_days: settings.value.lb_l4_conn_retention_days ?? 7,
+      metrics_max_bytes: settings.value.metrics_max_bytes ?? 0,
       jwt_expire_minutes: settings.value.jwt_expire_minutes,
       timezone: settings.value.timezone,
       server_map_lat: settings.value.server_map_lat ?? 0,

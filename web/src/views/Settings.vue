@@ -118,6 +118,9 @@ const settings = ref<SettingsConfig>({
   security_events_retention_days: 90,
   threat_traffic_sample_n: -1,
   security_events_row_cap: 1_000_000,
+  metrics_history_retention_days: 7,
+  lb_l4_conn_retention_days: 7,
+  metrics_max_bytes: 0,
   trusted_proxy_enabled: false,
   trusted_proxy_ranges: '[]',
   trusted_proxy_range_refs: '[]',
@@ -175,6 +178,10 @@ const applyBasicKeys = (data: ConfigPayload) => {
   settings.value.threat_traffic_sample_n = sampleN
   savedThreatTrafficSampleN.value = sampleN
   settings.value.security_events_row_cap = displaySecurityEventsRowCap(data.security_events_row_cap)
+  // metrics 治理三键（基础卡自有）：0=禁用为合法库值，原样回填不做展示归一
+  settings.value.metrics_history_retention_days = data.metrics_history_retention_days ?? 7
+  settings.value.lb_l4_conn_retention_days = data.lb_l4_conn_retention_days ?? 7
+  settings.value.metrics_max_bytes = data.metrics_max_bytes ?? 0
   // GitHub 下载代理与令牌状态随整包回填（基础设置卡不再自拉第二份 /config）：
   // 空值留给卡片的展示兜底（未配置→默认代理），令牌状态按未配置展示。
   settings.value.github_proxy_url = data.github_proxy_url ?? ''
