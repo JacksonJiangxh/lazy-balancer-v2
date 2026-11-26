@@ -11,12 +11,12 @@ const vue = code('src/views/settings/BasicSettings.vue')
 const settingsVue = code('src/views/Settings.vue')
 const types = code('src/types/index.ts')
 
-test('默认值：Settings.vue 初始值与回填默认均为 7/7/0，types 声明三键', () => {
-  assert.match(settingsVue, /metrics_history_retention_days:\s*7/, '初始默认应为 7')
-  assert.match(settingsVue, /lb_l4_conn_retention_days:\s*7/, '初始默认应为 7')
+test('默认值：Settings.vue 初始值与回填默认均为 3/3/0，types 声明三键', () => {
+  assert.match(settingsVue, /metrics_history_retention_days:\s*3/, '初始默认应为 3')
+  assert.match(settingsVue, /lb_l4_conn_retention_days:\s*3/, '初始默认应为 3')
   assert.match(settingsVue, /metrics_max_bytes:\s*0/, '初始默认应为 0（禁用）')
-  assert.match(settingsVue, /metrics_history_retention_days = data\.metrics_history_retention_days \?\? 7/, '回填默认 7')
-  assert.match(settingsVue, /lb_l4_conn_retention_days = data\.lb_l4_conn_retention_days \?\? 7/, '回填默认 7')
+  assert.match(settingsVue, /metrics_history_retention_days = data\.metrics_history_retention_days \?\? 3/, '回填默认 3')
+  assert.match(settingsVue, /lb_l4_conn_retention_days = data\.lb_l4_conn_retention_days \?\? 3/, '回填默认 3')
   assert.match(settingsVue, /metrics_max_bytes = data\.metrics_max_bytes \?\? 0/, '回填默认 0')
   assert.match(types, /metrics_history_retention_days:\s*number/)
   assert.match(types, /lb_l4_conn_retention_days:\s*number/)
@@ -33,12 +33,12 @@ test('非法值：保留天数非负（min=0 挡负数）；载荷无条件提�
   assert.doesNotMatch(vue, /v-model="settings\.metrics_history_retention_days"[^>]*:min="-1"/, '不得出现负下限')
   assert.match(
     vue,
-    /metrics_history_retention_days:\s*settings\.value\.metrics_history_retention_days \?\? 7/,
+    /metrics_history_retention_days:\s*settings\.value\.metrics_history_retention_days \?\? 3/,
     '载荷必须携带 metrics_history_retention_days（0 原样提交，不做脏检查省略）',
   )
   assert.match(
     vue,
-    /lb_l4_conn_retention_days:\s*settings\.value\.lb_l4_conn_retention_days \?\? 7/,
+    /lb_l4_conn_retention_days:\s*settings\.value\.lb_l4_conn_retention_days \?\? 3/,
     '载荷必须携带 lb_l4_conn_retention_days',
   )
   assert.match(

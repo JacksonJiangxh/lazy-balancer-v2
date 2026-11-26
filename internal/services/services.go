@@ -863,11 +863,12 @@ func (m *MetricsService) cleanupHistory() error {
 	if metricsCleanupHook != nil {
 		metricsCleanupHook()
 	}
-	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖复用「日志
-	// 保留」的裁定——用户明确指标类数据独立于日志保留配置);实时接口
-	// (/metrics/*)不受影响,仅历史图窗口收敛到 7 天。
+	// 2026-11-26 用户裁定：指标历史默认保留最近 3 天（此前 2026-09-15 裁定的
+	// 7 天因 metrics 库 27G 膨胀事故被显式收敛；覆盖复用「日志
+	// 保留」的裁定——指标类数据独立于日志保留配置）；实时接口
+	// (/metrics/*)不受影响,仅历史图窗口收敛到 3 天。
 	// JJC-20261126-001 可配置化：保留天数改读 global_config 三列（缺省回退
-	// 7/7/0，Load 失败降级默认不阻断整轮）。dailyAggRetentionDays 保持 90
+	// 3/3/0，Load 失败降级默认不阻断整轮）。dailyAggRetentionDays 保持 90
 	// 硬编码：日聚合与指标历史语义分离（90 天=回溯余量，非历史图窗口），
 	// 不挂 metrics_history_retention_days 语义。
 	const dailyAggRetentionDays = 90

@@ -127,13 +127,14 @@ const (
 	DefaultSecurityEventsRetentionDays = 90
 	DefaultSecurityEventsRowCap        = 1000000
 	// 指标历史保留与库体积硬上限三列治理默认（JJC-20261126-001）：
-	// metrics_history_retention_days / lb_l4_conn_retention_days 默认 7 天
-	// 引用 services.go:866 注释的既有用户裁定（指标历史固定 7 天，仅可配化
-	// 不改语义）；metrics_max_bytes 0=禁用硬上限裁剪。与 2026-10-26 已退役
+	// metrics_history_retention_days / lb_l4_conn_retention_days 默认 3 天
+	// （2026-11-26 用户裁定：默认保持 3 天——2026-11-23 metrics 库 27G 膨胀
+	// 事故后收敛磁盘占用；此前 2026-09-15 裁定的 7 天被本次显式改写）；
+	// metrics_max_bytes 0=禁用硬上限裁剪。与 2026-10-26 已退役
 	// 的历史死列 metrics_retention_days 无关（该列由 db.go:1508 附近的主动
 	// DROP 迁移删除，四处反向钉测看守，本三列不得复用其名）。
-	DefaultMetricsHistoryRetentionDays = 7
-	DefaultL4ConnRetentionDays         = 7
+	DefaultMetricsHistoryRetentionDays = 3
+	DefaultL4ConnRetentionDays         = 3
 	DefaultMetricsMaxBytes             = 0
 	// 保留边界的上限同样单源：写侧校验（caddy.go）、导入钳制
 	// （config_backup.go）、从端 apply 归一（cluster_apply.go）与 MCP schema
@@ -1522,8 +1523,8 @@ func runMigrations() error {
 	}
 	// （2026-09-05/06 审计裁定）：metrics_public/metrics_origins 为零
 	// 消费死列（历史上预留给「指标公开访问/CORS」设想，从未接线）；
-	// metrics_retention_days 是旧可配置指标保留期列——现行保留期固定 7 天
-	//（services cleanupHistory 写死，不读 audit_retention_months）——三列
+	// metrics_retention_days 是旧可配置指标保留期列——现行保留期经
+	// JJC-20261126-001 可配置化（新列 metrics_history_retention_days，默认 3 天）——三列
 	// 存量库逐列删除（逐列判定使单列残留形态也可收敛）；新库由建表语句
 	// 与 newColumns 不再补建。
 	for _, deadMetricsColumn := range []string{"metrics_public", "metrics_origins", "metrics_retention_days"} {

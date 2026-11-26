@@ -1875,8 +1875,8 @@ const handleSave = async () => {
       runtime_log_size_mb: settings.value.runtime_log_size_mb,
       audit_retention_months: settings.value.audit_retention_months,
       // metrics 治理三键：0 为合法值（禁用），无条件提交原值
-      metrics_history_retention_days: settings.value.metrics_history_retention_days ?? 7,
-      lb_l4_conn_retention_days: settings.value.lb_l4_conn_retention_days ?? 7,
+      metrics_history_retention_days: settings.value.metrics_history_retention_days ?? 3,
+      lb_l4_conn_retention_days: settings.value.lb_l4_conn_retention_days ?? 3,
       metrics_max_bytes: settings.value.metrics_max_bytes ?? 0,
       jwt_expire_minutes: settings.value.jwt_expire_minutes,
       timezone: settings.value.timezone,

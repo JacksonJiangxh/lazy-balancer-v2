@@ -466,13 +466,13 @@ func TestEnforceSizeLimit_trimsOldestToWatermark(t *testing.T) {
 }
 
 func TestLoadMetricsRetentionConfig_defaultsAndRead(t *testing.T) {
-	// nil 主库回退治理默认（7/7/0）
+	// nil 主库回退治理默认（3/3/0，2026-11-26 裁定默认 3 天）
 	oldDB, oldMetrics := DB, MetricsDB
 	DB, MetricsDB = nil, nil
 	t.Cleanup(func() { DB, MetricsDB = oldDB, oldMetrics })
 	h, l, m := LoadMetricsRetentionConfig()
-	if h != 7 || l != 7 || m != 0 {
-		t.Fatalf("fallback = %d/%d/%d, want 7/7/0", h, l, m)
+	if h != 3 || l != 3 || m != 0 {
+		t.Fatalf("fallback = %d/%d/%d, want 3/3/0", h, l, m)
 	}
 	// 真实库读列
 	preserveDatabaseHandles(t)
