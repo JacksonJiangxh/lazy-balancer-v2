@@ -866,10 +866,12 @@ func (m *MetricsService) cleanupHistory() error {
 	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖复用「日志
 	// 保留」的裁定——用户明确指标类数据独立于日志保留配置);实时接口
 	// (/metrics/*)不受影响,仅历史图窗口收敛到 7 天。
-	const retentionDays = 7
-	// dailyAggRetentionDays 正常请求日聚合保留天数：与 security_events 同口径
-	// 90 天（读路径窗口 ≤7 天+昨日，90 天为回溯余量；行数上界=规则数×90）。
+	// JJC-20261126-001 可配置化：保留天数改读 global_config 三列（缺省回退
+	// 7/7/0，Load 失败降级默认不阻断整轮）。dailyAggRetentionDays 保持 90
+	// 硬编码：日聚合与指标历史语义分离（90 天=回溯余量，非历史图窗口），
+	// 不挂 metrics_history_retention_days 语义。
 	const dailyAggRetentionDays = 90
+	historyDays, l4Days, metricsMaxBytes := db.LoadMetricsRetentionConfig()
 	if db.MetricsDB == nil {
 		// 守卫与 refreshDBOverviewMetrics 同口径（生产启动链不可达；防
 		// 测试/嵌入形态 nil 库 panic）。nil 库按失败上抛——「清理没跑成」
@@ -879,15 +881,15 @@ func (m *MetricsService) cleanupHistory() error {
 		}
 		return errMetricsDBUnavailable
 	}
-	if err := db.CleanupMetricsHistory(retentionDays); err != nil {
+	if err := db.CleanupMetricsHistory(historyDays); err != nil {
 		if lvl := logStateTransition("metrics-history-cleanup", true); lvl != "" {
 			Logf(lvl, "Failed to clean up metrics history: %v", err)
 		}
 		return err
 	}
-	// L4 连接计数历史同保留期同任务体（独立表，同 7 天窗口）：失败同口径
-	// 上抛进任务失败终态，不得静默继续。
-	if err := db.CleanupL4ConnHistory(retentionDays); err != nil {
+	// L4 连接计数历史同任务体（独立表，保留期独立可配，缺省同 7 天窗口）：
+	// 失败同口径上抛进任务失败终态，不得静默继续。
+	if err := db.CleanupL4ConnHistory(l4Days); err != nil {
 		if lvl := logStateTransition("metrics-history-cleanup", true); lvl != "" {
 			Logf(lvl, "Failed to clean up l4 conn history: %v", err)
 		}
@@ -900,6 +902,12 @@ func (m *MetricsService) cleanupHistory() error {
 			Logf(lvl, "Failed to clean up metrics daily agg: %v", err)
 		}
 		return err
+	}
+	// 库体积硬上限裁剪（JJC-20261126-001）：先 TTL 后裁剪；maxBytes<=0 禁用
+	// （EnforceSizeLimit 内部免判早退）。裁剪失败不阻断任务终态——TTL 清理
+	// 已成功，硬上限是资源防线而非正确性依赖，失败记日志下轮再试。
+	if err := db.EnforceSizeLimit(metricsMaxBytes); err != nil {
+		Logf("error", "metrics size limit enforcement failed: %v", err)
 	}
 	if lvl := logStateTransition("metrics-history-cleanup", false); lvl != "" {
 		Logf(lvl, "metrics history cleanup recovered")

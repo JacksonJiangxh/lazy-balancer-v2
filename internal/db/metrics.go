@@ -937,3 +937,129 @@ func CleanupDailyAgg(retentionDays int) error {
 	}
 	return nil
 }
+
+// LoadMetricsRetentionConfig 从主库 global_config 读指标保留三列（
+// JJC-20261126-001）：metrics_history_retention_days / lb_l4_conn_retention_days /
+// metrics_max_bytes。DB nil 或查询失败回退治理默认（7/7/0=禁用）——保留期读取
+// 失败不得阻断清理任务（失败降级为默认口径而非跳过整轮，同 GetDB 兜底族）。
+// 列缺失（极端：迁移未跑）同回退，不做 schema 探测。
+func LoadMetricsRetentionConfig() (historyDays, l4Days int, maxBytes int64) {
+	historyDays, l4Days, maxBytes = DefaultMetricsHistoryRetentionDays, DefaultL4ConnRetentionDays, int64(DefaultMetricsMaxBytes)
+	if DB == nil {
+		return
+	}
+	var h, l, m sql.NullInt64
+	if err := DB.QueryRow(`SELECT metrics_history_retention_days, lb_l4_conn_retention_days, metrics_max_bytes FROM global_config WHERE id=1`).
+		Scan(&h, &l, &m); err != nil {
+		return
+	}
+	if h.Valid && h.Int64 >= 0 {
+		historyDays = int(h.Int64)
+	}
+	if l.Valid && l.Int64 >= 0 {
+		l4Days = int(l.Int64)
+	}
+	if m.Valid && m.Int64 >= 0 {
+		maxBytes = m.Int64
+	}
+	return
+}
+
+// enforceSizeLimitBatch 是 EnforceSizeLimit 的单批删除行数（做成 var 便于
+// 测试收缩批次观察多轮行为，与 cleanupMetricsHistoryBatch 同惯例）。
+var enforceSizeLimitBatch = 1000
+
+// enforceSizeLimitMaxRounds 止损上限：单轮任务体内最多裁剪批次数。达上限仍
+// 超水位即放弃本轮（下轮再裁）——防止「裁剪速度 < 写入速度」的库陷入无限循环。
+var enforceSizeLimitMaxRounds = 20
+
+// EnforceSizeLimit 库体积硬上限裁剪（JJC-20261126-001）：metrics 库主文件
+// 超过 maxBytes 时按「最老先删」循环裁 metrics_history 与 lb_l4_conn_history
+// 至 90% 水位。maxBytes<=0 直接返回 nil（禁用语义，调用方免判）。裁剪只动
+// 两张历史表——metrics_daily_agg 行数=规则数×90，体积占比极小，超限仅由
+// 返回的告警信息提示、不参与裁剪（防死循环）。每批间让出写锁（同 Cleanup*
+// 口径）；达最大轮次止损退出。MetricsDB nil 早退 nil（同族守卫口径）。
+func EnforceSizeLimit(maxBytes int64) (err error) {
+	if maxBytes <= 0 || MetricsDB == nil {
+		return nil
+	}
+	size, err := metricsDBSizeBytes()
+	if err != nil {
+		return fmt.Errorf("measure metrics db size: %w", err)
+	}
+	if size <= maxBytes {
+		return nil
+	}
+	target := maxBytes * 9 / 10 // 90% 水位
+	for round := 0; round < enforceSizeLimitMaxRounds; round++ {
+		res, err := MetricsDB.Exec("DELETE FROM metrics_history WHERE rowid IN (SELECT rowid FROM metrics_history ORDER BY rowid ASC LIMIT ?)", enforceSizeLimitBatch)
+		if err != nil {
+			return fmt.Errorf("enforce size limit trim metrics_history: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count trim metrics_history rows: %w", err)
+		}
+		if affected < int64(enforceSizeLimitBatch) {
+			// metrics_history 已裁空（本批不满），轮到 lb_l4_conn_history
+			res2, err := MetricsDB.Exec("DELETE FROM lb_l4_conn_history WHERE rowid IN (SELECT rowid FROM lb_l4_conn_history ORDER BY rowid ASC LIMIT ?)", enforceSizeLimitBatch)
+			if err != nil {
+				return fmt.Errorf("enforce size limit trim lb_l4_conn_history: %w", err)
+			}
+			affected2, err := res2.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("count trim lb_l4_conn_history rows: %w", err)
+			}
+			if affected2 == 0 {
+				// 两表均已空，检查是否达水位
+				size, err = metricsDBSizeBytes()
+				if err != nil {
+					return fmt.Errorf("measure metrics db size: %w", err)
+				}
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		size, err = metricsDBSizeBytes()
+		if err != nil {
+			return fmt.Errorf("measure metrics db size: %w", err)
+		}
+		if size <= target {
+			break
+		}
+	}
+	// 裁剪后主动 checkpoint(TRUNCATE)：DELETE 只把页标 free——WAL 里的
+	// 裁剪记录不 checkpoint 则 -wal 文件依旧庞大，体积观测面（page_count
+	// 主文件+用户看的 -wal 字节数）不会回落，触发下一轮空裁剪。
+	var busy int
+	if err := MetricsDB.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, new(int), new(int)); err != nil {
+		return fmt.Errorf("checkpoint after size limit trim: %w", err)
+	}
+	if size > target {
+		log.Printf("metrics size limit: 达最大裁剪轮次仍高于 90%% 水位（当前 %d 字节 / 上限 %d 字节）——下轮任务继续裁剪；metrics_daily_agg 不参与裁剪，若其为主要体积来源请人工评估", size, maxBytes)
+	}
+	return nil
+}
+
+// metricsDBSizeBytes 主库文件+WAL 体积估算（page_count*page_size 只算主
+// 文件——WAL 由 autocheckpoint+裁剪后 TRUNCATE 收口，观测面把 -wal 并入：
+// 裁剪判定含 WAL 才不会在「主文件已达标但 WAL 巨大」时误判达标）。
+func metricsDBSizeBytes() (int64, error) {
+	var pageCount, pageSize int64
+	if err := MetricsDB.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return 0, err
+	}
+	if err := MetricsDB.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	total := pageCount * pageSize
+	// -wal 文件并入判定：db_file 路径由 PRAGMA database_list 拿主库文件名，
+	// os.Stat 其 -wal 伴生文件。Stat 失败（无 WAL/权限）按 0 计，不阻断。
+	var dbPath string
+	if err := MetricsDB.QueryRow("PRAGMA database_list").Scan(new(int), new(string), &dbPath); err == nil {
+		if fi, err := os.Stat(dbPath + "-wal"); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total, nil
+}

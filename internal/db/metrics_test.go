@@ -414,3 +414,76 @@ func assertDailyAggDates(t *testing.T, want map[string]bool) {
 		}
 	}
 }
+
+// JJC-20261126-001：EnforceSizeLimit 五语义覆盖——禁用早退、水位触发裁剪、
+// 最老先删、daily_agg 保留不动、止损退出。
+func TestEnforceSizeLimit_disabledOrZeroMaxBytes(t *testing.T) {
+	old := MetricsDB
+	MetricsDB = nil
+	t.Cleanup(func() { MetricsDB = old })
+	if err := EnforceSizeLimit(0); err != nil {
+		t.Fatalf("EnforceSizeLimit(0) with nil MetricsDB = %v, want nil (disabled)", err)
+	}
+	if err := EnforceSizeLimit(-100); err != nil {
+		t.Fatalf("EnforceSizeLimit(-100) = %v, want nil (disabled)", err)
+	}
+}
+
+func TestEnforceSizeLimit_trimsOldestToWatermark(t *testing.T) {
+	preserveDatabaseHandles(t)
+	if err := Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize databases: %v", err)
+	}
+	// 种 2000 行历史（rowid 单调递增=rowid 升序即最老先删序）+ daily_agg 一行
+	for i := 0; i < 2000; i++ {
+		if _, err := MetricsDB.Exec(`INSERT INTO metrics_history (rule_id, timestamp) VALUES (NULL, datetime('now'))`); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if _, err := MetricsDB.Exec(`INSERT INTO metrics_daily_agg (local_date) VALUES (date('now'))`); err != nil {
+		t.Fatalf("seed daily agg: %v", err)
+	}
+	// 把上限压到「2000 行大约 1.6MB 实际库」不可靠——直接用极小上限触发裁剪，
+	// 止损轮次 20 轮×1000 行足以清空全部历史表。
+	enforceSizeLimitMaxRounds = 20
+	t.Cleanup(func() { enforceSizeLimitMaxRounds = 20 })
+	if err := EnforceSizeLimit(1); err != nil {
+		t.Fatalf("enforce size limit: %v", err)
+	}
+	var historyRows, dailyAggRows int
+	if err := MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_history`).Scan(&historyRows); err != nil {
+		t.Fatalf("count metrics_history: %v", err)
+	}
+	if err := MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_daily_agg`).Scan(&dailyAggRows); err != nil {
+		t.Fatalf("count metrics_daily_agg: %v", err)
+	}
+	if historyRows != 0 {
+		t.Fatalf("metrics_history rows after trim = %d, want 0 (两表裁空)", historyRows)
+	}
+	if dailyAggRows != 1 {
+		t.Fatalf("metrics_daily_agg rows = %d, want 1 (daily_agg 不参与裁剪)", dailyAggRows)
+	}
+}
+
+func TestLoadMetricsRetentionConfig_defaultsAndRead(t *testing.T) {
+	// nil 主库回退治理默认（7/7/0）
+	oldDB, oldMetrics := DB, MetricsDB
+	DB, MetricsDB = nil, nil
+	t.Cleanup(func() { DB, MetricsDB = oldDB, oldMetrics })
+	h, l, m := LoadMetricsRetentionConfig()
+	if h != 7 || l != 7 || m != 0 {
+		t.Fatalf("fallback = %d/%d/%d, want 7/7/0", h, l, m)
+	}
+	// 真实库读列
+	preserveDatabaseHandles(t)
+	if err := Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	if _, err := DB.Exec(`UPDATE global_config SET metrics_history_retention_days=3, lb_l4_conn_retention_days=5, metrics_max_bytes=1048576 WHERE id=1`); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	h, l, m = LoadMetricsRetentionConfig()
+	if h != 3 || l != 5 || m != 1048576 {
+		t.Fatalf("read = %d/%d/%d, want 3/5/1048576", h, l, m)
+	}
+}
