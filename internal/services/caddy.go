@@ -5758,6 +5758,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 				tlsConfig["except_ports"] = []string{fmt.Sprintf("%d", PanelPort())}
 			}
 			transportConfig["tls"] = tlsConfig
+		}
 		if rule.UpstreamForceHTTP1 == 1 && rule.NTLMCompatible != 1 {
 			// 上游强制 HTTP/1.1（通用列，2026-10-12）：Caddy HTTPTransport.Versions
 			// （modules/caddyhttp/reverseproxy/httptransport.go）——限定协议版本集即
@@ -5777,7 +5778,6 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		// 渲染按 force_http1 优先——用户显式要 HTTP/1.1 的意图优先）。
 		if hasH2CUpstream && rule.UpstreamForceHTTP1 != 1 && rule.NTLMCompatible != 1 {
 			transportConfig["versions"] = []string{"1.1", "h2c"}
-		}
 		}
 		if rule.EnableDnsServer && rule.DnsServer != "" {
 			transportConfig["resolver"] = map[string]interface{}{"addresses": SplitDnsAddresses(rule.DnsServer)}
